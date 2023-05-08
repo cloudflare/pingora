@@ -1,0 +1,6 @@
+**/target
+**/*.rs.bk
+**/Cargo.lock
+**/dhat-heap.json
+.vscode
+.cover
