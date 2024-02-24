@@ -87,7 +87,7 @@ This phase is to modify requests before sending to upstream.
 ### `upstream_response_filter()/upstream_response_body_filter()`
 This phase is triggered after an upstream response header/body is received.
 
-This phase is to modify response headers (or body) before sending to downstream. Note that this phase is called _prior_ to HTTP caching and therefore any changes made here will affect the response stored in the HTTP cache.
+This phase is to modify or process response headers (or body) before sending to downstream. Note that this phase is called _prior_ to HTTP caching and therefore any changes made here will affect the response stored in the HTTP cache.
 
 ### `response_filter()/response_body_filter()/response_trailer_filter()`
 This phase is triggered after a response header/body/trailer is ready to send to downstream.

@@ -197,12 +197,21 @@ static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 81
 static CACHE_LOCK: Lazy<CacheLock> =
     Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(2)));
 
+// #[allow(clippy::upper_case_acronyms)]
+pub struct CacheCTX {
+    upstream_status: Option<u16>,
+}
+
 pub struct ExampleProxyCache {}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = CacheCTX;
+    fn new_ctx(&self) -> Self::CTX {
+        CacheCTX {
+            upstream_status: None,
+        }
+    }
 
     async fn upstream_peer(
         &self,
@@ -282,11 +291,22 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(resp_cacheable(cc.as_ref(), resp, false, &CACHE_DEFAULT))
     }
 
+    fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        ctx.upstream_status = Some(upstream_response.status.into());
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
@@ -314,6 +334,9 @@ impl ProxyHttp for ExampleProxyCache {
         }
         if let Some(d) = session.cache.lock_duration() {
             upstream_response.insert_header("x-cache-lock-time-ms", format!("{}", d.as_millis()))?
+        }
+        if let Some(up_stat) = ctx.upstream_status {
+            upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
     }
