@@ -305,6 +305,7 @@ mod test_cache {
         let headers = res.headers();
         let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
         assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         let res = reqwest::get(url).await.unwrap();
@@ -312,6 +313,7 @@ mod test_cache {
         let headers = res.headers();
         let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
         assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         assert_eq!(cache_miss_epoch, cache_hit_epoch);
@@ -323,6 +325,7 @@ mod test_cache {
         let headers = res.headers();
         let cache_expired_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
         assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(headers["x-upstream-status"], "304");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         // still the old object
