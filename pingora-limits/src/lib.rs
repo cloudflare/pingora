@@ -24,11 +24,9 @@ pub mod inflight;
 pub mod rate;
 
 use ahash::RandomState;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::Hash;
 
 #[inline]
 fn hash<T: Hash>(key: T, hasher: &RandomState) -> u64 {
-    let mut hasher = hasher.build_hasher();
-    key.hash(&mut hasher);
-    hasher.finish()
+    hasher.hash_one(&key)
 }
