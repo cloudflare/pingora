@@ -30,17 +30,12 @@ pub struct Estimator {
 impl Estimator {
     /// Create a new `Estimator` with the given amount of hashes and columns (slots).
     pub fn new(hashes: usize, slots: usize) -> Self {
-        let mut estimator = Vec::with_capacity(hashes);
-        for _ in 0..hashes {
-            let mut slot = Vec::with_capacity(slots);
-            for _ in 0..slots {
-                slot.push(AtomicIsize::new(0));
-            }
-            estimator.push((slot.into_boxed_slice(), RandomState::new()));
-        }
-
-        Estimator {
-            estimator: estimator.into_boxed_slice(),
+        Self {
+            estimator: (0..hashes)
+                .map(|_| (0..slots).map(|_| AtomicIsize::new(0)).collect::<Vec<_>>())
+                .map(|slot| (slot.into_boxed_slice(), RandomState::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 
@@ -48,15 +43,15 @@ impl Estimator {
     /// Note: overflow can happen. When some of the internal counters overflow, a negative number
     /// will be returned. It is up to the caller to catch and handle this case.
     pub fn incr<T: Hash>(&self, key: T, value: isize) -> isize {
-        let mut min = isize::MAX;
-        for (slot, hasher) in self.estimator.iter() {
-            let hash = hash(&key, hasher) as usize;
-            let counter = &slot[hash % slot.len()];
-            // Overflow is allowed for simplicity
-            let current = counter.fetch_add(value, Ordering::Relaxed);
-            min = std::cmp::min(min, current + value);
-        }
-        min
+        self.estimator
+            .iter()
+            .fold(isize::MAX, |min, (slot, hasher)| {
+                let hash = hash(&key, hasher) as usize;
+                let counter = &slot[hash % slot.len()];
+                // Overflow is allowed for simplicity
+                let current = counter.fetch_add(value, Ordering::Relaxed);
+                std::cmp::min(min, current + value)
+            })
     }
 
     /// Decrement `key` by the value given.
@@ -70,23 +65,22 @@ impl Estimator {
 
     /// Get the estimated frequency of `key`.
     pub fn get<T: Hash>(&self, key: T) -> isize {
-        let mut min = isize::MAX;
-        for (slot, hasher) in self.estimator.iter() {
-            let hash = hash(&key, hasher) as usize;
-            let counter = &slot[hash % slot.len()];
-            let current = counter.load(Ordering::Relaxed);
-            min = std::cmp::min(min, current);
-        }
-        min
+        self.estimator
+            .iter()
+            .fold(isize::MAX, |min, (slot, hasher)| {
+                let hash = hash(&key, hasher) as usize;
+                let counter = &slot[hash % slot.len()];
+                let current = counter.load(Ordering::Relaxed);
+                std::cmp::min(min, current)
+            })
     }
 
     /// Reset all values inside this `Estimator`.
     pub fn reset(&self) {
-        for (slot, _) in self.estimator.iter() {
-            for counter in slot.iter() {
-                counter.store(0, Ordering::Relaxed);
-            }
-        }
+        self.estimator.iter().for_each(|(slot, _)| {
+            slot.iter()
+                .for_each(|counter| counter.store(0, Ordering::Relaxed))
+        });
     }
 }
 
@@ -127,5 +121,18 @@ mod tests {
         est.incr("b", 2);
         assert_eq!(est.get("a"), 3);
         assert_eq!(est.get("b"), 3);
+    }
+
+    #[test]
+    fn reset() {
+        let est = Estimator::new(8, 8);
+        est.incr("a", 1);
+        est.incr("a", 2);
+        est.incr("b", 1);
+        est.incr("b", 2);
+        est.decr("b", 1);
+        est.reset();
+        assert_eq!(est.get("a"), 0);
+        assert_eq!(est.get("b"), 0);
     }
 }
