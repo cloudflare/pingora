@@ -30,17 +30,12 @@ pub struct Estimator {
 impl Estimator {
     /// Create a new `Estimator` with the given amount of hashes and columns (slots).
     pub fn new(hashes: usize, slots: usize) -> Self {
-        let mut estimator = Vec::with_capacity(hashes);
-        for _ in 0..hashes {
-            let mut slot = Vec::with_capacity(slots);
-            for _ in 0..slots {
-                slot.push(AtomicIsize::new(0));
-            }
-            estimator.push((slot.into_boxed_slice(), RandomState::new()));
-        }
-
-        Estimator {
-            estimator: estimator.into_boxed_slice(),
+        Self {
+            estimator: (0..hashes)
+                .map(|_| (0..slots).map(|_| AtomicIsize::new(0)).collect::<Vec<_>>())
+                .map(|slot| (slot.into_boxed_slice(), RandomState::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 
