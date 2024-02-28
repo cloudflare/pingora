@@ -43,15 +43,15 @@ impl Estimator {
     /// Note: overflow can happen. When some of the internal counters overflow, a negative number
     /// will be returned. It is up to the caller to catch and handle this case.
     pub fn incr<T: Hash>(&self, key: T, value: isize) -> isize {
-        let mut min = isize::MAX;
-        for (slot, hasher) in self.estimator.iter() {
-            let hash = hash(&key, hasher) as usize;
-            let counter = &slot[hash % slot.len()];
-            // Overflow is allowed for simplicity
-            let current = counter.fetch_add(value, Ordering::Relaxed);
-            min = std::cmp::min(min, current + value);
-        }
-        min
+        self.estimator
+            .iter()
+            .fold(isize::MAX, |min, (slot, hasher)| {
+                let hash = hash(&key, hasher) as usize;
+                let counter = &slot[hash % slot.len()];
+                // Overflow is allowed for simplicity
+                let current = counter.fetch_add(value, Ordering::Relaxed);
+                std::cmp::min(min, current + value)
+            })
     }
 
     /// Decrement `key` by the value given.
@@ -65,14 +65,14 @@ impl Estimator {
 
     /// Get the estimated frequency of `key`.
     pub fn get<T: Hash>(&self, key: T) -> isize {
-        let mut min = isize::MAX;
-        for (slot, hasher) in self.estimator.iter() {
-            let hash = hash(&key, hasher) as usize;
-            let counter = &slot[hash % slot.len()];
-            let current = counter.load(Ordering::Relaxed);
-            min = std::cmp::min(min, current);
-        }
-        min
+        self.estimator
+            .iter()
+            .fold(isize::MAX, |min, (slot, hasher)| {
+                let hash = hash(&key, hasher) as usize;
+                let counter = &slot[hash % slot.len()];
+                let current = counter.load(Ordering::Relaxed);
+                std::cmp::min(min, current)
+            })
     }
 
     /// Reset all values inside this `Estimator`.
