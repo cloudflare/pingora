@@ -183,7 +183,7 @@ impl Continuum {
         }
 
         // Sort and remove any duplicates.
-        ring.sort();
+        ring.sort_unstable();
         ring.dedup_by(|a, b| a.hash == b.hash);
 
         Continuum {
