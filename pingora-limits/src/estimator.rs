@@ -122,4 +122,17 @@ mod tests {
         assert_eq!(est.get("a"), 3);
         assert_eq!(est.get("b"), 3);
     }
+
+    #[test]
+    fn reset() {
+        let est = Estimator::new(8, 8);
+        est.incr("a", 1);
+        est.incr("a", 2);
+        est.incr("b", 1);
+        est.incr("b", 2);
+        est.decr("b", 1);
+        est.reset();
+        assert_eq!(est.get("a"), 0);
+        assert_eq!(est.get("b"), 0);
+    }
 }
