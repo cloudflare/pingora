@@ -1,0 +1,41 @@
+[package]
+name = "TinyUFO"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+edition = "2021"
+license = "Apache-2.0"
+description = "In-memory cache implementation with TinyLFU as the admission policy and S3-FIFO as the eviction policy"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["algorithms", "caching"]
+keywords = ["cache", "pingora"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "tinyufo"
+path = "src/lib.rs"
+
+[dependencies]
+ahash = { workspace = true }
+flurry = "<0.5.0" # Try not to require Rust 1.71
+parking_lot = "0"
+crossbeam-queue = "0"
+
+[dev-dependencies]
+rand = "0"
+lru = "0"
+zipf = "7"
+moka = { version = "0", features = ["sync"] }
+dhat = "0"
+
+[[bench]]
+name = "bench_perf"
+harness = false
+
+[[bench]]
+name = "bench_hit_ratio"
+harness = false
+
+[[bench]]
+name = "bench_memory"
+harness = false

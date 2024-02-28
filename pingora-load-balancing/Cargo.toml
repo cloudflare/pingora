@@ -1,0 +1,33 @@
+[package]
+name = "pingora-load-balancing"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["network-programming"]
+keywords = ["proxy", "pingora"]
+description = """
+Common load balancing features for Pingora proxy.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_load_balancing"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+pingora-http = { version = "0.1.0", path = "../pingora-http" }
+pingora-error = { version = "0.1.0", path = "../pingora-error" }
+pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-ketama = { version = "0.1.0", path = "../pingora-ketama" }
+pingora-runtime = { version = "0.1.0", path = "../pingora-runtime" }
+arc-swap = "1"
+fnv = "1"
+rand = "0"
+tokio = { workspace = true }
+futures = "0"
+log = { workspace = true }
+
+[dev-dependencies]

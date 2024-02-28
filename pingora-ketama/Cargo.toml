@@ -1,0 +1,32 @@
+[package]
+name = "pingora-ketama"
+version = "0.1.0"
+description = "Rust port of the nginx consistent hash function"
+authors = ["Pingora Team <pingora@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["caching", "algorithms"]
+keywords = ["hash", "hashing", "consistent", "pingora"]
+
+[dependencies]
+crc32fast = "1.3"
+
+[dev-dependencies]
+criterion = "0.4"
+csv = "1.2"
+dhat = "0.3"
+env_logger = "0.9"
+log = { workspace = true }
+rand = "0.8"
+
+[[bench]]
+name = "simple"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false
+
+[features]
+heap-prof = []

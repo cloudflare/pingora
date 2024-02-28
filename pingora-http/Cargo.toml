@@ -1,0 +1,26 @@
+[package]
+name = "pingora-http"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["web-programming"]
+keywords = ["http", "pingora"]
+description = """
+HTTP request and response header types for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_http"
+path = "src/lib.rs"
+
+[dependencies]
+http = { workspace = true }
+bytes = { workspace = true }
+pingora-error = { version = "0.1.0", path = "../pingora-error" }
+
+[features]
+default = []
+patched_http1 = []

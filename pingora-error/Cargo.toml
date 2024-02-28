@@ -1,0 +1,17 @@
+[package]
+name = "pingora-error"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["rust-patterns"]
+keywords = ["error", "error-handling", "pingora"]
+description = """
+Error types and error handling APIs for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_error"
+path = "src/lib.rs"

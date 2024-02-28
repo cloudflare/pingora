@@ -4,14 +4,18 @@ version = "0.1.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 description = "A library for rate limiting and event frequency estimation"
-edition = "2018"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["algorithms"]
+keywords = ["rate-limit", "pingora"]
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "pingora_limits"
 path = "src/lib.rs"
 
 [dependencies]
-ahash = "0"
+ahash = { workspace = true }
 
 [dev-dependencies]
 rand = "0"

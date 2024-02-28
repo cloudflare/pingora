@@ -1,0 +1,50 @@
+[package]
+name = "pingora"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+description = """
+A framework to build fast, reliable and programmable networked systems at Internet scale.
+"""
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "proxy", "http", "pingora"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "pingora"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-http = { version = "0.1.0", path = "../pingora-http" }
+pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
+pingora-load-balancing = { version = "0.1.0", path = "../pingora-load-balancing", optional = true }
+pingora-proxy = { version = "0.1.0", path = "../pingora-proxy", optional = true }
+pingora-cache = { version = "0.1.0", path = "../pingora-cache", optional = true }
+
+[dev-dependencies]
+structopt = "0.3"
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+matches = "0.1"
+env_logger = "0.9"
+reqwest = { version = "0.11", features = ["rustls"], default-features = false }
+hyperlocal = "0.8"
+hyper = "0.14"
+jemallocator = "0.5"
+async-trait = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+prometheus = "0.13"
+once_cell = { workspace = true }
+bytes = { workspace = true }
+
+[features]
+default = ["openssl"]
+openssl = ["pingora-core/openssl"]
+boringssl = ["pingora-core/boringssl"]
+proxy = ["pingora-proxy"]
+lb = ["pingora-load-balancing", "proxy"]
+cache = ["pingora-cache"]

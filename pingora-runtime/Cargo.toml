@@ -1,0 +1,30 @@
+[package]
+name = "pingora-runtime"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "non-blocking", "pingora"]
+description = """
+Multithreaded Tokio runtime with the option of disabling work stealing.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+rand = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+once_cell = { workspace = true }
+thread_local = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[[bench]]
+name = "hello"
+harness = false
