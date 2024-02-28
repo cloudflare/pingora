@@ -77,11 +77,10 @@ impl Estimator {
 
     /// Reset all values inside this `Estimator`.
     pub fn reset(&self) {
-        for (slot, _) in self.estimator.iter() {
-            for counter in slot.iter() {
-                counter.store(0, Ordering::Relaxed);
-            }
-        }
+        self.estimator.iter().for_each(|(slot, _)| {
+            slot.iter()
+                .for_each(|counter| counter.store(0, Ordering::Relaxed))
+        });
     }
 }
 
