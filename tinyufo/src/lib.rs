@@ -403,7 +403,7 @@ impl<K: Hash, T: Clone + Send + Sync> TinyUfo<K, T> {
     ///
     /// Return a list of [KV] of key and `T` that are evicted
     pub fn put(&self, key: K, data: T, weight: Weight) -> Vec<KV<T>> {
-        let key = self.random_status.hash_one(key);
+        let key = self.random_status.hash_one(&key);
         self.queues.admit(key, data, weight, false, &self.buckets)
     }
 
@@ -422,13 +422,13 @@ impl<K: Hash, T: Clone + Send + Sync> TinyUfo<K, T> {
     /// Compared to [Self::put], the hit ratio when using this function is reduced by about 0.5pp or less in
     /// under zipf workloads.
     pub fn force_put(&self, key: K, data: T, weight: Weight) -> Vec<KV<T>> {
-        let key = self.random_status.hash_one(key);
+        let key = self.random_status.hash_one(&key);
         self.queues.admit(key, data, weight, true, &self.buckets)
     }
 
     #[cfg(test)]
     fn peek_queue(&self, key: K) -> Option<bool> {
-        let key = self.random_status.hash_one(key);
+        let key = self.random_status.hash_one(&key);
         self.buckets.pin().get(&key).map(|p| p.queue.value())
     }
 }
