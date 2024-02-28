@@ -32,7 +32,7 @@ use std::time::SystemTime;
 ///
 /// - Space optimized in-memory LRU (see [pingora_lru]).
 /// - Instead of a single giant LRU, this struct shards the assets into `N` independent LRUs.
-/// This allows [EvictionManager::save()] not to lock the entire cache mananger while performing
+/// This allows [EvictionManager::save()] not to lock the entire cache manager while performing
 /// serialization.
 pub struct Manager<const N: usize>(Lru<CompactCacheKey, N>);
 
