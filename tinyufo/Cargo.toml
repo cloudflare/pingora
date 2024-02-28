@@ -26,6 +26,7 @@ rand = "0"
 lru = "0"
 zipf = "7"
 moka = { version = "0", features = ["sync"] }
+quick_cache = "0.4"
 dhat = "0"
 
 [[bench]]

@@ -14,11 +14,11 @@
 
 use rand::prelude::*;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::Instant;
 
-const ITEMS: usize = 100;
+const ITEMS: usize = 1_000;
 
 const ITERATIONS: usize = 5_000_000;
 const THREADS: usize = 8;
@@ -59,15 +59,17 @@ total 80865792 ops per second
 */
 
 fn main() {
-    // we don't bench eviction here so make the caches large enough to hold all
+    // we don't bench eviction here so make the caches large enough (10% extra) to hold all
     let lru = Mutex::new(lru::LruCache::<u64, ()>::unbounded());
-    let moka = moka::sync::Cache::new(ITEMS as u64 + 10);
-    let tinyufo = tinyufo::TinyUfo::new(ITEMS + 10, 10);
+    let moka = moka::sync::Cache::new((ITEMS + ITEMS / 10) as u64);
+    let quick_cache = quick_cache::sync::Cache::new(ITEMS + ITEMS / 10);
+    let tinyufo = tinyufo::TinyUfo::new(ITEMS + ITEMS / 10, ITEMS + ITEMS / 10);
 
     // populate first, then we bench access/promotion
     for i in 0..ITEMS {
         lru.lock().unwrap().put(i as u64, ());
         moka.insert(i as u64, ());
+        quick_cache.insert(i as u64, ());
         tinyufo.put(i as u64, (), 1);
     }
 
@@ -99,6 +101,17 @@ fn main() {
 
     let before = Instant::now();
     for _ in 0..ITERATIONS {
+        quick_cache.get(&(zipf.sample(&mut rng) as u64));
+    }
+    let elapsed = before.elapsed();
+    println!(
+        "quick_cache read total {elapsed:?}, {:?} avg per operation, {} ops per second",
+        elapsed / ITERATIONS as u32,
+        (ITERATIONS as f32 / elapsed.as_secs_f32()) as u32
+    );
+
+    let before = Instant::now();
+    for _ in 0..ITERATIONS {
         tinyufo.get(&(zipf.sample(&mut rng) as u64));
     }
     let elapsed = before.elapsed();
@@ -110,10 +123,12 @@ fn main() {
 
     // concurrent
 
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(ITEMS, 1.03).unwrap();
                 let before = Instant::now();
@@ -135,10 +150,12 @@ fn main() {
         (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
     );
 
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(ITEMS, 1.03).unwrap();
                 let before = Instant::now();
@@ -160,10 +177,39 @@ fn main() {
         (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
     );
 
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
+                let mut rng = thread_rng();
+                let zipf = zipf::ZipfDistribution::new(ITEMS, 1.03).unwrap();
+                let before = Instant::now();
+                for _ in 0..ITERATIONS {
+                    quick_cache.get(&(zipf.sample(&mut rng) as u64));
+                }
+                let elapsed = before.elapsed();
+                println!(
+                    "quick_cache read total {elapsed:?}, {:?} avg per operation, {} ops per second",
+                    elapsed / ITERATIONS as u32,
+                    (ITERATIONS as f32 / elapsed.as_secs_f32()) as u32
+                );
+            });
+        }
+    });
+    let elapsed = before.elapsed();
+    println!(
+        "total {} ops per second",
+        (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
+    );
+
+    let wg = Barrier::new(THREADS);
+    let before = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..THREADS {
+            s.spawn(|| {
+                wg.wait();
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(ITEMS, 1.03).unwrap();
                 let before = Instant::now();
@@ -186,17 +232,19 @@ fn main() {
     );
 
     ///// bench mixed read and write /////
-    const CACHE_SIZE: usize = 1000;
-    let items: usize = 10000;
+    const CACHE_SIZE: usize = 1_000;
+    let items: usize = 10_000;
     const ZIPF_EXP: f64 = 1.3;
 
     let lru = Mutex::new(lru::LruCache::<u64, ()>::new(
         NonZeroUsize::new(CACHE_SIZE).unwrap(),
     ));
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
                 let mut miss_count = 0;
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(items, ZIPF_EXP).unwrap();
@@ -225,11 +273,12 @@ fn main() {
     );
 
     let moka = moka::sync::Cache::new(CACHE_SIZE as u64);
-
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
                 let mut miss_count = 0;
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(items, ZIPF_EXP).unwrap();
@@ -256,11 +305,47 @@ fn main() {
         (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
     );
 
-    let tinyufo = tinyufo::TinyUfo::new(CACHE_SIZE, CACHE_SIZE);
+    let quick_cache = quick_cache::sync::Cache::new(CACHE_SIZE);
+    let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {
         for _ in 0..THREADS {
             s.spawn(|| {
+                wg.wait();
+                let mut miss_count = 0;
+                let mut rng = thread_rng();
+                let zipf = zipf::ZipfDistribution::new(items, ZIPF_EXP).unwrap();
+                let before = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let key = zipf.sample(&mut rng) as u64;
+                    if quick_cache.get(&key).is_none() {
+                        quick_cache.insert(key, ());
+                        miss_count +=1;
+                    }
+                }
+                let elapsed = before.elapsed();
+                println!(
+                    "quick_cache mixed read/write {elapsed:?}, {:?} avg per operation, {} ops per second, {miss_count} misses",
+                    elapsed / ITERATIONS as u32,
+                    (ITERATIONS as f32 / elapsed.as_secs_f32()) as u32,
+                );
+            });
+        }
+    });
+
+    let elapsed = before.elapsed();
+    println!(
+        "total {} ops per second",
+        (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
+    );
+
+    let tinyufo = tinyufo::TinyUfo::new(CACHE_SIZE, CACHE_SIZE);
+    let wg = Barrier::new(THREADS);
+    let before = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..THREADS {
+            s.spawn(|| {
+                wg.wait();
                 let mut miss_count = 0;
                 let mut rng = thread_rng();
                 let zipf = zipf::ZipfDistribution::new(items, ZIPF_EXP).unwrap();

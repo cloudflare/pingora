@@ -52,6 +52,22 @@ fn bench_moka(zip_exp: f64, items: usize, cache_size_percent: f32) {
     }
 }
 
+fn bench_quick_cache(zip_exp: f64, items: usize, cache_size_percent: f32) {
+    let cache_size = (cache_size_percent * items as f32).round() as usize;
+    let quick_cache = quick_cache::sync::Cache::new(cache_size);
+
+    let mut rng = thread_rng();
+    let zipf = zipf::ZipfDistribution::new(items, zip_exp).unwrap();
+
+    for _ in 0..ITERATIONS {
+        let key = zipf.sample(&mut rng) as u64;
+
+        if quick_cache.get(&key).is_none() {
+            quick_cache.insert(key, ());
+        }
+    }
+}
+
 fn bench_tinyufo(zip_exp: f64, items: usize, cache_size_percent: f32) {
     let cache_size = (cache_size_percent * items as f32).round() as usize;
     let tinyufo = tinyufo::TinyUfo::new(cache_size, (cache_size as f32 * 1.0) as usize);
@@ -109,6 +125,12 @@ fn main() {
             let _profiler = dhat::Profiler::new_heap();
             bench_moka(1.05, items, 0.1);
             println!("\nmoka");
+        }
+
+        {
+            let _profiler = dhat::Profiler::new_heap();
+            bench_quick_cache(1.05, items, 0.1);
+            println!("\nQuickCache");
         }
 
         {
