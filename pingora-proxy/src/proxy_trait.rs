@@ -264,7 +264,7 @@ pub trait ProxyHttp {
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
     /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    /// avaliable.
+    /// available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
