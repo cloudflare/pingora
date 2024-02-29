@@ -24,7 +24,7 @@ pingora = { version = "0.1", features = [ "lb" ] }
 
 ### Create a pingora server
 First, let's create a pingora server. A pingora `Server` is a process which can host one or many
-services. The pingora `Server` takes care of configuration and CLI argument parsing, daemonization,
+services. The pingora `Server` takes care of configuration and CLI argument parsing, demonization,
 signal handling, and graceful restart or shutdown.
 
 The preferred usage is to initialize the `Server` in the `main()` function and
