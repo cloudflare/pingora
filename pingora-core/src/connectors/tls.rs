@@ -217,7 +217,7 @@ where
     if peer.sni().is_empty() {
         ssl_conf.set_use_server_name_indication(false);
         /* NOTE: technically we can still verify who signs the cert but turn it off to be
-        consistant with nginx's behavior */
+        consistent with nginx's behavior */
         ssl_conf.set_verify(SslVerifyMode::NONE);
     } else if peer.verify_cert() {
         if peer.verify_hostname() {

@@ -29,9 +29,9 @@ pub mod simple_lru;
 /// be handled the implementations internally.
 #[async_trait]
 pub trait EvictionManager {
-    /// Total size of the cache in bytes tracked by this eviction mananger
+    /// Total size of the cache in bytes tracked by this eviction manager
     fn total_size(&self) -> usize;
-    /// Number of assets tracked by this eviction mananger
+    /// Number of assets tracked by this eviction manager
     fn total_items(&self) -> usize;
     /// Number of bytes that are already evicted
     ///
@@ -76,7 +76,7 @@ pub trait EvictionManager {
     /// method shouldn't change the popularity of the asset being peeked.
     fn peek(&self, item: &CompactCacheKey) -> bool;
 
-    /// Serialize to save the state of this eviction mananger to disk
+    /// Serialize to save the state of this eviction manager to disk
     ///
     /// This function is for preserving the eviction manager's state across server restarts.
     ///

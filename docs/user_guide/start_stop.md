@@ -1,4 +1,4 @@
-# Starting and stoping Pingora server
+# Starting and stopping Pingora server
 
 A pingora server is a regular unprivileged multithreaded process.
 
@@ -11,7 +11,7 @@ A Pingora server by default takes the following command-line arguments:
 | ------------- |-------------| ----|
 | -d, --daemon | Daemonize the server | false |
 | -t, --test | Test the server conf and then exit (WIP) | false |
-| -c, --conf | The path to the configuarion file | empty string |
+| -c, --conf | The path to the configuration file | empty string |
 | -u, --upgrade | This server should gracefully upgrade a running server | false |
 
 ## Stop
