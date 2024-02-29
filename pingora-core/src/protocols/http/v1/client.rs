@@ -293,7 +293,7 @@ impl HttpSession {
                         InvalidHTTPHeader,
                         format!("buf: {:?}", String::from_utf8_lossy(&buf)),
                         e,
-                    )
+                    );
                 }
             }
         }
@@ -430,8 +430,29 @@ impl HttpSession {
 
     // `Keep-Alive: timeout=5, max=1000` => 5, 1000
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        // TODO: implement this parsing
-        (None, None)
+        if let Some(keep_alive_header) = self.get_header("Keep-Alive") {
+            let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
+                return (None, None);
+            };
+
+            let mut timeout = None;
+            let mut max = None;
+
+            for param in header_value.split(',') {
+                let parts: Vec<&str> = param.split('=').map(|s| s.trim()).collect();
+                match &parts.as_slice() {
+                    ["timeout", timeout_value] => {
+                        timeout = timeout_value.trim().parse::<u64>().ok()
+                    }
+                    ["max", max_value] => max = max_value.trim().parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+
+            (timeout, max)
+        } else {
+            (None, None)
+        }
     }
 
     /// Close the connection abruptly. This allows to signal the server that the connection is closed
@@ -1080,6 +1101,65 @@ mod tests_stream {
                 .await
                 .keepalive_timeout,
             KeepaliveStatus::Off
+        );
+
+        async fn build_resp_with_keepalive_values(keep_alive: &str) -> HttpSession {
+            let input = format!("HTTP/1.1 200 OK\r\nKeep-Alive: {keep_alive}\r\n\r\n");
+            let mock_io = Builder::new().read(input.as_bytes()).build();
+            let mut http_stream = HttpSession::new(Box::new(mock_io));
+            let res = http_stream.read_response().await;
+            assert_eq!(input.len(), res.unwrap());
+            http_stream.respect_keepalive();
+            http_stream
+        }
+
+        assert_eq!(
+            build_resp_with_keepalive_values("timeout=5, max=1000")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("max=1000, timeout=5")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values(" timeout = 5, max = 1000 ")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("timeout=5")
+                .await
+                .get_keepalive_values(),
+            (Some(5), None)
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("max=1000")
+                .await
+                .get_keepalive_values(),
+            (None, Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("a=b")
+                .await
+                .get_keepalive_values(),
+            (None, None)
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("")
+                .await
+                .get_keepalive_values(),
+            (None, None)
         );
     }
 
