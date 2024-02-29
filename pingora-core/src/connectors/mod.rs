@@ -209,7 +209,7 @@ impl TransportConnector {
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
     ///
-    /// Not all TCP/TLS connection can be reused. It is the caller's responsibility to make sure
+    /// Not all TCP/TLS connections can be reused. It is the caller's responsibility to make sure
     /// that protocol over the [Stream] supports connection reuse and the [Stream] itself is ready
     /// to be reused.
     ///
@@ -263,7 +263,7 @@ impl TransportConnector {
 }
 
 // Perform the actual L4 and tls connection steps while respecting the peer's
-// connection timeout if there one
+// connection timeout if their one
 async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<SocketAddr>,

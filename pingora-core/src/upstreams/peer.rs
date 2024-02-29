@@ -64,7 +64,7 @@ pub trait Peer: Display + Clone {
     fn sni(&self) -> &str;
     /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
-    /// The connection to two peers are considered reusable to each other if their reuse hashes are
+    /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
     fn reuse_hash(&self) -> u64;
     /// Get the proxy setting to connect to the remote server
@@ -119,7 +119,7 @@ pub trait Peer: Display + Clone {
             None => None,
         }
     }
-    /// How long the overall connection establishment should take before  a timeout error is returned.
+    /// How long the overall connection establishment should take before a timeout error is returned.
     fn total_connection_timeout(&self) -> Option<Duration> {
         match self.get_peer_options() {
             Some(opt) => opt.total_connection_timeout,

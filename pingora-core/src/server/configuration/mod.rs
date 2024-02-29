@@ -96,7 +96,7 @@ impl Default for ServerConf {
 #[derive(StructOpt, Debug)]
 #[structopt(name = "basic")]
 pub struct Opt {
-    /// Whether this server should try to upgrade from an running old server
+    /// Whether this server should try to upgrade from a running old server
     ///
     /// `-u` or `--upgrade` can be used
     #[structopt(short, long)]

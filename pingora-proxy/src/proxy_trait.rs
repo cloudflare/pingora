@@ -46,7 +46,7 @@ pub trait ProxyHttp {
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
     /// return a response for this request.
     ///
-    /// If the user already sent a response to this request, a `Ok(true)` should be returned so that
+    /// If the user already sent a response to this request, an `Ok(true)` should be returned so that
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
@@ -358,7 +358,7 @@ pub trait ProxyHttp {
     /// Whether the request should be used to invalidate(delete) the HTTP cache
     ///
     /// - `true`: this request will be used to invalidate the cache.
-    /// - `false`: this request is a treated as an normal request
+    /// - `false`: this request is treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }
