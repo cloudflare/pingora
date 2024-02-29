@@ -28,7 +28,7 @@ pub struct CacheLock {
     timeout: Duration, // fixed timeout value for now
 }
 
-/// A struct prepresenting a locked cache access
+/// A struct representing a locked cache access
 #[derive(Debug)]
 pub enum Locked {
     /// The writer is allowed to fetch the asset
