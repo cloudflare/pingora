@@ -316,7 +316,7 @@ pub(crate) struct CacheMetaInner {
     pub(crate) internal: InternalMeta,
     pub(crate) header: ResponseHeader,
     /// An opaque type map to hold extra information for communication between cache backends
-    /// and users. This field is **not** garanteed be persistently stored in the cache backend.
+    /// and users. This field is **not** guaranteed be persistently stored in the cache backend.
     pub extensions: Extensions,
 }
 

@@ -340,7 +340,7 @@ impl HttpCache {
     /// Enable the cache
     ///
     /// - `storage`: the cache storage backend that implements [storage::Storage]
-    /// - `eviction`: optionally the eviction mananger, without it, nothing will be evicted from the storage
+    /// - `eviction`: optionally the eviction manager, without it, nothing will be evicted from the storage
     /// - `predictor`: optionally a cache predictor. The cache predictor predicts whether something is likely
     /// to be cacheable or not. This is useful because the proxy can apply different types of optimization to
     /// cacheable and uncacheable requests.

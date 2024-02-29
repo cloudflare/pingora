@@ -231,7 +231,7 @@ impl Session {
     /// Send error response to client
     pub async fn respond_error(&mut self, error: u16) {
         let resp = match error {
-            /* commmon error responses are pre-generated */
+            /* common error responses are pre-generated */
             502 => error_resp::HTTP_502_RESPONSE.clone(),
             400 => error_resp::HTTP_400_RESPONSE.clone(),
             _ => error_resp::gen_error_response(error),
