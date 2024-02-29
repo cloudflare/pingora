@@ -44,8 +44,8 @@ pub trait ServeHttp {
 // TODO: remove this in favor of HttpServer?
 #[cfg_attr(not(doc_async_trait), async_trait)]
 impl<SV> HttpServerApp for SV
-where
-    SV: ServeHttp + Send + Sync,
+    where
+        SV: ServeHttp + Send + Sync,
 {
     async fn process_new_http(
         self: &Arc<Self>,
@@ -82,8 +82,8 @@ where
             }
             Err(e) => {
                 error!(
-                    "HTTP server fails to write to downstream: {e}, {}",
-                    http.request_summary()
+                    "HTTP server fails to write to downstream: {e}, {:?}",
+                    http
                 );
             }
         }
@@ -92,8 +92,8 @@ where
             match http.write_response_body(body.into()).await {
                 Ok(_) => debug!("HTTP response written."),
                 Err(e) => error!(
-                    "HTTP server fails to write to downstream: {e}, {}",
-                    http.request_summary()
+                    "HTTP server fails to write to downstream: {e}, {:?}",
+                    http
                 ),
             }
         }
@@ -130,8 +130,8 @@ impl<SV> HttpServer<SV> {
 
 #[cfg_attr(not(doc_async_trait), async_trait)]
 impl<SV> HttpServerApp for HttpServer<SV>
-where
-    SV: ServeHttp + Send + Sync,
+    where
+        SV: ServeHttp + Send + Sync,
 {
     async fn process_new_http(
         self: &Arc<Self>,
@@ -176,8 +176,8 @@ where
             }
             Err(e) => {
                 error!(
-                    "HTTP server fails to write to downstream: {e}, {}",
-                    http.request_summary()
+                    "HTTP server fails to write to downstream: {e}, {:?}",
+                    http
                 );
             }
         }
@@ -195,8 +195,8 @@ where
         match http.response_duplex_vec(vec![task]).await {
             Ok(_) => debug!("HTTP response written."),
             Err(e) => error!(
-                "HTTP server fails to write to downstream: {e}, {}",
-                http.request_summary()
+                "HTTP server fails to write to downstream: {e}, {:?}",
+                http
             ),
         }
         match http.finish().await {

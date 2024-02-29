@@ -174,15 +174,6 @@ impl Session {
         }
     }
 
-    /// Return a digest of the request including the method, path and Host header
-    // TODO: make this use a `Formatter`
-    pub fn request_summary(&self) -> String {
-        match self {
-            Self::H1(s) => s.request_summary(),
-            Self::H2(s) => s.request_summary(),
-        }
-    }
-
     /// Return the written response header. `None` if it is not written yet.
     /// Only the final (status code >= 200 or 101) response header will be returned
     pub fn response_written(&self) -> Option<&ResponseHeader> {
@@ -328,6 +319,15 @@ impl Session {
         match self {
             Self::H1(s) => s.body_bytes_sent(),
             Self::H2(s) => s.body_bytes_sent(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Session::H1(s) => write!(f, "{:?}", s),
+            Session::H2(s) => write!(f, "{:?}", s),
         }
     }
 }

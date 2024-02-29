@@ -51,8 +51,8 @@ pub trait ProxyHttp {
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
     async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(false)
     }
@@ -93,8 +93,8 @@ pub trait ProxyHttp {
         _ctx: &mut Self::CTX,
         _req: &RequestHeader,
     ) -> Result<bool>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(false)
     }
@@ -111,8 +111,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<bool>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(true)
     }
@@ -150,8 +150,8 @@ pub trait ProxyHttp {
         _upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(())
     }
@@ -166,8 +166,7 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) {
-    }
+    ) {}
 
     /// Modify the response header before it is send to the downstream
     ///
@@ -179,8 +178,8 @@ pub trait ProxyHttp {
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(())
     }
@@ -195,8 +194,7 @@ pub trait ProxyHttp {
         _body: &Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) {
-    }
+    ) {}
 
     /// Similar to [Self::response_filter()] but for response body chunks
     fn response_body_filter(
@@ -205,8 +203,8 @@ pub trait ProxyHttp {
         _body: &Option<Bytes>,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(None)
     }
@@ -218,8 +216,8 @@ pub trait ProxyHttp {
         _upstream_trailers: &mut header::HeaderMap,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<Bytes>>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(None)
     }
@@ -230,10 +228,9 @@ pub trait ProxyHttp {
     /// An error log is already emitted if there is any error. This phase is used for collecting
     /// metrics and sending access logs.
     async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX)
-    where
-        Self::CTX: Send + Sync,
-    {
-    }
+        where
+            Self::CTX: Send + Sync,
+    {}
 
     /// A value of true means that the log message will be suppressed. The default value is false.
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
@@ -281,8 +278,8 @@ pub trait ProxyHttp {
     ///
     /// The response status code of the error response maybe returned for logging purpose.
     async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> u16
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         let server_session = session.as_mut();
         let code = match e.etype() {
@@ -342,8 +339,8 @@ pub trait ProxyHttp {
         _digest: Option<&Digest>,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
+        where
+            Self::CTX: Send + Sync,
     {
         Ok(())
     }
@@ -352,7 +349,7 @@ pub trait ProxyHttp {
     ///
     /// Users can define what is the important to be written about this request via the returned string.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
-        session.as_ref().request_summary()
+        format!("{:?}", session.as_ref())
     }
 
     /// Whether the request should be used to invalidate(delete) the HTTP cache

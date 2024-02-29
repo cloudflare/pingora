@@ -292,16 +292,6 @@ impl HttpSession {
             .map_or(b"", |h| h.as_bytes())
     }
 
-    /// Return a string `$METHOD $PATH $HOST`. Mostly for logging and debug purpose
-    pub fn request_summary(&self) -> String {
-        format!(
-            "{} {}, Host: {}",
-            self.get_method().map_or("-", |r| r.as_str()),
-            String::from_utf8_lossy(self.get_path()),
-            String::from_utf8_lossy(self.get_host())
-        )
-    }
-
     /// Is the request a upgrade request
     pub fn is_upgrade_req(&self) -> bool {
         match self.request_header.as_deref() {
@@ -977,6 +967,18 @@ fn http_resp_header_to_buf(
 
     buf.put_slice(CRLF);
     Ok(())
+}
+
+impl std::fmt::Debug for HttpSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}, Host: {}",
+            self.get_method().map_or("-", |r| r.as_str()),
+            String::from_utf8_lossy(self.get_path()),
+            String::from_utf8_lossy(self.get_host())
+        )
+    }
 }
 
 #[cfg(test)]

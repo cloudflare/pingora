@@ -60,6 +60,7 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 use futures::task::Context;
 use futures::task::Poll;
 use std::pin::Pin;
+
 /// The future to poll for an idle session.
 ///
 /// Calling `.await` in this object will not return until the client decides to close this stream.
@@ -74,7 +75,7 @@ impl<'a> Future for Idle<'a> {
         } else {
             self.0.send_response.poll_reset(cx)
         }
-        .map_err(|e| Error::because(ErrorType::H2Error, "downstream error while idling", e))
+            .map_err(|e| Error::because(ErrorType::H2Error, "downstream error while idling", e))
     }
 }
 
@@ -306,20 +307,6 @@ impl HttpSession {
         Ok(end_stream)
     }
 
-    /// Return a string `$METHOD $PATH $HOST`. Mostly for logging and debug purpose
-    pub fn request_summary(&self) -> String {
-        format!(
-            "{} {}, Host: {}",
-            self.request_header.method,
-            self.request_header.uri,
-            self.request_header
-                .headers
-                .get(header::HOST)
-                .map(|v| String::from_utf8_lossy(v.as_bytes()))
-                .unwrap_or_default()
-        )
-    }
-
     /// Return the written response header. `None` if it is not written yet.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
@@ -350,11 +337,11 @@ impl HttpSession {
     pub fn is_body_empty(&self) -> bool {
         self.body_read == 0
             && (self.is_body_done()
-                || self
-                    .request_header
-                    .headers
-                    .get(header::CONTENT_LENGTH)
-                    .map_or(false, |cl| cl.as_bytes() == b"0"))
+            || self
+            .request_header
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .map_or(false, |cl| cl.as_bytes() == b"0"))
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {
@@ -404,6 +391,21 @@ impl HttpSession {
     /// How many response body bytes sent to the client
     pub fn body_bytes_sent(&self) -> usize {
         self.body_sent
+    }
+}
+
+impl std::fmt::Debug for HttpSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+               "{} {}, Host: {}",
+               self.request_header.method,
+               self.request_header.uri,
+               self.request_header
+                   .headers
+                   .get(header::HOST)
+                   .map(|v| String::from_utf8_lossy(v.as_bytes()))
+                   .unwrap_or_default()
+        )
     }
 }
 
