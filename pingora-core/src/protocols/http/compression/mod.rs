@@ -322,7 +322,7 @@ enum Action {
     Decompress(Algorithm),
 }
 
-// parse Accpet-Encoding header and put it to the list
+// parse Accept-Encoding header and put it to the list
 fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut Vec<Algorithm>) {
     // https://www.rfc-editor.org/rfc/rfc9110#name-accept-encoding
     if let Some(ac) = accept_encoding {
@@ -400,7 +400,7 @@ fn decide_action(resp: &ResponseHeader, accept_encoding: &[Algorithm]) -> Action
             Some(Algorithm::Other)
         }
     } else {
-        // no Accpet-encoding
+        // no Accept-encoding
         None
     };
 
