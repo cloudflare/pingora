@@ -594,7 +594,7 @@ where
         };
 
         if *shutdown.borrow() {
-            // stop downstream downstream from reusing if this service is shutting down soon
+            // stop downstream from reusing if this service is shutting down soon
             session.set_keepalive(None);
         } else {
             // default 60s
