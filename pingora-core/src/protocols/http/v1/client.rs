@@ -926,7 +926,7 @@ mod tests_stream {
     }
 
     // Note: in debug mode, due to from_maybe_shared_unchecked() still tries to validate headers
-    // values, so the code has to replace CRLF with whitespaces. In release mode, the CRLF is
+    // values, so the code has to replace CRLF with whitespace. In release mode, the CRLF is
     // reserved
     #[tokio::test]
     async fn read_obsolete_multiline_headers() {
