@@ -66,9 +66,3 @@ jobs:
 
       - name: Run cargo audit
         uses: actions-rust-lang/audit@v1
-
-      - name: Run cargo doc
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --no-deps --all-features --document-private-items
