@@ -1,0 +1,64 @@
+[package]
+name = "pingora-cache"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "http", "cache"]
+description = """
+HTTP caching APIs for Pingora proxy.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_cache"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-error = { version = "0.1.0", path = "../pingora-error" }
+pingora-header-serde = { version = "0.1.0", path = "../pingora-header-serde" }
+pingora-http = { version = "0.1.0", path = "../pingora-http" }
+pingora-lru = { version = "0.1.0", path = "../pingora-lru" }
+pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
+http = { workspace = true }
+indexmap = "1"
+once_cell = { workspace = true }
+regex = "1"
+blake2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+rmp-serde = "1"
+bytes = { workspace = true }
+httpdate = "1.0.2"
+log = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = "0.12"
+rustracing = "0.5.1"
+rustracing_jaeger = "0.7"
+rmp = "0.8"
+tokio = { workspace = true }
+lru = { workspace = true }
+ahash = { workspace = true }
+hex = "0.4"
+httparse = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio = { workspace = true, features = ["fs"] }
+env_logger = "0.9"
+dhat = "0"
+futures = "0.3"
+
+[[bench]]
+name = "simple_lru_memory"
+harness = false
+
+[[bench]]
+name = "lru_memory"
+harness = false
+
+[[bench]]
+name = "lru_serde"
+harness = false

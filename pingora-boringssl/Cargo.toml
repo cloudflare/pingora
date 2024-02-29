@@ -1,0 +1,36 @@
+[package]
+name = "pingora-boringssl"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "tls", "ssl", "pingora"]
+description = """
+BoringSSL async APIs for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_boringssl"
+path = "src/lib.rs"
+
+[dependencies]
+boring = { version = "4.5", features = ["pq-experimental"] }
+boring-sys = "4.5"
+futures-util = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["io-util", "net", "macros", "rt-multi-thread"] }
+libc = "0.2.70"
+foreign-types-shared = { version = "0.3" }
+
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio = { workspace = true, features = ["full"] }
+
+[features]
+default = []
+pq_use_second_keyshare = []
+# waiting for boring-rs release
+read_uninit = []

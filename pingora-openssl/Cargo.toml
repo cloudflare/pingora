@@ -1,0 +1,29 @@
+[package]
+name = "pingora-openssl"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "tls", "ssl", "pingora"]
+description = """
+OpenSSL async APIs for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_openssl"
+path = "src/lib.rs"
+
+[dependencies]
+openssl-sys = "0.9"
+openssl = { version = "0.10", features = ["vendored"] }
+openssl-src = { version = "300", features = ["weak-crypto"] }
+tokio-openssl = { version = "0.6" }
+libc = "0.2.70"
+foreign-types = { version = "0.3"}
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio = { workspace = true, features = ["full"] }

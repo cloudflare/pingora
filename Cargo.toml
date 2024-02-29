@@ -1,4 +1,37 @@
 [workspace]
+resolver = "2"
 members = [
+    "pingora",
+    "pingora-core",
+    "pingora-pool",
+    "pingora-error",
     "pingora-limits",
+    "pingora-timeout",
+    "pingora-header-serde",
+    "pingora-proxy",
+    "pingora-cache",
+    "pingora-http",
+    "pingora-lru",
+    "pingora-openssl",
+    "pingora-boringssl",
+    "pingora-runtime",
+    "pingora-ketama",
+    "pingora-load-balancing",
+    "pingora-memory-cache",
+    "tinyufo",
 ]
+
+[workspace.dependencies]
+tokio = "1"
+async-trait = "0.1.42"
+httparse = "1"
+bytes = "1.0"
+http = "1.0.0"
+log = "0.4"
+h2 = ">=0.4.2"
+once_cell = "1"
+lru = "0"
+ahash = ">=0.8.9"
+
+[profile.bench]
+debug = true

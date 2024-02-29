@@ -1,0 +1,15 @@
+HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 22 Dec 2021 12:29:00 GMT
+Content-Type: application/javascript
+Last-Modified: Mon, 09 Sep 2019 07:47:37 GMT
+Transfer-Encoding: chunked
+Connection: keep-alive
+Vary: Accept-Encoding
+ETag: W/"5d760399-52868"
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Credentials: true
+Access-Control-Expose-Headers: Content-Length,Content-Range
+Access-Control-Allow-Headers: Range
+Content-Encoding: gzip
+

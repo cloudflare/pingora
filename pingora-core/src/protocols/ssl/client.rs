@@ -1,0 +1,78 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! TLS client specific implementation
+
+use super::SslStream;
+use crate::protocols::raw_connect::ProxyDigest;
+use crate::protocols::{GetProxyDigest, GetTimingDigest, TimingDigest, IO};
+use crate::tls::{
+    ssl,
+    ssl::ConnectConfiguration,
+    ssl_sys::{X509_V_ERR_INVALID_CALL, X509_V_OK},
+};
+
+use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use std::sync::Arc;
+
+/// Perform the TLS handshake for the given connection with the given configuration
+pub async fn handshake<S: IO>(
+    conn_config: ConnectConfiguration,
+    domain: &str,
+    io: S,
+) -> Result<SslStream<S>> {
+    let ssl = conn_config
+        .into_ssl(domain)
+        .explain_err(TLSHandshakeFailure, |e| format!("ssl config error: {e}"))?;
+    let mut stream = SslStream::new(ssl, io)
+        .explain_err(TLSHandshakeFailure, |e| format!("ssl stream error: {e}"))?;
+    let handshake_result = stream.connect().await;
+    match handshake_result {
+        Ok(()) => Ok(stream),
+        Err(e) => {
+            let context = format!("TLS connect() failed: {e}, SNI: {domain}");
+            match e.code() {
+                ssl::ErrorCode::SSL => match stream.ssl().verify_result().as_raw() {
+                    // X509_V_ERR_INVALID_CALL in case verify result was never set
+                    X509_V_OK | X509_V_ERR_INVALID_CALL => {
+                        Error::e_explain(TLSHandshakeFailure, context)
+                    }
+                    _ => Error::e_explain(InvalidCert, context),
+                },
+                /* likely network error, but still mark as TLS error */
+                _ => Error::e_explain(TLSHandshakeFailure, context),
+            }
+        }
+    }
+}
+
+impl<S> GetTimingDigest for SslStream<S>
+where
+    S: GetTimingDigest,
+{
+    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+        let mut ts_vec = self.get_ref().get_timing_digest();
+        ts_vec.push(Some(self.timing.clone()));
+        ts_vec
+    }
+}
+
+impl<S> GetProxyDigest for SslStream<S>
+where
+    S: GetProxyDigest,
+{
+    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+        self.get_ref().get_proxy_digest()
+    }
+}

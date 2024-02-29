@@ -1,0 +1,49 @@
+[package]
+name = "pingora-proxy"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "http", "proxy", "pingora"]
+exclude = ["tests/*"]
+description = """
+Pingora HTTP proxy APIs and traits.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-error = { version = "0.1.0", path = "../pingora-error" }
+pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
+pingora-cache = { version = "0.1.0", path = "../pingora-cache" }
+tokio = { workspace = true, features = ["macros", "net"] }
+pingora-http = { version = "0.1.0", path = "../pingora-http" }
+http = { workspace = true }
+futures = "0.3"
+bytes = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+h2 = { workspace = true }
+once_cell = { workspace = true }
+structopt = "0.3"
+regex = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = [
+    "gzip",
+    "rustls",
+], default-features = false }
+tokio-test = "0.4"
+env_logger = "0.9"
+hyperlocal = "0.8"
+hyper = "0.14"
+tokio-tungstenite = "0.20.1"
+pingora-load-balancing = { version = "0.1.0", path = "../pingora-load-balancing" }
+prometheus = "0"
+futures-util = "0.3"

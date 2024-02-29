@@ -1,0 +1,81 @@
+[package]
+name = "pingora-core"
+version = "0.1.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "http", "network", "pingora"]
+exclude = ["tests/*"]
+description = """
+Pingora's APIs and traits for the core network protocols.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "pingora_core"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-runtime = { version = "0.1.0", path = "../pingora-runtime" }
+pingora-openssl = { version = "0.1.0", path = "../pingora-openssl", optional = true }
+pingora-boringssl = { version = "0.1.0", path = "../pingora-boringssl", optional = true }
+pingora-pool = { version = "0.1.0", path = "../pingora-pool" }
+pingora-error = { version = "0.1.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
+pingora-http = { version = "0.1.0", path = "../pingora-http" }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+futures = "0.3"
+async-trait = { workspace = true }
+httparse = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+h2 = { workspace = true }
+lru = { workspace = true }
+nix = "0.24"
+structopt = "0.3"
+once_cell = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.8"
+libc = "0.2.70"
+chrono = { version = "0.4", features = ["alloc"], default-features = false }
+thread_local = "1.0"
+prometheus = "0.13"
+daemonize = "0.5.0"
+sentry = { version = "0.26", features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
+], default-features = false }
+regex = "1"
+percent-encoding = "2.1"
+parking_lot = "0.12"
+socket2 = { version = "0", features = ["all"] }
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+sfv = "0"
+rand = "0.8"
+ahash = { workspace = true }
+unicase = "2"
+brotli = "3"
+openssl-probe = "0.1"
+tokio-test = "0.4"
+zstd = "0"
+
+[dev-dependencies]
+matches = "0.1"
+env_logger = "0.9"
+reqwest = { version = "0.11", features = ["rustls"], default-features = false }
+hyperlocal = "0.8"
+hyper = "0.14"
+jemallocator = "0.5"
+
+[features]
+default = ["openssl"]
+openssl = ["pingora-openssl"]
+boringssl = ["pingora-boringssl"]
+patched_http1 = []
