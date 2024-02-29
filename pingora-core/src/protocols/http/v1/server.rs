@@ -609,6 +609,11 @@ impl HttpSession {
         Ok(res)
     }
 
+    /// Return how many request header and body bytes that have been read
+    pub fn request_length(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Return how many (application, not wire) body bytes that have been written
     pub fn body_bytes_sent(&self) -> usize {
         self.body_bytes_sent
