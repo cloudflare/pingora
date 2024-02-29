@@ -220,7 +220,7 @@ impl<SV> HttpProxy<SV> {
                 }
                 Err(e) => {
                     // Allow cache miss to fill cache even if cache lookup errors
-                    // this is mostly to suppport backward incompatible metadata update
+                    // this is mostly to support backward incompatible metadata update
                     // TODO: check error types
                     // session.cache.disable();
                     self.inner.cache_miss(session, ctx);
