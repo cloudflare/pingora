@@ -487,7 +487,7 @@ mod parse_response {
             return ParseState::Done(0);
         }
         if let Some(encoding) = resp.headers.get(http::header::TRANSFER_ENCODING) {
-            // TODO: case sensitive?
+            // TODO: case-sensitive?
             if encoding.as_bytes() == b"chunked" {
                 return ParseState::PartialChunkedBody(0);
             }
