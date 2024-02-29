@@ -582,7 +582,7 @@ fn test_adjust_response_header() {
         header.headers.get("content-length").unwrap().as_bytes(),
         b"20"
     );
-    assert!(header.headers.get("transfor-encoding").is_none());
+    assert!(header.headers.get("transfer-encoding").is_none());
 
     // decompress gzip
     let mut header = ResponseHeader::build(200, None).unwrap();
