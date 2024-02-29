@@ -21,7 +21,12 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt update
-          sudo apt install -y cmake libclang-dev
+          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends
+          # openresty is used for convenience in tests as a server.
+          wget -O - https://openresty.org/package/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openresty.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/openresty.list > /dev/null
+          sudo apt update
+          sudo apt install -y openresty --no-install-recommends
 
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
