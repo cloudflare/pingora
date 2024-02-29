@@ -151,7 +151,7 @@ impl PartialHit {
             };
             assert!(bytes_end >= self.bytes_read);
 
-            // more data avaliable to read
+            // more data available to read
             if bytes_end > self.bytes_read {
                 let new_bytes =
                     Bytes::copy_from_slice(&self.body.read()[self.bytes_read..bytes_end]);
