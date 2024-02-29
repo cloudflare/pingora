@@ -187,7 +187,7 @@ fn main() {
 }
 ```
 
-Now if we run our loud balancer again with `cargo run`, and test it with 
+Now if we run our load balancer again with `cargo run`, and test it with 
 
 ```
 curl 127.0.0.1:6188 -svo /dev/null
