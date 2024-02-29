@@ -567,7 +567,7 @@ use pingora_header_serde::HeaderSerde;
 use std::fs::File;
 use std::io::Read;
 
-/* load header compression engine and its' dictionary globally */
+/* load header compression engine and its dictionary globally */
 pub(crate) static COMPRESSION_DICT_PATH: OnceCell<String> = OnceCell::new();
 
 fn load_file(path: &String) -> Option<Vec<u8>> {
