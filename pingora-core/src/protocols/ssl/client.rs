@@ -43,13 +43,30 @@ pub async fn handshake<S: IO>(
         Err(e) => {
             let context = format!("TLS connect() failed: {e}, SNI: {domain}");
             match e.code() {
-                ssl::ErrorCode::SSL => match stream.ssl().verify_result().as_raw() {
-                    // X509_V_ERR_INVALID_CALL in case verify result was never set
-                    X509_V_OK | X509_V_ERR_INVALID_CALL => {
-                        Error::e_explain(TLSHandshakeFailure, context)
+                ssl::ErrorCode::SSL => {
+                    #[cfg(not(feature = "boringssl"))]
+                    match stream.ssl().verify_result().as_raw() {
+                        // X509_V_ERR_INVALID_CALL in case verify result was never set
+                        X509_V_OK | X509_V_ERR_INVALID_CALL => {
+                            Error::e_explain(TLSHandshakeFailure, context)
+                        }
+                        _ => Error::e_explain(InvalidCert, context),
                     }
-                    _ => Error::e_explain(InvalidCert, context),
-                },
+
+                    #[cfg(feature = "boringssl")]
+                    match stream.ssl().verify_result() {
+                        Ok(()) => Error::e_explain(TLSHandshakeFailure, context),
+                        Err(e) => {
+                            match e.as_raw() {
+                                // X509_V_ERR_INVALID_CALL in case verify result was never set
+                                X509_V_OK | X509_V_ERR_INVALID_CALL => {
+                                    Error::e_explain(TLSHandshakeFailure, context)
+                                }
+                                _ => Error::e_explain(InvalidCert, context),
+                            }
+                        }
+                    }
+                }
                 /* likely network error, but still mark as TLS error */
                 _ => Error::e_explain(TLSHandshakeFailure, context),
             }
