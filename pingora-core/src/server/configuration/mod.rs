@@ -90,7 +90,7 @@ impl Default for ServerConf {
     }
 }
 
-/// Commandline options
+/// Command-line options
 ///
 /// Call `Opt::from_args()` to build this object from the process's command line arguments.
 #[derive(StructOpt, Debug)]
