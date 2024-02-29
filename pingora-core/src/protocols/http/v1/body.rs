@@ -312,7 +312,7 @@ impl BodyReader {
                 } else {
                     if expecting_from_io > 0 {
                         trace!(
-                            "partial chunk playload, expecting_from_io: {}, \
+                            "partial chunk payload, expecting_from_io: {}, \
                                 existing_buf_end {}, buf: {:?}",
                             expecting_from_io,
                             existing_buf_end,
