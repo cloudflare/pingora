@@ -212,7 +212,7 @@ pub fn get_tcp_info(_fd: RawFd) -> io::Result<TCP_INFO> {
 }
 
 /*
- * this extention is needed until the following are addressed
+ * this extension is needed until the following are addressed
  * https://github.com/tokio-rs/tokio/issues/1543
  * https://github.com/tokio-rs/mio/issues/1257
  * https://github.com/tokio-rs/mio/issues/1211
