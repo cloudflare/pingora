@@ -38,7 +38,7 @@ API docs are also available for all the crates.
 * Pingora-openssl & pingora-boringssl: SSL related extensions and APIs
 * Pingora-ketama: the [Ketama](https://github.com/RJ/ketama) consistent algorithm
 * Pingora-limits: efficient counting algorithms
-* Pingora-load-balancing: load balancing algorithm extensions for Pingora-proxy
+* Pingora-load-balancing: load balancing algorithm extensions for pingora-proxy
 * Pingora-memory-cache: Async in-memory caching with cache lock to prevent cache stampede
 * Pingora-timeout: A more efficient async timer system
 * TinyUfo: The caching algorithm behind pingora-memory-cache
