@@ -257,7 +257,7 @@ enum Algorithm {
     Zstd,
     // TODO: Identify,
     // TODO: Deflate
-    Other, // anyting unknown
+    Other, // anything unknown
 }
 
 impl Algorithm {
