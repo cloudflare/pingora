@@ -20,7 +20,7 @@ use pingora_cache::{
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
-/// paticular stage (if applicable).
+/// particular stage (if applicable).
 ///
 /// If any of the filters returns [Result::Err], the request will fail and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
