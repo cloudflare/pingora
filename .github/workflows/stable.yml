@@ -1,9 +1,13 @@
 on: [push, pull_request]
 
-name: Stable
+name: build
 
 jobs:
   pingora:
+    strategy:
+      matrix:
+        toolchain: [nightly, stable]
+        profile: [minimal, default]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -22,8 +26,9 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
-          components: rustfmt, clippy,
+          toolchain: ${{ matrix.toolchain }}
+          profile: ${{ matrix.profile }}
+          components: rustfmt, clippy
           override: true
           default: true
 
