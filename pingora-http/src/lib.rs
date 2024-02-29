@@ -53,7 +53,7 @@ HMap({
 The order how HeaderMap iter over its items is "arbitrary, but consistent".
 Hopefully this property makes sure this map of header names always iterates in the
 same order of the map of header values.
-This idea is inspaired by hyper @nox
+This idea is inspired by hyper @nox
 */
 type CaseMap = HMap<CaseHeaderName>;
 
