@@ -34,7 +34,7 @@
 //! # Usage
 //! This crate provides low level service and protocol implementation and abstraction.
 //!
-//! If looking to build a (reverse) proxy, see `pingora-proxy` crate.
+//! If looking to build a (reverse) proxy, see [`pingora-proxy`](https://docs.rs/pingora-proxy) crate.
 //!
 //! # Optional features
 //! `boringssl`: Switch the internal TLS library from OpenSSL to BoringSSL.

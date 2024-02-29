@@ -54,7 +54,7 @@
 //! We've provided a health-aware example in
 //! `pingora-ketama/examples/health_aware_selector.rs`.
 //!
-//! For a carefully crafted real-world example, see the pingora-load-balancer
+//! For a carefully crafted real-world example, see the [`pingora-load-balancing`](https://docs.rs/pingora-load-balancing)
 //! crate.
 
 use std::cmp::Ordering;
