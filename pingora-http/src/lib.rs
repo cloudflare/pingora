@@ -170,7 +170,7 @@ impl RequestHeader {
     /// Insert the header name and value to `self`.
     ///
     /// Different from [Self::append_header()], this method will replace all other existing headers
-    /// under the same name (case insensitive).
+    /// under the same name (case-insensitive).
     pub fn insert_header(
         &mut self,
         name: impl IntoCaseHeaderName,
@@ -399,7 +399,7 @@ impl ResponseHeader {
     /// Insert the header name and value to `self`.
     ///
     /// Different from [Self::append_header()], this method will replace all other existing headers
-    /// under the same name (case insensitive).
+    /// under the same name (case-insensitive).
     pub fn insert_header(
         &mut self,
         name: impl IntoCaseHeaderName,

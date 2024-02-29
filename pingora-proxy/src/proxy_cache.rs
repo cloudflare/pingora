@@ -726,7 +726,7 @@ pub(crate) mod range_filter {
 
         // single byte range only for now
         // https://datatracker.ietf.org/doc/html/rfc7233#section-2.1
-        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case insensitive
+        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case-insensitive
         static RE_SINGLE_RANGE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"(?i)bytes=(?P<start>\d*)-(?P<end>\d*)").unwrap());
 
