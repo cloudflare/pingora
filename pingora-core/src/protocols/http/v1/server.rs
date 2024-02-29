@@ -772,7 +772,7 @@ impl HttpSession {
     /// It has no response body.
     pub async fn respond_error(&mut self, error_status_code: u16) {
         let (resp, resp_tmp) = match error_status_code {
-            /* commmon error responses are pre-generated */
+            /* common error responses are pre-generated */
             502 => (Some(&*error_resp::HTTP_502_RESPONSE), None),
             400 => (Some(&*error_resp::HTTP_400_RESPONSE), None),
             _ => (
