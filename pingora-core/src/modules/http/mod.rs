@@ -86,7 +86,7 @@ impl HttpModules {
     ///
     /// Each type of [HttpModule] can be only added once.
     /// # Panic
-    /// Panic if any [HttpModule] is added more tha once.
+    /// Panic if any [HttpModule] is added more than once.
     pub fn add_module(&mut self, builder: ModuleBuilder) {
         if self.module_index.get().is_some() {
             // We use a shared module_index the index would be out of sync if we
