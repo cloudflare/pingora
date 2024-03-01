@@ -1,6 +1,6 @@
 # Graceful restart and shutdown
 
-Graceful restart, upgrade, and shutdown mechanisms are very commonly used to avoid errors or downtime when releasing new versions of pingora servers.
+Graceful restart, upgrade, and shutdown mechanisms are very commonly used to avoid errors or downtime when releasing new versions of Pingora servers.
 
 Pingora graceful upgrade mechanism guarantees the following:
 * A request is guaranteed to be handled either by the old server instance or the new one. No request will see connection refused when trying to connect to the server endpoints.
