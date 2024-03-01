@@ -39,7 +39,7 @@ nix = "0.24"
 structopt = "0.3"
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 libc = "0.2.70"
 chrono = { version = "0.4", features = ["alloc"], default-features = false }
 thread_local = "1.0"
