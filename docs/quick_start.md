@@ -187,7 +187,7 @@ fn main() {
 }
 ```
 
-Now if we run our loud balancer again with `cargo run`, and test it with 
+Now if we run our load balancer again with `cargo run`, and test it with 
 
 ```
 curl 127.0.0.1:6188 -svo /dev/null
@@ -297,7 +297,7 @@ Now you can find the pid of the service.
 ### Gracefully upgrade the service
 (Linux only)
 
-Let's say we changed the code of the load balancer, recompiled the binary. Now we want to upgrade the service running in the background to this newer version.
+Let's say we changed the code of the load balancer and recompiled the binary. Now we want to upgrade the service running in the background to this newer version.
 
 If we simply stop the old service, then start the new one, some request arriving in between could be lost. Fortunately, Pingora provides a graceful way to upgrade the service.
 

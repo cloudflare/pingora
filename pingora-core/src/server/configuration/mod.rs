@@ -90,13 +90,13 @@ impl Default for ServerConf {
     }
 }
 
-/// Commandline options
+/// Command-line options
 ///
 /// Call `Opt::from_args()` to build this object from the process's command line arguments.
 #[derive(StructOpt, Debug)]
 #[structopt(name = "basic")]
 pub struct Opt {
-    /// Whether this server should try to upgrade from an running old server
+    /// Whether this server should try to upgrade from a running old server
     ///
     /// `-u` or `--upgrade` can be used
     #[structopt(short, long)]

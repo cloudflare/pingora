@@ -35,7 +35,7 @@ impl CaseHeaderName {
     }
 }
 
-/// A trait that converts into case sensitive header names.
+/// A trait that converts into case-sensitive header names.
 pub trait IntoCaseHeaderName {
     fn into_case_header_name(self) -> CaseHeaderName;
 }

@@ -1,4 +1,4 @@
-# Starting and stoping Pingora server
+# Starting and stopping Pingora server
 
 A pingora server is a regular unprivileged multithreaded process.
 
@@ -11,7 +11,7 @@ A Pingora server by default takes the following command-line arguments:
 | ------------- |-------------| ----|
 | -d, --daemon | Daemonize the server | false |
 | -t, --test | Test the server conf and then exit (WIP) | false |
-| -c, --conf | The path to the configuarion file | empty string |
+| -c, --conf | The path to the configuration file | empty string |
 | -u, --upgrade | This server should gracefully upgrade a running server | false |
 
 ## Stop
@@ -24,4 +24,4 @@ Upon receiving SIGINT (ctrl + c), the server will exit immediately with no delay
 Upon receiving SIGTERM, the server will notify all its services to shutdown, wait for some preconfigured time and then exit. This behavior gives requests a grace period to finish.
 
 ### SIGQUIT: graceful upgrade
-Similar to SIGQUIT, but the server will also transfer all its listening sockets to a new Pingora server so that there is no downtime during the upgrade. See the [graceful upgrade](graceful.md) section for more details.
+Similar to SIGTERM, but the server will also transfer all its listening sockets to a new Pingora server so that there is no downtime during the upgrade. See the [graceful upgrade](graceful.md) section for more details.
