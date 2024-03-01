@@ -220,7 +220,7 @@ impl<SV> HttpProxy<SV> {
                 }
                 Err(e) => {
                     // Allow cache miss to fill cache even if cache lookup errors
-                    // this is mostly to suppport backward incompatible metadata update
+                    // this is mostly to support backward incompatible metadata update
                     // TODO: check error types
                     // session.cache.disable();
                     self.inner.cache_miss(session, ctx);
@@ -280,7 +280,7 @@ impl<SV> HttpProxy<SV> {
             Err(e) => {
                 // TODO: more logging and error handling
                 session.as_mut().respond_error(500).await;
-                // we have not write anything dirty to downstream, it is still reuseable
+                // we have not write anything dirty to downstream, it is still reusable
                 return (true, Some(e));
             }
         }
@@ -724,7 +724,7 @@ pub(crate) mod range_filter {
     use http::header::*;
     use std::ops::Range;
 
-    // parse bytes into usize, ignores specifc error
+    // parse bytes into usize, ignores specific error
     fn parse_number(input: &[u8]) -> Option<usize> {
         str::from_utf8(input).ok()?.parse().ok()
     }
@@ -734,7 +734,7 @@ pub(crate) mod range_filter {
 
         // single byte range only for now
         // https://datatracker.ietf.org/doc/html/rfc7233#section-2.1
-        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case insensitive
+        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case-insensitive
         static RE_SINGLE_RANGE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"(?i)bytes=(?P<start>\d*)-(?P<end>\d*)").unwrap());
 

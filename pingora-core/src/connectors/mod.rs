@@ -263,7 +263,7 @@ impl TransportConnector {
 }
 
 // Perform the actual L4 and tls connection steps while respecting the peer's
-// connection timeout if there one
+// connection timeout if there is one
 async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<SocketAddr>,

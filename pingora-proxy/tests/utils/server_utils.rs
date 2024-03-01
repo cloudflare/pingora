@@ -412,7 +412,7 @@ impl Server {
     }
 }
 
-// FIXME: this still allows multiple servers to spawn across intergration tests
+// FIXME: this still allows multiple servers to spawn across integration tests
 pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
 use super::mock_origin::MOCK_ORIGIN;
 

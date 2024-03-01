@@ -66,7 +66,7 @@ pub mod lb {
 
 #[cfg(feature = "proxy")]
 #[cfg_attr(docsrs, doc(cfg(feature = "proxy")))]
-/// Load balancing recipes
+/// Proxying recipes
 pub mod proxy {
     pub use pingora_proxy::*;
 }

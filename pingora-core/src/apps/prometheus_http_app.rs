@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A HTTP application that reports Prometheus metrics.
+//! An HTTP application that reports Prometheus metrics.
 
 use async_trait::async_trait;
 use http::{self, Response};

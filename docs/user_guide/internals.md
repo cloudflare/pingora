@@ -132,7 +132,7 @@ For example, this is how an `HttpProxy` struct, from the `pingora-proxy` crate, 
                                                 └─────────────────────┘
 ```
 
-Different functionality and helpers are provided at different layers in this representation.
+Different functionalities and helpers are provided at different layers in this representation.
 
 ```
 ┌─────────────┐        ┌──────────────────────────────────────┐

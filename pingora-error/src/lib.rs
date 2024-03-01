@@ -108,7 +108,7 @@ pub enum ErrorType {
     TLSHandshakeFailure,
     TLSHandshakeTimedout,
     InvalidCert,
-    HandshakeError, // other handhshake
+    HandshakeError, // other handshake
     ConnectError,   // catch all
     BindError,
     AcceptError,
