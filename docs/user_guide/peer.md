@@ -22,7 +22,7 @@ A `PeerOptions` defines how to connect to the upstream.
 |connection_timeout: `Option<Duration>`| How long to wait before giving up *establishing* a TCP connection |
 |total_connection_timeout: `Option<Duration>`| How long to wait before giving up *establishing* a connection including TLS handshake time |
 |read_timeout: `Option<Duration>`| How long to wait before each individual `read()` from upstream. The timer is reset after each `read()` |
-|idle_timeout: `Option<Duration>`| How long to wait before closing a idle connection waiting for connetion reuse |
+|idle_timeout: `Option<Duration>`| How long to wait before closing a idle connection waiting for connection reuse |
 |write_timeout: `Option<Duration>`| How long to wait before a `write()` to upstream finishes |
 |verify_cert: `bool`| Whether to check if upstream' server cert is valid and validated |
 |verify_hostname: `bool`| Whether to check if upstream server cert's CN matches the SNI |
