@@ -22,7 +22,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 openssl-src = { version = "300", features = ["weak-crypto"] }
 tokio-openssl = { version = "0.6" }
 libc = "0.2.70"
-foreign-types = { version = "0.3"}
+foreign-types = { version = "0.5"}
 
 [dev-dependencies]
 tokio-test = "0.4"
