@@ -1,0 +1,34 @@
+on:
+  push:
+    branches:
+      - master
+
+name: Docs
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake libclang-dev
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          default: true
+
+      - name: Run cargo doc
+        uses: actions-rs/cargo@v1
+        with:
+          command: doc
+          args: --no-deps --all-features
