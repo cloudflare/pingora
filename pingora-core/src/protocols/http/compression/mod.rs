@@ -255,7 +255,7 @@ enum Algorithm {
     Gzip,
     Brotli,
     Zstd,
-    // TODO: Identify,
+    // TODO: Identity,
     // TODO: Deflate
     Other, // anything unknown
 }

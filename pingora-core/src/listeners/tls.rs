@@ -53,7 +53,7 @@ impl DerefMut for TlsSettings {
 }
 
 impl TlsSettings {
-    /// Create a new [`TlsSettings`] with the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29).
+    /// Create a new [`TlsSettings`] with the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29)
     /// server side TLS settings. Users can adjust the TLS settings after this object is created.
     /// Return error if the provided certificate and private key are invalid or not found.
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self> {

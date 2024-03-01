@@ -14,14 +14,14 @@
 
 //! The fast and more complicated version of pingora-timeout
 //!
-//! The following optimizations are applied
+//! The following optimizations are applied:
 //! - The timeouts lazily initialize their timer when the Future is pending for the first time.
 //! - There is no global lock for creating and cancelling timeouts.
 //! - Timeout timers are rounded to the next 10ms tick and timers are shared across all timeouts with the same deadline.
 //!
-//! In order for this to work, a standalone thread is created to arm the timers, which has its
-//! overheads. As a general rule, the benefits of this doesn't outweigh the overhead unless
-//! there are more than about 100/s timeout() calls in the system. Use regular tokio timeout or
+//! In order for this to work, a standalone thread is created to arm the timers, which has some
+//! overhead. As a general rule, the benefits of this don't outweigh the overhead unless
+//! there are more than about 100 timeout() calls/sec in the system. Use regular tokio timeout or
 //! [super::tokio_timeout] in the low usage case.
 
 use super::timer::*;
