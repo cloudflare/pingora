@@ -29,6 +29,16 @@ pub struct Weighted<H = FnvHasher> {
     algorithm: H,
 }
 
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    let mut r;
+    while b != 0 {
+        r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
     type Iter = WeightedIterator<H>;
 
@@ -38,9 +48,16 @@ impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
             "support up to 2^16 backends"
         );
         let backends = Vec::from_iter(backends.iter().cloned()).into_boxed_slice();
-        let mut weighted = Vec::with_capacity(backends.len());
+        let mut g = 0;
+        let mut total = 0;
+        // use gcd to reduce the memory overhead
+        for (_, b) in backends.iter().enumerate() {
+            g = gcd(g, b.weight);
+            total += b.weight;
+        }
+        let mut weighted = Vec::with_capacity(total / g);
         for (index, b) in backends.iter().enumerate() {
-            for _ in 0..b.weight {
+            for _ in 0..(b.weight / g) {
                 weighted.push(index as u16);
             }
         }
