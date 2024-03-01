@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ahash = { workspace = true }
-flurry = "<0.5.0" # Try not to require Rust 1.71
+flurry = "<0.6.0" # Try not to require Rust 1.71
 parking_lot = "0"
 crossbeam-queue = "0"
 
