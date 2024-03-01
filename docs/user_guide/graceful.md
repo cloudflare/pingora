@@ -11,7 +11,7 @@ Pingora graceful upgrade mechanism guarantees the following:
 Configure the upgrade socket. The old and new server need to agree on the same path to this socket. See configuration manual for details.
 
 ### Step 1
-Start the new instance with the `--upgrade` cli option. The new instance will not try to listen to the service endpoint right away. It will try to acquire the listening socket from the old instance instead.
+Start the new instance with the `--upgrade` CLI option. The new instance will not try to listen to the service endpoint right away. It will try to acquire the listening socket from the old instance instead.
 
 ### Step 2
 Send SIGQUIT signal to the old instance. The old instance will start to transfer the listening socket to the new instance.
