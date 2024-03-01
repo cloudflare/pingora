@@ -716,7 +716,7 @@ pub(crate) mod range_filter {
     use http::header::*;
     use std::ops::Range;
 
-    // parse bytes into usize, ignores specifc error
+    // parse bytes into usize, ignores specific error
     fn parse_number(input: &[u8]) -> Option<usize> {
         str::from_utf8(input).ok()?.parse().ok()
     }
