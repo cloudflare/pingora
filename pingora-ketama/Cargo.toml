@@ -16,7 +16,7 @@ crc32fast = "1.3"
 criterion = "0.4"
 csv = "1.2"
 dhat = "0.3"
-env_logger = "0.9"
+env_logger = "0.11"
 log = { workspace = true }
 rand = "0.8"
 

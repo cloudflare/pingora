@@ -40,7 +40,7 @@ reqwest = { version = "0.11", features = [
     "rustls",
 ], default-features = false }
 tokio-test = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 hyperlocal = "0.8"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"

@@ -47,7 +47,7 @@ httparse = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 tokio = { workspace = true, features = ["fs"] }
-env_logger = "0.9"
+env_logger = "0.11"
 dhat = "0"
 futures = "0.3"
 

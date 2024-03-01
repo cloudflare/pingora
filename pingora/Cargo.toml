@@ -29,7 +29,7 @@ pingora-cache = { version = "0.1.0", path = "../pingora-cache", optional = true 
 structopt = "0.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 matches = "0.1"
-env_logger = "0.9"
+env_logger = "0.11"
 reqwest = { version = "0.11", features = ["rustls"], default-features = false }
 hyperlocal = "0.8"
 hyper = "0.14"
