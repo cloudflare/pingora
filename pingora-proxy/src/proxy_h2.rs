@@ -102,6 +102,10 @@ impl<SV> HttpProxy<SV> {
             .inner
             .upstream_request_filter(session, &mut req, ctx)
             .await
+            .map_err(|e| {
+                error!("Error in upstream_request_filter: {}", e);
+                e
+            }) 
         {
             Ok(_) => { /* continue */ }
             Err(e) => {
