@@ -201,7 +201,7 @@ pub fn is_suspended_for_cert(error: &openssl::ssl::Error) -> bool {
 }
 
 #[allow(clippy::mut_from_ref)]
-/// Get a mutable SslRef ouf of SslRef, which is a missing functionality even when holding &mut SslStream
+/// Get a mutable SslRef out of SslRef, which is a missing functionality even when holding &mut SslStream
 /// # Safety
 /// the caller need to make sure that they hold a &mut SslStream (or other mutable ref to the Ssl)
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
