@@ -24,7 +24,7 @@ pingora-http = { version = "0.1.0", path = "../pingora-http" }
 pingora-lru = { version = "0.1.0", path = "../pingora-lru" }
 pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
 http = { workspace = true }
-indexmap = "1"
+indexmap = "2"
 once_cell = { workspace = true }
 regex = "1"
 blake2 = "0.10"
