@@ -30,7 +30,7 @@ Our [user guide](./docs/user_guide/index.md) covers more topics such as how to c
 API docs are also available for all the crates.
 
 # Notable crates in this workspace
-* Pingora: the "public facing" crate to build to build networked systems and proxies.
+* Pingora: the "public facing" crate to build networked systems and proxies.
 * Pingora-core: this crates defined the protocols, functionalities and basic traits.
 * Pingora-proxy: the logic and APIs to build HTTP proxies.
 * Pingora-error: the common error type used across Pingora crates
