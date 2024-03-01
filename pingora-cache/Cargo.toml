@@ -35,7 +35,7 @@ httpdate = "1.0.2"
 log = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = "0.12"
-rustracing = "0.5.1"
+rustracing = "0.6.0"
 rustracing_jaeger = "0.7"
 rmp = "0.8"
 tokio = { workspace = true }
