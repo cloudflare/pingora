@@ -34,7 +34,7 @@ pub trait HealthCheck {
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
-    /// number of check need to to flip from unhealthy to healthy.
+    /// number of check need to flip from unhealthy to healthy.
     fn health_threshold(&self, success: bool) -> usize;
 }
 
