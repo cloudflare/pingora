@@ -17,11 +17,7 @@
 use super::SslStream;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{GetProxyDigest, GetTimingDigest, TimingDigest, IO};
-use crate::tls::{
-    ssl,
-    ssl::ConnectConfiguration,
-    ssl_sys::{X509_V_ERR_INVALID_CALL, X509_V_OK},
-};
+use crate::tls::{ssl, ssl::ConnectConfiguration, ssl_sys::X509_V_ERR_INVALID_CALL};
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::sync::Arc;
@@ -43,13 +39,31 @@ pub async fn handshake<S: IO>(
         Err(e) => {
             let context = format!("TLS connect() failed: {e}, SNI: {domain}");
             match e.code() {
-                ssl::ErrorCode::SSL => match stream.ssl().verify_result().as_raw() {
-                    // X509_V_ERR_INVALID_CALL in case verify result was never set
-                    X509_V_OK | X509_V_ERR_INVALID_CALL => {
-                        Error::e_explain(TLSHandshakeFailure, context)
+                ssl::ErrorCode::SSL => {
+                    // Unify the return type of `verify_result` for openssl
+                    #[cfg(not(feature = "boringssl"))]
+                    fn verify_result<S>(stream: SslStream<S>) -> Result<(), i32> {
+                        match stream.ssl().verify_result().as_raw() {
+                            crate::tls::ssl_sys::X509_V_OK => Ok(()),
+                            e => Err(e),
+                        }
                     }
-                    _ => Error::e_explain(InvalidCert, context),
-                },
+
+                    // Unify the return type of `verify_result` for boringssl
+                    #[cfg(feature = "boringssl")]
+                    fn verify_result<S>(stream: SslStream<S>) -> Result<(), i32> {
+                        stream.ssl().verify_result().map_err(|e| e.as_raw())
+                    }
+
+                    match verify_result(stream) {
+                        Ok(()) => Error::e_explain(TLSHandshakeFailure, context),
+                        // X509_V_ERR_INVALID_CALL in case verify result was never set
+                        Err(X509_V_ERR_INVALID_CALL) => {
+                            Error::e_explain(TLSHandshakeFailure, context)
+                        }
+                        _ => Error::e_explain(InvalidCert, context),
+                    }
+                }
                 /* likely network error, but still mark as TLS error */
                 _ => Error::e_explain(TLSHandshakeFailure, context),
             }
