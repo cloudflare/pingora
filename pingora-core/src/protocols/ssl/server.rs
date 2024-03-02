@@ -73,7 +73,7 @@ pub async fn handshake_with_callback<S: IO>(
 #[async_trait]
 pub trait TlsAccept {
     // TODO: return error?
-    /// This function is called in the middle of a TLS handshake. Structs who implements this function
+    /// This function is called in the middle of a TLS handshake. Structs who implement this function
     /// should provide tls certificate and key to the [SslRef] via [ext::ssl_use_certificate] and [ext::ssl_use_private_key].
     async fn certificate_callback(&self, _ssl: &mut SslRef) -> () {
         // does nothing by default

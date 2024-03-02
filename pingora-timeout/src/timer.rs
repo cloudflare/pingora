@@ -24,7 +24,7 @@
 //! - create 7.809622ms total, 78ns avg per iteration
 //! - drop: 1.348552ms total, 13ns avg per iteration
 //!
-//! tokio timer:
+//! Tokio timer:
 //! - create 34.317439ms total, 343ns avg per iteration
 //! - drop: 10.694154ms total, 106ns avg per iteration
 
@@ -126,7 +126,7 @@ impl TimerManager {
         Self::default()
     }
 
-    // this thread sleep a resolution time and fire all Timers that a due to fire
+    // This thread sleeps for a resolution time and fires all timers that are due to fire
     pub(crate) fn clock_thread(&self) {
         loop {
             std::thread::sleep(RESOLUTION_DURATION);

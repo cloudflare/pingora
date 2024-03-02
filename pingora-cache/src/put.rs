@@ -446,7 +446,7 @@ mod parse_response {
                                 let mut chunk_bytes = self.buf.split_to(total_chunk_size);
                                 let mut chunk_body = chunk_bytes.split_off(header_len);
                                 chunk_body.truncate(body_len as usize);
-                                // Note that the final 0 sized chunk will return an empty Bytes
+                                // Note that the final 0 sized chunks will return an empty Bytes
                                 // instead of not None
                                 Ok(Some(chunk_body.freeze()))
                             }
@@ -483,7 +483,7 @@ mod parse_response {
             resp.status,
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
         ) {
-            // these status code cannot have body by definition
+            // these status codes cannot have body by definition
             return ParseState::Done(0);
         }
         if let Some(encoding) = resp.headers.get(http::header::TRANSFER_ENCODING) {

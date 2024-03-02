@@ -273,7 +273,7 @@ pub struct PeerOptions {
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub no_header_eos: bool,
     pub h2_ping_interval: Option<Duration>,
-    // how many concurrent h2 stream are allowed in the same connection
+    // how many concurrent h2 streams are allowed in the same connection
     pub max_h2_streams: usize,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise

@@ -36,9 +36,9 @@ use transfer_fd::Fds;
 use pingora_error::{Error, ErrorType, Result};
 
 /* time to wait before exiting the program
-this is the graceful period for all existing session to finish */
+this is the graceful period for all existing sessions to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
-/* time to wait before shutting down listening sockets
+/* time to wait before shutting down listening sockets,
 this is the graceful period for the new service to get ready */
 const CLOSE_TIMEOUT: u64 = 5;
 

@@ -41,7 +41,7 @@ pub(crate) struct CacheObject {
 
 pub(crate) struct TempObject {
     pub meta: BinaryMeta,
-    // these are Arc because they need to continue exist after this TempObject is removed
+    // these are Arc because they need to continue to exist after this TempObject is removed
     pub body: Arc<RwLock<Vec<u8>>>,
     bytes_written: Arc<watch::Sender<PartialState>>, // this should match body.len()
 }
@@ -309,7 +309,7 @@ impl Storage for MemCache {
     async fn purge(&'static self, key: &CompactCacheKey, _trace: &SpanHandle) -> Result<bool> {
         // TODO: purge partial
 
-        // This usually purges the primary key because, without a lookup, variance key is usually
+        // This usually purges the primary key because, without a lookup, the variance key is usually
         // empty
         let hash = key.combined();
         Ok(self.cached.write().remove(&hash).is_some())

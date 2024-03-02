@@ -157,7 +157,7 @@ pub fn ssl_use_second_key_share(_ssl: &mut SslRef, _enabled: bool) {}
 /// Clear the error stack
 ///
 /// SSL calls should check and clear the OpenSSL error stack. But some calls fail to do so.
-/// This causes the next unrelated SSL call to fail due to the leftover errors. This function allow
+/// This causes the next unrelated SSL call to fail due to the leftover errors. This function allows
 /// caller to clear the error stack before performing SSL calls to avoid this issue.
 pub fn clear_error_stack() {
     let _ = ErrorStack::get();
@@ -203,7 +203,7 @@ pub fn is_suspended_for_cert(error: &openssl::ssl::Error) -> bool {
 #[allow(clippy::mut_from_ref)]
 /// Get a mutable SslRef ouf of SslRef, which is a missing functionality even when holding &mut SslStream
 /// # Safety
-/// the caller need to make sure that they hold a &mut SslStream (or other mutable ref to the Ssl)
+/// the caller need to make sure that they hold a &mut SslStream (or the other mutable ref to the Ssl)
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
     SslRef::from_ptr_mut(ssl.as_ptr())
 }

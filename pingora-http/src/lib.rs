@@ -149,7 +149,7 @@ impl RequestHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,
@@ -378,7 +378,7 @@ impl ResponseHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,
@@ -477,7 +477,7 @@ fn clone_resp_parts(me: &RespParts) -> RespParts {
 
 // This function returns an upper bound on the size of the header map used inside the http crate.
 // As of version 0.2, there is a limit of 1 << 15 (32,768) items inside the map. There is an
-// assertion against this size inside the crate so we want to avoid panicking by not exceeding this
+// assertion against this size inside the crate, so we want to avoid panicking by not exceeding this
 // upper bound.
 fn http_header_map_upper_bound(size_hint: Option<usize>) -> usize {
     // Even though the crate has 1 << 15 as the max size, calls to `with_capacity` invoke a
@@ -485,8 +485,8 @@ fn http_header_map_upper_bound(size_hint: Option<usize>) -> usize {
     //
     // See https://github.com/hyperium/http/blob/34a9d6bdab027948d6dea3b36d994f9cbaf96f75/src/header/map.rs#L3220
     //
-    // Therefore we set our max size to be even lower so we guarantee ourselves we won't hit that
-    // upper bound in the crate. Any way you cut it, 4,096 headers is insane.
+    // Therefore we set our max size to be even lower, so we guarantee ourselves we won't hit that
+    // upper bound in the crate. Any way you cut it, 4,096 headers are insane.
     const PINGORA_MAX_HEADER_COUNT: usize = 4096;
     const INIT_HEADER_SIZE: usize = 8;
 
@@ -563,7 +563,7 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
         let iter = key_map.iter().zip(value_map.iter());
         for ((header, case_header), (header2, val)) in iter {
             if header != header2 {
-                // in case the header iter order changes in further version of HMap
+                // in case the header iter order changes in the further version of HMap
                 panic!("header iter mismatch {}, {}", header, header2)
             }
             buf.put_slice(case_header.as_slice());

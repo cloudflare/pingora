@@ -144,7 +144,7 @@ impl<'a> Iterator for ListValueIter<'a> {
     quoted-string   = "(?:[^"\\]|\\.)*"
 */
 static RE_CACHE_DIRECTIVE: Lazy<Regex> =
-    // unicode support disabled, allow ; or , delimiter | capture groups: 1: directive = 2: token OR quoted-string
+    // unicode support disabled, allow; or, delimiter | capture groups: 1: directive = 2: token OR quoted-string
     Lazy::new(|| {
         Regex::new(r#"(?-u)(?:^|(?:\s*[,;]\s*))([^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+)(?:=((?:[^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+|(?:"(?:[^"\\]|\\.)*"))))?"#).unwrap()
     });
@@ -220,7 +220,7 @@ impl CacheControl {
         self.has_key("public")
     }
 
-    /// Whether the given directive exists and it has no value.
+    /// Whether the given directive exists, and it has no value.
     fn has_key_without_value(&self, key: &str) -> bool {
         matches!(self.directives.get(key), Some(None))
     }

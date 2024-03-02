@@ -22,7 +22,7 @@ use pingora_cache::{
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
 /// paticular stage (if applicable).
 ///
-/// If any of the filters returns [Result::Err], the request will fail and the error will be logged.
+/// If any of the filters returns [Result::Err], the request will fail, and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
 pub trait ProxyHttp {
     /// The per request object to share state across the different filters
@@ -31,7 +31,7 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
-    /// Define where the proxy should sent the request to.
+    /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should
     /// be forwarded to.
@@ -158,7 +158,7 @@ pub trait ProxyHttp {
 
     /// Modify the response header from the upstream
     ///
-    /// The modification is before caching so any change here will be stored in cache if enabled.
+    /// The modification is before caching, so any change here will be stored in the cache if enabled.
     ///
     /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
     /// only the 304 from upstream will trigger the filter (though it will be merged into the
@@ -174,7 +174,7 @@ pub trait ProxyHttp {
     /// Modify the response header before it is send to the downstream
     ///
     /// The modification is after caching. This filter is called for all responses including
-    /// responses served from cache..
+    /// responses served from cache.
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -266,7 +266,7 @@ pub trait ProxyHttp {
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
     /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    /// avaliable.
+    ///  available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -352,7 +352,7 @@ pub trait ProxyHttp {
 
     /// This callback is invoked every time request related error log needs to be generated
     ///
-    /// Users can define what is the important to be written about this request via the returned string.
+    /// Users can define what is important to be written about this request via the returned string.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
         session.as_ref().request_summary()
     }
