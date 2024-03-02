@@ -89,27 +89,33 @@ cargo bench --bench bench_memory
 
 total items 1000, cache size 10%
 lru
-dhat: At t-gmax: 9,408 bytes in 106 blocks
+dhat: At t-gmax: 9,440 bytes in 106 blocks
 moka
-dhat: At t-gmax: 354,232 bytes in 1,581 blocks
+dhat: At t-gmax: 354,808 bytes in 1,748 blocks
+QuickCache
+dhat: At t-gmax: 11,864 bytes in 8 blocks
 TinyUFO
-dhat: At t-gmax: 37,337 bytes in 351 blocks
+dhat: At t-gmax: 50,009 bytes in 357 blocks
 
 total items 10000, cache size 10%
 lru
-dhat: At t-gmax: 128,512 bytes in 1,004 blocks
+dhat: At t-gmax: 128,528 bytes in 1,004 blocks
 moka
-dhat: At t-gmax: 535,320 bytes in 7,278 blocks
+dhat: At t-gmax: 535,488 bytes in 7,334 blocks
+QuickCache
+dhat: At t-gmax: 93,264 bytes in 66 blocks
 TinyUFO
-dhat: At t-gmax: 236,053 bytes in 2,182 blocks
+dhat: At t-gmax: 248,735 bytes in 2,188 blocks
 
 total items 100000, cache size 10%
 lru
-dhat: At t-gmax: 1,075,648 bytes in 10,004 blocks
+dhat: At t-gmax: 1,075,664 bytes in 10,004 blocks
 moka
-dhat: At t-gmax: 2,489,088 bytes in 62,374 blocks
+dhat: At t-gmax: 2,488,176 bytes in 62,499 blocks
+QuickCache
+dhat: At t-gmax: 809,232 bytes in 258 blocks
 TinyUFO
-dhat: At t-gmax: 2,290,635 bytes in 20,467 blocks
+dhat: At t-gmax: 2,303,307 bytes in 20,484 blocks
 */
 
 fn main() {
