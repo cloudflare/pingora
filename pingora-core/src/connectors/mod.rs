@@ -209,7 +209,7 @@ impl TransportConnector {
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
     ///
-    /// Not all TCP/TLS connection can be reused. It is the caller's responsibility to make sure
+    /// Not all TCP/TLS connections can be reused. It is the caller's responsibility to make sure
     /// that protocol over the [Stream] supports connection reuse and the [Stream] itself is ready
     /// to be reused.
     ///

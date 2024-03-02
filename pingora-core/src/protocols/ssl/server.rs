@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! TLS server  specific implementation
+//! TLS server specific implementation
 
 use super::SslStream;
 use crate::protocols::{Shutdown, IO};
