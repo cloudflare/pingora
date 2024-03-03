@@ -2,7 +2,7 @@
 
 ![Pingora banner image](./docs/assets/pingora_banner.png)
 
-**English** · [简体中文](./README.zh-CN.md)
+**English** · [简体中文](./README.zh-Hans.md)
 
 ## What is Pingora
 Pingora is a Rust framework to [build fast, reliable and programmable networked systems](https://blog.cloudflare.com/pingora-open-source).
