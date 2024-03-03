@@ -316,10 +316,7 @@ impl Server {
             .into_iter()
             .map(|rt| {
                 info!("Waiting for runtimes to exit!");
-                thread::spawn(move || {
-                    rt.shutdown_timeout(shutdown_timeout);
-                    thread::sleep(shutdown_timeout)
-                })
+                thread::spawn(move || rt.shutdown_timeout(shutdown_timeout))
             })
             .collect();
         for shutdown in shutdowns {
