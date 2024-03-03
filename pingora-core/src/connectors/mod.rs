@@ -360,9 +360,9 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 #[cfg(test)]
 mod tests {
     use pingora_error::ErrorType;
-    use pingora_openssl::ssl::SslMethod;
 
     use super::*;
+    use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
 
     // 192.0.2.1 is effectively a black hole
