@@ -26,10 +26,16 @@ design decisions to be made.
 ## Making a PR
 
 After you've filed an issue, you can make your PR referencing that issue number. Once you open your
-PR, it will be labelled _needs review_. A maintainer will review your PR as soon as they can. The
-reviewer may ask for changes - they will mark the PR as _changes requested_ and _work in progress_
-and will give you details about the requested changes. Feel free to ask lots of questions! The
-maintainers are there to help you.
+PR, it will be labelled _Needs Review_. A maintainer will review your PR as soon as they can. The
+reviewer may ask for changes - they will mark the PR as _Changes Requested_ and will give you
+details about the requested changes. Feel free to ask lots of questions! The maintainers are there
+to help you.
+
+Once we (the maintainers) decide to accept your change, we will label your PR as _Accepted_.
+Later (usually within a week or two), we will rebase your commits onto the `main` branch in a
+separate PR, batched alongside other _Accepted_ commits and any internal changes. (This process
+allows us to sync the state of our internal repository with the public repository.) Once your
+change lands in `main`, we will close your PR.
 
 ### Caveats
 
