@@ -181,7 +181,7 @@ where
             }
             None => {
                 let mut lockers = self.lockers.write();
-                // Acquiring write locks is not that fast in a high-concurrency environment,
+                // Acquiring write locks is not that easy in a high-concurrency environment,
                 // perhaps another one has already completed the lookup and removed the lock from locker.
                 // So we first check whether data already exists at the current point
                 let (result, cache_state) = self.inner.get(key);
