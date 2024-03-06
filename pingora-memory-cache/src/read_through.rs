@@ -181,15 +181,6 @@ where
             }
             None => {
                 let mut lockers = self.lockers.write();
-                // Acquiring write locks is not that easy in a high-concurrency environment,
-                // perhaps another one has already completed the lookup and removed the lock from locker.
-                // So we first check whether data already exists at the current point
-                let (result, cache_state) = self.inner.get(key);
-                if let Some(result) = result {
-                    /* cache hit */
-                    return (Ok(result), cache_state);
-                }
-
                 match lockers.get(&hashed_key) {
                     Some(lock) => {
                         /* another lookup to the same key got the write lock to locker first */
@@ -200,6 +191,13 @@ where
                         }
                     }
                     None => {
+                        // double check in this point in case some thread has already finished lookup
+                        let (result, cache_state) = self.inner.get(key);
+                        if let Some(result) = result {
+                            /* cache hit */
+                            return (Ok(result), cache_state);
+                        }
+
                         let new_lock = CacheLock::new_arc();
                         let new_lock2 = new_lock.clone();
                         lockers.insert(hashed_key, new_lock2);
