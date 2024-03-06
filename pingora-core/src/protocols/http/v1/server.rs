@@ -983,9 +983,8 @@ fn http_resp_header_to_buf(
 mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
-    use http::{Method, StatusCode};
+    use http::StatusCode;
     use std::str;
-    use std::time::Duration;
     use tokio_test::io::Builder;
 
     fn init_log() {

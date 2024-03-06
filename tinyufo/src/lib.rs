@@ -329,9 +329,7 @@ impl<T: Clone + Send + Sync> FiFoQueues<T> {
 
     fn evict_one_from_main(&self, buckets: &Buckets<T>) -> Option<KV<T>> {
         loop {
-            let Some(to_evict) = self.main.pop() else {
-                return None;
-            };
+            let to_evict = self.main.pop()?;
             let buckets = buckets.pin();
             let maybe_bucket = buckets.get(&to_evict);
             if let Some(bucket) = maybe_bucket.as_ref() {

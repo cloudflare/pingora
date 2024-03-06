@@ -19,8 +19,8 @@
 //TODO: Mark this module #[test] only
 
 use super::*;
-use crate::key::{CacheHashKey, CompactCacheKey};
-use crate::storage::{HandleHit, HandleMiss, Storage};
+use crate::key::CompactCacheKey;
+use crate::storage::{HandleHit, HandleMiss};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;

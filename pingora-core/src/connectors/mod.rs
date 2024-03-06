@@ -427,7 +427,7 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some system will allow the socket to bind and connect without error, only to timeout
+        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
         assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
     }
 
