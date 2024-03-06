@@ -22,7 +22,6 @@ use daemon::daemonize;
 use log::{debug, error, info};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
-use std::clone::Clone;
 use std::sync::Arc;
 use std::thread;
 use tokio::signal::unix;

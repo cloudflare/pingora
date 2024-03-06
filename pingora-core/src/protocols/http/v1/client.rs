@@ -672,8 +672,6 @@ mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::ParseState;
     use crate::ErrorType;
-    use std::str;
-    use std::time::Duration;
     use tokio_test::io::Builder;
 
     fn init_log() {

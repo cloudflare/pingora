@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{
-    key::HashBinary, CacheKey, CacheMeta, NoCacheReason, RespCacheable, RespCacheable::*,
-};
+use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
 
 /// The interface to control the HTTP proxy
 ///
