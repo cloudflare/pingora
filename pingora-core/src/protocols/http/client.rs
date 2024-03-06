@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::v1::client::HttpSession as Http1Session;
 use super::v2::client::Http2Session;
-use crate::protocols::Digest;
+use crate::protocols::{Digest, SocketAddr};
 
 /// A type for Http client session. It can be either an Http1 connection or an Http2 stream.
 pub enum HttpSession {
@@ -151,11 +151,27 @@ impl HttpSession {
     /// Return the [Digest] of the connection
     ///
     /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse the timing field
+    /// The caller should check if the connection is reused to avoid misuse of the timing field
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::H1(s) => Some(s.digest()),
             Self::H2(s) => s.digest(),
+        }
+    }
+
+    /// Return the server (peer) address of the connection.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        match self {
+            Self::H1(s) => s.server_addr(),
+            Self::H2(s) => s.server_addr(),
+        }
+    }
+
+    /// Return the client (local) address of the connection.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        match self {
+            Self::H1(s) => s.client_addr(),
+            Self::H2(s) => s.client_addr(),
         }
     }
 }
