@@ -16,7 +16,9 @@
 
 use super::SslStream;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{GetProxyDigest, GetTimingDigest, TimingDigest, IO};
+use crate::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, TimingDigest, IO,
+};
 use crate::tls::{ssl, ssl::ConnectConfiguration, ssl_sys::X509_V_ERR_INVALID_CALL};
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -88,5 +90,17 @@ where
 {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
         self.get_ref().get_proxy_digest()
+    }
+}
+
+impl<S> GetSocketDigest for SslStream<S>
+where
+    S: GetSocketDigest,
+{
+    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+        self.get_ref().get_socket_digest()
+    }
+    fn set_socket_digest(&mut self, socket_digest: SocketDigest) {
+        self.get_mut().set_socket_digest(socket_digest)
     }
 }

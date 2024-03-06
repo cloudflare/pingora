@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::HttpTask;
-use crate::protocols::{Digest, Stream, UniqueID};
+use crate::protocols::{Digest, SocketAddr, Stream, UniqueID};
 use crate::utils::{BufRef, KVRef};
 
 /// The HTTP 1.x client session
@@ -65,6 +65,7 @@ impl HttpSession {
             ssl_digest: stream.get_ssl_digest(),
             timing_digest: stream.get_timing_digest(),
             proxy_digest: stream.get_proxy_digest(),
+            socket_digest: stream.get_socket_digest(),
         });
         HttpSession {
             underlying_stream: stream,
@@ -600,6 +601,22 @@ impl HttpSession {
 
     pub fn digest(&self) -> &Digest {
         &self.digest
+    }
+
+    /// Return the server (peer) address recorded in the connection digest.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.peer_addr())?
+    }
+
+    /// Return the client (local) address recorded in the connection digest.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.local_addr())?
     }
 }
 

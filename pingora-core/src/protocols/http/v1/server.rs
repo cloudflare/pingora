@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::{body_buffer::FixedBuffer, date, error_resp, HttpTask};
-use crate::protocols::Stream;
+use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
 /// The HTTP 1.x server session
@@ -68,6 +68,8 @@ pub struct HttpSession {
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
+    /// Digest to track underlying connection metrics
+    digest: Box<Digest>,
 }
 
 impl HttpSession {
@@ -75,6 +77,14 @@ impl HttpSession {
     /// The created session needs to call [`Self::read_request()`] first before performing
     /// any other operations.
     pub fn new(underlying_stream: Stream) -> Self {
+        // TODO: maybe we should put digest in the connection itself
+        let digest = Box::new(Digest {
+            ssl_digest: underlying_stream.get_ssl_digest(),
+            timing_digest: underlying_stream.get_timing_digest(),
+            proxy_digest: underlying_stream.get_proxy_digest(),
+            socket_digest: underlying_stream.get_socket_digest(),
+        });
+
         HttpSession {
             underlying_stream,
             buf: Bytes::new(), // zero size, with be replaced by parsed header later
@@ -92,6 +102,7 @@ impl HttpSession {
             body_bytes_sent: 0,
             retry_buffer: None,
             upgraded: false,
+            digest,
         }
     }
 
@@ -749,6 +760,27 @@ impl HttpSession {
         } else {
             self.set_keepalive(keepalive);
         }
+    }
+
+    /// Return the [Digest] of the connection.
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    /// Return the client (peer) address of the underlying connnection.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.peer_addr())?
+    }
+
+    /// Return the server (local) address of the underlying connnection.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.local_addr())?
     }
 
     /// Consume `self`, if the connection can be reused, the underlying stream will be returned
