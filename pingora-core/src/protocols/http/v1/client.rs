@@ -185,10 +185,9 @@ impl HttpSession {
 
             let read_fut = self.underlying_stream.read_buf(&mut buf);
             let read_result = match self.read_timeout {
-                Some(t) => match timeout(t, read_fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(std::io::Error::from(ErrorKind::TimedOut)),
-                },
+                Some(t) => timeout(t, read_fut)
+                    .await
+                    .map_err(|_| Error::explain(ReadTimedout, "while reading response headers"))?,
                 None => read_fut.await,
             };
             let n = match read_result {
@@ -208,26 +207,19 @@ impl HttpSession {
                     }
                 },
                 Err(e) => {
-                    return match e.kind() {
-                        ErrorKind::TimedOut => {
-                            Error::e_explain(ReadTimedout, "while reading response headers")
-                        }
-                        _ => {
-                            let true_io_error = e.raw_os_error().is_some();
-                            let mut e = Error::because(
-                                ReadError,
-                                format!(
-                                    "while reading response headers, bytes already read: {already_read}",
-                                ),
-                                e,
-                            );
-                            // Likely OSError, typical if a previously reused connection drops it
-                            if true_io_error {
-                                e.retry = RetryType::ReusedOnly;
-                            } // else: not safe to retry TLS error
-                            Err(e)
-                        }
-                    };
+                    let true_io_error = e.raw_os_error().is_some();
+                    let mut e = Error::because(
+                        ReadError,
+                        format!(
+                            "while reading response headers, bytes already read: {already_read}",
+                        ),
+                        e,
+                    );
+                    // Likely OSError, typical if a previously reused connection drops it
+                    if true_io_error {
+                        e.retry = RetryType::ReusedOnly;
+                    } // else: not safe to retry TLS error
+                    return Err(e);
                 }
             };
             already_read += n;
