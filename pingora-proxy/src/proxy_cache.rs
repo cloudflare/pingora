@@ -85,7 +85,7 @@ impl<SV> HttpProxy<SV> {
                     if let Some((mut meta, handler)) = res {
                         // vary logic
                         // because this branch can be called multiple times in a loop, and we only
-                        // need to to update the vary once, check if variance is already set to
+                        // need to update the vary once, check if variance is already set to
                         // prevent unnecessary vary lookups
                         let cache_key = session.cache.cache_key();
                         if let Some(variance) = cache_key.variance_bin() {
