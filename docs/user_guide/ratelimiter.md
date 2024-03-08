@@ -63,7 +63,7 @@ impl LB {
 
 // global limiter
 lazy_static! {
-static ref RATE_LIMITER_MAP: Arc<Mutex<HashMap<String, Rate>>> = {
+    static ref RATE_LIMITER_MAP: Arc<Mutex<HashMap<String, Rate>>> = {
        Arc::new(Mutex::new(HashMap::new()))
     };
 }
