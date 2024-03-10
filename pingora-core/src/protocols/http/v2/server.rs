@@ -401,6 +401,11 @@ impl HttpSession {
         }
     }
 
+    /// Return how many request header and body bytes that have been read
+    pub fn request_length(&self) -> usize {
+        self.body_read
+    }
+
     /// How many response body bytes sent to the client
     pub fn body_bytes_sent(&self) -> usize {
         self.body_sent

@@ -330,4 +330,12 @@ impl Session {
             Self::H2(s) => s.body_bytes_sent(),
         }
     }
+
+    /// How many request body already read, including request headers
+    pub fn request_length(&self) -> usize {
+        match self {
+            Self::H1(s) => s.request_length(),
+            Self::H2(s) => s.request_length(),
+        }
+    }
 }
