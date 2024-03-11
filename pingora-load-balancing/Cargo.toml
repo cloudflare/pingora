@@ -20,7 +20,7 @@ path = "src/lib.rs"
 async-trait = { workspace = true }
 pingora-http = { version = "0.1.0", path = "../pingora-http" }
 pingora-error = { version = "0.1.0", path = "../pingora-error" }
-pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-core = { version = "0.1.0", path = "../pingora-core", default-features = false }
 pingora-ketama = { version = "0.1.0", path = "../pingora-ketama" }
 pingora-runtime = { version = "0.1.0", path = "../pingora-runtime" }
 arc-swap = "1"
@@ -31,3 +31,8 @@ futures = "0"
 log = { workspace = true }
 
 [dev-dependencies]
+
+[features]
+default = ["openssl"]
+openssl = ["pingora-core/openssl"]
+boringssl = ["pingora-core/boringssl"]
