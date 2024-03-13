@@ -563,7 +563,7 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
         let iter = key_map.iter().zip(value_map.iter());
         for ((header, case_header), (header2, val)) in iter {
             if header != header2 {
-                // in case the header iteration order changes in newer versions of HMap
+                // in case the header iteration order changes in future versions of HMap
                 panic!("header iter mismatch {}, {}", header, header2)
             }
             buf.put_slice(case_header.as_slice());
