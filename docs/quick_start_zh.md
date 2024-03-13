@@ -8,28 +8,28 @@
 
 ## 构建基本的负载均衡器
 
-为我们的负载均衡器创建一个新的 cargo 项目。我们将其称为 \`load_balancer\`
+为我们的负载均衡器创建一个新的 cargo 项目。我们将其称为 `load_balancer`
 
-\```bash
+```bash
 cargo new load_balancer
-\```
+```
 
 ### 包含 Pingora Crate 和基本依赖项
 
-在项目的 \`cargo.toml\` 文件中添加以下内容到你的依赖项中
+在项目的 `cargo.toml` 文件中添加以下内容到你的依赖项中
 
-\```toml
+```toml
 async-trait="0.1"
 pingora = { version = "0.1", features = [ "lb" ] }
-\```
+```
 
 ### 创建一个 pingora 服务器
 
-首先，让我们创建一个 pingora 服务器。pingora 的 \`Server\` 是一个可以承载一个或多个服务的进程。pingora 的 \`Server\` 负责配置和命令行参数解析、守护进程化、信号处理以及优雅地重启或关闭。
+首先，让我们创建一个 pingora 服务器。pingora 的 `Server` 是一个可以承载一个或多个服务的进程。pingora 的 `Server` 负责配置和命令行参数解析、守护进程化、信号处理以及优雅地重启或关闭。
 
-首选的用法是在 \`main()\` 函数中初始化 \`Server\` 并使用 \`run_forever()\` 生成所有运行时线程，并阻塞主线程，直到服务器准备好退出。
+首选的用法是在 `main()` 函数中初始化 `Server` 并使用 `run_forever()` 生成所有运行时线程，并阻塞主线程，直到服务器准备好退出。
 
-\```rust
+```rust
 use async_trait::async_trait;
 use pingora::prelude::*;
 use std::sync::Arc;
@@ -39,25 +39,25 @@ let mut my_server = Server::new(None).unwrap();
 my_server.bootstrap();
 my_server.run_forever();
 }
-\```
+```
 
 这将编译并运行，但并不执行任何有趣的操作。
 
 ### 创建一个负载均衡器代理
 
-接下来，让我们创建一个负载均衡器。我们的负载均衡器持有一个静态的上游 IP 列表。\`pingora-load-balancing\` crate 已经提供了 \`LoadBalancer\` 结构体，并且提供了常见的选择算法，比如轮询和哈希。所以我们只需使用它。如果使用案例需要更复杂或自定义的服务器选择逻辑，用户可以在这个函数中自行实现。
+接下来，让我们创建一个负载均衡器。我们的负载均衡器持有一个静态的上游 IP 列表。`pingora-load-balancing` crate 已经提供了 `LoadBalancer` 结构体，并且提供了常见的选择算法，比如轮询和哈希。所以我们只需使用它。如果使用案例需要更复杂或自定义的服务器选择逻辑，用户可以在这个函数中自行实现。
 
-\```rust
+```rust
 pub struct LB(Arc<LoadBalancer<RoundRobin>>);
-\```
+```
 
-为了使服务器成为代理，我们需要为其实现 \`ProxyHttp\` trait。
+为了使服务器成为代理，我们需要为其实现 `ProxyHttp` trait。
 
-任何实现 \`ProxyHttp\` trait 的对象本质上都定义了代理中如何处理请求。\`ProxyHttp\` trait 中唯一需要的方法是 \`upstream_peer()\`，它返回应该代理到的地址。
+任何实现 `ProxyHttp` trait 的对象本质上都定义了代理中如何处理请求。`ProxyHttp` trait 中唯一需要的方法是 `upstream_peer()`，它返回应该代理到的地址。
 
-在 \`upstream_peer()\` 的主体中，让我们使用 \`LoadBalancer\` 的 \`select()\` 方法来在上游 IP 之间进行轮询。在这个例子中，我们使用 HTTPS 连接到后端，所以我们还需要在构造 \`Peer\` 对象时指定 \`use_tls\` 和设置 SNI。
+在 `upstream_peer()` 的主体中，让我们使用 `LoadBalancer` 的 `select()` 方法来在上游 IP 之间进行轮询。在这个例子中，我们使用 HTTPS 连接到后端，所以我们还需要在构造 `Peer` 对象时指定 `use_tls` 和设置 SNI。
 
-\```rust
+```rust
 #[async_trait]
 impl ProxyHttp for LB {
 
@@ -79,11 +79,11 @@ impl ProxyHttp for LB {
         Ok(peer)
     }
 }
-\```
+```
 
-为了让 1.1.1.1 后端接受我们的请求，必须存在一个主机头。通过 \`upstream_request_filter()\` 回调可以添加此标头，该回调在与后端的连接建立后、在发送请求标头之前修改请求标头。
+为了让 1.1.1.1 后端接受我们的请求，必须存在一个主机头。通过 `upstream_request_filter()` 回调可以添加此标头，该回调在与后端的连接建立后、在发送请求标头之前修改请求标头。
 
-\```rust
+```rust
 impl ProxyHttp for LB {
 // ...
 async fn upstream_request_filter(
@@ -96,17 +96,17 @@ upstream_request.insert_header("Host", "one.one.one.one").unwrap();
 Ok(())
 }
 }
-\```
+```
 
 ### 创建一个 pingora-proxy 服务
 
 接下来，让我们创建一个遵循上述负载均衡器指令的代理服务。
 
-pingora 的 \`Service\` 监听一个或多个 (TCP 或 Unix 域套接字) 端点。当建立新连接时，\`Service\` 将连接交给其“应用程序”。\`pingora-proxy\` 就是这样一个应用程序，它将 HTTP 请求代理到上面配置的后端。
+pingora 的 `Service` 监听一个或多个 (TCP 或 Unix 域套接字) 端点。当建立新连接时，`Service` 将连接交给其“应用程序”。`pingora-proxy` 就是这样一个应用程序，它将 HTTP 请求代理到上面配置的后端。
 
-在下面的例子中，我们创建一个带有两个后端 \`1.1.1.1:443\` 和 \`1.0.0.1:443\` 的 \`LB\` 实例。我们通过 \`http_proxy_service()\` 调用将该 \`LB\` 实例放入一个代理 \`Service\`，然后告诉我们的 \`Server\` 托管该代理 \`Service\`。
+在下面的例子中，我们创建一个带有两个后端 `1.1.1.1:443` 和 `1.0.0.1:443` 的 `LB` 实例。我们通过 `http_proxy_service()` 调用将该 `LB` 实例放入一个代理 `Service`，然后告诉我们的 `Server` 托管该代理 `Service`。
 
-\```rust
+```rust
 fn main() {
 let mut my_server = Server::new(None).unwrap();
 my_server.bootstrap();
@@ -121,15 +121,15 @@ my_server.bootstrap();
 
     my_server.run_forever();
 }
-\```
+```
 
 ### 运行
 
 现在我们已经将负载均衡器添加到服务中，可以使用以下命令运行我们的新项目
 
-\```bash
+```bash
 cargo run
-\```
+```
 
 要测试它，只需使用以下命:
 
@@ -190,8 +190,8 @@ fn main() {
 curl 127.0.0.1:6188 -svo /dev/null
 ```
 
-我们会发现每3个请求中就有一个失败，返回 `502: Bad Gateway`。这是因为我们的对等体选择严格遵循了我们提供的 `RoundRobin` 选择模式，
-而不考虑该对等体是否健康。我们可以通过添加基本的健康检查服务来解决这个问题。
+我们会发现每3个请求中就有一个失败，返回 `502: Bad Gateway`。这是因为我们的peer选择严格遵循了我们提供的 `RoundRobin` 选择模式，
+而不考虑该peer是否健康。我们可以通过添加基本的健康检查服务来解决这个问题。
 
 
 
@@ -222,8 +222,8 @@ fn main() {
 }
 ```
 
-现在，如果我们再次运行和测试我们的负载均衡器，我们会发现所有请求都成功，并且损坏的对等体从未被使用。
-根据我们使用的配置，如果该对等体再次变得健康，它将在 1 秒内重新包含在轮询中。
+现在，如果我们再次运行和测试我们的负载均衡器，我们会发现所有请求都成功，并且损坏的peer从未被使用。
+根据我们使用的配置，如果该peer再次变得健康，它将在 1 秒内重新包含在轮询中。
 
 
 
