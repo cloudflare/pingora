@@ -23,6 +23,7 @@ fn bench_one(zip_exp: f64, cache_size_percent: f32) {
     let cache_size = (cache_size_percent * ITEMS as f32).round() as usize;
     let mut lru = lru::LruCache::<u64, ()>::new(NonZeroUsize::new(cache_size).unwrap());
     let moka = moka::sync::Cache::new(cache_size as u64);
+    let quick_cache = quick_cache::sync::Cache::new(cache_size);
     let tinyufo = tinyufo::TinyUfo::new(cache_size, cache_size);
 
     let mut rng = thread_rng();
@@ -30,6 +31,7 @@ fn bench_one(zip_exp: f64, cache_size_percent: f32) {
 
     let mut lru_hit = 0;
     let mut moka_hit = 0;
+    let mut quick_cache_hit = 0;
     let mut tinyufo_hit = 0;
 
     for _ in 0..ITERATIONS {
@@ -47,6 +49,12 @@ fn bench_one(zip_exp: f64, cache_size_percent: f32) {
             moka.insert(key, ());
         }
 
+        if quick_cache.get(&key).is_some() {
+            quick_cache_hit += 1;
+        } else {
+            quick_cache.insert(key, ());
+        }
+
         if tinyufo.get(&key).is_some() {
             tinyufo_hit += 1;
         } else {
@@ -56,42 +64,46 @@ fn bench_one(zip_exp: f64, cache_size_percent: f32) {
 
     print!("{:.2}%\t\t", lru_hit as f32 / ITERATIONS as f32 * 100.0);
     print!("{:.2}%\t\t", moka_hit as f32 / ITERATIONS as f32 * 100.0);
+    print!(
+        "{:.2}%\t\t",
+        quick_cache_hit as f32 / ITERATIONS as f32 * 100.0
+    );
     println!("{:.2}%", tinyufo_hit as f32 / ITERATIONS as f32 * 100.0);
 }
 
 /*
 cargo bench --bench bench_hit_ratio
 
-zipf & cache size               lru             moka            TinyUFO
-0.90, 0.005                     19.23%          33.46%          33.35%
-0.90, 0.01                      26.21%          37.88%          40.10%
-0.90, 0.05                      45.59%          55.34%          57.81%
-0.90,  0.1                      55.73%          64.22%          66.34%
-0.90, 0.25                      71.18%          77.15%          78.53%
-1.00, 0.005                     31.09%          45.65%          45.13%
-1.00, 0.01                      39.17%          50.69%          52.23%
-1.00, 0.05                      58.73%          66.95%          68.81%
-1.00,  0.1                      67.57%          74.35%          75.93%
-1.00, 0.25                      79.91%          84.34%          85.27%
-1.05, 0.005                     37.68%          51.77%          51.26%
-1.05, 0.01                      46.11%          57.07%          58.41%
-1.05, 0.05                      65.04%          72.33%          73.91%
-1.05,  0.1                      73.11%          78.96%          80.22%
-1.05, 0.25                      83.77%          87.45%          88.16%
-1.10, 0.005                     44.48%          57.86%          57.25%
-1.10, 0.01                      52.97%          63.18%          64.23%
-1.10, 0.05                      70.94%          77.27%          78.57%
-1.10,  0.1                      78.11%          83.05%          84.06%
-1.10, 0.25                      87.08%          90.06%          90.62%
-1.50, 0.005                     85.25%          89.89%          89.68%
-1.50, 0.01                      89.88%          92.79%          92.94%
-1.50, 0.05                      96.04%          97.09%          97.25%
-1.50,  0.1                      97.52%          98.17%          98.26%
-1.50, 0.25                      98.81%          99.09%          99.10%
+zipf & cache size               lru             moka            QuickC          TinyUFO
+0.90, 0.005                     19.24%          33.43%          32.33%          33.35%
+0.90, 0.01                      26.23%          37.86%          38.80%          40.06%
+0.90, 0.05                      45.58%          55.13%          55.71%          57.80%
+0.90,  0.1                      55.72%          64.15%          64.01%          66.36%
+0.90, 0.25                      71.16%          77.12%          75.92%          78.53%
+1.00, 0.005                     31.08%          45.68%          44.07%          45.15%
+1.00, 0.01                      39.17%          50.80%          50.90%          52.30%
+1.00, 0.05                      58.71%          66.92%          67.09%          68.79%
+1.00,  0.1                      67.59%          74.28%          74.00%          75.92%
+1.00, 0.25                      79.94%          84.35%          83.45%          85.28%
+1.05, 0.005                     37.66%          51.78%          50.13%          51.12%
+1.05, 0.01                      46.07%          57.13%          57.07%          58.41%
+1.05, 0.05                      65.06%          72.37%          72.41%          73.93%
+1.05,  0.1                      73.13%          78.97%          78.60%          80.24%
+1.05, 0.25                      83.74%          87.41%          86.68%          88.14%
+1.10, 0.005                     44.49%          57.84%          56.16%          57.28%
+1.10, 0.01                      52.97%          63.19%          62.99%          64.24%
+1.10, 0.05                      70.95%          77.24%          77.26%          78.55%
+1.10,  0.1                      78.05%          82.86%          82.66%          84.01%
+1.10, 0.25                      87.12%          90.10%          89.51%          90.66%
+1.50, 0.005                     85.27%          89.92%          89.08%          89.69%
+1.50, 0.01                      89.86%          92.77%          92.44%          92.94%
+1.50, 0.05                      96.01%          97.08%          96.99%          97.23%
+1.50,  0.1                      97.51%          98.15%          98.08%          98.24%
+1.50, 0.25                      98.81%          99.09%          99.03%          99.09%
  */
 
 fn main() {
-    println!("zipf & cache size\t\tlru\t\tmoka\t\tTinyUFO",);
+    println!("zipf & cache size\t\tlru\t\tmoka\t\tQuickC\t\tTinyUFO",);
     for zif_exp in [0.9, 1.0, 1.05, 1.1, 1.5] {
         for cache_capacity in [0.005, 0.01, 0.05, 0.1, 0.25] {
             bench_one(zif_exp, cache_capacity);
