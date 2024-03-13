@@ -28,6 +28,7 @@ lru = "0"
 zipf = "7"
 moka = { version = "0", features = ["sync"] }
 dhat = "0"
+quick_cache = "0.4"
 
 [[bench]]
 name = "bench_perf"
