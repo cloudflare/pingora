@@ -114,7 +114,7 @@ impl ProxyHttp for MyProxy {
 }
 ```
 
-完整示例可以在 [`pingora-proxy/examples/ctx.rs`](../../pingora-proxy/examples/ctx_zh.rs) 中找到。您可以使用 `cargo` 运行它：
+完整示例可以在 [`pingora-proxy/examples/ctx.rs`](../../pingora-proxy/examples/ctx.rs) 中找到。您可以使用 `cargo` 运行它：
 
 ```bash
 RUST_LOG=INFO cargo run --example ctx

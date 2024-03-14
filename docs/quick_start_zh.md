@@ -322,7 +322,7 @@ RUST_LOG=INFO cargo run -- -c conf.yaml -d -u
 
 这个示例的完整代码可以在这个存储库中找到：
 
-[pingora-proxy/examples/load_balancer.rs](../pingora-proxy/examples/load_balancer_zh.rs)
+[pingora-proxy/examples/load_balancer.rs](../pingora-proxy/examples/load_balancer.rs)
 
 还有其他您可能发现有用的示例在这里：
 
