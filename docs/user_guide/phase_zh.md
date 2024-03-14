@@ -5,7 +5,7 @@ pingora-proxy HTTP 代理框架支持高度可编程的代理行为。这通过�
 
 ## 代理的 HTTP 请求的生命周期
 1. 代理的 HTTP 请求的生命周期从代理从**下游**（即客户端）读取请求标头开始。
-2. 然后，代理连接到**上游**（即远程服务器）。如果有之前建立的[连接可重用](pooling.md)，则跳过此步骤。
+2. 然后，代理连接到**上游**（即远程服务器）。如果有之前建立的[连接可重用](pooling_zh.md)，则跳过此步骤。
 3. 接着，代理将请求标头发送到上游。
 4. 一旦请求标头发送完成，代理进入双工模式，同时代理：
    a. 上游响应（标头和正文）到下游，并
@@ -14,7 +14,7 @@ pingora-proxy HTTP 代理框架支持高度可编程的代理行为。这通过�
 
 ## Pingora-proxy 阶段和过滤器
 Pingora-proxy 允许用户在请求的生命周期中插入任意逻辑。
-\```mermaid
+```mermaid
 graph TD;
 start("新请求")-->request_filter;
 request_filter-->upstream_peer;
@@ -42,10 +42,10 @@ request_filter-->upstream_peer;
 
     Error>任何响应过滤器错误]-->error_while_proxy
     IOFailure>IO 错误]-->error_while_proxy
-\```
+```
 
 ### 通用过滤器使用指南
-* 大多数过滤器返回[`pingora_error::Result<_>`](errors.md)。当返回值为`Result::Err`时，将调用`fail_to_proxy()`并终止请求。
+* 大多数过滤器返回[`pingora_error::Result<_>`](errors_zh.md)。当返回值为`Result::Err`时，将调用`fail_to_proxy()`并终止请求。
 * 大多数过滤器都是异步函数，这允许在过滤器中执行其他异步操作，如 IO。
 * 可以定义每个请求的 `CTX` 对象，以在同一请求的过滤器之间共享状态。所有过滤器对该对象具有可变访问权限。
 * 大多数过滤器是可选的。

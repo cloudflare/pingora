@@ -150,7 +150,7 @@ within     │                     │
 
 `HttpProxy` 结构处理代理的高级工作流程
 
-它使用 `ProxyHttp`（注意顺序颠倒！）**trait** 来允许在以下各步骤进行定制（注意：摘自[phase chart](./phase_chart.md)文档）：
+它使用 `ProxyHttp`（注意顺序颠倒！）**trait** 来允许在以下各步骤进行定制（注意：摘自[phase chart](./phase_chart_zh.md)文档）：
 
 ```mermaid
  graph TD;
