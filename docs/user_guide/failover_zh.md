@@ -16,7 +16,7 @@ Pingora-proxy 允许用户定义如何处理代理请求的失败。
 一般来说，幂等的 HTTP 请求，例如 `GET`，是可以安全重试的。其他请求，例如 `POST`，如果请求已经发送，则不安全重试。当调用 `fail_to_connect()` 时，pingora-proxy 保证未向上游发送任何内容。除非用户足够了解上游服务器以知道是否安全，否则不建议在 `error_while_proxy()` 后重试非幂等请求。
 
 ### 示例
-在以下示例中，我们在 `CTX` 上设置了一个 `tries` 变量来跟踪我们尝试了多少次连接。当在 `upstream_peer` 中设置我们的对等体时，我们检查 `tries` 是否小于一，并连接到 192.0.2.1。在连接失败时，我们在 `fail_to_connect` 中递增 `tries`，并设置 `e.set_retry(true)`，告诉 Pingora 这是一个可重试的错误。在重试时，我们再次进入 `upstream_peer`，这次连接到 1.1.1.1。如果无法连接到 1.1.1.1，我们返回一个 502 错误，因为我们只在 `tries` 为零时在 `fail_to_connect` 中设置了 `e.set_retry(true)`。
+在以下示例中，我们在 `CTX` 上设置了一个 `tries` 变量来跟踪我们尝试了多少次连接。当在 `upstream_peer` 中设置我们的peer时，我们检查 `tries` 是否小于一，并连接到 192.0.2.1。在连接失败时，我们在 `fail_to_connect` 中递增 `tries`，并设置 `e.set_retry(true)`，告诉 Pingora 这是一个可重试的错误。在重试时，我们再次进入 `upstream_peer`，这次连接到 1.1.1.1。如果无法连接到 1.1.1.1，我们返回一个 502 错误，因为我们只在 `tries` 为零时在 `fail_to_connect` 中设置了 `e.set_retry(true)`。
 
 ```Rust
 pub struct MyProxy();

@@ -239,5 +239,5 @@ within     │                     │
 
 ## 多个 peer 怎么办？
 
-`Connectors` 只处理与单个对等体的连接，因此选择多个对等体中的一个实际上是在更高一级的 `ProxyHttp` trait 的 `upstream_peer()` 方法中处理的。
+`Connectors` 只处理与单个peer的连接，因此选择多个peer中的一个实际上是在更高一级的 `ProxyHttp` trait 的 `upstream_peer()` 方法中处理的。
 
