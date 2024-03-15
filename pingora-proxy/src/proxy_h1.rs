@@ -504,8 +504,11 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             HttpTask::Body(data, end) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }
