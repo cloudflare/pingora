@@ -532,7 +532,7 @@ impl HttpSession {
     }
 
     fn init_req_body_writer(&mut self, header: &RequestHeader) {
-        if self.is_upgrade_req() {
+        if is_upgrade_req(header) {
             self.body_writer.init_http10();
         } else {
             self.init_body_writer_comm(&header.headers)
@@ -890,6 +890,26 @@ mod tests_stream {
                 panic!("task should be header")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn init_body_for_upgraded_req() {
+        use crate::protocols::http::v1::body::BodyMode;
+
+        let wire =
+            b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().write(wire).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        new_request.insert_header("Connection", "Upgrade").unwrap();
+        new_request.insert_header("Upgrade", "WS").unwrap();
+        // CL is ignored when Upgrade presents
+        new_request.insert_header("Content-Length", "0").unwrap();
+        let _ = http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
     }
 
     #[tokio::test]
