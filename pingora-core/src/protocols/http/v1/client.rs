@@ -428,31 +428,34 @@ impl HttpSession {
         is_buf_keepalive(self.get_header(header::CONNECTION).map(|v| v.as_bytes()))
     }
 
-    // `Keep-Alive: timeout=5, max=1000` => 5, 1000
+    /// `Keep-Alive: timeout=5, max=1000` => 5, 1000
+    /// This is defined in the below spec, this not part of any RFC, so
+    /// it's behavior is different on different platforms.
+    /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        if let Some(keep_alive_header) = self.get_header("Keep-Alive") {
-            let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
-                return (None, None);
-            };
+        let Some(keep_alive_header) = self.get_header("Keep-Alive") else {
+            return (None, None);
+        };
 
-            let mut timeout = None;
-            let mut max = None;
+        let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
+            return (None, None);
+        };
 
-            for param in header_value.split(',') {
-                let parts: Vec<&str> = param.split('=').map(|s| s.trim()).collect();
-                match &parts.as_slice() {
-                    ["timeout", timeout_value] => {
-                        timeout = timeout_value.trim().parse::<u64>().ok()
-                    }
-                    ["max", max_value] => max = max_value.trim().parse::<usize>().ok(),
-                    _ => {}
+        let mut timeout = None;
+        let mut max = None;
+
+        for param in header_value.split(',') {
+            let mut parts = param.splitn(2, '=').map(|s| s.trim());
+            match (parts.next(), parts.next()) {
+                (Some("timeout"), Some(timeout_value)) => {
+                    timeout = timeout_value.trim().parse().ok()
                 }
+                (Some("max"), Some(max_value)) => max = max_value.trim().parse().ok(),
+                _ => {}
             }
-
-            (timeout, max)
-        } else {
-            (None, None)
         }
+
+        (timeout, max)
     }
 
     /// Close the connection abruptly. This allows to signal the server that the connection is closed
