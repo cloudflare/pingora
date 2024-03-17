@@ -177,13 +177,9 @@ impl std::str::FromStr for SocketAddr {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.starts_with("unix:") {
             let path = s.trim_start_matches("unix:");
-            if path.is_empty() {
-                panic!("empty UDS path");
-            } else {
-                let uds_socket = StdUnixSockAddr::from_pathname(path)
-                    .or_err(crate::BindError, "invalid UDS path")?;
-                Ok(SocketAddr::Unix(uds_socket))
-            }
+            let uds_socket = StdUnixSockAddr::from_pathname(path)
+                .or_err(crate::BindError, "invalid UDS path")?;
+            Ok(SocketAddr::Unix(uds_socket))
         } else {
             match StdSockAddr::from_str(s) {
                 Ok(addr) => Ok(SocketAddr::Inet(addr)),

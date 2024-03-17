@@ -339,12 +339,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_uds_panic() {
-        let _ = "unix:".parse::<SocketAddr>();
-    }
-
-    #[test]
     fn matches_nginx_sample() {
         let upstream_hosts = ["127.0.0.1:7777", "127.0.0.1:7778"];
         let upstream_hosts = upstream_hosts.iter().map(|i| get_sockaddr(i));
