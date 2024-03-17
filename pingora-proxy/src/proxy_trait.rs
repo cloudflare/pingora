@@ -29,7 +29,7 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
-    /// Define where the proxy should sent the request to.
+    /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should
     /// be forwarded to.
