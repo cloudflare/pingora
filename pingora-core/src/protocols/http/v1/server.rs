@@ -110,6 +110,8 @@ impl HttpSession {
     /// Return `Ok(None)` when the client closed the connection without sending any data, which
     /// is common on a reused connection.
     pub async fn read_request(&mut self) -> Result<Option<usize>> {
+        const MAX_ERR_BUF_LEN: usize = 2048;
+
         self.buf.clear();
         let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
         let mut already_read: usize = 0;
@@ -120,7 +122,7 @@ impl HttpSession {
                 this buffer */
                 return Error::e_explain(
                     InvalidHTTPHeader,
-                    format!("Request header larger than {}", MAX_HEADER_SIZE),
+                    format!("Request header larger than {MAX_HEADER_SIZE}"),
                 );
             }
 
@@ -236,18 +238,23 @@ impl HttpSession {
                                 already_read = buf.len();
                             } else {
                                 debug!("Invalid request header from {:?}", self.underlying_stream);
+                                buf.truncate(MAX_ERR_BUF_LEN);
                                 return Error::e_because(
                                     InvalidHTTPHeader,
-                                    format!("buf: {:?}", String::from_utf8_lossy(&buf)),
+                                    format!(
+                                        "buf: {}",
+                                        String::from_utf8_lossy(&buf).escape_default()
+                                    ),
                                     e,
                                 );
                             }
                         }
                         _ => {
                             debug!("Invalid request header from {:?}", self.underlying_stream);
+                            buf.truncate(MAX_ERR_BUF_LEN);
                             return Error::e_because(
                                 InvalidHTTPHeader,
-                                format!("buf: {:?}", String::from_utf8_lossy(&buf)),
+                                format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
                                 e,
                             );
                         }
