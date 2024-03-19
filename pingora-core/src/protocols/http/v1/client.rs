@@ -291,7 +291,7 @@ impl HttpSession {
                 HeaderParseState::Invalid(e) => {
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&buf)),
+                        format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
                         e,
                     );
                 }
