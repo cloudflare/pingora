@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_uds() {
-        let addr = "unix:/tmp/sock".parse::<SocketAddr>().unwrap().to_string();
+        let _ = "unix:/tmp/sock".parse::<SocketAddr>().unwrap().to_string();
 
         assert_eq!(
             "unix:/tmp/sock".parse::<SocketAddr>().unwrap().to_string(),
