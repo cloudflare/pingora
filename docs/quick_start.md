@@ -60,7 +60,7 @@ Any object that implements the `ProxyHttp` trait essentially defines how a reque
 the proxy. The only required method in the `ProxyHttp` trait is `upstream_peer()` which returns
 the address where the request should be proxied to.
 
-In the body of the `upstream_peer()`, let's use the `select()` method for the `LoadBalancer` to round-robin across the upstream IPs. In this example we use HTTPS to connect to the backends, so we also need to specify to `use_tls` and set the SNI when constructing our [`Peer`](peer.md) object.
+In the body of the `upstream_peer()`, let's use the `select()` method for the `LoadBalancer` to round-robin across the upstream IPs. In this example we use HTTPS to connect to the backends, so we also need to specify to `use_tls` and set the SNI when constructing our [`Peer`](user_guide/peer.md) object.
 
 ```rust
 #[async_trait]
