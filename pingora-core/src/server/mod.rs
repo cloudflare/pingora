@@ -16,7 +16,7 @@
 
 pub mod configuration;
 mod daemon;
-pub(crate) mod transfer_fd;
+pub mod transfer_fd;
 
 use daemon::daemonize;
 use log::{debug, error, info};
