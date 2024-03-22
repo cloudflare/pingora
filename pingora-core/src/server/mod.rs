@@ -30,7 +30,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::services::Service;
 use configuration::{Opt, ServerConf};
-use transfer_fd::Fds;
+pub use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
 
@@ -49,7 +49,7 @@ enum ShutdownType {
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
-pub(crate) type ListenFds = Arc<Mutex<Fds>>;
+pub type ListenFds = Arc<Mutex<Fds>>;
 
 /// The server object
 ///
