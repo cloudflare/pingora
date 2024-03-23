@@ -4,7 +4,7 @@ A Pingora configuration file is a list of Pingora settings in yaml format.
 
 Example
 ```yaml
----
+--
 version: 1
 threads: 2
 pid_file: /run/pingora.pid
