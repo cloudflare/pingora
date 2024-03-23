@@ -68,7 +68,7 @@ impl<T, const N: usize> Lru<T, N> {
 
         // Make sure weight is positive otherwise eviction won't work
         // TODO: Probably should use NonZeroUsize instead
-        let weight = if weight == 0 { 1 } else { weight };
+        let weight = weight.max(1);
 
         let old_weight = unit.admit(key, data, weight);
         if old_weight != weight {
