@@ -1,7 +1,8 @@
 use log::info;
 use pingora_ketama::{Bucket, Continuum};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+// use std::net::SocketAddr;
+use pingora_core::protocols::l4::socket::SocketAddr;
 
 // A repository for node healthiness, emulating a health checker.
 struct NodeHealthRepository {
@@ -50,7 +51,7 @@ impl<'a> HealthAwareNodeSelector<'a> {
             }
 
             if self.node_health_repo.node_is_healthy(node) {
-                return Some(*node);
+                return Some(node.clone());
             }
         }
 
@@ -83,9 +84,19 @@ fn main() {
     for i in 0..5 {
         let key = format!("key_{i}");
         match health_aware_selector.try_select(&key) {
-            Some(node) => {
-                info!("{key}: {}:{}", node.ip(), node.port());
-            }
+            Some(node) => match node {
+                SocketAddr::Inet(socket_addr) => {
+                    info!("{key}: {}:{}", socket_addr.ip(), socket_addr.port());
+                }
+                SocketAddr::Unix(uds) => {
+                    if let Some(path) = uds.as_pathname() {
+                        let path_str = path.to_string_lossy();
+                        info!("{key}: {}", path_str);
+                    } else {
+                        info!("{key}: {}", "");
+                    }
+                }
+            },
             None => {
                 info!("{key}: no healthy node found!");
             }

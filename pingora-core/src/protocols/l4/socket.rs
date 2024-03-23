@@ -174,14 +174,20 @@ impl std::str::FromStr for SocketAddr {
     type Err = Box<Error>;
 
     // This is very basic parsing logic, it might treat invalid IP:PORT str as UDS path
-    // TODO: require UDS to have some prefix
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match StdSockAddr::from_str(s) {
-            Ok(addr) => Ok(SocketAddr::Inet(addr)),
-            Err(_) => {
-                let uds_socket = StdUnixSockAddr::from_pathname(s)
-                    .or_err(crate::BindError, "invalid UDS path")?;
-                Ok(SocketAddr::Unix(uds_socket))
+        if s.starts_with("unix:") {
+            let path = s.trim_start_matches("unix:");
+            let uds_socket = StdUnixSockAddr::from_pathname(path)
+                .or_err(crate::BindError, "invalid UDS path")?;
+            Ok(SocketAddr::Unix(uds_socket))
+        } else {
+            match StdSockAddr::from_str(s) {
+                Ok(addr) => Ok(SocketAddr::Inet(addr)),
+                Err(_) => {
+                    let uds_socket = StdUnixSockAddr::from_pathname(s)
+                        .or_err(crate::BindError, "invalid UDS path")?;
+                    Ok(SocketAddr::Unix(uds_socket))
+                }
             }
         }
     }

@@ -32,14 +32,7 @@ impl BackendSelection for KetamaHashing {
     fn build(backends: &BTreeSet<Backend>) -> Self {
         let buckets: Vec<_> = backends
             .iter()
-            .filter_map(|b| {
-                // FIXME: ketama only supports Inet addr, UDS addrs are ignored here
-                if let SocketAddr::Inet(addr) = b.addr {
-                    Some(Bucket::new(addr, b.weight as u32))
-                } else {
-                    None
-                }
-            })
+            .map(|b| Bucket::new(b.addr.clone(), b.weight as u32))
             .collect();
         let new_backends = backends
             .iter()
@@ -67,10 +60,10 @@ pub struct OwnedNodeIterator {
 
 impl BackendIter for OwnedNodeIterator {
     fn next(&mut self) -> Option<&Backend> {
-        self.ring.ring.get_addr(&mut self.idx).and_then(|addr| {
-            let addr = SocketAddr::Inet(*addr);
-            self.ring.backends.get(&addr)
-        })
+        self.ring
+            .ring
+            .get_addr(&mut self.idx)
+            .and_then(|addr| self.ring.backends.get(addr))
     }
 }
 
