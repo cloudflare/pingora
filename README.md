@@ -58,6 +58,17 @@ Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months
 
 Our current MSRV is 1.72.
 
+## Build Requirements
+
+Some of the crates in this repository have dependencies on additional tools and
+libraries that must be satisfied in order to build them:
+
+* Make sure that [Clang] is installed on your system (for boringssl)
+* Make sure that [Perl 5] is installed on your system (for openssl)
+
+[Clang]:https://clang.llvm.org/
+[Perl 5]:https://www.perl.org/
+
 # Contributing
 Please see our [contribution guidelines](./.github/CONTRIBUTING.md).
 
