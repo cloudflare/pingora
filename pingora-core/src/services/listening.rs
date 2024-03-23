@@ -79,7 +79,7 @@ impl<A> Service<A> {
         self.listeners.add_tcp_with_settings(addr, sock_opt);
     }
 
-    /// Add an Unix domain socket listening endpoint with the given path.
+    /// Add a Unix domain socket listening endpoint with the given path.
     ///
     /// Optionally take a permission of the socket file. The default is read and write access for
     /// everyone (0o666).

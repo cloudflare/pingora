@@ -23,7 +23,7 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
-use pingora_core::protocols::Digest;
+use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -38,15 +38,72 @@ use structopt::StructOpt;
 pub struct ExampleProxyHttps {}
 
 #[allow(clippy::upper_case_acronyms)]
+#[derive(Default)]
 pub struct CTX {
     conn_reused: bool,
+    upstream_client_addr: Option<SocketAddr>,
+    upstream_server_addr: Option<SocketAddr>,
+}
+
+// Common logic for both ProxyHttp(s) types
+fn connected_to_upstream_common(
+    reused: bool,
+    digest: Option<&Digest>,
+    ctx: &mut CTX,
+) -> Result<()> {
+    ctx.conn_reused = reused;
+    let socket_digest = digest
+        .expect("upstream connector digest should be set for HTTP sessions")
+        .socket_digest
+        .as_ref()
+        .expect("socket digest should be set for HTTP sessions");
+    ctx.upstream_client_addr = socket_digest.local_addr().cloned();
+    ctx.upstream_server_addr = socket_digest.peer_addr().cloned();
+
+    Ok(())
+}
+
+fn response_filter_common(
+    session: &mut Session,
+    response: &mut ResponseHeader,
+    ctx: &mut CTX,
+) -> Result<()> {
+    if ctx.conn_reused {
+        response.insert_header("x-conn-reuse", "1")?;
+    }
+
+    let client_addr = session.client_addr();
+    let server_addr = session.server_addr();
+    response.insert_header(
+        "x-client-addr",
+        client_addr.map_or_else(|| "unset".into(), |a| a.to_string()),
+    )?;
+    response.insert_header(
+        "x-server-addr",
+        server_addr.map_or_else(|| "unset".into(), |a| a.to_string()),
+    )?;
+
+    response.insert_header(
+        "x-upstream-client-addr",
+        ctx.upstream_client_addr
+            .as_ref()
+            .map_or_else(|| "unset".into(), |a| a.to_string()),
+    )?;
+    response.insert_header(
+        "x-upstream-server-addr",
+        ctx.upstream_server_addr
+            .as_ref()
+            .map_or_else(|| "unset".into(), |a| a.to_string()),
+    )?;
+
+    Ok(())
 }
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttps {
     type CTX = CTX;
     fn new_ctx(&self) -> Self::CTX {
-        CTX { conn_reused: false }
+        CTX::default()
     }
 
     async fn upstream_peer(
@@ -101,17 +158,14 @@ impl ProxyHttp for ExampleProxyHttps {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
-        if ctx.conn_reused {
-            upstream_response.insert_header("x-conn-reuse", "1")?;
-        }
-        Ok(())
+        response_filter_common(session, upstream_response, ctx)
     }
 
     async fn upstream_request_filter(
@@ -119,10 +173,7 @@ impl ProxyHttp for ExampleProxyHttps {
         session: &mut Session,
         req: &mut RequestHeader,
         _ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
+    ) -> Result<()> {
         let host = session.get_header_bytes("host-override");
         if host != b"" {
             req.insert_header("host", host)?;
@@ -136,11 +187,10 @@ impl ProxyHttp for ExampleProxyHttps {
         reused: bool,
         _peer: &HttpPeer,
         _fd: std::os::unix::io::RawFd,
-        _digest: Option<&Digest>,
+        digest: Option<&Digest>,
         ctx: &mut CTX,
     ) -> Result<()> {
-        ctx.conn_reused = reused;
-        Ok(())
+        connected_to_upstream_common(reused, digest, ctx)
     }
 }
 
@@ -148,8 +198,10 @@ pub struct ExampleProxyHttp {}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = CTX;
+    fn new_ctx(&self) -> Self::CTX {
+        CTX::default()
+    }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
@@ -162,6 +214,15 @@ impl ProxyHttp for ExampleProxyHttp {
         }
 
         Ok(false)
+    }
+
+    async fn response_filter(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        response_filter_common(session, upstream_response, ctx)
     }
 
     async fn upstream_peer(
@@ -182,11 +243,23 @@ impl ProxyHttp for ExampleProxyHttp {
             .get("x-port")
             .map_or("8000", |v| v.to_str().unwrap());
         let peer = Box::new(HttpPeer::new(
-            format!("127.0.0.1:{}", port),
+            format!("127.0.0.1:{port}"),
             false,
             "".to_string(),
         ));
         Ok(peer)
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _http_session: &mut Session,
+        reused: bool,
+        _peer: &HttpPeer,
+        _fd: std::os::unix::io::RawFd,
+        digest: Option<&Digest>,
+        ctx: &mut CTX,
+    ) -> Result<()> {
+        connected_to_upstream_common(reused, digest, ctx)
     }
 }
 
@@ -197,12 +270,21 @@ static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 81
 static CACHE_LOCK: Lazy<CacheLock> =
     Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(2)));
 
+// #[allow(clippy::upper_case_acronyms)]
+pub struct CacheCTX {
+    upstream_status: Option<u16>,
+}
+
 pub struct ExampleProxyCache {}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
-    type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    type CTX = CacheCTX;
+    fn new_ctx(&self) -> Self::CTX {
+        CacheCTX {
+            upstream_status: None,
+        }
+    }
 
     async fn upstream_peer(
         &self,
@@ -282,11 +364,22 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(resp_cacheable(cc.as_ref(), resp, false, &CACHE_DEFAULT))
     }
 
+    fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        ctx.upstream_status = Some(upstream_response.status.into());
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
@@ -314,6 +407,9 @@ impl ProxyHttp for ExampleProxyCache {
         }
         if let Some(d) = session.cache.lock_duration() {
             upstream_response.insert_header("x-cache-lock-time-ms", format!("{}", d.as_millis()))?
+        }
+        if let Some(up_stat) = ctx.upstream_status {
+            upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
     }
@@ -389,7 +485,7 @@ impl Server {
     }
 }
 
-// FIXME: this still allows multiple servers to spawn across intergration tests
+// FIXME: this still allows multiple servers to spawn across integration tests
 pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
 use super::mock_origin::MOCK_ORIGIN;
 

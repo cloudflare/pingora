@@ -17,31 +17,31 @@ Pingora is battle tested as it has been serving more than 40 million Internet re
 * Support for a variety of observability tools
 
 ## Reasons to use Pingora
-* **Security** is your top priority: Pingora is a more memory safe alternative for services that are written in C/C++.
-* Your service is **performance-sensitive**: Pingora is fast and efficient.
-* Your service requires extensive **customization**: The APIs Pingora proxy framework provides are highly programmable.
+* **Security** is your top priority: Pingora is a more memory safe alternative for services that are written in C/C++
+* Your service is **performance-sensitive**: Pingora is fast and efficient
+* Your service requires extensive **customization**: The APIs Pingora proxy framework provides are highly programmable
 
 # Getting started
 
 See our [quick starting guide](./docs/quick_start.md) to see how easy it is to build a load balancer.
 
-Our [user guide](./docs/user_guide/index.md) covers more topics such as how to configure and run Pingora servers, as well as how to build custom HTTP server and proxy logic on top of Pingora's framework.
+Our [user guide](./docs/user_guide/index.md) covers more topics such as how to configure and run Pingora servers, as well as how to build custom HTTP servers and proxy logic on top of Pingora's framework.
 
 API docs are also available for all the crates.
 
 # Notable crates in this workspace
-* Pingora: the "public facing" crate to build to build networked systems and proxies.
-* Pingora-core: this crates defined the protocols, functionalities and basic traits.
-* Pingora-proxy: the logic and APIs to build HTTP proxies.
+* Pingora: the "public facing" crate to build networked systems and proxies
+* Pingora-core: this crate defines the protocols, functionalities and basic traits
+* Pingora-proxy: the logic and APIs to build HTTP proxies
 * Pingora-error: the common error type used across Pingora crates
 * Pingora-http: the HTTP header definitions and APIs
 * Pingora-openssl & pingora-boringssl: SSL related extensions and APIs
 * Pingora-ketama: the [Ketama](https://github.com/RJ/ketama) consistent algorithm
 * Pingora-limits: efficient counting algorithms
-* Pingora-load-balancing: load balancing algorithm extensions for pingora proxy
-* Pingora-memory-cache: Async in-memory caching with cache lock to prevent cache stampede.
-* Pingora-timeout: A more efficient async timer system.
-* TinyUfo: The caching algorithm behind pingora-memory-cache.
+* Pingora-load-balancing: load balancing algorithm extensions for pingora-proxy
+* Pingora-memory-cache: Async in-memory caching with cache lock to prevent cache stampede
+* Pingora-timeout: A more efficient async timer system
+* TinyUfo: The caching algorithm behind pingora-memory-cache
 
 # System requirements
 

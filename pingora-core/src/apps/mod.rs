@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::protocols::http::v2::server;
 use crate::protocols::http::ServerSession;
+use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
 
@@ -91,6 +92,15 @@ where
     ) -> Option<Stream> {
         match stream.selected_alpn_proto() {
             Some(ALPN::H2) => {
+                // create a shared connection digest
+                let digest = Arc::new(Digest {
+                    ssl_digest: stream.get_ssl_digest(),
+                    // TODO: log h2 handshake time
+                    timing_digest: stream.get_timing_digest(),
+                    proxy_digest: stream.get_proxy_digest(),
+                    socket_digest: stream.get_socket_digest(),
+                });
+
                 let h2_options = self.h2_options();
                 let h2_conn = server::handshake(stream, h2_options).await;
                 let mut h2_conn = match h2_conn {
@@ -100,10 +110,12 @@ where
                     }
                     Ok(c) => c,
                 };
+
                 loop {
                     // this loop ends when the client decides to close the h2 conn
                     // TODO: add a timeout?
-                    let h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn).await;
+                    let h2_stream =
+                        server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
                     let h2_stream = match h2_stream {
                         Err(e) => {
                             // It is common for client to just disconnect TCP without properly

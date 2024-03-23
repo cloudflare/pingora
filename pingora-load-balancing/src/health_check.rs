@@ -34,7 +34,7 @@ pub trait HealthCheck {
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
-    /// number of check need to to flip from unhealthy to healthy.
+    /// number of check need to flip from unhealthy to healthy.
     fn health_threshold(&self, success: bool) -> usize;
 }
 
@@ -52,7 +52,7 @@ pub struct TcpHealthCheck {
     /// The SocketAddr of `peer_template` is just a placeholder which will be replaced by the
     /// actual address of the backend when the health check runs.
     ///
-    /// By default this check will try to establish a TCP connection. When the the `sni` field is
+    /// By default this check will try to establish a TCP connection. When the `sni` field is
     /// set, it will also try to establish a TLS connection on top of the TCP connection.
     pub peer_template: BasicPeer,
     connector: TransportConnector,

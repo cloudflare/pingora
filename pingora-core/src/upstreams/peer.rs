@@ -119,7 +119,7 @@ pub trait Peer: Display + Clone {
             None => None,
         }
     }
-    /// How long the overall connection establishment should take before  a timeout error is returned.
+    /// How long the overall connection establishment should take before a timeout error is returned.
     fn total_connection_timeout(&self) -> Option<Duration> {
         match self.get_peer_options() {
             Some(opt) => opt.total_connection_timeout,

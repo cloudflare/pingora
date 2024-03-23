@@ -312,7 +312,7 @@ impl BodyReader {
                 } else {
                     if expecting_from_io > 0 {
                         trace!(
-                            "parital chunk playload, expecting_from_io: {}, \
+                            "partial chunk payload, expecting_from_io: {}, \
                                 existing_buf_end {}, buf: {:?}",
                             expecting_from_io,
                             existing_buf_end,
@@ -644,7 +644,6 @@ impl BodyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::BufRef;
     use tokio_test::io::Builder;
 
     fn init_log() {

@@ -147,7 +147,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_timeout() {

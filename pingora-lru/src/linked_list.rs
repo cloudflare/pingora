@@ -74,7 +74,7 @@ impl Nodes {
         };
         // Constrain the growth of vec: vec always double its capacity when it needs to grow
         // It could waste too much memory when it is already very large.
-        // Here we limit the memory waste to 10% onces it grows beyond the cap.
+        // Here we limit the memory waste to 10% once it grows beyond the cap.
         // The amortized growth cost is O(n) beyond the max of the initial reserved capacity and
         // the cap. But this list is for limited sized LRU and we recycle released node, so
         // hopefully insertions are rare beyond certain sizes

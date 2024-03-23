@@ -20,6 +20,10 @@ use reqwest::{header, StatusCode};
 
 use utils::server_utils::init;
 
+fn is_specified_port(port: u16) -> bool {
+    (1..65535).contains(&port)
+}
+
 #[tokio::test]
 async fn test_origin_alive() {
     init();
@@ -36,8 +40,27 @@ async fn test_simple_proxy() {
     init();
     let res = reqwest::get("http://127.0.0.1:6147").await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6147");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8000");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
@@ -53,8 +76,28 @@ async fn test_h2_to_h1() {
     let res = client.get("https://127.0.0.1:6150").send().await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6150");
+
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8443");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
@@ -75,8 +118,27 @@ async fn test_h2_to_h2() {
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
+
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6150");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8443");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }
@@ -159,7 +221,21 @@ async fn test_simple_proxy_uds() {
 
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let (resp, body) = res.into_parts();
-    assert_eq!(resp.headers[header::CONTENT_LENGTH], "13");
+
+    let headers = &resp.headers;
+    assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "/tmp/pingora_proxy.sock");
+    assert_eq!(headers["x-client-addr"], "unset"); // unnamed UDS
+
+    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8000");
+    let sockaddr = headers["x-upstream-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
+    assert!(is_specified_port(sockaddr.port()));
+
     let body = hyper::body::to_bytes(body).await.unwrap();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
@@ -168,15 +244,30 @@ async fn test_simple_proxy_uds() {
 async fn test_simple_proxy_uds_peer() {
     init();
     let client = reqwest::Client::new();
+
     let res = client
         .get("http://127.0.0.1:6147")
         .header("x-uds-peer", "1") // force upstream peer to be UDS
         .send()
         .await
         .unwrap();
+
     assert_eq!(res.status(), StatusCode::OK);
-    let headers = res.headers();
+
+    let headers = &res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers["x-server-addr"], "127.0.0.1:6147");
+    let sockaddr = headers["x-client-addr"]
+        .to_str()
+        .unwrap()
+        .parse::<std::net::SocketAddr>()
+        .unwrap();
+    assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
+    assert!(is_specified_port(sockaddr.port()));
+
+    assert_eq!(headers["x-upstream-client-addr"], "unset"); // unnamed UDS
+    assert_eq!(headers["x-upstream-server-addr"], "/tmp/nginx-test.sock");
+
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
 }

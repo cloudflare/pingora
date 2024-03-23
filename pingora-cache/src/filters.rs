@@ -16,12 +16,12 @@
 
 use super::*;
 use crate::cache_control::{CacheControl, Cacheable, InterpretCacheControl};
-use crate::{RespCacheable, RespCacheable::*};
+use crate::RespCacheable::*;
 
 use http::{header, HeaderValue};
 use httpdate::HttpDate;
 use log::warn;
-use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_http::RequestHeader;
 
 /// Decide if the request can be cacheable
 pub fn request_cacheable(req_header: &ReqHeader) -> bool {
@@ -187,7 +187,7 @@ pub mod upstream {
         // remove downstream range header as we'd like to cache the entire response (this might change in the future)
         req.remove_header(&header::RANGE);
 
-        // we have a persumably staled response already, add precondition headers for revalidation
+        // we have a presumably staled response already, add precondition headers for revalidation
         if let Some(m) = meta {
             // rfc7232: "SHOULD send both validators in cache validation" but
             // there have been weird cases that an origin has matching etag but not Last-Modified
@@ -206,6 +206,7 @@ pub mod upstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RespCacheable::Cacheable;
     use http::header::{HeaderName, CACHE_CONTROL, EXPIRES, SET_COOKIE};
     use http::StatusCode;
     use httpdate::fmt_http_date;

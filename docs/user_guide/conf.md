@@ -27,7 +27,7 @@ group: webusers
 | client_bind_to_ipv6 | source IPv6 addresses to bind to when connecting to server| list of string |
 | ca_file | The path to the root CA file | string |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
-| upstream_keepalive_pool_size | The number of total connections to keep in the connetion pool | number |
+| upstream_keepalive_pool_size | The number of total connections to keep in the connection pool | number |
 
 ## Extension
 Any unknown settings will be ignored. This allows extending the conf file to add and pass user defined settings. See User defined configuration section.

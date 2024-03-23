@@ -115,7 +115,7 @@ impl Listeners {
         listeners
     }
 
-    /// Create a new [`Listeners`] with with a TLS (TCP) endpoint with the given address string,
+    /// Create a new [`Listeners`] with a TLS (TCP) endpoint with the given address string,
     /// and path to the certificate/private key pairs.
     /// This endpoint will adopt the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29)
     /// server side TLS settings.
