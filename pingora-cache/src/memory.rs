@@ -526,7 +526,7 @@ mod test {
         assert!(cache.temp.read().contains_key(&hash));
 
         let result = cache.purge(&key, &Span::inactive().handle()).await;
-        assert!(result.unwrap());
+        assert!(result.is_ok());
 
         assert!(!cache.temp.read().contains_key(&hash));
     }
