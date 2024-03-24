@@ -307,6 +307,8 @@ impl Storage for MemCache {
     }
 
     async fn purge(&'static self, key: &CompactCacheKey, _trace: &SpanHandle) -> Result<bool> {
+        // This usually purges the primary key because, without a lookup, variance key is usually
+        // empty
         let hash = key.combined();
         let temp_removed = self.temp.write().remove(&hash).is_some();
         let cache_removed = self.cached.write().remove(&hash).is_some();
