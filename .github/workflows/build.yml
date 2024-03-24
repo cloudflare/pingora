@@ -1,0 +1,52 @@
+on: [push, pull_request]
+
+name: build
+
+jobs:
+  pingora:
+    strategy:
+      matrix:
+        # TODO: add nightly
+        toolchain: [stable]
+    runs-on: ubuntu-latest
+    # Only run on "pull_request" event for external PRs. This is to avoid
+    # duplicate builds for PRs created from internal branches.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends
+          # openresty is used for convenience in tests as a server.
+          wget -O - https://openresty.org/package/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openresty.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/openresty.list > /dev/null
+          sudo apt update
+          sudo apt install -y openresty --no-install-recommends
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo test
+        run: cargo test --verbose --lib --bins --tests --no-fail-fast
+
+      # Need to run doc tests separately.
+      # (https://github.com/rust-lang/cargo/issues/6669)
+      - name: Run cargo doc test
+        run: cargo test --verbose --doc
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets --all -- --deny=warnings
+
+      - name: Run cargo audit
+        uses: actions-rust-lang/audit@v1

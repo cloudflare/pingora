@@ -13,14 +13,12 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{
-    key::HashBinary, CacheKey, CacheMeta, NoCacheReason, RespCacheable, RespCacheable::*,
-};
+use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
 
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
-/// paticular stage (if applicable).
+/// particular stage (if applicable).
 ///
 /// If any of the filters returns [Result::Err], the request will fail and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
@@ -160,7 +158,9 @@ pub trait ProxyHttp {
     ///
     /// The modification is before caching so any change here will be stored in cache if enabled.
     ///
-    /// Responses served from cache won't trigger this filter.
+    /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
+    /// only the 304 from upstream will trigger the filter (though it will be merged into the
+    /// cached header, not served directly to downstream).
     fn upstream_response_filter(
         &self,
         _session: &mut Session,
@@ -264,7 +264,7 @@ pub trait ProxyHttp {
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
     /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    /// avaliable.
+    /// available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,

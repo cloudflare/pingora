@@ -85,7 +85,7 @@ impl<SV> HttpProxy<SV> {
                     if let Some((mut meta, handler)) = res {
                         // vary logic
                         // because this branch can be called multiple times in a loop, and we only
-                        // need to to update the vary once, check if variance is already set to
+                        // need to update the vary once, check if variance is already set to
                         // prevent unnecessary vary lookups
                         let cache_key = session.cache.cache_key();
                         if let Some(variance) = cache_key.variance_bin() {
@@ -220,7 +220,7 @@ impl<SV> HttpProxy<SV> {
                 }
                 Err(e) => {
                     // Allow cache miss to fill cache even if cache lookup errors
-                    // this is mostly to suppport backward incompatible metadata update
+                    // this is mostly to support backward incompatible metadata update
                     // TODO: check error types
                     // session.cache.disable();
                     self.inner.cache_miss(session, ctx);
@@ -280,7 +280,7 @@ impl<SV> HttpProxy<SV> {
             Err(e) => {
                 // TODO: more logging and error handling
                 session.as_mut().respond_error(500).await;
-                // we have not write anything dirty to downstream, it is still reuseable
+                // we have not write anything dirty to downstream, it is still reusable
                 return (true, Some(e));
             }
         }
@@ -505,6 +505,8 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Header(resp, _eos) => {
                 if resp.status == StatusCode::NOT_MODIFIED {
                     if session.cache.maybe_cache_meta().is_some() {
+                        // run upstream response filters on upstream 304 first
+                        self.inner.upstream_response_filter(session, resp, ctx);
                         // 304 doesn't contain all the headers, merge 304 into cached 200 header
                         // in order for response_cache_filter to run correctly
                         let merged_header = session.cache.revalidate_merge_header(resp);
@@ -525,11 +527,10 @@ impl<SV> HttpProxy<SV> {
                                     meta.set_variance(old_variance);
                                 }
                                 if let Err(e) = session.cache.revalidate_cache_meta(meta).await {
-                                    warn!("revalidate_cache_meta failed {:?}", e);
+                                    // Fail open: we can continue use the revalidated response even
+                                    // if the meta failed to write to storage
+                                    warn!("revalidate_cache_meta failed {e:?}");
                                 }
-                                // We can continue use the revalidated one even the meta was failed
-                                // to write to storage
-                                true
                             }
                             Ok(Uncacheable(reason)) => {
                                 // This response was once cacheable, and upstream tells us it has not changed
@@ -544,17 +545,24 @@ impl<SV> HttpProxy<SV> {
                                 // (downstream may have a different cacheability assessment and could cache the 304)
 
                                 //TODO: log more
-                                warn!("Uncacheable {:?} 304 received", reason);
+                                warn!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
                                 session.cache.revalidate_uncacheable(merged_header, reason);
-                                true
                             }
                             Err(e) => {
-                                warn!("Error {:?} response_cache_filter during revalidation, disable caching", e);
-                                session.cache.disable(NoCacheReason::InternalError);
-                                false
+                                // Error during revalidation, similarly to the reasons above
+                                // (avoid poisoning downstream cache with passthrough 304),
+                                // allow serving the stored response without updating cache
+                                warn!("Error {e:?} response_cache_filter during revalidation");
+                                session.cache.revalidate_uncacheable(
+                                    merged_header,
+                                    NoCacheReason::InternalError,
+                                );
+                                // Assume the next 304 may succeed, so don't mark uncacheable
                             }
                         }
+                        // always serve from cache after receiving the 304
+                        true
                     } else {
                         //TODO: log more
                         warn!("304 received without cached asset, disable caching");
@@ -716,7 +724,7 @@ pub(crate) mod range_filter {
     use http::header::*;
     use std::ops::Range;
 
-    // parse bytes into usize, ignores specifc error
+    // parse bytes into usize, ignores specific error
     fn parse_number(input: &[u8]) -> Option<usize> {
         str::from_utf8(input).ok()?.parse().ok()
     }
@@ -726,7 +734,7 @@ pub(crate) mod range_filter {
 
         // single byte range only for now
         // https://datatracker.ietf.org/doc/html/rfc7233#section-2.1
-        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case insensitive
+        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case-insensitive
         static RE_SINGLE_RANGE: Lazy<Regex> =
             Lazy::new(|| Regex::new(r"(?i)bytes=(?P<start>\d*)-(?P<end>\d*)").unwrap());
 

@@ -16,10 +16,12 @@ use log::debug;
 use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
 use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
+use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{connect as tcp_connect, connect_uds, set_tcp_keepalive};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
+use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
 
 /// Establish a connection (l4) to the given peer using its settings and an optional bind address.
@@ -32,7 +34,8 @@ where
             .await
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
-    let mut stream: Stream = match peer.address() {
+    let peer_addr = peer.address();
+    let mut stream: Stream = match peer_addr {
         SocketAddr::Inet(addr) => {
             let connect_future = tcp_connect(addr, bind_to.as_ref());
             let conn_res = match peer.connection_timeout() {
@@ -97,6 +100,14 @@ where
     }
 
     stream.set_nodelay()?;
+
+    let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
+    digest
+        .peer_addr
+        .set(Some(peer_addr.clone()))
+        .expect("newly created OnceCell must be empty");
+    stream.set_socket_digest(digest);
+
     Ok(stream)
 }
 

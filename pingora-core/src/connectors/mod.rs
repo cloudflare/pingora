@@ -263,7 +263,7 @@ impl TransportConnector {
 }
 
 // Perform the actual L4 and tls connection steps while respecting the peer's
-// connection timeout if there one
+// connection timeout if there is one
 async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<SocketAddr>,
@@ -360,9 +360,9 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 #[cfg(test)]
 mod tests {
     use pingora_error::ErrorType;
-    use pingora_openssl::ssl::SslMethod;
 
     use super::*;
+    use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
 
     // 192.0.2.1 is effectively a black hole
@@ -427,7 +427,7 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some system will allow the socket to bind and connect without error, only to timeout
+        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
         assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
     }
 

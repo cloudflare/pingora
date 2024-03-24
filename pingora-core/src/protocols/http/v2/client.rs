@@ -30,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use crate::connectors::http::v2::ConnectionRef;
-use crate::protocols::Digest;
+use crate::protocols::{Digest, SocketAddr};
 
 pub const PING_TIMEDOUT: ErrorType = ErrorType::new("PingTimedout");
 
@@ -308,6 +308,24 @@ impl Http2Session {
     /// The caller should check if the connection is reused to avoid misuse the timing field
     pub fn digest(&self) -> Option<&Digest> {
         Some(self.conn.digest())
+    }
+
+    /// Return the server (peer) address recorded in the connection digest.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.conn
+            .digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.peer_addr())?
+    }
+
+    /// Return the client (local) address recorded in the connection digest.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.conn
+            .digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.local_addr())?
     }
 
     /// the FD of the underlying connection

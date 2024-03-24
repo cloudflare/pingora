@@ -255,9 +255,9 @@ enum Algorithm {
     Gzip,
     Brotli,
     Zstd,
-    // TODO: Identify,
+    // TODO: Identity,
     // TODO: Deflate
-    Other, // anyting unknown
+    Other, // anything unknown
 }
 
 impl Algorithm {
@@ -322,7 +322,7 @@ enum Action {
     Decompress(Algorithm),
 }
 
-// parse Accpet-Encoding header and put it to the list
+// parse Accept-Encoding header and put it to the list
 fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut Vec<Algorithm>) {
     // https://www.rfc-editor.org/rfc/rfc9110#name-accept-encoding
     if let Some(ac) = accept_encoding {
@@ -339,7 +339,7 @@ fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut
                         if let Some(s) = i.bare_item.as_token() {
                             // TODO: support q value
                             let algorithm = Algorithm::from(s);
-                            // ignore algorithms that we don't understand ingore
+                            // ignore algorithms that we don't understand ignore
                             if algorithm != Algorithm::Other {
                                 list.push(Algorithm::from(s));
                             }
@@ -400,7 +400,7 @@ fn decide_action(resp: &ResponseHeader, accept_encoding: &[Algorithm]) -> Action
             Some(Algorithm::Other)
         }
     } else {
-        // no Accpet-encoding
+        // no Accept-encoding
         None
     };
 
@@ -582,7 +582,7 @@ fn test_adjust_response_header() {
         header.headers.get("content-length").unwrap().as_bytes(),
         b"20"
     );
-    assert!(header.headers.get("transfor-encoding").is_none());
+    assert!(header.headers.get("transfer-encoding").is_none());
 
     // decompress gzip
     let mut header = ResponseHeader::build(200, None).unwrap();

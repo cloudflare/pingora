@@ -18,7 +18,6 @@ use super::*;
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_ketama::{Bucket, Continuum};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Weighted Ketama consistent hashing
 pub struct KetamaHashing {

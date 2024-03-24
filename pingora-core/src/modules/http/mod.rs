@@ -30,7 +30,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The trait a HTTP traffic module needs to implement
+/// The trait an HTTP traffic module needs to implement
 // TODO: * async filters for, e.g., 3rd party auth server; * access the connection for, e.g., GeoIP
 pub trait HttpModule {
     fn request_header_filter(&mut self, _req: &mut RequestHeader) -> Result<()> {
@@ -86,7 +86,7 @@ impl HttpModules {
     ///
     /// Each type of [HttpModule] can be only added once.
     /// # Panic
-    /// Panic if any [HttpModule] is added more tha once.
+    /// Panic if any [HttpModule] is added more than once.
     pub fn add_module(&mut self, builder: ModuleBuilder) {
         if self.module_index.get().is_some() {
             // We use a shared module_index the index would be out of sync if we
@@ -135,7 +135,7 @@ pub struct HttpModuleCtx {
 }
 
 impl HttpModuleCtx {
-    /// Create an placeholder empty [HttpModuleCtx].
+    /// Create a placeholder empty [HttpModuleCtx].
     ///
     /// [HttpModules] should be used to create nonempty [HttpModuleCtx].
     pub fn empty() -> Self {
@@ -145,7 +145,7 @@ impl HttpModuleCtx {
         }
     }
 
-    /// Get a ref to  [HttpModule] if any.
+    /// Get a ref to [HttpModule] if any.
     pub fn get<T: 'static>(&self) -> Option<&T> {
         let idx = self.module_index.get(&TypeId::of::<T>())?;
         let ctx = &self.module_ctx[*idx];
@@ -156,7 +156,7 @@ impl HttpModuleCtx {
         )
     }
 
-    /// Get a mut ref to  [HttpModule] if any.
+    /// Get a mut ref to [HttpModule] if any.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
         let idx = self.module_index.get(&TypeId::of::<T>())?;
         let ctx = &mut self.module_ctx[*idx];
