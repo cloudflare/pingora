@@ -17,7 +17,7 @@ name = "pingora_cache"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-core = { version = "0.1.0", path = "../pingora-core", default-features = false }
 pingora-error = { version = "0.1.0", path = "../pingora-error" }
 pingora-header-serde = { version = "0.1.0", path = "../pingora-header-serde" }
 pingora-http = { version = "0.1.0", path = "../pingora-http" }
@@ -62,3 +62,8 @@ harness = false
 [[bench]]
 name = "lru_serde"
 harness = false
+
+[features]
+default = ["openssl"]
+openssl = ["pingora-core/openssl"]
+boringssl = ["pingora-core/boringssl"]
