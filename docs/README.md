@@ -1,7 +1,7 @@
 # Pingora User Manual
 
 ## Quick Start
-In this section we show you how to build a barebones load balancer.
+In this section we show you how to build a bare-bones load balancer.
 
 [Read the quick start here.](quick_start.md)
 
