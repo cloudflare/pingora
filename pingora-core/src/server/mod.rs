@@ -302,15 +302,25 @@ impl Server {
         let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
 
         if matches!(shutdown_type, ShutdownType::Graceful) {
-            info!("Graceful shutdown: grace period {}s starts", EXIT_TIMEOUT);
-            thread::sleep(Duration::from_secs(EXIT_TIMEOUT));
+            let exit_timeout = self
+                .configuration
+                .as_ref()
+                .grace_period_seconds
+                .unwrap_or(EXIT_TIMEOUT);
+            info!("Graceful shutdown: grace period {}s starts", exit_timeout);
+            thread::sleep(Duration::from_secs(exit_timeout));
             info!("Graceful shutdown: grace period ends");
         }
 
         // Give tokio runtimes time to exit
         let shutdown_timeout = match shutdown_type {
             ShutdownType::Quick => Duration::from_secs(0),
-            ShutdownType::Graceful => Duration::from_secs(5),
+            ShutdownType::Graceful => Duration::from_secs(
+                self.configuration
+                    .as_ref()
+                    .graceful_shutdown_timeout_seconds
+                    .unwrap_or(5),
+            ),
         };
         let shutdowns: Vec<_> = runtimes
             .into_iter()

@@ -60,6 +60,10 @@ pub struct ServerConf {
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
+    /// Grace period in seconds before starting the final step of the graceful shutdown after signaling shutdown.
+    pub grace_period_seconds: Option<u64>,
+    /// Timeout in seconds of the final step for the graceful shutdown.
+    pub graceful_shutdown_timeout_seconds: Option<u64>,
     // These options don't belong here as they are specific to certain services
     pub(crate) client_bind_to_ipv4: Vec<String>,
     pub(crate) client_bind_to_ipv6: Vec<String>,
@@ -86,6 +90,8 @@ impl Default for ServerConf {
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            grace_period_seconds: None,
+            graceful_shutdown_timeout_seconds: None,
         }
     }
 }
@@ -227,6 +233,8 @@ mod tests {
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            grace_period_seconds: None,
+            graceful_shutdown_timeout_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
