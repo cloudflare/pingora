@@ -233,6 +233,8 @@ mod tests {
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            grace_period_seconds: None,
+            graceful_shutdown_timeout_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
