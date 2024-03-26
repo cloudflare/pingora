@@ -371,7 +371,7 @@ async fn wait_for_shutdown_signal() -> ShutdownSignal {
     #[cfg(unix)]
     let sig_quit = async {
         unix::signal(unix::SignalKind::quit())
-            .expect("Failed to create SIGTERM listener.")
+            .expect("Failed to create SIGQUIT listener.")
             .recv()
             .await;
     };
