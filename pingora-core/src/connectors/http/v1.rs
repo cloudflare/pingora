@@ -65,6 +65,7 @@ impl Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::HttpPeer;
     use pingora_http::RequestHeader;
 
@@ -85,6 +86,8 @@ mod tests {
         let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
         // make a new connection to 1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
+        let server_addr = http.server_addr().unwrap();
+        assert_eq!(*server_addr, "1.1.1.1:80".parse::<SocketAddr>().unwrap());
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse
@@ -104,6 +107,8 @@ mod tests {
         let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // make a new connection to https://1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
+        let server_addr = http.server_addr().unwrap();
+        assert_eq!(*server_addr, "1.1.1.1:443".parse::<SocketAddr>().unwrap());
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse

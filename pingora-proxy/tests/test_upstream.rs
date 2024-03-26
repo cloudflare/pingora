@@ -135,7 +135,7 @@ async fn test_ws_server_ends_conn() {
 
 mod test_cache {
     use super::*;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_basic_caching() {

@@ -20,8 +20,7 @@ use http::header::HeaderName;
 use http::HeaderValue;
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
-use pingora_error::{Error, ErrorType, Result};
-use pingora_http::ResponseHeader;
+use pingora_error::{Error, ErrorType};
 use regex::bytes::Regex;
 use std::num::IntErrorKind;
 use std::slice;
@@ -434,7 +433,6 @@ pub trait InterpretCacheControl {
 mod tests {
     use super::*;
     use http::header::CACHE_CONTROL;
-    use http::HeaderValue;
     use http::{request, response};
 
     fn build_response(cc_key: HeaderName, cc_value: &str) -> response::Parts {

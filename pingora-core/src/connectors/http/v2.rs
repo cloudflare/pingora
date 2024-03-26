@@ -369,6 +369,7 @@ async fn handshake(
         // TODO: log h2 handshake time
         timing_digest: stream.get_timing_digest(),
         proxy_digest: stream.get_proxy_digest(),
+        socket_digest: stream.get_socket_digest(),
     };
     // TODO: make these configurable
     let (send_req, connection) = Builder::new()

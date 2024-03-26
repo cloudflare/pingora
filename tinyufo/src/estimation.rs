@@ -39,6 +39,11 @@ impl Estimator {
         Self::new(hashes, slots)
     }
 
+    fn compact(items: usize) -> Self {
+        let (slots, hashes) = Self::optimal_paras(items / 100);
+        Self::new(hashes, slots)
+    }
+
     /// Create a new `Estimator` with the given amount of hashes and columns (slots).
     pub fn new(hashes: usize, slots: usize) -> Self {
         let mut estimator = Vec::with_capacity(hashes);
@@ -142,6 +147,15 @@ impl TinyLfu {
     pub fn new(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::optimal(cache_size),
+            window_counter: Default::default(),
+            // 8x: just a heuristic to balance the memory usage and accuracy
+            window_limit: cache_size * 8,
+        }
+    }
+
+    pub fn new_compact(cache_size: usize) -> Self {
+        Self {
+            estimator: Estimator::compact(cache_size),
             window_counter: Default::default(),
             // 8x: just a heuristic to balance the memory usage and accuracy
             window_limit: cache_size * 8,

@@ -15,7 +15,6 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use http::Version;
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_1to1(

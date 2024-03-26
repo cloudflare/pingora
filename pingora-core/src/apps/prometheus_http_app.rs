@@ -15,7 +15,7 @@
 //! An HTTP application that reports Prometheus metrics.
 
 use async_trait::async_trait;
-use http::{self, Response};
+use http::Response;
 use prometheus::{Encoder, TextEncoder};
 
 use super::http_app::HttpServer;

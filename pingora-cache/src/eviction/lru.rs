@@ -233,7 +233,6 @@ impl<const N: usize> EvictionManager for Manager<N> {
 mod test {
     use super::*;
     use crate::CacheKey;
-    use EvictionManager;
 
     // we use shard (N) = 1 for eviction consistency in all tests
 
