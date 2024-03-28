@@ -18,6 +18,7 @@ use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use pingora_cache::{HitStatus, RespCacheable::*};
+use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 
@@ -256,8 +257,22 @@ impl<SV> HttpProxy<SV> {
 
         let req = session.req_header();
 
-        let header_only = conditional_filter::not_modified_filter(req, &mut header)
-            || req.method == http::method::Method::HEAD;
+        let not_modified = match self.inner.cache_not_modified_filter(session, &header, ctx) {
+            Ok(not_modified) => not_modified,
+            Err(e) => {
+                // fail open if cache_not_modified_filter errors,
+                // just return the whole original response
+                warn!(
+                    "Failed to run cache not modified filter: {e}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
+                false
+            }
+        };
+        if not_modified {
+            to_304(&mut header);
+        }
+        let header_only = not_modified || req.method == http::method::Method::HEAD;
 
         // process range header if the cache storage supports seek
         let range_type = if seekable && !session.ignore_downstream_range {
@@ -329,6 +344,51 @@ impl<SV> HttpProxy<SV> {
                 (true, None)
             }
             Err(e) => (false, Some(e)),
+        }
+    }
+
+    /* Downstream revalidation, only needed when cache is on because otherwise origin
+     * will handle it */
+    pub(crate) fn downstream_response_conditional_filter(
+        &self,
+        use_cache: &mut ServeFromCache,
+        session: &Session,
+        resp: &mut ResponseHeader,
+        ctx: &mut SV::CTX,
+    ) where
+        SV: ProxyHttp,
+    {
+        // TODO: range
+        let req = session.req_header();
+
+        let not_modified = match self.inner.cache_not_modified_filter(session, resp, ctx) {
+            Ok(not_modified) => not_modified,
+            Err(e) => {
+                // fail open if cache_not_modified_filter errors,
+                // just return the whole original response
+                warn!(
+                    "Failed to run cache not modified filter: {e}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
+                false
+            }
+        };
+
+        if not_modified {
+            to_304(resp);
+        }
+        let header_only = not_modified || req.method == http::method::Method::HEAD;
+        if header_only {
+            if use_cache.is_on() {
+                // tell cache to stop after yielding header
+                use_cache.enable_header_only();
+            } else {
+                // headers only during cache miss, upstream should continue send
+                // body to cache, `session` will ignore body automatically because
+                // of the signature of `header` (304)
+                // TODO: we should drop body before/within this filter so that body
+                // filter only runs on data downstream sees
+            }
         }
     }
 
@@ -1022,72 +1082,6 @@ pub(crate) mod range_filter {
     }
 }
 
-// https://datatracker.ietf.org/doc/html/rfc7232
-// Strictly speaking this module is also usable for web server, not just proxy
-mod conditional_filter {
-    use super::*;
-    use http::header::*;
-
-    // return if 304 is applied to the response
-    pub fn not_modified_filter(req: &RequestHeader, resp: &mut ResponseHeader) -> bool {
-        // https://datatracker.ietf.org/doc/html/rfc7232#section-4.1
-        // 304 can only validate 200
-        if resp.status != StatusCode::OK {
-            return false;
-        }
-
-        // TODO: If-Match and if If-Unmodified-Since
-
-        // https://datatracker.ietf.org/doc/html/rfc7232#section-6
-
-        if let Some(inm) = req.headers.get(IF_NONE_MATCH) {
-            if let Some(etag) = resp.headers.get(ETAG) {
-                if validate_etag(inm.as_bytes(), etag.as_bytes()) {
-                    to_304(resp);
-                    return true;
-                }
-            }
-            // MUST ignore If-Modified-Since if the request contains an If-None-Match header
-            return false;
-        }
-
-        // TODO: GET/HEAD only https://datatracker.ietf.org/doc/html/rfc7232#section-3.3
-        if let Some(since) = req.headers.get(IF_MODIFIED_SINCE) {
-            if let Some(last) = resp.headers.get(LAST_MODIFIED) {
-                if test_not_modified(since.as_bytes(), last.as_bytes()) {
-                    to_304(resp);
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn validate_etag(input_etag: &[u8], target_etag: &[u8]) -> bool {
-        // https://datatracker.ietf.org/doc/html/rfc7232#section-3.2 unsafe method only
-        if input_etag == b"*" {
-            return true;
-        }
-        // TODO: etag validation: https://datatracker.ietf.org/doc/html/rfc7232#section-2.3.2
-        input_etag == target_etag
-    }
-
-    fn test_not_modified(input_time: &[u8], last_modified_time: &[u8]) -> bool {
-        // TODO: http-date comparison: https://datatracker.ietf.org/doc/html/rfc7232#section-2.2.2
-        input_time == last_modified_time
-    }
-
-    fn to_304(resp: &mut ResponseHeader) {
-        // https://datatracker.ietf.org/doc/html/rfc7232#section-4.1
-        // XXX: https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.2
-        // "A server may send content-length in 304", but no common web server does it
-        // So we drop both content-length and content-type for consistency/less surprise
-        resp.set_status(StatusCode::NOT_MODIFIED).unwrap();
-        resp.remove_header(&CONTENT_LENGTH);
-        resp.remove_header(&CONTENT_TYPE);
-    }
-}
-
 // a state machine for proxy logic to tell when to use cache in the case of
 // miss/revalidation/error.
 #[derive(Debug)]
@@ -1187,30 +1181,6 @@ impl ServeFromCache {
                 }
             }
             Self::Done => Ok(HttpTask::Done),
-        }
-    }
-}
-
-/* Downstream revalidation, only needed when cache is on because otherwise origin
- * will handle it */
-pub(crate) fn downstream_response_conditional_filter(
-    use_cache: &mut ServeFromCache,
-    req: &RequestHeader,
-    resp: &mut ResponseHeader,
-) {
-    // TODO: range
-    let header_only = conditional_filter::not_modified_filter(req, resp)
-        || req.method == http::method::Method::HEAD;
-    if header_only {
-        if use_cache.is_on() {
-            // tell cache to stop after yielding header
-            use_cache.enable_header_only();
-        } else {
-            // headers only during cache miss, upstream should continue send
-            // body to cache, `session` will ignore body automatically because
-            // of the signature of `header` (304)
-            // TODO: we should drop body before/within this filter so that body
-            // filter only runs on data downstream sees
         }
     }
 }

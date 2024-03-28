@@ -418,10 +418,11 @@ impl<SV> HttpProxy<SV> {
                  * will handle it */
                 // TODO: if cache is disabled during response phase, we should still do the filter
                 if session.cache.enabled() {
-                    proxy_cache::downstream_response_conditional_filter(
+                    self.downstream_response_conditional_filter(
                         serve_from_cache,
-                        req,
+                        session,
                         &mut header,
+                        ctx,
                     );
                     if !session.ignore_downstream_range {
                         let range_type =

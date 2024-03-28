@@ -138,6 +138,29 @@ pub trait ProxyHttp {
         None
     }
 
+    /// Decide if the incoming request's condition _fails_ against the cached response.
+    ///
+    /// Returning `Ok(true)` means that the response does _not_ match against the condition, and
+    /// that the proxy can return `304 Not Modified` downstream.
+    ///
+    /// An example is a conditional GET request with `If-None-Match: "foobar"`. If the cached
+    /// response contains the `ETag: "foobar"`, then the condition fails, and `304 Not Modified`
+    /// should be returned. Else, the condition passes which means the full `200 OK` response must
+    /// be sent.
+    fn cache_not_modified_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        Ok(
+            pingora_core::protocols::http::conditional_filter::not_modified_filter(
+                session.req_header(),
+                resp,
+            ),
+        )
+    }
+
     /// Modify the request before it is sent to the upstream
     ///
     /// Unlike [Self::request_filter()], this filter allows to change the request headers to send
