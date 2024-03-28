@@ -36,7 +36,8 @@ use structopt::StructOpt;
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConf {
-    version: usize,
+    /// Version
+    pub version: usize,
     /// Whether to run this process in the background.
     pub daemon: bool,
     /// When configured, error log will be written to the given file. Otherwise StdErr will be used.
