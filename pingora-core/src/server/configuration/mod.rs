@@ -36,7 +36,8 @@ use structopt::StructOpt;
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConf {
-    version: usize,
+    /// Version
+    pub version: usize,
     /// Whether to run this process in the background.
     pub daemon: bool,
     /// When configured, error log will be written to the given file. Otherwise StdErr will be used.
@@ -65,11 +66,11 @@ pub struct ServerConf {
     /// Timeout in seconds of the final step for the graceful shutdown.
     pub graceful_shutdown_timeout_seconds: Option<u64>,
     // These options don't belong here as they are specific to certain services
-    pub(crate) client_bind_to_ipv4: Vec<String>,
-    pub(crate) client_bind_to_ipv6: Vec<String>,
-    pub(crate) upstream_keepalive_pool_size: usize,
-    pub(crate) upstream_connect_offload_threadpools: Option<usize>,
-    pub(crate) upstream_connect_offload_thread_per_pool: Option<usize>,
+    pub client_bind_to_ipv4: Vec<String>,
+    pub client_bind_to_ipv6: Vec<String>,
+    pub upstream_keepalive_pool_size: usize,
+    pub upstream_connect_offload_threadpools: Option<usize>,
+    pub upstream_connect_offload_thread_per_pool: Option<usize>,
 }
 
 impl Default for ServerConf {
