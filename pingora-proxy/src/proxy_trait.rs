@@ -192,7 +192,7 @@ pub trait ProxyHttp {
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &Option<Bytes>,
+        _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) {

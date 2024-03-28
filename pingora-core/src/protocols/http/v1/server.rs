@@ -688,6 +688,15 @@ impl HttpSession {
         }
     }
 
+    pub fn retry_buffer_write(&mut self, data: &Bytes) {
+        
+        if self.retry_buffer.is_none() {
+            let mut retry_buffer = FixedBuffer::new(data.len());
+            retry_buffer.write_to_buffer(data);
+            self.retry_buffer = Some(retry_buffer);
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         self.retry_buffer.as_ref().and_then(|b| {
             if b.is_truncated() {

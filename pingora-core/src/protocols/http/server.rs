@@ -274,6 +274,13 @@ impl Session {
         }
     }
 
+    pub fn retry_buffer_write(&mut self, data: &Bytes) {
+        match self {
+            Self::H1(s) => s.retry_buffer_write(data),
+            Self::H2(s) => s.retry_buffer_write(data),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
