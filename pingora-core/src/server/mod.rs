@@ -19,7 +19,7 @@ mod daemon;
 pub(crate) mod transfer_fd;
 
 use daemon::daemonize;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
 use std::sync::Arc;
@@ -166,6 +166,30 @@ impl Server {
         }
         self.listen_fds = Some(Arc::new(Mutex::new(fds)));
         Ok(())
+    }
+
+    /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
+    ///
+    /// This method is intended for pingora frontends that are NOT using the built-in
+    /// command line and configuration file parsing, and are instead using their own.
+    ///
+    /// If a configuration file path is provided as part of `opt`, it will be ignored
+    /// and a warning will be logged.
+    pub fn new_with_opt_and_conf(opt: Opt, conf: ServerConf) -> Server {
+        if let Some(c) = opt.conf.as_ref() {
+            warn!("Ignoring command line argument using '{c}' as configuration, and using provided configuration instead.");
+        }
+        let (tx, rx) = watch::channel(false);
+
+        Server {
+            services: vec![],
+            listen_fds: None,
+            shutdown_watch: tx,
+            shutdown_recv: rx,
+            configuration: Arc::new(conf),
+            options: Some(opt),
+            sentry: None,
+        }
     }
 
     /// Create a new [`Server`].

@@ -61,11 +61,11 @@ pub struct ServerConf {
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
     // These options don't belong here as they are specific to certain services
-    pub(crate) client_bind_to_ipv4: Vec<String>,
-    pub(crate) client_bind_to_ipv6: Vec<String>,
-    pub(crate) upstream_keepalive_pool_size: usize,
-    pub(crate) upstream_connect_offload_threadpools: Option<usize>,
-    pub(crate) upstream_connect_offload_thread_per_pool: Option<usize>,
+    pub client_bind_to_ipv4: Vec<String>,
+    pub client_bind_to_ipv6: Vec<String>,
+    pub upstream_keepalive_pool_size: usize,
+    pub upstream_connect_offload_threadpools: Option<usize>,
+    pub upstream_connect_offload_thread_per_pool: Option<usize>,
 }
 
 impl Default for ServerConf {
