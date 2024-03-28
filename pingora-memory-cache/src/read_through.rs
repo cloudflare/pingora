@@ -123,7 +123,7 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
 {
     /// Create a new [RTCache] of given size. `lock_age` defines how long a lock is valid for.
     /// `lock_timeout` is used to stop a lookup from holding on to the key for too long.
@@ -142,7 +142,7 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
     CB: Lookup<K, T, S>,
 {
     /// Query the cache for a given value. If it exists and no TTL is configured initially, it will
@@ -288,7 +288,7 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
     CB: MultiLookup<K, T, S>,
 {
     /// Same behavior as [RTCache::get] but for an arbitrary amount of keys.

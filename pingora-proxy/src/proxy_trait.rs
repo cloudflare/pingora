@@ -13,14 +13,12 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{
-    key::HashBinary, CacheKey, CacheMeta, NoCacheReason, RespCacheable, RespCacheable::*,
-};
+use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
 
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
-/// paticular stage (if applicable).
+/// particular stage (if applicable).
 ///
 /// If any of the filters returns [Result::Err], the request will fail, and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
@@ -265,8 +263,8 @@ pub trait ProxyHttp {
     /// In this filter the user can decide whether the error is retry-able by marking the error `e`.
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
-    /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    ///  available.
+    /// can decide whether to send the request to the same upstream or another upstream that is possibly 
+    /// available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,

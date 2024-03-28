@@ -19,8 +19,8 @@
 //TODO: Mark this module #[test] only
 
 use super::*;
-use crate::key::{CacheHashKey, CompactCacheKey};
-use crate::storage::{HandleHit, HandleMiss, Storage};
+use crate::key::CompactCacheKey;
+use crate::storage::{HandleHit, HandleMiss};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
@@ -211,7 +211,7 @@ impl HandleHit for MemHitHandler {
 pub struct MemMissHandler {
     body: Arc<RwLock<Vec<u8>>>,
     bytes_written: Arc<watch::Sender<PartialState>>,
-    // these are used only in finish() to to data from temp to cache
+    // these are used only in finish() to data from temp to cache
     key: String,
     cache: Arc<RwLock<HashMap<String, CacheObject>>>,
     temp: Arc<RwLock<HashMap<String, TempObject>>>,

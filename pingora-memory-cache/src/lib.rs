@@ -81,7 +81,7 @@ pub struct MemoryCache<K: Hash, T: Clone> {
     pub(crate) hasher: RandomState,
 }
 
-impl<K: Hash, T: Clone + Send + Sync> MemoryCache<K, T> {
+impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// Create a new [MemoryCache] with the given size.
     pub fn new(size: usize) -> Self {
         MemoryCache {

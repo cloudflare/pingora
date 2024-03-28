@@ -264,14 +264,12 @@ mod test {
 
 mod parse_response {
     use super::*;
-    use bytes::{Bytes, BytesMut};
+    use bytes::BytesMut;
     use httparse::Status;
     use pingora_error::{
         Error,
         ErrorType::{self, *},
-        Result,
     };
-    use pingora_http::ResponseHeader;
 
     pub const INVALID_CHUNK: ErrorType = ErrorType::new("InvalidChunk");
     pub const INCOMPLETE_BODY: ErrorType = ErrorType::new("IncompleteHttpBody");
@@ -280,7 +278,7 @@ mod parse_response {
     const INIT_HEADER_BUF_SIZE: usize = 4096;
     const CHUNK_DELIMITER_SIZE: usize = 2; // \r\n
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     enum ParseState {
         Init,
         PartialHeader,
@@ -561,6 +559,10 @@ mod parse_response {
             let output = parser.inject_data(input);
             // header is not complete
             assert!(output.is_err());
+            match parser.state {
+                ParseState::Invalid(httparse::Error::Version) => {}
+                _ => panic!("should have failed to parse"),
+            }
         }
 
         #[test]

@@ -38,12 +38,12 @@ Because of TinyUFO's lock-free design, it greatly outperforms the others.
 
 ### Memory overhead
 
+TinyUFO provides a compact mode to trade raw read speed for more memory efficiency. Whether the saving worthy the trade off depends on the actual size and the work load. For small in-memory assets, the saved memory means more things can be cached.
+
 The table below show the memory allocation (in bytes) of the compared cache library under certain workloads to store zero-sized assets.
 
-| cache size | TinyUFO | LRU | moka |
-| -------- | ------- | ------- | ------ |
-| 100 | 39,409 | 9,408 | 354,376
-| 1000 | 236,053 | 128,512 | 535,888
-| 10000 | 2,290,635 | 1,075,648 | 2,489,088
-
-Whether these overheads matter depends on the actual sizes and volume of the assets. The more advanced algorithms are likely to be less memory efficient than the simple LRU.
+| cache size | TinyUFO | TinyUFO compact | LRU | moka |
+| -------- | ------- | ------- | ------- | ------ |
+| 100 | 39,409 | 19,000 | 9,408 | 354,376
+| 1000 | 236,053 | 86,352 | 128,512 | 535,888
+| 10000 | 2,290,635 | 766,024|  1,075,648 | 2,489,088

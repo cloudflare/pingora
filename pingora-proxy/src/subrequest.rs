@@ -17,7 +17,9 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use pingora_cache::lock::WritePermit;
 use pingora_core::protocols::raw_connect::ProxyDigest;
-use pingora_core::protocols::{GetProxyDigest, GetTimingDigest, Ssl, TimingDigest, UniqueID};
+use pingora_core::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, TimingDigest, UniqueID,
+};
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, Error, ReadBuf};
@@ -81,6 +83,12 @@ impl GetTimingDigest for DummyIO {
 
 impl GetProxyDigest for DummyIO {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
+        None
+    }
+}
+
+impl GetSocketDigest for DummyIO {
+    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
         None
     }
 }

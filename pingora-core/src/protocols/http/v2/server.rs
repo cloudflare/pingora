@@ -23,12 +23,13 @@ use http::header::HeaderName;
 use http::{header, Response};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::sync::Arc;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
-use crate::protocols::Stream;
+use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::{Error, ErrorType, OrErr, Result};
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
@@ -95,6 +96,8 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    // digest to record underlying connection info
+    digest: Arc<Digest>,
 }
 
 impl HttpSession {
@@ -102,11 +105,19 @@ impl HttpSession {
     /// This function returns a new HTTP/2 session when the provided HTTP/2 connection, `conn`,
     /// establishes a new HTTP/2 stream to this server.
     ///
+    /// A [`Digest`] from the IO stream is also stored in the resulting session, since the
+    /// session doesn't have access to the underlying stream (and the stream itself isn't
+    /// accessible from the `h2::server::Connection`).
+    ///
     /// Note: in order to handle all **existing** and new HTTP/2 sessions, the server must call
     /// this function in a loop until the client decides to close the connection.
     ///
     /// `None` will be returned when the connection is closing so that the loop can exit.
-    pub async fn from_h2_conn(conn: &mut H2Connection<Stream>) -> Result<Option<Self>> {
+    ///
+    pub async fn from_h2_conn(
+        conn: &mut H2Connection<Stream>,
+        digest: Arc<Digest>,
+    ) -> Result<Option<Self>> {
         // NOTE: conn.accept().await is what drives the entire connection.
         let res = conn.accept().await.transpose().or_err(
             ErrorType::H2Error,
@@ -125,6 +136,7 @@ impl HttpSession {
                 body_read: 0,
                 body_sent: 0,
                 retry_buffer: None,
+                digest,
             }
         }))
     }
@@ -405,6 +417,21 @@ impl HttpSession {
     pub fn body_bytes_sent(&self) -> usize {
         self.body_sent
     }
+
+    /// Return the [Digest] of the connection.
+    pub fn digest(&self) -> Option<&Digest> {
+        Some(&self.digest)
+    }
+
+    /// Return the server (local) address recorded in the connection digest.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.digest.socket_digest.as_ref().map(|d| d.local_addr())?
+    }
+
+    /// Return the client (peer) address recorded in the connection digest.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.digest.socket_digest.as_ref().map(|d| d.peer_addr())?
+    }
 }
 
 #[cfg(test)]
@@ -444,8 +471,12 @@ mod test {
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
 
-        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection).await.unwrap() {
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
             tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::GET);

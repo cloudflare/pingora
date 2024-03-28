@@ -27,7 +27,10 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{GetProxyDigest, GetTimingDigest, Shutdown, Ssl, TimingDigest, UniqueID};
+use crate::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, Shutdown, SocketDigest, Ssl, TimingDigest,
+    UniqueID,
+};
 use crate::upstreams::peer::Tracer;
 
 #[derive(Debug)]
@@ -105,6 +108,15 @@ impl AsyncWrite for RawStream {
     }
 }
 
+impl AsRawFd for RawStream {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        match self {
+            RawStream::Tcp(s) => s.as_raw_fd(),
+            RawStream::Unix(s) => s.as_raw_fd(),
+        }
+    }
+}
+
 // Large read buffering helps reducing syscalls with little trade-off
 // Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
 const BUF_READ_SIZE: usize = 64 * 1024;
@@ -123,6 +135,7 @@ pub struct Stream {
     stream: BufStream<RawStream>,
     buffer_write: bool,
     proxy_digest: Option<Arc<ProxyDigest>>,
+    socket_digest: Option<Arc<SocketDigest>>,
     /// When this connection is established
     pub established_ts: SystemTime,
     /// The distributed tracing object for this stream
@@ -147,6 +160,7 @@ impl From<TcpStream> for Stream {
             buffer_write: true,
             established_ts: SystemTime::now(),
             proxy_digest: None,
+            socket_digest: None,
             tracer: None,
         }
     }
@@ -159,17 +173,21 @@ impl From<UnixStream> for Stream {
             buffer_write: true,
             established_ts: SystemTime::now(),
             proxy_digest: None,
+            socket_digest: None,
             tracer: None,
         }
     }
 }
 
+impl AsRawFd for Stream {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.stream.get_ref().as_raw_fd()
+    }
+}
+
 impl UniqueID for Stream {
     fn id(&self) -> i32 {
-        match &self.stream.get_ref() {
-            RawStream::Tcp(s) => s.as_raw_fd(),
-            RawStream::Unix(s) => s.as_raw_fd(),
-        }
+        self.as_raw_fd()
     }
 }
 
@@ -201,6 +219,16 @@ impl GetProxyDigest for Stream {
 
     fn set_proxy_digest(&mut self, digest: ProxyDigest) {
         self.proxy_digest = Some(Arc::new(digest));
+    }
+}
+
+impl GetSocketDigest for Stream {
+    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+        self.socket_digest.clone()
+    }
+
+    fn set_socket_digest(&mut self, socket_digest: SocketDigest) {
+        self.socket_digest = Some(Arc::new(socket_digest))
     }
 }
 

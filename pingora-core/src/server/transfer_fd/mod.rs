@@ -343,7 +343,6 @@ where
 mod tests {
     use super::*;
     use log::{debug, error};
-    use std::thread;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();

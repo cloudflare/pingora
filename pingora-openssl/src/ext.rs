@@ -165,7 +165,7 @@ pub fn clear_error_stack() {
 
 /// Create a new [Ssl] from &[SslAcceptor]
 ///
-/// this function is to unify the interface between this crate and `pingora-boringssl`
+/// this function is to unify the interface between this crate and [`pingora-boringssl`](https://docs.rs/pingora-boringssl)
 pub fn ssl_from_acceptor(acceptor: &SslAcceptor) -> Result<Ssl, ErrorStack> {
     Ssl::new(acceptor.context())
 }
