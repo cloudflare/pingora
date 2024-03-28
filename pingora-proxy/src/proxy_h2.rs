@@ -247,7 +247,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",

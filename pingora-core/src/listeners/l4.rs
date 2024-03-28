@@ -164,7 +164,7 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
         .or_err_with(BindError, || format!("fail to create address {sock_addr}"))?;
 
         // NOTE: this is to preserve the current TcpListener::bind() behavior.
-        // We have a few test relying on this behavior to allow multiple identical
+        // We have a few tests relying on this behavior to allow multiple identical
         // test servers to coexist.
         listener_socket
             .set_reuseaddr(true)

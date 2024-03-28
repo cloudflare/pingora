@@ -23,7 +23,7 @@ use crate::apps::http_app::ServeHttp;
 use crate::modules::http::compression::ResponseCompressionBuilder;
 use crate::protocols::http::ServerSession;
 
-/// A HTTP application that reports Prometheus metrics.
+/// An HTTP application that reports Prometheus metrics.
 ///
 /// This application will report all the [static metrics](https://docs.rs/prometheus/latest/prometheus/index.html#static-metrics)
 /// collected via the [Prometheus](https://docs.rs/prometheus/) crate;

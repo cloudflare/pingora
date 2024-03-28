@@ -64,7 +64,7 @@ pub trait Peer: Display + Clone {
     fn sni(&self) -> &str;
     /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
-    /// The connection to two peers are considered reusable to each other if their reuse hashes are
+    /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
     fn reuse_hash(&self) -> u64;
     /// Get the proxy setting to connect to the remote server
@@ -273,7 +273,7 @@ pub struct PeerOptions {
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub no_header_eos: bool,
     pub h2_ping_interval: Option<Duration>,
-    // how many concurrent h2 stream are allowed in the same connection
+    // how many concurrent h2 streams are allowed in the same connection
     pub max_h2_streams: usize,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise

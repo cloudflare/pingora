@@ -27,7 +27,7 @@ use structopt::StructOpt;
 
 /// The configuration file
 ///
-/// Pingora configuration files are by default YAML files but any key value format can potentially
+/// Pingora configuration files are by default YAML files, but any key value format can potentially
 /// be used.
 ///
 /// # Extension

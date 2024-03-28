@@ -55,7 +55,7 @@ impl<const N: usize> Manager<N> {
 
         assert!(shard < N);
 
-        // NOTE: This could use a lot memory to buffer the serialized data in memory
+        // NOTE: This could use a lot of memory to buffer the serialized data in memory
         // NOTE: This for loop could lock the LRU for too long
         let mut nodes = Vec::with_capacity(self.0.shard_len(shard));
         self.0.iter_for_each(shard, |(node, size)| {
@@ -113,7 +113,7 @@ impl<'de, 'a, const N: usize> serde::de::Visitor<'de> for InsertToManager<'a, N>
 
 #[inline]
 fn u64key(key: &CompactCacheKey) -> u64 {
-    // note that std hash is not uniform, I'm not sure if ahash is also the case
+    // note that std hash is not uniform, I'm not sure if hash is also the case
     let mut hasher = ahash::AHasher::default();
     key.hash(&mut hasher);
     hasher.finish()

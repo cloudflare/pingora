@@ -18,7 +18,7 @@
 //!
 //! Features
 //! - Preallocate consecutive memory, no memory fragmentation.
-//! - No shrink function: for Lru cache that grows to a certain size but never shrink.
+//! - No shrink function: for Lru cache that grows to a certain size but never shrinks.
 //! - Relatively fast and efficient.
 
 // inspired by clru::FixedSizeList (Élie!)
@@ -72,10 +72,10 @@ impl Nodes {
             next: NULL,
             data,
         };
-        // Constrain the growth of vec: vec always double its capacity when it needs to grow
+        // Constrain the growth of vec: vec always double its capacity when it needs to grow.
         // It could waste too much memory when it is already very large.
         // Here we limit the memory waste to 10% once it grows beyond the cap.
-        // The amortized growth cost is O(n) beyond the max of the initial reserved capacity and
+        // The amortized growth cost is O(n) beyond the max of the initially reserved capacity and
         // the cap. But this list is for limited sized LRU and we recycle released node, so
         // hopefully insertions are rare beyond certain sizes
         if self.data_nodes.capacity() > VEC_EXP_GROWTH_CAP
@@ -129,7 +129,7 @@ pub struct LinkedList {
     free: Vec<Index>, // to keep track of freed node to be used again
 }
 // Panic when index used as parameters are invalid
-// Index returned by push_* are always valid.
+// Index returned by push_* is always valid.
 impl LinkedList {
     /// Create a [LinkedList] with the given predicted capacity.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -178,7 +178,7 @@ impl LinkedList {
         self.node(index).map(|n| n.data)
     }
 
-    // safe because index still needs to be in the range of the vec
+    // safe because the index still needs to be in the range of the vec
     fn peek_unchecked(&self, index: Index) -> &u64 {
         &self.nodes[index].data
     }

@@ -17,7 +17,7 @@
 //! This mod implements the most rudimentary CONNECT client over raw stream.
 //! The idea is to yield raw stream once the CONNECT handshake is complete
 //! so that the protocol encapsulated can use the stream directly.
-//! this idea only works for CONNECT over HTTP 1.1 and localhost (or where the server is close by).
+//! This idea only works for CONNECT over HTTP 1.1 and localhost (or where the server is close by).
 
 use super::http::v1::client::HttpSession;
 use super::http::v1::common::*;

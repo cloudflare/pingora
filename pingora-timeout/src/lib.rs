@@ -85,7 +85,7 @@ impl std::error::Error for Elapsed {}
 ///
 /// The timer is created the first time the `future` is pending. This avoids unnecessary timer
 /// creation and cancellation on busy IOs with a good chance to be already ready (e.g., reading
-/// data from TCP where the recv buffer already has a lot data to read right away).
+/// data from TCP where the recv buffer already has a lot of data to read right away).
 pub fn tokio_timeout<T>(duration: Duration, future: T) -> Timeout<T, TokioTimeout>
 where
     T: Future,

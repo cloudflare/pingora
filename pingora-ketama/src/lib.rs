@@ -101,7 +101,7 @@ struct Point {
     hash: u32,
 }
 
-// We only want to compare the hash when sorting so we implement these traits by hand.
+// We only want to compare the hash when sorting, so we implement these traits by hand.
 impl Ord for Point {
     fn cmp(&self, other: &Self) -> Ordering {
         self.hash.cmp(&other.hash)

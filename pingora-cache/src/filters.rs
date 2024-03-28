@@ -31,7 +31,7 @@ pub fn request_cacheable(req_header: &ReqHeader) -> bool {
 
 /// Decide if the response is cacheable.
 ///
-/// `cache_control` is the parsed [CacheControl] from the response header. It is an standalone
+/// `cache_control` is the parsed [CacheControl] from the response header. It is a standalone
 /// argument so that caller has the flexibility to choose to use, change or ignore it.
 // TODO: vary processing
 pub fn resp_cacheable(

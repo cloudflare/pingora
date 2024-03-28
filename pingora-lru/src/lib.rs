@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An implementation of a LRU that focuses on memory efficiency, concurrency and persistence
+//! An implementation of an LRU that focuses on memory efficiency, concurrency and persistence
 //!
 //! Features
 //! - keys can have different sizes
@@ -85,7 +85,7 @@ impl<T, const N: usize> Lru<T, N> {
 
     /// Promote the key to the head of the LRU
     ///
-    /// Return `true` if the key exist.
+    /// Return `true` if the key exists.
     pub fn promote(&self, key: u64) -> bool {
         self.units[get_shard(key, N)].write().access(key)
     }
