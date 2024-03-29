@@ -17,6 +17,10 @@ keywords = ["async", "proxy", "http", "pingora"]
 name = "pingora"
 path = "src/lib.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 pingora-core = { version = "0.1.0", path = "../pingora-core", default-features = false }
 pingora-http = { version = "0.1.0", path = "../pingora-http" }
