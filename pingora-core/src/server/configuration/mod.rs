@@ -173,9 +173,7 @@ impl ServerConf {
     pub fn load_yaml_with_opt_override(opt: &Opt) -> Result<Self> {
         if let Some(path) = &opt.conf {
             let mut conf = Self::load_from_yaml(path)?;
-            if opt.daemon {
-                conf.daemon = true;
-            }
+            conf.merge_with_opt(opt);
             Ok(conf)
         } else {
             Error::e_explain(ReadError, "No path specified")
@@ -190,9 +188,7 @@ impl ServerConf {
         let conf = Self::new();
         match conf {
             Some(mut c) => {
-                if opt.daemon {
-                    c.daemon = true;
-                }
+                c.merge_with_opt(opt);
                 Some(c)
             }
             None => None,
@@ -216,6 +212,12 @@ impl ServerConf {
     pub fn validate(self) -> Result<Self> {
         // TODO: do the validation
         Ok(self)
+    }
+
+    pub fn merge_with_opt(&mut self, opt: &Opt) {
+        if opt.daemon {
+            self.daemon = true;
+        }
     }
 }
 
