@@ -29,7 +29,7 @@ pub struct Rate {
     // 2 slots so that we use one to collect the current events and the other to report rate
     red_slot: Estimator,
     blue_slot: Estimator,
-    red_or_blue: AtomicBool, // true: current slot is red, otherwise blue
+    red_or_blue: AtomicBool, // true: the current slot is red, otherwise blue
     start: Instant,
     // Use u64 below instead of Instant because we want atomic operation
     reset_interval_ms: u64, // the time interval to reset `current` and move it to `previous`
@@ -160,6 +160,6 @@ mod tests {
 
         // second: 3
         sleep(Duration::from_secs(1));
-        assert_eq!(r.rate(&key), 0f64); // no event observed in the past 2 second
+        assert_eq!(r.rate(&key), 0f64); // no event observed in the past 2 seconds
     }
 }

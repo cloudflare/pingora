@@ -219,7 +219,7 @@ impl CacheControl {
         self.has_key("public")
     }
 
-    /// Whether the given directive exists and it has no value.
+    /// Whether the given directive exists, and it has no value.
     fn has_key_without_value(&self, key: &str) -> bool {
         matches!(self.directives.get(key), Some(None))
     }

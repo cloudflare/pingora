@@ -54,7 +54,7 @@ pub trait ServerApp {
     fn cleanup(&self) {}
 }
 
-/// This trait defines the interface of a HTTP application.
+/// This trait defines the interface of an HTTP application.
 #[cfg_attr(not(doc_async_trait), async_trait)]
 pub trait HttpServerApp {
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
@@ -118,7 +118,7 @@ where
                         server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
                     let h2_stream = match h2_stream {
                         Err(e) => {
-                            // It is common for client to just disconnect TCP without properly
+                            // It is common for the client to just disconnect TCP without properly
                             // closing H2. So we don't log the errors here
                             debug!("H2 error when accepting new stream {e}");
                             return None;
