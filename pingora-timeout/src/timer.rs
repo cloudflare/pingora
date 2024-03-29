@@ -126,7 +126,7 @@ impl TimerManager {
         Self::default()
     }
 
-    // this thread sleep a resolution time and fire all Timers that a due to fire
+    // This thread sleeps for a resolution time and then fires all the timers that are due to fire
     pub(crate) fn clock_thread(&self) {
         loop {
             std::thread::sleep(RESOLUTION_DURATION);
