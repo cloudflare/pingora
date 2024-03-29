@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/stale@v9
         with:
-          stale-issue-message: 'This question has been stale for a week. It'll be closed in an additional day if not updated.'
+          stale-issue-message: 'This question has been stale for a week. It will be closed in an additional day if not updated.'
           close-issue-message: 'This issue has been closed because it has been stalled with no activity.'
           days-before-stale: -1
           days-before-issue-stale: 7
