@@ -175,10 +175,12 @@ impl Server {
     ///
     /// If a configuration file path is provided as part of `opt`, it will be ignored
     /// and a warning will be logged.
-    pub fn new_with_opt_and_conf(opt: Opt, conf: ServerConf) -> Server {
+    pub fn new_with_opt_and_conf(opt: Opt, mut conf: ServerConf) -> Server {
         if let Some(c) = opt.conf.as_ref() {
             warn!("Ignoring command line argument using '{c}' as configuration, and using provided configuration instead.");
         }
+        conf.merge_with_opt(&opt);
+
         let (tx, rx) = watch::channel(false);
 
         Server {
