@@ -57,7 +57,7 @@ pub trait ProxyHttp {
 
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
-    /// The caller can interact with `Session.cache` to enabled caching.
+    /// The caller can interact with `Session.cache` to enable caching.
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
@@ -127,7 +127,7 @@ pub trait ProxyHttp {
 
     /// Decide how to generate cache vary key from both request and response
     ///
-    /// None means no variance is need.
+    /// None means no variance is needed.
     fn cache_vary_filter(
         &self,
         _meta: &CacheMeta,

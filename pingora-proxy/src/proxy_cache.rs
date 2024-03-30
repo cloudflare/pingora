@@ -83,30 +83,34 @@ impl<SV> HttpProxy<SV> {
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     if let Some((mut meta, handler)) = res {
-                        // vary logic
-                        // because this branch can be called multiple times in a loop, and we only
+                        // Vary logic
+                        // Because this branch can be called multiple times in a loop, and we only
                         // need to update the vary once, check if variance is already set to
-                        // prevent unnecessary vary lookups
+                        // prevent unnecessary vary lookups.
                         let cache_key = session.cache.cache_key();
                         if let Some(variance) = cache_key.variance_bin() {
-                            // adhoc double check the variance found is the variance we want
+                            // We've looked up a secondary slot.
+                            // Adhoc double check that the variance found is the variance we want.
                             if Some(variance) != meta.variance() {
                                 warn!("Cache variance mismatch, {variance:?}, {cache_key:?}");
                                 session.cache.disable(NoCacheReason::InternalError);
                                 break None;
                             }
                         } else {
+                            // Basic cache key; either variance is off, or this is the primary slot.
                             let req_header = session.req_header();
                             let variance = self.inner.cache_vary_filter(&meta, ctx, req_header);
                             if let Some(variance) = variance {
+                                // Variance is on. This is the primary slot.
                                 if !session.cache.cache_vary_lookup(variance, &meta) {
-                                    // cache key variance updated, need to lookup again
+                                    // This wasn't the desired variant. Updated cache key variance, cause another
+                                    // lookup to get the desired variant, which would be in a secondary slot.
                                     continue;
                                 }
-                            } //else: vary is not in use
+                            } // else: vary is not in use
                         }
 
-                        // either no variance or the current handler is the variance
+                        // Either no variance, or the current handler targets the correct variant.
 
                         // hit
                         // TODO: maybe round and/or cache now()
@@ -206,6 +210,7 @@ impl<SV> HttpProxy<SV> {
                     } else {
                         // cache miss
                         if session.cache.is_cache_locked() {
+                            // Another request is filling the cache; try waiting til that's done and retry.
                             let lock_status = session.cache.cache_lock_wait().await;
                             if self.handle_lock_status(session, ctx, lock_status) {
                                 continue;
