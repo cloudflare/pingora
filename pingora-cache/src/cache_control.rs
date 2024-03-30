@@ -26,7 +26,7 @@ use std::num::IntErrorKind;
 use std::slice;
 use std::str;
 
-/// The max delta-second per [RFC 7234](https://datatracker.ietf.org/doc/html/rfc7234#section-1.2.1)
+/// The max delta-second per [RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-1.2.2)
 // "If a cache receives a delta-seconds
 // value greater than the greatest integer it can represent, or if any
 // of its subsequent calculations overflows, the cache MUST consider the
@@ -111,7 +111,7 @@ impl<'a> ListValueIter<'a> {
     }
 }
 
-// https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.3
+// https://datatracker.ietf.org/doc/html/rfc9110#name-whitespace
 // optional whitespace OWS = *(SP / HTAB); SP = 0x20, HTAB = 0x09
 fn trim_ows(bytes: &[u8]) -> &[u8] {
     fn not_ows(b: &u8) -> bool {
@@ -135,23 +135,31 @@ impl<'a> Iterator for ListValueIter<'a> {
     }
 }
 
-/*
-    Originally from https://github.com/hapijs/wreck:
-    Cache-Control   = 1#cache-directive
-    cache-directive = token [ "=" ( token / quoted-string ) ]
-    token           = [^\x00-\x20\(\)<>@\,;\:\\"\/\[\]\?\=\{\}\x7F]+
-    quoted-string   = "(?:[^"\\]|\\.)*"
-*/
+// Originally from https://github.com/hapijs/wreck which has the following comments:
+// Cache-Control   = 1#cache-directive
+// cache-directive = token [ "=" ( token / quoted-string ) ]
+// token           = [^\x00-\x20\(\)<>@\,;\:\\"\/\[\]\?\=\{\}\x7F]+
+// quoted-string   = "(?:[^"\\]|\\.)*"
+//
+// note the `token` implementation excludes disallowed ASCII ranges
+// and disallowed delimiters: https://datatracker.ietf.org/doc/html/rfc9110#section-5.6.2
+// though it does not forbid `obs-text`: %x80-FF
 static RE_CACHE_DIRECTIVE: Lazy<Regex> =
-    // unicode support disabled, allow ; or , delimiter | capture groups: 1: directive = 2: token OR quoted-string
+    // to break our version down further:
+    // `(?-u)`: unicode support disabled, which puts the regex into "ASCII compatible mode" for specifying literal bytes like \x7F: https://docs.rs/regex/1.10.4/regex/bytes/index.html#syntax
+    // `(?:^|(?:\s*[,;]\s*)`: allow either , or ; as a delimiter
+    // `([^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+)`: token (directive name capture group)
+    // `(?:=((?:[^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+|(?:"(?:[^"\\]|\\.)*"))))`: token OR quoted-string (directive value capture-group)
     Lazy::new(|| {
         Regex::new(r#"(?-u)(?:^|(?:\s*[,;]\s*))([^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+)(?:=((?:[^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+|(?:"(?:[^"\\]|\\.)*"))))?"#).unwrap()
     });
 
 impl CacheControl {
     // Our parsing strategy is more permissive than the RFC in a few ways:
-    // - Allows semicolons as delimiters (in addition to commas).
-    // - Allows octets outside of visible ASCII in tokens.
+    // - Allows semicolons as delimiters (in addition to commas). See the regex above.
+    // - Allows octets outside of visible ASCII in `token`s, and in later RFCs, octets outside of
+    //   the `quoted-string` range: https://datatracker.ietf.org/doc/html/rfc9110#section-5.6.2
+    //   See the regex above.
     // - Doesn't require no-value for "boolean directives," such as must-revalidate
     // - Allows quoted-string format for numeric values.
     fn from_headers(headers: http::header::GetAll<HeaderValue>) -> Option<Self> {
