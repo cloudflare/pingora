@@ -307,6 +307,7 @@ impl<T> LruUnit<T> {
         self.lookup_table.remove(&key).map(|node| {
             let list_key = self.order.remove(node.list_index);
             assert_eq!(key, list_key);
+            self.used_weight -= node.weight;
             (node.data, node.weight)
         })
     }
@@ -322,6 +323,7 @@ impl<T> LruUnit<T> {
             weight,
         });
         self.lookup_table.insert(key, node);
+        self.used_weight += weight;
         true
     }
 
@@ -657,5 +659,65 @@ mod test_lru_unit {
         assert_eq!(lru.evict(), None);
         assert_eq!(lru.used_weight(), 0);
         assert_lru(&lru, &[]);
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut lru = LruUnit::with_capacity(10);
+
+        lru.admit(2, 2, 2);
+        lru.admit(3, 3, 3);
+        lru.admit(4, 4, 4);
+        lru.admit(5, 5, 5);
+        assert_lru(&lru, &[5, 4, 3, 2]);
+
+        assert!(lru.access(4));
+        assert!(lru.access(3));
+        assert!(lru.access(3));
+        assert!(lru.access(2));
+        assert_lru(&lru, &[2, 3, 4, 5]);
+
+        assert_eq!(lru.used_weight(), 2 + 3 + 4 + 5);
+        assert_eq!(lru.remove(2), Some((2, 2)));
+        assert_eq!(lru.used_weight(), 3 + 4 + 5);
+        assert_lru(&lru, &[3, 4, 5]);
+
+        assert_eq!(lru.remove(4), Some((4, 4)));
+        assert_eq!(lru.used_weight(), 3 + 5);
+        assert_lru(&lru, &[3, 5]);
+
+        assert_eq!(lru.remove(5), Some((5, 5)));
+        assert_eq!(lru.used_weight(), 3);
+        assert_lru(&lru, &[3]);
+
+        assert_eq!(lru.remove(1), None);
+        assert_eq!(lru.used_weight(), 3);
+        assert_lru(&lru, &[3]);
+
+        assert_eq!(lru.remove(3), Some((3, 3)));
+        assert_eq!(lru.used_weight(), 0);
+        assert_lru(&lru, &[]);
+    }
+
+    #[test]
+    fn test_insert_tail() {
+        let mut lru = LruUnit::with_capacity(10);
+        assert_eq!(lru.len(), 0);
+        assert!(lru.peek(0).is_none());
+
+        assert!(lru.insert_tail(2, 2, 1));
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.peek(2).unwrap(), &2);
+        assert_eq!(lru.used_weight(), 1);
+
+        assert!(!lru.insert_tail(2, 2, 2));
+        assert!(lru.insert_tail(3, 3, 3));
+        assert_eq!(lru.used_weight(), 1 + 3);
+        assert_lru(&lru, &[2, 3]);
+
+        assert!(lru.insert_tail(4, 4, 4));
+        assert!(lru.insert_tail(5, 5, 5));
+        assert_eq!(lru.used_weight(), 1 + 3 + 4 + 5);
+        assert_lru(&lru, &[2, 3, 4, 5]);
     }
 }
