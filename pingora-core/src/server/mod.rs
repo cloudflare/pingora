@@ -289,7 +289,7 @@ impl Server {
     ///
     /// Note: this function may fork the process for daemonization, so any additional threads created
     /// before this function will be lost to any service logic once this function is called.
-    pub fn run_forever(&mut self) {
+    pub fn run_forever(mut self) -> ! {
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
@@ -364,7 +364,7 @@ impl Server {
             }
         }
         info!("All runtimes exited, exiting now");
-        std::process::exit(0);
+        std::process::exit(0)
     }
 
     fn create_runtime(name: &str, threads: usize, work_steal: bool) -> Runtime {
