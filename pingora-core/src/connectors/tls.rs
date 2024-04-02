@@ -162,8 +162,7 @@ impl Connector {
 */
 fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     // wildcard is only leftmost label
-    let mut s = sni.splitn(2, '.');
-    if let (Some(leftmost), Some(rest)) = (s.next(), s.next()) {
+    if let Some((leftmost, rest)) = sni.split_once('.') {
         // if not a subdomain or leftmost does not contain underscore return
         if !rest.contains('.') || !leftmost.contains('_') {
             return None;
