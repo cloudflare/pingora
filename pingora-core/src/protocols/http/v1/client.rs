@@ -445,7 +445,7 @@ impl HttpSession {
         let mut max = None;
 
         for param in header_value.split(',') {
-            let parts = param.split_once('=').map(|(k, v)| (k.trim(), v.trim()));
+            let parts = param.split_once('=').map(|(k, v)| (k.trim(), v));
             match parts {
                 Some(("timeout", timeout_value)) => timeout = timeout_value.trim().parse().ok(),
                 Some(("max", max_value)) => max = max_value.trim().parse().ok(),
