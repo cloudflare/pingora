@@ -400,4 +400,20 @@ pub trait ProxyHttp {
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }
+
+    /// This filter is called after the proxy cache generates the downstream response to the purge
+    /// request (to invalidate or delete from the HTTP cache), based on the purge status, which
+    /// indicates whether the request succeeded or failed.
+    ///
+    /// The filter allows the user to modify or replace the generated downstream response.
+    /// If the filter returns `Err`, the proxy will instead send a 500 response.
+    fn purge_response_filter(
+        &self,
+        _session: &Session,
+        _ctx: &mut Self::CTX,
+        _purge_status: PurgeStatus,
+        _purge_response: &mut std::borrow::Cow<'static, ResponseHeader>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

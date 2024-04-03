@@ -62,11 +62,7 @@ impl<SV> HttpProxy<SV> {
 
         // cache purge logic: PURGE short-circuits rest of request
         if self.inner.is_purge(session, ctx) {
-            if session.cache.enabled() {
-                return self.proxy_purge(session, ctx).await;
-            } else {
-                return Some(proxy_purge::write_no_purge_response(session).await);
-            }
+            return self.proxy_purge(session, ctx).await;
         }
 
         // bypass cache lookup if we predict to be uncacheable
