@@ -83,6 +83,11 @@ pub struct ServerConf {
     /// See [`ConnectorOptions`].
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_connect_offload_thread_per_pool: Option<usize>,
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// env variable. This can be used by tools like Wireshark to decrypt upstream traffic
+    /// for debugging purposes.
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub upstream_debug_ssl_keylog: bool,
 }
 
 impl Default for ServerConf {
@@ -94,6 +99,7 @@ impl Default for ServerConf {
             ca_file: None,
             daemon: false,
             error_log: None,
+            upstream_debug_ssl_keylog: false,
             pid_file: "/tmp/pingora.pid".to_string(),
             upgrade_sock: "/tmp/pingora_upgrade.sock".to_string(),
             user: None,
@@ -239,6 +245,7 @@ mod tests {
             ca_file: None,
             daemon: false,
             error_log: None,
+            upstream_debug_ssl_keylog: false,
             pid_file: "".to_string(),
             upgrade_sock: "".to_string(),
             user: None,
