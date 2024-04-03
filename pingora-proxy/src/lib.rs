@@ -79,6 +79,7 @@ mod subrequest;
 
 use subrequest::Ctx as SubReqCtx;
 
+pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::ProxyHttp;
 
 pub mod prelude {
