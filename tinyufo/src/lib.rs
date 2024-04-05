@@ -121,7 +121,7 @@ pub struct KV<T> {
 }
 
 // the data and its metadata
-struct Bucket<T> {
+pub struct Bucket<T> {
     uses: Uses,
     queue: Location,
     weight: Weight,
