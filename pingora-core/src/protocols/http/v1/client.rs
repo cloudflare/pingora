@@ -52,8 +52,7 @@ pub struct HttpSession {
     pub(crate) digest: Box<Digest>,
     response_header: Option<Box<ResponseHeader>>,
     request_written: Option<Box<RequestHeader>>,
-    // request body bytes written to upstream
-    body_bytes_sent: usize,
+    bytes_sent: usize,
     upgraded: bool,
 }
 
@@ -78,10 +77,10 @@ impl HttpSession {
             keepalive_timeout: KeepaliveStatus::Off,
             response_header: None,
             request_written: None,
-            body_bytes_sent: 0,
             read_timeout: None,
             write_timeout: None,
             digest,
+            bytes_sent: 0,
             upgraded: false,
         }
     }
@@ -128,7 +127,7 @@ impl HttpSession {
             .await;
 
         if let Ok(Some(num_bytes)) = written {
-            self.body_bytes_sent += num_bytes;
+            self.bytes_sent += num_bytes;
         }
 
         written
