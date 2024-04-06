@@ -323,11 +323,19 @@ impl Session {
         }
     }
 
-    /// How many response body bytes already sent
+    /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         match self {
             Self::H1(s) => s.body_bytes_sent(),
             Self::H2(s) => s.body_bytes_sent(),
+        }
+    }
+
+    /// Return how many request body bytes (application, not wire) already read from downstream
+    pub fn body_bytes_read(&self) -> usize {
+        match self {
+            Self::H1(s) => s.body_bytes_read(),
+            Self::H2(s) => s.body_bytes_read(),
         }
     }
 

@@ -90,9 +90,9 @@ pub struct HttpSession {
     // Indicate that whether a END_STREAM is already sent
     // in order to tell whether needs to send one extra FRAME when this response finishes
     ended: bool,
-    // How many request body bytes have been read so far.
+    // How many (application, not wire) request body bytes have been read so far.
     body_read: usize,
-    // How many response body bytes have been sent so far.
+    // How many (application, not wire) response body bytes have been sent so far.
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
@@ -413,9 +413,14 @@ impl HttpSession {
         }
     }
 
-    /// How many response body bytes sent to the client
+    /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         self.body_sent
+    }
+
+    /// Return how many request body bytes (application, not wire) already read from downstream
+    pub fn body_bytes_read(&self) -> usize {
+        self.body_read
     }
 
     /// Return the [Digest] of the connection.
@@ -490,6 +495,7 @@ mod test {
                 let body = http.read_body_or_idle(false).await.unwrap().unwrap();
                 assert_eq!(body, client_body);
                 assert!(http.is_body_done());
+                assert_eq!(http.body_bytes_read(), 16);
 
                 let retry_body = http.get_retry_buffer().unwrap();
                 assert_eq!(retry_body, client_body);
@@ -511,6 +517,7 @@ mod test {
 
                 // end: false here to verify finish() closes the stream nicely
                 http.write_body(server_body.into(), false).unwrap();
+                assert_eq!(http.body_bytes_sent(), 16);
 
                 http.finish().unwrap();
             });
