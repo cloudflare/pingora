@@ -73,7 +73,7 @@ pub trait CacheHashKey {
 
     /// An extra tag for identifying users
     ///
-    /// For example if the storage backend implements per user quota, this tag can be used.
+    /// For example, if the storage backend implements per user quota, this tag can be used.
     fn user_tag(&self) -> &str;
 
     /// The hex string of [Self::primary_bin()]
@@ -95,13 +95,13 @@ pub trait CacheHashKey {
 /// General purpose cache key
 #[derive(Debug, Clone)]
 pub struct CacheKey {
-    // All strings for now, can be more structural as long as it can hash
+    // All strings for now. It can be more structural as long as it can hash
     namespace: String,
     primary: String,
     variance: Option<HashBinary>,
     /// An extra tag for identifying users
     ///
-    /// For example if the storage backend implements per user quota, this tag can be used.
+    /// For example, if the storage backend implements per user quota, this tag can be used.
     pub user_tag: String,
 }
 

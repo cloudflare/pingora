@@ -25,7 +25,7 @@ pub use read_through::{Lookup, MultiLookup, RTCache};
 #[derive(Debug, PartialEq, Eq)]
 /// [CacheStatus] indicates the response type for a query.
 pub enum CacheStatus {
-    /// The key was found in cache
+    /// The key was found in the cache
     Hit,
     /// The key was not found.
     Miss,
@@ -109,7 +109,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
 
     /// Insert a key and value pair with an optional TTL into the cache.
     ///
-    /// An item with zero TTL of zero not inserted.
+    /// An item with zero TTL of zero will not be inserted.
     pub fn put(&self, key: &K, value: T, ttl: Option<Duration>) {
         if let Some(t) = ttl {
             if t.is_zero() {
