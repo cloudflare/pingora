@@ -14,6 +14,8 @@
 
 use super::cert;
 use async_trait::async_trait;
+use http::header::VARY;
+use http::HeaderValue;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
@@ -31,6 +33,7 @@ use pingora_core::utils::CertKey;
 use pingora_error::{Error, ErrorSource, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
 use structopt::StructOpt;
@@ -269,6 +272,9 @@ static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, Non
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<CacheLock> =
     Lazy::new(|| CacheLock::new(std::time::Duration::from_secs(2)));
+// Example of how one might restrict which fields can be varied on.
+static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
+    Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -342,15 +348,41 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn cache_vary_filter(
         &self,
-        _meta: &CacheMeta,
+        meta: &CacheMeta,
         _ctx: &mut Self::CTX,
         req: &RequestHeader,
     ) -> Option<HashBinary> {
-        // Here the response is always vary on request header "x-vary-me" if it exists
-        // in the real world, this callback should check Vary response header to decide
-        let vary_me = req.headers.get("x-vary-me")?;
         let mut key = VarianceBuilder::new();
-        key.add_value("headers.x-vary-me", vary_me);
+
+        // Vary per header from origin. Target headers are de-duplicated by key logic.
+        let vary_headers_lowercased: Vec<String> = meta
+            .headers()
+            .get_all(VARY)
+            .iter()
+            // Filter out any unparseable vary headers.
+            .flat_map(|vary_header| vary_header.to_str().ok())
+            .flat_map(|vary_header| vary_header.split(','))
+            .map(|s| s.trim().to_lowercase())
+            .filter(|header_name| {
+                // Filter only for allowed headers, if restricted.
+                CACHE_VARY_ALLOWED_HEADERS
+                    .as_ref()
+                    .map(|al| al.contains(header_name.as_str()))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        vary_headers_lowercased.iter().for_each(|header_name| {
+            // Add this header and value to be considered in the variance key.
+            key.add_value(
+                header_name,
+                req.headers
+                    .get(header_name)
+                    .map(|v| v.as_bytes())
+                    .unwrap_or(&[]),
+            );
+        });
+
         key.finalize()
     }
 
