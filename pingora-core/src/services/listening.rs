@@ -206,6 +206,7 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         futures::future::join_all(handlers).await;
         self.listeners.cleanup();
         self.app_logic.cleanup();
+        self.app_logic.async_cleanup().await;
     }
 
     fn name(&self) -> &str {

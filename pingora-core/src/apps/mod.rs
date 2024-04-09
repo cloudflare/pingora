@@ -52,6 +52,11 @@ pub trait ServerApp {
 
     /// This callback will be called once after the service stops listening to its endpoints.
     fn cleanup(&self) {}
+
+    /// This callback will be called once after the service stops listening to its endpoints.
+    ///
+    /// Used for async cleanup tasks.
+    async fn async_cleanup(&self) {}
 }
 
 /// This trait defines the interface of an HTTP application.
