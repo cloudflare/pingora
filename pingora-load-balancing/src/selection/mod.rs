@@ -17,6 +17,7 @@
 pub mod algorithms;
 pub mod consistent;
 pub mod weighted;
+pub mod round_robin;
 
 use super::Backend;
 use std::collections::{BTreeSet, HashSet};
@@ -64,7 +65,7 @@ pub type FVNHash = Weighted<fnv::FnvHasher>;
 /// Random selection on weighted backends
 pub type Random = Weighted<algorithms::Random>;
 /// Round robin selection on weighted backends
-pub type RoundRobin = Weighted<algorithms::RoundRobin>;
+pub type RoundRobin = round_robin::SmoothRoundRobin;
 /// Consistent Ketama hashing on weighted backends
 pub type Consistent = consistent::KetamaHashing;
 
