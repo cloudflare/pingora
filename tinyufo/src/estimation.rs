@@ -183,20 +183,25 @@ mod tests {
         assert_eq!(tiny.incr(1), 2);
         assert_eq!(tiny.get(1), 2);
 
-        assert_eq!(tiny.get(2), 0);
-        assert_eq!(tiny.incr(2), 1);
-        assert_eq!(tiny.incr(2), 2);
-        assert_eq!(tiny.get(2), 2);
+        // Might have hash collisions for the others, need to
+        // get() before can assert on the incr() value.
+        let two = tiny.get(2);
+        assert_eq!(tiny.incr(2), two + 1);
+        assert_eq!(tiny.incr(2), two + 2);
+        assert_eq!(tiny.get(2), two + 2);
 
-        assert_eq!(tiny.incr(3), 1);
-        assert_eq!(tiny.incr(3), 2);
-        assert_eq!(tiny.incr(3), 3);
-        assert_eq!(tiny.incr(3), 4);
+        let three = tiny.get(3);
+        assert_eq!(tiny.incr(3), three + 1);
+        assert_eq!(tiny.incr(3), three + 2);
+        assert_eq!(tiny.incr(3), three + 3);
+        assert_eq!(tiny.incr(3), three + 4);
 
-        // 8 incr(), now reset
+        // 8 incr(), now resets on next incr
+        // can only assert they are greater than or equal
+        // to the incr() we do per key.
 
-        assert_eq!(tiny.incr(3), 3);
-        assert_eq!(tiny.incr(1), 2);
-        assert_eq!(tiny.incr(2), 2);
+        assert!(tiny.incr(3) >= 3); // had 4, reset to 2, added another.
+        assert!(tiny.incr(1) >= 2); // had 2, reset to 1, added another.
+        assert!(tiny.incr(2) >= 2); // had 2, reset to 1, added another.
     }
 }
