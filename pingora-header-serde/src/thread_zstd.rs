@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 use thread_local::ThreadLocal;
+use zstd_safe::{CCtx, DCtx};
 
 /// Each thread will own its compression and decompression CTXes, and they share a single dict
 /// https://facebook.github.io/zstd/zstd_manual.html recommends to reuse ctx per thread
@@ -50,7 +51,7 @@ impl Compression {
         level: i32,
     ) -> Result<usize, &'static str> {
         self.com_context
-            .get_or(|| RefCell::new(zstd_safe::create_cctx()))
+            .get_or(|| RefCell::new(CCtx::create()))
             .borrow_mut()
             .compress_using_dict(destination, source, &self.dict[..], level)
             .map_err(zstd_safe::get_error_name)
@@ -71,7 +72,7 @@ impl Compression {
         destination: &mut C,
     ) -> Result<usize, &'static str> {
         self.de_context
-            .get_or(|| RefCell::new(zstd_safe::create_dctx()))
+            .get_or(|| RefCell::new(DCtx::create()))
             .borrow_mut()
             .decompress_using_dict(destination, source, &self.dict)
             .map_err(zstd_safe::get_error_name)
