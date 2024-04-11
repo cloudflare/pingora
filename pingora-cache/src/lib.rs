@@ -69,7 +69,7 @@ pub enum CachePhase {
     /// Cache was enabled, the request decided not to use it
     // HttpCache.inner is kept
     Bypass,
-    /// Awaiting cache key to be generated
+    /// Awaiting the cache key to be generated
     CacheKey,
     /// Cache hit
     Hit,
@@ -81,7 +81,7 @@ pub enum CachePhase {
     Expired,
     /// A staled (expired) asset was found, and it was revalidated to be fresh
     Revalidated,
-    /// Revalidated, but deemed uncacheable so we do not freshen it
+    /// Revalidated, but deemed uncacheable, so we do not freshen it
     RevalidatedNoCache(NoCacheReason),
 }
 
@@ -114,12 +114,12 @@ pub enum NoCacheReason {
     ResponseTooLarge,
     /// Due to internal caching storage error
     StorageError,
-    /// Due to other type of internal issues
+    /// Due to other types of internal issues
     InternalError,
     /// will be cacheable but skip cache admission now
     ///
-    /// This happens when the cache predictor predicted that this request is not cacheable but
-    /// the response turns out to be OK to cache. However it might be too large to re-enable caching
+    /// This happens when the cache predictor predicted that this request is not cacheable, but
+    /// the response turns out to be OK to cache. However, it might be too large to re-enable caching
     /// for this request.
     Deferred,
     /// The writer of the cache lock sees that the request is not cacheable (Could be OriginNotCache)
@@ -285,7 +285,7 @@ impl HttpCache {
                     let lock = inner.lock.take();
                     if let Some(Locked::Write(_r)) = lock {
                         let lock_status = match reason {
-                            // let next request try to fetch it
+                            // let the next request try to fetch it
                             InternalError | StorageError | Deferred => LockStatus::TransientError,
                             // no need for the lock anymore
                             OriginNotCache | ResponseTooLarge => LockStatus::GiveUp,
@@ -414,7 +414,7 @@ impl HttpCache {
 
     /// Return the cache key used for asset lookup
     /// # Panic
-    /// Can only be called after cache key is set and cache is not disabled. Panic otherwise.
+    /// Can only be called after the cache key is set and the cache is not disabled. Panic otherwise.
     pub fn cache_key(&self) -> &CacheKey {
         match self.phase {
             CachePhase::Disabled(_) | CachePhase::Uninit => panic!("wrong phase {:?}", self.phase),
@@ -511,7 +511,7 @@ impl HttpCache {
         }
     }
 
-    /// Return the body reader during a cache admission(miss/expired) which decouples the downstream
+    /// Return the body reader during a cache admission (miss/expired) which decouples the downstream
     /// read and upstream cache write
     pub fn miss_body_reader(&mut self) -> Option<&mut HitHandler> {
         match self.phase {
@@ -588,7 +588,7 @@ impl HttpCache {
                 };
 
                 if inner.storage.support_streaming_partial_write() {
-                    // If reader can access partial write, the cache lock can be released here
+                    // If a reader can access partial write, the cache lock can be released here
                     // to let readers start reading the body.
                     let lock = inner.lock.take();
                     if let Some(Locked::Write(_r)) = lock {
@@ -929,7 +929,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::CacheKey => {
                 let inner = self.inner_mut();
-                // make sure that all variance found are fresher than this asset
+                // make sure that all variances found are fresher than this asset
                 // this is because when purging all the variance, only the primary slot is deleted
                 // the created TS of the primary is the tombstone of all the variances
                 inner.valid_after = Some(meta.created());
@@ -943,8 +943,8 @@ impl HttpCache {
                 let matches_variance = meta.variance() == variance_binary;
 
                 // We should remove the variance in the lookup `key` if this is the primary variant
-                // slot. We know this is the primary variant slot if this is the initial cache hit
-                // AND the variance in the `key` already matches the `meta`'s.)
+                // slot. We know this is the primary variant slot if this is the initial cache hit,
+                // AND the variance in the `key` already matches the `meta`'s.
                 //
                 // For the primary variant slot, the storage backend needs to use the primary key
                 // for both cache lookup and updating the meta. Otherwise it will look for the
@@ -1039,7 +1039,7 @@ impl HttpCache {
 
     /// Delete the asset from the cache storage
     /// # Panic
-    /// Need to be called after cache key is set. Panic otherwise.
+    /// Need to be called after the cache key is set. Panic otherwise.
     pub async fn purge(&mut self) -> Result<bool> {
         match self.phase {
             CachePhase::CacheKey => {
@@ -1066,7 +1066,7 @@ impl HttpCache {
         }
     }
 
-    /// Tell the predictor that this response which is previously predicted to be uncacheable
+    /// Tell the predictor that this response, which is previously predicted to be uncacheable,
     /// is cacheable now.
     pub fn response_became_cacheable(&self) {
         if let Some(predictor) = self.inner().predictor {
@@ -1083,7 +1083,7 @@ impl HttpCache {
     }
 }
 
-/// Set the header compression dictionary that help serialize http header.
+/// Set the header compression dictionary, which helps serialize http header.
 ///
 /// Return false if it is already set.
 pub fn set_compression_dict_path(path: &str) -> bool {

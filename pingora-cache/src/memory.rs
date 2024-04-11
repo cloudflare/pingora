@@ -41,7 +41,7 @@ pub(crate) struct CacheObject {
 
 pub(crate) struct TempObject {
     pub meta: BinaryMeta,
-    // these are Arc because they need to continue exist after this TempObject is removed
+    // these are Arc because they need to continue to exist after this TempObject is removed
     pub body: Arc<RwLock<Vec<u8>>>,
     bytes_written: Arc<watch::Sender<PartialState>>, // this should match body.len()
 }
@@ -307,12 +307,12 @@ impl Storage for MemCache {
     }
 
     async fn purge(&'static self, key: &CompactCacheKey, _trace: &SpanHandle) -> Result<bool> {
-        // TODO: purge partial
-
-        // This usually purges the primary key because, without a lookup, variance key is usually
+        // This usually purges the primary key because, without a lookup, the variance key is usually
         // empty
         let hash = key.combined();
-        Ok(self.cached.write().remove(&hash).is_some())
+        let temp_removed = self.temp.write().remove(&hash).is_some();
+        let cache_removed = self.cached.write().remove(&hash).is_some();
+        Ok(temp_removed || cache_removed)
     }
 
     async fn update_meta(
@@ -506,5 +506,54 @@ mod test {
         assert!(data.is_none());
         let data = hit_handler2.read_body().await.unwrap();
         assert!(data.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_partial() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+
+        let key = CacheKey::new("", "a", "1").to_compact();
+        let hash = key.combined();
+        let meta = (
+            "meta_key".as_bytes().to_vec(),
+            "meta_value".as_bytes().to_vec(),
+        );
+
+        let temp_obj = TempObject::new(meta);
+        cache.temp.write().insert(hash.clone(), temp_obj);
+
+        assert!(cache.temp.read().contains_key(&hash));
+
+        let result = cache.purge(&key, &Span::inactive().handle()).await;
+        assert!(result.is_ok());
+
+        assert!(!cache.temp.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_purge_complete() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+
+        let key = CacheKey::new("", "a", "1").to_compact();
+        let hash = key.combined();
+        let meta = (
+            "meta_key".as_bytes().to_vec(),
+            "meta_value".as_bytes().to_vec(),
+        );
+        let body = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+        let cache_obj = CacheObject {
+            meta,
+            body: Arc::new(body),
+        };
+        cache.cached.write().insert(hash.clone(), cache_obj);
+
+        assert!(cache.cached.read().contains_key(&hash));
+
+        let result = cache.purge(&key, &Span::inactive().handle()).await;
+        assert!(result.is_ok());
+
+        assert!(!cache.cached.read().contains_key(&hash));
     }
 }

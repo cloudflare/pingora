@@ -481,7 +481,7 @@ mod parse_response {
             resp.status,
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
         ) {
-            // these status code cannot have body by definition
+            // these status codes cannot have body by definition
             return ParseState::Done(0);
         }
         if let Some(encoding) = resp.headers.get(http::header::TRANSFER_ENCODING) {

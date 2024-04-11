@@ -55,7 +55,7 @@ impl<const N: usize> Manager<N> {
 
         assert!(shard < N);
 
-        // NOTE: This could use a lot memory to buffer the serialized data in memory
+        // NOTE: This could use a lot of memory to buffer the serialized data in memory
         // NOTE: This for loop could lock the LRU for too long
         let mut nodes = Vec::with_capacity(self.0.shard_len(shard));
         self.0.iter_for_each(shard, |(node, size)| {

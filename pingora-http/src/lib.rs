@@ -148,7 +148,7 @@ impl RequestHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,
@@ -377,7 +377,7 @@ impl ResponseHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,

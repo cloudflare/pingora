@@ -140,7 +140,7 @@ pub fn ssl_use_second_key_share(_ssl: &mut SslRef, _enabled: bool) {}
 /// Clear the error stack
 ///
 /// SSL calls should check and clear the BoringSSL error stack. But some calls fail to do so.
-/// This causes the next unrelated SSL call to fail due to the leftover errors. This function allow
+/// This causes the next unrelated SSL call to fail due to the leftover errors. This function allows
 /// the caller to clear the error stack before performing SSL calls to avoid this issue.
 pub fn clear_error_stack() {
     let _ = ErrorStack::get();
@@ -186,7 +186,7 @@ pub fn is_suspended_for_cert(error: &boring::ssl::Error) -> bool {
 #[allow(clippy::mut_from_ref)]
 /// Get a mutable SslRef ouf of SslRef. which is a missing functionality for certain SslStream
 /// # Safety
-/// the caller need to make sure that they hold a &mut SslRef
+/// the caller needs to make sure that they hold a &mut SslRef
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
     unsafe { SslRef::from_ptr_mut(ssl.as_ptr()) }
 }

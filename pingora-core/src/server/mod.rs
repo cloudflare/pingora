@@ -19,7 +19,7 @@ mod daemon;
 pub(crate) mod transfer_fd;
 
 use daemon::daemonize;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
 use std::sync::Arc;
@@ -30,15 +30,15 @@ use tokio::time::{sleep, Duration};
 
 use crate::services::Service;
 use configuration::{Opt, ServerConf};
-use transfer_fd::Fds;
+pub use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
 
-/* time to wait before exiting the program
-this is the graceful period for all existing session to finish */
+/* Time to wait before exiting the program.
+This is the graceful period for all existing sessions to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
-/* time to wait before shutting down listening sockets
-this is the graceful period for the new service to get ready */
+/* Time to wait before shutting down listening sockets.
+This is the graceful period for the new service to get ready */
 const CLOSE_TIMEOUT: u64 = 5;
 
 enum ShutdownType {
@@ -49,7 +49,7 @@ enum ShutdownType {
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
-pub(crate) type ListenFds = Arc<Mutex<Fds>>;
+pub type ListenFds = Arc<Mutex<Fds>>;
 
 /// The server object
 ///
@@ -166,6 +166,32 @@ impl Server {
         }
         self.listen_fds = Some(Arc::new(Mutex::new(fds)));
         Ok(())
+    }
+
+    /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
+    ///
+    /// This method is intended for pingora frontends that are NOT using the built-in
+    /// command line and configuration file parsing, and are instead using their own.
+    ///
+    /// If a configuration file path is provided as part of `opt`, it will be ignored
+    /// and a warning will be logged.
+    pub fn new_with_opt_and_conf(opt: Opt, mut conf: ServerConf) -> Server {
+        if let Some(c) = opt.conf.as_ref() {
+            warn!("Ignoring command line argument using '{c}' as configuration, and using provided configuration instead.");
+        }
+        conf.merge_with_opt(&opt);
+
+        let (tx, rx) = watch::channel(false);
+
+        Server {
+            services: vec![],
+            listen_fds: None,
+            shutdown_watch: tx,
+            shutdown_recv: rx,
+            configuration: Arc::new(conf),
+            options: Some(opt),
+            sentry: None,
+        }
     }
 
     /// Create a new [`Server`].
@@ -302,15 +328,25 @@ impl Server {
         let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
 
         if matches!(shutdown_type, ShutdownType::Graceful) {
-            info!("Graceful shutdown: grace period {}s starts", EXIT_TIMEOUT);
-            thread::sleep(Duration::from_secs(EXIT_TIMEOUT));
+            let exit_timeout = self
+                .configuration
+                .as_ref()
+                .grace_period_seconds
+                .unwrap_or(EXIT_TIMEOUT);
+            info!("Graceful shutdown: grace period {}s starts", exit_timeout);
+            thread::sleep(Duration::from_secs(exit_timeout));
             info!("Graceful shutdown: grace period ends");
         }
 
         // Give tokio runtimes time to exit
         let shutdown_timeout = match shutdown_type {
             ShutdownType::Quick => Duration::from_secs(0),
-            ShutdownType::Graceful => Duration::from_secs(5),
+            ShutdownType::Graceful => Duration::from_secs(
+                self.configuration
+                    .as_ref()
+                    .graceful_shutdown_timeout_seconds
+                    .unwrap_or(5),
+            ),
         };
         let shutdowns: Vec<_> = runtimes
             .into_iter()

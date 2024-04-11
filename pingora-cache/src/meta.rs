@@ -166,9 +166,9 @@ mod internal_meta {
         {
             // v0 has 4 items and no version number
             4 => Ok(InternalMetaV0::deserialize(buf)?.into()),
-            // other V should has version number encoded
+            // other V should have version number encoded
             _ => {
-                // rmp will encode version < 128 into a fixint (one byte),
+                // rmp will encode `version` < 128 into a fixint (one byte),
                 // so we use read_pfix
                 let version = rmp::decode::read_pfix(preread_buf)
                     .or_err(InternalError, "failed to decode meta version")?;
