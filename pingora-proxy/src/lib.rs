@@ -114,7 +114,7 @@ impl<SV> HttpProxy<SV> {
         // phase 1 read request header
 
         let res = tokio::select! {
-            biased; // biased select is cheaper and we don't want to drop already buffered requests
+            biased; // biased select is cheaper, and we don't want to drop already buffered requests
             res = downstream_session.read_request() => { res }
             _ = self.shutdown.notified() => {
                 // service shutting down, dropping the connection to stop more req from coming in
@@ -416,7 +416,7 @@ impl<SV> HttpProxy<SV> {
         {
             Ok(proxy_to_upstream) => {
                 if !proxy_to_upstream {
-                    // The hook can choose to write its own response, but if it doesn't we respond
+                    // The hook can choose to write its own response, but if it doesn't, we respond
                     // with a generic 502
                     if session.response_written().is_none() {
                         match session.write_response_header_ref(&BAD_GATEWAY).await {
@@ -489,7 +489,7 @@ impl<SV> HttpProxy<SV> {
         }
 
         // serve stale if error
-        // check both error and cache before calling the function because await is not cheap
+        // Check both error and cache before calling the function because await is not cheap
         let serve_stale_result = if proxy_error.is_some() && session.cache.can_serve_stale_error() {
             self.handle_stale_if_error(&mut session, &mut ctx, proxy_error.as_ref().unwrap())
                 .await
@@ -562,7 +562,7 @@ where
             None => return, // bad request
         };
 
-        // no real downstream to keepalive but it doesn't matter what is set here because at the end
+        // no real downstream to keepalive, but it doesn't matter what is set here because at the end
         // of this fn the dummy connection will be dropped
         session.set_keepalive(None);
 
@@ -606,7 +606,7 @@ where
     }
 
     fn http_cleanup(&self) {
-        // Notify all keepalived request blocking on read_request() to abort
+        // Notify all keepalived requests blocking on read_request() to abort
         self.shutdown.notify_waiters();
 
         // TODO: impl shutting down flag so that we don't need to read stack.is_shutting_down()

@@ -644,7 +644,6 @@ impl BodyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::BufRef;
     use tokio_test::io::Builder;
 
     fn init_log() {

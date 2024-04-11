@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! An async read through cache where cache miss are populated via the provided
+//! An async read through cache where cache misses are populated via the provided
 //! async callback.
 
 use super::{CacheStatus, MemoryCache};
@@ -123,7 +123,7 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
 {
     /// Create a new [RTCache] of given size. `lock_age` defines how long a lock is valid for.
     /// `lock_timeout` is used to stop a lookup from holding on to the key for too long.
@@ -142,7 +142,7 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
     CB: Lookup<K, T, S>,
 {
     /// Query the cache for a given value. If it exists and no TTL is configured initially, it will
@@ -288,12 +288,12 @@ where
 impl<K, T, CB, S> RTCache<K, T, CB, S>
 where
     K: Hash + Send,
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
     CB: MultiLookup<K, T, S>,
 {
     /// Same behavior as [RTCache::get] but for an arbitrary amount of keys.
     ///
-    /// If there are keys that are missing from cache, `multi_lookup` is invoked to populate the
+    /// If there are keys that are missing from the cache, `multi_lookup` is invoked to populate the
     /// cache before returning the final results. This is useful if your type supports batch
     /// queries.
     ///
@@ -316,7 +316,7 @@ where
             match CB::multi_lookup(&misses, extra).await {
                 Ok(miss_results) => {
                     // assert! here to prevent index panic when building results,
-                    // final_results has full list of misses but miss_results might not
+                    // final_results has the full list of misses but miss_results might not
                     assert!(
                         miss_results.len() == misses.len(),
                         "multi_lookup() failed to return the matching number of results"
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(resp[1].1, CacheStatus::Miss);
         assert_eq!(resp[2].0, 3);
         assert_eq!(resp[2].1, CacheStatus::Miss);
-        // all hit after a fetch
+        // all hits after a fetch
         let resp = cache
             .multi_get([1, 2, 3].iter(), None, opt1.as_ref())
             .await
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "multi_lookup() failed to return the matching number of results")]
     async fn test_inconsistent_miss_results() {
-        // force empty result
+        // force an empty result
         let opt1 = Some(ExtraOpt {
             error: false,
             empty: true,

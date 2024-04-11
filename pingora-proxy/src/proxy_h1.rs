@@ -15,7 +15,6 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use http::Version;
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_1to1(
@@ -270,7 +269,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",
@@ -505,8 +504,11 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             HttpTask::Body(data, end) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }

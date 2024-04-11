@@ -95,7 +95,7 @@ impl Fds {
 }
 
 fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
-    // There are many way to do this. serde is probably the way to go
+    // There are many ways to do this. Serde is probably the way to go
     // But let's start with something simple: space separated strings
     let joined = vec_string.join(" ");
     // TODO: check the buf is large enough
@@ -343,7 +343,6 @@ where
 mod tests {
     use super::*;
     use log::{debug, error};
-    use std::thread;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();

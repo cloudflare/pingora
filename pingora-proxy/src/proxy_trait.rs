@@ -13,16 +13,14 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{
-    key::HashBinary, CacheKey, CacheMeta, NoCacheReason, RespCacheable, RespCacheable::*,
-};
+use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
 
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
-/// paticular stage (if applicable).
+/// particular stage (if applicable).
 ///
-/// If any of the filters returns [Result::Err], the request will fail and the error will be logged.
+/// If any of the filters returns [Result::Err], the request will fail, and the error will be logged.
 #[cfg_attr(not(doc_async_trait), async_trait)]
 pub trait ProxyHttp {
     /// The per request object to share state across the different filters
@@ -31,7 +29,7 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
-    /// Define where the proxy should sent the request to.
+    /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should
     /// be forwarded to.
@@ -46,7 +44,7 @@ pub trait ProxyHttp {
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
     /// return a response for this request.
     ///
-    /// If the user already sent a response to this request, a `Ok(true)` should be returned so that
+    /// If the user already sent a response to this request, an `Ok(true)` should be returned so that
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
@@ -59,7 +57,7 @@ pub trait ProxyHttp {
 
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
-    /// The caller can interact with `Session.cache` to enabled caching.
+    /// The caller can interact with `Session.cache` to enable caching.
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
@@ -129,7 +127,7 @@ pub trait ProxyHttp {
 
     /// Decide how to generate cache vary key from both request and response
     ///
-    /// None means no variance is need.
+    /// None means no variance is needed.
     fn cache_vary_filter(
         &self,
         _meta: &CacheMeta,
@@ -158,7 +156,7 @@ pub trait ProxyHttp {
 
     /// Modify the response header from the upstream
     ///
-    /// The modification is before caching so any change here will be stored in cache if enabled.
+    /// The modification is before caching, so any change here will be stored in the cache if enabled.
     ///
     /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
     /// only the 304 from upstream will trigger the filter (though it will be merged into the
@@ -174,7 +172,7 @@ pub trait ProxyHttp {
     /// Modify the response header before it is send to the downstream
     ///
     /// The modification is after caching. This filter is called for all responses including
-    /// responses served from cache..
+    /// responses served from cache.
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -194,7 +192,7 @@ pub trait ProxyHttp {
     fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &Option<Bytes>,
+        _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) {
@@ -204,7 +202,8 @@ pub trait ProxyHttp {
     fn response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &Option<Bytes>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>>
     where
@@ -266,7 +265,7 @@ pub trait ProxyHttp {
     ///
     /// If the error can be retried, [Self::upstream_peer()] will be called again so that the user
     /// can decide whether to send the request to the same upstream or another upstream that is possibly
-    /// avaliable.
+    /// available.
     fn fail_to_connect(
         &self,
         _session: &mut Session,
@@ -352,7 +351,7 @@ pub trait ProxyHttp {
 
     /// This callback is invoked every time request related error log needs to be generated
     ///
-    /// Users can define what is the important to be written about this request via the returned string.
+    /// Users can define what is important to be written about this request via the returned string.
     fn request_summary(&self, session: &Session, _ctx: &Self::CTX) -> String {
         session.as_ref().request_summary()
     }
@@ -360,7 +359,7 @@ pub trait ProxyHttp {
     /// Whether the request should be used to invalidate(delete) the HTTP cache
     ///
     /// - `true`: this request will be used to invalidate the cache.
-    /// - `false`: this request is a treated as an normal request
+    /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
     }

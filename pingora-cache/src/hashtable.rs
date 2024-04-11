@@ -67,7 +67,7 @@ where
 pub struct LruShard<V>(RwLock<LruCache<u128, V>>);
 impl<V> Default for LruShard<V> {
     fn default() -> Self {
-        // help satisfy default construction of array
+        // help satisfy default construction of arrays
         LruShard(RwLock::new(LruCache::unbounded()))
     }
 }

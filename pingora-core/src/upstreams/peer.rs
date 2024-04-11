@@ -64,7 +64,7 @@ pub trait Peer: Display + Clone {
     fn sni(&self) -> &str;
     /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
-    /// The connection to two peers are considered reusable to each other if their reuse hashes are
+    /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
     fn reuse_hash(&self) -> u64;
     /// Get the proxy setting to connect to the remote server

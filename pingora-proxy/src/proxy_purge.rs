@@ -14,9 +14,6 @@
 
 use super::*;
 
-use once_cell::sync::Lazy;
-use pingora_core::protocols::http::SERVER_NAME;
-
 fn gen_purge_response(code: u16) -> ResponseHeader {
     let mut resp = ResponseHeader::build(code, Some(3)).unwrap();
     resp.insert_header(header::SERVER, &SERVER_NAME[..])
