@@ -221,6 +221,16 @@ pub trait ProxyHttp {
     ) {
     }
 
+    /// Similar to [Self::upstream_response_filter()] but for response trailers
+    fn upstream_response_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Similar to [Self::response_filter()] but for response body chunks
     fn response_body_filter(
         &self,
@@ -235,7 +245,11 @@ pub trait ProxyHttp {
         Ok(None)
     }
 
-    /// When a trailer is received.
+    /// Similar to [Self::response_filter()] but for response trailers.
+    /// Note, returning an Ok(Some(Bytes)) will result in the downstream response
+    /// trailers being written to the response body.
+    ///
+    /// TODO: make this interface more intuitive
     async fn response_trailer_filter(
         &self,
         _session: &mut Session,

@@ -20,8 +20,8 @@ use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
-use http::header::AsHeaderName;
 use http::HeaderValue;
+use http::{header::AsHeaderName, HeaderMap};
 use log::error;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -138,6 +138,14 @@ impl Session {
                 Ok(())
             }
             Self::H2(s) => s.write_body(data, false),
+        }
+    }
+
+    /// Write the response trailers to client
+    pub async fn write_response_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
+        match self {
+            Self::H1(_) => Ok(()), // TODO: support trailers for h1
+            Self::H2(s) => s.write_trailers(trailers),
         }
     }
 
