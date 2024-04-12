@@ -222,7 +222,12 @@ impl<SV> HttpProxy<SV> {
         }
     }
 
-    fn upstream_filter(&self, session: &mut Session, task: &mut HttpTask, ctx: &mut SV::CTX)
+    fn upstream_filter(
+        &self,
+        session: &mut Session,
+        task: &mut HttpTask,
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
     where
         SV: ProxyHttp,
     {
@@ -233,10 +238,14 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Body(data, eos) => self
                 .inner
                 .upstream_response_body_filter(session, data, *eos, ctx),
+            HttpTask::Trailer(Some(trailers)) => self
+                .inner
+                .upstream_response_trailer_filter(session, trailers, ctx)?,
             _ => {
-                // TODO: add other upstream filter traits
+                // task does not support a filter
             }
         }
+        Ok(())
     }
 
     async fn finish(

@@ -431,7 +431,7 @@ impl<SV> HttpProxy<SV> {
     {
         // skip caching if already served from cache
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx);
+            self.upstream_filter(session, &mut task, ctx)?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -515,7 +515,7 @@ impl<SV> HttpProxy<SV> {
                 }
                 Ok(HttpTask::Body(data, end))
             }
-            HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // no h1 trailer filter yet
+            HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }

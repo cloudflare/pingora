@@ -381,7 +381,7 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx);
+            self.upstream_filter(session, &mut task, ctx)?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -457,18 +457,18 @@ impl<SV> HttpProxy<SV> {
                     .inner
                     .response_body_filter(session, &mut data, eos, ctx)?
                 {
-                    trace!("delaying response for {:?}", duration);
+                    trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
             }
-            HttpTask::Trailer(header_map) => {
-                let trailer_buffer = match header_map {
-                    Some(mut trailer_map) => {
+            HttpTask::Trailer(mut trailers) => {
+                let trailer_buffer = match trailers.as_mut() {
+                    Some(trailers) => {
                         debug!("Parsing response trailers..");
                         match self
                             .inner
-                            .response_trailer_filter(session, &mut trailer_map, ctx)
+                            .response_trailer_filter(session, trailers, ctx)
                             .await
                         {
                             Ok(buf) => buf,
@@ -490,7 +490,7 @@ impl<SV> HttpProxy<SV> {
                     // https://http2.github.io/http2-spec/#malformed
                     Ok(HttpTask::Body(Some(buffer), true))
                 } else {
-                    Ok(HttpTask::Done)
+                    Ok(HttpTask::Trailer(trailers))
                 }
             }
             HttpTask::Done => Ok(task),
