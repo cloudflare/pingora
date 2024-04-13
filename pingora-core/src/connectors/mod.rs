@@ -25,7 +25,7 @@ use crate::tls::ssl::SslConnector;
 use crate::upstreams::peer::{Peer, ALPN};
 
 use l4::connect as l4_connect;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -201,7 +201,7 @@ impl TransportConnector {
                         }
                     }
                     Err(_) => {
-                        error!("failed to acquire reusable stream");
+                        debug!("failed to acquire reusable stream");
                         None
                     }
                 }
