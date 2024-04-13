@@ -121,8 +121,8 @@ impl<T> PoolNode<T> {
         }
     }
 
-    // This function acquires 2 locks and iterates over the entire hot queue
-    // But it should be fine because remove() rarely happens on a busy PoolNode
+    // This function acquires 2 locks and iterates over the entire hot queue.
+    // But it should be fine because remove() rarely happens on a busy PoolNode.
     /// Remove the item associated with the id from the pool. The item is returned
     /// if it is found and removed.
     pub fn remove(&self, id: ID) -> Option<T> {
@@ -141,7 +141,7 @@ impl<T> PoolNode<T> {
                     // this is the item, it is already popped
                     return Some(conn);
                 } else {
-                    // not this item, put back to hot queue but it could also be full
+                    // not this item, put back to hot queue, but it could also be full
                     self.insert(conn_id, conn);
                 }
             } else {
@@ -167,7 +167,7 @@ pub struct ConnectionPool<S> {
 impl<S> ConnectionPool<S> {
     /// Create a new [ConnectionPool] with a size limit.
     ///
-    /// when a connection is released to this pool, the least recently used connection will be dropped.
+    /// When a connection is released to this pool, the least recently used connection will be dropped.
     pub fn new(size: usize) -> Self {
         ConnectionPool {
             pool: RwLock::new(HashMap::with_capacity(size)), // this is oversized since some connections will have the same key
@@ -187,7 +187,7 @@ impl<S> ConnectionPool<S> {
         {
             // write lock section
             let mut pool = self.pool.write();
-            // check again since another task might already added it
+            // check again since another task might have already added it
             if let Some(v) = pool.get(&key) {
                 return (*v).clone();
             }
@@ -198,7 +198,7 @@ impl<S> ConnectionPool<S> {
         }
     }
 
-    // only remove from pool because lru already removed it
+    // only remove from the pool because lru already removed it
     fn pop_evicted(&self, meta: &ConnectionMeta) {
         let pool_node = {
             let pool = self.pool.read();
@@ -309,7 +309,7 @@ impl<S> ConnectionPool<S> {
     /// Passively wait to close the connection after the timeout
     ///
     /// If this connection is not being picked up or evicted before the timeout is reach, this
-    /// function will removed it from the pool and close the connection.
+    /// function will remove it from the pool and close the connection.
     pub async fn idle_timeout(
         &self,
         meta: &ConnectionMeta,

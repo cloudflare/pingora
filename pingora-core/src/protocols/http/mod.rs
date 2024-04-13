@@ -17,6 +17,7 @@
 mod body_buffer;
 pub mod client;
 pub mod compression;
+pub mod conditional_filter;
 pub(crate) mod date;
 pub mod error_resp;
 pub mod server;

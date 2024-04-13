@@ -39,7 +39,7 @@ struct Node {
 
 /// A simple LRU eviction manager
 ///
-/// The implementation is not optimized. All operation require global locks.
+/// The implementation is not optimized. All operations require global locks.
 pub struct Manager {
     lru: RwLock<LruCache<u64, Node>>,
     limit: usize,
@@ -86,7 +86,7 @@ impl Manager {
         }
     }
 
-    // evict items until the used capacity is below limit
+    // evict items until the used capacity is below the limit
     fn evict(&self) -> Vec<CompactCacheKey> {
         if self.used.load(Ordering::Relaxed) <= self.limit {
             return vec![];
@@ -107,13 +107,13 @@ impl Manager {
         to_evict
     }
 
-    // This could use a lot memory to buffer the serialized data in memory and could lock the LRU
+    // This could use a lot of memory to buffer the serialized data in memory and could lock the LRU
     // for too long
     fn serialize(&self) -> Result<Vec<u8>> {
         use rmp_serde::encode::Serializer;
         use serde::ser::SerializeSeq;
         use serde::ser::Serializer as _;
-        // NOTE: This could use a lot memory to buffer the serialized data in memory
+        // NOTE: This could use a lot of memory to buffer the serialized data in memory
         let mut ser = Serializer::new(vec![]);
         // NOTE: This long for loop could lock the LRU for too long
         let lru = self.lru.read();

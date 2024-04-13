@@ -34,7 +34,7 @@ pub trait HealthCheck {
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
-    /// number of check need to to flip from unhealthy to healthy.
+    /// number of check need to flip from unhealthy to healthy.
     fn health_threshold(&self, success: bool) -> usize;
 }
 
@@ -42,9 +42,9 @@ pub trait HealthCheck {
 ///
 /// This health check checks if a TCP (or TLS) connection can be established to a given backend.
 pub struct TcpHealthCheck {
-    /// Number of successful check to flip from unhealthy to healthy.
+    /// Number of successful checks to flip from unhealthy to healthy.
     pub consecutive_success: usize,
-    /// Number of failed check to flip from healthy to unhealthy.
+    /// Number of failed checks to flip from healthy to unhealthy.
     pub consecutive_failure: usize,
     /// How to connect to the backend.
     ///
@@ -52,7 +52,7 @@ pub struct TcpHealthCheck {
     /// The SocketAddr of `peer_template` is just a placeholder which will be replaced by the
     /// actual address of the backend when the health check runs.
     ///
-    /// By default this check will try to establish a TCP connection. When the `sni` field is
+    /// By default, this check will try to establish a TCP connection. When the `sni` field is
     /// set, it will also try to establish a TLS connection on top of the TCP connection.
     pub peer_template: BasicPeer,
     connector: TransportConnector,
@@ -118,9 +118,9 @@ type Validator = Box<dyn Fn(&ResponseHeader) -> Result<()> + Send + Sync>;
 ///
 /// This health check checks if it can receive the expected HTTP(s) response from the given backend.
 pub struct HttpHealthCheck {
-    /// Number of successful check to flip from unhealthy to healthy.
+    /// Number of successful checks to flip from unhealthy to healthy.
     pub consecutive_success: usize,
-    /// Number of failed check to flip from healthy to unhealthy.
+    /// Number of failed checks to flip from healthy to unhealthy.
     pub consecutive_failure: usize,
     /// How to connect to the backend.
     ///
@@ -157,7 +157,7 @@ impl HttpHealthCheck {
     /// * consecutive_success: 1
     /// * consecutive_failure: 1
     /// * reuse_connection: false
-    /// * validator: `None`, any 200 response is consider successful
+    /// * validator: `None`, any 200 response is considered successful
     pub fn new(host: &str, tls: bool) -> Self {
         let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.append_header("Host", host).unwrap();
@@ -241,7 +241,7 @@ impl HealthCheck for HttpHealthCheck {
 struct HealthInner {
     /// Whether the endpoint is healthy to serve traffic
     healthy: bool,
-    /// Whether the endpoint is allowed to serve traffic independent from its health
+    /// Whether the endpoint is allowed to serve traffic independent of its health
     enabled: bool,
     /// The counter for stateful transition between healthy and unhealthy.
     /// When [healthy] is true, this counts the number of consecutive health check failures

@@ -32,7 +32,7 @@ pub trait BackendSelection {
     /// Select backends for a given key.
     ///
     /// An [BackendIter] should be returned. The first item in the iter is the first
-    /// choice backend. The user should continue iterate over it if the first backend
+    /// choice backend. The user should continue to iterate over it if the first backend
     /// cannot be used due to its health or other reasons.
     fn iter(self: &Arc<Self>, key: &[u8]) -> Self::Iter
     where

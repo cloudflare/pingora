@@ -54,7 +54,7 @@
 //! We've provided a health-aware example in
 //! `pingora-ketama/examples/health_aware_selector.rs`.
 //!
-//! For a carefully crafted real-world example, see the pingora-load-balancer
+//! For a carefully crafted real-world example, see the [`pingora-load-balancing`](https://docs.rs/pingora-load-balancing)
 //! crate.
 
 use std::cmp::Ordering;
@@ -101,7 +101,7 @@ struct Point {
     hash: u32,
 }
 
-// We only want to compare the hash when sorting so we implement these traits by hand.
+// We only want to compare the hash when sorting, so we implement these traits by hand.
 impl Ord for Point {
     fn cmp(&self, other: &Self) -> Ordering {
         self.hash.cmp(&other.hash)

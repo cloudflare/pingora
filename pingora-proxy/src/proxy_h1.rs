@@ -15,7 +15,6 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use http::Version;
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_1to1(
@@ -270,7 +269,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",
@@ -464,20 +463,21 @@ impl<SV> HttpProxy<SV> {
 
         match task {
             HttpTask::Header(mut header, end) => {
-                let req = session.req_header();
-
                 /* Downstream revalidation/range, only needed when cache is on because otherwise origin
                  * will handle it */
                 // TODO: if cache is disabled during response phase, we should still do the filter
                 if session.cache.enabled() {
-                    proxy_cache::downstream_response_conditional_filter(
+                    self.downstream_response_conditional_filter(
                         serve_from_cache,
-                        req,
+                        session,
                         &mut header,
+                        ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type =
-                            proxy_cache::range_filter::range_header_filter(req, &mut header);
+                        let range_type = proxy_cache::range_filter::range_header_filter(
+                            session.req_header(),
+                            &mut header,
+                        );
                         range_body_filter.set(range_type);
                     }
                 }
@@ -485,7 +485,7 @@ impl<SV> HttpProxy<SV> {
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = req.method == http::method::Method::HEAD
+                let no_body = session.req_header().method == http::method::Method::HEAD
                     || matches!(header.status.as_u16(), 204 | 304);
                 if !no_body
                     && !header.status.is_informational()
@@ -505,8 +505,11 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             HttpTask::Body(data, end) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, end, ctx)?
+                {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }

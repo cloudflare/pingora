@@ -8,16 +8,15 @@ jobs:
       matrix:
         # TODO: add nightly
         toolchain: [stable]
-        profile: [minimal, default]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: "recursive"
 
       - name: Install build dependencies
         run: |
@@ -30,39 +29,24 @@ jobs:
           sudo apt install -y openresty --no-install-recommends
 
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-          profile: ${{ matrix.profile }}
           components: rustfmt, clippy
-          override: true
-          default: true
 
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose --lib --bins --tests --no-fail-fast
+        run: cargo test --verbose --lib --bins --tests --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose --doc
+        run: cargo test --verbose --doc
 
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-targets --all -- --deny=warnings
+        run: cargo clippy --all-targets --all -- --deny=warnings
 
       - name: Run cargo audit
         uses: actions-rust-lang/audit@v1
