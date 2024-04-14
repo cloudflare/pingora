@@ -28,7 +28,7 @@ pub struct CacheLock {
     timeout: Duration, // fixed timeout value for now
 }
 
-/// A struct prepresenting a locked cache access
+/// A struct representing locked cache access
 #[derive(Debug)]
 pub enum Locked {
     /// The writer is allowed to fetch the asset
@@ -174,8 +174,8 @@ impl LockCore {
 
     fn unlock(&self, reason: LockStatus) {
         self.lock_status.store(reason.into(), Ordering::SeqCst);
-        // any small positive number will do, 10 is used for RwLock too
-        // no need to wake up all at once
+        // Any small positive number will do, 10 is used for RwLock as well.
+        // No need to wake up all at once.
         self.lock.add_permits(10);
     }
 
@@ -186,7 +186,7 @@ impl LockCore {
 
 // all 3 structs below are just Arc<LockCore> with different interfaces
 
-/// ReadLock: requests who get it need to wait until it is released
+/// ReadLock: the requests who get it need to wait until it is released
 #[derive(Debug)]
 pub struct ReadLock(Arc<LockCore>);
 
@@ -245,7 +245,7 @@ impl WritePermit {
 
 impl Drop for WritePermit {
     fn drop(&mut self) {
-        // writer exit without properly unlock, let others to compete for the write lock again
+        // Writer exited without properly unlocking. We let others to compete for the write lock again
         if self.0.locked() {
             self.unlock(LockStatus::Dangling);
         }

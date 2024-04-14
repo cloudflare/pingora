@@ -19,9 +19,9 @@ path = "src/lib.rs"
 
 [dependencies]
 pingora-error = { version = "0.1.0", path = "../pingora-error" }
-pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-core = { version = "0.1.0", path = "../pingora-core", default-features = false }
 pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
-pingora-cache = { version = "0.1.0", path = "../pingora-cache" }
+pingora-cache = { version = "0.1.0", path = "../pingora-cache", default-features = false }
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.1.0", path = "../pingora-http" }
 http = { workspace = true }
@@ -47,3 +47,11 @@ tokio-tungstenite = "0.20.1"
 pingora-load-balancing = { version = "0.1.0", path = "../pingora-load-balancing" }
 prometheus = "0"
 futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.8"
+
+[features]
+default = ["openssl"]
+openssl = ["pingora-core/openssl", "pingora-cache/openssl"]
+boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl"]

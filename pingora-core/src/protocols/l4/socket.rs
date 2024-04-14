@@ -15,10 +15,12 @@
 //! Generic socket type
 
 use crate::{Error, OrErr};
+use nix::sys::socket::{getpeername, getsockname, SockaddrStorage};
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr as StdSockAddr;
 use std::os::unix::net::SocketAddr as StdUnixSockAddr;
+use tokio::net::unix::SocketAddr as TokioUnixSockAddr;
 
 /// [`SocketAddr`] is a storage type that contains either a Internet (IP address)
 /// socket address or a Unix domain socket address.
@@ -51,6 +53,40 @@ impl SocketAddr {
     pub fn set_port(&mut self, port: u16) {
         if let SocketAddr::Inet(addr) = self {
             addr.set_port(port)
+        }
+    }
+
+    fn from_sockaddr_storage(sock: &SockaddrStorage) -> Option<SocketAddr> {
+        if let Some(v4) = sock.as_sockaddr_in() {
+            return Some(SocketAddr::Inet(StdSockAddr::V4(
+                std::net::SocketAddrV4::new(v4.ip().into(), v4.port()),
+            )));
+        } else if let Some(v6) = sock.as_sockaddr_in6() {
+            return Some(SocketAddr::Inet(StdSockAddr::V6(
+                std::net::SocketAddrV6::new(v6.ip(), v6.port(), v6.flowinfo(), v6.scope_id()),
+            )));
+        }
+
+        // TODO: don't set abstract / unnamed for now,
+        // for parity with how we treat these types in TryFrom<TokioUnixSockAddr>
+        Some(SocketAddr::Unix(
+            sock.as_unix_addr()
+                .map(|addr| addr.path().map(StdUnixSockAddr::from_pathname))??
+                .ok()?,
+        ))
+    }
+
+    pub fn from_raw_fd(fd: std::os::unix::io::RawFd, peer_addr: bool) -> Option<SocketAddr> {
+        let sockaddr_storage = if peer_addr {
+            getpeername(fd)
+        } else {
+            getsockname(fd)
+        };
+        match sockaddr_storage {
+            Ok(sockaddr) => Self::from_sockaddr_storage(&sockaddr),
+            // could be errors such as EBADF, i.e. fd is no longer a valid socket
+            // fail open in this case
+            Err(_e) => None,
         }
     }
 }
@@ -163,6 +199,34 @@ impl std::net::ToSocketAddrs for SocketAddr {
                 std::io::ErrorKind::Other,
                 "UDS socket cannot be used as inet socket",
             ))
+        }
+    }
+}
+
+impl From<StdSockAddr> for SocketAddr {
+    fn from(sockaddr: StdSockAddr) -> Self {
+        SocketAddr::Inet(sockaddr)
+    }
+}
+
+impl From<StdUnixSockAddr> for SocketAddr {
+    fn from(sockaddr: StdUnixSockAddr) -> Self {
+        SocketAddr::Unix(sockaddr)
+    }
+}
+
+// TODO: ideally mio/tokio will start using the std version of the unix `SocketAddr`
+// so we can avoid a fallible conversion
+// https://github.com/tokio-rs/mio/issues/1527
+impl TryFrom<TokioUnixSockAddr> for SocketAddr {
+    type Error = String;
+
+    fn try_from(value: TokioUnixSockAddr) -> Result<Self, Self::Error> {
+        if let Some(Ok(addr)) = value.as_pathname().map(StdUnixSockAddr::from_pathname) {
+            Ok(addr.into())
+        } else {
+            // may be unnamed/abstract UDS
+            Err(format!("could not convert {value:?} to SocketAddr"))
         }
     }
 }

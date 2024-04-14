@@ -47,6 +47,10 @@ pub struct ConnectorOptions {
     ///
     /// Each individual connection can use their own cert key to override this.
     pub cert_key_file: Option<(String, String)>,
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// env variable. This can be used by tools like Wireshark to decrypt traffic
+    /// for debugging purposes.
+    pub debug_ssl_keylog: bool,
     /// How many connections to keepalive
     pub keepalive_pool_size: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
@@ -95,6 +99,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: server_conf.ca_file.clone(),
             cert_key_file: None, // TODO: use it
+            debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
             keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
             offload_threadpool,
             bind_to_v4,
@@ -107,6 +112,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: None,
             cert_key_file: None,
+            debug_ssl_keylog: false,
             keepalive_pool_size,
             offload_threadpool: None,
             bind_to_v4: vec![],
@@ -209,7 +215,7 @@ impl TransportConnector {
 
     /// Return the [Stream] to the [TransportConnector] for connection reuse.
     ///
-    /// Not all TCP/TLS connection can be reused. It is the caller's responsibility to make sure
+    /// Not all TCP/TLS connections can be reused. It is the caller's responsibility to make sure
     /// that protocol over the [Stream] supports connection reuse and the [Stream] itself is ready
     /// to be reused.
     ///
@@ -360,9 +366,9 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 #[cfg(test)]
 mod tests {
     use pingora_error::ErrorType;
-    use pingora_openssl::ssl::SslMethod;
 
     use super::*;
+    use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
 
     // 192.0.2.1 is effectively a black hole
@@ -427,7 +433,7 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some system will allow the socket to bind and connect without error, only to timeout
+        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
         assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
     }
 

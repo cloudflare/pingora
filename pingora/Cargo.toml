@@ -17,13 +17,17 @@ keywords = ["async", "proxy", "http", "pingora"]
 name = "pingora"
 path = "src/lib.rs"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
-pingora-core = { version = "0.1.0", path = "../pingora-core" }
+pingora-core = { version = "0.1.0", path = "../pingora-core", default-features = false }
 pingora-http = { version = "0.1.0", path = "../pingora-http" }
 pingora-timeout = { version = "0.1.0", path = "../pingora-timeout" }
-pingora-load-balancing = { version = "0.1.0", path = "../pingora-load-balancing", optional = true }
-pingora-proxy = { version = "0.1.0", path = "../pingora-proxy", optional = true }
-pingora-cache = { version = "0.1.0", path = "../pingora-cache", optional = true }
+pingora-load-balancing = { version = "0.1.0", path = "../pingora-load-balancing", optional = true, default-features = false }
+pingora-proxy = { version = "0.1.0", path = "../pingora-proxy", optional = true, default-features = false }
+pingora-cache = { version = "0.1.0", path = "../pingora-cache", optional = true, default-features = false }
 
 [dev-dependencies]
 structopt = "0.3"
@@ -40,11 +44,22 @@ log = { workspace = true }
 prometheus = "0.13"
 once_cell = { workspace = true }
 bytes = { workspace = true }
+regex = "1"
 
 [features]
 default = ["openssl"]
-openssl = ["pingora-core/openssl"]
-boringssl = ["pingora-core/boringssl"]
+openssl = [
+    "pingora-core/openssl",
+    "pingora-proxy?/openssl",
+    "pingora-cache?/openssl",
+    "pingora-load-balancing?/openssl",
+]
+boringssl = [
+    "pingora-core/boringssl",
+    "pingora-proxy?/boringssl",
+    "pingora-cache?/boringssl",
+    "pingora-load-balancing?/boringssl",
+]
 proxy = ["pingora-proxy"]
 lb = ["pingora-load-balancing", "proxy"]
 cache = ["pingora-cache"]

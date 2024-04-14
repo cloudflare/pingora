@@ -27,7 +27,7 @@ use structopt::StructOpt;
 
 /// The configuration file
 ///
-/// Pingora configuration files are by default YAML files but any key value format can potentially
+/// Pingora configuration files are by default YAML files, but any key value format can potentially
 /// be used.
 ///
 /// # Extension
@@ -36,7 +36,8 @@ use structopt::StructOpt;
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConf {
-    version: usize,
+    /// Version
+    pub version: usize,
     /// Whether to run this process in the background.
     pub daemon: bool,
     /// When configured, error log will be written to the given file. Otherwise StdErr will be used.
@@ -60,12 +61,33 @@ pub struct ServerConf {
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
+    /// Grace period in seconds before starting the final step of the graceful shutdown after signaling shutdown.
+    pub grace_period_seconds: Option<u64>,
+    /// Timeout in seconds of the final step for the graceful shutdown.
+    pub graceful_shutdown_timeout_seconds: Option<u64>,
     // These options don't belong here as they are specific to certain services
-    pub(crate) client_bind_to_ipv4: Vec<String>,
-    pub(crate) client_bind_to_ipv6: Vec<String>,
-    pub(crate) upstream_keepalive_pool_size: usize,
-    pub(crate) upstream_connect_offload_threadpools: Option<usize>,
-    pub(crate) upstream_connect_offload_thread_per_pool: Option<usize>,
+    /// IPv4 addresses for a client connector to bind to. See [`ConnectorOptions`].
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub client_bind_to_ipv4: Vec<String>,
+    /// IPv6 addresses for a client connector to bind to. See [`ConnectorOptions`].
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub client_bind_to_ipv6: Vec<String>,
+    /// Keepalive pool size for client connections to upstream. See [`ConnectorOptions`].
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub upstream_keepalive_pool_size: usize,
+    /// Number of dedicated thread pools to use for upstream connection establishment.
+    /// See [`ConnectorOptions`].
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub upstream_connect_offload_threadpools: Option<usize>,
+    /// Number of threads per dedicated upstream connection establishment pool.
+    /// See [`ConnectorOptions`].
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub upstream_connect_offload_thread_per_pool: Option<usize>,
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// env variable. This can be used by tools like Wireshark to decrypt upstream traffic
+    /// for debugging purposes.
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub upstream_debug_ssl_keylog: bool,
 }
 
 impl Default for ServerConf {
@@ -77,6 +99,7 @@ impl Default for ServerConf {
             ca_file: None,
             daemon: false,
             error_log: None,
+            upstream_debug_ssl_keylog: false,
             pid_file: "/tmp/pingora.pid".to_string(),
             upgrade_sock: "/tmp/pingora_upgrade.sock".to_string(),
             user: None,
@@ -86,6 +109,8 @@ impl Default for ServerConf {
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            grace_period_seconds: None,
+            graceful_shutdown_timeout_seconds: None,
         }
     }
 }
@@ -154,9 +179,7 @@ impl ServerConf {
     pub fn load_yaml_with_opt_override(opt: &Opt) -> Result<Self> {
         if let Some(path) = &opt.conf {
             let mut conf = Self::load_from_yaml(path)?;
-            if opt.daemon {
-                conf.daemon = true;
-            }
+            conf.merge_with_opt(opt);
             Ok(conf)
         } else {
             Error::e_explain(ReadError, "No path specified")
@@ -171,9 +194,7 @@ impl ServerConf {
         let conf = Self::new();
         match conf {
             Some(mut c) => {
-                if opt.daemon {
-                    c.daemon = true;
-                }
+                c.merge_with_opt(opt);
                 Some(c)
             }
             None => None,
@@ -198,6 +219,12 @@ impl ServerConf {
         // TODO: do the validation
         Ok(self)
     }
+
+    pub fn merge_with_opt(&mut self, opt: &Opt) {
+        if opt.daemon {
+            self.daemon = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +245,7 @@ mod tests {
             ca_file: None,
             daemon: false,
             error_log: None,
+            upstream_debug_ssl_keylog: false,
             pid_file: "".to_string(),
             upgrade_sock: "".to_string(),
             user: None,
@@ -227,6 +255,8 @@ mod tests {
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            grace_period_seconds: None,
+            graceful_shutdown_timeout_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());

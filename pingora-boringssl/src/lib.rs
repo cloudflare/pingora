@@ -15,7 +15,7 @@
 //! The BoringSSL API compatibility layer.
 //!
 //! This crate aims at making [boring] APIs exchangeable with [openssl-rs](https://docs.rs/openssl/latest/openssl/).
-//! In other words, this crate and `pingora-openssl` expose identical rust APIs.
+//! In other words, this crate and [`pingora-openssl`](https://docs.rs/pingora-openssl) expose identical rust APIs.
 
 #![warn(clippy::all)]
 

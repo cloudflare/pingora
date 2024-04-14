@@ -30,7 +30,6 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::convert::TryInto;
 use std::ops::Deref;
 
 pub use http::method::Method;
@@ -149,7 +148,7 @@ impl RequestHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,
@@ -170,7 +169,7 @@ impl RequestHeader {
     /// Insert the header name and value to `self`.
     ///
     /// Different from [Self::append_header()], this method will replace all other existing headers
-    /// under the same name (case insensitive).
+    /// under the same name (case-insensitive).
     pub fn insert_header(
         &mut self,
         name: impl IntoCaseHeaderName,
@@ -378,7 +377,7 @@ impl ResponseHeader {
 
     /// Append the header name and value to `self`.
     ///
-    /// If there are already some header under the same name, a new value will be added without
+    /// If there are already some headers under the same name, a new value will be added without
     /// any others being removed.
     pub fn append_header(
         &mut self,
@@ -477,7 +476,7 @@ fn clone_resp_parts(me: &RespParts) -> RespParts {
 
 // This function returns an upper bound on the size of the header map used inside the http crate.
 // As of version 0.2, there is a limit of 1 << 15 (32,768) items inside the map. There is an
-// assertion against this size inside the crate so we want to avoid panicking by not exceeding this
+// assertion against this size inside the crate, so we want to avoid panicking by not exceeding this
 // upper bound.
 fn http_header_map_upper_bound(size_hint: Option<usize>) -> usize {
     // Even though the crate has 1 << 15 as the max size, calls to `with_capacity` invoke a
@@ -485,13 +484,13 @@ fn http_header_map_upper_bound(size_hint: Option<usize>) -> usize {
     //
     // See https://github.com/hyperium/http/blob/34a9d6bdab027948d6dea3b36d994f9cbaf96f75/src/header/map.rs#L3220
     //
-    // Therefore we set our max size to be even lower so we guarantee ourselves we won't hit that
+    // Therefore we set our max size to be even lower, so we guarantee ourselves we won't hit that
     // upper bound in the crate. Any way you cut it, 4,096 headers is insane.
     const PINGORA_MAX_HEADER_COUNT: usize = 4096;
     const INIT_HEADER_SIZE: usize = 8;
 
-    // We select the size hint or the max size here such that we pick a value substantially lower
-    // 1 << 15 with room to grow the header map.
+    // We select the size hint or the max size here, ensuring that we pick a value substantially lower
+    // than 1 << 15 with room to grow the header map.
     std::cmp::min(
         size_hint.unwrap_or(INIT_HEADER_SIZE),
         PINGORA_MAX_HEADER_COUNT,
@@ -510,7 +509,7 @@ fn append_header_value<T>(
         .as_slice()
         .try_into()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
-    // storage the original case in the map
+    // store the original case in the map
     if let Some(name_map) = name_map {
         name_map.append(header_name.clone(), case_header_name);
     }
@@ -531,7 +530,7 @@ fn insert_header_value<T>(
         .try_into()
         .or_err(InvalidHTTPHeader, "invalid header name")?;
     if let Some(name_map) = name_map {
-        // storage the original case in the map
+        // store the original case in the map
         name_map.insert(header_name.clone(), case_header_name);
     }
     value_map.insert(header_name, value);
@@ -563,7 +562,7 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
         let iter = key_map.iter().zip(value_map.iter());
         for ((header, case_header), (header2, val)) in iter {
             if header != header2 {
-                // in case the header iter order changes in further version of HMap
+                // in case the header iteration order changes in future versions of HMap
                 panic!("header iter mismatch {}, {}", header, header2)
             }
             buf.put_slice(case_header.as_slice());

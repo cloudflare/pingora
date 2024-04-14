@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::HttpTask;
-use crate::protocols::{Digest, Stream, UniqueID};
+use crate::protocols::{Digest, SocketAddr, Stream, UniqueID};
 use crate::utils::{BufRef, KVRef};
 
 /// The HTTP 1.x client session
@@ -65,6 +65,7 @@ impl HttpSession {
             ssl_digest: stream.get_ssl_digest(),
             timing_digest: stream.get_timing_digest(),
             proxy_digest: stream.get_proxy_digest(),
+            socket_digest: stream.get_socket_digest(),
         });
         HttpSession {
             underlying_stream: stream,
@@ -185,10 +186,9 @@ impl HttpSession {
 
             let read_fut = self.underlying_stream.read_buf(&mut buf);
             let read_result = match self.read_timeout {
-                Some(t) => match timeout(t, read_fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(std::io::Error::from(ErrorKind::TimedOut)),
-                },
+                Some(t) => timeout(t, read_fut)
+                    .await
+                    .map_err(|_| Error::explain(ReadTimedout, "while reading response headers"))?,
                 None => read_fut.await,
             };
             let n = match read_result {
@@ -208,26 +208,19 @@ impl HttpSession {
                     }
                 },
                 Err(e) => {
-                    return match e.kind() {
-                        ErrorKind::TimedOut => {
-                            Error::e_explain(ReadTimedout, "while reading response headers")
-                        }
-                        _ => {
-                            let true_io_error = e.raw_os_error().is_some();
-                            let mut e = Error::because(
-                                ReadError,
-                                format!(
-                                    "while reading response headers, bytes already read: {already_read}",
-                                ),
-                                e,
-                            );
-                            // Likely OSError, typical if a previously reused connection drops it
-                            if true_io_error {
-                                e.retry = RetryType::ReusedOnly;
-                            } // else: not safe to retry TLS error
-                            Err(e)
-                        }
-                    };
+                    let true_io_error = e.raw_os_error().is_some();
+                    let mut e = Error::because(
+                        ReadError,
+                        format!(
+                            "while reading response headers, bytes already read: {already_read}",
+                        ),
+                        e,
+                    );
+                    // Likely OSError, typical if a previously reused connection drops it
+                    if true_io_error {
+                        e.retry = RetryType::ReusedOnly;
+                    } // else: not safe to retry TLS error
+                    return Err(e);
                 }
             };
             already_read += n;
@@ -298,9 +291,9 @@ impl HttpSession {
                 HeaderParseState::Invalid(e) => {
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&buf)),
+                        format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
                         e,
-                    )
+                    );
                 }
             }
         }
@@ -435,10 +428,34 @@ impl HttpSession {
         is_buf_keepalive(self.get_header(header::CONNECTION).map(|v| v.as_bytes()))
     }
 
-    // `Keep-Alive: timeout=5, max=1000` => 5, 1000
+    /// `Keep-Alive: timeout=5, max=1000` => 5, 1000
+    /// This is defined in the below spec, this not part of any RFC, so
+    /// it's behavior is different on different platforms.
+    /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        // TODO: implement this parsing
-        (None, None)
+        let Some(keep_alive_header) = self.get_header("Keep-Alive") else {
+            return (None, None);
+        };
+
+        let Ok(header_value) = str::from_utf8(keep_alive_header.as_bytes()) else {
+            return (None, None);
+        };
+
+        let mut timeout = None;
+        let mut max = None;
+
+        for param in header_value.split(',') {
+            let mut parts = param.splitn(2, '=').map(|s| s.trim());
+            match (parts.next(), parts.next()) {
+                (Some("timeout"), Some(timeout_value)) => {
+                    timeout = timeout_value.trim().parse().ok()
+                }
+                (Some("max"), Some(max_value)) => max = max_value.trim().parse().ok(),
+                _ => {}
+            }
+        }
+
+        (timeout, max)
     }
 
     /// Close the connection abruptly. This allows to signal the server that the connection is closed
@@ -539,7 +556,7 @@ impl HttpSession {
     }
 
     fn init_req_body_writer(&mut self, header: &RequestHeader) {
-        if self.is_upgrade_req() {
+        if is_upgrade_req(header) {
             self.body_writer.init_http10();
         } else {
             self.init_body_writer_comm(&header.headers)
@@ -609,6 +626,22 @@ impl HttpSession {
     pub fn digest(&self) -> &Digest {
         &self.digest
     }
+
+    /// Return the server (peer) address recorded in the connection digest.
+    pub fn server_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.peer_addr())?
+    }
+
+    /// Return the client (local) address recorded in the connection digest.
+    pub fn client_addr(&self) -> Option<&SocketAddr> {
+        self.digest()
+            .socket_digest
+            .as_ref()
+            .map(|d| d.local_addr())?
+    }
 }
 
 #[inline]
@@ -672,8 +705,6 @@ mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::ParseState;
     use crate::ErrorType;
-    use std::str;
-    use std::time::Duration;
     use tokio_test::io::Builder;
 
     fn init_log() {
@@ -886,6 +917,26 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn init_body_for_upgraded_req() {
+        use crate::protocols::http::v1::body::BodyMode;
+
+        let wire =
+            b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().write(wire).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        new_request.insert_header("Connection", "Upgrade").unwrap();
+        new_request.insert_header("Upgrade", "WS").unwrap();
+        // CL is ignored when Upgrade presents
+        new_request.insert_header("Content-Length", "0").unwrap();
+        let _ = http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+    }
+
+    #[tokio::test]
     async fn read_switching_protocol() {
         init_log();
         let input1 = b"HTTP/1.1 101 Continue\r\n\r\n";
@@ -1053,6 +1104,65 @@ mod tests_stream {
                 .await
                 .keepalive_timeout,
             KeepaliveStatus::Off
+        );
+
+        async fn build_resp_with_keepalive_values(keep_alive: &str) -> HttpSession {
+            let input = format!("HTTP/1.1 200 OK\r\nKeep-Alive: {keep_alive}\r\n\r\n");
+            let mock_io = Builder::new().read(input.as_bytes()).build();
+            let mut http_stream = HttpSession::new(Box::new(mock_io));
+            let res = http_stream.read_response().await;
+            assert_eq!(input.len(), res.unwrap());
+            http_stream.respect_keepalive();
+            http_stream
+        }
+
+        assert_eq!(
+            build_resp_with_keepalive_values("timeout=5, max=1000")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("max=1000, timeout=5")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values(" timeout = 5, max = 1000 ")
+                .await
+                .get_keepalive_values(),
+            (Some(5), Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("timeout=5")
+                .await
+                .get_keepalive_values(),
+            (Some(5), None)
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("max=1000")
+                .await
+                .get_keepalive_values(),
+            (None, Some(1000))
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("a=b")
+                .await
+                .get_keepalive_values(),
+            (None, None)
+        );
+
+        assert_eq!(
+            build_resp_with_keepalive_values("")
+                .await
+                .get_keepalive_values(),
+            (None, None)
         );
     }
 

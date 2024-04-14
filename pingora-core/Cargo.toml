@@ -35,13 +35,13 @@ http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 lru = { workspace = true }
-nix = "0.24"
+nix = "~0.24.3"
 structopt = "0.3"
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
 libc = "0.2.70"
-chrono = { version = "0.4", features = ["alloc"], default-features = false }
+chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
 thread_local = "1.0"
 prometheus = "0.13"
 daemonize = "0.5.0"
@@ -65,6 +65,7 @@ brotli = "3"
 openssl-probe = "0.1"
 tokio-test = "0.4"
 zstd = "0"
+httpdate = "1"
 
 [dev-dependencies]
 matches = "0.1"

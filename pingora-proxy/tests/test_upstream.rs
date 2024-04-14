@@ -135,7 +135,7 @@ async fn test_ws_server_ends_conn() {
 
 mod test_cache {
     use super::*;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_basic_caching() {
@@ -333,15 +333,16 @@ mod test_cache {
     }
 
     #[tokio::test]
-    async fn test_cache_downstream_revalidation() {
+    async fn test_cache_downstream_revalidation_etag() {
         init();
-        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation/revalidate_now";
+        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation_etag/revalidate_now";
         let client = reqwest::Client::new();
 
         // MISS + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"") // "abcd" is the fixed etag of this
+            // endpoint
             .send()
             .await
             .unwrap();
@@ -354,7 +355,7 @@ mod test_cache {
         // HIT + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"")
             .send()
             .await
             .unwrap();
@@ -366,12 +367,96 @@ mod test_cache {
 
         assert_eq!(cache_miss_epoch, cache_hit_epoch);
 
+        // HIT + 200 (condition passed)
+        let res = client
+            .get(url)
+            .header("If-None-Match", "\"foobar\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
         sleep(Duration::from_millis(1100)).await; // ttl is 1
 
         // revalidated + 304
         let res = client
             .get(url)
-            .header("If-None-Match", "\"abcd\"") // the fixed etag of this endpoint
+            .header("If-None-Match", "\"abcd\", \"foobar\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_expired_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        // still the old object
+        assert_eq!(cache_expired_epoch, cache_hit_epoch);
+    }
+
+    #[tokio::test]
+    async fn test_cache_downstream_revalidation_last_modified() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_downstream_revalidation_last_modified/revalidate_now";
+        let client = reqwest::Client::new();
+
+        // MISS + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:04:39 GMT") // fixed last-modified of
+            // the endpoint
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        // HIT + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:11:39 GMT")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), ""); // 304 no body
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        // HIT + 200 (condition passed)
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 00:11:39 GMT")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // revalidated + 304
+        let res = client
+            .get(url)
+            .header("If-Modified-Since", "Tue, 03 May 2022 01:11:39 GMT")
             .send()
             .await
             .unwrap();

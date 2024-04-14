@@ -25,7 +25,6 @@ use structopt::StructOpt;
 use tokio::time::interval;
 
 use std::time::Duration;
-use std::vec::Vec;
 
 mod app;
 mod service;

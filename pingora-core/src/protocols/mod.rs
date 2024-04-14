@@ -20,7 +20,10 @@ pub mod l4;
 pub mod raw_connect;
 pub mod ssl;
 
-pub use digest::{Digest, GetProxyDigest, GetTimingDigest, ProtoDigest, TimingDigest};
+pub use digest::{
+    Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
+    TimingDigest,
+};
 pub use ssl::ALPN;
 
 use async_trait::async_trait;
@@ -71,6 +74,7 @@ pub trait IO:
     + Ssl
     + GetTimingDigest
     + GetProxyDigest
+    + GetSocketDigest
     + Unpin
     + Debug
     + Send
@@ -90,6 +94,7 @@ impl<
             + Ssl
             + GetTimingDigest
             + GetProxyDigest
+            + GetSocketDigest
             + Unpin
             + Debug
             + Send
@@ -134,6 +139,11 @@ mod ext_io_impl {
             None
         }
     }
+    impl GetSocketDigest for Mock {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
 
     use std::io::Cursor;
 
@@ -157,6 +167,11 @@ mod ext_io_impl {
             None
         }
     }
+    impl<T> GetSocketDigest for Cursor<T> {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
 
     use tokio::io::DuplexStream;
 
@@ -177,6 +192,11 @@ mod ext_io_impl {
     }
     impl GetProxyDigest for DuplexStream {
         fn get_proxy_digest(&self) -> Option<Arc<raw_connect::ProxyDigest>> {
+            None
+        }
+    }
+    impl GetSocketDigest for DuplexStream {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
             None
         }
     }

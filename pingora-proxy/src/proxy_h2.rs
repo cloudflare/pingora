@@ -247,7 +247,7 @@ impl<SV> HttpProxy<SV> {
                         Ok(b) => b,
                         Err(e) => {
                             if serve_from_cache.is_miss() {
-                                // ignore downstream error so that upstream can continue write cache
+                                // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
                                     "Downstream Error ignored during caching: {}, {}",
@@ -418,10 +418,11 @@ impl<SV> HttpProxy<SV> {
                  * will handle it */
                 // TODO: if cache is disabled during response phase, we should still do the filter
                 if session.cache.enabled() {
-                    proxy_cache::downstream_response_conditional_filter(
+                    self.downstream_response_conditional_filter(
                         serve_from_cache,
-                        req,
+                        session,
                         &mut header,
+                        ctx,
                     );
                     if !session.ignore_downstream_range {
                         let range_type =
@@ -451,8 +452,11 @@ impl<SV> HttpProxy<SV> {
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
-                let data = range_body_filter.filter_body(data);
-                if let Some(duration) = self.inner.response_body_filter(session, &data, ctx)? {
+                let mut data = range_body_filter.filter_body(data);
+                if let Some(duration) = self
+                    .inner
+                    .response_body_filter(session, &mut data, eos, ctx)?
+                {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }

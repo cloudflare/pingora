@@ -16,12 +16,12 @@
 
 use super::*;
 use crate::cache_control::{CacheControl, Cacheable, InterpretCacheControl};
-use crate::{RespCacheable, RespCacheable::*};
+use crate::RespCacheable::*;
 
 use http::{header, HeaderValue};
 use httpdate::HttpDate;
 use log::warn;
-use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_http::RequestHeader;
 
 /// Decide if the request can be cacheable
 pub fn request_cacheable(req_header: &ReqHeader) -> bool {
@@ -31,9 +31,8 @@ pub fn request_cacheable(req_header: &ReqHeader) -> bool {
 
 /// Decide if the response is cacheable.
 ///
-/// `cache_control` is the parsed [CacheControl] from the response header. It is an standalone
+/// `cache_control` is the parsed [CacheControl] from the response header. It is a standalone
 /// argument so that caller has the flexibility to choose to use, change or ignore it.
-// TODO: vary processing
 pub fn resp_cacheable(
     cache_control: Option<&CacheControl>,
     resp_header: &ResponseHeader,
@@ -206,6 +205,7 @@ pub mod upstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RespCacheable::Cacheable;
     use http::header::{HeaderName, CACHE_CONTROL, EXPIRES, SET_COOKIE};
     use http::StatusCode;
     use httpdate::fmt_http_date;
