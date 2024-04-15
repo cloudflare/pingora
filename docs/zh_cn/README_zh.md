@@ -6,7 +6,7 @@
 [阅读快速入门指南](quick_start_zh.md)
 
 ## 用户指南
-介绍如何配置和运行 `Pingora` 服务器，以及如何在 `Pingora` 框架上构建自定义的 `HTTP` 服务器和实现自己的 `Proxy` 方式。
+介绍如何配置和运行 `Pingora` 服务器，以及如何在 `Pingora` 框架上构建自定义的 `HTTP` 服务器和实现自己的 `Proxy` 代理。
 
 [阅读用户指南](user_guide/index_zh.md)
 
