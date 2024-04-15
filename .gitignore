@@ -7,3 +7,4 @@ dhat-heap.json
 .cover
 pingora/tests/keys/
 bleeper.user.toml
+.DS_Store
