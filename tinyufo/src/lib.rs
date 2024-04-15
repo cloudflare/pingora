@@ -443,6 +443,20 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
         self.queues.admit(key, data, weight, true, &self.buckets)
     }
 
+    pub fn remove(&self, key: K) {
+        let key = self.random_status.hash_one(key);
+        self.buckets.get_map(&key, |p| {
+            if p.queue.is_main() {
+                self.queues.main_weight.fetch_sub(p.weight as usize, SeqCst);
+            } else {
+                self.queues.small_weight.fetch_sub(p.weight as usize, SeqCst);
+            }
+        });
+        
+        //estimator should not be updated due to collision possibility
+        self.buckets.remove(&key);
+    }
+
     #[cfg(test)]
     fn peek_queue(&self, key: K) -> Option<bool> {
         let key = self.random_status.hash_one(&key);
@@ -551,6 +565,29 @@ mod tests {
         assert_eq!(cache.peek_queue(2), None);
         assert_eq!(cache.peek_queue(3), Some(SMALL));
         assert_eq!(cache.peek_queue(4), Some(SMALL));
+    }
+    
+    #[test]
+    fn test_remove_key() {
+        let cache = TinyUfo::new(5, 5);
+
+        cache.put(1, 1, 1);
+        cache.put(2, 2, 2);
+        cache.put(3, 3, 2);
+        // cache full now
+
+        assert_eq!(cache.peek_queue(1), Some(SMALL));
+        assert_eq!(cache.peek_queue(2), Some(SMALL));
+        assert_eq!(cache.peek_queue(3), Some(SMALL));
+
+        cache.remove(1);
+        cache.put(4, 4, 1);
+
+        assert_eq!(cache.peek_queue(1), None);
+        assert_eq!(cache.peek_queue(2), Some(SMALL));
+        assert_eq!(cache.peek_queue(3), Some(SMALL));
+        assert_eq!(cache.peek_queue(4), Some(SMALL));
+
     }
 
     #[test]

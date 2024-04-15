@@ -122,6 +122,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         self.store.put(hashed_key, node, 1);
     }
 
+    pub fn remove(&self, key: &K) {
+        let hashed_key = self.hasher.hash_one(key);
+        self.store.remove(hashed_key);
+    }
+
     pub(crate) fn force_put(&self, key: &K, value: T, ttl: Option<Duration>) {
         if let Some(t) = ttl {
             if t.is_zero() {
@@ -221,6 +226,19 @@ mod tests {
         let (res, hit) = cache.get(&3);
         assert_eq!(res.unwrap(), 6);
         assert_eq!(hit, CacheStatus::Hit);
+    }
+
+    #[test]
+    fn test_remove() {
+        let cache: MemoryCache<i32, i32> = MemoryCache::new(10);
+        cache.put(&1, 2, None);
+        let (res, hit) = cache.get(&1);
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(hit, CacheStatus::Hit);
+        cache.remove(&1);
+        let (res, hit) = cache.get(&1);
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
     }
 
     #[test]
