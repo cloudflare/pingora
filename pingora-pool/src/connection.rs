@@ -215,7 +215,7 @@ impl<S> ConnectionPool<S> {
         debug!("evict fd: {} from key {}", meta.id, meta.key);
     }
 
-    fn pop_closed(&self, meta: &ConnectionMeta) {
+    pub fn pop_closed(&self, meta: &ConnectionMeta) {
         // NOTE: which of these should be done first?
         self.pop_evicted(meta);
         self.lru.pop(&meta.id);
