@@ -1,6 +1,6 @@
 # Prometheus
 
-Pingora 内置了用于抓取的 Prometheus HTTP 指标服务器。
+`Pingora` 内置了用于抓取的 `Prometheus` `HTTP` metrics 服务。
 
 ```rust
 ...
@@ -19,4 +19,4 @@ register_int_gauge!("my_counter", "my counter").unwrap()
 
 ```
 
-这个静态指标将自动出现在 Prometheus 指标端点中。
+这个端点静态指标将自动出现在 `Prometheus` 指标中。

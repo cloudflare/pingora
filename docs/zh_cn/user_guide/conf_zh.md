@@ -17,8 +17,8 @@ group: webusers
 | version                      | 配置文件版本，目前是常量 \`1\` | number   |
 | pid_file                     | pid 文件路径                | string |
 | daemon                       | 是否在后台运行服务器          | bool |
-| error_log                    | 错误日志输出文件路径。如果未设置，则使用 STDERR | string |
-| upgrade_sock                 | 升级套接字路径             | string |
+| error_log                    | 异常日志输出文件路径。如果未设置，则使用 STDERR | string |
+| upgrade_sock                 | 升级`Socket`路径             | string |
 | threads                      | 每个服务的线程数             | number   |
 | user                         | 守护进程后 pingora 服务器应以哪个用户身份运行 | string |
 | group                        | 守护进程后 pingora 服务器应以哪个用户组身份运行 | string |
