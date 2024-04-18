@@ -65,6 +65,7 @@ brotli = "3"
 openssl-probe = "0.1"
 tokio-test = "0.4"
 zstd = "0"
+httpdate = "1"
 
 [dev-dependencies]
 matches = "0.1"

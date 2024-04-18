@@ -47,6 +47,10 @@ pub struct ConnectorOptions {
     ///
     /// Each individual connection can use their own cert key to override this.
     pub cert_key_file: Option<(String, String)>,
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// env variable. This can be used by tools like Wireshark to decrypt traffic
+    /// for debugging purposes.
+    pub debug_ssl_keylog: bool,
     /// How many connections to keepalive
     pub keepalive_pool_size: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
@@ -95,6 +99,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: server_conf.ca_file.clone(),
             cert_key_file: None, // TODO: use it
+            debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
             keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
             offload_threadpool,
             bind_to_v4,
@@ -107,6 +112,7 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: None,
             cert_key_file: None,
+            debug_ssl_keylog: false,
             keepalive_pool_size,
             offload_threadpool: None,
             bind_to_v4: vec![],
