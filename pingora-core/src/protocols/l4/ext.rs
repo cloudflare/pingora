@@ -211,6 +211,18 @@ pub fn get_tcp_info(_fd: RawFd) -> io::Result<TCP_INFO> {
     Ok(unsafe { TCP_INFO::new() })
 }
 
+/// Set the TCP receive buffer size. See SO_RCVBUF.
+#[cfg(target_os = "linux")]
+pub fn set_recv_buf(fd: RawFd, val: usize) -> Result<()> {
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, val as c_int)
+        .or_err(ConnectError, "failed to set SO_RCVBUF")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_recv_buf(_fd: RawFd) -> io::Result<()> {
+    Ok(())
+}
+
 /*
  * this extension is needed until the following are addressed
  * https://github.com/tokio-rs/tokio/issues/1543
@@ -294,4 +306,32 @@ pub fn set_tcp_keepalive(stream: &TcpStream, ka: &TcpKeepalive) -> Result<()> {
     let fd = stream.as_raw_fd();
     // TODO: check localhost or if keepalive is already set
     set_keepalive(fd, ka).or_err(ConnectError, "failed to set keepalive")
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_set_recv_buf() {
+        use tokio::net::TcpSocket;
+        let socket = TcpSocket::new_v4().unwrap();
+        set_recv_buf(socket.as_raw_fd(), 102400).unwrap();
+
+        let mut recv_size: c_int = 0;
+        let mut size = std::mem::size_of::<c_int>() as u32;
+        get_opt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &mut recv_size,
+            &mut size,
+        )
+        .unwrap();
+
+        if cfg!(target_os = "linux") {
+            // kernel doubles whatever is set
+            assert_eq!(recv_size, 102400 * 2);
+        }
+    }
 }

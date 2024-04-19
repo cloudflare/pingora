@@ -18,7 +18,9 @@ use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
-use crate::protocols::l4::ext::{connect as tcp_connect, connect_uds, set_tcp_keepalive};
+use crate::protocols::l4::ext::{
+    connect as tcp_connect, connect_uds, set_recv_buf, set_tcp_keepalive,
+};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
@@ -52,6 +54,10 @@ where
                     if let Some(ka) = peer.tcp_keepalive() {
                         debug!("Setting tcp keepalive");
                         set_tcp_keepalive(&socket, ka)?;
+                    }
+                    if let Some(recv_buf) = peer.tcp_recv_buf() {
+                        debug!("Setting recv buf size");
+                        set_recv_buf(socket.as_raw_fd(), recv_buf)?;
                     }
                     Ok(socket.into())
                 }

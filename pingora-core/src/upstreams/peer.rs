@@ -163,6 +163,11 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.h2_ping_interval)
     }
 
+    /// The size of the TCP receive buffer should be limited to. See SO_RCVBUF for more details.
+    fn tcp_recv_buf(&self) -> Option<usize> {
+        self.get_peer_options().and_then(|o| o.tcp_recv_buf)
+    }
+
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
     }
@@ -271,6 +276,7 @@ pub struct PeerOptions {
     pub alpn: ALPN,
     pub ca: Option<Arc<Box<[X509]>>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
+    pub tcp_recv_buf: Option<usize>,
     pub no_header_eos: bool,
     pub h2_ping_interval: Option<Duration>,
     // how many concurrent h2 stream are allowed in the same connection
@@ -301,6 +307,7 @@ impl PeerOptions {
             alpn: ALPN::H1,
             ca: None,
             tcp_keepalive: None,
+            tcp_recv_buf: None,
             no_header_eos: false,
             h2_ping_interval: None,
             max_h2_streams: 1,
