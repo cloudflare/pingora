@@ -51,12 +51,7 @@ pub trait ServerApp {
     ) -> Option<Stream>;
 
     /// This callback will be called once after the service stops listening to its endpoints.
-    fn cleanup(&self) {}
-
-    /// This callback will be called once after the service stops listening to its endpoints.
-    ///
-    /// Used for async cleanup tasks.
-    async fn async_cleanup(&self) {}
+    async fn cleanup(&self) {}
 }
 
 /// This trait defines the interface of an HTTP application.
@@ -82,7 +77,7 @@ pub trait HttpServerApp {
         None
     }
 
-    fn http_cleanup(&self) {}
+    async fn http_cleanup(&self) {}
 }
 
 #[cfg_attr(not(doc_async_trait), async_trait)]
@@ -146,7 +141,7 @@ where
         }
     }
 
-    fn cleanup(&self) {
-        self.http_cleanup()
+    async fn cleanup(&self) {
+        self.http_cleanup().await;
     }
 }
