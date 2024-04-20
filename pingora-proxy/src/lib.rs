@@ -614,7 +614,7 @@ where
         self.process_request(session, ctx).await
     }
 
-    fn http_cleanup(&self) {
+    async fn http_cleanup(&self) {
         // Notify all keepalived requests blocking on read_request() to abort
         self.shutdown.notify_waiters();
 
