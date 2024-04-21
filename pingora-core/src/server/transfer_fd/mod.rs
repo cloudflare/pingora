@@ -88,7 +88,7 @@ impl Fds {
     {
         let mut de_buf: [u8; 2048] = [0; 2048];
         let (fds, bytes) = get_fds_from(path, &mut de_buf)?;
-        let keys = deserialize_vec_string(&de_buf[..bytes]);
+        let keys = deserialize_vec_string(&de_buf[..bytes])?;
         self.deserialize(keys, fds);
         Ok(())
     }
@@ -102,13 +102,13 @@ fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
     buf.write(joined.as_bytes()).unwrap()
 }
 
-fn deserialize_vec_string(buf: &[u8]) -> Vec<String> {
-    let joined = std::str::from_utf8(buf).unwrap(); // TODO: handle error
+fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
+    let joined = std::str::from_utf8(buf).map_err(|_| Error::EINVAL)?;
     let mut results: Vec<String> = Vec::new();
     for iter in joined.split_ascii_whitespace() {
         results.push(String::from(iter));
     }
-    results
+    Ok(results)
 }
 
 #[cfg(target_os = "linux")]
@@ -380,7 +380,7 @@ mod tests {
         let vec_str: Vec<String> = vec!["aaaa".to_string(), "bbb".to_string()];
         let mut ser_buf: [u8; 1024] = [0; 1024];
         let size = serialize_vec_string(&vec_str, &mut ser_buf);
-        let de_vec_string = deserialize_vec_string(&ser_buf[..size]);
+        let de_vec_string = deserialize_vec_string(&ser_buf[..size]).unwrap();
         assert_eq!(de_vec_string.len(), 2);
         assert_eq!(de_vec_string[0], "aaaa");
         assert_eq!(de_vec_string[1], "bbb");
