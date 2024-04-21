@@ -104,11 +104,7 @@ fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
 
 fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
     let joined = std::str::from_utf8(buf).map_err(|_| Error::EINVAL)?;
-    let mut results: Vec<String> = Vec::new();
-    for iter in joined.split_ascii_whitespace() {
-        results.push(String::from(iter));
-    }
-    Ok(results)
+    Ok(joined.split_ascii_whitespace().map(String::from).collect())
 }
 
 #[cfg(target_os = "linux")]
