@@ -407,9 +407,9 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
-    pub fn new_uds(path: &str, tls: bool, sni: String) -> Self {
-        let addr = SocketAddr::Unix(UnixSocketAddr::from_pathname(Path::new(path)).unwrap()); //TODO: handle error
-        Self::new_from_sockaddr(addr, tls, sni)
+    pub fn new_uds(path: &str, tls: bool, sni: String) -> std::io::Result<Self> {
+        let addr = SocketAddr::Unix(UnixSocketAddr::from_pathname(Path::new(path))?);
+        Ok(Self::new_from_sockaddr(addr, tls, sni))
     }
 
     /// Create a new [`HttpPeer`] that uses a proxy to connect to the upstream IP and port

@@ -235,11 +235,9 @@ impl ProxyHttp for ExampleProxyHttp {
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
         if req.headers.contains_key("x-uds-peer") {
-            return Ok(Box::new(HttpPeer::new_uds(
-                "/tmp/nginx-test.sock",
-                false,
-                "".to_string(),
-            )));
+            return Ok(Box::new(
+                HttpPeer::new_uds("/tmp/nginx-test.sock", false, "".to_string()).unwrap(),
+            ));
         }
         let port = req
             .headers
