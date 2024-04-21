@@ -65,10 +65,9 @@ impl Fds {
     }
 
     pub fn deserialize(&mut self, binds: Vec<String>, fds: Vec<RawFd>) {
-        assert!(binds.len() == fds.len());
-        // TODO: use zip()
-        for i in 0..binds.len() {
-            self.map.insert(binds[i].clone(), fds[i]);
+        assert_eq!(binds.len(), fds.len());
+        for (bind, fd) in binds.into_iter().zip(fds) {
+            self.map.insert(bind, fd);
         }
     }
 
