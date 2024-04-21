@@ -51,17 +51,7 @@ impl Fds {
     }
 
     pub fn serialize(&self) -> (Vec<String>, Vec<RawFd>) {
-        let serialized: Vec<(String, RawFd)> = self
-            .map
-            .iter()
-            .map(|(key, value)| (key.clone(), *value))
-            .collect();
-
-        (
-            serialized.iter().map(|v| v.0.clone()).collect(),
-            serialized.iter().map(|v| v.1).collect(),
-        )
-        // Surely there is a better way of doing this
+        self.map.iter().map(|(key, val)| (key.clone(), val)).unzip()
     }
 
     pub fn deserialize(&mut self, binds: Vec<String>, fds: Vec<RawFd>) {
