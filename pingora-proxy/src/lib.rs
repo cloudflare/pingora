@@ -626,3 +626,17 @@ pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<Http
         HttpProxy::new(inner, conf.clone()),
     )
 }
+
+/// Create a [Service] from the user implemented [ProxyHttp].
+///
+/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service_with_name<SV>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+    name: &str,
+) -> Service<HttpProxy<SV>> {
+    Service::new(
+        name.to_string(),
+        HttpProxy::new(inner, conf.clone()),
+    )
+}
