@@ -219,7 +219,7 @@ pub fn set_recv_buf(fd: RawFd, val: usize) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_recv_buf(_fd: RawFd) -> io::Result<()> {
+pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
 
@@ -318,18 +318,18 @@ mod test {
         let socket = TcpSocket::new_v4().unwrap();
         set_recv_buf(socket.as_raw_fd(), 102400).unwrap();
 
-        let mut recv_size: c_int = 0;
-        let mut size = std::mem::size_of::<c_int>() as u32;
-        get_opt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &mut recv_size,
-            &mut size,
-        )
-        .unwrap();
-
-        if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
+            let mut recv_size: c_int = 0;
+            let mut size = std::mem::size_of::<c_int>() as u32;
+            get_opt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut recv_size,
+                &mut size,
+            )
+            .unwrap();
             // kernel doubles whatever is set
             assert_eq!(recv_size, 102400 * 2);
         }
