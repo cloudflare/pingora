@@ -331,14 +331,15 @@ impl HttpSession {
                     true
                 }
                 HttpTask::Trailer(None) => true,
-                HttpTask::Done => {
-                    self.finish().map_err(|e| e.into_down())?;
-                    return Ok(true);
-                }
+                HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     return Err(e);
                 }
             } || end_stream // safe guard in case `end` in tasks flips from true to false
+        }
+        if end_stream {
+            // no-op if finished already
+            self.finish().map_err(|e| e.into_down())?;
         }
         Ok(end_stream)
     }

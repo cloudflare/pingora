@@ -598,27 +598,26 @@ impl HttpSession {
         if self.should_read_resp_header() {
             let resp_header = self.read_resp_header_parts().await?;
             let end_of_body = self.is_body_done();
-            debug!("Response header: {:?}", resp_header);
+            debug!("Response header: {resp_header:?}");
             trace!(
                 "Raw Response header: {:?}",
                 str::from_utf8(self.get_headers_raw()).unwrap()
             );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
+            // no body
             debug!("Response is done");
             Ok(HttpTask::Done)
         } else {
             /* need to read body */
-            let data = self.read_body_bytes().await?;
+            let body = self.read_body_bytes().await?;
             let end_of_body = self.is_body_done();
-            if let Some(body) = data {
-                debug!("Response body: {} bytes", body.len());
-                trace!("Response body: {:?}", body);
-                Ok(HttpTask::Body(Some(body), end_of_body))
-            } else {
-                debug!("Response is done");
-                Ok(HttpTask::Done)
-            }
+            debug!(
+                "Response body: {} bytes, end: {end_of_body}",
+                body.as_ref().map_or(0, |b| b.len())
+            );
+            trace!("Response body: {body:?}");
+            Ok(HttpTask::Body(body, end_of_body))
         }
         // TODO: support h1 trailer
     }
@@ -983,9 +982,12 @@ mod tests_stream {
         // read body
         let task = http_stream.read_response_task().await.unwrap();
         match task {
-            HttpTask::Done => {}
+            HttpTask::Body(b, eob) => {
+                assert!(b.is_none());
+                assert!(eob);
+            }
             _ => {
-                panic!("task should be Done")
+                panic!("task should be body with end of stream")
             }
         }
     }
