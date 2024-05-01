@@ -288,6 +288,8 @@ pub struct ResponseHeader {
     base: RespParts,
     // an ordered header map to store the original case of each header name
     header_name_map: Option<CaseMap>,
+    // the reason phrase of the response, if unset, a default one will be used
+    reason_phrase: Option<String>,
 }
 
 impl AsRef<RespParts> for ResponseHeader {
@@ -309,6 +311,7 @@ impl Clone for ResponseHeader {
         Self {
             base: self.as_owned_parts(),
             header_name_map: self.header_name_map.clone(),
+            reason_phrase: self.reason_phrase.clone(),
         }
     }
 }
@@ -319,6 +322,7 @@ impl From<RespParts> for ResponseHeader {
         Self {
             base: parts,
             header_name_map: None,
+            reason_phrase: None,
         }
     }
 }
@@ -350,6 +354,7 @@ impl ResponseHeader {
         ResponseHeader {
             base,
             header_name_map: None,
+            reason_phrase: None,
         }
     }
 
@@ -441,6 +446,27 @@ impl ResponseHeader {
     /// Set the HTTP version
     pub fn set_version(&mut self, version: Version) {
         self.base.version = version
+    }
+
+    /// Set the HTTP reason phase. If `None`, a default reason phase will be used
+    pub fn set_reason_phrase(&mut self, reason_phrase: Option<&str>) -> Result<()> {
+        // No need to allocate memory to store the phrase if it is the default one.
+        if reason_phrase == self.base.status.canonical_reason() {
+            self.reason_phrase = None;
+            return Ok(());
+        }
+
+        // TODO: validate it "*( HTAB / SP / VCHAR / obs-text )"
+        self.reason_phrase = reason_phrase.map(str::to_string);
+        Ok(())
+    }
+
+    /// Get the HTTP reason phase. If [Self::set_reason_phrase()] is never called
+    /// or set to `None`, a default reason phase will be used
+    pub fn get_reason_phrase(&self) -> Option<&str> {
+        self.reason_phrase
+            .as_deref()
+            .or_else(|| self.base.status.canonical_reason())
     }
 
     /// Clone `self` into [http::response::Parts].
@@ -667,5 +693,24 @@ mod tests {
         let req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
         assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
         assert_eq!(raw_path, req.raw_path());
+    }
+
+    #[test]
+    fn test_reason_phrase() {
+        let mut resp = ResponseHeader::new(None);
+        let reason = resp.get_reason_phrase().unwrap();
+        assert_eq!(reason, "OK");
+
+        resp.set_reason_phrase(Some("FooBar")).unwrap();
+        let reason = resp.get_reason_phrase().unwrap();
+        assert_eq!(reason, "FooBar");
+
+        resp.set_reason_phrase(Some("OK")).unwrap();
+        let reason = resp.get_reason_phrase().unwrap();
+        assert_eq!(reason, "OK");
+
+        resp.set_reason_phrase(None).unwrap();
+        let reason = resp.get_reason_phrase().unwrap();
+        assert_eq!(reason, "OK");
     }
 }

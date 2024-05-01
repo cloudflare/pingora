@@ -1013,7 +1013,7 @@ fn http_resp_header_to_buf(
     let status = resp.status;
     buf.put_slice(status.as_str().as_bytes());
     buf.put_u8(b' ');
-    let reason = status.canonical_reason();
+    let reason = resp.get_reason_phrase();
     if let Some(reason_buf) = reason {
         buf.put_slice(reason_buf.as_bytes());
     }
@@ -1373,6 +1373,21 @@ mod tests_stream {
         let mock_io = Builder::new().write(wire).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Foo", "Bar").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&new_response)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_custom_reason() {
+        let wire = b"HTTP/1.1 200 Just Fine\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().write(wire).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.set_reason_phrase(Some("Just Fine")).unwrap();
         new_response.append_header("Foo", "Bar").unwrap();
         http_stream.update_resp_headers = false;
         http_stream
