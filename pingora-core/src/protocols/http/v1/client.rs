@@ -249,6 +249,8 @@ impl HttpSession {
                         _ => Version::HTTP_09,
                     });
 
+                    response_header.set_reason_phrase(resp.reason)?;
+
                     let buf = buf.freeze();
 
                     for header in header_refs {
@@ -718,6 +720,20 @@ mod tests_stream {
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
         assert_eq!(0, http_stream.resp_header().unwrap().headers.len());
+    }
+
+    #[tokio::test]
+    async fn read_response_custom_reason() {
+        init_log();
+        let input = b"HTTP/1.1 200 Just Fine\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert_eq!(input.len(), res.unwrap());
+        assert_eq!(
+            http_stream.resp_header().unwrap().get_reason_phrase(),
+            Some("Just Fine")
+        );
     }
 
     #[tokio::test]
