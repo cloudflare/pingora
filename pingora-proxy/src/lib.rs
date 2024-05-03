@@ -645,8 +645,5 @@ pub fn http_proxy_service_with_name<SV>(
     inner: SV,
     name: &str,
 ) -> Service<HttpProxy<SV>> {
-    Service::new(
-        name.to_string(),
-        HttpProxy::new(inner, conf.clone()),
-    )
+    Service::new(name.to_string(), HttpProxy::new(inner, conf.clone()))
 }
