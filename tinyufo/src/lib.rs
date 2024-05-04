@@ -449,10 +449,12 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
             if p.queue.is_main() {
                 self.queues.main_weight.fetch_sub(p.weight as usize, SeqCst);
             } else {
-                self.queues.small_weight.fetch_sub(p.weight as usize, SeqCst);
+                self.queues
+                    .small_weight
+                    .fetch_sub(p.weight as usize, SeqCst);
             }
         });
-        
+
         //estimator should not be updated due to collision possibility
         self.buckets.remove(&key);
     }
@@ -566,7 +568,7 @@ mod tests {
         assert_eq!(cache.peek_queue(3), Some(SMALL));
         assert_eq!(cache.peek_queue(4), Some(SMALL));
     }
-    
+
     #[test]
     fn test_remove_key() {
         let cache = TinyUfo::new(5, 5);
@@ -587,7 +589,6 @@ mod tests {
         assert_eq!(cache.peek_queue(2), Some(SMALL));
         assert_eq!(cache.peek_queue(3), Some(SMALL));
         assert_eq!(cache.peek_queue(4), Some(SMALL));
-
     }
 
     #[test]
