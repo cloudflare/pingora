@@ -223,16 +223,33 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
 
-/*
- * this extension is needed until the following are addressed
- * https://github.com/tokio-rs/tokio/issues/1543
- * https://github.com/tokio-rs/mio/issues/1257
- * https://github.com/tokio-rs/mio/issues/1211
- */
-/// connect() to the given address while optionally bind to the specific source address
+/// Enable client side TCP fast open.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_fastopen_connect(fd: RawFd) -> Result<()> {
+    set_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_FASTOPEN_CONNECT,
+        1 as c_int,
+    )
+    .or_err(ConnectError, "failed to set TCP_FASTOPEN_CONNECT")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_fastopen_connect(_fd: RawFd) -> Result<()> {
+    Ok(())
+}
+
+/// connect() to the given address while optionally binding to the specific source address.
+///
+/// The `set_socket` callback can be used to tune the socket before `connect()` is called.
 ///
 /// `IP_BIND_ADDRESS_NO_PORT` is used.
-pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<TcpStream> {
+pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
+    addr: &SocketAddr,
+    bind_to: Option<&SocketAddr>,
+    set_socket: F,
+) -> Result<TcpStream> {
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -252,10 +269,19 @@ pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<
     }
     // TODO: add support for bind on other platforms
 
+    set_socket(&socket)?;
+
     socket
         .connect(*addr)
         .await
         .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))
+}
+
+/// connect() to the given address while optionally binding to the specific source address.
+///
+/// `IP_BIND_ADDRESS_NO_PORT` is used.
+pub async fn connect(addr: &SocketAddr, bind_to: Option<&SocketAddr>) -> Result<TcpStream> {
+    connect_with(addr, bind_to, |_| Ok(())).await
 }
 
 /// connect() to the given Unix domain socket
@@ -333,5 +359,30 @@ mod test {
             // kernel doubles whatever is set
             assert_eq!(recv_size, 102400 * 2);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[ignore] // this test requires the Linux system to have net.ipv4.tcp_fastopen set
+    #[tokio::test]
+    async fn test_set_fast_open() {
+        use std::time::Instant;
+
+        // connect once to make sure their is a SYN cookie to use for TFO
+        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
+            set_tcp_fastopen_connect(socket.as_raw_fd())
+        })
+        .await
+        .unwrap();
+
+        let start = Instant::now();
+        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
+            set_tcp_fastopen_connect(socket.as_raw_fd())
+        })
+        .await
+        .unwrap();
+        let connection_time = start.elapsed();
+
+        // connect() return right away as the SYN goes out only when the first write() is called.
+        assert!(connection_time.as_millis() < 4);
     }
 }

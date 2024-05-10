@@ -19,7 +19,8 @@ use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{
-    connect as tcp_connect, connect_uds, set_recv_buf, set_tcp_keepalive,
+    connect_uds, connect_with as tcp_connect, set_recv_buf, set_tcp_fastopen_connect,
+    set_tcp_keepalive,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -39,7 +40,12 @@ where
     let peer_addr = peer.address();
     let mut stream: Stream = match peer_addr {
         SocketAddr::Inet(addr) => {
-            let connect_future = tcp_connect(addr, bind_to.as_ref());
+            let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
+                if peer.tcp_fast_open() {
+                    set_tcp_fastopen_connect(socket.as_raw_fd())?;
+                }
+                Ok(())
+            });
             let conn_res = match peer.connection_timeout() {
                 Some(t) => pingora_timeout::timeout(t, connect_future)
                     .await
