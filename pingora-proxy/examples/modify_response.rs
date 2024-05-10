@@ -14,9 +14,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
-use structopt::StructOpt;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -117,7 +117,7 @@ impl ProxyHttp for Json2Yaml {
 fn main() {
     env_logger::init();
 
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 

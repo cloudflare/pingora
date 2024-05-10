@@ -22,7 +22,7 @@ use pingora::services::background::{background_service, BackgroundService};
 use pingora::services::{listening::Service as ListeningService, Service};
 
 use async_trait::async_trait;
-use structopt::StructOpt;
+use clap::Parser;
 use tokio::time::interval;
 
 use std::time::Duration;
@@ -106,7 +106,7 @@ pub fn main() {
 
     print!("{USAGE}");
 
-    let opt = Some(Opt::from_args());
+    let opt = Some(Opt::parse());
     let mut my_server = Server::new(opt).unwrap();
     my_server.bootstrap();
 

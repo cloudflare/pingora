@@ -14,6 +14,7 @@
 
 use super::cert;
 use async_trait::async_trait;
+use clap::Parser;
 use http::header::VARY;
 use http::HeaderValue;
 use once_cell::sync::Lazy;
@@ -36,7 +37,6 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use structopt::StructOpt;
 
 pub struct ExampleProxyHttps {}
 
@@ -469,7 +469,7 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server = pingora_core::server::Server::new(Some(Opt::from_iter(opts))).unwrap();
+    let mut my_server = pingora_core::server::Server::new(Some(Opt::parse_from(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =
