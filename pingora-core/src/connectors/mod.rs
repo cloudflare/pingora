@@ -370,6 +370,8 @@ mod tests {
     use super::*;
     use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
 
     // 192.0.2.1 is effectively a black hole
     const BLACK_HOLE: &str = "192.0.2.1:79";
@@ -394,6 +396,38 @@ mod tests {
         peer.sni = "one.one.one.one".to_string();
         // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), None);
+
+        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        assert!(reused);
+    }
+
+    const MOCK_UDS_PATH: &str = "/tmp/test_unix_transport_connector.sock";
+
+    // one-off mock server
+    async fn mock_connect_server() {
+        let _ = std::fs::remove_file(MOCK_UDS_PATH);
+        let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
+        if let Ok((mut stream, _addr)) = listener.accept().await {
+            stream.write_all(b"it works!").await.unwrap();
+            // wait a bit so that the client can read
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_file(MOCK_UDS_PATH);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connect_uds() {
+        tokio::spawn(async {
+            mock_connect_server().await;
+        });
+        // create a new service at /tmp
+        let connector = TransportConnector::new(None);
+        let peer = BasicPeer::new_uds(MOCK_UDS_PATH).unwrap();
+        // make a new connection to mock uds
+        let mut stream = connector.new_stream(&peer).await.unwrap();
+        let mut buf = [0; 9];
+        let _ = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"it works!");
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
