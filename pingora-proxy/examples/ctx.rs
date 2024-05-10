@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use clap::Parser;
 use log::info;
 use std::sync::Mutex;
-use clap::Parser;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;

@@ -14,6 +14,7 @@
 
 use super::cert;
 use async_trait::async_trait;
+use clap::Parser;
 use http::header::VARY;
 use http::HeaderValue;
 use once_cell::sync::Lazy;
@@ -36,7 +37,6 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use clap::Parser;
 
 pub struct ExampleProxyHttps {}
 

@@ -19,11 +19,11 @@
 //! * Number of threads per service
 //! * Error log file path
 
+use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use clap::Parser;
 
 /// The configuration file
 ///

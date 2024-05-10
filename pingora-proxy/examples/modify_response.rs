@@ -14,9 +14,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
-use clap::Parser;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
