@@ -53,9 +53,7 @@ impl ProxyHttp for Router {
     }
 }
 
-fn build_cluster_service<S: BackendSelection>(
-    upstreams: &[&str],
-) -> GenBackgroundService<LoadBalancer<S>>
+fn build_cluster_service<S>(upstreams: &[&str]) -> GenBackgroundService<LoadBalancer<S>>
 where
     S: BackendSelection + 'static,
     S::Iter: BackendIter,
