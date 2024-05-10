@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use clap::Parser;
 use log::info;
 use pingora_core::services::background::background_service;
 use std::{sync::Arc, time::Duration};
-use structopt::StructOpt;
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
@@ -62,7 +62,7 @@ fn main() {
     env_logger::init();
 
     // read command line arguments
-    let opt = Opt::from_args();
+    let opt = Opt::parse();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
