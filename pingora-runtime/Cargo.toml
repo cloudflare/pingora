@@ -1,6 +1,6 @@
 [package]
 name = "pingora-runtime"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
