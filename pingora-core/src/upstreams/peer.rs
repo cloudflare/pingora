@@ -169,6 +169,13 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.tcp_recv_buf)
     }
 
+    /// Whether to enable TCP fast open.
+    fn tcp_fast_open(&self) -> bool {
+        self.get_peer_options()
+            .map(|o| o.tcp_fast_open)
+            .unwrap_or_default()
+    }
+
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
     }
@@ -301,6 +308,8 @@ pub struct PeerOptions {
     pub curves: Option<&'static str>,
     // see ssl_use_second_key_share
     pub second_keyshare: bool,
+    // whether to enable TCP fast open
+    pub tcp_fast_open: bool,
     // use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
 }
@@ -328,6 +337,7 @@ impl PeerOptions {
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
+            tcp_fast_open: false,
             tracer: None,
         }
     }
