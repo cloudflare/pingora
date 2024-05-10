@@ -31,7 +31,7 @@ async-trait = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 once_cell = { workspace = true }
-structopt = "0.3"
+clap = { version = "4.5", features = ["derive"] }
 regex = "1"
 
 [dev-dependencies]

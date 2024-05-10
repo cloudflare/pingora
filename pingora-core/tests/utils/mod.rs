@@ -19,7 +19,7 @@ use pingora_core::listeners::Listeners;
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
-use structopt::StructOpt;
+use clap::Parser;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -106,7 +106,7 @@ impl MyServer {
             "tests/pingora_conf.yaml".into(),
         ];
         let server_handle = thread::spawn(|| {
-            entry_point(Some(Opt::from_iter(opts)));
+            entry_point(Some(Opt::parse_from(opts)));
         });
         // wait until the server is up
         thread::sleep(time::Duration::from_secs(2));

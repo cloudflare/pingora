@@ -30,7 +30,7 @@ pingora-proxy = { version = "0.1.0", path = "../pingora-proxy", optional = true,
 pingora-cache = { version = "0.1.0", path = "../pingora-cache", optional = true, default-features = false }
 
 [dev-dependencies]
-structopt = "0.3"
+clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 matches = "0.1"
 env_logger = "0.9"
