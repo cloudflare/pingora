@@ -15,6 +15,7 @@
 //! Defines where to connect to and how to connect to a remote server
 
 use ahash::AHasher;
+use pingora_error::{ErrorType::InternalError, OrErr, Result};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -186,11 +187,24 @@ pub struct BasicPeer {
 }
 
 impl BasicPeer {
-    /// Create a new [`BasicPeer`]
+    /// Create a new [`BasicPeer`].
     pub fn new(address: &str) -> Self {
+        let addr = SocketAddr::Inet(address.parse().unwrap()); // TODO: check error
+        Self::new_from_sockaddr(addr)
+    }
+
+    /// Create a new [`BasicPeer`] with the given path to a Unix domain socket.
+    pub fn new_uds<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(path.as_ref())
+                .or_err(InternalError, "while creating BasicPeer")?,
+        );
+        Ok(Self::new_from_sockaddr(addr))
+    }
+
+    fn new_from_sockaddr(sockaddr: SocketAddr) -> Self {
         BasicPeer {
-            _address: SocketAddr::Inet(address.parse().unwrap()), // TODO: check error, add support
-            // for UDS
+            _address: sockaddr,
             sni: "".to_string(), // TODO: add support for SNI
             options: PeerOptions::new(),
         }
