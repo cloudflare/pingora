@@ -119,7 +119,9 @@ pub fn main() {
         .unwrap();
 
     let mut echo_service_http = service::echo::echo_service_http();
-    echo_service_http.add_tcp("0.0.0.0:6145");
+    let mut options = pingora::listeners::TcpSocketOptions::default();
+    options.tcp_fastopen = Some(10);
+    echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);
     echo_service_http.add_uds("/tmp/echo.sock", None);
 
     let dynamic_cert = DynamicCert::new(&cert_path, &key_path);

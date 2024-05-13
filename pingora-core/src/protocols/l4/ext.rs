@@ -240,6 +240,18 @@ pub fn set_tcp_fastopen_connect(_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Enable server side TCP fast open.
+#[cfg(target_os = "linux")]
+pub fn set_tcp_fastopen_backlog(fd: RawFd, backlog: usize) -> Result<()> {
+    set_opt(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, backlog as c_int)
+        .or_err(ConnectError, "failed to set TCP_FASTOPEN")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
+    Ok(())
+}
+
 /// connect() to the given address while optionally binding to the specific source address.
 ///
 /// The `set_socket` callback can be used to tune the socket before `connect()` is called.
