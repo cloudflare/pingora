@@ -223,7 +223,14 @@ impl<SV> HttpProxy<SV> {
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            send_body_to_pipe(buffer, downstream_state.is_done(), send_permit).await;
+            self.send_body_to_pipe(
+                session,
+                buffer,
+                downstream_state.is_done(),
+                send_permit,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -288,12 +295,15 @@ impl<SV> HttpProxy<SV> {
                         response_state.maybe_set_upstream_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
-                    let request_done = send_body_to_pipe(
+                    let is_body_done = session.is_body_done();
+                    let request_done = self.send_body_to_pipe(
+                        session,
                         body,
-                        session.is_body_done(),
+                        is_body_done,
                         send_permit.unwrap(), // safe because we checked is_ok()
+                        ctx,
                     )
-                    .await;
+                    .await?;
                     downstream_state.maybe_finished(request_done);
                 },
 
@@ -520,30 +530,48 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
     }
-}
 
-// TODO:: use this function to replace send_body_to2
-pub(crate) async fn send_body_to_pipe(
-    data: Option<Bytes>,
-    end_of_body: bool,
-    tx: mpsc::Permit<'_, HttpTask>,
-) -> bool {
-    match data {
-        Some(data) => {
-            debug!("Read {} bytes body from downstream", data.len());
-            if data.is_empty() && !end_of_body {
-                /* it is normal to get 0 bytes because of multi-chunk
-                 * don't write 0 bytes to downstream since it will be
-                 * misread as the terminating chunk */
-                return false;
-            }
-            tx.send(HttpTask::Body(Some(data), end_of_body));
-            end_of_body
+    // TODO:: use this function to replace send_body_to2
+    async fn send_body_to_pipe(
+        &self,
+        session: &mut Session,
+        mut data: Option<Bytes>,
+        end_of_body: bool,
+        tx: mpsc::Permit<'_, HttpTask>,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        // None: end of body
+        // this var is to signal if downstream finish sending the body, which shouldn't be
+        // affected by the request_body_filter
+        let end_of_body = end_of_body || data.is_none();
+
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
+
+        // the flag to signal to upstream
+        let upstream_end_of_body = end_of_body || data.is_none();
+
+        /* It is normal to get 0 bytes because of multi-chunk or request_body_filter decides not to
+         * output anything yet.
+         * Don't write 0 bytes to the network since it will be
+         * treated as the terminating chunk */
+        if !upstream_end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+            return Ok(false);
         }
-        None => {
-            tx.send(HttpTask::Body(None, true));
-            true
-        }
+
+        debug!(
+            "Read {} bytes body from downstream",
+            data.as_ref().map_or(-1, |d| d.len() as isize)
+        );
+
+        tx.send(HttpTask::Body(data, upstream_end_of_body));
+
+        Ok(end_of_body)
     }
 }
 

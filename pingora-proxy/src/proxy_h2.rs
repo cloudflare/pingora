@@ -223,7 +223,14 @@ impl<SV> HttpProxy<SV> {
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            send_body_to2(Ok(Some(buffer)), downstream_state.is_done(), client_body)?;
+            self.send_body_to2(
+                session,
+                Some(buffer),
+                downstream_state.is_done(),
+                client_body,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -260,7 +267,10 @@ impl<SV> HttpProxy<SV> {
                            }
                         }
                     };
-                    let request_done = send_body_to2(Ok(body), session.is_body_done(), client_body)?;
+                    let is_body_done = session.is_body_done();
+                    let request_done =
+                        self.send_body_to2(session, body, is_body_done, client_body, ctx)
+                        .await?;
                     downstream_state.maybe_finished(request_done);
                 },
 
@@ -497,38 +507,40 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         }
     }
-}
 
-pub(crate) fn send_body_to2(
-    data: Result<Option<Bytes>>,
-    end_of_body: bool,
-    client_body: &mut h2::SendStream<bytes::Bytes>,
-) -> Result<bool> {
-    match data {
-        Ok(res) => match res {
-            Some(data) => {
-                let data_len = data.len();
-                debug!(
-                    "Read {} bytes body from downstream, body end: {}",
-                    data_len, end_of_body
-                );
-                if data_len == 0 && !end_of_body {
-                    /* it is normal to get 0 bytes because of multi-chunk parsing */
-                    return Ok(false);
-                }
-                write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
-                debug!("Write {} bytes body to h2 upstream", data_len);
-                Ok(end_of_body)
-            }
-            None => {
-                debug!("Read downstream body done");
-                /* send a standalone END_STREAM flag */
-                write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
-                debug!("Write END_STREAM to h2 upstream");
-                Ok(true)
-            }
-        },
-        Err(e) => e.into_down().into_err(),
+    async fn send_body_to2(
+        &self,
+        session: &mut Session,
+        mut data: Option<Bytes>,
+        end_of_body: bool,
+        client_body: &mut h2::SendStream<bytes::Bytes>,
+        ctx: &mut SV::CTX,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
+
+        /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
+         * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
+         * for consistency */
+        if !end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+            return Ok(false);
+        }
+
+        if let Some(data) = data {
+            debug!("Write {} bytes body to h2 upstream", data.len());
+            write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
+        } else {
+            debug!("Read downstream body done");
+            /* send a standalone END_STREAM flag */
+            write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
+        }
+
+        Ok(end_of_body)
     }
 }
 
