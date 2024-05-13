@@ -44,6 +44,10 @@ where
                 if peer.tcp_fast_open() {
                     set_tcp_fastopen_connect(socket.as_raw_fd())?;
                 }
+                if let Some(recv_buf) = peer.tcp_recv_buf() {
+                    debug!("Setting recv buf size");
+                    set_recv_buf(socket.as_raw_fd(), recv_buf)?;
+                }
                 Ok(())
             });
             let conn_res = match peer.connection_timeout() {
@@ -60,10 +64,6 @@ where
                     if let Some(ka) = peer.tcp_keepalive() {
                         debug!("Setting tcp keepalive");
                         set_tcp_keepalive(&socket, ka)?;
-                    }
-                    if let Some(recv_buf) = peer.tcp_recv_buf() {
-                        debug!("Setting recv buf size");
-                        set_recv_buf(socket.as_raw_fd(), recv_buf)?;
                     }
                     Ok(socket.into())
                 }
