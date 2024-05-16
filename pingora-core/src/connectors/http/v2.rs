@@ -22,7 +22,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 use bytes::Bytes;
 use h2::client::SendRequest;
 use log::{debug, warn};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
@@ -55,6 +55,8 @@ pub(crate) struct ConnectionRefInner {
     // because `SendRequest` doesn't actually have access to the underlying Stream,
     // we log info about timing and tcp info here.
     pub(crate) digest: Digest,
+    // To serialize certain operations when trying to release the connect back to the pool,
+    pub(crate) release_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -77,6 +79,7 @@ impl ConnectionRef {
             max_streams,
             current_streams: AtomicUsize::new(0),
             digest,
+            release_lock: Arc::new(Mutex::new(())),
         }))
     }
     pub fn more_streams_allowed(&self) -> bool {
@@ -300,6 +303,12 @@ impl Connector {
         let reuse_hash = peer.reuse_hash();
         // get a ref to the connection, which we might need below, before dropping the h2
         let conn = session.conn();
+
+        // The lock here is to make sure that in_use_pool.insert() below cannot be called after
+        // in_use_pool.release(), which would have put the conn entry in both pools.
+        // It also makes sure that only one conn will trigger the conn.is_idle() condition, which
+        // avoids putting the same conn into the idle_pool more than once.
+        let locked = conn.0.release_lock.lock_arc();
         // this drop() will both drop the actual stream and call the conn.release_stream()
         drop(session);
         // find and remove the conn stored in in_use_pool so that it could be put in the idle pool
@@ -310,6 +319,7 @@ impl Connector {
             return;
         }
         if conn.is_idle() {
+            drop(locked);
             let meta = ConnectionMeta {
                 key: reuse_hash,
                 id,
@@ -326,6 +336,7 @@ impl Connector {
             }
         } else {
             self.in_use_pool.insert(reuse_hash, conn);
+            drop(locked);
         }
     }
 
