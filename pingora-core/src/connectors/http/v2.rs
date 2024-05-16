@@ -21,7 +21,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
-use log::debug;
+use log::{debug, warn};
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
@@ -269,14 +269,16 @@ impl Connector {
             .get(reuse_hash)
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
-            let h2_stream = conn
-                .spawn_stream()
-                .await?
-                .expect("connection from the pools should have free stream to allocate");
+            let h2_stream = conn.spawn_stream().await?;
+            if h2_stream.is_none() {
+                warn!("connection from the pools should have free stream to allocate, current in use {}, max {}",
+                    conn.0.current_streams.load(Ordering::Relaxed),
+                    conn.0.max_streams);
+            }
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
             }
-            Ok(Some(h2_stream))
+            Ok(h2_stream)
         } else {
             Ok(None)
         }
