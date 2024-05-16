@@ -109,9 +109,9 @@ pub trait ProxyHttp {
     // flex purge, other filtering, returns whether asset is should be force expired or not
     async fn cache_hit_filter(
         &self,
+        _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-        _req: &RequestHeader,
     ) -> Result<bool>
     where
         Self::CTX: Send + Sync,
