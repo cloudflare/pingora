@@ -386,7 +386,7 @@ impl HttpSession {
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
         if let Some(resp) = self.response_written.as_ref() {
-            if !resp.status.is_informational() {
+            if !resp.status.is_informational() || self.upgraded {
                 warn!("Respond header is already sent, cannot send again");
                 return Ok(());
             }
@@ -1431,6 +1431,14 @@ mod tests_stream {
             .unwrap();
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
+        // simulate upgrade
+        http_stream.upgraded = true;
+        // this write should be ignored
+        let response_502 = ResponseHeader::build(StatusCode::BAD_GATEWAY, None).unwrap();
+        http_stream
+            .write_response_header_ref(&response_502)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
