@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
+use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Shutdown, SocketDigest, Ssl, TimingDigest,
@@ -148,6 +149,15 @@ impl Stream {
         if let RawStream::Tcp(s) = &self.stream.get_ref() {
             s.set_nodelay(true)
                 .or_err(ConnectError, "failed to set_nodelay")?;
+        }
+        Ok(())
+    }
+
+    /// set TCP keepalive settings for this connection if `self` is TCP
+    pub fn set_keepalive(&mut self, ka: &TcpKeepalive) -> Result<()> {
+        if let RawStream::Tcp(s) = &self.stream.get_ref() {
+            debug!("Setting tcp keepalive");
+            set_tcp_keepalive(s, ka)?;
         }
         Ok(())
     }

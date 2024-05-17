@@ -24,6 +24,7 @@ pub use digest::{
     Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
     TimingDigest,
 };
+pub use l4::ext::TcpKeepalive;
 pub use ssl::ALPN;
 
 use async_trait::async_trait;
