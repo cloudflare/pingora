@@ -222,7 +222,7 @@ struct HttpCacheInner {
     pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
     pub cache_lock: Option<&'static CacheLock>,
     pub lock_duration: Option<Duration>,
-    /// time spent in cache lookup and reading the header
+    // time spent in cache lookup and reading the header
     pub lookup_duration: Option<Duration>,
     pub traces: trace::CacheTraceCTX,
 }
@@ -1046,6 +1046,12 @@ impl HttpCache {
     pub fn lock_duration(&self) -> Option<Duration> {
         // FIXME: this duration is lost when cache is disabled
         self.inner.as_ref().and_then(|i| i.lock_duration)
+    }
+
+    /// How long did this request spent on cache lookup and reading the header
+    pub fn lookup_duration(&self) -> Option<Duration> {
+        // FIXME: this duration is lost when cache is disabled
+        self.inner.as_ref().and_then(|i| i.lookup_duration)
     }
 
     /// Delete the asset from the cache storage
