@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use crate::protocols::l4::ext::TcpKeepalive;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
+use crate::protocols::TcpKeepalive;
 use crate::tls::x509::X509;
 use crate::utils::{get_organization_unit, CertKey};
 

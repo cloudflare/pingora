@@ -15,6 +15,7 @@
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt;
 use pingora::server::{Server, ShutdownWatch};
 use pingora::services::background::{background_service, BackgroundService};
@@ -119,8 +120,15 @@ pub fn main() {
         .unwrap();
 
     let mut echo_service_http = service::echo::echo_service_http();
+
     let mut options = pingora::listeners::TcpSocketOptions::default();
     options.tcp_fastopen = Some(10);
+    options.tcp_keepalive = Some(TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(5),
+        count: 5,
+    });
+
     echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);
     echo_service_http.add_uds("/tmp/echo.sock", None);
 

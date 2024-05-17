@@ -20,7 +20,6 @@ use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{
     connect_uds, connect_with as tcp_connect, set_recv_buf, set_tcp_fastopen_connect,
-    set_tcp_keepalive,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -61,10 +60,6 @@ where
             match conn_res {
                 Ok(socket) => {
                     debug!("connected to new server: {}", peer.address());
-                    if let Some(ka) = peer.tcp_keepalive() {
-                        debug!("Setting tcp keepalive");
-                        set_tcp_keepalive(&socket, ka)?;
-                    }
                     Ok(socket.into())
                 }
                 Err(e) => {
@@ -92,7 +87,6 @@ where
             match conn_res {
                 Ok(socket) => {
                     debug!("connected to new server: {}", peer.address());
-                    // no SO_KEEPALIVE for UDS
                     Ok(socket.into())
                 }
                 Err(e) => {
@@ -111,6 +105,10 @@ where
         stream.tracer = Some(t);
     }
 
+    // settings applied based on stream type
+    if let Some(ka) = peer.tcp_keepalive() {
+        stream.set_keepalive(ka)?;
+    }
     stream.set_nodelay()?;
 
     let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
