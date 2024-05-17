@@ -161,13 +161,16 @@ where
         }
         let mut module_ctx = self.modules.build_ctx();
         let req = http.req_header_mut();
-        module_ctx.request_header_filter(req).ok()?;
+        module_ctx.request_header_filter(req).await.ok()?;
         let new_response = self.app.response(&mut http).await;
         let (parts, body) = new_response.into_parts();
-        let resp_header: ResponseHeader = parts.into();
-        let mut task = HttpTask::Header(Box::new(resp_header), body.is_empty());
-        module_ctx.response_filter(&mut task).ok()?;
+        let mut resp_header: ResponseHeader = parts.into();
+        module_ctx
+            .response_header_filter(&mut resp_header, body.is_empty())
+            .await
+            .ok()?;
 
+        let task = HttpTask::Header(Box::new(resp_header), body.is_empty());
         trace!("{task:?}");
 
         match http.response_duplex_vec(vec![task]).await {
@@ -181,15 +184,13 @@ where
                 );
             }
         }
-        let mut task = if !body.is_empty() {
-            HttpTask::Body(Some(body.into()), true)
-        } else {
-            HttpTask::Body(None, true)
-        };
+
+        let mut body = Some(body.into());
+        module_ctx.response_body_filter(&mut body, true).ok()?;
+
+        let task = HttpTask::Body(body, true);
 
         trace!("{task:?}");
-
-        module_ctx.response_filter(&mut task).ok()?;
 
         // TODO: check if chunked encoding is needed
         match http.response_duplex_vec(vec![task]).await {

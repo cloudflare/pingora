@@ -159,7 +159,11 @@ impl ResponseCompressionCtx {
         }
     }
 
-    fn response_header_filter(&mut self, resp: &mut ResponseHeader, end: bool) {
+    /// Feed the response header into this ctx
+    pub fn response_header_filter(&mut self, resp: &mut ResponseHeader, end: bool) {
+        if !self.is_enabled() {
+            return;
+        }
         match &self.0 {
             CtxInner::HeaderPhase {
                 compression_level,
@@ -195,7 +199,8 @@ impl ResponseCompressionCtx {
         }
     }
 
-    fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
+    /// Stream the response body chunks into this ctx. The return value will be the compressed data
+    pub fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
         match &mut self.0 {
             CtxInner::HeaderPhase {
                 compression_level: _,
@@ -222,6 +227,7 @@ impl ResponseCompressionCtx {
         }
     }
 
+    // TODO: retire this function, replace it with the two functions above
     /// Feed the response into this ctx.
     /// This filter will mutate the response accordingly if encoding is needed.
     pub fn response_filter(&mut self, t: &mut HttpTask) {
