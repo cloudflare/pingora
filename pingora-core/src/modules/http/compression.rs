@@ -20,6 +20,7 @@ use crate::protocols::http::compression::ResponseCompressionCtx;
 /// HTTP response compression module
 pub struct ResponseCompression(ResponseCompressionCtx);
 
+#[async_trait]
 impl HttpModule for ResponseCompression {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -28,13 +29,30 @@ impl HttpModule for ResponseCompression {
         self
     }
 
-    fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
+    async fn request_header_filter(&mut self, req: &mut RequestHeader) -> Result<()> {
         self.0.request_filter(req);
         Ok(())
     }
 
-    fn response_filter(&mut self, t: &mut HttpTask) -> Result<()> {
-        self.0.response_filter(t);
+    async fn response_header_filter(
+        &mut self,
+        resp: &mut ResponseHeader,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        self.0.response_header_filter(resp, end_of_stream);
+        Ok(())
+    }
+
+    fn response_body_filter(
+        &mut self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        if !self.0.is_enabled() {
+            return Ok(());
+        }
+        let compressed = self.0.response_body_filter(body.as_ref(), end_of_stream);
+        *body = compressed;
         Ok(())
     }
 }
