@@ -56,7 +56,7 @@ Both x86_64 and aarch64 architectures will be supported.
 
 Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old.
 
-Our current MSRV is 1.72.
+Our current MSRV is 1.74.0
 
 ## Build Requirements
 
