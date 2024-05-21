@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use once_cell::sync::OnceCell;
 
+use super::l4::ext::{get_recv_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::ssl::digest::SslDigest;
@@ -87,6 +88,14 @@ impl SocketDigest {
         self.local_addr
             .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, false))
             .as_ref()
+    }
+
+    pub fn tcp_info(&self) -> Option<TCP_INFO> {
+        get_tcp_info(self.raw_fd).ok()
+    }
+
+    pub fn get_recv_buf(&self) -> Option<usize> {
+        get_recv_buf(self.raw_fd).ok()
     }
 }
 

@@ -56,13 +56,12 @@ pub struct TCP_INFO {
     tcpi_rcv_ssthresh: u32,
     pub tcpi_rtt: u32,
     tcpi_rttvar: u32,
-    /* uncomment these field if needed
     tcpi_snd_ssthresh: u32,
     tcpi_snd_cwnd: u32,
     tcpi_advmss: u32,
     tcpi_reordering: u32,
     tcpi_rcv_rtt: u32,
-    tcpi_rcv_space: u32,
+    pub tcpi_rcv_space: u32,
     tcpi_total_retrans: u32,
     tcpi_pacing_rate: u64,
     tcpi_max_pacing_rate: u64,
@@ -75,8 +74,19 @@ pub struct TCP_INFO {
     tcpi_data_segs_in: u32,
     tcpi_data_segs_out: u32,
     tcpi_delivery_rate: u64,
-    */
-    /* and more, see include/linux/tcp.h */
+    tcpi_busy_time: u64,
+    tcpi_rwnd_limited: u64,
+    tcpi_sndbuf_limited: u64,
+    tcpi_delivered: u32,
+    tcpi_delivered_ce: u32,
+    tcpi_bytes_sent: u64,
+    tcpi_bytes_retrans: u64,
+    tcpi_dsack_dups: u32,
+    tcpi_reord_seen: u32,
+    tcpi_rcv_ooopack: u32,
+    tcpi_snd_wnd: u32,
+    pub tcpi_rcv_wnd: u32,
+    // and more, see include/linux/tcp.h
 }
 
 impl TCP_INFO {
@@ -223,6 +233,25 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
+    let mut recv_size: c_int = 0;
+    let mut size = std::mem::size_of::<c_int>() as u32;
+    get_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_RCVBUF,
+        &mut recv_size,
+        &mut size,
+    )?;
+    Ok(recv_size as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_recv_buf(_fd: RawFd) -> Result<usize> {
+    Ok(0)
+}
+
 /// Enable client side TCP fast open.
 #[cfg(target_os = "linux")]
 pub fn set_tcp_fastopen_connect(fd: RawFd) -> Result<()> {
@@ -358,18 +387,8 @@ mod test {
 
         #[cfg(target_os = "linux")]
         {
-            let mut recv_size: c_int = 0;
-            let mut size = std::mem::size_of::<c_int>() as u32;
-            get_opt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &mut recv_size,
-                &mut size,
-            )
-            .unwrap();
             // kernel doubles whatever is set
-            assert_eq!(recv_size, 102400 * 2);
+            assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
         }
     }
 
