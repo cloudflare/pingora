@@ -122,35 +122,41 @@ impl Default for ServerConf {
 #[clap(name = "basic")]
 pub struct Opt {
     /// Whether this server should try to upgrade from a running old server
-    ///
-    /// `-u` or `--upgrade` can be used
-    #[clap(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "This is the base set of command line arguments for a pingora-based service"
+    )]
     pub upgrade: bool,
+
     /// Whether should run this server in the background
-    ///
-    /// `-d` or `--daemon` can be used
     #[clap(short, long)]
     pub daemon: bool,
+
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[clap(long)]
+    #[clap(long, hidden = true)]
     pub nocapture: bool,
+
     /// Test the configuration and exit
     ///
     /// When this flag is set, calling `server.bootstrap()` will exit the process without errors
     ///
     /// This flag is useful for upgrading service where the user wants to make sure the new
     /// service can start before shutting down the old server process.
-    ///
-    /// `-t` or `--test` can be used
-    #[clap(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "This flag is useful for upgrading service where the user wants \
+                to make sure the new service can start before shutting down \
+                the old server process."
+    )]
     pub test: bool,
+
     /// The path to the configuration file.
     ///
     /// See [`ServerConf`] for more details of the configuration file.
-    ///
-    /// `-c` or `--conf` can be used
-    #[clap(short, long)]
+    #[clap(short, long, help = "The path to the configuration file.")]
     pub conf: Option<String>,
 }
 
