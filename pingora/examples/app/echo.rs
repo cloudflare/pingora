@@ -86,13 +86,3 @@ impl ServeHttp for HttpEchoApp {
             .unwrap()
     }
 }
-
-impl EchoApp {
-    pub fn new() -> Arc<Self> {
-        Arc::new(EchoApp {})
-    }
-}
-
-pub fn new_http_echo_app() -> Arc<HttpEchoApp> {
-    Arc::new(HttpEchoApp {})
-}

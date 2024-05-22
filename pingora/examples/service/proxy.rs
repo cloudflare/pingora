@@ -16,7 +16,6 @@ use crate::app::proxy::ProxyApp;
 use pingora_core::listeners::Listeners;
 use pingora_core::services::listening::Service;
 use pingora_core::upstreams::peer::BasicPeer;
-use std::sync::Arc;
 
 pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
     let proxy_to = BasicPeer::new(proxy_addr);
@@ -24,7 +23,7 @@ pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
     Service::with_listeners(
         "Proxy Service".to_string(),
         Listeners::tcp(addr),
-        Arc::new(ProxyApp::new(proxy_to)),
+        ProxyApp::new(proxy_to),
     )
 }
 
@@ -41,6 +40,6 @@ pub fn proxy_service_tls(
     Service::with_listeners(
         "Proxy Service TLS".to_string(),
         Listeners::tls(addr, cert_path, key_path).unwrap(),
-        Arc::new(ProxyApp::new(proxy_to)),
+        ProxyApp::new(proxy_to),
     )
 }
