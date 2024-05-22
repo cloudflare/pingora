@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::v1::client::HttpSession as Http1Session;
 use super::v2::client::Http2Session;
-use crate::protocols::{Digest, SocketAddr};
+use crate::protocols::{Digest, SocketAddr, Stream};
 
 /// A type for Http client session. It can be either an Http1 connection or an Http2 stream.
 pub enum HttpSession {
@@ -172,6 +172,15 @@ impl HttpSession {
         match self {
             Self::H1(s) => s.client_addr(),
             Self::H2(s) => s.client_addr(),
+        }
+    }
+
+    /// Get the reference of the [Stream] that this HTTP/1 session is operating upon.
+    /// None if the HTTP session is over H2
+    pub fn stream(&self) -> Option<&Stream> {
+        match self {
+            Self::H1(s) => Some(s.stream()),
+            Self::H2(_) => None,
         }
     }
 }

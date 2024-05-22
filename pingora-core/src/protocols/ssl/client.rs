@@ -23,6 +23,7 @@ use crate::tls::{ssl, ssl::ConnectConfiguration, ssl_sys::X509_V_ERR_INVALID_CAL
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Perform the TLS handshake for the given connection with the given configuration
 pub async fn handshake<S: IO>(
@@ -81,6 +82,13 @@ where
         let mut ts_vec = self.get_ref().get_timing_digest();
         ts_vec.push(Some(self.timing.clone()));
         ts_vec
+    }
+    fn get_read_pending_time(&self) -> Duration {
+        self.get_ref().get_read_pending_time()
+    }
+
+    fn get_write_pending_time(&self) -> Duration {
+        self.get_ref().get_write_pending_time()
     }
 }
 

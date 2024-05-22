@@ -15,7 +15,7 @@
 //! Extra information about the connection
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
@@ -103,6 +103,12 @@ impl SocketDigest {
 pub trait GetTimingDigest {
     /// Return the timing for each layer from the lowest layer to upper
     fn get_timing_digest(&self) -> Vec<Option<TimingDigest>>;
+    fn get_read_pending_time(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn get_write_pending_time(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The interface to set or return proxy information

@@ -370,4 +370,13 @@ impl Session {
             Self::H2(s) => s.server_addr(),
         }
     }
+
+    /// Get the reference of the [Stream] that this HTTP/1 session is operating upon.
+    /// None if the HTTP session is over H2
+    pub fn stream(&self) -> Option<&Stream> {
+        match self {
+            Self::H1(s) => Some(s.stream()),
+            Self::H2(_) => None,
+        }
+    }
 }
