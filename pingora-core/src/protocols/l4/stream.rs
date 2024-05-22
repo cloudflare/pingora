@@ -375,6 +375,12 @@ pub mod async_write_vec {
         buf: &'a mut B,
     }
 
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct WriteVecAll<'a, W, B> {
+        writer: &'a mut W,
+        buf: &'a mut B,
+    }
+
     pub trait AsyncWriteVec {
         fn poll_write_vec<B: Buf>(
             self: Pin<&mut Self>,
@@ -392,6 +398,17 @@ pub mod async_write_vec {
                 buf: src,
             }
         }
+
+        fn write_vec_all<'a, B>(&'a mut self, src: &'a mut B) -> WriteVecAll<'a, Self, B>
+        where
+            Self: Sized,
+            B: Buf,
+        {
+            WriteVecAll {
+                writer: self,
+                buf: src,
+            }
+        }
     }
 
     impl<W, B> Future for WriteVec<'_, W, B>
@@ -404,6 +421,25 @@ pub mod async_write_vec {
         fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
             let me = &mut *self;
             Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf)
+        }
+    }
+
+    impl<W, B> Future for WriteVecAll<'_, W, B>
+    where
+        W: AsyncWriteVec + Unpin,
+        B: Buf,
+    {
+        type Output = io::Result<()>;
+
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let me = &mut *self;
+            while me.buf.has_remaining() {
+                let n = ready!(Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+            }
+            Poll::Ready(Ok(()))
         }
     }
 
