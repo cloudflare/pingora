@@ -96,12 +96,12 @@ pub struct HttpProxy<SV> {
 }
 
 impl<SV> HttpProxy<SV> {
-    fn new(inner: SV, conf: Arc<ServerConf>) -> Arc<Self> {
-        Arc::new(HttpProxy {
+    fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+        HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
-        })
+        }
     }
 
     async fn handle_new_request(
