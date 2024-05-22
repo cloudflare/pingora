@@ -641,6 +641,11 @@ impl HttpSession {
             .as_ref()
             .map(|d| d.local_addr())?
     }
+
+    /// Get the reference of the [Stream] that this HTTP session is operating upon.
+    pub fn stream(&self) -> &Stream {
+        &self.underlying_stream
+    }
 }
 
 #[inline]

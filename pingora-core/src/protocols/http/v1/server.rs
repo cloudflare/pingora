@@ -926,6 +926,11 @@ impl HttpSession {
         }
         Ok(end_stream)
     }
+
+    /// Get the reference of the [Stream] that this HTTP session is operating upon.
+    pub fn stream(&self) -> &Stream {
+        &self.underlying_stream
+    }
 }
 
 // Regex to parse request line that has illegal chars in it
