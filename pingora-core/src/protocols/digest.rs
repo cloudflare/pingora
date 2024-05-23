@@ -90,12 +90,24 @@ impl SocketDigest {
             .as_ref()
     }
 
+    fn is_inet(&self) -> bool {
+        self.local_addr().and_then(|p| p.as_inet()).is_some()
+    }
+
     pub fn tcp_info(&self) -> Option<TCP_INFO> {
-        get_tcp_info(self.raw_fd).ok()
+        if self.is_inet() {
+            get_tcp_info(self.raw_fd).ok()
+        } else {
+            None
+        }
     }
 
     pub fn get_recv_buf(&self) -> Option<usize> {
-        get_recv_buf(self.raw_fd).ok()
+        if self.is_inet() {
+            get_recv_buf(self.raw_fd).ok()
+        } else {
+            None
+        }
     }
 }
 
