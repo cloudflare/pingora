@@ -130,7 +130,7 @@ pub struct Opt {
     )]
     pub upgrade: bool,
 
-    /// Whether should run this server in the background
+    /// Whether this server should run in the background
     #[clap(short, long)]
     pub daemon: bool,
 
