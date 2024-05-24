@@ -119,17 +119,18 @@ impl Default for ServerConf {
 ///
 /// Call `Opt::from_args()` to build this object from the process's command line arguments.
 #[derive(Parser, Debug)]
-#[clap(name = "basic")]
+#[clap(name = "basic", long_about = None)]
 pub struct Opt {
     /// Whether this server should try to upgrade from a running old server
     #[clap(
         short,
         long,
-        help = "This is the base set of command line arguments for a pingora-based service"
+        help = "This is the base set of command line arguments for a pingora-based service",
+        long_help = None
     )]
     pub upgrade: bool,
 
-    /// Whether should run this server in the background
+    /// Whether this server should run in the background
     #[clap(short, long)]
     pub daemon: bool,
 
@@ -149,14 +150,15 @@ pub struct Opt {
         long,
         help = "This flag is useful for upgrading service where the user wants \
                 to make sure the new service can start before shutting down \
-                the old server process."
+                the old server process.",
+        long_help = None
     )]
     pub test: bool,
 
     /// The path to the configuration file.
     ///
     /// See [`ServerConf`] for more details of the configuration file.
-    #[clap(short, long, help = "The path to the configuration file.")]
+    #[clap(short, long, help = "The path to the configuration file.", long_help = None)]
     pub conf: Option<String>,
 }
 
