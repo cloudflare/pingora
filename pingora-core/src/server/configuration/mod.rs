@@ -82,7 +82,7 @@ impl Default for ServerConf {
             user: None,
             group: None,
             threads: 1,
-            work_stealing: true,
+            work_stealing: false,
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
