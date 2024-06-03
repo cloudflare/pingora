@@ -100,7 +100,7 @@ impl std::net::ToSocketAddrs for Backend {
 /// [Backends] is a collection of [Backend]s.
 ///
 /// It includes a service discovery method (static or dynamic) to discover all
-/// the available backends as well as an optionally health check method to probe the liveness
+/// the available backends as well as an optional health check method to probe the liveness
 /// of each backend.
 pub struct Backends {
     discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
@@ -207,9 +207,9 @@ impl Backends {
         Ok(self.do_update(new_backends, enablement))
     }
 
-    /// Run health check on all the backend if it is set.
+    /// Run health check on all backends if it is set.
     ///
-    /// When `parallel: true`, all the backends are checked in parallel instead of sequentially
+    /// When `parallel: true`, all backends are checked in parallel instead of sequentially
     pub async fn run_health_check(&self, parallel: bool) {
         use crate::health_check::HealthCheck;
         use log::{info, warn};
