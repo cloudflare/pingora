@@ -58,8 +58,12 @@ pub trait SelectionAlgorithm {
     fn next(&self, key: &[u8]) -> u64;
 }
 
-/// [FVN](https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function) hashing
+/// [FNV](https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function) hashing
 /// on weighted backends
+pub type FNVHash = Weighted<fnv::FnvHasher>;
+
+/// Alias of [`FNVHash`] for backwards compatibility until the next breaking change
+#[doc(hidden)]
 pub type FVNHash = Weighted<fnv::FnvHasher>;
 /// Random selection on weighted backends
 pub type Random = Weighted<algorithms::Random>;
