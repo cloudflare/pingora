@@ -573,10 +573,13 @@ fn remove_header<'a, T, N: ?Sized>(
 where
     &'a N: 'a + AsHeaderName,
 {
-    if let Some(name_map) = name_map {
-        name_map.remove(name);
+    let removed = value_map.remove(name);
+    if removed.is_some() {
+        if let Some(name_map) = name_map {
+            name_map.remove(name);
+        }
     }
-    value_map.remove(name)
+    removed
 }
 
 #[inline]
