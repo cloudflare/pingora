@@ -312,6 +312,21 @@ impl Session {
         }
     }
 
+    /// Create a new [Session] from the given [Stream]
+    ///
+    /// This function is mostly used for testing and mocking.
+    pub fn new_h1(stream: Stream) -> Self {
+        let modules = HttpModules::new();
+        Self::new(Box::new(HttpSession::new_http1(stream)), &modules)
+    }
+
+    /// Create a new [Session] from the given [Stream] with modules
+    ///
+    /// This function is mostly used for testing and mocking.
+    pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
+        Self::new(Box::new(HttpSession::new_http1(stream)), downstream_modules)
+    }
+
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
         &mut self.downstream_session
     }
