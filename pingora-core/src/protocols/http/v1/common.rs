@@ -14,7 +14,7 @@
 
 //! Common functions and constants
 
-use http::header;
+use http::{header, HeaderValue};
 use log::warn;
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
@@ -202,9 +202,9 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize
 }
 
 #[inline]
-pub(super) fn is_buf_keepalive(header_value: Option<&[u8]>) -> Option<bool> {
+pub(super) fn is_buf_keepalive(header_value: Option<&HeaderValue>) -> Option<bool> {
     header_value.and_then(|value| {
-        let value = parse_connection_header(value);
+        let value = parse_connection_header(value.as_bytes());
         if value.keep_alive {
             Some(true)
         } else if value.close {
