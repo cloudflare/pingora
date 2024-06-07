@@ -508,7 +508,7 @@ impl HttpSession {
     }
 
     fn is_connection_keepalive(&self) -> Option<bool> {
-        is_buf_keepalive(self.get_header(header::CONNECTION).map(|v| v.as_bytes()))
+        is_buf_keepalive(self.get_header(header::CONNECTION))
     }
 
     /// Apply keepalive settings according to the client
