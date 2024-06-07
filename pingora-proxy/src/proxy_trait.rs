@@ -56,6 +56,22 @@ pub trait ProxyHttp {
         Ok(false)
     }
 
+    /// Handle the incoming request before any downstream module is executed.
+    ///
+    /// This function is similar to [Self::request_filter()] but execute before any other logic
+    /// especially the downstream modules. The main purpose of this function is to provide finer
+    /// grained control of behavior of the modules.
+    ///
+    /// Note that because this function is executed before any module that might provide access
+    /// control or rate limiting, logic should stay in request_filter() if it can in order to be
+    /// protected by said modules.
+    async fn early_request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is

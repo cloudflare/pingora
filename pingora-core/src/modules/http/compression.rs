@@ -16,9 +16,24 @@
 
 use super::*;
 use crate::protocols::http::compression::ResponseCompressionCtx;
+use std::ops::{Deref, DerefMut};
 
 /// HTTP response compression module
 pub struct ResponseCompression(ResponseCompressionCtx);
+
+impl Deref for ResponseCompression {
+    type Target = ResponseCompressionCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ResponseCompression {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[async_trait]
 impl HttpModule for ResponseCompression {
@@ -52,7 +67,9 @@ impl HttpModule for ResponseCompression {
             return Ok(());
         }
         let compressed = self.0.response_body_filter(body.as_ref(), end_of_stream);
-        *body = compressed;
+        if compressed.is_some() {
+            *body = compressed;
+        }
         Ok(())
     }
 }

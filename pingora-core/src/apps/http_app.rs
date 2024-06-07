@@ -89,7 +89,7 @@ where
         }
         if !body.is_empty() {
             // TODO: check if chunked encoding is needed
-            match http.write_response_body(body.into()).await {
+            match http.write_response_body(body.into(), true).await {
                 Ok(_) => debug!("HTTP response written."),
                 Err(e) => error!(
                     "HTTP server fails to write to downstream: {e}, {}",

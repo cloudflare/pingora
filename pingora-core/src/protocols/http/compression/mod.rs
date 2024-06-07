@@ -200,6 +200,8 @@ impl ResponseCompressionCtx {
     }
 
     /// Stream the response body chunks into this ctx. The return value will be the compressed data
+    ///
+    /// Return None if the compressed is not enabled
     pub fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
         match &mut self.0 {
             CtxInner::HeaderPhase {

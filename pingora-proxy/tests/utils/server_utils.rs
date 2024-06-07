@@ -26,6 +26,7 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
+use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
@@ -206,14 +207,38 @@ impl ProxyHttp for ExampleProxyHttp {
         CTX::default()
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
         let req = session.req_header();
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if downstream_compression {
-            session.downstream_compression.adjust_level(6);
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_level(6);
         } else {
             // enable upstream compression for all requests by default
             session.upstream_compression.adjust_level(6);
+        }
+        Ok(())
+    }
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let req = session.req_header();
+        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        if !downstream_compression {
+            // enable upstream compression for all requests by default
+            session.upstream_compression.adjust_level(6);
+            // also disable downstream compression in order to test the upstream one
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_level(0);
         }
 
         Ok(false)

@@ -311,7 +311,7 @@ impl<SV> HttpProxy<SV> {
                             // write to downstream
                             if let Err(e) = session
                                 .as_mut()
-                                .write_response_body(b)
+                                .write_response_body(b, false)
                                 .await
                                 .map_err(|e| e.into_down())
                             {
