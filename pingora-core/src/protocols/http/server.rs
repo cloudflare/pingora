@@ -131,13 +131,19 @@ impl Session {
     }
 
     /// Write the response body to client
-    pub async fn write_response_body(&mut self, data: Bytes) -> Result<()> {
+    pub async fn write_response_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+        if data.is_empty() && !end {
+            // writing 0 byte to a chunked encoding h1 would finish the stream
+            // writing 0 bytes to h2 is noop
+            // we don't want to actually write in either cases
+            return Ok(());
+        }
         match self {
             Self::H1(s) => {
                 s.write_body(&data).await?;
                 Ok(())
             }
-            Self::H2(s) => s.write_body(data, false),
+            Self::H2(s) => s.write_body(data, end),
         }
     }
 
@@ -236,14 +242,18 @@ impl Session {
         }
     }
 
-    /// Send error response to client
-    pub async fn respond_error(&mut self, error: u16) {
-        let resp = match error {
+    pub fn generate_error(error: u16) -> ResponseHeader {
+        match error {
             /* common error responses are pre-generated */
             502 => error_resp::HTTP_502_RESPONSE.clone(),
             400 => error_resp::HTTP_400_RESPONSE.clone(),
             _ => error_resp::gen_error_response(error),
-        };
+        }
+    }
+
+    /// Send error response to client
+    pub async fn respond_error(&mut self, error: u16) {
+        let resp = Self::generate_error(error);
 
         // TODO: we shouldn't be closing downstream connections on internally generated errors
         // and possibly other upstream connect() errors (connection refused, timeout, etc)

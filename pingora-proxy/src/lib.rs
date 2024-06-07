@@ -54,6 +54,8 @@ use tokio::time;
 use pingora_cache::NoCacheReason;
 use pingora_core::apps::HttpServerApp;
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
+use pingora_core::modules::http::compression::ResponseCompressionBuilder;
+use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::HttpTask;
@@ -93,6 +95,7 @@ pub struct HttpProxy<SV> {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector,
     shutdown: Notify,
+    pub downstream_modules: HttpModules,
 }
 
 impl<SV> HttpProxy<SV> {
@@ -101,6 +104,7 @@ impl<SV> HttpProxy<SV> {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
+            downstream_modules: HttpModules::new(),
         }
     }
 
@@ -285,31 +289,27 @@ pub struct Session {
     pub cache: HttpCache,
     /// (de)compress responses coming into the proxy (from upstream)
     pub upstream_compression: ResponseCompressionCtx,
-    /// (de)compress responses leaving the proxy (to downstream)
-    pub downstream_compression: ResponseCompressionCtx,
     /// ignore downstream range (skip downstream range filters)
     pub ignore_downstream_range: bool,
     // the context from parent request
     subrequest_ctx: Option<Box<SubReqCtx>>,
+    // Downstream filter modules
+    pub downstream_modules_ctx: HttpModuleCtx,
 }
 
 impl Session {
-    fn new(downstream_session: impl Into<Box<HttpSession>>) -> Self {
+    fn new(
+        downstream_session: impl Into<Box<HttpSession>>,
+        downstream_modules: &HttpModules,
+    ) -> Self {
         Session {
             downstream_session: downstream_session.into(),
             cache: HttpCache::new(),
             upstream_compression: ResponseCompressionCtx::new(0, false), // disable both
-            downstream_compression: ResponseCompressionCtx::new(0, false), // disable both
             ignore_downstream_range: false,
             subrequest_ctx: None,
+            downstream_modules_ctx: downstream_modules.build_ctx(),
         }
-    }
-
-    /// Create a new [Session] from the given [Stream]
-    ///
-    /// This function is mostly used for testing and mocking.
-    pub fn new_h1(stream: Stream) -> Self {
-        Self::new(Box::new(HttpSession::new_http1(stream)))
     }
 
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
@@ -319,16 +319,71 @@ impl Session {
     pub fn as_downstream(&self) -> &HttpSession {
         &self.downstream_session
     }
-}
 
-impl Session {
-    async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        // all built-in downstream response filters goes here
-        // NOTE: if downstream_session is written directly (error page), the filters will be
-        // bypassed.
-        tasks
-            .iter_mut()
-            .for_each(|t| self.downstream_compression.response_filter(t));
+    /// Write HTTP response with the given error code to the downstream
+    pub async fn respond_error(&mut self, error: u16) -> Result<()> {
+        let resp = HttpSession::generate_error(error);
+        self.write_response_header(Box::new(resp), true)
+            .await
+            .unwrap_or_else(|e| {
+                self.downstream_session.set_keepalive(None);
+                error!("failed to send error response to downstream: {e}");
+            });
+        Ok(())
+    }
+
+    /// Write the given HTTP response header to the downstream
+    ///
+    /// Different from directly calling [HttpSession::write_response_header], this function also
+    /// invokes the filter modules.
+    pub async fn write_response_header(
+        &mut self,
+        mut resp: Box<ResponseHeader>,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        self.downstream_modules_ctx
+            .response_header_filter(&mut resp, end_of_stream)
+            .await?;
+        self.downstream_session.write_response_header(resp).await
+    }
+
+    /// Write the given HTTP response body chunk to the downstream
+    ///
+    /// Different from directly calling [HttpSession::write_response_body], this function also
+    /// invokes the filter modules.
+    pub async fn write_response_body(
+        &mut self,
+        mut body: Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<()> {
+        self.downstream_modules_ctx
+            .response_body_filter(&mut body, end_of_stream)?;
+
+        if body.is_none() && !end_of_stream {
+            return Ok(());
+        }
+
+        let data = body.unwrap_or_default();
+        self.downstream_session
+            .write_response_body(data, end_of_stream)
+            .await
+    }
+
+    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        for task in tasks.iter_mut() {
+            match task {
+                HttpTask::Header(resp, end) => {
+                    self.downstream_modules_ctx
+                        .response_header_filter(resp, *end)
+                        .await?;
+                }
+                HttpTask::Body(data, end) => {
+                    self.downstream_modules_ctx
+                        .response_body_filter(data, *end)?;
+                }
+                _ => { /* HttpModules doesn't handle trailer yet */ }
+            }
+        }
         self.downstream_session.response_duplex_vec(tasks).await
     }
 }
@@ -383,6 +438,34 @@ impl<SV> HttpProxy<SV> {
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        if let Err(e) = self
+            .inner
+            .early_request_filter(&mut session, &mut ctx)
+            .await
+        {
+            self.handle_error(&mut session, &mut ctx, e, "Fail to early filter request:")
+                .await;
+            return None;
+        }
+
+        let req = session.downstream_session.req_header_mut();
+
+        // Built-in downstream request filters go first
+        if let Err(e) = session
+            .downstream_modules_ctx
+            .request_header_filter(req)
+            .await
+        {
+            self.handle_error(
+                &mut session,
+                &mut ctx,
+                e,
+                "Failed in downstream modules request filter:",
+            )
+            .await;
+            return None;
+        }
+
         match self.inner.request_filter(&mut session, &mut ctx).await {
             Ok(response_sent) => {
                 if response_sent {
@@ -393,24 +476,11 @@ impl<SV> HttpProxy<SV> {
                 /* else continue */
             }
             Err(e) => {
-                if !self.inner.suppress_error_log(&session, &ctx, &e) {
-                    error!(
-                        "Fail to filter request: {}, {}",
-                        e,
-                        self.inner.request_summary(&session, &ctx)
-                    );
-                }
-                self.inner.fail_to_proxy(&mut session, &e, &mut ctx).await;
-                self.inner.logging(&mut session, Some(&e), &mut ctx).await;
+                self.handle_error(&mut session, &mut ctx, e, "Fail to filter request:")
+                    .await;
                 return None;
             }
         }
-
-        // all built-in downstream request filters go below
-
-        session
-            .downstream_compression
-            .request_filter(session.downstream_session.req_header());
 
         if let Some((reuse, err)) = self.proxy_cache(&mut session, &mut ctx).await {
             // cache hit
@@ -432,15 +502,14 @@ impl<SV> HttpProxy<SV> {
                         match session.write_response_header_ref(&BAD_GATEWAY).await {
                             Ok(()) => {}
                             Err(e) => {
-                                if !self.inner.suppress_error_log(&session, &ctx, &e) {
-                                    error!(
-                                        "Error responding with Bad Gateway: {}, {}",
-                                        e,
-                                        self.inner.request_summary(&session, &ctx)
-                                    );
-                                }
-                                self.inner.fail_to_proxy(&mut session, &e, &mut ctx).await;
-                                self.inner.logging(&mut session, Some(&e), &mut ctx).await;
+                                self.handle_error(
+                                    &mut session,
+                                    &mut ctx,
+                                    e,
+                                    "Error responding with Bad Gateway:",
+                                )
+                                .await;
+
                                 return None;
                             }
                         }
@@ -451,15 +520,13 @@ impl<SV> HttpProxy<SV> {
                 /* else continue */
             }
             Err(e) => {
-                if !self.inner.suppress_error_log(&session, &ctx, &e) {
-                    error!(
-                        "Error deciding if we should proxy to upstream: {}, {}",
-                        e,
-                        self.inner.request_summary(&session, &ctx)
-                    );
-                }
-                self.inner.fail_to_proxy(&mut session, &e, &mut ctx).await;
-                self.inner.logging(&mut session, Some(&e), &mut ctx).await;
+                self.handle_error(
+                    &mut session,
+                    &mut ctx,
+                    e,
+                    "Error deciding if we should proxy to upstream:",
+                )
+                .await;
                 return None;
             }
         }
@@ -535,6 +602,27 @@ impl<SV> HttpProxy<SV> {
         self.finish(session, &mut ctx, server_reuse, final_error.as_deref())
             .await
     }
+
+    async fn handle_error(
+        &self,
+        session: &mut Session,
+        ctx: &mut <SV as ProxyHttp>::CTX,
+        e: Box<Error>,
+        context: &str,
+    ) where
+        SV: ProxyHttp + Send + Sync + 'static,
+        <SV as ProxyHttp>::CTX: Send + Sync,
+    {
+        if !self.inner.suppress_error_log(session, ctx, &e) {
+            error!(
+                "{context} {}, {}",
+                e,
+                self.inner.request_summary(session, ctx)
+            );
+        }
+        self.inner.fail_to_proxy(session, &e, ctx).await;
+        self.inner.logging(session, Some(&e), ctx).await;
+    }
 }
 
 /* Make process_subrequest() a trait to workaround https://github.com/rust-lang/rust/issues/78649
@@ -568,7 +656,7 @@ where
     ) {
         debug!("starting subrequest");
         let mut session = match self.handle_new_request(session).await {
-            Some(downstream_session) => Session::new(downstream_session),
+            Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return, // bad request
         };
 
@@ -599,7 +687,7 @@ where
 
         // TODO: keepalive pool, use stack
         let mut session = match self.handle_new_request(session).await {
-            Some(downstream_session) => Session::new(downstream_session),
+            Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return None, // bad request
         };
 
@@ -631,10 +719,7 @@ use pingora_core::services::listening::Service;
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
 pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>> {
-    Service::new(
-        "Pingora HTTP Proxy Service".into(),
-        HttpProxy::new(inner, conf.clone()),
-    )
+    http_proxy_service_with_name(conf, inner, "Pingora HTTP Proxy Service")
 }
 
 /// Create a [Service] from the user implemented [ProxyHttp].
@@ -645,5 +730,10 @@ pub fn http_proxy_service_with_name<SV>(
     inner: SV,
     name: &str,
 ) -> Service<HttpProxy<SV>> {
-    Service::new(name.to_string(), HttpProxy::new(inner, conf.clone()))
+    let mut proxy = HttpProxy::new(inner, conf.clone());
+    // Add disabled downstream compression module by default
+    proxy
+        .downstream_modules
+        .add_module(ResponseCompressionBuilder::enable(0));
+    Service::new(name.to_string(), proxy)
 }
