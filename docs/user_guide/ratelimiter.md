@@ -98,16 +98,7 @@ impl ProxyHttp for LB {
       // retrieve the current window requests
       let curr_window_requests = {
          let mut rate_limiter_map = RATE_LIMITER_MAP.lock().unwrap();
-         let rate_limiter = match rate_limiter_map.get(&appid) {
-            None => {
-               let limiter = Rate::new(Duration::from_secs(1));
-               rate_limiter_map.insert(appid.clone(), limiter);
-               rate_limiter_map.get(&appid).unwrap()
-            }
-            Some(limiter) => {
-               limiter
-            }
-         };
+         let rate_limiter = rate_limiter_map.entry(appid.clone()).insert_or_with(|| Rate::new(Duration::from_secs(1)));
          rate_limiter.observe(&appid, 1)
       };
       if curr_window_requests > MAX_REQ_PER_SEC { // rate limited, return 429
