@@ -118,7 +118,7 @@ impl Default for ServerConf {
 /// Command-line options
 ///
 /// Call `Opt::from_args()` to build this object from the process's command line arguments.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[clap(name = "basic", long_about = None)]
 pub struct Opt {
     /// Whether this server should try to upgrade from a running old server
@@ -160,15 +160,6 @@ pub struct Opt {
     /// See [`ServerConf`] for more details of the configuration file.
     #[clap(short, long, help = "The path to the configuration file.", long_help = None)]
     pub conf: Option<String>,
-}
-
-/// Create the default instance of Opt based on the current command-line args.
-/// This is equivalent to running `Opt::parse` but does not require the
-/// caller to have included the `clap::Parser`
-impl Default for Opt {
-    fn default() -> Self {
-        Opt::parse()
-    }
 }
 
 impl ServerConf {
