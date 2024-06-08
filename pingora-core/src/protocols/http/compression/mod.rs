@@ -19,6 +19,7 @@
 use super::HttpTask;
 
 use bytes::Bytes;
+use http::header::ACCEPT_RANGES;
 use log::warn;
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -553,6 +554,8 @@ fn adjust_response_header(resp: &mut ResponseHeader, action: &Action) {
     fn set_stream_headers(resp: &mut ResponseHeader) {
         // because the transcoding is streamed, content length is not known ahead
         resp.remove_header(&CONTENT_LENGTH);
+        // remove Accept-Ranges header because range requests will no longer work
+        resp.remove_header(&ACCEPT_RANGES);
         // we stream body now TODO: chunked is for h1 only
         resp.insert_header(&TRANSFER_ENCODING, HeaderValue::from_static("chunked"))
             .unwrap();
@@ -607,12 +610,14 @@ fn test_adjust_response_header() {
     // compress
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-length", "20").unwrap();
+    header.insert_header("accept-ranges", "bytes").unwrap();
     adjust_response_header(&mut header, &Compress(Gzip));
     assert_eq!(
         header.headers.get("content-encoding").unwrap().as_bytes(),
         b"gzip"
     );
     assert!(header.headers.get("content-length").is_none());
+    assert!(header.headers.get("accept-ranges").is_none());
     assert_eq!(
         header.headers.get("transfer-encoding").unwrap().as_bytes(),
         b"chunked"
