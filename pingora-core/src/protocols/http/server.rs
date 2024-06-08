@@ -365,6 +365,14 @@ impl Session {
         }
     }
 
+    /// Return a mutable digest reference for the session.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest_mut()),
+            Self::H2(s) => s.digest_mut(),
+        }
+    }
+
     /// Return the client (peer) address of the connnection.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         match self {

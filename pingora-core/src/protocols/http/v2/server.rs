@@ -454,6 +454,11 @@ impl HttpSession {
         Some(&self.digest)
     }
 
+    /// Return a mutable [Digest] reference for the connection.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        Arc::get_mut(&mut self.digest)
+    }
+
     /// Return the server (local) address recorded in the connection digest.
     pub fn server_addr(&self) -> Option<&SocketAddr> {
         self.digest.socket_digest.as_ref().map(|d| d.local_addr())?

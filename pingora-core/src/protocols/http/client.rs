@@ -159,6 +159,17 @@ impl HttpSession {
         }
     }
 
+    /// Return a mutable [Digest] reference for the connection
+    ///
+    /// For reused connection, the timing in the digest will reflect its initial handshakes
+    /// The caller should check if the connection is reused to avoid misuse of the timing field
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest_mut()),
+            Self::H2(s) => s.digest_mut(),
+        }
+    }
+
     /// Return the server (peer) address of the connection.
     pub fn server_addr(&self) -> Option<&SocketAddr> {
         match self {
