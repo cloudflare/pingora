@@ -310,6 +310,14 @@ impl Http2Session {
         Some(self.conn.digest())
     }
 
+    /// Return a mutable [Digest] reference for the connection
+    ///
+    /// For reused connection, the timing in the digest will reflect its initial handshakes
+    /// The caller should check if the connection is reused to avoid misuse the timing field
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        self.conn.digest_mut()
+    }
+
     /// Return the server (peer) address recorded in the connection digest.
     pub fn server_addr(&self) -> Option<&SocketAddr> {
         self.conn

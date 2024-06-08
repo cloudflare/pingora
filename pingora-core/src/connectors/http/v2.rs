@@ -102,6 +102,10 @@ impl ConnectionRef {
         &self.0.digest
     }
 
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        Arc::get_mut(&mut self.0).map(|inner| &mut inner.digest)
+    }
+
     pub fn ping_timedout(&self) -> bool {
         self.0.ping_timeout_occurred.load(Ordering::Relaxed)
     }

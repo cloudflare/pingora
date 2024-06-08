@@ -635,6 +635,10 @@ impl HttpSession {
         &self.digest
     }
 
+    pub fn digest_mut(&mut self) -> &mut Digest {
+        &mut self.digest
+    }
+
     /// Return the server (peer) address recorded in the connection digest.
     pub fn server_addr(&self) -> Option<&SocketAddr> {
         self.digest()

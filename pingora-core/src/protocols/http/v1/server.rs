@@ -829,6 +829,11 @@ impl HttpSession {
         &self.digest
     }
 
+    /// Return a mutable [Digest] reference for the connection.
+    pub fn digest_mut(&mut self) -> &mut Digest {
+        &mut self.digest
+    }
+
     /// Return the client (peer) address of the underlying connection.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         self.digest()
