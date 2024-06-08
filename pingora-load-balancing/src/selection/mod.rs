@@ -26,7 +26,7 @@ use weighted::Weighted;
 /// [BackendSelection] is the interface to implement backend selection mechanisms.
 pub trait BackendSelection {
     /// The [BackendIter] returned from iter() below.
-    type Iter;
+    type Iter: BackendIter;
     /// The function to create a [BackendSelection] implementation.
     fn build(backends: &BTreeSet<Backend>) -> Self;
     /// Select backends for a given key.
@@ -34,9 +34,7 @@ pub trait BackendSelection {
     /// An [BackendIter] should be returned. The first item in the iter is the first
     /// choice backend. The user should continue to iterate over it if the first backend
     /// cannot be used due to its health or other reasons.
-    fn iter(self: &Arc<Self>, key: &[u8]) -> Self::Iter
-    where
-        Self::Iter: BackendIter;
+    fn iter(self: &Arc<Self>, key: &[u8]) -> Self::Iter;
 }
 
 /// An iterator to find the suitable backend

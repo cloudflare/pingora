@@ -16,15 +16,12 @@
 
 use std::time::{Duration, Instant};
 
-use super::{BackendIter, BackendSelection, LoadBalancer};
+use super::{BackendSelection, LoadBalancer};
 use async_trait::async_trait;
 use pingora_core::services::background::BackgroundService;
 
 #[async_trait]
-impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancer<S>
-where
-    S::Iter: BackendIter,
-{
+impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancer<S> {
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
         // 136 years
         const NEVER: Duration = Duration::from_secs(u32::MAX as u64);
