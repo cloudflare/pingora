@@ -28,7 +28,7 @@ pub trait BackendSelection {
     /// The [BackendIter] returned from iter() below.
     type Iter: BackendIter;
     /// The function to create a [BackendSelection] implementation.
-    /// `previous` is previous instance of self, when it's created during backend update 
+    /// `previous` is previous instance of self, when it's created during backend update
     fn build(backends: &BTreeSet<Backend>, previous: Option<Arc<Self>>) -> Self;
     /// Select backends for a given key.
     ///
