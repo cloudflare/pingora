@@ -40,9 +40,10 @@ pub struct ServerConf {
     pub version: usize,
     /// Whether to run this process in the background.
     pub daemon: bool,
-    /// When configured, error log will be written to the given file. Otherwise StdErr will be used.
+    /// When configured and `daemon` setting is `true`, error log will be written to the given
+    /// file. Otherwise StdErr will be used.
     pub error_log: Option<String>,
-    /// The pid (process ID) file of this server
+    /// The pid (process ID) file of this server to be created when running in background
     pub pid_file: String,
     /// the path to the upgrade socket
     ///
