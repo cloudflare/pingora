@@ -305,7 +305,7 @@ where
 
     /// Build a [LoadBalancer] with the given [Backends].
     pub fn from_backends(backends: Backends) -> Self {
-        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend())));
+        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend(), None)));
         LoadBalancer {
             backends,
             selector,
@@ -321,8 +321,10 @@ where
     /// is running as a background service.
     pub async fn update(&self) -> Result<()> {
         if self.backends.update().await? {
-            self.selector
-                .store(Arc::new(S::build(&self.backends.get_backend())))
+            self.selector.store(Arc::new(S::build(
+                &self.backends.get_backend(),
+                Some(self.selector.load_full()),
+            )))
         }
         Ok(())
     }
