@@ -18,7 +18,11 @@ use crate::proxy_common::*;
 use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
 
 // add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]) -> Result<()> {
+fn update_h2_scheme_authority(
+    header: &mut http::request::Parts,
+    raw_host: &[u8],
+    tls: bool,
+) -> Result<()> {
     let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
         if s.starts_with('[') {
             // don't mess with ipv6 host
@@ -43,8 +47,9 @@ fn update_h2_scheme_authority(header: &mut http::request::Parts, raw_host: &[u8]
         );
     };
 
+    let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
-        .scheme("https")
+        .scheme(scheme)
         .authority(authority)
         .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
         .build();
@@ -123,7 +128,7 @@ impl<SV> HttpProxy<SV> {
 
         // H2 requires authority to be set, so copy that from H1 host if that is set
         if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes()) {
+            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
                 return (false, Some(e));
             }
         }
@@ -619,14 +624,20 @@ fn test_update_authority() {
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
     assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
     assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
     assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345").unwrap();
+    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
     assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]").unwrap();
+    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
     assert_eq!("[::1]", parts.uri.authority().unwrap());
+
+    // verify scheme
+    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", parts.uri);
+    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", parts.uri);
 }

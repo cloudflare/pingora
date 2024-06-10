@@ -53,6 +53,13 @@ pub trait ServerApp {
     /// This callback will be called once after the service stops listening to its endpoints.
     async fn cleanup(&self) {}
 }
+#[non_exhaustive]
+#[derive(Default)]
+/// HTTP Server options that control how the server handles some transport types.
+pub struct HttpServerOptions {
+    /// Use HTTP/2 for plaintext.
+    pub h2c: bool,
+}
 
 /// This trait defines the interface of an HTTP application.
 #[cfg_attr(not(doc_async_trait), async_trait)]
@@ -77,6 +84,14 @@ pub trait HttpServerApp {
         None
     }
 
+    /// Provide HTTP server options used to override default behavior. This function will be called
+    /// every time a new connection is processed.
+    ///
+    /// A `None` means no server options will be applied.
+    fn server_options(&self) -> Option<&HttpServerOptions> {
+        None
+    }
+
     async fn http_cleanup(&self) {}
 }
 
@@ -90,54 +105,53 @@ where
         stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
-        match stream.selected_alpn_proto() {
-            Some(ALPN::H2) => {
-                // create a shared connection digest
-                let digest = Arc::new(Digest {
-                    ssl_digest: stream.get_ssl_digest(),
-                    // TODO: log h2 handshake time
-                    timing_digest: stream.get_timing_digest(),
-                    proxy_digest: stream.get_proxy_digest(),
-                    socket_digest: stream.get_socket_digest(),
-                });
+        let h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
+        // TODO: allow h2c and http/1.1 to co-exist
+        if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
+            // create a shared connection digest
+            let digest = Arc::new(Digest {
+                ssl_digest: stream.get_ssl_digest(),
+                // TODO: log h2 handshake time
+                timing_digest: stream.get_timing_digest(),
+                proxy_digest: stream.get_proxy_digest(),
+                socket_digest: stream.get_socket_digest(),
+            });
 
-                let h2_options = self.h2_options();
-                let h2_conn = server::handshake(stream, h2_options).await;
-                let mut h2_conn = match h2_conn {
+            let h2_options = self.h2_options();
+            let h2_conn = server::handshake(stream, h2_options).await;
+            let mut h2_conn = match h2_conn {
+                Err(e) => {
+                    error!("H2 handshake error {e}");
+                    return None;
+                }
+                Ok(c) => c,
+            };
+
+            loop {
+                // this loop ends when the client decides to close the h2 conn
+                // TODO: add a timeout?
+                let h2_stream =
+                    server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
+                let h2_stream = match h2_stream {
                     Err(e) => {
-                        error!("H2 handshake error {e}");
+                        // It is common for the client to just disconnect TCP without properly
+                        // closing H2. So we don't log the errors here
+                        debug!("H2 error when accepting new stream {e}");
                         return None;
                     }
-                    Ok(c) => c,
+                    Ok(s) => s?, // None means the connection is ready to be closed
                 };
-
-                loop {
-                    // this loop ends when the client decides to close the h2 conn
-                    // TODO: add a timeout?
-                    let h2_stream =
-                        server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
-                    let h2_stream = match h2_stream {
-                        Err(e) => {
-                            // It is common for the client to just disconnect TCP without properly
-                            // closing H2. So we don't log the errors here
-                            debug!("H2 error when accepting new stream {e}");
-                            return None;
-                        }
-                        Ok(s) => s?, // None means the connection is ready to be closed
-                    };
-                    let app = self.clone();
-                    let shutdown = shutdown.clone();
-                    pingora_runtime::current_handle().spawn(async move {
-                        app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
-                            .await;
-                    });
-                }
+                let app = self.clone();
+                let shutdown = shutdown.clone();
+                pingora_runtime::current_handle().spawn(async move {
+                    app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
+                        .await;
+                });
             }
-            _ => {
-                // No ALPN or ALPN::H1 or something else, just try Http1
-                self.process_new_http(ServerSession::new_http1(stream), shutdown)
-                    .await
-            }
+        } else {
+            // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
+            self.process_new_http(ServerSession::new_http1(stream), shutdown)
+                .await
         }
     }
 
