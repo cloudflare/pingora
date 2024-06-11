@@ -173,6 +173,14 @@ pub mod ssl {
         ) -> Result<(), ErrorStack> {
             panic!("Not implemented");
         }
+
+        /// Sets the maximum supported protocol version.
+        pub fn set_max_proto_version(
+            &mut self,
+            _version: Option<SslVersion>,
+        ) -> Result<(), ErrorStack> {
+            panic!("Not implemented");
+        }
     }
 
     /// Reference to an [`SslCipher`].
@@ -374,6 +382,9 @@ pub mod ssl {
     impl SslVersion {
         /// TLSv1.0
         pub const TLS1: SslVersion = Self {};
+
+        /// TLSv1.2
+        pub const TLS1_2: SslVersion = Self {};
 
         /// TLSv1.3
         pub const TLS1_3: SslVersion = Self {};
