@@ -132,6 +132,24 @@ fn get_opt<T>(
 }
 
 #[cfg(target_os = "linux")]
+fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
+    let mut payload = mem::MaybeUninit::zeroed();
+    let expected_size = mem::size_of::<T>() as socklen_t;
+    let mut size = expected_size;
+    get_opt(sock, opt, val, &mut payload, &mut size)?;
+
+    if size != expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "get_opt size mismatch",
+        ));
+    }
+    // Assume getsockopt() will set the value properly
+    let payload = unsafe { payload.assume_init() };
+    Ok(payload)
+}
+
+#[cfg(target_os = "linux")]
 fn cvt_linux_error(t: i32) -> io::Result<i32> {
     if t == -1 {
         Err(io::Error::last_os_error())
@@ -198,22 +216,7 @@ fn set_keepalive(_fd: RawFd, _ka: &TcpKeepalive) -> io::Result<()> {
 /// Get the kernel TCP_INFO for the given FD.
 #[cfg(target_os = "linux")]
 pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
-    let mut tcp_info = unsafe { TCP_INFO::new() };
-    let mut data_len: socklen_t = TCP_INFO::len();
-    get_opt(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_INFO,
-        &mut tcp_info,
-        &mut data_len,
-    )?;
-    if data_len != TCP_INFO::len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "TCP_INFO struct size mismatch",
-        ));
-    }
-    Ok(tcp_info)
+    get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -235,20 +238,11 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
-    let mut recv_size: c_int = 0;
-    let mut size = std::mem::size_of::<c_int>() as u32;
-    get_opt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_RCVBUF,
-        &mut recv_size,
-        &mut size,
-    )?;
-    Ok(recv_size as usize)
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_recv_buf(_fd: RawFd) -> Result<usize> {
+pub fn get_recv_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
 
@@ -283,17 +277,7 @@ pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn get_socket_cookie(fd: RawFd) -> io::Result<u64> {
-    let mut cookie: c_ulonglong = 0;
-    let mut size = std::mem::size_of_val(&cookie) as socklen_t;
-    get_opt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_COOKIE,
-        &mut cookie,
-        &mut size,
-    )?;
-
-    Ok(cookie as u64)
+    get_opt_sized::<c_ulonglong>(fd, libc::SOL_SOCKET, libc::SO_COOKIE)
 }
 
 #[cfg(not(target_os = "linux"))]
