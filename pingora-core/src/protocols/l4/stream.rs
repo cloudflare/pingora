@@ -512,17 +512,18 @@ impl AccumulatedDuration {
                     self.start();
                 }
             }
-            // Pending: start the timer, Ready(Err()): does not matter
+            Poll::Ready(Err(_)) => {
+                self.stop();
+            }
             _ => self.start(),
         }
     }
 
     fn poll_time(&mut self, result: &Poll<io::Result<()>>) {
         match result {
-            Poll::Ready(Ok(())) => {
+            Poll::Ready(_) => {
                 self.stop();
             }
-            // Pending: start the timer, Ready(Err()): does not matter
             _ => self.start(),
         }
     }
