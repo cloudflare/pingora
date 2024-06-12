@@ -18,7 +18,7 @@
 
 use libc::socklen_t;
 #[cfg(target_os = "linux")]
-use libc::{c_int, c_void};
+use libc::{c_int, c_ulonglong, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::io::{self, ErrorKind};
 use std::mem;
@@ -279,6 +279,26 @@ pub fn set_tcp_fastopen_backlog(fd: RawFd, backlog: usize) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_socket_cookie(fd: RawFd) -> io::Result<u64> {
+    let mut cookie: c_ulonglong = 0;
+    let mut size = std::mem::size_of_val(&cookie) as socklen_t;
+    get_opt(
+        fd,
+        libc::SOL_SOCKET,
+        libc::SO_COOKIE,
+        &mut cookie,
+        &mut size,
+    )?;
+
+    Ok(cookie as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_socket_cookie(_fd: RawFd) -> io::Result<u64> {
+    Ok(0) // SO_COOKIE is a Linux concept
 }
 
 /// connect() to the given address while optionally binding to the specific source address.
