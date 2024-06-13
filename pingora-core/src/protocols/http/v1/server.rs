@@ -72,6 +72,8 @@ pub struct HttpSession {
     upgraded: bool,
     /// Digest to track underlying connection metrics
     digest: Box<Digest>,
+    /// Minimum send rate to the client
+    min_send_rate: Option<usize>,
 }
 
 impl HttpSession {
@@ -106,6 +108,7 @@ impl HttpSession {
             retry_buffer: None,
             upgraded: false,
             digest,
+            min_send_rate: None,
         }
     }
 
@@ -511,6 +514,18 @@ impl HttpSession {
         is_buf_keepalive(self.get_header(header::CONNECTION))
     }
 
+    // calculate write timeout from min_send_rate if set, otherwise return write_timeout
+    fn write_timeout(&self, buf_len: usize) -> Option<Duration> {
+        let Some(min_send_rate) = self.min_send_rate.filter(|r| *r > 0) else {
+            return self.write_timeout;
+        };
+
+        // min timeout is 1s
+        let ms = (buf_len.max(min_send_rate) as f64 / min_send_rate as f64) * 1000.0;
+        // truncates unrealistically large values (we'll be out of memory before this happens)
+        Some(Duration::from_millis(ms as u64))
+    }
+
     /// Apply keepalive settings according to the client
     /// For HTTP 1.1, assume keepalive as long as there is no `Connection: Close` request header.
     /// For HTTP 1.0, only keepalive if there is an explicit header `Connection: keep-alive`.
@@ -579,7 +594,7 @@ impl HttpSession {
     /// to be written, e.g., writing more bytes than what the `Content-Length` header suggests
     pub async fn write_body(&mut self, buf: &[u8]) -> Result<Option<usize>> {
         // TODO: check if the response header is written
-        match self.write_timeout {
+        match self.write_timeout(buf.len()) {
             Some(t) => match timeout(t, self.do_write_body(buf)).await {
                 Ok(res) => res,
                 Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
@@ -588,7 +603,7 @@ impl HttpSession {
         }
     }
 
-    async fn write_body_buf(&mut self) -> Result<Option<usize>> {
+    async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
         // Don't flush empty chunks, they are considered end of body for chunks
         if self.body_write_buf.is_empty() {
             return Ok(None);
@@ -607,6 +622,16 @@ impl HttpSession {
         self.body_write_buf.clear();
 
         written
+    }
+
+    async fn write_body_buf(&mut self) -> Result<Option<usize>> {
+        match self.write_timeout(self.body_write_buf.len()) {
+            Some(t) => match timeout(t, self.do_write_body_buf()).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
+            },
+            None => self.do_write_body_buf().await,
+        }
     }
 
     fn maybe_force_close_body_reader(&mut self) {
@@ -775,6 +800,27 @@ impl HttpSession {
             self.set_keepalive(None);
         } else {
             self.set_keepalive(keepalive);
+        }
+    }
+
+    /// Sets the downstream write timeout. This will trigger if we're unable
+    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// configured then the `min_send_rate` calculated timeout has higher priority.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        self.write_timeout = Some(timeout);
+    }
+
+    /// Sets the minimum downstream send rate in bytes per second. This
+    /// is used to calculate a write timeout in seconds based on the size
+    /// of the buffer being written. If a `min_send_rate` is configured it
+    /// has higher priority over a set `write_timeout`. The minimum send
+    /// rate must be greater than zero.
+    ///
+    /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
+    /// is greater than zero, a send rate of zero is a noop.
+    pub fn set_min_send_rate(&mut self, min_send_rate: usize) {
+        if min_send_rate > 0 {
+            self.min_send_rate = Some(min_send_rate);
         }
     }
 
@@ -1584,6 +1630,30 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "There is still data left to write.")]
+    async fn test_write_body_buf_write_timeout() {
+        let wire1 = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+        let wire2 = b"abc";
+        let mock_io = Builder::new()
+            .write(wire1)
+            .wait(Duration::from_millis(500))
+            .write(wire2)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.write_timeout = Some(Duration::from_millis(100));
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Content-Length", "3").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&new_response)
+            .await
+            .unwrap();
+        http_stream.body_write_buf = BytesMut::from(&b"abc"[..]);
+        let res = http_stream.write_body_buf().await;
+        assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
+    }
+
+    #[tokio::test]
     async fn test_write_continue_resp() {
         let wire = b"HTTP/1.1 100 Continue\r\n\r\n";
         let mock_io = Builder::new().write(wire).build();
@@ -1609,6 +1679,48 @@ mod tests_stream {
         response.set_status(http::StatusCode::OK).unwrap();
         response.set_version(http::Version::HTTP_11);
         assert!(!is_upgrade_resp(&response));
+    }
+
+    #[test]
+    fn test_get_write_timeout() {
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        let expected = Duration::from_secs(5);
+
+        http_stream.set_write_timeout(expected);
+        assert_eq!(Some(expected), http_stream.write_timeout(50));
+    }
+
+    #[test]
+    fn test_get_write_timeout_none() {
+        let http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        assert!(http_stream.write_timeout(50).is_none());
+    }
+
+    #[test]
+    fn test_get_write_timeout_min_send_rate_zero_noop() {
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        http_stream.set_min_send_rate(0);
+        assert!(http_stream.write_timeout(50).is_none());
+    }
+
+    #[test]
+    fn test_get_write_timeout_min_send_rate_overrides_write_timeout() {
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        let expected = Duration::from_millis(29800);
+
+        http_stream.set_write_timeout(Duration::from_secs(60));
+        http_stream.set_min_send_rate(5000);
+
+        assert_eq!(Some(expected), http_stream.write_timeout(149000));
+    }
+
+    #[test]
+    fn test_get_write_timeout_min_send_rate_max_zero_buf() {
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        let expected = Duration::from_secs(1);
+
+        http_stream.set_min_send_rate(1);
+        assert_eq!(Some(expected), http_stream.write_timeout(0));
     }
 }
 

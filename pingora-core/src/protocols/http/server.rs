@@ -25,6 +25,7 @@ use http::{header::AsHeaderName, HeaderMap};
 use log::error;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
 pub enum Session {
@@ -184,6 +185,35 @@ impl Session {
     pub fn set_keepalive(&mut self, duration: Option<u64>) {
         match self {
             Self::H1(s) => s.set_server_keepalive(duration),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the downstream write timeout. This will trigger if we're unable
+    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// configured then the `min_send_rate` calculated timeout has higher priority.
+    ///
+    /// This is a noop for h2.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_write_timeout(timeout),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the minimum downstream send rate in bytes per second. This
+    /// is used to calculate a write timeout in seconds based on the size
+    /// of the buffer being written. If a `min_send_rate` is configured it
+    /// has higher priority over a set `write_timeout`. The minimum send
+    /// rate must be greater than zero.
+    ///
+    /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
+    /// is greater than zero, a send rate of zero is a noop.
+    ///
+    /// This is a noop for h2.
+    pub fn set_min_send_rate(&mut self, rate: usize) {
+        match self {
+            Self::H1(s) => s.set_min_send_rate(rate),
             Self::H2(_) => {}
         }
     }
