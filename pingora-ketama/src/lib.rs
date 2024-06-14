@@ -60,7 +60,6 @@
 use std::cmp::Ordering;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::usize;
 
 use crc32fast::Hasher;
 
