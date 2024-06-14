@@ -7,7 +7,7 @@ jobs:
     strategy:
       matrix:
         # TODO: add nightly
-        toolchain: [stable, 1.72]
+        toolchain: [1.78, 1.72]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
