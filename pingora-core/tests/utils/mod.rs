@@ -63,6 +63,8 @@ impl ServeHttp for EchoApp {
 }
 
 pub struct MyServer {
+    // Maybe useful in the future
+    #[allow(dead_code)]
     pub handle: thread::JoinHandle<()>,
 }
 
