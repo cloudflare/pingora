@@ -11,6 +11,7 @@ keywords = ["hash", "hashing", "consistent", "pingora"]
 
 [dependencies]
 crc32fast = "1.3"
+pingora-core = { version = "0.1.0", path = "../pingora-core" }
 
 [dev-dependencies]
 criterion = "0.4"
