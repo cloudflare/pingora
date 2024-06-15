@@ -40,6 +40,11 @@ pub trait ProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
 
+    /// Set up downstream modules.
+    ///
+    /// In this phase, users can add or configure modules before the server starts up.
+    fn init_downstream_modules(&self, _modules: &mut HttpModules) {}
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
