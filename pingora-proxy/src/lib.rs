@@ -368,7 +368,8 @@ impl Session {
         resp: &ResponseHeader,
         end_of_stream: bool,
     ) -> Result<(), Box<Error>> {
-        self.write_response_header(Box::new(resp.clone()), end_of_stream).await
+        self.write_response_header(Box::new(resp.clone()), end_of_stream)
+            .await
     }
 
     /// Write the given HTTP response body chunk to the downstream
