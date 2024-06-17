@@ -25,6 +25,7 @@ pub use tokio_openssl as tokio_ssl;
 pub mod ext;
 
 // export commonly used libs
+pub use ssl_lib::dh;
 pub use ssl_lib::error;
 pub use ssl_lib::hash;
 pub use ssl_lib::nid;
