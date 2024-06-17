@@ -40,7 +40,7 @@ pub enum HttpTask {
     Trailer(Option<Box<http::HeaderMap>>),
     /// Signal that the response is already finished
     Done,
-    /// Signal that the reading of the response encounters errors.
+    /// Signal that the reading of the response encountered errors.
     Failed(pingora_error::BError),
 }
 
