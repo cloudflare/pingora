@@ -45,6 +45,14 @@ impl CacheStatus {
             Self::LockHit => "lock_hit",
         }
     }
+
+    /// Returns whether this status represents a cache hit.
+    pub fn is_hit(&self) -> bool {
+        match self {
+            CacheStatus::Hit | CacheStatus::LockHit => true,
+            CacheStatus::Miss | CacheStatus::Expired => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
