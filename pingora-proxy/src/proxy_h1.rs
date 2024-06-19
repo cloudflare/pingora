@@ -98,10 +98,7 @@ impl<SV> HttpProxy<SV> {
         );
 
         match ret {
-            Ok((_first, _second)) => {
-                client_session.respect_keepalive();
-                (true, true, None)
-            }
+            Ok((_first, _second)) => (true, true, None),
             Err(e) => (false, false, Some(e)),
         }
     }

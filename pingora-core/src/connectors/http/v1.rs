@@ -51,10 +51,11 @@ impl Connector {
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
         &self,
-        session: HttpSession,
+        mut session: HttpSession,
         peer: &P,
         idle_timeout: Option<Duration>,
     ) {
+        session.respect_keepalive();
         if let Some(stream) = session.reuse().await {
             self.transport
                 .release_stream(stream, peer.reuse_hash(), idle_timeout);
