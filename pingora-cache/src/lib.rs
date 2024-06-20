@@ -44,7 +44,7 @@ pub use key::CacheKey;
 use lock::{CacheLock, LockStatus, Locked};
 pub use memory::MemCache;
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, Storage};
+pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -658,7 +658,10 @@ impl HttpCache {
                     let handle = span.handle();
                     for item in evicted {
                         // TODO: warn/log the error
-                        let _ = inner.storage.purge(&item, &handle).await;
+                        let _ = inner
+                            .storage
+                            .purge(&item, PurgeType::Eviction, &handle)
+                            .await;
                     }
                 }
                 inner.traces.finish_miss_span();
@@ -1063,7 +1066,10 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 let mut span = inner.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                let result = inner.storage.purge(&key, &span.handle()).await;
+                let result = inner
+                    .storage
+                    .purge(&key, PurgeType::Invalidation, &span.handle())
+                    .await;
                 // FIXME: also need to remove from eviction manager
                 span.set_tag(|| trace::Tag::new("purged", matches!(result, Ok(true))));
                 result
