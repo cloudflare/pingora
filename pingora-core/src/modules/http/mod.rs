@@ -65,7 +65,7 @@ pub trait HttpModule {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-type Module = Box<dyn HttpModule + 'static + Send + Sync>;
+pub type Module = Box<dyn HttpModule + 'static + Send + Sync>;
 
 /// Trait to init the http module ctx for each request
 pub trait HttpModuleBuilder {
