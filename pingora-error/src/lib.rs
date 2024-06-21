@@ -539,6 +539,35 @@ impl<T, E> OrErr<T, E> for Result<T, E> {
     }
 }
 
+/// Helper trait to convert an [Option] to an [Error] with context.
+pub trait OkOrErr<T> {
+    fn or_err(self, et: ErrorType, context: &'static str) -> Result<T, BError>;
+
+    fn or_err_with<C: Into<ImmutStr>, F: FnOnce() -> C>(
+        self,
+        et: ErrorType,
+        context: F,
+    ) -> Result<T, BError>;
+}
+
+impl<T> OkOrErr<T> for Option<T> {
+    /// Convert the [Option] to a new [Error] with [ErrorType] and context if None, Ok otherwise.
+    ///
+    /// This is a shortcut for .ok_or(Error::explain())
+    fn or_err(self, et: ErrorType, context: &'static str) -> Result<T, BError> {
+        self.ok_or(Error::explain(et, context))
+    }
+
+    /// Similar to to_err(), but takes a closure, which is useful for constructing String.
+    fn or_err_with<C: Into<ImmutStr>, F: FnOnce() -> C>(
+        self,
+        et: ErrorType,
+        context: F,
+    ) -> Result<T, BError> {
+        self.ok_or_else(|| Error::explain(et, context()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +613,32 @@ mod tests {
         assert_eq!(
             format!("{}", e2.unwrap_err()),
             " HTTPStatus context: another cause:  InternalError"
+        );
+    }
+
+    #[test]
+    fn test_option_some_ok() {
+        let m = Some(2);
+        let o = m.or_err(ErrorType::InternalError, "some is not an error!");
+        assert_eq!(2, o.unwrap());
+
+        let o = m.or_err_with(ErrorType::InternalError, || "some is not an error!");
+        assert_eq!(2, o.unwrap());
+    }
+
+    #[test]
+    fn test_option_none_err() {
+        let m: Option<i32> = None;
+        let e1 = m.or_err(ErrorType::InternalError, "none is an error!");
+        assert_eq!(
+            format!("{}", e1.unwrap_err()),
+            " InternalError context: none is an error!"
+        );
+
+        let e1 = m.or_err_with(ErrorType::InternalError, || "none is an error!");
+        assert_eq!(
+            format!("{}", e1.unwrap_err()),
+            " InternalError context: none is an error!"
         );
     }
 }

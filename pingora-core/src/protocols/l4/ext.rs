@@ -18,7 +18,7 @@
 
 use libc::socklen_t;
 #[cfg(target_os = "linux")]
-use libc::{c_int, c_void};
+use libc::{c_int, c_ulonglong, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::io::{self, ErrorKind};
 use std::mem;
@@ -31,60 +31,60 @@ use tokio::net::{TcpSocket, TcpStream, UnixStream};
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TCP_INFO {
-    tcpi_state: u8,
-    tcpi_ca_state: u8,
-    tcpi_retransmits: u8,
-    tcpi_probes: u8,
-    tcpi_backoff: u8,
-    tcpi_options: u8,
-    tcpi_snd_wscale_4_rcv_wscale_4: u8,
-    tcpi_delivery_rate_app_limited: u8,
-    tcpi_rto: u32,
-    tcpi_ato: u32,
-    tcpi_snd_mss: u32,
-    tcpi_rcv_mss: u32,
-    tcpi_unacked: u32,
-    tcpi_sacked: u32,
-    tcpi_lost: u32,
-    tcpi_retrans: u32,
-    tcpi_fackets: u32,
-    tcpi_last_data_sent: u32,
-    tcpi_last_ack_sent: u32,
-    tcpi_last_data_recv: u32,
-    tcpi_last_ack_recv: u32,
-    tcpi_pmtu: u32,
-    tcpi_rcv_ssthresh: u32,
+    pub tcpi_state: u8,
+    pub tcpi_ca_state: u8,
+    pub tcpi_retransmits: u8,
+    pub tcpi_probes: u8,
+    pub tcpi_backoff: u8,
+    pub tcpi_options: u8,
+    pub tcpi_snd_wscale_4_rcv_wscale_4: u8,
+    pub tcpi_delivery_rate_app_limited: u8,
+    pub tcpi_rto: u32,
+    pub tcpi_ato: u32,
+    pub tcpi_snd_mss: u32,
+    pub tcpi_rcv_mss: u32,
+    pub tcpi_unacked: u32,
+    pub tcpi_sacked: u32,
+    pub tcpi_lost: u32,
+    pub tcpi_retrans: u32,
+    pub tcpi_fackets: u32,
+    pub tcpi_last_data_sent: u32,
+    pub tcpi_last_ack_sent: u32,
+    pub tcpi_last_data_recv: u32,
+    pub tcpi_last_ack_recv: u32,
+    pub tcpi_pmtu: u32,
+    pub tcpi_rcv_ssthresh: u32,
     pub tcpi_rtt: u32,
-    tcpi_rttvar: u32,
-    tcpi_snd_ssthresh: u32,
-    tcpi_snd_cwnd: u32,
-    tcpi_advmss: u32,
-    tcpi_reordering: u32,
-    tcpi_rcv_rtt: u32,
+    pub tcpi_rttvar: u32,
+    pub tcpi_snd_ssthresh: u32,
+    pub tcpi_snd_cwnd: u32,
+    pub tcpi_advmss: u32,
+    pub tcpi_reordering: u32,
+    pub tcpi_rcv_rtt: u32,
     pub tcpi_rcv_space: u32,
-    tcpi_total_retrans: u32,
-    tcpi_pacing_rate: u64,
-    tcpi_max_pacing_rate: u64,
-    tcpi_bytes_acked: u64,
-    tcpi_bytes_received: u64,
-    tcpi_segs_out: u32,
-    tcpi_segs_in: u32,
-    tcpi_notsent_bytes: u32,
-    tcpi_min_rtt: u32,
-    tcpi_data_segs_in: u32,
-    tcpi_data_segs_out: u32,
-    tcpi_delivery_rate: u64,
-    tcpi_busy_time: u64,
-    tcpi_rwnd_limited: u64,
-    tcpi_sndbuf_limited: u64,
-    tcpi_delivered: u32,
-    tcpi_delivered_ce: u32,
-    tcpi_bytes_sent: u64,
-    tcpi_bytes_retrans: u64,
-    tcpi_dsack_dups: u32,
-    tcpi_reord_seen: u32,
-    tcpi_rcv_ooopack: u32,
-    tcpi_snd_wnd: u32,
+    pub tcpi_total_retrans: u32,
+    pub tcpi_pacing_rate: u64,
+    pub tcpi_max_pacing_rate: u64,
+    pub tcpi_bytes_acked: u64,
+    pub tcpi_bytes_received: u64,
+    pub tcpi_segs_out: u32,
+    pub tcpi_segs_in: u32,
+    pub tcpi_notsent_bytes: u32,
+    pub tcpi_min_rtt: u32,
+    pub tcpi_data_segs_in: u32,
+    pub tcpi_data_segs_out: u32,
+    pub tcpi_delivery_rate: u64,
+    pub tcpi_busy_time: u64,
+    pub tcpi_rwnd_limited: u64,
+    pub tcpi_sndbuf_limited: u64,
+    pub tcpi_delivered: u32,
+    pub tcpi_delivered_ce: u32,
+    pub tcpi_bytes_sent: u64,
+    pub tcpi_bytes_retrans: u64,
+    pub tcpi_dsack_dups: u32,
+    pub tcpi_reord_seen: u32,
+    pub tcpi_rcv_ooopack: u32,
+    pub tcpi_snd_wnd: u32,
     pub tcpi_rcv_wnd: u32,
     // and more, see include/linux/tcp.h
 }
@@ -129,6 +129,24 @@ fn get_opt<T>(
         cvt_linux_error(libc::getsockopt(sock, opt, val, payload as *mut _, size))?;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
+    let mut payload = mem::MaybeUninit::zeroed();
+    let expected_size = mem::size_of::<T>() as socklen_t;
+    let mut size = expected_size;
+    get_opt(sock, opt, val, &mut payload, &mut size)?;
+
+    if size != expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "get_opt size mismatch",
+        ));
+    }
+    // Assume getsockopt() will set the value properly
+    let payload = unsafe { payload.assume_init() };
+    Ok(payload)
 }
 
 #[cfg(target_os = "linux")]
@@ -198,22 +216,7 @@ fn set_keepalive(_fd: RawFd, _ka: &TcpKeepalive) -> io::Result<()> {
 /// Get the kernel TCP_INFO for the given FD.
 #[cfg(target_os = "linux")]
 pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
-    let mut tcp_info = unsafe { TCP_INFO::new() };
-    let mut data_len: socklen_t = TCP_INFO::len();
-    get_opt(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_INFO,
-        &mut tcp_info,
-        &mut data_len,
-    )?;
-    if data_len != TCP_INFO::len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "TCP_INFO struct size mismatch",
-        ));
-    }
-    Ok(tcp_info)
+    get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -235,20 +238,11 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
-    let mut recv_size: c_int = 0;
-    let mut size = std::mem::size_of::<c_int>() as u32;
-    get_opt(
-        fd,
-        libc::SOL_SOCKET,
-        libc::SO_RCVBUF,
-        &mut recv_size,
-        &mut size,
-    )?;
-    Ok(recv_size as usize)
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_recv_buf(_fd: RawFd) -> Result<usize> {
+pub fn get_recv_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
 
@@ -279,6 +273,16 @@ pub fn set_tcp_fastopen_backlog(fd: RawFd, backlog: usize) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_socket_cookie(fd: RawFd) -> io::Result<u64> {
+    get_opt_sized::<c_ulonglong>(fd, libc::SOL_SOCKET, libc::SO_COOKIE)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_socket_cookie(_fd: RawFd) -> io::Result<u64> {
+    Ok(0) // SO_COOKIE is a Linux concept
 }
 
 /// connect() to the given address while optionally binding to the specific source address.

@@ -783,7 +783,7 @@ impl HttpSession {
         &self.digest
     }
 
-    /// Return the client (peer) address of the underlying connnection.
+    /// Return the client (peer) address of the underlying connection.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         self.digest()
             .socket_digest
@@ -791,7 +791,7 @@ impl HttpSession {
             .map(|d| d.peer_addr())?
     }
 
-    /// Return the server (local) address of the underlying connnection.
+    /// Return the server (local) address of the underlying connection.
     pub fn server_addr(&self) -> Option<&SocketAddr> {
         self.digest()
             .socket_digest

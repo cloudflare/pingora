@@ -15,7 +15,10 @@
 //! Defines where to connect to and how to connect to a remote server
 
 use ahash::AHasher;
-use pingora_error::{ErrorType::InternalError, OrErr, Result};
+use pingora_error::{
+    ErrorType::{InternalError, SocketError},
+    OrErr, Result,
+};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -431,9 +434,11 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
-    pub fn new_uds(path: &str, tls: bool, sni: String) -> Self {
-        let addr = SocketAddr::Unix(UnixSocketAddr::from_pathname(Path::new(path)).unwrap()); //TODO: handle error
-        Self::new_from_sockaddr(addr, tls, sni)
+    pub fn new_uds(path: &str, tls: bool, sni: String) -> Result<Self> {
+        let addr = SocketAddr::Unix(
+            UnixSocketAddr::from_pathname(Path::new(path)).or_err(SocketError, "invalid path")?,
+        );
+        Ok(Self::new_from_sockaddr(addr, tls, sni))
     }
 
     /// Create a new [`HttpPeer`] that uses a proxy to connect to the upstream IP and port

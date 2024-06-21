@@ -365,7 +365,7 @@ impl Session {
         }
     }
 
-    /// Return the client (peer) address of the connnection.
+    /// Return the client (peer) address of the connection.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         match self {
             Self::H1(s) => s.client_addr(),
