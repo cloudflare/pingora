@@ -15,6 +15,7 @@
 //! Generic socket type
 
 use crate::{Error, OrErr};
+use log::warn;
 use nix::sys::socket::{getpeername, getsockname, SockaddrStorage};
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
@@ -174,14 +175,23 @@ impl std::str::FromStr for SocketAddr {
     type Err = Box<Error>;
 
     // This is very basic parsing logic, it might treat invalid IP:PORT str as UDS path
-    // TODO: require UDS to have some prefix
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match StdSockAddr::from_str(s) {
-            Ok(addr) => Ok(SocketAddr::Inet(addr)),
-            Err(_) => {
-                let uds_socket = StdUnixSockAddr::from_pathname(s)
-                    .or_err(crate::BindError, "invalid UDS path")?;
-                Ok(SocketAddr::Unix(uds_socket))
+        if s.starts_with("unix:") {
+            // format unix:/tmp/server.socket
+            let path = s.trim_start_matches("unix:");
+            let uds_socket = StdUnixSockAddr::from_pathname(path)
+                .or_err(crate::BindError, "invalid UDS path")?;
+            Ok(SocketAddr::Unix(uds_socket))
+        } else {
+            match StdSockAddr::from_str(s) {
+                Ok(addr) => Ok(SocketAddr::Inet(addr)),
+                Err(_) => {
+                    // Try to parse as UDS for backward compatibility
+                    let uds_socket = StdUnixSockAddr::from_pathname(s)
+                        .or_err(crate::BindError, "invalid UDS path")?;
+                    warn!("Raw Unix domain socket path support will be deprecated, add 'unix:' prefix instead");
+                    Ok(SocketAddr::Unix(uds_socket))
+                }
             }
         }
     }
@@ -244,6 +254,12 @@ mod test {
     #[test]
     fn parse_uds() {
         let uds: SocketAddr = "/tmp/my.sock".parse().unwrap();
+        assert!(uds.as_unix().is_some());
+    }
+
+    #[test]
+    fn parse_uds_with_prefix() {
+        let uds: SocketAddr = "unix:/tmp/my.sock".parse().unwrap();
         assert!(uds.as_unix().is_some());
     }
 }
