@@ -766,10 +766,6 @@ where
     SV: ProxyHttp,
 {
     let mut proxy = HttpProxy::new(inner, conf.clone());
-    // Add disabled downstream compression module by default
-    proxy
-        .downstream_modules
-        .add_module(ResponseCompressionBuilder::enable(0));
     proxy.handle_init_modules();
     Service::new(name.to_string(), proxy)
 }

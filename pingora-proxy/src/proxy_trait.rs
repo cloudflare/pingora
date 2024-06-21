@@ -42,8 +42,14 @@ pub trait ProxyHttp {
 
     /// Set up downstream modules.
     ///
-    /// In this phase, users can add or configure modules before the server starts up.
-    fn init_downstream_modules(&self, _modules: &mut HttpModules) {}
+    /// In this phase, users can add or configure [HttpModules] before the server starts up.
+    ///
+    /// In the default implementation of this method, [ResponseCompressionBuilder] is added
+    /// and disabled.
+    fn init_downstream_modules(&self, modules: &mut HttpModules) {
+        // Add disabled downstream compression module by default
+        modules.add_module(ResponseCompressionBuilder::enable(0));
+    }
 
     /// Handle the incoming request.
     ///
