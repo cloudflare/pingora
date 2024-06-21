@@ -19,7 +19,6 @@
 use super::HttpTask;
 
 use bytes::Bytes;
-use http::header::ACCEPT_RANGES;
 use log::warn;
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
