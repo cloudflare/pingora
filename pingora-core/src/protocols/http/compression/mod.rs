@@ -204,7 +204,11 @@ impl ResponseCompressionCtx {
                     return;
                 }
 
-                if depends_on_accept_encoding(resp, *compression_level != 0, *decompress_enable) {
+                if depends_on_accept_encoding(
+                    resp,
+                    levels.iter().any(|level| *level != 0),
+                    *decompress_enable,
+                ) {
                     // The response depends on the Accept-Encoding header, make sure to indicate it
                     // in the Vary response header.
                     // https://www.rfc-editor.org/rfc/rfc9110#name-vary
