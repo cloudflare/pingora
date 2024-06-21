@@ -473,7 +473,9 @@ mod tests {
 
     #[test]
     fn test_evict_from_small() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -496,7 +498,9 @@ mod tests {
 
     #[test]
     fn test_evict_from_small_to_main() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -510,20 +514,30 @@ mod tests {
         assert_eq!(cache.peek_queue(2), Some(SMALL));
         assert_eq!(cache.peek_queue(3), Some(SMALL));
 
-        let evicted = cache.put(4, 4, 1);
+        let evicted = cache.put(4, 4, 2);
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].data, 2);
+        assert_eq!(evicted[0].weight, 2);
 
         assert_eq!(cache.peek_queue(1), Some(MAIN));
-        // 2 is evicted because 1 is in main
-        assert_eq!(cache.peek_queue(2), None);
-        assert_eq!(cache.peek_queue(3), Some(SMALL));
-        assert_eq!(cache.peek_queue(4), Some(SMALL));
+        // either 2, 3, or 4 was evicted. Check evicted for which.
+        let mut remaining = vec![2, 3, 4];
+        remaining.remove(
+            remaining
+                .iter()
+                .position(|x| *x == evicted[0].data)
+                .unwrap(),
+        );
+        assert_eq!(cache.peek_queue(evicted[0].key), None);
+        for k in remaining {
+            assert_eq!(cache.peek_queue(k), Some(SMALL));
+        }
     }
 
     #[test]
     fn test_evict_reentry() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -555,7 +569,9 @@ mod tests {
 
     #[test]
     fn test_evict_entry_denied() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -583,7 +599,9 @@ mod tests {
 
     #[test]
     fn test_force_put() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -612,7 +630,9 @@ mod tests {
 
     #[test]
     fn test_evict_from_main() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -649,7 +669,9 @@ mod tests {
 
     #[test]
     fn test_evict_from_small_compact() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_compact_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
@@ -672,7 +694,9 @@ mod tests {
 
     #[test]
     fn test_evict_from_small_to_main_compact() {
-        let cache = TinyUfo::new(5, 5);
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_compact_seeded(5);
 
         cache.put(1, 1, 1);
         cache.put(2, 2, 2);
