@@ -674,12 +674,8 @@ fn adjust_response_header(resp: &mut ResponseHeader, action: &Action) {
     fn set_stream_headers(resp: &mut ResponseHeader) {
         // because the transcoding is streamed, content length is not known ahead
         resp.remove_header(&CONTENT_LENGTH);
-
-        // Even if upstream supports ranged requests, streamed responses cannot. Replace any
-        // present Accept-Ranges headers.
-        // https://www.rfc-editor.org/rfc/rfc9110#field.accept-ranges
-        resp.insert_header(&ACCEPT_RANGES, HeaderValue::from_static("none"))
-            .unwrap();
+        // remove Accept-Ranges header because range requests will no longer work
+        resp.remove_header(&ACCEPT_RANGES);
 
         // we stream body now TODO: chunked is for h1 only
         resp.insert_header(&TRANSFER_ENCODING, HeaderValue::from_static("chunked"))
@@ -733,10 +729,7 @@ fn test_adjust_response_header() {
         header.headers.get("transfer-encoding").unwrap().as_bytes(),
         b"chunked"
     );
-    assert_eq!(
-        header.headers.get("accept-ranges").unwrap().as_bytes(),
-        b"none"
-    );
+    assert!(header.headers.get("accept-ranges").is_none());
 
     // compress
     let mut header = ResponseHeader::build(200, None).unwrap();
@@ -748,16 +741,9 @@ fn test_adjust_response_header() {
         b"gzip"
     );
     assert!(header.headers.get("content-length").is_none());
-    assert_eq!(
-        header.headers.get("accept-ranges").unwrap().as_bytes(),
-        b"none"
-    );
+    assert!(header.headers.get("accept-ranges").is_none());
     assert_eq!(
         header.headers.get("transfer-encoding").unwrap().as_bytes(),
         b"chunked"
-    );
-    assert_eq!(
-        header.headers.get("accept-ranges").unwrap().as_bytes(),
-        b"none"
     );
 }
