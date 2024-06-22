@@ -20,6 +20,7 @@ In this guide, we will cover the most used features, operations and settings of 
 * [Examples: take control of the request](modify_filter.md)
 * [Connection pooling and reuse](pooling.md)
 * [Handling failures and failover](failover.md)
+* [RateLimiter quickstart](ratelimiter.md)
 
 ## Advanced topics (WIP)
 * [Pingora internals](internals.md)
