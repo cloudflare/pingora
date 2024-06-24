@@ -63,15 +63,15 @@ pub trait SelectionAlgorithm {
 
 /// [FNV](https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function) hashing
 /// on weighted backends
-pub type FNVHash = Weighted<fnv::FnvHasher>;
+pub type FNVHash<M> = Weighted<M, fnv::FnvHasher>;
 
 /// Alias of [`FNVHash`] for backwards compatibility until the next breaking change
 #[doc(hidden)]
-pub type FVNHash = Weighted<fnv::FnvHasher>;
+pub type FVNHash<M> = Weighted<M, fnv::FnvHasher>;
 /// Random selection on weighted backends
-pub type Random = Weighted<algorithms::Random>;
+pub type Random<M> = Weighted<M, algorithms::Random>;
 /// Round robin selection on weighted backends
-pub type RoundRobin = Weighted<algorithms::RoundRobin>;
+pub type RoundRobin<M> = Weighted<M, algorithms::RoundRobin>;
 /// Consistent Ketama hashing on weighted backends
 pub type Consistent<M> = consistent::KetamaHashing<M>;
 
@@ -126,12 +126,14 @@ where
 mod tests {
     use super::*;
 
+    type TestMetadata = u32;
+
     struct TestIter {
-        seq: Vec<Backend>,
+        seq: Vec<Backend<TestMetadata>>,
         idx: usize,
     }
     impl TestIter {
-        fn new(input: &[&Backend]) -> Self {
+        fn new(input: &[&Backend<TestMetadata>]) -> Self {
             Self {
                 seq: input.iter().cloned().cloned().collect(),
                 idx: 0,
@@ -139,18 +141,20 @@ mod tests {
         }
     }
     impl BackendIter for TestIter {
-        fn next(&mut self) -> Option<&Backend> {
+        fn next(&mut self) -> Option<&Backend<TestMetadata>> {
             let idx = self.idx;
             self.idx += 1;
             self.seq.get(idx)
         }
+
+        type Metadata = TestMetadata;
     }
 
     #[test]
     fn unique_iter_max_iterations_is_correct() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let b2 = Backend::new("1.0.0.1:80").unwrap();
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
+        let b1 = Backend::new_with_meta("1.1.1.1:80", 1u32).unwrap();
+        let b2 = Backend::new_with_meta("1.0.0.1:80", 2u32).unwrap();
+        let b3 = Backend::new_with_meta("1.0.0.255:80", 3u32).unwrap();
         let items = [&b1, &b2, &b3];
 
         let mut all = UniqueIterator::new(TestIter::new(&items), 3);
@@ -166,9 +170,9 @@ mod tests {
 
     #[test]
     fn unique_iter_duplicate_items_are_filtered() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let b2 = Backend::new("1.0.0.1:80").unwrap();
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
+        let b1 = Backend::new_with_meta("1.1.1.1:80", 1u32).unwrap();
+        let b2 = Backend::new_with_meta("1.0.0.1:80", 2u32).unwrap();
+        let b3 = Backend::new_with_meta("1.0.0.255:80", 3u32).unwrap();
         let items = [&b1, &b1, &b2, &b2, &b2, &b3];
 
         let mut uniq = UniqueIterator::new(TestIter::new(&items), 10);

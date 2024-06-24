@@ -114,12 +114,12 @@ mod test {
 
     #[test]
     fn test_fnv() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let mut b2 = Backend::new("1.0.0.1:80").unwrap();
+        let b1 = Backend::new_with_meta("1.1.1.1:80", 1u32).unwrap();
+        let mut b2 = Backend::new_with_meta("1.0.0.1:80", 2u32).unwrap();
         b2.weight = 10; // 10x than the rest
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
+        let b3 = Backend::new_with_meta("1.0.0.255:80", 3u32).unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted<_>> = Arc::new(Weighted::build(&backends));
 
         // same hash iter over
         let mut iter = hash.iter(b"test");
@@ -156,12 +156,12 @@ mod test {
 
     #[test]
     fn test_round_robin() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let mut b2 = Backend::new("1.0.0.1:80").unwrap();
+        let b1 = Backend::new_with_meta("1.1.1.1:80", 1u32).unwrap();
+        let mut b2 = Backend::new_with_meta("1.0.0.1:80", 2u32).unwrap();
         b2.weight = 8; // 8x than the rest
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
+        let b3 = Backend::new_with_meta("1.0.0.255:80", 3u32).unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted<RoundRobin>> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted<_, RoundRobin>> = Arc::new(Weighted::build(&backends));
 
         // same hash iter over
         let mut iter = hash.iter(b"test");
@@ -197,7 +197,7 @@ mod test {
         b2.weight = 8; // 8x than the rest
         let b3 = Backend::new("1.0.0.255:80").unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted<Random>> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted<_, Random>> = Arc::new(Weighted::build(&backends));
 
         let mut count = HashMap::new();
         count.insert(b1.clone(), 0);

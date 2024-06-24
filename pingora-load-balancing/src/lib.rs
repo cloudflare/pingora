@@ -316,7 +316,7 @@ pub struct LoadBalancer<S, M> {
     pub parallel_health_check: bool,
 }
 
-impl<'a, S, M> LoadBalancer<S, M>
+impl<S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
@@ -330,8 +330,8 @@ where
     where
         A: ToSocketAddrs,
     {
-        let discovery = discovery::Static::try_from_iter(iter)?;
-        let backends = Backends::new(discovery);
+        let discovery = discovery::Static::<M>::try_from_iter(iter)?;
+        let backends = Backends::<M>::new(discovery);
         let lb = Self::from_backends(backends);
         lb.update()
             .now_or_never()
@@ -341,10 +341,11 @@ where
     }
 }
 
-impl<'a, S, M> LoadBalancer<S, M>
+impl<S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
+    // M: Clone,
 {
     /// Build a [LoadBalancer] with the given [Backends].
     pub fn from_backends(backends: Backends<M>) -> Self {
@@ -378,7 +379,7 @@ where
     }
 }
 
-impl<'a, S, M> LoadBalancer<S, M>
+impl<S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
@@ -420,7 +421,7 @@ where
     }
 }
 
-impl<'a, S, M> LoadBalancer<S, M>
+impl<S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
@@ -445,13 +446,15 @@ mod test {
     use super::*;
     use async_trait::async_trait;
 
+    type TestMetadata = u32;
+
     #[tokio::test]
     async fn test_static_backends() {
-        let backends: LoadBalancer<selection::RoundRobin> =
+        let backends: LoadBalancer<selection::RoundRobin<_>, _> =
             LoadBalancer::try_from_iter(["1.1.1.1:80", "1.0.0.1:80"]).unwrap();
 
-        let backend1 = Backend::new("1.1.1.1:80").unwrap();
-        let backend2 = Backend::new("1.0.0.1:80").unwrap();
+        let backend1 = Backend::new_with_meta("1.1.1.1:80", u32::default()).unwrap();
+        let backend2 = Backend::new_with_meta("1.0.0.1:80", u32::default()).unwrap();
         let backend = backends.backends().get_backend();
         assert!(backend.contains(&backend1));
         assert!(backend.contains(&backend2));
@@ -493,22 +496,24 @@ mod test {
     async fn test_discovery_readiness() {
         use discovery::Static;
 
-        struct TestDiscovery(Static);
+        struct TestDiscovery(Static<TestMetadata>);
         #[async_trait]
         impl ServiceDiscovery for TestDiscovery {
-            async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
-                let bad = Backend::new("127.0.0.1:79").unwrap();
+            type Metadata = TestMetadata;
+
+            async fn discover(&self) -> Result<(BTreeSet<Backend<TestMetadata>>, HashMap<u64, bool>)> {
+                let bad = Backend::new_with_meta("127.0.0.1:79", 3u32).unwrap();
                 let (backends, mut readiness) = self.0.discover().await?;
                 readiness.insert(bad.hash_key(), false);
                 Ok((backends, readiness))
             }
         }
-        let discovery = Static::default();
-        let good1 = Backend::new("1.1.1.1:80").unwrap();
+        let discovery = Static::<TestMetadata>::default();
+        let good1 = Backend::new_with_meta("1.1.1.1:80", 1u32).unwrap();
         discovery.add(good1.clone());
-        let good2 = Backend::new("1.0.0.1:80").unwrap();
+        let good2 = Backend::new_with_meta("1.0.0.1:80", 2u32).unwrap();
         discovery.add(good2.clone());
-        let bad = Backend::new("127.0.0.1:79").unwrap();
+        let bad = Backend::new_with_meta("127.0.0.1:79", 3u32).unwrap();
         discovery.add(bad.clone());
         let discovery = TestDiscovery(discovery);
 

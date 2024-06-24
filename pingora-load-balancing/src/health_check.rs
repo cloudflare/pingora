@@ -339,13 +339,16 @@ mod test {
     use super::*;
     use crate::SocketAddr;
 
+    type TestMetadata = u32;
+
     #[tokio::test]
     async fn test_tcp_check() {
-        let tcp_check = TcpHealthCheck::default();
+        let tcp_check = TcpHealthCheck::<TestMetadata>::default();
 
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            metadata: 10,
         };
 
         assert!(tcp_check.check(&backend).await.is_ok());
@@ -353,6 +356,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:79".parse().unwrap()),
             weight: 1,
+            metadata: 20,
         };
 
         assert!(tcp_check.check(&backend).await.is_err());
@@ -364,6 +368,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            metadata: 30,
         };
 
         assert!(tls_check.check(&backend).await.is_ok());
@@ -376,6 +381,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            metadata: 40,
         };
 
         assert!(https_check.check(&backend).await.is_ok());
@@ -398,6 +404,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            metadata: 60,
         };
 
         http_check.check(&backend).await.unwrap();
