@@ -305,15 +305,14 @@ impl Http2Session {
     /// Return the [Digest] of the connection
     ///
     /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse the timing field
+    /// The caller should check if the connection is reused to avoid misuse the timing field.
     pub fn digest(&self) -> Option<&Digest> {
         Some(self.conn.digest())
     }
 
-    /// Return a mutable [Digest] reference for the connection
+    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
     ///
-    /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse the timing field
+    /// Will return `None` if multiple H2 streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
         self.conn.digest_mut()
     }

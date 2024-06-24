@@ -387,7 +387,7 @@ impl Session {
         }
     }
 
-    /// Return the digest for the session.
+    /// Return the [Digest] for the connection.
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::H1(s) => Some(s.digest()),
@@ -395,7 +395,9 @@ impl Session {
         }
     }
 
-    /// Return a mutable digest reference for the session.
+    /// Return a mutable [Digest] reference for the connection.
+    ///
+    /// Will return `None` if multiple H2 streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
         match self {
             Self::H1(s) => Some(s.digest_mut()),

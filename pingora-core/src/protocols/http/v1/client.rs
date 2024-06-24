@@ -631,10 +631,15 @@ impl HttpSession {
         // TODO: support h1 trailer
     }
 
+    /// Return the [Digest] of the connection
+    ///
+    /// For reused connection, the timing in the digest will reflect its initial handshakes
+    /// The caller should check if the connection is reused to avoid misuse the timing field.
     pub fn digest(&self) -> &Digest {
         &self.digest
     }
 
+    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
     pub fn digest_mut(&mut self) -> &mut Digest {
         &mut self.digest
     }

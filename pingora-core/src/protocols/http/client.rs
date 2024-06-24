@@ -153,7 +153,7 @@ impl HttpSession {
     /// Return the [Digest] of the connection
     ///
     /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse of the timing field
+    /// The caller should check if the connection is reused to avoid misuse of the timing field.
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::H1(s) => Some(s.digest()),
@@ -161,10 +161,9 @@ impl HttpSession {
         }
     }
 
-    /// Return a mutable [Digest] reference for the connection
+    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
     ///
-    /// For reused connection, the timing in the digest will reflect its initial handshakes
-    /// The caller should check if the connection is reused to avoid misuse of the timing field
+    /// Will return `None` if this is an H2 session and multiple streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
         match self {
             Self::H1(s) => Some(s.digest_mut()),
