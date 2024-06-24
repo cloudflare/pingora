@@ -20,16 +20,20 @@ use pingora_ketama::{Bucket, Continuum};
 use std::collections::HashMap;
 
 /// Weighted Ketama consistent hashing
-pub struct KetamaHashing {
+pub struct KetamaHashing<M> {
     ring: Continuum,
     // TODO: update Ketama to just store this
-    backends: HashMap<SocketAddr, Backend>,
+    backends: HashMap<SocketAddr, Backend<M>>,
 }
 
-impl BackendSelection for KetamaHashing {
-    type Iter = OwnedNodeIterator;
+impl<M> BackendSelection for KetamaHashing<M>
+where
+    M: Clone,
+{
+    type Iter = OwnedNodeIterator<M>;
+    type Metadata = M;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    fn build(backends: &BTreeSet<Backend<M>>) -> Self {
         let buckets: Vec<_> = backends
             .iter()
             .filter_map(|b| {
@@ -60,13 +64,14 @@ impl BackendSelection for KetamaHashing {
 }
 
 /// Iterator over a Continuum
-pub struct OwnedNodeIterator {
+pub struct OwnedNodeIterator<M> {
     idx: usize,
-    ring: Arc<KetamaHashing>,
+    ring: Arc<KetamaHashing<M>>,
 }
 
-impl BackendIter for OwnedNodeIterator {
-    fn next(&mut self) -> Option<&Backend> {
+impl<M> BackendIter for OwnedNodeIterator<M> {
+    type Metadata = M;
+    fn next(&mut self) -> Option<&Backend<M>> {
         self.ring.ring.get_addr(&mut self.idx).and_then(|addr| {
             let addr = SocketAddr::Inet(*addr);
             self.ring.backends.get(&addr)

@@ -27,8 +27,10 @@ use weighted::Weighted;
 pub trait BackendSelection {
     /// The [BackendIter] returned from iter() below.
     type Iter;
+    /// The metadata associated with the Backend
+    type Metadata;
     /// The function to create a [BackendSelection] implementation.
-    fn build(backends: &BTreeSet<Backend>) -> Self;
+    fn build(backends: &BTreeSet<Backend<Self::Metadata>>) -> Self;
     /// Select backends for a given key.
     ///
     /// An [BackendIter] should be returned. The first item in the iter is the first
@@ -43,8 +45,9 @@ pub trait BackendSelection {
 ///
 /// Similar to [Iterator] but allow self referencing.
 pub trait BackendIter {
+    type Metadata;
     /// Return `Some(&Backend)` when there are more backends left to choose from.
-    fn next(&mut self) -> Option<&Backend>;
+    fn next(&mut self) -> Option<&Backend<Self::Metadata>>;
 }
 
 /// [SelectionAlgorithm] is the interface to implement selection algorithms.
@@ -70,7 +73,7 @@ pub type Random = Weighted<algorithms::Random>;
 /// Round robin selection on weighted backends
 pub type RoundRobin = Weighted<algorithms::RoundRobin>;
 /// Consistent Ketama hashing on weighted backends
-pub type Consistent = consistent::KetamaHashing;
+pub type Consistent<M> = consistent::KetamaHashing<M>;
 
 // TODO: least conn
 
@@ -89,6 +92,7 @@ where
 impl<I> UniqueIterator<I>
 where
     I: BackendIter,
+    I::Metadata: Clone + std::hash::Hash,
 {
     /// Wrap a new iterator and specify the maximum number of times we want to iterate.
     pub fn new(iter: I, max_iterations: usize) -> Self {
@@ -100,7 +104,7 @@ where
         }
     }
 
-    pub fn get_next(&mut self) -> Option<Backend> {
+    pub fn get_next(&mut self) -> Option<Backend<I::Metadata>> {
         while let Some(item) = self.iter.next() {
             if self.steps >= self.max_iterations {
                 return None;

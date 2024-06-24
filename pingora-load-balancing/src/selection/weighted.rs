@@ -22,17 +22,21 @@ use std::sync::Arc;
 /// Weighted selection with a given selection algorithm
 ///
 /// The default algorithm is [FnvHasher]. See [super::algorithms] for more choices.
-pub struct Weighted<H = FnvHasher> {
-    backends: Box<[Backend]>,
+pub struct Weighted<M, H = FnvHasher> {
+    backends: Box<[Backend<M>]>,
     // each item is an index to the `backends`, use u16 to save memory, support up to 2^16 backends
     weighted: Box<[u16]>,
     algorithm: H,
 }
 
-impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
-    type Iter = WeightedIterator<H>;
+impl<M, H: SelectionAlgorithm> BackendSelection for Weighted<M, H>
+where
+    M: Clone,
+{
+    type Metadata = M;
+    type Iter = WeightedIterator<M, H>;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    fn build(backends: &BTreeSet<Backend<M>>) -> Self {
         assert!(
             backends.len() <= u16::MAX as usize,
             "support up to 2^16 backends"
@@ -59,16 +63,16 @@ impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
 /// An iterator over the backends of a [Weighted] selection.
 ///
 /// See [super::BackendSelection] for more information.
-pub struct WeightedIterator<H> {
+pub struct WeightedIterator<M, H> {
     // the unbounded index seed
     index: u64,
-    backend: Arc<Weighted<H>>,
+    backend: Arc<Weighted<M, H>>,
     first: bool,
 }
 
-impl<H: SelectionAlgorithm> WeightedIterator<H> {
+impl<M, H: SelectionAlgorithm> WeightedIterator<M, H> {
     /// Constructs a new [WeightedIterator].
-    fn new(input: &[u8], backend: Arc<Weighted<H>>) -> Self {
+    fn new(input: &[u8], backend: Arc<Weighted<M, H>>) -> Self {
         Self {
             index: backend.algorithm.next(input),
             backend,
@@ -77,8 +81,10 @@ impl<H: SelectionAlgorithm> WeightedIterator<H> {
     }
 }
 
-impl<H: SelectionAlgorithm> BackendIter for WeightedIterator<H> {
-    fn next(&mut self) -> Option<&Backend> {
+impl<M, H: SelectionAlgorithm> BackendIter for WeightedIterator<M, H> {
+    type Metadata = M;
+
+    fn next(&mut self) -> Option<&Backend<M>> {
         if self.backend.backends.is_empty() {
             // short circuit if empty
             return None;

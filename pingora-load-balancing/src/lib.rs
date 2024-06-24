@@ -46,28 +46,28 @@ pub mod prelude {
 
 /// [Backend] represents a server to proxy or connect to.
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct Backend {
+pub struct Backend<M> {
     /// The address to the backend server.
     pub addr: SocketAddr,
     /// The relative weight of the server. Load balancing algorithms will
     /// proportionally distributed traffic according to this value.
     pub weight: usize,
+    /// Additional, optional metadata
+    pub metadata: M,
 }
 
-impl Backend {
+impl Backend<()> {
     /// Create a new [Backend] with `weight` 1. The function will try to parse
     ///  `addr` into a [std::net::SocketAddr].
     pub fn new(addr: &str) -> Result<Self> {
-        let addr = addr
-            .parse()
-            .or_err(ErrorType::InternalError, "invalid socket addr")?;
-        Ok(Backend {
-            addr: SocketAddr::Inet(addr),
-            weight: 1,
-        })
-        // TODO: UDS
+        Self::new_with_meta(addr, ())
     }
+}
 
+impl<M> Backend<M>
+where
+    M: Hash,
+{
     pub(crate) fn hash_key(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
@@ -75,7 +75,24 @@ impl Backend {
     }
 }
 
-impl std::ops::Deref for Backend {
+impl<M> Backend<M> {
+    /// Create a new [Backend] with `weight` 1. The function will try to parse
+    ///  `addr` into a [std::net::SocketAddr].
+    pub fn new_with_meta(addr: &str, meta: M) -> Result<Self> {
+        let addr = addr
+            .parse()
+            .or_err(ErrorType::InternalError, "invalid socket addr")?;
+
+        Ok(Backend {
+            addr: SocketAddr::Inet(addr),
+            weight: 1,
+            metadata: meta,
+        })
+        // TODO: UDS
+    }
+}
+
+impl<M> std::ops::Deref for Backend<M> {
     type Target = SocketAddr;
 
     fn deref(&self) -> &Self::Target {
@@ -83,13 +100,13 @@ impl std::ops::Deref for Backend {
     }
 }
 
-impl std::ops::DerefMut for Backend {
+impl<M> std::ops::DerefMut for Backend<M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.addr
     }
 }
 
-impl std::net::ToSocketAddrs for Backend {
+impl<M> std::net::ToSocketAddrs for Backend<M> {
     type Iter = std::iter::Once<std::net::SocketAddr>;
 
     fn to_socket_addrs(&self) -> std::io::Result<Self::Iter> {
@@ -102,18 +119,18 @@ impl std::net::ToSocketAddrs for Backend {
 /// It includes a service discovery method (static or dynamic) to discover all
 /// the available backends as well as an optional health check method to probe the liveness
 /// of each backend.
-pub struct Backends {
-    discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
-    health_check: Option<Arc<dyn health_check::HealthCheck + Send + Sync + 'static>>,
-    backends: ArcSwap<BTreeSet<Backend>>,
+pub struct Backends<M> {
+    discovery: Box<dyn ServiceDiscovery<Metadata = M> + Send + Sync + 'static>,
+    health_check: Option<Arc<dyn health_check::HealthCheck<Metadata = M> + Send + Sync + 'static>>,
+    backends: ArcSwap<BTreeSet<Backend<M>>>,
     health: ArcSwap<HashMap<u64, Health>>,
 }
 
-impl Backends {
+impl<M> Backends<M> {
     /// Create a new [Backends] with the given [ServiceDiscovery] implementation.
     ///
     /// The health check method is by default empty.
-    pub fn new(discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>) -> Self {
+    pub fn new(discovery: Box<dyn ServiceDiscovery<Metadata = M> + Send + Sync + 'static>) -> Self {
         Self {
             discovery,
             health_check: None,
@@ -125,13 +142,18 @@ impl Backends {
     /// Set the health check method. See [health_check] for the methods provided.
     pub fn set_health_check(
         &mut self,
-        hc: Box<dyn health_check::HealthCheck + Send + Sync + 'static>,
+        hc: Box<dyn health_check::HealthCheck<Metadata = M> + Send + Sync + 'static>,
     ) {
         self.health_check = Some(hc.into())
     }
+}
 
+impl<M> Backends<M>
+where
+    M: PartialEq + Hash,
+{
     /// Return true when the new is different from the current set of backends
-    fn do_update(&self, new_backends: BTreeSet<Backend>, enablement: HashMap<u64, bool>) -> bool {
+    fn do_update(&self, new_backends: BTreeSet<Backend<M>>, enablement: HashMap<u64, bool>) -> bool {
         if (**self.backends.load()) != new_backends {
             let old_health = self.health.load();
             let mut health = HashMap::with_capacity(new_backends.len());
@@ -164,13 +186,28 @@ impl Backends {
         }
     }
 
+    /// Call the service discovery method to update the collection of backends.
+    ///
+    /// Return `true` when the new collection is different from the current set of backends.
+    /// This return value is useful to tell the caller when to rebuild things that are expensive to
+    /// update, such as consistent hashing rings.
+    pub async fn update(&self) -> Result<bool> {
+        let (new_backends, enablement) = self.discovery.discover().await?;
+        Ok(self.do_update(new_backends, enablement))
+    }
+}
+
+impl<M> Backends<M>
+where
+    M: Hash,
+{
     /// Whether a certain [Backend] is ready to serve traffic.
     ///
     /// This function returns true when the backend is both healthy and enabled.
     /// This function returns true when the health check is unset but the backend is enabled.
     /// When the health check is set, this function will return false for the `backend` it
     /// doesn't know.
-    pub fn ready(&self, backend: &Backend) -> bool {
+    pub fn ready(&self, backend: &Backend<M>) -> bool {
         self.health
             .load()
             .get(&backend.hash_key())
@@ -185,28 +222,27 @@ impl Backends {
     /// to stop a backend from accepting traffic when it is still healthy.
     ///
     /// This method is noop when the given backend doesn't exist in the service discovery.
-    pub fn set_enable(&self, backend: &Backend, enabled: bool) {
+    pub fn set_enable(&self, backend: &Backend<M>, enabled: bool) {
         // this should always be Some(_) because health is always populated during update
         if let Some(h) = self.health.load().get(&backend.hash_key()) {
             h.enable(enabled)
         };
     }
+}
 
+impl<M> Backends<M> {
     /// Return the collection of the backends.
-    pub fn get_backend(&self) -> Arc<BTreeSet<Backend>> {
+    pub fn get_backend(&self) -> Arc<BTreeSet<Backend<M>>> {
         self.backends.load_full()
     }
+}
 
-    /// Call the service discovery method to update the collection of backends.
-    ///
-    /// Return `true` when the new collection is different from the current set of backends.
-    /// This return value is useful to tell the caller when to rebuild things that are expensive to
-    /// update, such as consistent hashing rings.
-    pub async fn update(&self) -> Result<bool> {
-        let (new_backends, enablement) = self.discovery.discover().await?;
-        Ok(self.do_update(new_backends, enablement))
-    }
+use core::fmt::Debug;
 
+impl<M> Backends<M>
+where
+    M: Debug + Hash + Send + Clone + Sync + 'static,
+{
     /// Run health check on all backends if it is set.
     ///
     /// When `parallel: true`, all backends are checked in parallel instead of sequentially
@@ -215,9 +251,9 @@ impl Backends {
         use log::{info, warn};
         use pingora_runtime::current_handle;
 
-        async fn check_and_report(
-            backend: &Backend,
-            check: &Arc<dyn HealthCheck + Send + Sync>,
+        async fn check_and_report<M: Debug + Hash>(
+            backend: &Backend<M>,
+            check: &Arc<dyn HealthCheck<Metadata = M> + Send + Sync>,
             health_table: &HashMap<u64, Health>,
         ) {
             let errored = check.check(backend).await.err();
@@ -247,14 +283,14 @@ impl Backends {
                 let check = health_check.clone();
                 let ht = health_table.clone();
                 runtime.spawn(async move {
-                    check_and_report(&backend, &check, &ht).await;
+                    check_and_report::<M>(&backend, &check, &ht).await;
                 })
             });
 
             futures::future::join_all(jobs).await;
         } else {
             for backend in backends.iter() {
-                check_and_report(backend, health_check, &self.health.load()).await;
+                check_and_report::<M>(backend, health_check, &self.health.load()).await;
             }
         }
     }
@@ -265,8 +301,8 @@ impl Backends {
 ///
 /// In order to run service discovery and health check at the designated frequencies, the [LoadBalancer]
 /// needs to be run as a [pingora_core::services::background::BackgroundService].
-pub struct LoadBalancer<S> {
-    backends: Backends,
+pub struct LoadBalancer<S, M> {
+    backends: Backends<M>,
     selector: ArcSwap<S>,
     /// How frequent the health check logic (if set) should run.
     ///
@@ -280,10 +316,11 @@ pub struct LoadBalancer<S> {
     pub parallel_health_check: bool,
 }
 
-impl<'a, S: BackendSelection> LoadBalancer<S>
+impl<'a, S, M> LoadBalancer<S, M>
 where
-    S: BackendSelection + 'static,
-    S::Iter: BackendIter,
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Default + Send + Sync + Hash + PartialEq + Ord + Clone + 'static,
 {
     /// Build a [LoadBalancer] with static backends created from the iter.
     ///
@@ -302,9 +339,15 @@ where
             .expect("static should not error");
         Ok(lb)
     }
+}
 
+impl<'a, S, M> LoadBalancer<S, M>
+where
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+{
     /// Build a [LoadBalancer] with the given [Backends].
-    pub fn from_backends(backends: Backends) -> Self {
+    pub fn from_backends(backends: Backends<M>) -> Self {
         let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend())));
         LoadBalancer {
             backends,
@@ -314,7 +357,14 @@ where
             parallel_health_check: false,
         }
     }
+}
 
+impl<'a, S, M> LoadBalancer<S, M>
+where
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Hash + PartialEq,
+{
     /// Run the service discovery and update the selection algorithm.
     ///
     /// This function will be called every `update_frequency` if this [LoadBalancer] instance
@@ -326,7 +376,14 @@ where
         }
         Ok(())
     }
+}
 
+impl<'a, S, M> LoadBalancer<S, M>
+where
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Hash + Clone,
+{
     /// Return the first healthy [Backend] according to the selection algorithm and the
     /// health check results.
     ///
@@ -337,7 +394,7 @@ where
     /// algorithm like Ketama hashing, the search for the next backend is linear and could take
     /// a lot steps.
     // TODO: consider remove `max_iterations` as users have no idea how to set it.
-    pub fn select(&self, key: &[u8], max_iterations: usize) -> Option<Backend> {
+    pub fn select(&self, key: &[u8], max_iterations: usize) -> Option<Backend<M>> {
         self.select_with(key, max_iterations, |_, health| health)
     }
 
@@ -348,9 +405,9 @@ where
     /// backend. The function can do things like ignoring the internal health checks or skipping this backend
     /// because it failed before. The `accept` function is called multiple times iterating over backends
     /// until it returns `true`.
-    pub fn select_with<F>(&self, key: &[u8], max_iterations: usize, accept: F) -> Option<Backend>
+    pub fn select_with<F>(&self, key: &[u8], max_iterations: usize, accept: F) -> Option<Backend<M>>
     where
-        F: Fn(&Backend, bool) -> bool,
+        F: Fn(&Backend<M>, bool) -> bool,
     {
         let selection = self.selector.load();
         let mut iter = UniqueIterator::new(selection.iter(key), max_iterations);
@@ -361,17 +418,24 @@ where
         }
         None
     }
+}
+
+impl<'a, S, M> LoadBalancer<S, M>
+where
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+{
 
     /// Set the health check method. See [health_check].
     pub fn set_health_check(
         &mut self,
-        hc: Box<dyn health_check::HealthCheck + Send + Sync + 'static>,
+        hc: Box<dyn health_check::HealthCheck<Metadata = M> + Send + Sync + 'static>,
     ) {
         self.backends.set_health_check(hc);
     }
 
     /// Access the [Backends] of this [LoadBalancer]
-    pub fn backends(&self) -> &Backends {
+    pub fn backends(&self) -> &Backends<M> {
         &self.backends
     }
 }
