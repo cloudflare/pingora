@@ -24,8 +24,8 @@ use pingora_load_balancing::{
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 
 struct Router {
-    cluster_one: Arc<LoadBalancer<RoundRobin>>,
-    cluster_two: Arc<LoadBalancer<RoundRobin>>,
+    cluster_one: Arc<LoadBalancer<RoundRobin<()>, ()>>,
+    cluster_two: Arc<LoadBalancer<RoundRobin<()>, ()>>,
 }
 
 #[async_trait]
@@ -53,12 +53,13 @@ impl ProxyHttp for Router {
     }
 }
 
-fn build_cluster_service<S>(upstreams: &[&str]) -> GenBackgroundService<LoadBalancer<S>>
+fn build_cluster_service<S, M>(upstreams: &[&str]) -> GenBackgroundService<LoadBalancer<S, M>>
 where
-    S: BackendSelection + 'static,
-    S::Iter: BackendIter,
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Clone + Default + Send + Sync + std::hash::Hash + Ord + 'static,
 {
-    let mut cluster = LoadBalancer::try_from_iter(upstreams).unwrap();
+    let mut cluster = LoadBalancer::try_from_iter_default_meta(upstreams).unwrap();
     cluster.set_health_check(TcpHealthCheck::new());
     cluster.health_check_frequency = Some(std::time::Duration::from_secs(1));
 
@@ -73,8 +74,8 @@ fn main() {
     my_server.bootstrap();
 
     // build multiple clusters
-    let cluster_one = build_cluster_service::<RoundRobin>(&["1.1.1.1:443", "127.0.0.1:343"]);
-    let cluster_two = build_cluster_service::<RoundRobin>(&["1.0.0.1:443", "127.0.0.2:343"]);
+    let cluster_one = build_cluster_service::<RoundRobin<_>, ()>(&["1.1.1.1:443", "127.0.0.1:343"]);
+    let cluster_two = build_cluster_service::<RoundRobin<_>, ()>(&["1.0.0.1:443", "127.0.0.2:343"]);
 
     let router = Router {
         cluster_one: cluster_one.task(),

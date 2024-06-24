@@ -69,7 +69,7 @@ where
 
 impl<M> Static<M>
 where
-    M: Ord + Clone
+    M: Ord + Clone,
 {
     /// Create a new boxed [Static] service discovery with the given backends.
     pub fn new(backends: BTreeSet<Backend<M>>) -> Box<Self> {

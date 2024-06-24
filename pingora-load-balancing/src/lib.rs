@@ -56,14 +56,6 @@ pub struct Backend<M> {
     pub metadata: M,
 }
 
-impl Backend<()> {
-    /// Create a new [Backend] with `weight` 1. The function will try to parse
-    ///  `addr` into a [std::net::SocketAddr].
-    pub fn new(addr: &str) -> Result<Self> {
-        Self::new_with_meta(addr, ())
-    }
-}
-
 impl<M> Backend<M>
 where
     M: Hash,
@@ -90,19 +82,21 @@ impl<M> Backend<M> {
         })
         // TODO: UDS
     }
-}
 
-impl<M> std::ops::Deref for Backend<M> {
-    type Target = SocketAddr;
-
-    fn deref(&self) -> &Self::Target {
+    pub fn addr(&self) -> &SocketAddr {
         &self.addr
     }
-}
 
-impl<M> std::ops::DerefMut for Backend<M> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    pub fn addr_mut(&mut self) -> &mut SocketAddr {
         &mut self.addr
+    }
+
+    pub fn metadata(&self) -> &M {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut M {
+        &mut self.metadata
     }
 }
 
@@ -153,7 +147,11 @@ where
     M: PartialEq + Hash,
 {
     /// Return true when the new is different from the current set of backends
-    fn do_update(&self, new_backends: BTreeSet<Backend<M>>, enablement: HashMap<u64, bool>) -> bool {
+    fn do_update(
+        &self,
+        new_backends: BTreeSet<Backend<M>>,
+        enablement: HashMap<u64, bool>,
+    ) -> bool {
         if (**self.backends.load()) != new_backends {
             let old_health = self.health.load();
             let mut health = HashMap::with_capacity(new_backends.len());
@@ -326,7 +324,7 @@ where
     ///
     /// Note: [ToSocketAddrs] will invoke blocking network IO for DNS lookup if
     /// the input cannot be directly parsed as [SocketAddr].
-    pub fn try_from_iter<A, T: IntoIterator<Item = A>>(iter: T) -> IoResult<Self>
+    pub fn try_from_iter_default_meta<A, T: IntoIterator<Item = A>>(iter: T) -> IoResult<Self>
     where
         A: ToSocketAddrs,
     {
@@ -426,7 +424,6 @@ where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
 {
-
     /// Set the health check method. See [health_check].
     pub fn set_health_check(
         &mut self,
@@ -451,7 +448,7 @@ mod test {
     #[tokio::test]
     async fn test_static_backends() {
         let backends: LoadBalancer<selection::RoundRobin<_>, _> =
-            LoadBalancer::try_from_iter(["1.1.1.1:80", "1.0.0.1:80"]).unwrap();
+            LoadBalancer::try_from_iter_default_meta(["1.1.1.1:80", "1.0.0.1:80"]).unwrap();
 
         let backend1 = Backend::new_with_meta("1.1.1.1:80", u32::default()).unwrap();
         let backend2 = Backend::new_with_meta("1.0.0.1:80", u32::default()).unwrap();
@@ -463,11 +460,11 @@ mod test {
     #[tokio::test]
     async fn test_backends() {
         let discovery = discovery::Static::default();
-        let good1 = Backend::new("1.1.1.1:80").unwrap();
+        let good1 = Backend::new_with_meta("1.1.1.1:80", 101u32).unwrap();
         discovery.add(good1.clone());
-        let good2 = Backend::new("1.0.0.1:80").unwrap();
+        let good2 = Backend::new_with_meta("1.0.0.1:80", 102u32).unwrap();
         discovery.add(good2.clone());
-        let bad = Backend::new("127.0.0.1:79").unwrap();
+        let bad = Backend::new_with_meta("127.0.0.1:79", 404u32).unwrap();
         discovery.add(bad.clone());
 
         let mut backends = Backends::new(Box::new(discovery));
@@ -501,7 +498,9 @@ mod test {
         impl ServiceDiscovery for TestDiscovery {
             type Metadata = TestMetadata;
 
-            async fn discover(&self) -> Result<(BTreeSet<Backend<TestMetadata>>, HashMap<u64, bool>)> {
+            async fn discover(
+                &self,
+            ) -> Result<(BTreeSet<Backend<TestMetadata>>, HashMap<u64, bool>)> {
                 let bad = Backend::new_with_meta("127.0.0.1:79", 3u32).unwrap();
                 let (backends, mut readiness) = self.0.discover().await?;
                 readiness.insert(bad.hash_key(), false);
@@ -533,11 +532,11 @@ mod test {
     #[tokio::test]
     async fn test_parallel_health_check() {
         let discovery = discovery::Static::default();
-        let good1 = Backend::new("1.1.1.1:80").unwrap();
+        let good1 = Backend::new_with_meta("1.1.1.1:80", 100u32).unwrap();
         discovery.add(good1.clone());
-        let good2 = Backend::new("1.0.0.1:80").unwrap();
+        let good2 = Backend::new_with_meta("1.0.0.1:80", 200u32).unwrap();
         discovery.add(good2.clone());
-        let bad = Backend::new("127.0.0.1:79").unwrap();
+        let bad = Backend::new_with_meta("127.0.0.1:79", 404u32).unwrap();
         discovery.add(bad.clone());
 
         let mut backends = Backends::new(Box::new(discovery));

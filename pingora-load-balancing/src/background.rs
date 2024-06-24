@@ -14,7 +14,10 @@
 
 //! Implement [BackgroundService] for [LoadBalancer]
 
-use std::{hash::Hash, time::{Duration, Instant}};
+use std::{
+    hash::Hash,
+    time::{Duration, Instant},
+};
 
 use super::{BackendIter, BackendSelection, LoadBalancer};
 use async_trait::async_trait;

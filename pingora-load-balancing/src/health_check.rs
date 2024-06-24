@@ -89,7 +89,6 @@ where
 }
 
 impl<M> TcpHealthCheck<M> {
-
     /// Create a new [TcpHealthCheck] that tries to establish a TLS connection.
     ///
     /// The default values are the same as [Self::new()].
