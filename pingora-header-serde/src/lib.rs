@@ -131,7 +131,7 @@ fn resp_header_to_buf(resp: &ResponseHeader, buf: &mut Vec<u8>) -> usize {
 }
 
 // Should match pingora http1 setting
-const MAX_HEADERS: usize = 160;
+const MAX_HEADERS: usize = 256;
 
 #[inline]
 fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
