@@ -546,6 +546,11 @@ impl<SV> HttpProxy<SV> {
         // affected by the request_body_filter
         let end_of_body = end_of_body || data.is_none();
 
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
+
         self.inner
             .request_body_filter(session, &mut data, end_of_body, ctx)
             .await?;
