@@ -227,6 +227,15 @@ impl ServerConf {
     }
 }
 
+/// Create an instance of Opt by parsing the current command-line args.
+/// This is equivalent to running `Opt::parse` but does not require the
+/// caller to have included the `clap::Parser`
+impl Opt {
+    pub fn parse_args() -> Self {
+        Opt::parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
