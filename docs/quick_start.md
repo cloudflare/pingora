@@ -237,7 +237,7 @@ take advantage of with single-line change.
 
 ```rust
 fn main() {
-    let mut my_server = Server::new(Some(Opt::default())).unwrap();
+    let mut my_server = Server::new(Some(Opt::parse_args())).unwrap();
     ...
 }
 ```
