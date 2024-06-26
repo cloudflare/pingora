@@ -27,7 +27,7 @@ use openssl_sys::{
 use std::ffi::CString;
 use std::os::raw;
 
-fn cvt(r: c_int) -> Result<c_int, ErrorStack> {
+fn cvt(r: c_long) -> Result<c_long, ErrorStack> {
     if r != 1 {
         Err(ErrorStack::get())
     } else {
@@ -42,8 +42,8 @@ extern "C" {
         namelen: size_t,
     ) -> c_int;
 
-    pub fn SSL_use_certificate(ssl: *const SSL, cert: *mut X509) -> c_int;
-    pub fn SSL_use_PrivateKey(ctx: *const SSL, key: *mut EVP_PKEY) -> c_int;
+    pub fn SSL_use_certificate(ssl: *mut SSL, cert: *mut X509) -> c_int;
+    pub fn SSL_use_PrivateKey(ssl: *mut SSL, key: *mut EVP_PKEY) -> c_int;
 
     pub fn SSL_set_cert_cb(
         ssl: *mut SSL,
@@ -64,9 +64,9 @@ pub fn add_host(verify_param: &mut X509VerifyParamRef, host: &str) -> Result<(),
     unsafe {
         cvt(X509_VERIFY_PARAM_add1_host(
             verify_param.as_ptr(),
-            host.as_ptr() as *const _,
+            host.as_ptr() as *const c_char,
             host.len(),
-        ))
+        ) as c_long)
         .map(|_| ())
     }
 }
@@ -84,7 +84,7 @@ pub fn ssl_set_verify_cert_store(
             SSL_CTRL_SET_VERIFY_CERT_STORE,
             1, // increase the ref count of X509Store so that ssl_ctx can outlive X509StoreRef
             cert_store.as_ptr() as *mut c_void,
-        ) as i32)?;
+        ))?;
     }
     Ok(())
 }
@@ -94,7 +94,7 @@ pub fn ssl_set_verify_cert_store(
 /// See [SSL_use_certificate](https://www.openssl.org/docs/man1.1.1/man3/SSL_use_certificate.html).
 pub fn ssl_use_certificate(ssl: &mut SslRef, cert: &X509Ref) -> Result<(), ErrorStack> {
     unsafe {
-        cvt(SSL_use_certificate(ssl.as_ptr(), cert.as_ptr()))?;
+        cvt(SSL_use_certificate(ssl.as_ptr() as *mut SSL, cert.as_ptr() as *mut X509) as c_long)?;
     }
     Ok(())
 }
@@ -107,7 +107,7 @@ where
     T: HasPrivate,
 {
     unsafe {
-        cvt(SSL_use_PrivateKey(ssl.as_ptr(), key.as_ptr()))?;
+        cvt(SSL_use_PrivateKey(ssl.as_ptr() as *mut SSL, key.as_ptr() as *mut EVP_PKEY) as c_long)?;
     }
     Ok(())
 }
@@ -123,7 +123,7 @@ pub fn ssl_add_chain_cert(ssl: &mut SslRef, cert: &X509Ref) -> Result<(), ErrorS
             SSL_CTRL_CHAIN_CERT,
             1, // increase the ref count of X509 so that ssl can outlive X509StoreRef
             cert.as_ptr() as *mut c_void,
-        ) as i32)?;
+        ))?;
     }
     Ok(())
 }
@@ -137,14 +137,17 @@ pub fn ssl_set_renegotiate_mode_freely(_ssl: &mut SslRef) {}
 ///
 /// See [set_groups_list](https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set1_curves.html).
 pub fn ssl_set_groups_list(ssl: &mut SslRef, groups: &str) -> Result<(), ErrorStack> {
-    let groups = CString::new(groups).unwrap();
+    if groups.contains('\0') {
+        return Err(ErrorStack::get());
+    }
+    let groups = CString::new(groups).map_err(|_| ErrorStack::get())?;
     unsafe {
         cvt(SSL_ctrl(
             ssl.as_ptr(),
             SSL_CTRL_SET_GROUPS_LIST,
             0,
             groups.as_ptr() as *mut c_void,
-        ) as i32)?;
+        ))?;
     }
     Ok(())
 }
@@ -206,4 +209,23 @@ pub fn is_suspended_for_cert(error: &openssl::ssl::Error) -> bool {
 /// the caller needs to make sure that they hold a &mut SslStream (or other types of mutable ref to the Ssl)
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
     SslRef::from_ptr_mut(ssl.as_ptr())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::ssl::{SslContextBuilder, SslMethod};
+
+    #[test]
+    fn test_ssl_set_groups_list() {
+        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        let ssl = Ssl::new(&ctx_builder.build()).unwrap();
+        let ssl_ref = unsafe { ssl_mut(&ssl) };
+
+        // Valid input
+        assert!(ssl_set_groups_list(ssl_ref, "P-256:P-384").is_ok());
+
+        // Invalid input (contains null byte)
+        assert!(ssl_set_groups_list(ssl_ref, "P-256\0P-384").is_err());
+    }
 }
