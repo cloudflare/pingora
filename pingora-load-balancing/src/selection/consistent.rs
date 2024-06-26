@@ -33,7 +33,7 @@ where
     type Iter = OwnedNodeIterator<M>;
     type Metadata = M;
 
-    fn build(backends: &BTreeSet<Backend<M>>) -> Self {
+    fn build(backends: &HashSet<Backend<M>>) -> Self {
         let buckets: Vec<_> = backends
             .iter()
             .filter_map(|b| {
@@ -88,7 +88,7 @@ mod test {
         let b1 = Backend::new_with_meta("1.1.1.1:80", 200u32).unwrap();
         let b2 = Backend::new_with_meta("1.0.0.1:80", 300u32).unwrap();
         let b3 = Backend::new_with_meta("1.0.0.255:80", 400u32).unwrap();
-        let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
+        let backends = HashSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
         let hash = Arc::new(KetamaHashing::build(&backends));
 
         let mut iter = hash.iter(b"test0");
@@ -113,7 +113,7 @@ mod test {
         assert_eq!(iter.next(), Some(&b2));
 
         // remove b3
-        let backends = BTreeSet::from_iter([b1.clone(), b2.clone()]);
+        let backends = HashSet::from_iter([b1.clone(), b2.clone()]);
         let hash = Arc::new(KetamaHashing::build(&backends));
         let mut iter = hash.iter(b"test0");
         assert_eq!(iter.next(), Some(&b2));

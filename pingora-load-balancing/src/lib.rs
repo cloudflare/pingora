@@ -21,7 +21,7 @@ use futures::FutureExt;
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::Result as IoResult;
 use std::net::ToSocketAddrs;
@@ -116,7 +116,7 @@ impl<M> std::net::ToSocketAddrs for Backend<M> {
 pub struct Backends<M> {
     discovery: Box<dyn ServiceDiscovery<Metadata = M> + Send + Sync + 'static>,
     health_check: Option<Arc<dyn health_check::HealthCheck<Metadata = M> + Send + Sync + 'static>>,
-    backends: ArcSwap<BTreeSet<Backend<M>>>,
+    backends: ArcSwap<HashSet<Backend<M>>>,
     health: ArcSwap<HashMap<u64, Health>>,
 }
 
@@ -144,12 +144,12 @@ impl<M> Backends<M> {
 
 impl<M> Backends<M>
 where
-    M: PartialEq + Hash,
+    M: Eq + Hash,
 {
     /// Return true when the new is different from the current set of backends
     fn do_update(
         &self,
-        new_backends: BTreeSet<Backend<M>>,
+        new_backends: HashSet<Backend<M>>,
         enablement: HashMap<u64, bool>,
     ) -> bool {
         if (**self.backends.load()) != new_backends {
@@ -230,7 +230,7 @@ where
 
 impl<M> Backends<M> {
     /// Return the collection of the backends.
-    pub fn get_backend(&self) -> Arc<BTreeSet<Backend<M>>> {
+    pub fn get_backend(&self) -> Arc<HashSet<Backend<M>>> {
         self.backends.load_full()
     }
 }
@@ -318,13 +318,41 @@ impl<S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
-    M: Default + Send + Sync + Hash + PartialEq + Ord + Clone + 'static,
+    M: Default + Send + Sync + Hash + Eq + Clone + 'static,
 {
     /// Build a [LoadBalancer] with static backends created from the iter.
     ///
     /// Note: [ToSocketAddrs] will invoke blocking network IO for DNS lookup if
     /// the input cannot be directly parsed as [SocketAddr].
     pub fn try_from_iter_default_meta<A, T: IntoIterator<Item = A>>(iter: T) -> IoResult<Self>
+    where
+        A: ToSocketAddrs,
+    {
+        let iter = iter.into_iter().map(|a| {
+            (a, M::default())
+        });
+        let discovery = discovery::Static::<M>::try_from_iter(iter)?;
+        let backends = Backends::<M>::new(discovery);
+        let lb = Self::from_backends(backends);
+        lb.update()
+            .now_or_never()
+            .expect("static should not block")
+            .expect("static should not error");
+        Ok(lb)
+    }
+}
+
+impl<S, M> LoadBalancer<S, M>
+where
+    S: BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Send + Sync + Hash + Eq + Clone + 'static,
+{
+    /// Build a [LoadBalancer] with static backends created from the iter.
+    ///
+    /// Note: [ToSocketAddrs] will invoke blocking network IO for DNS lookup if
+    /// the input cannot be directly parsed as [SocketAddr].
+    pub fn try_from_iter<A, T: IntoIterator<Item = (A, M)>>(iter: T) -> IoResult<Self>
     where
         A: ToSocketAddrs,
     {
@@ -362,7 +390,7 @@ impl<'a, S, M> LoadBalancer<S, M>
 where
     S: BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
-    M: Hash + PartialEq,
+    M: Hash + Eq,
 {
     /// Run the service discovery and update the selection algorithm.
     ///
@@ -500,7 +528,7 @@ mod test {
 
             async fn discover(
                 &self,
-            ) -> Result<(BTreeSet<Backend<TestMetadata>>, HashMap<u64, bool>)> {
+            ) -> Result<(HashSet<Backend<TestMetadata>>, HashMap<u64, bool>)> {
                 let bad = Backend::new_with_meta("127.0.0.1:79", 3u32).unwrap();
                 let (backends, mut readiness) = self.0.discover().await?;
                 readiness.insert(bad.hash_key(), false);

@@ -19,7 +19,7 @@ pub mod consistent;
 pub mod weighted;
 
 use super::Backend;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use weighted::Weighted;
 
@@ -30,7 +30,7 @@ pub trait BackendSelection {
     /// The metadata associated with the Backend
     type Metadata;
     /// The function to create a [BackendSelection] implementation.
-    fn build(backends: &BTreeSet<Backend<Self::Metadata>>) -> Self;
+    fn build(backends: &HashSet<Backend<Self::Metadata>>) -> Self;
     /// Select backends for a given key.
     ///
     /// An [BackendIter] should be returned. The first item in the iter is the first

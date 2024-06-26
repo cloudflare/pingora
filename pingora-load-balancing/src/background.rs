@@ -28,7 +28,7 @@ impl<S, M> BackgroundService for LoadBalancer<S, M>
 where
     S: Send + Sync + BackendSelection<Metadata = M> + 'static,
     S::Iter: BackendIter<Metadata = M>,
-    M: Hash + PartialEq + Clone + core::fmt::Debug + Send + Sync + 'static,
+    M: Hash + Eq + Clone + core::fmt::Debug + Send + Sync + 'static,
 {
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
         // 136 years
