@@ -19,7 +19,6 @@ use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
 };
-use std::{collections::BTreeMap, ops::Deref};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr as InetSocketAddr, ToSocketAddrs as ToInetSocketAddrs};
@@ -28,6 +27,7 @@ use std::os::unix::prelude::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::BTreeMap, ops::Deref};
 
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
@@ -68,9 +68,7 @@ impl PartialEq for Tracer {
     }
 }
 
-impl Eq for Tracer {
-
-}
+impl Eq for Tracer {}
 
 /// [`Peer`] defines the interface to communicate with the [`crate::connectors`] regarding where to
 /// connect to and how to connect to it.

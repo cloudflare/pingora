@@ -21,7 +21,7 @@ use futures::FutureExt;
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::Result as IoResult;
 use std::net::ToSocketAddrs;
@@ -147,11 +147,7 @@ where
     M: Eq + Hash,
 {
     /// Return true when the new is different from the current set of backends
-    fn do_update(
-        &self,
-        new_backends: HashSet<Backend<M>>,
-        enablement: HashMap<u64, bool>,
-    ) -> bool {
+    fn do_update(&self, new_backends: HashSet<Backend<M>>, enablement: HashMap<u64, bool>) -> bool {
         if (**self.backends.load()) != new_backends {
             let old_health = self.health.load();
             let mut health = HashMap::with_capacity(new_backends.len());
@@ -328,9 +324,7 @@ where
     where
         A: ToSocketAddrs,
     {
-        let iter = iter.into_iter().map(|a| {
-            (a, M::default())
-        });
+        let iter = iter.into_iter().map(|a| (a, M::default()));
         let discovery = discovery::Static::<M>::try_from_iter(iter)?;
         let backends = Backends::<M>::new(discovery);
         let lb = Self::from_backends(backends);

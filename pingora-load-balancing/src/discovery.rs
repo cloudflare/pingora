@@ -22,7 +22,7 @@ use std::hash::Hash;
 use std::io::Result as IoResult;
 use std::net::ToSocketAddrs;
 use std::{
-    collections::{HashSet, HashMap},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
