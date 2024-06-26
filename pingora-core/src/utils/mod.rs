@@ -156,6 +156,16 @@ pub struct CertKey {
     key: PKey<Private>,
 }
 
+impl PartialEq for CertKey {
+    fn eq(&self, other: &Self) -> bool {
+        // Use destructuring to make sure that we update this for new fields
+        let CertKey { certificates, key } = self;
+        certificates.eq(&other.certificates) && key.public_eq(&other.key)
+    }
+}
+
+impl Eq for CertKey {}
+
 impl CertKey {
     /// Create a new `CertKey` given a list of certificates and a private key.
     pub fn new(certificates: Vec<X509>, key: PKey<Private>) -> CertKey {

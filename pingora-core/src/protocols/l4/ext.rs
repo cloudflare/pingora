@@ -356,7 +356,7 @@ fn wrap_os_connect_error(e: std::io::Error, context: String) -> Box<Error> {
 }
 
 /// The configuration for TCP keepalive
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpKeepalive {
     /// The time a connection needs to be idle before TCP begins sending out keep-alive probes.
     pub idle: Duration,

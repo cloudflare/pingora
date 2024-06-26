@@ -178,7 +178,7 @@ impl<T> Ssl for SslStream<T> {
 }
 
 /// The protocol for Application-Layer Protocol Negotiation
-#[derive(Hash, Clone, Debug)]
+#[derive(Hash, Clone, Debug, PartialEq, Eq)]
 pub enum ALPN {
     /// Prefer HTTP/1.1 only
     H1,
