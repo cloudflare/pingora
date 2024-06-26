@@ -121,7 +121,7 @@ pub fn ssl_add_chain_cert(ssl: &mut SslRef, cert: &X509Ref) -> Result<(), ErrorS
         cvt(SSL_ctrl(
             ssl.as_ptr(),
             SSL_CTRL_CHAIN_CERT,
-            0,
+            1, // increase the ref count of X509 so that ssl can outlive X509StoreRef
             cert.as_ptr() as *mut c_void,
         ))?;
     }
