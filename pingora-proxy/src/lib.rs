@@ -230,7 +230,8 @@ impl<SV> HttpProxy<SV> {
                     }),
                 )
             }
-            Err(e) => {
+            Err(mut e) => {
+                e.as_up();
                 let new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
                 (false, Some(new_err.into_up()))
             }
