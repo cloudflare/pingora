@@ -231,10 +231,10 @@ impl ConnFdReusable for Path {
             Ok(peer) => match UnixAddr::new(self) {
                 Ok(addr) => {
                     if addr == peer {
-                        debug!("Unix FD to: {peer:?} is reusable");
+                        debug!("Unix FD to: {peer} is reusable");
                         true
                     } else {
-                        error!("Crit: unix FD mismatch: fd: {fd:?}, peer: {peer:?}, addr: {addr}",);
+                        error!("Crit: unix FD mismatch: fd: {fd:?}, peer: {peer}, addr: {addr}",);
                         false
                     }
                 }
@@ -258,10 +258,10 @@ impl ConnFdReusable for InetSocketAddr {
             Ok(peer) => {
                 let addr = SockaddrStorage::from(*self);
                 if addr == peer {
-                    debug!("Inet FD to: {peer:?} is reusable");
+                    debug!("Inet FD to: {addr} is reusable");
                     true
                 } else {
-                    error!("Crit: FD mismatch: fd: {fd:?}, addr: {addr:?}, peer: {peer:?}",);
+                    error!("Crit: FD mismatch: fd: {fd:?}, addr: {addr}, peer: {peer}",);
                     false
                 }
             }
