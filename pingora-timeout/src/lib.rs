@@ -39,7 +39,6 @@ pub mod timer;
 pub use fast_timeout::fast_sleep as sleep;
 pub use fast_timeout::fast_timeout as timeout;
 
-use futures::future::BoxFuture;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
@@ -50,7 +49,7 @@ use tokio::time::{sleep as tokio_sleep, Duration};
 ///
 /// Users don't need to interact with this trait
 pub trait ToTimeout {
-    fn timeout(&self) -> BoxFuture<'static, ()>;
+    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
     fn create(d: Duration) -> Self;
 }
 
@@ -60,7 +59,7 @@ pub trait ToTimeout {
 pub struct TokioTimeout(Duration);
 
 impl ToTimeout for TokioTimeout {
-    fn timeout(&self) -> BoxFuture<'static, ()> {
+    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
         Box::pin(tokio_sleep(self.0))
     }
 
@@ -100,7 +99,7 @@ pin_project! {
         #[pin]
         value: T,
         #[pin]
-        delay: Option<BoxFuture<'static, ()>>,
+        delay: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
         callback: F, // callback to create the timer
     }
 }
