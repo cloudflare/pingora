@@ -24,7 +24,6 @@ tokio = { workspace = true, features = [
     "sync",
 ] }
 pin-project-lite = "0.2"
-futures = "0.3"
 once_cell = { workspace = true }
 parking_lot = "0.12"
 thread_local = "1.0"
