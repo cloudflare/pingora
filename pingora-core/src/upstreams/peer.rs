@@ -403,6 +403,9 @@ pub struct HttpPeer {
     pub sni: String,
     pub proxy: Option<Proxy>,
     pub client_cert_key: Option<Arc<CertKey>>,
+    /// a custom field to isolate connection reuse. Requests with different group keys
+    /// cannot share connections with each other.
+    pub group_key: u64,
     pub options: PeerOptions,
 }
 
@@ -422,6 +425,7 @@ impl HttpPeer {
             sni,
             proxy: None,
             client_cert_key: None,
+            group_key: 0,
             options: PeerOptions::new(),
         }
     }
@@ -462,6 +466,7 @@ impl HttpPeer {
                 headers,
             }),
             client_cert_key: None,
+            group_key: 0,
             options: PeerOptions::new(),
         }
     }
@@ -485,6 +490,7 @@ impl Hash for HttpPeer {
         self.verify_cert().hash(state);
         self.verify_hostname().hash(state);
         self.alternative_cn().hash(state);
+        self.group_key.hash(state);
     }
 }
 
