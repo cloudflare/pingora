@@ -32,7 +32,7 @@ pub struct Weighted<H = FnvHasher> {
 impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
     type Iter = WeightedIterator<H>;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    fn build(backends: &BTreeSet<Backend>, _previous: Option<Arc<Self>>) -> Self {
         assert!(
             backends.len() <= u16::MAX as usize,
             "support up to 2^16 backends"
@@ -113,7 +113,7 @@ mod test {
         b2.weight = 10; // 10x than the rest
         let b3 = Backend::new("1.0.0.255:80").unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted> = Arc::new(Weighted::build(&backends, None));
 
         // same hash iter over
         let mut iter = hash.iter(b"test");
@@ -155,7 +155,7 @@ mod test {
         b2.weight = 8; // 8x than the rest
         let b3 = Backend::new("1.0.0.255:80").unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted<RoundRobin>> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted<RoundRobin>> = Arc::new(Weighted::build(&backends, None));
 
         // same hash iter over
         let mut iter = hash.iter(b"test");
@@ -191,7 +191,7 @@ mod test {
         b2.weight = 8; // 8x than the rest
         let b3 = Backend::new("1.0.0.255:80").unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted<Random>> = Arc::new(Weighted::build(&backends));
+        let hash: Arc<Weighted<Random>> = Arc::new(Weighted::build(&backends, None));
 
         let mut count = HashMap::new();
         count.insert(b1.clone(), 0);

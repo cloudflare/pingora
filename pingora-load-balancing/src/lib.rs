@@ -35,8 +35,8 @@ pub mod selection;
 
 use discovery::ServiceDiscovery;
 use health_check::Health;
+use selection::BackendSelection;
 use selection::UniqueIterator;
-use selection::{BackendIter, BackendSelection};
 
 pub mod prelude {
     pub use crate::health_check::TcpHealthCheck;
@@ -267,7 +267,8 @@ impl Backends {
 /// needs to be run as a [pingora_core::services::background::BackgroundService].
 pub struct LoadBalancer<S> {
     backends: Backends,
-    selector: ArcSwap<S>,
+    /// Backend selection mechanism
+    pub selector: ArcSwap<S>,
     /// How frequent the health check logic (if set) should run.
     ///
     /// If `None`, the health check logic will only run once at the beginning.
@@ -283,7 +284,6 @@ pub struct LoadBalancer<S> {
 impl<'a, S: BackendSelection> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
-    S::Iter: BackendIter,
 {
     /// Build a [LoadBalancer] with static backends created from the iter.
     ///
@@ -305,7 +305,7 @@ where
 
     /// Build a [LoadBalancer] with the given [Backends].
     pub fn from_backends(backends: Backends) -> Self {
-        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend())));
+        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend(), None)));
         LoadBalancer {
             backends,
             selector,
@@ -321,8 +321,10 @@ where
     /// is running as a background service.
     pub async fn update(&self) -> Result<()> {
         if self.backends.update().await? {
-            self.selector
-                .store(Arc::new(S::build(&self.backends.get_backend())))
+            self.selector.store(Arc::new(S::build(
+                &self.backends.get_backend(),
+                Some(self.selector.load_full()),
+            )))
         }
         Ok(())
     }

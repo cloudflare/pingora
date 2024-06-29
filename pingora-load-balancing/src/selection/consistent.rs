@@ -29,7 +29,7 @@ pub struct KetamaHashing {
 impl BackendSelection for KetamaHashing {
     type Iter = OwnedNodeIterator;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    fn build(backends: &BTreeSet<Backend>, _previous: Option<Arc<Self>>) -> Self {
         let buckets: Vec<_> = backends
             .iter()
             .filter_map(|b| {
@@ -84,7 +84,7 @@ mod test {
         let b2 = Backend::new("1.0.0.1:80").unwrap();
         let b3 = Backend::new("1.0.0.255:80").unwrap();
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash = Arc::new(KetamaHashing::build(&backends));
+        let hash = Arc::new(KetamaHashing::build(&backends, None));
 
         let mut iter = hash.iter(b"test0");
         assert_eq!(iter.next(), Some(&b2));
@@ -109,7 +109,7 @@ mod test {
 
         // remove b3
         let backends = BTreeSet::from_iter([b1.clone(), b2.clone()]);
-        let hash = Arc::new(KetamaHashing::build(&backends));
+        let hash = Arc::new(KetamaHashing::build(&backends, None));
         let mut iter = hash.iter(b"test0");
         assert_eq!(iter.next(), Some(&b2));
         let mut iter = hash.iter(b"test1");
