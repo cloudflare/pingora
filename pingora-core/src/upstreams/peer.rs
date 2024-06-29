@@ -19,7 +19,6 @@ use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
 };
-use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr as InetSocketAddr, ToSocketAddrs as ToInetSocketAddrs};
@@ -28,6 +27,7 @@ use std::os::unix::prelude::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::BTreeMap, ops::Deref};
 
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
@@ -56,6 +56,19 @@ impl Clone for Tracer {
         Tracer(self.0.boxed_clone())
     }
 }
+
+impl PartialEq for Tracer {
+    fn eq(&self, other: &Self) -> bool {
+        // This is a VERY simple check for "pointer equality". We could also require that
+        // Tracer have an Eq/PartialEq implementation as part of the supertrait, however
+        // currently this is only provided to allow HttpPeer to be Eq.
+        let a: *const dyn Tracing = self.0.deref();
+        let b: *const dyn Tracing = other.0.deref();
+        core::ptr::addr_eq(a, b)
+    }
+}
+
+impl Eq for Tracer {}
 
 /// [`Peer`] defines the interface to communicate with the [`crate::connectors`] regarding where to
 /// connect to and how to connect to it.
@@ -257,7 +270,7 @@ impl Peer for BasicPeer {
 }
 
 /// Define whether to connect via http or https
-#[derive(Hash, Clone, Debug, PartialEq)]
+#[derive(Hash, Clone, Debug, PartialEq, Eq)]
 pub enum Scheme {
     HTTP,
     HTTPS,
@@ -285,7 +298,7 @@ impl Scheme {
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerOptions {
     pub bind_to: Option<InetSocketAddr>,
     pub connection_timeout: Option<Duration>,
@@ -396,7 +409,7 @@ impl Display for PeerOptions {
 }
 
 /// A peer representing the remote HTTP server to connect to
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HttpPeer {
     pub _address: SocketAddr,
     pub scheme: Scheme,
@@ -552,7 +565,7 @@ impl Peer for HttpPeer {
 }
 
 /// The proxy settings to connect to the remote server, CONNECT only for now
-#[derive(Debug, Hash, Clone)]
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub struct Proxy {
     pub next_hop: Box<Path>, // for now this will be the path to the UDS
     pub host: String,        // the proxied host. Could be either IP addr or hostname.

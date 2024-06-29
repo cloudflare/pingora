@@ -20,16 +20,20 @@ use pingora_ketama::{Bucket, Continuum};
 use std::collections::HashMap;
 
 /// Weighted Ketama consistent hashing
-pub struct KetamaHashing {
+pub struct KetamaHashing<M> {
     ring: Continuum,
     // TODO: update Ketama to just store this
-    backends: HashMap<SocketAddr, Backend>,
+    backends: HashMap<SocketAddr, Backend<M>>,
 }
 
-impl BackendSelection for KetamaHashing {
-    type Iter = OwnedNodeIterator;
+impl<M> BackendSelection for KetamaHashing<M>
+where
+    M: Clone,
+{
+    type Iter = OwnedNodeIterator<M>;
+    type Metadata = M;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    fn build(backends: &HashSet<Backend<M>>) -> Self {
         let buckets: Vec<_> = backends
             .iter()
             .filter_map(|b| {
@@ -60,13 +64,14 @@ impl BackendSelection for KetamaHashing {
 }
 
 /// Iterator over a Continuum
-pub struct OwnedNodeIterator {
+pub struct OwnedNodeIterator<M> {
     idx: usize,
-    ring: Arc<KetamaHashing>,
+    ring: Arc<KetamaHashing<M>>,
 }
 
-impl BackendIter for OwnedNodeIterator {
-    fn next(&mut self) -> Option<&Backend> {
+impl<M> BackendIter for OwnedNodeIterator<M> {
+    type Metadata = M;
+    fn next(&mut self) -> Option<&Backend<M>> {
         self.ring.ring.get_addr(&mut self.idx).and_then(|addr| {
             let addr = SocketAddr::Inet(*addr);
             self.ring.backends.get(&addr)
@@ -80,10 +85,10 @@ mod test {
 
     #[test]
     fn test_ketama() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let b2 = Backend::new("1.0.0.1:80").unwrap();
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
-        let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
+        let b1 = Backend::new_with_meta("1.1.1.1:80", 200u32).unwrap();
+        let b2 = Backend::new_with_meta("1.0.0.1:80", 300u32).unwrap();
+        let b3 = Backend::new_with_meta("1.0.0.255:80", 400u32).unwrap();
+        let backends = HashSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
         let hash = Arc::new(KetamaHashing::build(&backends));
 
         let mut iter = hash.iter(b"test0");
@@ -108,7 +113,7 @@ mod test {
         assert_eq!(iter.next(), Some(&b2));
 
         // remove b3
-        let backends = BTreeSet::from_iter([b1.clone(), b2.clone()]);
+        let backends = HashSet::from_iter([b1.clone(), b2.clone()]);
         let hash = Arc::new(KetamaHashing::build(&backends));
         let mut iter = hash.iter(b"test0");
         assert_eq!(iter.next(), Some(&b2));

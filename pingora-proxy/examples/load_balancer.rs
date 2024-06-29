@@ -25,7 +25,7 @@ use pingora_core::Result;
 use pingora_load_balancing::{health_check, selection::RoundRobin, LoadBalancer};
 use pingora_proxy::{ProxyHttp, Session};
 
-pub struct LB(Arc<LoadBalancer<RoundRobin>>);
+pub struct LB(Arc<LoadBalancer<RoundRobin<()>, ()>>);
 
 #[async_trait]
 impl ProxyHttp for LB {
@@ -68,7 +68,8 @@ fn main() {
 
     // 127.0.0.1:343" is just a bad server
     let mut upstreams =
-        LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443", "127.0.0.1:343"]).unwrap();
+        LoadBalancer::try_from_iter_default_meta(["1.1.1.1:443", "1.0.0.1:443", "127.0.0.1:343"])
+            .unwrap();
 
     // We add health check in the background so that the bad server is never selected.
     let hc = health_check::TcpHealthCheck::new();

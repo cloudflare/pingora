@@ -21,16 +21,18 @@ use pingora_core::connectors::{http::Connector as HttpConnector, TransportConnec
 use pingora_core::upstreams::peer::{BasicPeer, HttpPeer, Peer};
 use pingora_error::{Error, ErrorType::CustomCode, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// [HealthCheck] is the interface to implement health check for backends
 #[async_trait]
 pub trait HealthCheck {
+    type Metadata;
     /// Check the given backend.
     ///
     /// `Ok(())`` if the check passes, otherwise the check fails.
-    async fn check(&self, target: &Backend) -> Result<()>;
+    async fn check(&self, target: &Backend<Self::Metadata>) -> Result<()>;
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
@@ -41,7 +43,7 @@ pub trait HealthCheck {
 /// TCP health check
 ///
 /// This health check checks if a TCP (or TLS) connection can be established to a given backend.
-pub struct TcpHealthCheck {
+pub struct TcpHealthCheck<M> {
     /// Number of successful checks to flip from unhealthy to healthy.
     pub consecutive_success: usize,
     /// Number of failed checks to flip from healthy to unhealthy.
@@ -56,9 +58,10 @@ pub struct TcpHealthCheck {
     /// set, it will also try to establish a TLS connection on top of the TCP connection.
     pub peer_template: BasicPeer,
     connector: TransportConnector,
+    pd: PhantomData<M>,
 }
 
-impl Default for TcpHealthCheck {
+impl<M> Default for TcpHealthCheck<M> {
     fn default() -> Self {
         let mut peer_template = BasicPeer::new("0.0.0.0:1");
         peer_template.options.connection_timeout = Some(Duration::from_secs(1));
@@ -67,19 +70,25 @@ impl Default for TcpHealthCheck {
             consecutive_failure: 1,
             peer_template,
             connector: TransportConnector::new(None),
+            pd: PhantomData,
         }
     }
 }
 
-impl TcpHealthCheck {
+impl<M> TcpHealthCheck<M>
+where
+    M: Default,
+{
     /// Create a new [TcpHealthCheck] with the following default values
     /// * connect timeout: 1 second
     /// * consecutive_success: 1
     /// * consecutive_failure: 1
     pub fn new() -> Box<Self> {
-        Box::<TcpHealthCheck>::default()
+        Box::<TcpHealthCheck<M>>::default()
     }
+}
 
+impl<M> TcpHealthCheck<M> {
     /// Create a new [TcpHealthCheck] that tries to establish a TLS connection.
     ///
     /// The default values are the same as [Self::new()].
@@ -96,7 +105,12 @@ impl TcpHealthCheck {
 }
 
 #[async_trait]
-impl HealthCheck for TcpHealthCheck {
+impl<M> HealthCheck for TcpHealthCheck<M>
+where
+    M: Clone + Send + Sync + 'static,
+{
+    type Metadata = M;
+
     fn health_threshold(&self, success: bool) -> usize {
         if success {
             self.consecutive_success
@@ -105,10 +119,10 @@ impl HealthCheck for TcpHealthCheck {
         }
     }
 
-    async fn check(&self, target: &Backend) -> Result<()> {
+    async fn check(&self, target: &Backend<M>) -> Result<()> {
         let mut peer = self.peer_template.clone();
         peer._address = target.addr.clone();
-        self.connector.get_stream(&peer).await.map(|_| {})
+        self.connector.get_stream(&peer).await.map(drop)
     }
 }
 
@@ -117,7 +131,7 @@ type Validator = Box<dyn Fn(&ResponseHeader) -> Result<()> + Send + Sync>;
 /// HTTP health check
 ///
 /// This health check checks if it can receive the expected HTTP(s) response from the given backend.
-pub struct HttpHealthCheck {
+pub struct HttpHealthCheck<M> {
     /// Number of successful checks to flip from unhealthy to healthy.
     pub consecutive_success: usize,
     /// Number of failed checks to flip from healthy to unhealthy.
@@ -147,9 +161,11 @@ pub struct HttpHealthCheck {
     /// Sometimes the health check endpoint lives one a different port than the actual backend.
     /// Setting this option allows the health check to perform on the given port of the backend IP.
     pub port_override: Option<u16>,
+
+    pub pd: PhantomData<M>,
 }
 
-impl HttpHealthCheck {
+impl<M> HttpHealthCheck<M> {
     /// Create a new [HttpHealthCheck] with the following default settings
     /// * connect timeout: 1 second
     /// * read timeout: 1 second
@@ -174,6 +190,7 @@ impl HttpHealthCheck {
             req,
             validator: None,
             port_override: None,
+            pd: PhantomData,
         }
     }
 
@@ -184,7 +201,12 @@ impl HttpHealthCheck {
 }
 
 #[async_trait]
-impl HealthCheck for HttpHealthCheck {
+impl<M> HealthCheck for HttpHealthCheck<M>
+where
+    M: Clone + Sync,
+{
+    type Metadata = M;
+
     fn health_threshold(&self, success: bool) -> usize {
         if success {
             self.consecutive_success
@@ -193,7 +215,7 @@ impl HealthCheck for HttpHealthCheck {
         }
     }
 
-    async fn check(&self, target: &Backend) -> Result<()> {
+    async fn check(&self, target: &Backend<M>) -> Result<()> {
         let mut peer = self.peer_template.clone();
         peer._address = target.addr.clone();
         if let Some(port) = self.port_override {
@@ -316,13 +338,16 @@ mod test {
     use super::*;
     use crate::SocketAddr;
 
+    type TestMetadata = u32;
+
     #[tokio::test]
     async fn test_tcp_check() {
-        let tcp_check = TcpHealthCheck::default();
+        let tcp_check = TcpHealthCheck::<TestMetadata>::default();
 
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            metadata: 10,
         };
 
         assert!(tcp_check.check(&backend).await.is_ok());
@@ -330,6 +355,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:79".parse().unwrap()),
             weight: 1,
+            metadata: 20,
         };
 
         assert!(tcp_check.check(&backend).await.is_err());
@@ -341,6 +367,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            metadata: 30,
         };
 
         assert!(tls_check.check(&backend).await.is_ok());
@@ -353,6 +380,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            metadata: 40,
         };
 
         assert!(https_check.check(&backend).await.is_ok());
@@ -375,6 +403,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            metadata: 60,
         };
 
         http_check.check(&backend).await.unwrap();

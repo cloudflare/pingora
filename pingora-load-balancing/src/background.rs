@@ -14,16 +14,21 @@
 
 //! Implement [BackgroundService] for [LoadBalancer]
 
-use std::time::{Duration, Instant};
+use std::{
+    hash::Hash,
+    time::{Duration, Instant},
+};
 
 use super::{BackendIter, BackendSelection, LoadBalancer};
 use async_trait::async_trait;
 use pingora_core::services::background::BackgroundService;
 
 #[async_trait]
-impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancer<S>
+impl<S, M> BackgroundService for LoadBalancer<S, M>
 where
-    S::Iter: BackendIter,
+    S: Send + Sync + BackendSelection<Metadata = M> + 'static,
+    S::Iter: BackendIter<Metadata = M>,
+    M: Hash + Eq + Clone + core::fmt::Debug + Send + Sync + 'static,
 {
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
         // 136 years
