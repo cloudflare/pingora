@@ -509,6 +509,13 @@ pub trait OrErr<T, E> {
         et: ErrorType,
         context: F,
     ) -> Result<T, BError>;
+
+    /// Similar to or_err() but just to surface errors that are not [Error] (where `?` cannot be used directly).
+    ///
+    /// or_err()/or_err_with() are still preferred because they make the error more readable and traceable.
+    fn or_fail(self) -> Result<T>
+    where
+        E: Into<Box<dyn ErrorTrait + Send + Sync>>;
 }
 
 impl<T, E> OrErr<T, E> for Result<T, E> {
@@ -536,6 +543,13 @@ impl<T, E> OrErr<T, E> for Result<T, E> {
         exp: F,
     ) -> Result<T, BError> {
         self.map_err(|e| Error::explain(et, exp(e)))
+    }
+
+    fn or_fail(self) -> Result<T, BError>
+    where
+        E: Into<Box<dyn ErrorTrait + Send + Sync>>,
+    {
+        self.map_err(|e| Error::because(ErrorType::InternalError, "", e))
     }
 }
 
@@ -640,5 +654,20 @@ mod tests {
             format!("{}", e1.unwrap_err()),
             " InternalError context: none is an error!"
         );
+    }
+
+    #[test]
+    fn test_into() {
+        fn other_error() -> Result<(), &'static str> {
+            Err("oops")
+        }
+
+        fn surface_err() -> Result<()> {
+            other_error().or_fail()?; // can return directly but want to showcase ?
+            Ok(())
+        }
+
+        let e = surface_err().unwrap_err();
+        assert_eq!(format!("{}", e), " InternalError context:  cause: oops");
     }
 }
