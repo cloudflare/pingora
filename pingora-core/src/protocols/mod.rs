@@ -29,6 +29,7 @@ pub use ssl::ALPN;
 
 use async_trait::async_trait;
 use std::fmt::Debug;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 /// Define how a protocol should shutdown its connection.
@@ -256,6 +257,14 @@ impl ConnFdReusable for InetSocketAddr {
         let fd = fd.as_raw_fd();
         match getpeername::<SockaddrStorage>(fd) {
             Ok(peer) => {
+                const ZERO: IpAddr = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+                if self.ip() == ZERO {
+                    // https://www.rfc-editor.org/rfc/rfc1122.html#section-3.2.1.3
+                    // 0.0.0.0 should only be used as source IP not destination
+                    // However in some systems this destination IP is mapped to 127.0.0.1.
+                    // We just skip this check here to avoid false positive mismatch.
+                    return true;
+                }
                 let addr = SockaddrStorage::from(*self);
                 if addr == peer {
                     debug!("Inet FD to: {addr} is reusable");
