@@ -28,7 +28,7 @@ pub trait ProxyHttp {
     type CTX;
 
     /// Define how the `ctx` should be created.
-    fn new_ctx(&self) -> Self::CTX;
+    fn new_ctx(&self, session: &Session) -> Self::CTX;
 
     /// Define where the proxy should send the request to.
     ///
