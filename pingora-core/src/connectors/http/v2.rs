@@ -143,7 +143,7 @@ impl ConnectionRef {
                 // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
                 // accepts new streams. We can still try to create new connection.
                 if e.root_cause()
-                    .downcast_ref::<Box<h2::Error>>()
+                    .downcast_ref::<h2::Error>()
                     .map(|e| {
                         e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR)
                     })
