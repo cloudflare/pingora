@@ -25,7 +25,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::time::Duration;
 use tokio::net::TcpSocket;
 
-use crate::protocols::l4::ext::set_tcp_fastopen_backlog;
+use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
 use crate::protocols::TcpKeepalive;
@@ -76,6 +76,9 @@ pub struct TcpSocketOptions {
     /// Enable TCP keepalive on accepted connections.
     /// See the [man page](https://man7.org/linux/man-pages/man7/tcp.7.html) for more information.
     pub tcp_keepalive: Option<TcpKeepalive>,
+    /// Specifies the server should set the following DSCP value on outgoing connections.
+    /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
+    pub dscp: Option<u8>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -149,6 +152,10 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
 
     if let Some(backlog) = opt.tcp_fastopen {
         set_tcp_fastopen_backlog(sock.as_raw_fd(), backlog)?;
+    }
+
+    if let Some(dscp) = opt.dscp {
+        set_dscp(sock.as_raw_fd(), dscp)?;
     }
     Ok(())
 }
@@ -279,6 +286,9 @@ impl ListenerEndpoint {
         };
         if let Some(ka) = op.tcp_keepalive.as_ref() {
             stream.set_keepalive(ka)?;
+        }
+        if let Some(dscp) = op.dscp {
+            set_dscp(stream.as_raw_fd(), dscp)?;
         }
         Ok(())
     }

@@ -19,7 +19,7 @@ use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{
-    connect_uds, connect_with as tcp_connect, set_recv_buf, set_tcp_fastopen_connect,
+    connect_uds, connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -46,6 +46,10 @@ where
                 if let Some(recv_buf) = peer.tcp_recv_buf() {
                     debug!("Setting recv buf size");
                     set_recv_buf(socket.as_raw_fd(), recv_buf)?;
+                }
+                if let Some(dscp) = peer.dscp() {
+                    debug!("Setting dscp");
+                    set_dscp(socket.as_raw_fd(), dscp)?;
                 }
                 Ok(())
             });
