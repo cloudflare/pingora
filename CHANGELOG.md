@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0](https://github.com/cloudflare/pingora/compare/0.2.0...0.3.0) - 2024-07-12
+
+### 🚀 Features
+- Add support for HTTP modules. This feature allows users to import modules written by 3rd parties.
+- Add `request_body_filter`. Now request body can be inspected and modified.
+- Add H2c support.
+- Add TCP fast open support.
+- Add support for server side TCP keep-alive.
+- Add support to get TCP_INFO.
+- Add support to set DSCP.
+- Add `or_err()`/`or_err_with` API to convert `Options` to `pingora::Error`.
+- Add `or_fail()` API to convert `impl std::error::Error` to `pingora::Error`.
+- Add the API to track socket read and write pending time.
+- Compression: allow setting level per algorithm.
+
+### 🐛 Bug Fixes
+- Fixed a panic when using multiple H2 streams in the same H2 connection to upstreams.
+- Pingora now respects the `Connection` header it sends to upstream.
+- Accept-Ranges header is now removed when response is compressed.
+- Fix ipv6_only socket flag.
+- A new H2 connection is opened now if the existing connection returns GOAWAY with graceful shutdown error.
+- Fix a FD mismatch error when 0.0.0.0 is used as the upstream IP
+
+### ⚙️ Changes and Miscellaneous Tasks
+- Dependency: replace `structopt` with `clap`
+- Rework the API of HTTP modules
+- Optimize remove_header() API call
+- UDS parsing now requires the path to have `unix:` prefix. The support for the path without prefix is deprecated and will be removed on the next release.
+- Other minor API changes
+
 ## [0.2.0](https://github.com/cloudflare/pingora/compare/0.1.1...0.2.0) - 2024-05-10
 
 ### 🚀 Features
