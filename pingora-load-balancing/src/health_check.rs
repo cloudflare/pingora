@@ -24,6 +24,13 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[async_trait]
+pub trait HealthObserve {
+    /// This function is called When health status changes
+    async fn health_check_callback(&self, _target: &Backend, _healthy: bool);
+}
+pub type HealthCheckCallback = Box<dyn HealthObserve + Send + Sync>;
+
 /// [HealthCheck] is the interface to implement health check for backends
 #[async_trait]
 pub trait HealthCheck {
@@ -31,6 +38,10 @@ pub trait HealthCheck {
     ///
     /// `Ok(())`` if the check passes, otherwise the check fails.
     async fn check(&self, target: &Backend) -> Result<()>;
+
+    /// This function is called When health status changes
+    async fn health_status_change(&self, _target: &Backend, _healthy: bool) {}
+
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
@@ -56,6 +67,7 @@ pub struct TcpHealthCheck {
     /// set, it will also try to establish a TLS connection on top of the TCP connection.
     pub peer_template: BasicPeer,
     connector: TransportConnector,
+    callback: Option<HealthCheckCallback>,
 }
 
 impl Default for TcpHealthCheck {
@@ -67,6 +79,7 @@ impl Default for TcpHealthCheck {
             consecutive_failure: 1,
             peer_template,
             connector: TransportConnector::new(None),
+            callback: None,
         }
     }
 }
@@ -93,6 +106,11 @@ impl TcpHealthCheck {
     pub fn set_connector(&mut self, connector: TransportConnector) {
         self.connector = connector;
     }
+
+    /// Set the health observe callback function.
+    pub fn set_callback(&mut self, callback: HealthCheckCallback) {
+        self.callback = Some(callback);
+    }
 }
 
 #[async_trait]
@@ -109,6 +127,12 @@ impl HealthCheck for TcpHealthCheck {
         let mut peer = self.peer_template.clone();
         peer._address = target.addr.clone();
         self.connector.get_stream(&peer).await.map(|_| {})
+    }
+
+    async fn health_status_change(&self, target: &Backend, healthy: bool) {
+        if let Some(callback) = &self.callback {
+            callback.health_check_callback(target, healthy).await;
+        }
     }
 }
 
@@ -147,6 +171,7 @@ pub struct HttpHealthCheck {
     /// Sometimes the health check endpoint lives one a different port than the actual backend.
     /// Setting this option allows the health check to perform on the given port of the backend IP.
     pub port_override: Option<u16>,
+    callback: Option<HealthCheckCallback>,
 }
 
 impl HttpHealthCheck {
@@ -174,12 +199,17 @@ impl HttpHealthCheck {
             req,
             validator: None,
             port_override: None,
+            callback: None,
         }
     }
 
     /// Replace the internal http connector with the given [HttpConnector]
     pub fn set_connector(&mut self, connector: HttpConnector) {
         self.connector = connector;
+    }
+    /// Set the health observe callback function.
+    pub fn set_callback(&mut self, callback: HealthCheckCallback) {
+        self.callback = Some(callback);
     }
 }
 
@@ -234,6 +264,11 @@ impl HealthCheck for HttpHealthCheck {
         }
 
         Ok(())
+    }
+    async fn health_status_change(&self, target: &Backend, healthy: bool) {
+        if let Some(callback) = &self.callback {
+            callback.health_check_callback(target, healthy).await;
+        }
     }
 }
 
@@ -313,8 +348,11 @@ impl Health {
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
     use super::*;
     use crate::SocketAddr;
+    use async_trait::async_trait;
 
     #[tokio::test]
     async fn test_tcp_check() {
@@ -380,5 +418,55 @@ mod test {
         http_check.check(&backend).await.unwrap();
 
         assert!(http_check.check(&backend).await.is_ok());
+    }
+
+    struct Observe {
+        healthy_count: Arc<AtomicU16>,
+    }
+    #[async_trait]
+    impl HealthObserve for Observe {
+        async fn health_check_callback(&self, _target: &Backend, healthy: bool) {
+            if healthy {
+                self.healthy_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tcp_health_observe() {
+        let healthy_count = Arc::new(AtomicU16::new(0));
+        let ob = Observe {
+            healthy_count: healthy_count.clone(),
+        };
+        let bob = Box::new(ob);
+
+        let mut tcp_check = TcpHealthCheck::default();
+        tcp_check.set_callback(bob);
+
+        let backend = Backend {
+            addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
+            weight: 1,
+        };
+
+        assert!(tcp_check.check(&backend).await.is_ok());
+        assert!(1 == healthy_count.load(Ordering::Relaxed));
+    }
+    #[tokio::test]
+    async fn test_https_health_observe() {
+        let healthy_count = Arc::new(AtomicU16::new(0));
+        let ob = Observe {
+            healthy_count: healthy_count.clone(),
+        };
+        let bob = Box::new(ob);
+        let mut https_check = HttpHealthCheck::new("one.one.one.one", true);
+        https_check.set_callback(bob);
+
+        let backend = Backend {
+            addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
+            weight: 1,
+        };
+
+        assert!(https_check.check(&backend).await.is_ok());
+        assert!(1 == healthy_count.load(Ordering::Relaxed));
     }
 }
