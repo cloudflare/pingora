@@ -287,7 +287,7 @@ impl Server {
     /// This function will block forever until the server needs to quit. So this would be the last
     /// function to call for this object.
     ///
-    /// Note: this function may fork the process for daemonization, so any additional threads created
+    /// Note: this function may fork the process for demonization, so any additional threads created
     /// before this function will be lost to any service logic once this function is called.
     pub fn run_forever(mut self) -> ! {
         info!("Server starting");
