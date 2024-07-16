@@ -82,7 +82,7 @@ pub fn ssl_set_verify_cert_store(
         cvt(SSL_ctrl(
             ssl.as_ptr(),
             SSL_CTRL_SET_VERIFY_CERT_STORE,
-            0,
+            1, // increase the ref count of X509Store so that ssl_ctx can outlive X509StoreRef
             cert_store.as_ptr() as *mut c_void,
         ))?;
     }
