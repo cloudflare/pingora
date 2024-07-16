@@ -83,7 +83,7 @@ pub struct MyProxy;
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self, _session: &Session) -> Self::CTX {}
 
     // This function is only called once when the server starts
     fn init_downstream_modules(&self, modules: &mut HttpModules) {
