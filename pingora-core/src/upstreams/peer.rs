@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::connectors::L4Connect;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -322,6 +323,8 @@ pub struct PeerOptions {
     pub tcp_fast_open: bool,
     // use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
+    // A custom L4 connector to use to establish new L4 connections
+    pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
 }
 
 impl PeerOptions {
@@ -350,6 +353,7 @@ impl PeerOptions {
             second_keyshare: true, // default true and noop when not using PQ curves
             tcp_fast_open: false,
             tracer: None,
+            custom_l4: None,
         }
     }
 
