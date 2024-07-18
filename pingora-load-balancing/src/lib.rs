@@ -68,7 +68,7 @@ impl Backend {
             .or_err(ErrorType::InternalError, "invalid socket addr")?;
         Ok(Backend {
             addr: SocketAddr::Inet(addr),
-            weight: weight,
+            weight,
         })
         // TODO: UDS
     }
