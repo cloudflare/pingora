@@ -58,12 +58,17 @@ impl Backend {
     /// Create a new [Backend] with `weight` 1. The function will try to parse
     ///  `addr` into a [std::net::SocketAddr].
     pub fn new(addr: &str) -> Result<Self> {
+        Self::new_with_weight(addr,1)
+    }
+
+    // Create a new [Background] with address and weight.
+    pub fn new_with_weight(addr: &str,weight: usize) -> Result<Self> {
         let addr = addr
             .parse()
             .or_err(ErrorType::InternalError, "invalid socket addr")?;
         Ok(Backend {
             addr: SocketAddr::Inet(addr),
-            weight: 1,
+            weight: weight,
         })
         // TODO: UDS
     }
