@@ -315,6 +315,7 @@ impl Health {
 mod test {
     use super::*;
     use crate::SocketAddr;
+    use http::Extensions;
 
     #[tokio::test]
     async fn test_tcp_check() {
@@ -323,6 +324,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_ok());
@@ -330,6 +332,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:79".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_err());
@@ -341,6 +344,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tls_check.check(&backend).await.is_ok());
@@ -353,6 +357,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(https_check.check(&backend).await.is_ok());
@@ -375,6 +380,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         http_check.check(&backend).await.unwrap();
