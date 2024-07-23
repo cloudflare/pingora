@@ -89,7 +89,7 @@ impl ResponseCompressionBuilder {
 impl HttpModuleBuilder for ResponseCompressionBuilder {
     fn init(&self) -> Module {
         Box::new(ResponseCompression(ResponseCompressionCtx::new(
-            self.level, false,
+            self.level, false, false,
         )))
     }
 
