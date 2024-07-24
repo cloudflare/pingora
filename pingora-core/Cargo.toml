@@ -20,8 +20,9 @@ path = "src/lib.rs"
 
 [dependencies]
 pingora-runtime = { version = "0.3.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.3.0", path = "../pingora-openssl", optional = true }
 pingora-boringssl = { version = "0.3.0", path = "../pingora-boringssl", optional = true }
+pingora-openssl = { version = "0.3.0", path = "../pingora-openssl", optional = true }
+pingora-rustls = { version = "0.3.0", path = "../pingora-rustls", optional = true }
 pingora-pool = { version = "0.3.0", path = "../pingora-pool" }
 pingora-error = { version = "0.3.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.3.0", path = "../pingora-timeout" }
@@ -68,6 +69,7 @@ openssl-probe = "0.1"
 tokio-test = "0.4"
 zstd = "0"
 httpdate = "1"
+x509-parser = { version = "0.16.0", optional = true }
 
 [dev-dependencies]
 matches = "0.1"
@@ -81,4 +83,5 @@ jemallocator = "0.5"
 default = ["openssl"]
 openssl = ["pingora-openssl"]
 boringssl = ["pingora-boringssl"]
+rustls = ["pingora-rustls", "dep:x509-parser"]
 patched_http1 = []

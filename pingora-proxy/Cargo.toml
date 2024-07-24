@@ -44,7 +44,7 @@ env_logger = "0.9"
 hyperlocal = "0.8"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
-pingora-load-balancing = { version = "0.3.0", path = "../pingora-load-balancing" }
+pingora-load-balancing = { version = "0.3.0", path = "../pingora-load-balancing", default-features = false }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -55,3 +55,4 @@ serde_yaml = "0.8"
 default = ["openssl"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl"]
 boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl"]
+rustls = ["pingora-core/rustls", "pingora-cache/rustls"]

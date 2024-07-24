@@ -22,7 +22,7 @@ use once_cell::sync::OnceCell;
 use super::l4::ext::{get_recv_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
-use super::ssl::digest::SslDigest;
+use super::tls::SslDigest;
 
 /// The information can be extracted from a connection
 #[derive(Clone, Debug, Default)]
