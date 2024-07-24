@@ -153,6 +153,14 @@ pub(super) fn is_upgrade_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11 && req.headers.get(header::UPGRADE).is_some()
 }
 
+pub(super) fn is_expect_continue_req(req: &RequestHeader) -> bool {
+    req.version == http::Version::HTTP_11
+        // https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1
+        && req.headers.get(header::EXPECT).map_or(false, |v| {
+            v.as_bytes().eq_ignore_ascii_case(b"100-continue")
+        })
+}
+
 // Unlike the upgrade check on request, this function doesn't check the Upgrade or Connection header
 // because when seeing 101, we assume the server accepts to switch protocol.
 // In reality it is not common that some servers don't send all the required headers to establish
