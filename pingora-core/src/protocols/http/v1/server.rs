@@ -74,6 +74,8 @@ pub struct HttpSession {
     digest: Box<Digest>,
     /// Minimum send rate to the client
     min_send_rate: Option<usize>,
+    /// When this is enabled informational response headers will not be proxied downstream
+    ignore_info_resp: bool,
 }
 
 impl HttpSession {
@@ -109,6 +111,7 @@ impl HttpSession {
             upgraded: false,
             digest,
             min_send_rate: None,
+            ignore_info_resp: false,
         }
     }
 
@@ -388,6 +391,11 @@ impl HttpSession {
     /// Write the response header to the client.
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
+        if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
+            debug!("ignoring informational headers");
+            return Ok(());
+        }
+
         if let Some(resp) = self.response_written.as_ref() {
             if !resp.status.is_informational() || self.upgraded {
                 warn!("Respond header is already sent, cannot send again");
@@ -409,7 +417,7 @@ impl HttpSession {
             header.insert_header(header::CONNECTION, connection_value)?;
         }
 
-        if header.status.as_u16() == 101 {
+        if header.status == 101 {
             // make sure the connection is closed at the end when 101/upgrade is used
             self.set_keepalive(None);
         }
@@ -508,6 +516,18 @@ impl HttpSession {
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
         // TODO: implement this parsing
         (None, None)
+    }
+
+    fn ignore_info_resp(&self, status: u16) -> bool {
+        // ignore informational response if ignore flag is set and it's not an Upgrade and Expect: 100-continue isn't set
+        self.ignore_info_resp && status != 101 && !(status == 100 && self.is_expect_continue_req())
+    }
+
+    fn is_expect_continue_req(&self) -> bool {
+        match self.request_header.as_deref() {
+            Some(req) => is_expect_continue_req(req),
+            None => false,
+        }
     }
 
     fn is_connection_keepalive(&self) -> Option<bool> {
@@ -822,6 +842,14 @@ impl HttpSession {
         if min_send_rate > 0 {
             self.min_send_rate = Some(min_send_rate);
         }
+    }
+
+    /// Sets whether we ignore writing informational responses downstream.
+    ///
+    /// This is a noop if the response is Upgrade or Continue and
+    /// Expect: 100-continue was set on the request.
+    pub fn set_ignore_info_resp(&mut self, ignore: bool) {
+        self.ignore_info_resp = ignore;
     }
 
     /// Return the [Digest] of the connection.
@@ -1461,6 +1489,75 @@ mod tests_stream {
         let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
         http_stream
             .write_response_header_ref(&response_100)
+            .await
+            .unwrap();
+        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response_200.append_header("Foo", "Bar").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response_200)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_informational_ignored() {
+        let wire = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().write(wire).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // ignore the 100 Continue
+        http_stream.ignore_info_resp = true;
+        let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
+        http_stream
+            .write_response_header_ref(&response_100)
+            .await
+            .unwrap();
+        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response_200.append_header("Foo", "Bar").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response_200)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_informational_100_not_ignored_if_expect_continue() {
+        let input = b"GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n";
+        let output = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).write(output).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.ignore_info_resp = true;
+        // 100 Continue is not ignored due to Expect: 100-continue on request
+        let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
+        http_stream
+            .write_response_header_ref(&response_100)
+            .await
+            .unwrap();
+        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response_200.append_header("Foo", "Bar").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response_200)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_informational_1xx_ignored_if_expect_continue() {
+        let input = b"GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n";
+        let output = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).write(output).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.ignore_info_resp = true;
+        // 102 Processing is ignored
+        let response_102 = ResponseHeader::build(StatusCode::PROCESSING, None).unwrap();
+        http_stream
+            .write_response_header_ref(&response_102)
             .await
             .unwrap();
         let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
