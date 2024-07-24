@@ -87,7 +87,7 @@ pub fn get_x509_serial(cert: &X509) -> pingora_error::Result<String> {
 }
 
 pub fn der_to_x509(ca: &[u8]) -> pingora_error::Result<X509> {
-    let cert = X509::from_der(&*ca).explain_err(InvalidCert, |e| {
+    let cert = X509::from_der(ca).explain_err(InvalidCert, |e| {
         format!(
             "Failed to convert ca certificate in DER form to X509 cert. Error: {:?}",
             e

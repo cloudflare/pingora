@@ -182,7 +182,7 @@ where
     if let Some(ca_list) = peer.get_ca() {
         let mut store_builder = X509StoreBuilder::new().unwrap();
         for ca in &**ca_list {
-            let cert = der_to_x509(&**ca)?;
+            let cert = der_to_x509(ca)?;
             store_builder.add_cert(cert).unwrap();
         }
         ssl_set_verify_cert_store(&mut ssl_conf, &store_builder.build())
@@ -192,9 +192,9 @@ where
     // Set up client cert/key
     if let Some(key_pair) = peer.get_client_cert_key() {
         debug!("setting client cert and key");
-        let leaf = der_to_x509(&*key_pair.leaf())?;
+        let leaf = der_to_x509(key_pair.leaf())?;
         ssl_use_certificate(&mut ssl_conf, &leaf).or_err(InternalError, "invalid client cert")?;
-        let key = der_to_private_key(&*key_pair.key())?;
+        let key = der_to_private_key(key_pair.key())?;
         ssl_use_private_key(&mut ssl_conf, &key).or_err(InternalError, "invalid client key")?;
 
         let intermediates = key_pair.intermediates();

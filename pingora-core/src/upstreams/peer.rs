@@ -388,7 +388,7 @@ impl Display for PeerOptions {
                 write!(
                     f,
                     "CA: {}, expire: {},",
-                    get_organizational_unit(&**ca).unwrap_or_default(),
+                    get_organizational_unit(ca).unwrap_or_default(),
                     get_not_after(ca),
                 )?;
             }

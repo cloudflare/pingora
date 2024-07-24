@@ -34,8 +34,8 @@ fn load_file(path: &String) -> BufReader<File> {
 fn load_pem_file(path: &String) -> Result<Vec<Item>, std::io::Error> {
     let iter: Vec<Item> = rustls_pemfile::read_all(&mut load_file(path))
         .filter_map(|f| {
-            if f.is_ok() {
-                Some(f.unwrap())
+            if let Ok(f) = f {
+                Some(f)
             } else {
                 let err = f.err().unwrap();
                 warn!(
@@ -103,14 +103,15 @@ pub fn load_certs_key_file<'a>(
     key: &String,
 ) -> Option<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>)> {
     let certs_file = load_pem_file(cert)
-        .expect(format!("Failed to load configured cert file located at {}.", cert).as_str());
+        .unwrap_or_else(|_| panic!("Failed to load configured cert file located at {}.", cert));
     let key_file = load_pem_file(key)
-        .expect(format!("Failed to load configured key file located at {}.", cert).as_str());
+        .unwrap_or_else(|_| panic!("Failed to load configured key file located at {}.", cert));
 
     let mut certs: Vec<CertificateDer<'a>> = vec![];
-    certs_file.into_iter().for_each(|i| match i {
-        Item::X509Certificate(cert) => certs.push(cert),
-        _ => {}
+    certs_file.into_iter().for_each(|i| {
+        if let Item::X509Certificate(cert) = i {
+            certs.push(cert)
+        }
     });
 
     let private_key = match key_file.into_iter().next()? {
@@ -145,10 +146,8 @@ pub fn load_pem_file_ca(path: &String) -> Vec<u8> {
 
 pub fn load_pem_file_private_key(path: &String) -> Vec<u8> {
     let key = rustls_pemfile::private_key(&mut load_file(path));
-    if let Ok(key) = key {
-        if let Some(key) = key {
-            return key.secret_der().to_vec();
-        }
+    if let Ok(Some(key)) = key {
+        return key.secret_der().to_vec();
     }
     Vec::new()
 }

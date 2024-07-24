@@ -36,7 +36,7 @@ pub mod boringssl_openssl;
 #[cfg(feature = "rustls")]
 pub(crate) mod rustls;
 
-pub(crate) struct Acceptor {
+pub struct Acceptor {
     ssl_acceptor: Box<dyn TlsAcceptor + Send + Sync>,
     callbacks: Option<TlsAcceptCallbacks>,
 }
