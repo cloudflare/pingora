@@ -98,7 +98,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
                 ssl::ErrorCode::SSL => {
                     // Unify the return type of `verify_result` for openssl
                     #[cfg(not(feature = "boringssl"))]
-                    fn verify_result<S>(ssl: &SslRef) -> Result<(), i32> {
+                    fn verify_result(ssl: &SslRef) -> Result<(), i32> {
                         match ssl.verify_result().as_raw() {
                             crate::tls::ssl_sys::X509_V_OK => Ok(()),
                             e => Err(e),
@@ -107,11 +107,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
 
                     // Unify the return type of `verify_result` for boringssl
                     #[cfg(feature = "boringssl")]
-                    fn verify_result<S>(ssl: &SslRef) -> Result<(), i32> {
+                    fn verify_result(ssl: &SslRef) -> Result<(), i32> {
                         ssl.verify_result().map_err(|e| e.as_raw())
                     }
 
-                    match verify_result::<T>(self.0.ssl()) {
+                    match verify_result(self.0.ssl()) {
                         Ok(()) => Error::e_explain(TLSHandshakeFailure, context),
                         // X509_V_ERR_INVALID_CALL in case verify result was never set
                         Err(X509_V_ERR_INVALID_CALL) => {
