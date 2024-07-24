@@ -194,21 +194,20 @@ impl HttpSession {
             return Ok(());
         }
 
-        // FIXME: we should ignore 1xx header because send_response() can only be called once
-        // https://github.com/hyperium/h2/issues/167
-
-        if let Some(resp) = self.response_written.as_ref() {
-            if !resp.status.is_informational() {
-                warn!("Respond header is already sent, cannot send again");
-                return Ok(());
-            }
+        if header.status.is_informational() {
+            // ignore informational response 1xx header because send_response() can only be called once
+            // https://github.com/hyperium/h2/issues/167
+            debug!("ignoring informational headers");
+            return Ok(());
         }
 
-        // no need to add these headers to 1xx responses
-        if !header.status.is_informational() {
-            /* update headers */
-            header.insert_header(header::DATE, get_cached_date())?;
+        if self.response_written.as_ref().is_some() {
+            warn!("Response header is already sent, cannot send again");
+            return Ok(());
         }
+
+        /* update headers */
+        header.insert_header(header::DATE, get_cached_date())?;
 
         // remove other h1 hop headers that cannot be present in H2
         // https://httpwg.org/specs/rfc7540.html#n-connection-specific-header-fields
@@ -486,7 +485,8 @@ mod test {
         expected_trailers.insert("test", HeaderValue::from_static("trailers"));
         let trailers = expected_trailers.clone();
 
-        tokio::spawn(async move {
+        let mut handles = vec![];
+        handles.push(tokio::spawn(async move {
             let (h2, connection) = h2::client::handshake(client).await.unwrap();
             tokio::spawn(async move {
                 connection.await.unwrap();
@@ -510,7 +510,7 @@ mod test {
             assert_eq!(data, server_body);
             let resp_trailers = body.trailers().await.unwrap().unwrap();
             assert_eq!(resp_trailers, expected_trailers);
-        });
+        }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
@@ -520,7 +520,7 @@ mod test {
             .unwrap()
         {
             let trailers = trailers.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::GET);
                 assert_eq!(req.uri, "https://www.example.com/");
@@ -545,7 +545,11 @@ mod test {
                 }
 
                 let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
-                http.write_response_header(response_header, false).unwrap();
+                assert!(http
+                    .write_response_header(response_header.clone(), false)
+                    .is_ok());
+                // this write should be ignored otherwise we will error
+                assert!(http.write_response_header(response_header, false).is_ok());
 
                 // test idling after response header is sent
                 tokio::select! {
@@ -559,7 +563,11 @@ mod test {
 
                 http.write_trailers(trailers).unwrap();
                 http.finish().unwrap();
-            });
+            }));
+        }
+        for handle in handles {
+            // ensure no panics
+            assert!(handle.await.is_ok());
         }
     }
 }

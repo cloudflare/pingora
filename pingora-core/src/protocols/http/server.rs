@@ -218,6 +218,19 @@ impl Session {
         }
     }
 
+    /// Sets whether we ignore writing informational responses downstream.
+    ///
+    /// For HTTP/1.1 this is a noop if the response is Upgrade or Continue and
+    /// Expect: 100-continue was set on the request.
+    ///
+    /// This is a noop for h2 because informational responses are always ignored.
+    pub fn set_ignore_info_resp(&mut self, ignore: bool) {
+        match self {
+            Self::H1(s) => s.set_ignore_info_resp(ignore),
+            Self::H2(_) => {} // always ignored
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {
