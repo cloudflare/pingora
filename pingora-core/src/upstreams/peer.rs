@@ -32,11 +32,11 @@ use std::time::Duration;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
-use crate::utils::tls::CertKey;
 #[cfg(not(feature = "rustls"))]
-use crate::utils::tls::boringssl_openssl::{get_organizational_unit, get_not_after};
+use crate::utils::tls::boringssl_openssl::{get_not_after, get_organizational_unit};
 #[cfg(feature = "rustls")]
-use crate::utils::tls::rustls::{get_organizational_unit, get_not_after};
+use crate::utils::tls::rustls::{get_not_after, get_organizational_unit};
+use crate::utils::tls::CertKey;
 
 pub use crate::protocols::tls::ALPN;
 

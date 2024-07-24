@@ -14,15 +14,15 @@
 
 //! Rustls TLS server specific implementation
 
-use std::pin::Pin;
-use async_trait::async_trait;
-use log::warn;
-use tokio::io::{AsyncRead, AsyncWrite};
+use crate::listeners::tls::Acceptor;
 use crate::protocols::tls::rustls::TlsStream;
 use crate::protocols::tls::server::{ResumableAccept, TlsAcceptCallbacks};
-use pingora_error::{ErrorType::*, OrErr, Result};
 use crate::protocols::IO;
-use crate::listeners::tls::Acceptor;
+use async_trait::async_trait;
+use log::warn;
+use pingora_error::{ErrorType::*, OrErr, Result};
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> {
@@ -49,12 +49,16 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> 
 }
 
 async fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
-    TlsStream::from_acceptor(acceptor, io).await
+    TlsStream::from_acceptor(acceptor, io)
+        .await
         .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake(acceptor: &Acceptor, io: Box<dyn IO + Send>) -> Result<TlsStream<Box<dyn IO + Send>>> {
+pub async fn handshake(
+    acceptor: &Acceptor,
+    io: Box<dyn IO + Send>,
+) -> Result<TlsStream<Box<dyn IO + Send>>> {
     let mut stream = prepare_tls_stream(acceptor, io).await?;
     stream
         .accept()
@@ -71,9 +75,7 @@ pub async fn handshake_with_callback(
     _callbacks: &TlsAcceptCallbacks,
 ) -> Result<TlsStream<Box<dyn IO + Send>>> {
     let mut tls_stream = prepare_tls_stream(acceptor, io).await?;
-    let done = Pin::new(&mut tls_stream)
-        .start_accept()
-        .await?;
+    let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
         // TODO: verify if/how callback in handshake can be done using Rustls
         warn!("Callacks are not supported with feature \"rustls\".");

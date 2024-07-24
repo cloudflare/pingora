@@ -13,21 +13,30 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
+use std::path::Path;
 use std::process;
 use std::{thread, time};
-use std::path::Path;
 
 pub static MOCK_ORIGIN: Lazy<bool> = Lazy::new(init);
 
 fn init() -> bool {
     #[cfg(feature = "rustls")]
-    let src_cert_path = format!("{}/tests/utils/conf/keys/server_rustls.crt", env!("CARGO_MANIFEST_DIR"));
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_rustls.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
     #[cfg(not(feature = "rustls"))]
-    let src_cert_path = format!("{}/tests/utils/conf/keys/server_boringssl_openssl.crt", env!("CARGO_MANIFEST_DIR"));
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_boringssl_openssl.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
 
     let mut dst_cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
     std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
-    dst_cert_path = format!("{}/tests/utils/conf/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+    dst_cert_path = format!(
+        "{}/tests/utils/conf/keys/server.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
     std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
 
     // TODO: figure out a way to kill openresty when exiting

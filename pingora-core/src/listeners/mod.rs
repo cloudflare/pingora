@@ -19,15 +19,15 @@ use std::{fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, Stream as L4Stream};
 pub use l4::{ServerAddress, TcpSocketOptions};
 use pingora_error::Result;
-pub use tls::{ALPN, TlsSettings};
 use tls::Acceptor;
+pub use tls::{TlsSettings, ALPN};
 
-use crate::protocols::{IO, Stream};
+pub use crate::protocols::tls::server::TlsAccept;
 #[cfg(not(feature = "rustls"))]
 use crate::protocols::tls::TlsStream as TlsStreamProvider;
 #[cfg(feature = "rustls")]
 use crate::protocols::tls::TlsStream as TlsStreamProvider;
-pub use crate::protocols::tls::server::TlsAccept;
+use crate::protocols::{Stream, IO};
 use crate::server::ListenFds;
 
 mod l4;
@@ -85,7 +85,8 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(self) -> Result<Stream> {
         if let Some(tls) = self.tls {
-            let tls_stream : TlsStreamProvider<Box<dyn IO + Send>> = tls.handshake(Box::new(self.l4)).await?;
+            let tls_stream: TlsStreamProvider<Box<dyn IO + Send>> =
+                tls.handshake(Box::new(self.l4)).await?;
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))
@@ -187,7 +188,7 @@ impl Listeners {
 mod test {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
 
     use super::*;
 

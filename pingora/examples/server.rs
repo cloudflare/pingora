@@ -52,9 +52,9 @@ impl BackgroundService for ExampleBackgroundService {
 
 #[cfg(not(feature = "rustls"))]
 mod boringssl_openssl {
+    use super::*;
     use pingora::tls::pkey::{PKey, Private};
     use pingora::tls::x509::X509;
-    use super::*;
 
     pub(super) struct DynamicCert {
         cert: X509,
@@ -146,13 +146,16 @@ pub fn main() {
         let dynamic_cert = boringssl_openssl::DynamicCert::new(&cert_path, &key_path);
         tls_settings = pingora::listeners::TlsSettings::with_callbacks(dynamic_cert).unwrap();
         // by default intermediate supports both TLS 1.2 and 1.3. We force to tls 1.2 just for the demo
-        tls_settings.get_builder().native()
+        tls_settings
+            .get_builder()
+            .native()
             .set_max_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
             .unwrap();
     }
     #[cfg(feature = "rustls")]
     {
-        tls_settings = pingora::listeners::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        tls_settings =
+            pingora::listeners::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     }
     tls_settings.enable_h2();
     echo_service_http.add_tls_with_settings("0.0.0.0:6148", None, tls_settings);

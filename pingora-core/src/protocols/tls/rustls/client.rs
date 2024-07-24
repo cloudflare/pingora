@@ -14,11 +14,11 @@
 
 //! Rustls TLS client specific implementation
 
-use pingora_error::{Error, OrErr, Result};
-use pingora_error::ErrorType::TLSHandshakeFailure;
-use pingora_rustls::TlsConnector;
-use crate::protocols::IO;
 use crate::protocols::tls::rustls::TlsStream;
+use crate::protocols::IO;
+use pingora_error::ErrorType::TLSHandshakeFailure;
+use pingora_error::{Error, OrErr, Result};
+use pingora_rustls::TlsConnector;
 
 // Perform the TLS handshake for the given connection with the given configuration
 pub async fn handshake<S: IO>(
@@ -26,8 +26,11 @@ pub async fn handshake<S: IO>(
     domain: &str,
     io: S,
 ) -> Result<TlsStream<S>> {
-    let mut stream = TlsStream::from_connector(connector, domain, io).await
-        .explain_err(TLSHandshakeFailure, |e| format!("tip: tls stream error: {e}"))?;
+    let mut stream = TlsStream::from_connector(connector, domain, io)
+        .await
+        .explain_err(TLSHandshakeFailure, |e| {
+            format!("tip: tls stream error: {e}")
+        })?;
 
     let handshake_result = stream.connect().await;
     match handshake_result {
@@ -38,4 +41,3 @@ pub async fn handshake<S: IO>(
         }
     }
 }
-

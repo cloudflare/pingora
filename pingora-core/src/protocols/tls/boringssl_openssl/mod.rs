@@ -21,11 +21,11 @@ use std::task::{Context, Poll};
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
 use pingora_error::ErrorType::TLSHandshakeFailure;
-use pingora_error::{Result, OrErr};
+use pingora_error::{OrErr, Result};
 
-use crate::protocols::{ALPN, Ssl, UniqueID};
 use crate::protocols::tls::boringssl_openssl::stream::InnerStream;
 use crate::protocols::tls::SslDigest;
+use crate::protocols::{Ssl, UniqueID, ALPN};
 use crate::tls::hash::MessageDigest;
 use crate::tls::ssl;
 use crate::tls::ssl::SslRef;
@@ -33,13 +33,13 @@ use crate::utils::tls::boringssl_openssl::{get_x509_organization, get_x509_seria
 
 use super::TlsStream;
 
-pub(super) mod stream;
 pub mod client;
 pub mod server;
+pub(super) mod stream;
 
 impl<T> TlsStream<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin + Send
+    T: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Create a new TLS connection from the given `stream`
     ///

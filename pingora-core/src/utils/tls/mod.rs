@@ -20,11 +20,15 @@ pub mod boringssl_openssl;
 #[cfg(feature = "rustls")]
 pub mod rustls;
 
-use std::hash::{Hash, Hasher};
 #[cfg(not(feature = "rustls"))]
-use boringssl_openssl::{get_organization, get_serial, get_common_name, get_organizational_unit, get_not_after};
+use boringssl_openssl::{
+    get_common_name, get_not_after, get_organization, get_organizational_unit, get_serial,
+};
 #[cfg(feature = "rustls")]
-use rustls::{get_organization, get_serial, get_common_name, get_organizational_unit, get_not_after};
+use rustls::{
+    get_common_name, get_not_after, get_organization, get_organizational_unit, get_serial,
+};
+use std::hash::{Hash, Hasher};
 
 /// This type contains a list of one or more certificates and an associated private key. The leaf
 /// certificate should always be first. The certificates and keys are stored in Vec<u8> DER encoded

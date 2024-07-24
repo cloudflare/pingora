@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use hyper::{Body, body::HttpBody, Client, header::HeaderValue};
+use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
 
@@ -73,9 +73,12 @@ async fn test_h2_to_h1() {
         .build()
         .unwrap();
 
-    let res = client.get("https://127.0.0.1:6150")
+    let res = client
+        .get("https://127.0.0.1:6150")
         .header("sni", "openrusty.org")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
@@ -294,7 +297,10 @@ async fn test_simple_proxy_uds_peer() {
     assert!(is_specified_port(sockaddr.port()));
 
     assert_eq!(headers["x-upstream-client-addr"], "unset"); // unnamed UDS
-    assert_eq!(headers["x-upstream-server-addr"], "/tmp/pingora_nginx_test.sock");
+    assert_eq!(
+        headers["x-upstream-server-addr"],
+        "/tmp/pingora_nginx_test.sock"
+    );
 
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");

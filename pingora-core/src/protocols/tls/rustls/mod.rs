@@ -18,19 +18,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use pingora_error::ErrorType::{InternalError, TLSHandshakeFailure};
+use pingora_error::{OrErr, Result};
+use pingora_rustls::TlsStream as RusTlsStream;
+use pingora_rustls::{hash_certificate, ServerName, TlsConnector};
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 use x509_parser::nom::AsBytes;
-use pingora_error::{OrErr, Result};
-use pingora_error::ErrorType::{InternalError, TLSHandshakeFailure};
-use pingora_rustls::{hash_certificate, ServerName, TlsConnector};
-use pingora_rustls::TlsStream as RusTlsStream;
 
-use crate::utils::tls::rustls::{get_organization_serial};
+use crate::utils::tls::rustls::get_organization_serial;
 
-use crate::listeners::tls::{Acceptor};
-use crate::protocols::{ALPN, Ssl, UniqueID};
+use crate::listeners::tls::Acceptor;
 use crate::protocols::tls::rustls::stream::InnerStream;
 use crate::protocols::tls::SslDigest;
+use crate::protocols::{Ssl, UniqueID, ALPN};
 
 use super::TlsStream;
 
@@ -49,10 +49,13 @@ where
     pub async fn from_connector(connector: &TlsConnector, domain: &str, stream: T) -> Result<Self> {
         let server = ServerName::try_from(domain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-            .explain_err(InternalError, |e| format!("failed to parse domain: {}, error: {}", domain, e))?
+            .explain_err(InternalError, |e| {
+                format!("failed to parse domain: {}, error: {}", domain, e)
+            })?
             .to_owned();
 
-        let tls = InnerStream::from_connector(connector, server, stream).await
+        let tls = InnerStream::from_connector(connector, server, stream)
+            .await
             .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;
 
         Ok(TlsStream {
@@ -67,7 +70,8 @@ where
     /// Using RustTLS the stream is only returned after the handshake.
     /// The caller does therefor not need to perform [`Self::accept()`].
     pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
-        let tls = InnerStream::from_acceptor(acceptor, stream).await
+        let tls = InnerStream::from_acceptor(acceptor, stream)
+            .await
             .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;
 
         Ok(TlsStream {
@@ -143,10 +147,8 @@ impl<T> Ssl for TlsStream<T> {
         if let Some(stream) = st {
             let proto = stream.get_ref().1.alpn_protocol();
             match proto {
-                None => { None }
-                Some(raw) => {
-                    ALPN::from_wire_selected(raw)
-                }
+                None => None,
+                Some(raw) => ALPN::from_wire_selected(raw),
             }
         } else {
             None
@@ -163,44 +165,36 @@ impl SslDigest {
         let peer_certificates = session.peer_certificates();
 
         let cipher = match cipher_suite {
-            Some(suite) => {
-                match suite.suite().as_str() {
-                    Some(suite_str) => suite_str,
-                    None => "",
-                }
+            Some(suite) => match suite.suite().as_str() {
+                Some(suite_str) => suite_str,
+                None => "",
             },
             None => "",
         };
 
         let version = match protocol {
-            Some(proto) => {
-                match proto.as_str() {
-                    Some(ver) => ver,
-                    None => "",
-                }
+            Some(proto) => match proto.as_str() {
+                Some(ver) => ver,
+                None => "",
             },
             None => "",
         };
 
         let cert_digest = match peer_certificates {
-            Some(certs) => {
-                match certs.first() {
-                    Some(cert) => hash_certificate(cert.clone()),
-                    None => vec![],
-                }
+            Some(certs) => match certs.first() {
+                Some(cert) => hash_certificate(cert.clone()),
+                None => vec![],
             },
             None => vec![],
         };
 
         let (organization, serial_number) = match peer_certificates {
-            Some(certs) => {
-                match certs.first() {
-                    Some(cert) => {
-                        let (organization, serial) = get_organization_serial(cert.as_bytes());
-                        (organization, Some(serial))
-                    },
-                    None => (None, None),
+            Some(certs) => match certs.first() {
+                Some(cert) => {
+                    let (organization, serial) = get_organization_serial(cert.as_bytes());
+                    (organization, Some(serial))
                 }
+                None => (None, None),
             },
             None => (None, None),
         };

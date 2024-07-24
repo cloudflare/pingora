@@ -18,29 +18,34 @@ use std::fs::File;
 use std::io::BufReader;
 
 use log::{error, warn};
-pub use rustls::{ClientConfig, RootCertStore, ServerConfig, Stream, version};
+pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
+pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
-pub use no_debug::{NoDebug, WithTypeInfo, Ellipses};
+pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 
 fn load_file(path: &String) -> BufReader<File> {
     let file = File::open(path).expect("io error");
     BufReader::new(file)
 }
 fn load_pem_file(path: &String) -> Result<Vec<Item>, std::io::Error> {
-    let iter: Vec<Item> = rustls_pemfile::read_all(&mut load_file(path)).filter_map(|f| {
-        if f.is_ok() {
-            Some(f.unwrap())
-        } else {
-            let err = f.err().unwrap();
-            warn!("Skipping PEM element in file \"{}\" due to error \"{}\"", path, err);
-            None
-        }
-    }).collect();
+    let iter: Vec<Item> = rustls_pemfile::read_all(&mut load_file(path))
+        .filter_map(|f| {
+            if f.is_ok() {
+                Some(f.unwrap())
+            } else {
+                let err = f.err().unwrap();
+                warn!(
+                    "Skipping PEM element in file \"{}\" due to error \"{}\"",
+                    path, err
+                );
+                None
+            }
+        })
+        .collect();
     Ok(iter)
 }
 
@@ -51,12 +56,12 @@ pub fn load_ca_file_into_store(path: &String, cert_store: &mut RootCertStore) {
             cas.into_iter().for_each(|pem_item| {
                 // only loading certificates, handling a CA file
                 match pem_item {
-                    Item::X509Certificate(content) => {
-                        match cert_store.add(content) {
-                            Ok(_) => {}
-                            Err(err) => { error!("{}", err) }
+                    Item::X509Certificate(content) => match cert_store.add(content) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("{}", err)
                         }
-                    }
+                    },
                     Item::Pkcs1Key(_) => {}
                     Item::Pkcs8Key(_) => {}
                     Item::Sec1Key(_) => {}
@@ -67,7 +72,10 @@ pub fn load_ca_file_into_store(path: &String, cert_store: &mut RootCertStore) {
             });
         }
         Err(err) => {
-            error!("Failed to load configured ca file located at \"{}\", error: \"{}\"", path, err);
+            error!(
+                "Failed to load configured ca file located at \"{}\", error: \"{}\"",
+                path, err
+            );
         }
     }
 }
@@ -82,38 +90,34 @@ pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) {
             }
         }
         Err(err) => {
-            error!("Failed to load native platform ca-certificates: \"{:?}\". Continuing without ...", err);
+            error!(
+                "Failed to load native platform ca-certificates: \"{:?}\". Continuing without ...",
+                err
+            );
         }
     }
 }
 
-pub fn load_certs_key_file<'a>(cert: &String, key: &String) -> Option<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>)> {
+pub fn load_certs_key_file<'a>(
+    cert: &String,
+    key: &String,
+) -> Option<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>)> {
     let certs_file = load_pem_file(cert)
         .expect(format!("Failed to load configured cert file located at {}.", cert).as_str());
     let key_file = load_pem_file(key)
         .expect(format!("Failed to load configured key file located at {}.", cert).as_str());
 
     let mut certs: Vec<CertificateDer<'a>> = vec![];
-    certs_file.into_iter().for_each(|i| {
-        match i {
-            Item::X509Certificate(cert) => {
-                certs.push(cert)
-            }
-            _ => {}
-        }
+    certs_file.into_iter().for_each(|i| match i {
+        Item::X509Certificate(cert) => certs.push(cert),
+        _ => {}
     });
 
     let private_key = match key_file.into_iter().next()? {
-        Item::Pkcs1Key(key) => {
-            Some(PrivateKeyDer::from(key))
-        }
-        Item::Pkcs8Key(key) => {
-            Some(PrivateKeyDer::from(key))
-        }
-        Item::Sec1Key(key) => {
-            Some(PrivateKeyDer::from(key))
-        }
-        _ => { None }
+        Item::Pkcs1Key(key) => Some(PrivateKeyDer::from(key)),
+        Item::Pkcs8Key(key) => Some(PrivateKeyDer::from(key)),
+        Item::Sec1Key(key) => Some(PrivateKeyDer::from(key)),
+        _ => None,
     };
 
     if certs.is_empty() || private_key.is_none() {
@@ -134,10 +138,8 @@ pub fn load_pem_file_ca(path: &String) -> Vec<u8> {
         }
     });
     match ca {
-        None => { Vec::new() }
-        Some(ca) => {
-            ca.to_vec()
-        }
+        None => Vec::new(),
+        Some(ca) => ca.to_vec(),
     }
 }
 
@@ -150,7 +152,6 @@ pub fn load_pem_file_private_key(path: &String) -> Vec<u8> {
     }
     Vec::new()
 }
-
 
 pub fn hash_certificate(cert: CertificateDer) -> Vec<u8> {
     let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());

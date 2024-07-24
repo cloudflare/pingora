@@ -19,13 +19,13 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use pingora_error::{OrErr, Result};
 use pingora_error::ErrorType::{TLSHandshakeFailure, TLSWantX509Lookup};
+use pingora_error::{OrErr, Result};
 
 use crate::listeners::tls::Acceptor;
-use crate::protocols::{IO, Ssl};
 use crate::protocols::tls::boringssl_openssl::TlsStream;
 use crate::protocols::tls::server::{ResumableAccept, TlsAcceptCallbacks};
+use crate::protocols::{Ssl, IO};
 use crate::tls::ext;
 use crate::tls::ext::ssl_from_acceptor;
 use crate::tls::ssl::SslAcceptor;
@@ -59,14 +59,17 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> 
 }
 
 fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
-    let ssl_acceptor =  acceptor.inner().downcast_ref::<SslAcceptor>().unwrap();
+    let ssl_acceptor = acceptor.inner().downcast_ref::<SslAcceptor>().unwrap();
     let ssl = ssl_from_acceptor(ssl_acceptor)
         .explain_err(TLSHandshakeFailure, |e| format!("ssl_acceptor error: {e}"))?;
     TlsStream::new(ssl, io).explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake(acceptor: &Acceptor, io: Box<dyn IO + Send>) -> Result<TlsStream<Box<dyn IO + Send>>> {
+pub async fn handshake(
+    acceptor: &Acceptor,
+    io: Box<dyn IO + Send>,
+) -> Result<TlsStream<Box<dyn IO + Send>>> {
     let mut stream = prepare_tls_stream(acceptor, io)?;
     stream
         .accept()
@@ -82,9 +85,7 @@ pub async fn handshake_with_callback(
     callbacks: &TlsAcceptCallbacks,
 ) -> pingora_error::Result<TlsStream<Box<dyn IO + Send>>> {
     let mut tls_stream = prepare_tls_stream(acceptor, io)?;
-    let done = Pin::new(&mut tls_stream)
-        .start_accept()
-        .await?;
+    let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.0.ssl()) };
@@ -101,12 +102,12 @@ pub async fn handshake_with_callback(
 
 #[tokio::test]
 async fn test_async_cert() {
-    use crate::tls::ssl;
-    use tokio::io::AsyncReadExt;
-    use crate::tls::ssl::SslRef;
-    use crate::listeners::TlsAccept;
     use crate::listeners::tls::TlsSettings;
+    use crate::listeners::TlsAccept;
     use crate::protocols::tls::server::TlsAcceptCallbacks;
+    use crate::tls::ssl;
+    use crate::tls::ssl::SslRef;
+    use tokio::io::AsyncReadExt;
 
     struct Callback;
     #[async_trait]

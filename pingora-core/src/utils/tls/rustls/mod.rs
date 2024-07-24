@@ -14,8 +14,8 @@
 
 //! This module contains various helpers that make it easier to work with X509 certificates.
 
-use x509_parser::prelude::FromDer;
 use pingora_error::Result;
+use x509_parser::prelude::FromDer;
 
 pub fn get_organization_serial(cert: &[u8]) -> (Option<String>, String) {
     let serial = get_serial(cert).expect("Failed to get serial for certificate.");
@@ -32,7 +32,9 @@ pub fn get_serial(cert: &[u8]) -> Result<String> {
 pub fn get_organization(cert: &[u8]) -> Option<String> {
     let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
         .expect("Failed to parse certificate from DER format.");
-    x509cert.subject.iter_organization()
+    x509cert
+        .subject
+        .iter_organization()
         .filter_map(|a| a.as_str().ok())
         .map(|a| a.to_string())
         .reduce(|cur, next| cur + &next)
@@ -42,7 +44,9 @@ pub fn get_organization(cert: &[u8]) -> Option<String> {
 pub fn get_organizational_unit(cert: &[u8]) -> Option<String> {
     let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
         .expect("Failed to parse certificate from DER format.");
-    x509cert.subject.iter_organizational_unit()
+    x509cert
+        .subject
+        .iter_organizational_unit()
         .filter_map(|a| a.as_str().ok())
         .map(|a| a.to_string())
         .reduce(|cur, next| cur + &next)
@@ -58,9 +62,10 @@ pub fn get_not_after(cert: &[u8]) -> String {
 pub fn get_common_name(cert: &[u8]) -> Option<String> {
     let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
         .expect("Failed to parse certificate from DER format.");
-    x509cert.subject.iter_common_name()
+    x509cert
+        .subject
+        .iter_common_name()
         .filter_map(|a| a.as_str().ok())
         .map(|a| a.to_string())
         .reduce(|cur, next| cur + &next)
 }
-

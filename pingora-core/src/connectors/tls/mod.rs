@@ -16,8 +16,8 @@ use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use pingora_error::{Error, Result};
 use pingora_error::ErrorType::ConnectTimedout;
+use pingora_error::{Error, Result};
 
 use crate::connectors::l4::connect as l4_connect;
 #[cfg(not(feature = "rustls"))]
@@ -29,7 +29,7 @@ use crate::connectors::tls::rustls::connect as tls_connect;
 #[cfg(feature = "rustls")]
 use crate::connectors::tls::rustls::TlsConnectorCtx;
 use crate::protocols::Stream;
-use crate::upstreams::peer::{ALPN, Peer};
+use crate::upstreams::peer::{Peer, ALPN};
 
 use super::ConnectorOptions;
 
@@ -53,14 +53,15 @@ pub(crate) trait TlsConnectorContext {
     fn as_any(&self) -> &dyn Any;
 
     fn build_connector(options: Option<ConnectorOptions>) -> Connector
-    where Self: Sized;
+    where
+        Self: Sized;
 }
 
 pub(super) async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<SocketAddr>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>
+    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
@@ -82,7 +83,7 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<SocketAddr>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>
+    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
@@ -138,17 +139,24 @@ mod tests {
         ];
 
         for case in none_cases {
-            assert!(super::replace_leftmost_underscore(case).is_none(), "{}", case);
+            assert!(
+                super::replace_leftmost_underscore(case).is_none(),
+                "{}",
+                case
+            );
         }
 
         assert_eq!(
-            Some("bb-b.some.com".to_string()), super::replace_leftmost_underscore("bb_b.some.com")
+            Some("bb-b.some.com".to_string()),
+            super::replace_leftmost_underscore("bb_b.some.com")
         );
         assert_eq!(
-            Some("a-a-a.some.com".to_string()), super::replace_leftmost_underscore("a_a_a.some.com")
+            Some("a-a-a.some.com".to_string()),
+            super::replace_leftmost_underscore("a_a_a.some.com")
         );
         assert_eq!(
-            Some("-.some.com".to_string()), super::replace_leftmost_underscore("_.some.com")
+            Some("-.some.com".to_string()),
+            super::replace_leftmost_underscore("_.some.com")
         );
     }
 }

@@ -28,10 +28,10 @@ use offload::OffloadRuntime;
 use pingora_error::{ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 
-use crate::connectors::tls::{Connector, do_connect};
+use crate::connectors::tls::{do_connect, Connector};
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
-use crate::upstreams::peer::{ALPN, Peer};
+use crate::upstreams::peer::{Peer, ALPN};
 
 pub mod http;
 mod l4;
@@ -270,9 +270,6 @@ impl TransportConnector {
         self.preferred_http_version.add(peer, 1);
     }
 }
-
-
-
 
 struct PreferredHttpVersion {
     // TODO: shard to avoid the global lock

@@ -57,10 +57,18 @@ pub use pingora_error::{ErrorType::*, *};
 #[cfg(all(not(feature = "rustls"), feature = "boringssl"))]
 pub use pingora_boringssl as tls;
 
-#[cfg(all(not(feature = "rustls"), not(feature = "boringssl"), feature = "openssl"))]
+#[cfg(all(
+    not(feature = "rustls"),
+    not(feature = "boringssl"),
+    feature = "openssl"
+))]
 pub use pingora_openssl as tls;
 
-#[cfg(all(not(feature = "boringssl"), not(feature = "openssl"), feature = "rustls"))]
+#[cfg(all(
+    not(feature = "boringssl"),
+    not(feature = "openssl"),
+    feature = "rustls"
+))]
 pub use pingora_rustls as tls;
 
 pub mod prelude {

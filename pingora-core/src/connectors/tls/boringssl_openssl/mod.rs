@@ -19,27 +19,27 @@ use std::sync::{Arc, Once};
 
 use log::debug;
 
-use pingora_error::{Error, OrErr, Result};
 use pingora_error::ErrorType::{ConnectTimedout, InternalError};
+use pingora_error::{Error, OrErr, Result};
 
 use crate::connectors::ConnectorOptions;
 use crate::listeners::ALPN;
-use crate::protocols::IO;
 use crate::protocols::tls::boringssl_openssl::client::handshake;
 use crate::protocols::tls::TlsStream;
+use crate::protocols::IO;
 use crate::tls::ext::{
     add_host, clear_error_stack, ssl_add_chain_cert, ssl_set_groups_list,
     ssl_set_renegotiate_mode_freely, ssl_set_verify_cert_store, ssl_use_certificate,
     ssl_use_private_key, ssl_use_second_key_share,
 };
-use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 #[cfg(feature = "boringssl")]
 use crate::tls::ssl::SslCurve;
+use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::Peer;
 use crate::utils::tls::boringssl_openssl::{der_to_private_key, der_to_x509};
 
-use super::{Connector, replace_leftmost_underscore, TlsConnectorContext};
+use super::{replace_leftmost_underscore, Connector, TlsConnectorContext};
 
 const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
     :AES-256-GCM-SHA384\
@@ -103,7 +103,7 @@ impl TlsConnectorContext for TlsConnectorCtx {
 
     fn build_connector(options: Option<ConnectorOptions>) -> Connector
     where
-        Self: Sized
+        Self: Sized,
     {
         let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
         // TODO: make these conf
@@ -168,9 +168,9 @@ pub(super) async fn connect<T, P>(
     alpn_override: Option<ALPN>,
     tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
 ) -> Result<TlsStream<T>>
-    where
-        T: IO,
-        P: Peer + Send + Sync
+where
+    T: IO,
+    P: Peer + Send + Sync,
 {
     let ctx = tls_ctx.as_any().downcast_ref::<TlsConnectorCtx>().unwrap();
     let mut ssl_conf = ctx.0.configure().unwrap();
@@ -193,11 +193,9 @@ pub(super) async fn connect<T, P>(
     if let Some(key_pair) = peer.get_client_cert_key() {
         debug!("setting client cert and key");
         let leaf = der_to_x509(&*key_pair.leaf())?;
-        ssl_use_certificate(&mut ssl_conf, &leaf)
-            .or_err(InternalError, "invalid client cert")?;
+        ssl_use_certificate(&mut ssl_conf, &leaf).or_err(InternalError, "invalid client cert")?;
         let key = der_to_private_key(&*key_pair.key())?;
-        ssl_use_private_key(&mut ssl_conf, &key)
-            .or_err(InternalError, "invalid client key")?;
+        ssl_use_private_key(&mut ssl_conf, &key).or_err(InternalError, "invalid client key")?;
 
         let intermediates = key_pair.intermediates();
         if !intermediates.is_empty() {

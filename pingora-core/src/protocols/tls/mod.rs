@@ -14,28 +14,29 @@
 
 //! The TLS layer implementations
 
+use async_trait::async_trait;
+use pingora_error::Result;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
-use pingora_error::Result;
 
-use crate::protocols::{GetProxyDigest, GetSocketDigest, GetTimingDigest, IO, SocketDigest, UniqueID};
 use crate::protocols::digest::TimingDigest;
 use crate::protocols::raw_connect::ProxyDigest;
+use crate::protocols::{
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, UniqueID, IO,
+};
 
-pub mod server;
 #[cfg(not(feature = "rustls"))]
 pub(crate) mod boringssl_openssl;
 #[cfg(feature = "rustls")]
 pub(crate) mod rustls;
+pub mod server;
 
 #[cfg(not(feature = "rustls"))]
 use boringssl_openssl::stream::InnerStream;
 #[cfg(feature = "rustls")]
 use rustls::stream::InnerStream;
-
 
 /// The TLS connection
 #[derive(Debug)]
@@ -57,9 +58,7 @@ pub trait InnerTlsStream {
     fn selected_alpn_proto(&mut self) -> Option<ALPN>;
 }
 
-
-impl GetSocketDigest for Box<dyn IO + Send>
-{
+impl GetSocketDigest for Box<dyn IO + Send> {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
         (**self).get_socket_digest()
     }
@@ -68,27 +67,23 @@ impl GetSocketDigest for Box<dyn IO + Send>
     }
 }
 
-impl GetTimingDigest for Box<dyn IO + Send>
-{
+impl GetTimingDigest for Box<dyn IO + Send> {
     fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
         vec![]
     }
 }
 
-impl GetProxyDigest for Box<dyn IO + Send>
-{
+impl GetProxyDigest for Box<dyn IO + Send> {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
         (**self).get_proxy_digest()
     }
 }
 
-impl UniqueID for Box<dyn IO + Send>
-{
+impl UniqueID for Box<dyn IO + Send> {
     fn id(&self) -> i32 {
         (**self).id()
     }
 }
-
 
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug)]
@@ -155,7 +150,7 @@ impl ALPN {
         match self {
             ALPN::H1 => vec![b"http/1.1".to_vec()],
             ALPN::H2 => vec![b"h2".to_vec()],
-            ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+            ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         }
     }
 
@@ -182,7 +177,6 @@ pub struct SslDigest {
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
 }
-
 
 impl<S> GetSocketDigest for TlsStream<S>
 where
@@ -231,7 +225,7 @@ impl<T> TlsStream<T> {
 
 impl<T> TlsStream<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin + Send
+    T: AsyncRead + AsyncWrite + Unpin + Send,
 {
     /// Connect to the remote TLS server as a client
     pub(crate) async fn connect(&mut self) -> Result<()> {

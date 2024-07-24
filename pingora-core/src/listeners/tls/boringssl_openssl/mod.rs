@@ -14,12 +14,12 @@
 
 //! BoringSSL & OpenSSL listener specific implementation
 
-use core::any::Any;
-use async_trait::async_trait;
-use pingora_error::{ErrorType, OrErr, Result};
-use crate::listeners::{ALPN, TlsSettings};
 use crate::listeners::tls::{NativeBuilder, TlsAcceptor, TlsAcceptorBuilder};
+use crate::listeners::{TlsSettings, ALPN};
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
+use async_trait::async_trait;
+use core::any::Any;
+use pingora_error::{ErrorType, OrErr, Result};
 const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
 struct TlsAcc(SslAcceptor);
@@ -47,7 +47,9 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
     }
 
     fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
-        where Self: Sized {
+    where
+        Self: Sized,
+    {
         let mut accept_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).or_err(
             TLS_CONF_ERR,
             "fail to create mozilla_intermediate_v5 Acceptor",
@@ -64,7 +66,9 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
     }
 
     fn acceptor_with_callbacks() -> Result<Self>
-        where Self: Sized {
+    where
+        Self: Sized,
+    {
         let accept_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).or_err(
             TLS_CONF_ERR,
             "fail to create mozilla_intermediate_v5 Acceptor",
@@ -96,7 +100,7 @@ impl From<SslAcceptorBuilder> for TlsSettings {
 
 mod alpn {
     use crate::protocols::ALPN;
-    use crate::tls::ssl::{AlpnError, select_next_proto, SslRef};
+    use crate::tls::ssl::{select_next_proto, AlpnError, SslRef};
 
     // A standard implementation provided by the SSL lib is used below
 

@@ -17,19 +17,19 @@ use std::any::Any;
 use async_trait::async_trait;
 use log::debug;
 
-use pingora_error::Result;
 #[cfg(not(feature = "rustls"))]
 use crate::listeners::tls::boringssl_openssl::TlsAcceptorBuil;
 #[cfg(feature = "rustls")]
 use crate::listeners::tls::rustls::TlsAcceptorBuil;
-use crate::protocols::IO;
-pub use crate::protocols::tls::ALPN;
 #[cfg(not(feature = "rustls"))]
 use crate::protocols::tls::boringssl_openssl::server::{handshake, handshake_with_callback};
 #[cfg(feature = "rustls")]
 use crate::protocols::tls::rustls::server::{handshake, handshake_with_callback};
 use crate::protocols::tls::server::TlsAcceptCallbacks;
 use crate::protocols::tls::TlsStream;
+pub use crate::protocols::tls::ALPN;
+use crate::protocols::IO;
+use pingora_error::Result;
 
 #[cfg(not(feature = "rustls"))]
 pub mod boringssl_openssl;
@@ -56,9 +56,11 @@ pub trait TlsAcceptorBuilder: Any {
     fn build(self: Box<Self>) -> Box<dyn TlsAcceptor + Send + Sync>;
     fn set_alpn(&mut self, alpn: ALPN);
     fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
-        where Self: Sized;
+    where
+        Self: Sized;
     fn acceptor_with_callbacks() -> Result<Self>
-        where Self: Sized;
+    where
+        Self: Sized;
     fn as_any(&mut self) -> &mut dyn Any;
 }
 
@@ -111,7 +113,10 @@ impl TlsSettings {
 }
 
 impl Acceptor {
-    pub async fn handshake(&self, stream: Box<dyn IO + Send>) -> Result<TlsStream<Box<dyn IO + Send>>> {
+    pub async fn handshake(
+        &self,
+        stream: Box<dyn IO + Send>,
+    ) -> Result<TlsStream<Box<dyn IO + Send>>> {
         debug!("new tls session");
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {

@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Debug;
-use std::sync::Arc;
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
-use pingora_error::{Error, ImmutStr, OrErr, Result};
 use pingora_error::ErrorType::{AcceptError, ConnectError, TLSHandshakeFailure};
-use pingora_rustls::{Accept, Connect, ServerName, TlsConnector};
+use pingora_error::{Error, ImmutStr, OrErr, Result};
+use pingora_rustls::NoDebug;
 use pingora_rustls::TlsAcceptor as RusTlsAcceptor;
 use pingora_rustls::TlsStream as RusTlsStream;
-use pingora_rustls::NoDebug;
+use pingora_rustls::{Accept, Connect, ServerName, TlsConnector};
+use std::fmt::Debug;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::listeners::ALPN;
 use crate::listeners::tls::Acceptor;
-use crate::protocols::{GetProxyDigest, GetTimingDigest};
+use crate::listeners::ALPN;
 use crate::protocols::digest::{GetSocketDigest, SocketDigest, TimingDigest};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::InnerTlsStream;
 use crate::protocols::tls::SslDigest;
+use crate::protocols::{GetProxyDigest, GetTimingDigest};
 
 #[derive(Debug)]
 pub struct InnerStream<T> {
@@ -43,7 +43,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
     ///
     /// The caller needs to perform [`Self::connect()`] or [`Self::accept()`] to perform TLS
     /// handshake after.
-    pub(crate) async fn from_connector(connector: &TlsConnector, server: ServerName<'_>, stream: T) -> Result<Self> {
+    pub(crate) async fn from_connector(
+        connector: &TlsConnector,
+        server: ServerName<'_>,
+        stream: T,
+    ) -> Result<Self> {
         let connect = connector.connect(server.to_owned(), stream);
         Ok(InnerStream {
             accept: None.into(),
@@ -53,7 +57,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
     }
 
     pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
-        let tls_acceptor =  acceptor.inner().downcast_ref::<RusTlsAcceptor>().unwrap();
+        let tls_acceptor = acceptor.inner().downcast_ref::<RusTlsAcceptor>().unwrap();
         let accept = tls_acceptor.accept(stream);
 
         Ok(InnerStream {
@@ -71,14 +75,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
         let connect = &mut (*self.connect);
 
         if let Some(ref mut connect) = connect {
-            let stream = connect.await
+            let stream = connect
+                .await
                 .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
             self.stream = Some(RusTlsStream::Client(stream));
             self.connect = None.into();
 
             Ok(())
         } else {
-            Err(Error::explain(ConnectError, ImmutStr::from("TLS connect not available to perform handshake.")))
+            Err(Error::explain(
+                ConnectError,
+                ImmutStr::from("TLS connect not available to perform handshake."),
+            ))
         }
     }
 
@@ -88,14 +96,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
         let accept = &mut (*self.accept);
 
         if let Some(ref mut accept) = accept {
-            let stream = accept.await
+            let stream = accept
+                .await
                 .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
             self.stream = Some(RusTlsStream::Server(stream));
             self.connect = None.into();
 
             Ok(())
         } else {
-            Err(Error::explain(AcceptError, ImmutStr::from("TLS accept not available to perform handshake.")))
+            Err(Error::explain(
+                AcceptError,
+                ImmutStr::from("TLS accept not available to perform handshake."),
+            ))
         }
     }
 
@@ -107,10 +119,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
         if let Some(stream) = self.stream.as_ref() {
             let proto = stream.get_ref().1.alpn_protocol();
             match proto {
-                None => { None }
-                Some(raw) => {
-                    ALPN::from_wire_selected(raw)
-                }
+                None => None,
+                Some(raw) => ALPN::from_wire_selected(raw),
             }
         } else {
             None
@@ -118,10 +128,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
     }
 }
 
-
 impl<S> GetSocketDigest for InnerStream<S>
-    where
-        S: GetSocketDigest,
+where
+    S: GetSocketDigest,
 {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
         if let Some(stream) = self.stream.as_ref() {
@@ -131,22 +140,32 @@ impl<S> GetSocketDigest for InnerStream<S>
         }
     }
     fn set_socket_digest(&mut self, socket_digest: SocketDigest) {
-        self.stream.as_mut().unwrap().get_mut().0.set_socket_digest(socket_digest)
+        self.stream
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .0
+            .set_socket_digest(socket_digest)
     }
 }
 
 impl<S> GetTimingDigest for InnerStream<S>
-    where
-        S: GetTimingDigest,
+where
+    S: GetTimingDigest,
 {
     fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        self.stream.as_ref().unwrap().get_ref().0.get_timing_digest()
+        self.stream
+            .as_ref()
+            .unwrap()
+            .get_ref()
+            .0
+            .get_timing_digest()
     }
 }
 
 impl<S> GetProxyDigest for InnerStream<S>
-    where
-        S: GetProxyDigest,
+where
+    S: GetProxyDigest,
 {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
         if let Some(stream) = self.stream.as_ref() {

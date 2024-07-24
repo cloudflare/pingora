@@ -16,8 +16,8 @@
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 
-use crate::protocols::IO;
 use crate::protocols::tls::boringssl_openssl::TlsStream;
+use crate::protocols::IO;
 use crate::tls::ssl::ConnectConfiguration;
 
 /// Perform the TLS handshake for the given connection with the given configuration
@@ -32,16 +32,13 @@ pub async fn handshake<S: IO>(
     let mut stream = TlsStream::new(ssl, io)
         .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;
 
-    stream.connect().await
-        .map_err(|e| {
-            let err_msg = format!("TLS connect() failed: {e}, SNI: {domain}");
-            if let Some(context) = e.context {
-                Error::explain(e.etype,
-                               format!("{}, {}", err_msg, context.as_str()))
-            } else {
-                Error::explain(e.etype, err_msg)
-            }
-        })?;
+    stream.connect().await.map_err(|e| {
+        let err_msg = format!("TLS connect() failed: {e}, SNI: {domain}");
+        if let Some(context) = e.context {
+            Error::explain(e.etype, format!("{}, {}", err_msg, context.as_str()))
+        } else {
+            Error::explain(e.etype, err_msg)
+        }
+    })?;
     Ok(stream)
 }
-

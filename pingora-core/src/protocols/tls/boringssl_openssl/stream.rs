@@ -14,24 +14,24 @@
 
 //! BoringSSL & OpenSSL TLS stream specific implementation
 
-use std::pin::Pin;
-use std::sync::Arc;
 use async_trait::async_trait;
 use log::warn;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 
 use crate::listeners::ALPN;
-use crate::protocols::{GetProxyDigest, GetTimingDigest};
 use crate::protocols::digest::{GetSocketDigest, SocketDigest, TimingDigest};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::InnerTlsStream;
 use crate::protocols::tls::SslDigest;
-use crate::tls::tokio_ssl::SslStream;
+use crate::protocols::{GetProxyDigest, GetTimingDigest};
 use crate::tls::error::ErrorStack;
 use crate::tls::ext;
 use crate::tls::tokio_ssl;
+use crate::tls::tokio_ssl::SslStream;
 use crate::tls::{ssl, ssl::SslRef, ssl_sys::X509_V_ERR_INVALID_CALL};
 
 #[derive(Debug)]
@@ -64,12 +64,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
     async fn connect(&mut self) -> Result<()> {
         Self::clear_error();
         match Pin::new(&mut self.0).connect().await {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(err) => {
-                self.transform_ssl_error(err)
-            }
+            Ok(_) => Ok(()),
+            Err(err) => self.transform_ssl_error(err),
         }
     }
 
@@ -77,12 +73,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
     async fn accept(&mut self) -> Result<()> {
         Self::clear_error();
         match Pin::new(&mut self.0).accept().await {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(err) => {
-                self.transform_ssl_error(err)
-            }
+            Ok(_) => Ok(()),
+            Err(err) => self.transform_ssl_error(err),
         }
     }
 
@@ -136,8 +128,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
 }
 
 impl<S> GetSocketDigest for InnerStream<S>
-    where
-        S: GetSocketDigest,
+where
+    S: GetSocketDigest,
 {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
         self.0.get_ref().get_socket_digest()
@@ -148,8 +140,8 @@ impl<S> GetSocketDigest for InnerStream<S>
 }
 
 impl<S> GetTimingDigest for InnerStream<S>
-    where
-        S: GetTimingDigest,
+where
+    S: GetTimingDigest,
 {
     fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
         self.0.get_ref().get_timing_digest()
@@ -157,8 +149,8 @@ impl<S> GetTimingDigest for InnerStream<S>
 }
 
 impl<S> GetProxyDigest for InnerStream<S>
-    where
-        S: GetProxyDigest,
+where
+    S: GetProxyDigest,
 {
     fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
         self.0.get_ref().get_proxy_digest()

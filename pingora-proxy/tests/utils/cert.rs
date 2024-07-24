@@ -15,10 +15,13 @@
 use once_cell::sync::Lazy;
 use std::fs;
 
-#[cfg(not(feature = "rustls"))]
-use pingora_core::tls::{pkey::{PKey, Private}, x509::X509};
 #[cfg(feature = "rustls")]
 use pingora_core::tls::{load_pem_file_ca, load_pem_file_private_key};
+#[cfg(not(feature = "rustls"))]
+use pingora_core::tls::{
+    pkey::{PKey, Private},
+    x509::X509,
+};
 
 //pub static ROOT_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/root.crt"));
 //pub static ROOT_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/root.key"));
@@ -47,7 +50,10 @@ fn load_cert(path: &str) -> Vec<u8> {
 fn load_key(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
     let key_bytes = fs::read(path).unwrap();
-    PKey::private_key_from_pem(&key_bytes).unwrap().private_key_to_der().unwrap()
+    PKey::private_key_from_pem(&key_bytes)
+        .unwrap()
+        .private_key_to_der()
+        .unwrap()
 }
 
 #[cfg(feature = "rustls")]

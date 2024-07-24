@@ -19,23 +19,23 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use pingora_error::{Error, ErrorSource, ImmutStr, OrErr, Result};
 use pingora_error::ErrorType::InternalError;
-use pingora_rustls::{TlsAcceptor as RusTlsAcceptor, version};
+use pingora_error::{Error, ErrorSource, ImmutStr, OrErr, Result};
 use pingora_rustls::load_certs_key_file;
 use pingora_rustls::ServerConfig;
+use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
-use crate::listeners::ALPN;
 use crate::listeners::tls::{TlsAcceptor, TlsAcceptorBuilder};
+use crate::listeners::ALPN;
 
 pub(super) struct TlsAcceptorBuil {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
-    key_path: String
+    key_path: String,
 }
 
 struct TlsAcc {
-    acceptor: RusTlsAcceptor
+    acceptor: RusTlsAcceptor,
 }
 
 #[async_trait]
@@ -47,21 +47,29 @@ impl TlsAcceptor for TlsAcc {
 
 impl TlsAcceptorBuilder for TlsAcceptorBuil {
     fn build(self: Box<Self>) -> Box<dyn TlsAcceptor + Send + Sync> {
-        let (certs, key) = load_certs_key_file(&self.cert_path, &self.key_path)
-            .expect(format!("Failed to load provided certificates \"{}\" or key \"{}\".", self.cert_path, self.key_path).as_str());
+        let (certs, key) = load_certs_key_file(&self.cert_path, &self.key_path).expect(
+            format!(
+                "Failed to load provided certificates \"{}\" or key \"{}\".",
+                self.cert_path, self.key_path
+            )
+            .as_str(),
+        );
 
-        let mut config = ServerConfig::builder_with_protocol_versions(&vec![&version::TLS12, &version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| format!("Failed to create server listener config: {}", e))
-            .unwrap();
+        let mut config =
+            ServerConfig::builder_with_protocol_versions(&vec![&version::TLS12, &version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .explain_err(InternalError, |e| {
+                    format!("Failed to create server listener config: {}", e)
+                })
+                .unwrap();
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
         }
 
         Box::new(TlsAcc {
-            acceptor: RusTlsAcceptor::from(Arc::new(config))
+            acceptor: RusTlsAcceptor::from(Arc::new(config)),
         })
     }
     fn set_alpn(&mut self, alpn: ALPN) {
@@ -69,21 +77,28 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
     }
 
     fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         Ok(TlsAcceptorBuil {
             alpn_protocols: None,
             cert_path: cert_path.to_string(),
-            key_path: key_path.to_string()
+            key_path: key_path.to_string(),
         })
     }
 
     fn acceptor_with_callbacks() -> Result<Self>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         // TODO: verify if/how callback in handshake can be done using Rustls
-        Err(Error::create(InternalError,
-                          ErrorSource::Internal,
-                          Some(ImmutStr::from("Certificate callbacks are not supported with feature \"rustls\".")),
-                          None
+        Err(Error::create(
+            InternalError,
+            ErrorSource::Internal,
+            Some(ImmutStr::from(
+                "Certificate callbacks are not supported with feature \"rustls\".",
+            )),
+            None,
         ))
     }
 

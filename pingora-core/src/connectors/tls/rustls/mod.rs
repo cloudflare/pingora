@@ -19,29 +19,31 @@ use std::sync::Arc;
 
 use log::debug;
 
-use pingora_error::{Error, OrErr, Result};
 use pingora_error::ErrorType::{ConnectTimedout, InvalidCert};
-use pingora_rustls::{load_ca_file_into_store, load_certs_key_file, load_platform_certs_incl_env_into_store};
+use pingora_error::{Error, OrErr, Result};
+use pingora_rustls::version;
 use pingora_rustls::CertificateDer;
 use pingora_rustls::ClientConfig;
 use pingora_rustls::ClientConfig as RusTlsClientConfig;
 use pingora_rustls::PrivateKeyDer;
 use pingora_rustls::RootCertStore;
 use pingora_rustls::TlsConnector as RusTlsConnector;
-use pingora_rustls::version;
+use pingora_rustls::{
+    load_ca_file_into_store, load_certs_key_file, load_platform_certs_incl_env_into_store,
+};
 
 use crate::connectors::ConnectorOptions;
 use crate::listeners::ALPN;
-use crate::protocols::IO;
 use crate::protocols::tls::rustls::client::handshake;
 use crate::protocols::tls::TlsStream;
+use crate::protocols::IO;
 use crate::upstreams::peer::Peer;
 
-use super::{Connector, replace_leftmost_underscore, TlsConnectorContext};
+use super::{replace_leftmost_underscore, Connector, TlsConnectorContext};
 
 pub(crate) struct TlsConnectorCtx {
     config: RusTlsClientConfig,
-    ca_certs: RootCertStore
+    ca_certs: RootCertStore,
 }
 impl TlsConnectorContext for TlsConnectorCtx {
     fn as_any(&self) -> &dyn Any {
@@ -50,7 +52,7 @@ impl TlsConnectorContext for TlsConnectorCtx {
 
     fn build_connector(options: Option<ConnectorOptions>) -> Connector
     where
-        Self: Sized
+        Self: Sized,
     {
         // NOTE: Rustls only supports TLS 1.2 & 1.3
 
@@ -88,37 +90,35 @@ impl TlsConnectorContext for TlsConnectorCtx {
         let config = match certs_key {
             Some((certs, key)) => {
                 match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
-                    Ok(config) => { config }
+                    Ok(config) => config,
                     Err(err) => {
                         // TODO: is there a viable alternative to the panic?
                         // falling back to no client auth... does not seem to be reasonable.
-                        panic!("{}", format!("Failed to configure client auth cert/key. Error: {}", err));
+                        panic!(
+                            "{}",
+                            format!("Failed to configure client auth cert/key. Error: {}", err)
+                        );
                     }
                 }
             }
-            None => {
-                builder.with_no_client_auth()
-            }
+            None => builder.with_no_client_auth(),
         };
 
         Connector {
-            ctx: Arc::new(TlsConnectorCtx {
-                config,
-                ca_certs
-            }),
+            ctx: Arc::new(TlsConnectorCtx { config, ca_certs }),
         }
     }
 }
 
-pub(super)  async fn connect<T, P>(
+pub(super) async fn connect<T, P>(
     stream: T,
     peer: &P,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>
+    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
 ) -> Result<TlsStream<T>>
 where
     T: IO,
-    P: Peer + Send + Sync
+    P: Peer + Send + Sync,
 {
     let ctx = tls_ctx.as_any().downcast_ref::<TlsConnectorCtx>().unwrap();
     let mut config = ctx.config.clone();
@@ -129,7 +129,7 @@ where
 
     let key_pair = peer.get_client_cert_key();
     let updated_config: Option<ClientConfig> = match key_pair {
-        None => { None }
+        None => None,
         Some(key_arc) => {
             debug!("setting client cert and key");
 
@@ -138,20 +138,34 @@ where
             cert_chain.push(key_arc.leaf().to_owned());
 
             debug!("adding intermediate certificates to mTLS cert chain");
-            key_arc.intermediates().to_owned().iter()
+            key_arc
+                .intermediates()
+                .to_owned()
+                .iter()
                 .map(|i| i.to_vec())
                 .for_each(|i| cert_chain.push(i));
 
-            let certs: Vec<CertificateDer> = cert_chain.into_iter()
-                .map(|c| c.as_slice().to_owned().into()).collect();
-            let private_key: PrivateKeyDer = key_arc.key().as_slice().to_owned().try_into().unwrap();
+            let certs: Vec<CertificateDer> = cert_chain
+                .into_iter()
+                .map(|c| c.as_slice().to_owned().into())
+                .collect();
+            let private_key: PrivateKeyDer =
+                key_arc.key().as_slice().to_owned().try_into().unwrap();
 
-            let builder =
-                ClientConfig::builder_with_protocol_versions(&vec![&version::TLS12, &version::TLS13])
-                    .with_root_certificates(ctx.ca_certs.clone());
+            let builder = ClientConfig::builder_with_protocol_versions(&vec![
+                &version::TLS12,
+                &version::TLS13,
+            ])
+            .with_root_certificates(ctx.ca_certs.clone());
 
-            let updated_config = builder.with_client_auth_cert(certs, private_key)
-                .explain_err(InvalidCert, |e| format!("Failed to use peer cert/key to update Rustls config: {:?}",e))?;
+            let updated_config = builder
+                .with_client_auth_cert(certs, private_key)
+                .explain_err(InvalidCert, |e| {
+                    format!(
+                        "Failed to use peer cert/key to update Rustls config: {:?}",
+                        e
+                    )
+                })?;
             Some(updated_config)
         }
     };
