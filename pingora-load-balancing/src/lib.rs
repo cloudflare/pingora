@@ -482,7 +482,7 @@ mod test {
         let backends = Backends::new(Box::new(discovery));
 
         // fill in the backends
-        backends.update().await.unwrap();
+        backends.update(|_| {}).await.unwrap();
 
         let backend = backends.get_backend();
         assert!(backend.contains(&b1));
