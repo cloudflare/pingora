@@ -68,9 +68,13 @@ where
     H: Iterator<Item = (S, &'a Vec<u8>)>,
 {
     // TODO: valid that host doesn't have port
-    // TODO: support adding ad-hoc headers
 
-    let authority = format!("{host}:{port}");
+    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+
     let req = http::request::Builder::new()
         .version(http::Version::HTTP_11)
         .method(http::method::Method::CONNECT)
@@ -217,6 +221,19 @@ mod test_sync {
         assert_eq!(req.headers.get("Host").unwrap(), "pingora.org:123");
         assert_eq!(req.headers.get("foo").unwrap(), "bar");
     }
+
+    #[test]
+    fn test_generate_connect_header_ipv6() {
+        let mut headers = BTreeMap::new();
+        headers.insert(String::from("foo"), b"bar".to_vec());
+        let req = generate_connect_header("::1", 123, headers.iter()).unwrap();
+
+        assert_eq!(req.method, http::method::Method::CONNECT);
+        assert_eq!(req.uri.authority().unwrap(), "[::1]:123");
+        assert_eq!(req.headers.get("Host").unwrap(), "[::1]:123");
+        assert_eq!(req.headers.get("foo").unwrap(), "bar");
+    }
+
     #[test]
     fn test_request_to_wire_auth_form() {
         let new_request = http::Request::builder()
