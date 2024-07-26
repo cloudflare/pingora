@@ -46,7 +46,7 @@ jobs:
 
       - name: Run cargo clippy
         run: |
-          [[ ${{ matrix.toolchain }} == nightly ]] || cargo clippy --all-targets --all -- --deny=warnings
+          [[ ${{ matrix.toolchain }} == nightly ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
 
       - name: Run cargo audit
         run: |
