@@ -26,7 +26,7 @@ use super::Service;
 use crate::server::{ListenFds, ShutdownWatch};
 
 /// The background service interface
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 pub trait BackgroundService {
     /// This function is called when the pingora server tries to start all the
     /// services. The background service can return at anytime or wait for the

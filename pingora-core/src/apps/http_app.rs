@@ -28,7 +28,7 @@ use crate::protocols::Stream;
 use crate::server::ShutdownWatch;
 
 /// This trait defines how to map a request to a response
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 pub trait ServeHttp {
     /// Define the mapping from a request to a response.
     /// Note that the request header is already read, but the implementation needs to read the
@@ -42,7 +42,7 @@ pub trait ServeHttp {
 }
 
 // TODO: remove this in favor of HttpServer?
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 impl<SV> HttpServerApp for SV
 where
     SV: ServeHttp + Send + Sync,
@@ -128,7 +128,7 @@ impl<SV> HttpServer<SV> {
     }
 }
 
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 impl<SV> HttpServerApp for HttpServer<SV>
 where
     SV: ServeHttp + Send + Sync,

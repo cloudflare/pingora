@@ -18,8 +18,6 @@
 #![allow(clippy::match_wild_err_arm)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::upper_case_acronyms)]
-// enable nightly feature async trait so that the docs are cleaner
-#![cfg_attr(doc_async_trait, feature(async_fn_in_trait))]
 
 //! # Pingora
 //!

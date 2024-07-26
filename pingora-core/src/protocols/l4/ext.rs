@@ -369,13 +369,10 @@ fn wrap_os_connect_error(e: std::io::Error, context: String) -> Box<Error> {
             Error::because(InternalError, context, e)
         }
         _ => match e.raw_os_error() {
-            Some(code) => match code {
-                libc::ENETUNREACH | libc::EHOSTUNREACH => {
-                    Error::because(ConnectNoRoute, context, e)
-                }
-                _ => Error::because(ConnectError, context, e),
-            },
-            None => Error::because(ConnectError, context, e),
+            Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => {
+                Error::because(ConnectNoRoute, context, e)
+            }
+            _ => Error::because(ConnectError, context, e),
         },
     }
 }
