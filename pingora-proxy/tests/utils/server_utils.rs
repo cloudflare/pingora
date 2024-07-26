@@ -32,7 +32,7 @@ use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::utils::CertKey;
+use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
@@ -281,7 +281,7 @@ impl ProxyHttp for ExampleProxyHttp {
         let req = session.req_header();
         if req.headers.contains_key("x-uds-peer") {
             return Ok(Box::new(HttpPeer::new_uds(
-                "/tmp/nginx-test.sock",
+                "/tmp/pingora_nginx_test.sock",
                 false,
                 "".to_string(),
             )?));

@@ -13,35 +13,57 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
-use pingora_core::tls::pkey::{PKey, Private};
-use pingora_core::tls::x509::X509;
 use std::fs;
 
-pub static ROOT_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/root.crt"));
-pub static ROOT_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/root.key"));
-pub static INTERMEDIATE_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/intermediate.crt"));
-pub static INTERMEDIATE_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/intermediate.key"));
-pub static LEAF_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/leaf.crt"));
-pub static LEAF2_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/leaf2.crt"));
-pub static LEAF_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/leaf.key"));
-pub static LEAF2_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/leaf2.key"));
-pub static SERVER_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/server.crt"));
-pub static SERVER_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/key.pem"));
-pub static CURVE_521_TEST_KEY: Lazy<PKey<Private>> =
-    Lazy::new(|| load_key("keys/curve_test.521.key.pem"));
-pub static CURVE_521_TEST_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/curve_test.521.crt"));
-pub static CURVE_384_TEST_KEY: Lazy<PKey<Private>> =
-    Lazy::new(|| load_key("keys/curve_test.384.key.pem"));
-pub static CURVE_384_TEST_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/curve_test.384.crt"));
+#[cfg(feature = "rustls")]
+use pingora_core::tls::{load_pem_file_ca, load_pem_file_private_key};
+#[cfg(not(feature = "rustls"))]
+use pingora_core::tls::{
+    pkey::{PKey, Private},
+    x509::X509,
+};
 
-fn load_cert(path: &str) -> X509 {
+//pub static ROOT_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/root.crt"));
+//pub static ROOT_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/root.key"));
+pub static INTERMEDIATE_CERT: Lazy<Vec<u8>> = Lazy::new(|| load_cert("keys/intermediate.crt"));
+//pub static INTERMEDIATE_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/intermediate.key"));
+pub static LEAF_CERT: Lazy<Vec<u8>> = Lazy::new(|| load_cert("keys/leaf.crt"));
+pub static LEAF2_CERT: Lazy<Vec<u8>> = Lazy::new(|| load_cert("keys/leaf2.crt"));
+pub static LEAF_KEY: Lazy<Vec<u8>> = Lazy::new(|| load_key("keys/leaf.key"));
+pub static LEAF2_KEY: Lazy<Vec<u8>> = Lazy::new(|| load_key("keys/leaf2.key"));
+//pub static SERVER_CERT: Lazy<X509> = Lazy::new(|| load_cert("keys/server.crt"));
+//pub static SERVER_KEY: Lazy<PKey<Private>> = Lazy::new(|| load_key("keys/key.pem"));
+pub static CURVE_521_TEST_KEY: Lazy<Vec<u8>> =
+    Lazy::new(|| load_key("keys/curve_test.521.key.pem"));
+pub static CURVE_521_TEST_CERT: Lazy<Vec<u8>> = Lazy::new(|| load_cert("keys/curve_test.521.crt"));
+pub static CURVE_384_TEST_KEY: Lazy<Vec<u8>> =
+    Lazy::new(|| load_key("keys/curve_test.384.key.pem"));
+pub static CURVE_384_TEST_CERT: Lazy<Vec<u8>> = Lazy::new(|| load_cert("keys/curve_test.384.crt"));
+
+#[cfg(not(feature = "rustls"))]
+fn load_cert(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
     let cert_bytes = fs::read(path).unwrap();
-    X509::from_pem(&cert_bytes).unwrap()
+    X509::from_pem(&cert_bytes).unwrap().to_der().unwrap()
 }
-
-fn load_key(path: &str) -> PKey<Private> {
+#[cfg(not(feature = "rustls"))]
+fn load_key(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
     let key_bytes = fs::read(path).unwrap();
-    PKey::private_key_from_pem(&key_bytes).unwrap()
+    PKey::private_key_from_pem(&key_bytes)
+        .unwrap()
+        .private_key_to_der()
+        .unwrap()
+}
+
+#[cfg(feature = "rustls")]
+fn load_cert(path: &str) -> Vec<u8> {
+    let path = format!("{}/{path}", super::conf_dir());
+    load_pem_file_ca(&path)
+}
+
+#[cfg(feature = "rustls")]
+fn load_key(path: &str) -> Vec<u8> {
+    let path = format!("{}/{path}", super::conf_dir());
+    load_pem_file_private_key(&path)
 }

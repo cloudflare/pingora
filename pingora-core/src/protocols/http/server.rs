@@ -53,7 +53,7 @@ impl Session {
     /// else with the session.
     /// - `Ok(true)`: successful
     /// - `Ok(false)`: client exit without sending any bytes. This is normal on reused connection.
-    /// In this case the user should give up this session.
+    ///   In this case the user should give up this session.
     pub async fn read_request(&mut self) -> Result<bool> {
         match self {
             Self::H1(s) => {

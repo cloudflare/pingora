@@ -30,7 +30,7 @@ use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Shutdown, SocketDigest, Ssl, TimingDigest,
-    UniqueID,
+    UniqueID, IO,
 };
 use crate::upstreams::peer::Tracer;
 
@@ -208,6 +208,7 @@ impl UniqueID for Stream {
 }
 
 impl Ssl for Stream {}
+impl Ssl for Box<dyn IO + Send> {}
 
 #[async_trait]
 impl Shutdown for Stream {

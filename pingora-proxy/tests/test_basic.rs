@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod utils;
-
 use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
 
 use utils::server_utils::init;
+
+mod utils;
 
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
@@ -73,7 +73,12 @@ async fn test_h2_to_h1() {
         .build()
         .unwrap();
 
-    let res = client.get("https://127.0.0.1:6150").send().await.unwrap();
+    let res = client
+        .get("https://127.0.0.1:6150")
+        .header("sni", "openrusty.org")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
@@ -112,6 +117,7 @@ async fn test_h2_to_h2() {
 
     let res = client
         .get("https://127.0.0.1:6150")
+        .header("sni", "openrusty.org")
         .header("x-h2", "true")
         .send()
         .await
@@ -165,6 +171,7 @@ async fn test_h2c_to_h2c() {
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
+#[cfg(not(feature = "rustls"))]
 #[tokio::test]
 async fn test_h2_to_h2_host_override() {
     init();
@@ -200,6 +207,7 @@ async fn test_h2_to_h2_upload() {
 
     let res = client
         .get("https://127.0.0.1:6150/echo")
+        .header("sni", "openrusty.org")
         .header("x-h2", "true")
         .body(payload)
         .send()
@@ -223,6 +231,7 @@ async fn test_h2_to_h1_upload() {
 
     let res = client
         .get("https://127.0.0.1:6150/echo")
+        .header("sni", "openrusty.org")
         .body(payload)
         .send()
         .await
@@ -288,7 +297,10 @@ async fn test_simple_proxy_uds_peer() {
     assert!(is_specified_port(sockaddr.port()));
 
     assert_eq!(headers["x-upstream-client-addr"], "unset"); // unnamed UDS
-    assert_eq!(headers["x-upstream-server-addr"], "/tmp/nginx-test.sock");
+    assert_eq!(
+        headers["x-upstream-server-addr"],
+        "/tmp/pingora_nginx_test.sock"
+    );
 
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
@@ -419,6 +431,8 @@ async fn test_dropped_conn() {
     test_dropped_conn_post_body_over().await;
 }
 
+// currently not supported with Rustls implementaiton
+#[cfg(not(feature = "rustls"))]
 #[tokio::test]
 async fn test_tls_no_verify() {
     init();
@@ -448,6 +462,8 @@ async fn test_tls_verify_sni_not_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+// currently not supported with Rustls implementaiton
+#[cfg(not(feature = "rustls"))]
 #[tokio::test]
 async fn test_tls_none_verify_host() {
     init();

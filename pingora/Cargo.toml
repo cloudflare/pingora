@@ -60,6 +60,12 @@ boringssl = [
     "pingora-cache?/boringssl",
     "pingora-load-balancing?/boringssl",
 ]
+rustls = [
+    "pingora-core/rustls",
+    "pingora-proxy?/rustls",
+    "pingora-cache?/rustls",
+    "pingora-load-balancing?/rustls",
+]
 proxy = ["pingora-proxy"]
 lb = ["pingora-load-balancing", "proxy"]
 cache = ["pingora-cache"]

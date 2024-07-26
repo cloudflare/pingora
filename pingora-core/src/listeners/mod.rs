@@ -14,21 +14,24 @@
 
 //! The listening endpoints (TCP and TLS) and their configurations.
 
-mod l4;
-mod tls;
-
-use crate::protocols::Stream;
-use crate::server::ListenFds;
-
-use pingora_error::Result;
 use std::{fs::Permissions, sync::Arc};
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
-use tls::Acceptor;
-
-pub use crate::protocols::ssl::server::TlsAccept;
 pub use l4::{ServerAddress, TcpSocketOptions};
+use pingora_error::Result;
+use tls::Acceptor;
 pub use tls::{TlsSettings, ALPN};
+
+pub use crate::protocols::tls::server::TlsAccept;
+#[cfg(not(feature = "rustls"))]
+use crate::protocols::tls::TlsStream as TlsStreamProvider;
+#[cfg(feature = "rustls")]
+use crate::protocols::tls::TlsStream as TlsStreamProvider;
+use crate::protocols::{Stream, IO};
+use crate::server::ListenFds;
+
+mod l4;
+pub mod tls;
 
 struct TransportStackBuilder {
     l4: ServerAddress,
@@ -82,7 +85,8 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(self) -> Result<Stream> {
         if let Some(tls) = self.tls {
-            let tls_stream = tls.tls_handshake(self.l4).await?;
+            let tls_stream: TlsStreamProvider<Box<dyn IO + Send>> =
+                tls.handshake(Box::new(self.l4)).await?;
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))
@@ -182,10 +186,11 @@ impl Listeners {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::time::{sleep, Duration};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_listen_tcp() {

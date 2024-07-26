@@ -54,11 +54,22 @@ pub use pingora_error::{ErrorType::*, *};
 // If both openssl and boringssl are enabled, prefer boringssl.
 // This is to make sure that boringssl can override the default openssl feature
 // when this crate is used indirectly by other crates.
-#[cfg(feature = "boringssl")]
+#[cfg(all(not(feature = "rustls"), feature = "boringssl"))]
 pub use pingora_boringssl as tls;
 
-#[cfg(all(not(feature = "boringssl"), feature = "openssl"))]
+#[cfg(all(
+    not(feature = "rustls"),
+    not(feature = "boringssl"),
+    feature = "openssl"
+))]
 pub use pingora_openssl as tls;
+
+#[cfg(all(
+    not(feature = "boringssl"),
+    not(feature = "openssl"),
+    feature = "rustls"
+))]
+pub use pingora_rustls as tls;
 
 pub mod prelude {
     pub use crate::server::configuration::Opt;

@@ -18,14 +18,14 @@ mod digest;
 pub mod http;
 pub mod l4;
 pub mod raw_connect;
-pub mod ssl;
+pub mod tls;
 
 pub use digest::{
     Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
     TimingDigest,
 };
 pub use l4::ext::TcpKeepalive;
-pub use ssl::ALPN;
+pub use tls::ALPN;
 
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -48,19 +48,19 @@ pub trait UniqueID {
 /// Interface to get TLS info
 pub trait Ssl {
     /// Return the TLS info if the connection is over TLS
+    #[cfg(not(feature = "rustls"))]
     fn get_ssl(&self) -> Option<&crate::tls::ssl::SslRef> {
         None
     }
 
     /// Return the [`ssl::SslDigest`] for logging
-    fn get_ssl_digest(&self) -> Option<Arc<ssl::SslDigest>> {
+    fn get_ssl_digest(&self) -> Option<Arc<tls::SslDigest>> {
         None
     }
 
     /// Return selected ALPN if any
     fn selected_alpn_proto(&self) -> Option<ALPN> {
-        let ssl = self.get_ssl()?;
-        ALPN::from_wire_selected(ssl.selected_alpn_protocol()?)
+        None
     }
 }
 

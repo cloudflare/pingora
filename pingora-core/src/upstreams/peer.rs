@@ -32,10 +32,13 @@ use std::time::Duration;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
-use crate::tls::x509::X509;
-use crate::utils::{get_organization_unit, CertKey};
+#[cfg(not(feature = "rustls"))]
+use crate::utils::tls::boringssl_openssl::{get_not_after, get_organizational_unit};
+#[cfg(feature = "rustls")]
+use crate::utils::tls::rustls::{get_not_after, get_organizational_unit};
+use crate::utils::tls::CertKey;
 
-pub use crate::protocols::ssl::ALPN;
+pub use crate::protocols::tls::ALPN;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
@@ -66,7 +69,7 @@ pub trait Peer: Display + Clone {
     fn tls(&self) -> bool;
     /// The SNI to send, if TLS is used
     fn sni(&self) -> &str;
-    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
+    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
     /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
@@ -144,7 +147,7 @@ pub trait Peer: Display + Clone {
     /// Get the CA cert to use to validate the server cert.
     ///
     /// If not set, the default CAs will be used.
-    fn get_ca(&self) -> Option<&Arc<Box<[X509]>>> {
+    fn get_ca(&self) -> Option<&Arc<[Box<[u8]>]>> {
         match self.get_peer_options() {
             Some(opt) => opt.ca.as_ref(),
             None => None,
@@ -304,7 +307,7 @@ pub struct PeerOptions {
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
     pub alpn: ALPN,
-    pub ca: Option<Arc<Box<[X509]>>>,
+    pub ca: Option<Arc<[Box<[u8]>]>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
@@ -385,8 +388,8 @@ impl Display for PeerOptions {
                 write!(
                     f,
                     "CA: {}, expire: {},",
-                    get_organization_unit(ca).unwrap_or_default(),
-                    ca.not_after()
+                    get_organizational_unit(ca).unwrap_or_default(),
+                    get_not_after(ca),
                 )?;
             }
         }

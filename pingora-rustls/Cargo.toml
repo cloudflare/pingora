@@ -1,0 +1,31 @@
+[package]
+name = "pingora-rustls"
+version = "0.3.0"
+authors = ["Harald Gutmann <harald@gutmann.one>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "tls", "ssl", "pingora"]
+description = """
+RusTLS async APIs for Pingora.
+"""
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "pingora_rustls"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4.21"
+ring = "0.17.8"
+rustls = "0.23.12"
+rustls-native-certs = "0.7.1"
+rustls-pemfile = "2.1.2"
+rustls-pki-types = "1.7.0"
+tokio-rustls = "0.26.0"
+no_debug = "3.1.0"
+
+[dev-dependencies]
+tokio-test = "0.4.3"
+tokio = { workspace = true, features = ["full"] }

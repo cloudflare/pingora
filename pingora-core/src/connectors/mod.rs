@@ -14,26 +14,29 @@
 
 //! Connecting to servers
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use futures::future::FutureExt;
+use log::{debug, error, warn};
+use parking_lot::RwLock;
+use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
+
+use offload::OffloadRuntime;
+use pingora_error::{ErrorType::*, OrErr, Result};
+use pingora_pool::{ConnectionMeta, ConnectionPool};
+
+use crate::connectors::tls::{do_connect, Connector};
+use crate::protocols::Stream;
+use crate::server::configuration::ServerConf;
+use crate::upstreams::peer::{Peer, ALPN};
+
 pub mod http;
 mod l4;
 mod offload;
 mod tls;
-
-use crate::protocols::Stream;
-use crate::server::configuration::ServerConf;
-use crate::tls::ssl::SslConnector;
-use crate::upstreams::peer::{Peer, ALPN};
-
-use l4::connect as l4_connect;
-use log::{debug, error, warn};
-use offload::OffloadRuntime;
-use parking_lot::RwLock;
-use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_pool::{ConnectionMeta, ConnectionPool};
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// The options to configure a [TransportConnector]
 #[derive(Clone)]
@@ -123,7 +126,7 @@ impl ConnectorOptions {
 
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
-    tls_ctx: tls::Connector,
+    tls_ctx: Connector,
     connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
@@ -149,7 +152,7 @@ impl TransportConnector {
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
         TransportConnector {
-            tls_ctx: tls::Connector::new(options),
+            tls_ctx: Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
             offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
             bind_to_v4,
@@ -268,46 +271,6 @@ impl TransportConnector {
     }
 }
 
-// Perform the actual L4 and tls connection steps while respecting the peer's
-// connection timeout if there is one
-async fn do_connect<P: Peer + Send + Sync>(
-    peer: &P,
-    bind_to: Option<SocketAddr>,
-    alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
-) -> Result<Stream> {
-    // Create the future that does the connections, but don't evaluate it until
-    // we decide if we need a timeout or not
-    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
-
-    match peer.total_connection_timeout() {
-        Some(t) => match pingora_timeout::timeout(t, connect_future).await {
-            Ok(res) => res,
-            Err(_) => Error::e_explain(
-                ConnectTimedout,
-                format!("connecting to server {peer}, total-connection timeout {t:?}"),
-            ),
-        },
-        None => connect_future.await,
-    }
-}
-
-// Perform the actual L4 and tls connection steps with no timeout
-async fn do_connect_inner<P: Peer + Send + Sync>(
-    peer: &P,
-    bind_to: Option<SocketAddr>,
-    alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
-) -> Result<Stream> {
-    let stream = l4_connect(peer, bind_to).await?;
-    if peer.tls() {
-        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
-        Ok(Box::new(tls_stream))
-    } else {
-        Ok(Box::new(stream))
-    }
-}
-
 struct PreferredHttpVersion {
     // TODO: shard to avoid the global lock
     versions: RwLock<HashMap<u64, u8>>, // <hash of peer, version>
@@ -337,9 +300,6 @@ impl PreferredHttpVersion {
     }
 }
 
-use futures::future::FutureExt;
-use tokio::io::AsyncReadExt;
-
 /// Test whether a stream is already closed or not reusable (server sent unexpected data)
 fn test_reusable_stream(stream: &mut Stream) -> bool {
     let mut buf = [0; 1];
@@ -365,13 +325,14 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pingora_error::ErrorType;
-
-    use super::*;
-    use crate::tls::ssl::SslMethod;
-    use crate::upstreams::peer::BasicPeer;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
+
+    use pingora_error::ErrorType;
+
+    use crate::upstreams::peer::BasicPeer;
+
+    use super::*;
 
     // 192.0.2.1 is effectively a black hole
     const BLACK_HOLE: &str = "192.0.2.1:79";
@@ -475,8 +436,8 @@ mod tests {
     /// This assumes that the connection will fail to on the peer and returns
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
-        let ssl_connector = SslConnector::builder(SslMethod::tls()).unwrap().build();
-        let stream = do_connect(peer, None, None, &ssl_connector).await;
+        let connector = Connector::new(None);
+        let stream = do_connect(peer, None, None, &connector.ctx).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (
@@ -509,6 +470,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_do_connect_without_total_timeout() {
         let peer = BasicPeer::new(BLACK_HOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;

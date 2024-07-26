@@ -36,3 +36,4 @@ log = { workspace = true }
 default = ["openssl"]
 openssl = ["pingora-core/openssl"]
 boringssl = ["pingora-core/boringssl"]
+rustls = ["pingora-core/rustls"]

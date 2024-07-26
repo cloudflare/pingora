@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use log::debug;
-use pingora_error::{Error, ErrorType::*, OrErr, Result};
+//! BoringSSL & OpenSSL TLS connector specific implementation
+
+use std::any::Any;
 use std::sync::{Arc, Once};
 
-use super::ConnectorOptions;
-use crate::protocols::ssl::client::handshake;
-use crate::protocols::ssl::SslStream;
+use log::debug;
+
+use pingora_error::ErrorType::{ConnectTimedout, InternalError};
+use pingora_error::{Error, OrErr, Result};
+
+use crate::connectors::ConnectorOptions;
+use crate::listeners::ALPN;
+use crate::protocols::tls::boringssl_openssl::client::handshake;
+use crate::protocols::tls::TlsStream;
 use crate::protocols::IO;
 use crate::tls::ext::{
     add_host, clear_error_stack, ssl_add_chain_cert, ssl_set_groups_list,
@@ -29,7 +36,10 @@ use crate::tls::ext::{
 use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
-use crate::upstreams::peer::{Peer, ALPN};
+use crate::upstreams::peer::Peer;
+use crate::utils::tls::boringssl_openssl::{der_to_private_key, der_to_x509};
+
+use super::{replace_leftmost_underscore, Connector, TlsConnectorContext};
 
 const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
     :AES-256-GCM-SHA384\
@@ -60,6 +70,7 @@ const SIGALG_LIST: &str = "ECDSA_SECP256R1_SHA256\
     :RSA_PKCS1_SHA512\
     :RSA_PKCS1_SHA1\
     :ECDSA_SECP521R1_SHA512";
+
 /**
  * Enabled curves for ECDHE (signature key exchange).
  * As of 4/10/2023, the only addition to boringssl's defaults is SECP521R1.
@@ -83,13 +94,17 @@ fn init_ssl_cert_env_vars() {
     INIT_CA_ENV.call_once(openssl_probe::init_ssl_cert_env_vars);
 }
 
-#[derive(Clone)]
-pub struct Connector {
-    pub(crate) ctx: Arc<SslConnector>, // Arc to support clone
-}
+pub(crate) struct TlsConnectorCtx(pub(crate) SslConnector);
 
-impl Connector {
-    pub fn new(options: Option<ConnectorOptions>) -> Self {
+impl TlsConnectorContext for TlsConnectorCtx {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn build_connector(options: Option<ConnectorOptions>) -> Connector
+    where
+        Self: Sized,
+    {
         let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
         // TODO: make these conf
         // Set supported ciphers.
@@ -142,49 +157,23 @@ impl Connector {
         }
 
         Connector {
-            ctx: Arc::new(builder.build()),
+            ctx: Arc::new(TlsConnectorCtx(builder.build())),
         }
     }
 }
 
-/*
-    OpenSSL considers underscores in hostnames non-compliant.
-    We replace the underscore in the leftmost label as we must support these
-    hostnames for wildcard matches and we have not patched OpenSSL.
-
-    https://github.com/openssl/openssl/issues/12566
-
-    > The labels must follow the rules for ARPANET host names.  They must
-    > start with a letter, end with a letter or digit, and have as interior
-    > characters only letters, digits, and hyphen.  There are also some
-    > restrictions on the length.  Labels must be 63 characters or less.
-    - https://datatracker.ietf.org/doc/html/rfc1034#section-3.5
-*/
-fn replace_leftmost_underscore(sni: &str) -> Option<String> {
-    // wildcard is only leftmost label
-    if let Some((leftmost, rest)) = sni.split_once('.') {
-        // if not a subdomain or leftmost does not contain underscore return
-        if !rest.contains('.') || !leftmost.contains('_') {
-            return None;
-        }
-        // we have a subdomain, replace underscores
-        let leftmost = leftmost.replace('_', "-");
-        return Some(format!("{leftmost}.{rest}"));
-    }
-    None
-}
-
-pub(crate) async fn connect<T, P>(
+pub(super) async fn connect<T, P>(
     stream: T,
     peer: &P,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
-) -> Result<SslStream<T>>
+    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
+) -> Result<TlsStream<T>>
 where
     T: IO,
     P: Peer + Send + Sync,
 {
-    let mut ssl_conf = tls_ctx.configure().unwrap();
+    let ctx = tls_ctx.as_any().downcast_ref::<TlsConnectorCtx>().unwrap();
+    let mut ssl_conf = ctx.0.configure().unwrap();
 
     ssl_set_renegotiate_mode_freely(&mut ssl_conf);
 
@@ -192,8 +181,9 @@ where
     // TODO: store X509Store in the peer directly
     if let Some(ca_list) = peer.get_ca() {
         let mut store_builder = X509StoreBuilder::new().unwrap();
-        for ca in &***ca_list {
-            store_builder.add_cert(ca.clone()).unwrap();
+        for ca in &**ca_list {
+            let cert = der_to_x509(ca)?;
+            store_builder.add_cert(cert).unwrap();
         }
         ssl_set_verify_cert_store(&mut ssl_conf, &store_builder.build())
             .or_err(InternalError, "failed to load cert store")?;
@@ -202,16 +192,17 @@ where
     // Set up client cert/key
     if let Some(key_pair) = peer.get_client_cert_key() {
         debug!("setting client cert and key");
-        ssl_use_certificate(&mut ssl_conf, key_pair.leaf())
-            .or_err(InternalError, "invalid client cert")?;
-        ssl_use_private_key(&mut ssl_conf, key_pair.key())
-            .or_err(InternalError, "invalid client key")?;
+        let leaf = der_to_x509(key_pair.leaf())?;
+        ssl_use_certificate(&mut ssl_conf, &leaf).or_err(InternalError, "invalid client cert")?;
+        let key = der_to_private_key(key_pair.key())?;
+        ssl_use_private_key(&mut ssl_conf, &key).or_err(InternalError, "invalid client key")?;
 
         let intermediates = key_pair.intermediates();
         if !intermediates.is_empty() {
             debug!("adding intermediate certificates for mTLS chain");
             for int in intermediates {
-                ssl_add_chain_cert(&mut ssl_conf, int)
+                let cert = der_to_x509(int)?;
+                ssl_add_chain_cert(&mut ssl_conf, &cert)
                     .or_err(InternalError, "invalid intermediate client cert")?;
             }
         }
@@ -281,43 +272,5 @@ where
             ),
         },
         None => connect_future.await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_replace_leftmost_underscore() {
-        let none_cases = [
-            "",
-            "some",
-            "some.com",
-            "1.1.1.1:5050",
-            "dog.dot.com",
-            "dog.d_t.com",
-            "dog.dot.c_m",
-            "d_g.com",
-            "_",
-            "dog.c_m",
-        ];
-
-        for case in none_cases {
-            assert!(replace_leftmost_underscore(case).is_none(), "{}", case);
-        }
-
-        assert_eq!(
-            Some("bb-b.some.com".to_string()),
-            replace_leftmost_underscore("bb_b.some.com")
-        );
-        assert_eq!(
-            Some("a-a-a.some.com".to_string()),
-            replace_leftmost_underscore("a_a_a.some.com")
-        );
-        assert_eq!(
-            Some("-.some.com".to_string()),
-            replace_leftmost_underscore("_.some.com")
-        );
     }
 }

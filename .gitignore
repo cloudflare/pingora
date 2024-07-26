@@ -6,3 +6,5 @@ dhat-heap.json
 .idea
 .cover
 bleeper.user.toml
+pingora-proxy/tests/keys/server.crt
+pingora-proxy/tests/utils/conf/keys/server.crt
