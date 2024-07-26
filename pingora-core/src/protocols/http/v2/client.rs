@@ -349,6 +349,19 @@ impl Http2Session {
         if self.ping_timedout() {
             e.etype = PING_TIMEDOUT;
         }
+
+        // is_go_away: retry via another connection, this connection is being teardown
+        // should retry
+        if self.response_header.is_none() {
+            if let Some(err) = e.root_cause().downcast_ref::<h2::Error>() {
+                if err.is_go_away()
+                    && err.is_remote()
+                    && err.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
+                {
+                    e.retry = true.into();
+                }
+            }
+        }
         e
     }
 }
@@ -367,7 +380,7 @@ pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> 
 /* Types of errors during h2 header read
  1. peer requests to downgrade to h1, mostly IIS server for NTLM: we will downgrade and retry
  2. peer sends invalid h2 frames, usually sending h1 only header: we will downgrade and retry
- 3. peer sends GO_AWAY(NO_ERROR) on reused conn, usually hit http2_max_requests: we will retry
+ 3. peer sends GO_AWAY(NO_ERROR) connection is being shut down: we will retry
  4. peer IO error on reused conn, usually firewall kills old conn: we will retry
  5. All other errors will terminate the request
 */
@@ -393,9 +406,8 @@ fn handle_read_header_error(e: h2::Error) -> Box<Error> {
         && e.reason().map_or(false, |r| r == h2::Reason::NO_ERROR)
     {
         // is_go_away: retry via another connection, this connection is being teardown
-        // only retry if the connection is reused
         let mut err = Error::because(H2Error, "while reading h2 header", e);
-        err.retry = RetryType::ReusedOnly;
+        err.retry = true.into();
         err
     } else if e.is_io() {
         // is_io: typical if a previously reused connection silently drops it
