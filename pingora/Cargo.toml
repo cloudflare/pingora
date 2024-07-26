@@ -63,3 +63,4 @@ boringssl = [
 proxy = ["pingora-proxy"]
 lb = ["pingora-load-balancing", "proxy"]
 cache = ["pingora-cache"]
+time = []

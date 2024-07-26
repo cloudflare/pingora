@@ -133,9 +133,9 @@ pub struct HttpHealthCheck {
     /// Whether the underlying TCP/TLS connection can be reused across checks.
     ///
     /// * `false` will make sure that every health check goes through TCP (and TLS) handshakes.
-    /// Established connections sometimes hide the issue of firewalls and L4 LB.
+    ///   Established connections sometimes hide the issue of firewalls and L4 LB.
     /// * `true` will try to reuse connections across checks, this is the more efficient and fast way
-    /// to perform health checks.
+    ///   to perform health checks.
     pub reuse_connection: bool,
     /// The request header to send to the backend
     pub req: RequestHeader,

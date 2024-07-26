@@ -28,7 +28,7 @@ use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
 
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
 pub trait ServerApp {
     /// Whenever a new connection is established, this function will be called with the established
@@ -62,7 +62,7 @@ pub struct HttpServerOptions {
 }
 
 /// This trait defines the interface of an HTTP application.
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 pub trait HttpServerApp {
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
@@ -95,7 +95,7 @@ pub trait HttpServerApp {
     async fn http_cleanup(&self) {}
 }
 
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 impl<T> ServerApp for T
 where
     T: HttpServerApp + Send + Sync + 'static,
