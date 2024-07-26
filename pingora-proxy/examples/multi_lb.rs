@@ -18,7 +18,7 @@ use std::sync::Arc;
 use pingora_core::{prelude::*, services::background::GenBackgroundService};
 use pingora_load_balancing::{
     health_check::TcpHealthCheck,
-    selection::{BackendIter, BackendSelection, RoundRobin},
+    selection::{BackendSelection, RoundRobin},
     LoadBalancer,
 };
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
@@ -56,7 +56,6 @@ impl ProxyHttp for Router {
 fn build_cluster_service<S>(upstreams: &[&str]) -> GenBackgroundService<LoadBalancer<S>>
 where
     S: BackendSelection + 'static,
-    S::Iter: BackendIter,
 {
     let mut cluster = LoadBalancer::try_from_iter(upstreams).unwrap();
     cluster.set_health_check(TcpHealthCheck::new());
