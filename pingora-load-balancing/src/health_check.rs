@@ -446,8 +446,10 @@ mod test {
                 unhealthy_count: unhealthy_count.clone(),
             };
             let bob = Box::new(ob);
-            let mut tcp_check = TcpHealthCheck::default();
-            tcp_check.health_changed_callback = Some(bob);
+            let tcp_check = TcpHealthCheck {
+                health_changed_callback: Some(bob),
+                ..Default::default()
+            };
 
             let discovery = discovery::Static::default();
             let mut backends = Backends::new(Box::new(discovery));
