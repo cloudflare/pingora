@@ -35,9 +35,6 @@
 //!
 //! See `examples/load_balancer.rs` for a detailed example.
 
-// enable nightly feature async trait so that the docs are cleaner
-#![cfg_attr(doc_async_trait, feature(async_fn_in_trait))]
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::FutureExt;

@@ -53,7 +53,7 @@ impl Session {
     /// else with the session.
     /// - `Ok(true)`: successful
     /// - `Ok(false)`: client exit without sending any bytes. This is normal on reused connection.
-    /// In this case the user should give up this session.
+    ///   In this case the user should give up this session.
     pub async fn read_request(&mut self) -> Result<bool> {
         match self {
             Self::H1(s) => {
@@ -215,6 +215,19 @@ impl Session {
         match self {
             Self::H1(s) => s.set_min_send_rate(rate),
             Self::H2(_) => {}
+        }
+    }
+
+    /// Sets whether we ignore writing informational responses downstream.
+    ///
+    /// For HTTP/1.1 this is a noop if the response is Upgrade or Continue and
+    /// Expect: 100-continue was set on the request.
+    ///
+    /// This is a noop for h2 because informational responses are always ignored.
+    pub fn set_ignore_info_resp(&mut self, ignore: bool) {
+        match self {
+            Self::H1(s) => s.set_ignore_info_resp(ignore),
+            Self::H2(_) => {} // always ignored
         }
     }
 

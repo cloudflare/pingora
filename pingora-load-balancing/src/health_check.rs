@@ -154,9 +154,9 @@ pub struct HttpHealthCheck {
     /// Whether the underlying TCP/TLS connection can be reused across checks.
     ///
     /// * `false` will make sure that every health check goes through TCP (and TLS) handshakes.
-    /// Established connections sometimes hide the issue of firewalls and L4 LB.
+    ///   Established connections sometimes hide the issue of firewalls and L4 LB.
     /// * `true` will try to reuse connections across checks, this is the more efficient and fast way
-    /// to perform health checks.
+    ///   to perform health checks.
     pub reuse_connection: bool,
     /// The request header to send to the backend
     pub req: RequestHeader,
@@ -350,6 +350,7 @@ mod test {
     use super::*;
     use crate::{discovery, Backends, SocketAddr};
     use async_trait::async_trait;
+    use http::Extensions;
 
     #[tokio::test]
     async fn test_tcp_check() {
@@ -358,6 +359,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_ok());
@@ -365,6 +367,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:79".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_err());
@@ -376,6 +379,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tls_check.check(&backend).await.is_ok());
@@ -388,6 +392,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(https_check.check(&backend).await.is_ok());
@@ -410,6 +415,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         http_check.check(&backend).await.unwrap();
