@@ -461,7 +461,7 @@ mod test {
             let mut backends = Backends::new(Box::new(discovery));
             backends.set_health_check(Box::new(tcp_check));
             let result = new_good_backends();
-            backends.do_update(result.0, result.1);
+            backends.do_update(result.0, result.1, |_backend: Arc<BTreeSet<Backend>>| {});
             // the backend is ready
             assert!(backends.ready(&good_backend));
 
@@ -487,7 +487,7 @@ mod test {
             let mut backends = Backends::new(Box::new(discovery));
             backends.set_health_check(Box::new(https_check));
             let result = new_good_backends();
-            backends.do_update(result.0, result.1);
+            backends.do_update(result.0, result.1, |_backend: Arc<BTreeSet<Backend>>| {});
             // the backend is ready
             assert!(backends.ready(&good_backend));
             // run health check
