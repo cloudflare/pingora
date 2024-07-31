@@ -29,6 +29,8 @@ rand = "0"
 tokio = { workspace = true }
 futures = "0"
 log = { workspace = true }
+http = { workspace = true }
+derivative = "2.2.0"
 
 [dev-dependencies]
 

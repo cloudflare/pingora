@@ -29,7 +29,7 @@ use crate::protocols::http::ServerSession;
 /// collected via the [Prometheus](https://docs.rs/prometheus/) crate;
 pub struct PrometheusHttpApp;
 
-#[cfg_attr(not(doc_async_trait), async_trait)]
+#[async_trait]
 impl ServeHttp for PrometheusHttpApp {
     async fn response(&self, _http_session: &mut ServerSession) -> Response<Vec<u8>> {
         let encoder = TextEncoder::new();

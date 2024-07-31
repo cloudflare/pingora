@@ -16,8 +16,14 @@
 //! This crate provides common service discovery, health check and load balancing
 //! algorithms for proxies to use.
 
+// https://github.com/mcarton/rust-derivative/issues/112
+// False positive for macro generated code
+#![allow(clippy::non_canonical_partial_ord_impl)]
+
 use arc_swap::ArcSwap;
+use derivative::Derivative;
 use futures::FutureExt;
+pub use http::Extensions;
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::collections::hash_map::DefaultHasher;
@@ -45,13 +51,26 @@ pub mod prelude {
 }
 
 /// [Backend] represents a server to proxy or connect to.
-#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Derivative)]
+#[derivative(Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct Backend {
     /// The address to the backend server.
     pub addr: SocketAddr,
     /// The relative weight of the server. Load balancing algorithms will
     /// proportionally distributed traffic according to this value.
     pub weight: usize,
+
+    /// The extension field to put arbitrary data to annotate the Backend.
+    /// The data added here is opaque to this crate hence the data is ignored by
+    /// functionalities of this crate. For example, two backends with the same
+    /// [SocketAddr] and the same weight but different `ext` data are considered
+    /// identical.
+    /// See [Extensions] for how to add and read the data.
+    #[derivative(PartialEq = "ignore")]
+    #[derivative(PartialOrd = "ignore")]
+    #[derivative(Hash = "ignore")]
+    #[derivative(Ord = "ignore")]
+    pub ext: Extensions,
 }
 
 impl Backend {
@@ -137,8 +156,17 @@ impl Backends {
         self.health_check = Some(hc.into())
     }
 
-    /// Return true when the new is different from the current set of backends
-    fn do_update(&self, new_backends: BTreeSet<Backend>, enablement: HashMap<u64, bool>) -> bool {
+    /// Updates backends when the new is different from the current set,
+    /// the callback will be invoked when the new set of backend is different
+    /// from the current one so that the caller can update the selector accordingly.
+    fn do_update<F>(
+        &self,
+        new_backends: BTreeSet<Backend>,
+        enablement: HashMap<u64, bool>,
+        callback: F,
+    ) where
+        F: Fn(Arc<BTreeSet<Backend>>),
+    {
         if (**self.backends.load()) != new_backends {
             let old_health = self.health.load();
             let mut health = HashMap::with_capacity(new_backends.len());
@@ -154,10 +182,14 @@ impl Backends {
                 health.insert(hash_key, backend_health);
             }
 
-            // TODO: put backend and health under 1 ArcSwap so that this update is atomic
-            self.backends.store(Arc::new(new_backends));
+            // TODO: put this all under 1 ArcSwap so the update is atomic
+            // It's important the `callback()` executes first since computing selector backends might
+            // be expensive. For example, if a caller checks `backends` to see if any are available
+            // they may encounter false positives if the selector isn't ready yet.
+            let new_backends = Arc::new(new_backends);
+            callback(new_backends.clone());
+            self.backends.store(new_backends);
             self.health.store(Arc::new(health));
-            true
         } else {
             // no backend change, just check enablement
             for (hash_key, backend_enabled) in enablement.iter() {
@@ -167,7 +199,6 @@ impl Backends {
                     backend_health.enable(*backend_enabled);
                 }
             }
-            false
         }
     }
 
@@ -206,12 +237,15 @@ impl Backends {
 
     /// Call the service discovery method to update the collection of backends.
     ///
-    /// Return `true` when the new collection is different from the current set of backends.
-    /// This return value is useful to tell the caller when to rebuild things that are expensive to
-    /// update, such as consistent hashing rings.
-    pub async fn update(&self) -> Result<bool> {
+    /// The callback will be invoked when the new set of backend is different
+    /// from the current one so that the caller can update the selector accordingly.
+    pub async fn update<F>(&self, callback: F) -> Result<()>
+    where
+        F: Fn(Arc<BTreeSet<Backend>>),
+    {
         let (new_backends, enablement) = self.discovery.discover().await?;
-        Ok(self.do_update(new_backends, enablement))
+        self.do_update(new_backends, enablement, callback);
+        Ok(())
     }
 
     /// Run health check on all backends if it is set.
@@ -327,11 +361,9 @@ where
     /// This function will be called every `update_frequency` if this [LoadBalancer] instance
     /// is running as a background service.
     pub async fn update(&self) -> Result<()> {
-        if self.backends.update().await? {
-            self.selector
-                .store(Arc::new(S::build(&self.backends.get_backend())))
-        }
-        Ok(())
+        self.backends
+            .update(|backends| self.selector.store(Arc::new(S::build(&backends))))
+            .await
     }
 
     /// Return the first healthy [Backend] according to the selection algorithm and the
@@ -385,6 +417,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
     use super::*;
     use async_trait::async_trait;
 
@@ -415,10 +449,20 @@ mod test {
         backends.set_health_check(check);
 
         // true: new backend discovered
-        assert!(backends.update().await.unwrap());
+        let updated = AtomicBool::new(false);
+        backends
+            .update(|_| updated.store(true, Relaxed))
+            .await
+            .unwrap();
+        assert!(updated.load(Relaxed));
 
         // false: no new backend discovered
-        assert!(!backends.update().await.unwrap());
+        let updated = AtomicBool::new(false);
+        backends
+            .update(|_| updated.store(true, Relaxed))
+            .await
+            .unwrap();
+        assert!(!updated.load(Relaxed));
 
         backends.run_health_check(false).await;
 
@@ -430,6 +474,31 @@ mod test {
         assert!(backends.ready(&good1));
         assert!(backends.ready(&good2));
         assert!(!backends.ready(&bad));
+    }
+    #[tokio::test]
+    async fn test_backends_with_ext() {
+        let discovery = discovery::Static::default();
+        let mut b1 = Backend::new("1.1.1.1:80").unwrap();
+        b1.ext.insert(true);
+        let mut b2 = Backend::new("1.0.0.1:80").unwrap();
+        b2.ext.insert(1u8);
+        discovery.add(b1.clone());
+        discovery.add(b2.clone());
+
+        let backends = Backends::new(Box::new(discovery));
+
+        // fill in the backends
+        backends.update(|_| {}).await.unwrap();
+
+        let backend = backends.get_backend();
+        assert!(backend.contains(&b1));
+        assert!(backend.contains(&b2));
+
+        let b2 = backend.first().unwrap();
+        assert_eq!(b2.ext.get::<u8>(), Some(&1));
+
+        let b1 = backend.last().unwrap();
+        assert_eq!(b1.ext.get::<bool>(), Some(&true));
     }
 
     #[tokio::test]
@@ -456,7 +525,14 @@ mod test {
         let discovery = TestDiscovery(discovery);
 
         let backends = Backends::new(Box::new(discovery));
-        assert!(backends.update().await.unwrap());
+
+        // true: new backend discovered
+        let updated = AtomicBool::new(false);
+        backends
+            .update(|_| updated.store(true, Relaxed))
+            .await
+            .unwrap();
+        assert!(updated.load(Relaxed));
 
         let backend = backends.get_backend();
         assert!(backend.contains(&good1));
@@ -483,12 +559,59 @@ mod test {
         backends.set_health_check(check);
 
         // true: new backend discovered
-        assert!(backends.update().await.unwrap());
+        let updated = AtomicBool::new(false);
+        backends
+            .update(|_| updated.store(true, Relaxed))
+            .await
+            .unwrap();
+        assert!(updated.load(Relaxed));
 
         backends.run_health_check(true).await;
 
         assert!(backends.ready(&good1));
         assert!(backends.ready(&good2));
         assert!(!backends.ready(&bad));
+    }
+
+    mod thread_safety {
+        use super::*;
+
+        struct MockDiscovery {
+            expected: usize,
+        }
+        #[async_trait]
+        impl ServiceDiscovery for MockDiscovery {
+            async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+                let mut d = BTreeSet::new();
+                let mut m = HashMap::with_capacity(self.expected);
+                for i in 0..self.expected {
+                    let b = Backend::new(&format!("1.1.1.1:{i}")).unwrap();
+                    m.insert(i as u64, true);
+                    d.insert(b);
+                }
+                Ok((d, m))
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_consistency() {
+            let expected = 3000;
+            let discovery = MockDiscovery { expected };
+            let lb = Arc::new(LoadBalancer::<selection::Consistent>::from_backends(
+                Backends::new(Box::new(discovery)),
+            ));
+            let lb2 = lb.clone();
+
+            tokio::spawn(async move {
+                assert!(lb2.update().await.is_ok());
+            });
+            let mut backend_count = 0;
+            while backend_count == 0 {
+                let backends = lb.backends();
+                backend_count = backends.backends.load_full().len();
+            }
+            assert_eq!(backend_count, expected);
+            assert!(lb.select_with(b"test", 1, |_, _| true).is_some());
+        }
     }
 }

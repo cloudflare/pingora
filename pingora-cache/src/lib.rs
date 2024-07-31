@@ -344,10 +344,10 @@ impl HttpCache {
     /// - `storage`: the cache storage backend that implements [storage::Storage]
     /// - `eviction`: optionally the eviction manager, without it, nothing will be evicted from the storage
     /// - `predictor`: optionally a cache predictor. The cache predictor predicts whether something is likely
-    /// to be cacheable or not. This is useful because the proxy can apply different types of optimization to
-    /// cacheable and uncacheable requests.
+    ///   to be cacheable or not. This is useful because the proxy can apply different types of optimization to
+    ///   cacheable and uncacheable requests.
     /// - `cache_lock`: optionally a cache lock which handles concurrent lookups to the same asset. Without it
-    /// such lookups will all be allowed to fetch the asset independently.
+    ///   such lookups will all be allowed to fetch the asset independently.
     pub fn enable(
         &mut self,
         storage: &'static (dyn storage::Storage + Sync),

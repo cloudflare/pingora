@@ -55,3 +55,10 @@ serde_yaml = "0.8"
 default = ["openssl"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl"]
 boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl"]
+
+# or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "doc_async_trait"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }
