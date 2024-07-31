@@ -70,6 +70,7 @@ impl Backend {
         Ok(Backend {
             addr: SocketAddr::Inet(addr),
             weight,
+            ext: Extensions::new(),
         })
         // TODO: UDS
     }
