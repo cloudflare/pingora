@@ -493,7 +493,8 @@ impl HttpCache {
         match self.phase {
             // from CacheKey: set state to miss during cache lookup
             // from Bypass: response became cacheable, set state to miss to cache
-            CachePhase::CacheKey | CachePhase::Bypass => {
+            // from Stale: waited for cache lock, then retried and found asset was gone
+            CachePhase::CacheKey | CachePhase::Bypass | CachePhase::Stale => {
                 self.phase = CachePhase::Miss;
                 self.inner_mut().traces.start_miss_span();
             }
