@@ -21,7 +21,9 @@
 use crate::apps::ServerApp;
 use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TlsSettings, TransportStack};
 use crate::protocols::Stream;
-use crate::server::{ListenFds, ShutdownWatch};
+#[cfg(unix)]
+use crate::server::ListenFds;
+use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
@@ -83,6 +85,7 @@ impl<A> Service<A> {
     ///
     /// Optionally take a permission of the socket file. The default is read and write access for
     /// everyone (0o666).
+    #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
         self.listeners.add_uds(addr, perm);
     }
@@ -201,9 +204,16 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
 
 #[async_trait]
 impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
-    async fn start_service(&mut self, fds: Option<ListenFds>, shutdown: ShutdownWatch) {
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] fds: Option<ListenFds>,
+        shutdown: ShutdownWatch,
+    ) {
         let runtime = current_handle();
-        let endpoints = self.listeners.build(fds);
+        let endpoints = self.listeners.build(
+            #[cfg(unix)]
+            fds,
+        );
         let app_logic = self
             .app_logic
             .take()

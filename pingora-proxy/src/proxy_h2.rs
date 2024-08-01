@@ -192,16 +192,14 @@ impl<SV> HttpProxy<SV> {
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        #[cfg(windows)]
+        let raw = client_session.fd() as std::os::windows::io::RawSocket;
+        #[cfg(unix)]
+        let raw = client_session.fd();
+
         if let Err(e) = self
             .inner
-            .connected_to_upstream(
-                session,
-                reused,
-                peer,
-                client_session.fd(),
-                client_session.digest(),
-                ctx,
-            )
+            .connected_to_upstream(session, reused, peer, raw, client_session.digest(), ctx)
             .await
         {
             return (false, Some(e));

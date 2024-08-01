@@ -62,7 +62,10 @@ impl Default for TimingDigest {
 #[derive(Debug)]
 /// The interface to return socket-related information
 pub struct SocketDigest {
+    #[cfg(unix)]
     raw_fd: std::os::unix::io::RawFd,
+    #[cfg(windows)]
+    raw_sock: std::os::windows::io::RawSocket,
     /// Remote socket address
     pub peer_addr: OnceCell<Option<SocketAddr>>,
     /// Local socket address
@@ -70,6 +73,7 @@ pub struct SocketDigest {
 }
 
 impl SocketDigest {
+    #[cfg(unix)]
     pub fn from_raw_fd(raw_fd: std::os::unix::io::RawFd) -> SocketDigest {
         SocketDigest {
             raw_fd,
@@ -78,15 +82,39 @@ impl SocketDigest {
         }
     }
 
+    #[cfg(windows)]
+    pub fn from_raw_socket(raw_sock: std::os::windows::io::RawSocket) -> SocketDigest {
+        SocketDigest {
+            raw_sock,
+            peer_addr: OnceCell::new(),
+            local_addr: OnceCell::new(),
+        }
+    }
+    #[cfg(unix)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
         self.peer_addr
             .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, true))
             .as_ref()
     }
 
+    #[cfg(windows)]
+    pub fn peer_addr(&self) -> Option<&SocketAddr> {
+        self.peer_addr
+            .get_or_init(|| SocketAddr::from_raw_socket(self.raw_sock, true))
+            .as_ref()
+    }
+
+    #[cfg(unix)]
     pub fn local_addr(&self) -> Option<&SocketAddr> {
         self.local_addr
             .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, false))
+            .as_ref()
+    }
+
+    #[cfg(windows)]
+    pub fn local_addr(&self) -> Option<&SocketAddr> {
+        self.local_addr
+            .get_or_init(|| SocketAddr::from_raw_socket(self.raw_sock, false))
             .as_ref()
     }
 
@@ -94,6 +122,7 @@ impl SocketDigest {
         self.local_addr().and_then(|p| p.as_inet()).is_some()
     }
 
+    #[cfg(unix)]
     pub fn tcp_info(&self) -> Option<TCP_INFO> {
         if self.is_inet() {
             get_tcp_info(self.raw_fd).ok()
@@ -102,9 +131,28 @@ impl SocketDigest {
         }
     }
 
+    #[cfg(windows)]
+    pub fn tcp_info(&self) -> Option<TCP_INFO> {
+        if self.is_inet() {
+            get_tcp_info(self.raw_sock).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
     pub fn get_recv_buf(&self) -> Option<usize> {
         if self.is_inet() {
             get_recv_buf(self.raw_fd).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn get_recv_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_recv_buf(self.raw_sock).ok()
         } else {
             None
         }

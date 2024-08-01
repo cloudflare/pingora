@@ -15,21 +15,26 @@
 //! Server process and configuration management
 
 pub mod configuration;
+#[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
 pub(crate) mod transfer_fd;
 
+#[cfg(unix)]
 use daemon::daemonize;
 use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
 use std::sync::Arc;
 use std::thread;
+#[cfg(unix)]
 use tokio::signal::unix;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{sleep, Duration};
 
 use crate::services::Service;
 use configuration::{Opt, ServerConf};
+#[cfg(unix)]
 pub use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
@@ -49,6 +54,7 @@ enum ShutdownType {
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
+#[cfg(unix)]
 pub type ListenFds = Arc<Mutex<Fds>>;
 
 /// The server object
@@ -58,6 +64,7 @@ pub type ListenFds = Arc<Mutex<Fds>>;
 /// zero downtime upgrade and error reporting.
 pub struct Server {
     services: Vec<Box<dyn Service>>,
+    #[cfg(unix)]
     listen_fds: Option<ListenFds>,
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
@@ -75,6 +82,7 @@ pub struct Server {
 // TODO: delete the pid when exit
 
 impl Server {
+    #[cfg(unix)]
     async fn main_loop(&self) -> ShutdownType {
         // waiting for exit signal
         // TODO: there should be a signal handling function
@@ -142,7 +150,7 @@ impl Server {
 
     fn run_service(
         mut service: Box<dyn Service>,
-        fds: Option<ListenFds>,
+        #[cfg(unix)] fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
@@ -152,12 +160,19 @@ impl Server {
     {
         let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
         service_runtime.get_handle().spawn(async move {
-            service.start_service(fds, shutdown).await;
+            service
+                .start_service(
+                    #[cfg(unix)]
+                    fds,
+                    shutdown,
+                )
+                .await;
             info!("service exited.")
         });
         service_runtime
     }
 
+    #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
         let mut fds = Fds::new();
         if upgrade {
@@ -185,6 +200,7 @@ impl Server {
 
         Server {
             services: vec![],
+            #[cfg(unix)]
             listen_fds: None,
             shutdown_watch: tx,
             shutdown_recv: rx,
@@ -225,6 +241,7 @@ impl Server {
 
         Ok(Server {
             services: vec![],
+            #[cfg(unix)]
             listen_fds: None,
             shutdown_watch: tx,
             shutdown_recv: rx,
@@ -267,6 +284,7 @@ impl Server {
         }
 
         // load fds
+        #[cfg(unix)]
         match self.load_fds(self.options.as_ref().map_or(false, |o| o.upgrade)) {
             Ok(_) => {
                 info!("Bootstrap done");
@@ -294,11 +312,16 @@ impl Server {
 
         let conf = self.configuration.as_ref();
 
+        #[cfg(unix)]
         if conf.daemon {
             info!("Daemonizing the server");
             fast_timeout::pause_for_fork();
             daemonize(&self.configuration);
             fast_timeout::unpause();
+        }
+        #[cfg(windows)]
+        if conf.daemon {
+            panic!("Daemonizing under windows is not supported");
         }
 
         /* only init sentry in release builds */
@@ -314,6 +337,7 @@ impl Server {
             let threads = service.threads().unwrap_or(conf.threads);
             let runtime = Server::run_service(
                 service,
+                #[cfg(unix)]
                 self.listen_fds.clone(),
                 self.shutdown_recv.clone(),
                 threads,
@@ -325,7 +349,10 @@ impl Server {
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
         let server_runtime = Server::create_runtime("Server", 1, true);
+        #[cfg(unix)]
         let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
+        #[cfg(windows)]
+        let shutdown_type = ShutdownType::Graceful;
 
         if matches!(shutdown_type, ShutdownType::Graceful) {
             let exit_timeout = self
