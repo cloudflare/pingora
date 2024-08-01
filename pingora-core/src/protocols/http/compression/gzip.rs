@@ -12,15 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::Encode;
+use super::{Encode, COMPRESSION_ERROR};
 
 use bytes::Bytes;
-use flate2::write::GzEncoder;
-use pingora_error::Result;
+use flate2::write::{GzDecoder, GzEncoder};
+use pingora_error::{OrErr, Result};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-// TODO: unzip
+pub struct Decompressor {
+    decompress: GzDecoder<Vec<u8>>,
+    total_in: usize,
+    total_out: usize,
+    duration: Duration,
+}
+
+impl Decompressor {
+    pub fn new() -> Self {
+        Decompressor {
+            decompress: GzDecoder::new(vec![]),
+            total_in: 0,
+            total_out: 0,
+            duration: Duration::new(0, 0),
+        }
+    }
+}
+
+impl Encode for Decompressor {
+    fn encode(&mut self, input: &[u8], end: bool) -> Result<Bytes> {
+        const MAX_INIT_COMPRESSED_SIZE_CAP: usize = 4 * 1024;
+        const ESTIMATED_COMPRESSION_RATIO: usize = 3; // estimated 2.5-3x compression
+        let start = Instant::now();
+        self.total_in += input.len();
+        // cap the buf size amplification, there is a DoS risk of always allocate
+        // 3x the memory of the input buffer
+        let reserve_size = if input.len() < MAX_INIT_COMPRESSED_SIZE_CAP {
+            input.len() * ESTIMATED_COMPRESSION_RATIO
+        } else {
+            input.len()
+        };
+        self.decompress.get_mut().reserve(reserve_size);
+        self.decompress
+            .write_all(input)
+            .or_err(COMPRESSION_ERROR, "while decompress Gzip")?;
+        // write to vec will never fail, only possible error is that the input data
+        // was not actually gzip compressed
+        if end {
+            self.decompress
+                .try_finish()
+                .or_err(COMPRESSION_ERROR, "while decompress Gzip")?;
+        }
+        self.total_out += self.decompress.get_ref().len();
+        self.duration += start.elapsed();
+        Ok(std::mem::take(self.decompress.get_mut()).into()) // into() Bytes will drop excess capacity
+    }
+
+    fn stat(&self) -> (&'static str, usize, usize, Duration) {
+        ("de-gzip", self.total_in, self.total_out, self.duration)
+    }
+}
 
 pub struct Compressor {
     // TODO: enum for other compression algorithms
@@ -66,6 +116,20 @@ impl Encode for Compressor {
 }
 
 use std::ops::{Deref, DerefMut};
+impl Deref for Decompressor {
+    type Target = GzDecoder<Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.decompress
+    }
+}
+
+impl DerefMut for Decompressor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.decompress
+    }
+}
+
 impl Deref for Compressor {
     type Target = GzEncoder<Vec<u8>>;
 
@@ -99,5 +163,22 @@ mod tests_stream {
         assert_eq!(compressor.total_out, compressed.len());
 
         assert!(compressor.get_ref().is_empty());
+    }
+
+    #[test]
+    fn gunzip_data() {
+        let mut decompressor = Decompressor::new();
+
+        let compressed_bytes = &[
+            0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 255, 75, 76, 74, 78, 73, 77, 75, 7, 0, 166, 106,
+            42, 49, 7, 0, 0, 0,
+        ];
+        let decompressed = decompressor.encode(compressed_bytes, true).unwrap();
+
+        assert_eq!(&decompressed[..], b"abcdefg");
+        assert_eq!(decompressor.total_in, compressed_bytes.len());
+        assert_eq!(decompressor.total_out, decompressed.len());
+
+        assert!(decompressor.get_ref().is_empty());
     }
 }

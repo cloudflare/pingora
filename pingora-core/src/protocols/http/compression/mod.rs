@@ -67,10 +67,10 @@ pub struct ResponseCompressionCtx(CtxInner);
 
 enum CtxInner {
     HeaderPhase {
-        decompress_enable: bool,
         // Store the preferred list to compare with content-encoding
         accept_encoding: Vec<Algorithm>,
         encoding_levels: [u32; Algorithm::COUNT],
+        decompress_enable: [bool; Algorithm::COUNT],
     },
     BodyPhase(Option<Box<dyn Encode + Send + Sync>>),
 }
@@ -81,9 +81,9 @@ impl ResponseCompressionCtx {
     /// The `decompress_enable` flag will tell the ctx to decompress if needed.
     pub fn new(compression_level: u32, decompress_enable: bool) -> Self {
         Self(CtxInner::HeaderPhase {
-            decompress_enable,
             accept_encoding: Vec::new(),
             encoding_levels: [compression_level; Algorithm::COUNT],
+            decompress_enable: [decompress_enable; Algorithm::COUNT],
         })
     }
 
@@ -93,9 +93,9 @@ impl ResponseCompressionCtx {
         match &self.0 {
             CtxInner::HeaderPhase {
                 decompress_enable,
-                accept_encoding: _,
                 encoding_levels: levels,
-            } => levels.iter().any(|l| *l != 0) || *decompress_enable,
+                ..
+            } => levels.iter().any(|l| *l != 0) || decompress_enable.iter().any(|d| *d),
             CtxInner::BodyPhase(c) => c.is_some(),
         }
     }
@@ -104,11 +104,7 @@ impl ResponseCompressionCtx {
     /// algorithm name, in bytes, out bytes, time took for the compression
     pub fn get_info(&self) -> Option<(&'static str, usize, usize, Duration)> {
         match &self.0 {
-            CtxInner::HeaderPhase {
-                decompress_enable: _,
-                accept_encoding: _,
-                encoding_levels: _,
-            } => None,
+            CtxInner::HeaderPhase { .. } => None,
             CtxInner::BodyPhase(c) => c.as_ref().map(|c| c.stat()),
         }
     }
@@ -119,9 +115,8 @@ impl ResponseCompressionCtx {
     pub fn adjust_level(&mut self, new_level: u32) {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                decompress_enable: _,
-                accept_encoding: _,
                 encoding_levels: levels,
+                ..
             } => {
                 *levels = [new_level; Algorithm::COUNT];
             }
@@ -135,9 +130,8 @@ impl ResponseCompressionCtx {
     pub fn adjust_algorithm_level(&mut self, algorithm: Algorithm, new_level: u32) {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                decompress_enable: _,
-                accept_encoding: _,
                 encoding_levels: levels,
+                ..
             } => {
                 levels[algorithm.index()] = new_level;
             }
@@ -145,17 +139,29 @@ impl ResponseCompressionCtx {
         }
     }
 
-    /// Adjust the decompression flag.
+    /// Adjust the decompression flag for all compression algorithms.
     /// # Panic
     /// This function will panic if it has already started encoding the response body.
     pub fn adjust_decompression(&mut self, enabled: bool) {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                decompress_enable,
-                accept_encoding: _,
-                encoding_levels: _,
+                decompress_enable, ..
             } => {
-                *decompress_enable = enabled;
+                *decompress_enable = [enabled; Algorithm::COUNT];
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
+    /// Adjust the decompression flag for a specific algorithm.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn adjust_algorithm_decompression(&mut self, algorithm: Algorithm, enabled: bool) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase {
+                decompress_enable, ..
+            } => {
+                decompress_enable[algorithm.index()] = enabled;
             }
             CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
         }
@@ -208,7 +214,9 @@ impl ResponseCompressionCtx {
                 let encoder = match action {
                     Action::Noop => None,
                     Action::Compress(algorithm) => algorithm.compressor(levels[algorithm.index()]),
-                    Action::Decompress(algorithm) => algorithm.decompressor(*decompress_enable),
+                    Action::Decompress(algorithm) => {
+                        algorithm.decompressor(decompress_enable[algorithm.index()])
+                    }
                 };
                 if encoder.is_some() {
                     adjust_response_header(resp, &action);
@@ -317,6 +325,7 @@ impl Algorithm {
             None
         } else {
             match self {
+                Self::Gzip => Some(Box::new(gzip::Decompressor::new())),
                 Self::Brotli => Some(Box::new(brotli::Decompressor::new())),
                 _ => None, // not implemented
             }
