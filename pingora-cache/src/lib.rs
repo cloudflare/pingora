@@ -77,6 +77,8 @@ pub enum CachePhase {
     Miss,
     /// A staled (expired) asset is found
     Stale,
+    /// A staled (expired) asset was found, but another request is revalidating it
+    StaleUpdating,
     /// A staled (expired) asset was found, so a fresh one was fetched
     Expired,
     /// A staled (expired) asset was found, and it was revalidated to be fresh
@@ -96,6 +98,7 @@ impl CachePhase {
             CachePhase::Hit => "hit",
             CachePhase::Miss => "miss",
             CachePhase::Stale => "stale",
+            CachePhase::StaleUpdating => "stale-updating",
             CachePhase::Expired => "expired",
             CachePhase::Revalidated => "revalidated",
             CachePhase::RevalidatedNoCache(_) => "revalidated-nocache",
@@ -260,7 +263,7 @@ impl HttpCache {
         use CachePhase::*;
         match self.phase {
             Disabled(_) | Bypass | Miss | Expired | Revalidated | RevalidatedNoCache(_) => true,
-            Hit | Stale => false,
+            Hit | Stale | StaleUpdating => false,
             Uninit | CacheKey => false, // invalid states for this call, treat them as false to keep it simple
         }
     }
@@ -509,6 +512,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::Hit
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => self.inner_mut().body_reader.as_mut().unwrap(),
             _ => panic!("wrong phase {:?}", self.phase),
@@ -544,6 +548,7 @@ impl HttpCache {
             | CachePhase::Miss
             | CachePhase::Expired
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => {
                 let inner = self.inner_mut();
@@ -786,6 +791,14 @@ impl HttpCache {
         // TODO: remove this asset from cache once finished?
     }
 
+    /// Mark this asset as stale, but being updated separately from this request.
+    pub fn set_stale_updating(&mut self) {
+        match self.phase {
+            CachePhase::Stale => self.phase = CachePhase::StaleUpdating,
+            _ => panic!("wrong phase {:?}", self.phase),
+        }
+    }
+
     /// Update the variance of the [CacheMeta].
     ///
     /// Note that this process may change the lookup `key`, and eventually (when the asset is
@@ -854,6 +867,7 @@ impl HttpCache {
         match self.phase {
             // TODO: allow in Bypass phase?
             CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Expired
             | CachePhase::Hit
             | CachePhase::Revalidated
@@ -882,6 +896,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::Miss
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Expired
             | CachePhase::Hit
             | CachePhase::Revalidated
@@ -1006,7 +1021,7 @@ impl HttpCache {
 
     /// Whether this request's cache hit is staled
     fn has_staled_asset(&self) -> bool {
-        self.phase == CachePhase::Stale
+        matches!(self.phase, CachePhase::Stale | CachePhase::StaleUpdating)
     }
 
     /// Whether this asset is staled and stale if error is allowed

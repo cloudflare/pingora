@@ -473,6 +473,9 @@ impl ProxyHttp for ExampleProxyCache {
                 CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
                 CachePhase::Miss => upstream_response.insert_header("x-cache-status", "miss")?,
                 CachePhase::Stale => upstream_response.insert_header("x-cache-status", "stale")?,
+                CachePhase::StaleUpdating => {
+                    upstream_response.insert_header("x-cache-status", "stale-updating")?
+                }
                 CachePhase::Expired => {
                     upstream_response.insert_header("x-cache-status", "expired")?
                 }
