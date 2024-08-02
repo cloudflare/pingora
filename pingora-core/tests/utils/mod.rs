@@ -78,6 +78,7 @@ fn entry_point(opt: Option<Opt>) {
     my_server.bootstrap();
 
     let mut listeners = Listeners::tcp("0.0.0.0:6145");
+    #[cfg(unix)]
     listeners.add_uds("/tmp/echo.sock", None);
 
     let mut tls_settings =

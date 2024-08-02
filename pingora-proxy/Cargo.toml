@@ -34,6 +34,9 @@ once_cell = { workspace = true }
 clap = { version = "3.2.25", features = ["derive"] }
 regex = "1"
 
+[target.'cfg(unix)'.dev-dependencies]
+hyperlocal = "0.8"
+
 [dev-dependencies]
 reqwest = { version = "0.11", features = [
     "gzip",
@@ -41,7 +44,6 @@ reqwest = { version = "0.11", features = [
 ], default-features = false }
 tokio-test = "0.4"
 env_logger = "0.9"
-hyperlocal = "0.8"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
 pingora-load-balancing = { version = "0.3.0", path = "../pingora-load-balancing" }

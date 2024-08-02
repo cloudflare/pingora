@@ -23,7 +23,9 @@
 
 use async_trait::async_trait;
 
-use crate::server::{ListenFds, ShutdownWatch};
+#[cfg(unix)]
+use crate::server::ListenFds;
+use crate::server::ShutdownWatch;
 
 pub mod background;
 pub mod listening;
@@ -39,7 +41,11 @@ pub trait Service: Sync + Send {
     /// the collection, the service should create its own listening sockets and then put them into
     /// the collection in order for them to be passed to the next server.
     /// - `shutdown`: the shutdown signal this server would receive.
-    async fn start_service(&mut self, fds: Option<ListenFds>, mut shutdown: ShutdownWatch);
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] fds: Option<ListenFds>,
+        mut shutdown: ShutdownWatch,
+    );
 
     /// The name of the service, just for logging and naming the threads assigned to this service
     ///

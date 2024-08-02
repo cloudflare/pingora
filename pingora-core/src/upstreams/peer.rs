@@ -23,14 +23,17 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr as InetSocketAddr, ToSocketAddrs as ToInetSocketAddrs};
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
-use std::os::unix::prelude::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::{net::SocketAddr as UnixSocketAddr, prelude::AsRawFd};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::connectors::L4Connect;
 use crate::protocols::l4::socket::SocketAddr;
+#[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
 use crate::tls::x509::X509;
@@ -186,8 +189,14 @@ pub trait Peer: Display + Clone {
             .unwrap_or_default()
     }
 
+    #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
+    }
+    #[cfg(windows)]
+    fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
+        use crate::protocols::ConnSockReusable;
+        self.address().check_sock_match(sock)
     }
 
     fn get_tracer(&self) -> Option<Tracer> {
@@ -211,6 +220,7 @@ impl BasicPeer {
     }
 
     /// Create a new [`BasicPeer`] with the given path to a Unix domain socket.
+    #[cfg(unix)]
     pub fn new_uds<P: AsRef<Path>>(path: P) -> Result<Self> {
         let addr = SocketAddr::Unix(
             UnixSocketAddr::from_pathname(path.as_ref())
@@ -450,6 +460,7 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
+    #[cfg(unix)]
     pub fn new_uds(path: &str, tls: bool, sni: String) -> Result<Self> {
         let addr = SocketAddr::Unix(
             UnixSocketAddr::from_pathname(Path::new(path)).or_err(SocketError, "invalid path")?,
@@ -552,11 +563,22 @@ impl Peer for HttpPeer {
         self.proxy.as_ref()
     }
 
+    #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         if let Some(proxy) = self.get_proxy() {
             proxy.next_hop.check_fd_match(fd)
         } else {
             self.address().check_fd_match(fd)
+        }
+    }
+    #[cfg(windows)]
+    fn matches_sock<V: AsRawSocket>(&self, sock: V) -> bool {
+        use crate::protocols::ConnSockReusable;
+
+        if let Some(proxy) = self.get_proxy() {
+            panic!("windows do not support peers with proxy")
+        } else {
+            self.address().check_sock_match(sock)
         }
     }
 

@@ -18,6 +18,7 @@ mod l4;
 mod tls;
 
 use crate::protocols::Stream;
+#[cfg(unix)]
 use crate::server::ListenFds;
 
 use pingora_error::Result;
@@ -36,10 +37,11 @@ struct TransportStackBuilder {
 }
 
 impl TransportStackBuilder {
-    pub fn build(&mut self, upgrade_listeners: Option<ListenFds>) -> TransportStack {
+    pub fn build(&mut self, #[cfg(unix)] upgrade_listeners: Option<ListenFds>) -> TransportStack {
         TransportStack {
             l4: ListenerEndpoint::new(self.l4.clone()),
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            #[cfg(unix)]
             upgrade_listeners,
         }
     }
@@ -49,6 +51,7 @@ pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
     // listeners sent from the old process for graceful upgrade
+    #[cfg(unix)]
     upgrade_listeners: Option<ListenFds>,
 }
 
@@ -58,7 +61,12 @@ impl TransportStack {
     }
 
     pub async fn listen(&mut self) -> Result<()> {
-        self.l4.listen(self.upgrade_listeners.take()).await
+        self.l4
+            .listen(
+                #[cfg(unix)]
+                self.upgrade_listeners.take(),
+            )
+            .await
     }
 
     pub async fn accept(&mut self) -> Result<UninitializedStream> {
@@ -109,6 +117,7 @@ impl Listeners {
     }
 
     /// Create a new [`Listeners`] with a Unix domain socket endpoint from the given string.
+    #[cfg(unix)]
     pub fn uds(addr: &str, perm: Option<Permissions>) -> Self {
         let mut listeners = Self::new();
         listeners.add_uds(addr, perm);
@@ -136,6 +145,7 @@ impl Listeners {
     }
 
     /// Add a Unix domain socket endpoint to `self`.
+    #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
         self.add_address(ServerAddress::Uds(addr.into(), perm));
     }
@@ -168,10 +178,18 @@ impl Listeners {
         self.stacks.push(TransportStackBuilder { l4, tls })
     }
 
-    pub(crate) fn build(&mut self, upgrade_listeners: Option<ListenFds>) -> Vec<TransportStack> {
+    pub(crate) fn build(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+    ) -> Vec<TransportStack> {
         self.stacks
             .iter_mut()
-            .map(|b| b.build(upgrade_listeners.clone()))
+            .map(|b| {
+                b.build(
+                    #[cfg(unix)]
+                    upgrade_listeners.clone(),
+                )
+            })
             .collect()
     }
 
@@ -194,7 +212,10 @@ mod test {
         let mut listeners = Listeners::tcp(addr1);
         listeners.add_tcp(addr2);
 
-        let listeners = listeners.build(None);
+        let listeners = listeners.build(
+            #[cfg(unix)]
+            None,
+        );
         assert_eq!(listeners.len(), 2);
         for mut listener in listeners {
             tokio::spawn(async move {
@@ -220,7 +241,13 @@ mod test {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
-        let mut listener = listeners.build(None).pop().unwrap();
+        let mut listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .pop()
+            .unwrap();
 
         tokio::spawn(async move {
             listener.listen().await.unwrap();

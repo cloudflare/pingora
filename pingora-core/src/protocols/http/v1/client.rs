@@ -28,7 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::HttpTask;
-use crate::protocols::{Digest, SocketAddr, Stream, UniqueID};
+use crate::protocols::{Digest, SocketAddr, Stream, UniqueID, UniqueIDType};
 use crate::utils::{BufRef, KVRef};
 
 /// The HTTP 1.x client session
@@ -717,7 +717,7 @@ pub(crate) fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
 }
 
 impl UniqueID for HttpSession {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         self.underlying_stream.id()
     }
 }
