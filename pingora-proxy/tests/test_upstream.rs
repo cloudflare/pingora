@@ -1373,7 +1373,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         // sleep just a little to make sure the req above gets the cache lock
@@ -1387,7 +1387,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         let task3 = tokio::spawn(async move {
@@ -1399,7 +1399,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1436,7 +1436,7 @@ mod test_cache {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "stale");
+        assert_eq!(headers["x-cache-status"], "stale-updating");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         // wait for the background request to finish
