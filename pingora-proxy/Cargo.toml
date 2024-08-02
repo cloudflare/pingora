@@ -44,6 +44,7 @@ env_logger = "0.9"
 hyperlocal = "0.8"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
+pingora-limits = { version = "0.3.0", path = "../pingora-limits" }
 pingora-load-balancing = { version = "0.3.0", path = "../pingora-load-balancing" }
 prometheus = "0"
 futures-util = "0.3"
