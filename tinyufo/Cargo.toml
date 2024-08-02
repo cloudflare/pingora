@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ahash = { workspace = true }
-flurry = "<0.5.0" # Try not to require Rust 1.71
+flurry = "0.5"
 parking_lot = "0"
 crossbeam-queue = "0"
 crossbeam-skiplist = "0"
@@ -28,7 +28,7 @@ lru = "0"
 zipf = "7"
 moka = { version = "0", features = ["sync"] }
 dhat = "0"
-quick_cache = "0.4"
+quick_cache = "0.6"
 triomphe = "<=0.1.11" # 0.1.12 requires Rust 1.76
 
 [[bench]]
