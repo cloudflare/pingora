@@ -58,6 +58,9 @@ pub use pingora_boringssl as tls;
 #[cfg(all(not(feature = "boringssl"), feature = "openssl"))]
 pub use pingora_openssl as tls;
 
+#[cfg(all(not(feature = "boringssl"), not(feature = "openssl")))]
+pub mod tls;
+
 pub mod prelude {
     pub use crate::server::configuration::Opt;
     pub use crate::server::Server;
