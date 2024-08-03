@@ -28,6 +28,8 @@ use pingora_cache::{
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
+use pingora_core::protocols::http::client::HttpSession;
+use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
@@ -108,7 +110,7 @@ fn response_filter_common(
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttps {
     type CTX = CTX;
-    fn new_ctx(&self) -> Self::CTX {
+    fn new_ctx(&self, session: &Session) -> Self::CTX {
         CTX::default()
     }
 
@@ -205,7 +207,7 @@ pub struct ExampleProxyHttp {}
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
-    fn new_ctx(&self) -> Self::CTX {
+    fn new_ctx(&self, session: &Session) -> Self::CTX {
         CTX::default()
     }
 
@@ -338,7 +340,7 @@ pub struct ExampleProxyCache {}
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
     type CTX = CacheCTX;
-    fn new_ctx(&self) -> Self::CTX {
+    fn new_ctx(&self, session: &Session) -> Self::CTX {
         CacheCTX {
             upstream_status: None,
         }

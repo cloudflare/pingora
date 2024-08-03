@@ -97,7 +97,7 @@ pub struct HttpProxy<SV> {
 }
 
 impl<SV> HttpProxy<SV> {
-    fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+    pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
@@ -688,8 +688,8 @@ where
         session.set_keepalive(None);
 
         session.subrequest_ctx.replace(sub_req_ctx);
+        let ctx = self.inner.new_ctx(&session);
         trace!("processing subrequest");
-        let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await;
         trace!("subrequest done");
     }
@@ -707,7 +707,6 @@ where
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let session = Box::new(session);
-
         // TODO: keepalive pool, use stack
         let mut session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
@@ -722,7 +721,7 @@ where
             session.set_keepalive(Some(60));
         }
 
-        let ctx = self.inner.new_ctx();
+        let ctx = self.inner.new_ctx(&session);
         self.process_request(session, ctx).await
     }
 

@@ -43,7 +43,7 @@ fn check_beta_user(req: &pingora_http::RequestHeader) -> bool {
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = MyCtx;
-    fn new_ctx(&self) -> Self::CTX {
+    fn new_ctx(&self, _session: &Session) -> Self::CTX {
         MyCtx { beta_user: false }
     }
 

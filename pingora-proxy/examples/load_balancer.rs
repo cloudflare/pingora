@@ -30,7 +30,7 @@ pub struct LB(Arc<LoadBalancer<RoundRobin>>);
 #[async_trait]
 impl ProxyHttp for LB {
     type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self, _session: &Session) -> Self::CTX {}
 
     async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
         let upstream = self
