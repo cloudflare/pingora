@@ -348,12 +348,8 @@ impl HttpSession {
         format!(
             "{} {}, Host: {}",
             self.request_header.method,
-            self.request_header.uri,
-            self.request_header
-                .headers
-                .get(header::HOST)
-                .map(|v| String::from_utf8_lossy(v.as_bytes()))
-                .unwrap_or_default()
+            self.request_header.uri.path(),
+            self.request_header.uri.host().unwrap_or_default(),
         )
     }
 
