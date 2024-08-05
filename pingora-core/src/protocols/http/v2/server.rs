@@ -346,10 +346,16 @@ impl HttpSession {
     /// Return a string `$METHOD $PATH $HOST`. Mostly for logging and debug purpose
     pub fn request_summary(&self) -> String {
         format!(
-            "{} {}, Host: {}",
+            "{} {}, Host: {}:{}",
             self.request_header.method,
             self.request_header.uri.path(),
             self.request_header.uri.host().unwrap_or_default(),
+            self.req_header()
+                .uri
+                .port()
+                .as_ref()
+                .map(|port| port.as_str())
+                .unwrap_or_default()
         )
     }
 
