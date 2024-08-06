@@ -179,6 +179,7 @@ pub fn get_fds_from<P>(_path: &P, _payload: &mut [u8]) -> Result<(Vec<RawFd>, us
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
+    log::error!("Upgrade is not currently supported outside of Linux platforms");
     Err(Errno::ECONNREFUSED)
 }
 
