@@ -191,6 +191,13 @@ where
                         }
                     }
                     None => {
+                        // double check in this point in case some thread has already finished lookup
+                        let (result, cache_state) = self.inner.get(key);
+                        if let Some(result) = result {
+                            /* cache hit */
+                            return (Ok(result), cache_state);
+                        }
+
                         let new_lock = CacheLock::new_arc();
                         let new_lock2 = new_lock.clone();
                         lockers.insert(hashed_key, new_lock2);
