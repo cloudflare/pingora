@@ -130,7 +130,7 @@ impl CacheKey {
 
 /// Storage optimized cache key to keep in memory or in storage
 // 16 bytes + 8 bytes (+16 * u8) + user_tag.len() + 16 Bytes (Box<str>)
-#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CompactCacheKey {
     pub primary: HashBinary,
     // save 8 bytes for non-variance but waste 8 bytes for variance vs, store flat 16 bytes
