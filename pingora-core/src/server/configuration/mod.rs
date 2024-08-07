@@ -137,7 +137,7 @@ pub struct Opt {
 
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[clap(long, hidden = true)]
+    #[clap(long, hide = true)]
     pub nocapture: bool,
 
     /// Test the configuration and exit
