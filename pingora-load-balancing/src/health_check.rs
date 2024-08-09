@@ -24,6 +24,8 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// [HealthObserve] is an interface for observing health changes of backends,
+/// this is what's used for our health observation callback.
 #[async_trait]
 pub trait HealthObserve {
     /// Observes the health of a [Backend], can be used for monitoring purposes.
