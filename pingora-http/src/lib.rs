@@ -69,6 +69,8 @@ pub struct RequestHeader {
     header_name_map: Option<CaseMap>,
     // store the raw path bytes only if it is invalid utf-8
     raw_path_fallback: Vec<u8>, // can also be Box<[u8]>
+    // whether we send END_STREAM with HEADERS for h2 requests
+    send_end_stream: bool,
 }
 
 impl AsRef<ReqParts> for RequestHeader {
@@ -93,6 +95,7 @@ impl RequestHeader {
             base,
             header_name_map: None,
             raw_path_fallback: vec![],
+            send_end_stream: true,
         }
     }
 
@@ -211,6 +214,20 @@ impl RequestHeader {
         self.base.uri = uri;
     }
 
+    /// Set whether we send an END_STREAM on H2 request HEADERS if body is empty.
+    pub fn set_send_end_stream(&mut self, send_end_stream: bool) {
+        self.send_end_stream = send_end_stream;
+    }
+
+    /// Returns if we support sending an END_STREAM on H2 request HEADERS if body is empty,
+    /// returns None if not H2.
+    pub fn send_end_stream(&self) -> Option<bool> {
+        if self.base.version != Version::HTTP_2 {
+            return None;
+        }
+        Some(self.send_end_stream)
+    }
+
     /// Return the request path in its raw format
     ///
     /// Non-UTF8 is supported.
@@ -256,6 +273,7 @@ impl Clone for RequestHeader {
             base: self.as_owned_parts(),
             header_name_map: self.header_name_map.clone(),
             raw_path_fallback: self.raw_path_fallback.clone(),
+            send_end_stream: self.send_end_stream,
         }
     }
 }
@@ -268,6 +286,7 @@ impl From<ReqParts> for RequestHeader {
             header_name_map: None,
             // no illegal path
             raw_path_fallback: vec![],
+            send_end_stream: true,
         }
     }
 }
@@ -715,5 +734,24 @@ mod tests {
         resp.set_reason_phrase(None).unwrap();
         let reason = resp.get_reason_phrase().unwrap();
         assert_eq!(reason, "OK");
+    }
+
+    #[test]
+    fn set_test_send_end_stream() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.set_send_end_stream(true);
+
+        // None for requests that are not h2
+        assert!(req.send_end_stream().is_none());
+
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.set_version(Version::HTTP_2);
+
+        // Some(true) by default for h2
+        assert!(req.send_end_stream().unwrap());
+
+        req.set_send_end_stream(false);
+        // Some(false)
+        assert!(!req.send_end_stream().unwrap());
     }
 }
