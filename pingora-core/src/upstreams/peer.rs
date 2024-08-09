@@ -309,7 +309,6 @@ pub struct PeerOptions {
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
-    pub no_header_eos: bool,
     pub h2_ping_interval: Option<Duration>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
@@ -345,7 +344,6 @@ impl PeerOptions {
             tcp_keepalive: None,
             tcp_recv_buf: None,
             dscp: None,
-            no_header_eos: false,
             h2_ping_interval: None,
             max_h2_streams: 1,
             extra_proxy_headers: BTreeMap::new(),
@@ -396,9 +394,6 @@ impl Display for PeerOptions {
         }
         if let Some(tcp_keepalive) = &self.tcp_keepalive {
             write!(f, "tcp_keepalive: {},", tcp_keepalive)?;
-        }
-        if self.no_header_eos {
-            write!(f, "no_header_eos: true,")?;
         }
         if let Some(h2_ping_interval) = self.h2_ping_interval {
             write!(f, "h2_ping_interval: {:?},", h2_ping_interval)?;

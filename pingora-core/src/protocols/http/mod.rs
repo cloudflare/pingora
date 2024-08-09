@@ -15,6 +15,7 @@
 //! HTTP/1.x and HTTP/2 implementation APIs
 
 mod body_buffer;
+pub mod bridge;
 pub mod client;
 pub mod compression;
 pub mod conditional_filter;

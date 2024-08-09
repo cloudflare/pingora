@@ -405,7 +405,20 @@ impl Session {
                     self.downstream_modules_ctx
                         .response_body_filter(data, *end)?;
                 }
-                _ => { /* HttpModules doesn't handle trailer yet */ }
+                HttpTask::Trailer(trailers) => {
+                    if let Some(buf) = self
+                        .downstream_modules_ctx
+                        .response_trailer_filter(trailers)?
+                    {
+                        // Write the trailers into the body if the filter
+                        // returns a buffer.
+                        //
+                        // Note, this will not work if end of stream has already
+                        // been seen or we've written content-length bytes.
+                        *task = HttpTask::Body(Some(buf), true);
+                    }
+                }
+                _ => { /* Done or Failed */ }
             }
         }
         self.downstream_session.response_duplex_vec(tasks).await
