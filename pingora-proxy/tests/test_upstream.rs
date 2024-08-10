@@ -133,6 +133,60 @@ async fn test_ws_server_ends_conn() {
     assert!(ws_stream.next().await.is_none());
 }
 
+#[tokio::test]
+async fn test_download_timeout() {
+    init();
+    use hyper::body::HttpBody;
+    use tokio::time::sleep;
+
+    let client = hyper::Client::new();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .header("x-write-timeout", "1")
+        .body(hyper::Body::empty())
+        .unwrap();
+    let mut res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut err = false;
+    sleep(Duration::from_secs(2)).await;
+    while let Some(chunk) = res.body_mut().data().await {
+        if chunk.is_err() {
+            err = true;
+        }
+    }
+    assert!(err);
+}
+
+#[tokio::test]
+async fn test_download_timeout_min_rate() {
+    init();
+    use hyper::body::HttpBody;
+    use tokio::time::sleep;
+
+    let client = hyper::Client::new();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .header("x-write-timeout", "1")
+        .header("x-min-rate", "10000")
+        .body(hyper::Body::empty())
+        .unwrap();
+    let mut res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut err = false;
+    sleep(Duration::from_secs(2)).await;
+    while let Some(chunk) = res.body_mut().data().await {
+        if chunk.is_err() {
+            err = true;
+        }
+    }
+    // no error as write timeout is overridden by min rate
+    assert!(!err);
+}
+
 mod test_cache {
     use super::*;
     use std::str::FromStr;
@@ -1319,7 +1373,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         // sleep just a little to make sure the req above gets the cache lock
@@ -1333,7 +1387,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
         let task3 = tokio::spawn(async move {
@@ -1345,7 +1399,7 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "stale");
+            assert_eq!(headers["x-cache-status"], "stale-updating");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1382,7 +1436,7 @@ mod test_cache {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "stale");
+        assert_eq!(headers["x-cache-status"], "stale-updating");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         // wait for the background request to finish

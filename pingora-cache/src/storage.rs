@@ -22,6 +22,15 @@ use async_trait::async_trait;
 use pingora_error::Result;
 use std::any::Any;
 
+/// The reason a purge() is called
+#[derive(Debug, Clone, Copy)]
+pub enum PurgeType {
+    // For eviction because the cache storage is full
+    Eviction,
+    // For cache invalidation
+    Invalidation,
+}
+
 /// Cache storage interface
 #[async_trait]
 pub trait Storage {
@@ -45,7 +54,12 @@ pub trait Storage {
     /// Delete the cached asset for the given key
     ///
     /// [CompactCacheKey] is used here because it is how eviction managers store the keys
-    async fn purge(&'static self, key: &CompactCacheKey, trace: &SpanHandle) -> Result<bool>;
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        purge_type: PurgeType,
+        trace: &SpanHandle,
+    ) -> Result<bool>;
 
     /// Update cache header and metadata for the already stored asset.
     async fn update_meta(

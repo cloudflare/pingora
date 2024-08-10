@@ -24,6 +24,16 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// [HealthObserve] is an interface for observing health changes of backends,
+/// this is what's used for our health observation callback.
+#[async_trait]
+pub trait HealthObserve {
+    /// Observes the health of a [Backend], can be used for monitoring purposes.
+    async fn observe(&self, target: &Backend, healthy: bool);
+}
+/// Provided to a [HealthCheck] to observe changes to [Backend] health.
+pub type HealthObserveCallback = Box<dyn HealthObserve + Send + Sync>;
+
 /// [HealthCheck] is the interface to implement health check for backends
 #[async_trait]
 pub trait HealthCheck {
@@ -31,6 +41,10 @@ pub trait HealthCheck {
     ///
     /// `Ok(())`` if the check passes, otherwise the check fails.
     async fn check(&self, target: &Backend) -> Result<()>;
+
+    /// Called when the health changes for a [Backend].
+    async fn health_status_change(&self, _target: &Backend, _healthy: bool) {}
+
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
     /// For example: with `success``: `true`: this function should return the
@@ -56,6 +70,8 @@ pub struct TcpHealthCheck {
     /// set, it will also try to establish a TLS connection on top of the TCP connection.
     pub peer_template: BasicPeer,
     connector: TransportConnector,
+    /// A callback that is invoked when the `healthy` status changes for a [Backend].
+    pub health_changed_callback: Option<HealthObserveCallback>,
 }
 
 impl Default for TcpHealthCheck {
@@ -67,6 +83,7 @@ impl Default for TcpHealthCheck {
             consecutive_failure: 1,
             peer_template,
             connector: TransportConnector::new(None),
+            health_changed_callback: None,
         }
     }
 }
@@ -110,6 +127,12 @@ impl HealthCheck for TcpHealthCheck {
         peer._address = target.addr.clone();
         self.connector.get_stream(&peer).await.map(|_| {})
     }
+
+    async fn health_status_change(&self, target: &Backend, healthy: bool) {
+        if let Some(callback) = &self.health_changed_callback {
+            callback.observe(target, healthy).await;
+        }
+    }
 }
 
 type Validator = Box<dyn Fn(&ResponseHeader) -> Result<()> + Send + Sync>;
@@ -133,9 +156,9 @@ pub struct HttpHealthCheck {
     /// Whether the underlying TCP/TLS connection can be reused across checks.
     ///
     /// * `false` will make sure that every health check goes through TCP (and TLS) handshakes.
-    /// Established connections sometimes hide the issue of firewalls and L4 LB.
+    ///   Established connections sometimes hide the issue of firewalls and L4 LB.
     /// * `true` will try to reuse connections across checks, this is the more efficient and fast way
-    /// to perform health checks.
+    ///   to perform health checks.
     pub reuse_connection: bool,
     /// The request header to send to the backend
     pub req: RequestHeader,
@@ -147,6 +170,8 @@ pub struct HttpHealthCheck {
     /// Sometimes the health check endpoint lives one a different port than the actual backend.
     /// Setting this option allows the health check to perform on the given port of the backend IP.
     pub port_override: Option<u16>,
+    /// A callback that is invoked when the `healthy` status changes for a [Backend].
+    pub health_changed_callback: Option<HealthObserveCallback>,
 }
 
 impl HttpHealthCheck {
@@ -174,6 +199,7 @@ impl HttpHealthCheck {
             req,
             validator: None,
             port_override: None,
+            health_changed_callback: None,
         }
     }
 
@@ -234,6 +260,11 @@ impl HealthCheck for HttpHealthCheck {
         }
 
         Ok(())
+    }
+    async fn health_status_change(&self, target: &Backend, healthy: bool) {
+        if let Some(callback) = &self.health_changed_callback {
+            callback.observe(target, healthy).await;
+        }
     }
 }
 
@@ -313,8 +344,15 @@ impl Health {
 
 #[cfg(test)]
 mod test {
+    use std::{
+        collections::{BTreeSet, HashMap},
+        sync::atomic::{AtomicU16, Ordering},
+    };
+
     use super::*;
-    use crate::SocketAddr;
+    use crate::{discovery, Backends, SocketAddr};
+    use async_trait::async_trait;
+    use http::Extensions;
 
     #[tokio::test]
     async fn test_tcp_check() {
@@ -323,6 +361,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_ok());
@@ -330,6 +369,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:79".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tcp_check.check(&backend).await.is_err());
@@ -341,6 +381,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(tls_check.check(&backend).await.is_ok());
@@ -353,6 +394,7 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:443".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         assert!(https_check.check(&backend).await.is_ok());
@@ -375,10 +417,85 @@ mod test {
         let backend = Backend {
             addr: SocketAddr::Inet("1.1.1.1:80".parse().unwrap()),
             weight: 1,
+            ext: Extensions::new(),
         };
 
         http_check.check(&backend).await.unwrap();
 
         assert!(http_check.check(&backend).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_observe() {
+        struct Observe {
+            unhealthy_count: Arc<AtomicU16>,
+        }
+        #[async_trait]
+        impl HealthObserve for Observe {
+            async fn observe(&self, _target: &Backend, healthy: bool) {
+                if !healthy {
+                    self.unhealthy_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let good_backend = Backend::new("127.0.0.1:79").unwrap();
+        let new_good_backends = || -> (BTreeSet<Backend>, HashMap<u64, bool>) {
+            let mut healthy = HashMap::new();
+            healthy.insert(good_backend.hash_key(), true);
+            let mut backends = BTreeSet::new();
+            backends.extend(vec![good_backend.clone()]);
+            (backends, healthy)
+        };
+        // tcp health check
+        {
+            let unhealthy_count = Arc::new(AtomicU16::new(0));
+            let ob = Observe {
+                unhealthy_count: unhealthy_count.clone(),
+            };
+            let bob = Box::new(ob);
+            let tcp_check = TcpHealthCheck {
+                health_changed_callback: Some(bob),
+                ..Default::default()
+            };
+
+            let discovery = discovery::Static::default();
+            let mut backends = Backends::new(Box::new(discovery));
+            backends.set_health_check(Box::new(tcp_check));
+            let result = new_good_backends();
+            backends.do_update(result.0, result.1, |_backend: Arc<BTreeSet<Backend>>| {});
+            // the backend is ready
+            assert!(backends.ready(&good_backend));
+
+            // run health check
+            backends.run_health_check(false).await;
+            assert!(1 == unhealthy_count.load(Ordering::Relaxed));
+            // backend is unhealthy
+            assert!(!backends.ready(&good_backend));
+        }
+
+        // http health check
+        {
+            let unhealthy_count = Arc::new(AtomicU16::new(0));
+            let ob = Observe {
+                unhealthy_count: unhealthy_count.clone(),
+            };
+            let bob = Box::new(ob);
+
+            let mut https_check = HttpHealthCheck::new("one.one.one.one", true);
+            https_check.health_changed_callback = Some(bob);
+
+            let discovery = discovery::Static::default();
+            let mut backends = Backends::new(Box::new(discovery));
+            backends.set_health_check(Box::new(https_check));
+            let result = new_good_backends();
+            backends.do_update(result.0, result.1, |_backend: Arc<BTreeSet<Backend>>| {});
+            // the backend is ready
+            assert!(backends.ready(&good_backend));
+            // run health check
+            backends.run_health_check(false).await;
+            assert!(1 == unhealthy_count.load(Ordering::Relaxed));
+            assert!(!backends.ready(&good_backend));
+        }
     }
 }

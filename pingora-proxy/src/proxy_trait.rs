@@ -40,6 +40,17 @@ pub trait ProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
 
+    /// Set up downstream modules.
+    ///
+    /// In this phase, users can add or configure [HttpModules] before the server starts up.
+    ///
+    /// In the default implementation of this method, [ResponseCompressionBuilder] is added
+    /// and disabled.
+    fn init_downstream_modules(&self, modules: &mut HttpModules) {
+        // Add disabled downstream compression module by default
+        modules.add_module(ResponseCompressionBuilder::enable(0));
+    }
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or

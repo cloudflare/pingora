@@ -38,6 +38,15 @@ pub struct TlsSettings {
     callbacks: Option<TlsAcceptCallbacks>,
 }
 
+impl From<SslAcceptorBuilder> for TlsSettings {
+    fn from(settings: SslAcceptorBuilder) -> Self {
+        TlsSettings {
+            accept_builder: settings,
+            callbacks: None,
+        }
+    }
+}
+
 impl Deref for TlsSettings {
     type Target = SslAcceptorBuilder;
 

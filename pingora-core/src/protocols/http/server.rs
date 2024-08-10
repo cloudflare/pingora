@@ -25,6 +25,7 @@ use http::{header::AsHeaderName, HeaderMap};
 use log::error;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
 pub enum Session {
@@ -52,7 +53,7 @@ impl Session {
     /// else with the session.
     /// - `Ok(true)`: successful
     /// - `Ok(false)`: client exit without sending any bytes. This is normal on reused connection.
-    /// In this case the user should give up this session.
+    ///   In this case the user should give up this session.
     pub async fn read_request(&mut self) -> Result<bool> {
         match self {
             Self::H1(s) => {
@@ -185,6 +186,48 @@ impl Session {
         match self {
             Self::H1(s) => s.set_server_keepalive(duration),
             Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the downstream write timeout. This will trigger if we're unable
+    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// configured then the `min_send_rate` calculated timeout has higher priority.
+    ///
+    /// This is a noop for h2.
+    pub fn set_write_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_write_timeout(timeout),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the minimum downstream send rate in bytes per second. This
+    /// is used to calculate a write timeout in seconds based on the size
+    /// of the buffer being written. If a `min_send_rate` is configured it
+    /// has higher priority over a set `write_timeout`. The minimum send
+    /// rate must be greater than zero.
+    ///
+    /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
+    /// is greater than zero, a send rate of zero is a noop.
+    ///
+    /// This is a noop for h2.
+    pub fn set_min_send_rate(&mut self, rate: usize) {
+        match self {
+            Self::H1(s) => s.set_min_send_rate(rate),
+            Self::H2(_) => {}
+        }
+    }
+
+    /// Sets whether we ignore writing informational responses downstream.
+    ///
+    /// For HTTP/1.1 this is a noop if the response is Upgrade or Continue and
+    /// Expect: 100-continue was set on the request.
+    ///
+    /// This is a noop for h2 because informational responses are always ignored.
+    pub fn set_ignore_info_resp(&mut self, ignore: bool) {
+        match self {
+            Self::H1(s) => s.set_ignore_info_resp(ignore),
+            Self::H2(_) => {} // always ignored
         }
     }
 
@@ -357,11 +400,21 @@ impl Session {
         }
     }
 
-    /// Return the digest for the session.
+    /// Return the [Digest] for the connection.
     pub fn digest(&self) -> Option<&Digest> {
         match self {
             Self::H1(s) => Some(s.digest()),
             Self::H2(s) => s.digest(),
+        }
+    }
+
+    /// Return a mutable [Digest] reference for the connection.
+    ///
+    /// Will return `None` if multiple H2 streams are open.
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        match self {
+            Self::H1(s) => Some(s.digest_mut()),
+            Self::H2(s) => s.digest_mut(),
         }
     }
 

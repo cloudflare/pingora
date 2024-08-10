@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use async_trait::async_trait;
 use log::debug;
 use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
 use rand::seq::SliceRandom;
@@ -19,12 +20,18 @@ use std::net::SocketAddr as InetSocketAddr;
 use std::os::unix::io::AsRawFd;
 
 use crate::protocols::l4::ext::{
-    connect_uds, connect_with as tcp_connect, set_recv_buf, set_tcp_fastopen_connect,
+    connect_uds, connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
+
+/// The interface to establish a L4 connection
+#[async_trait]
+pub trait Connect: std::fmt::Debug {
+    async fn connect(&self, addr: &SocketAddr) -> Result<Stream>;
+}
 
 /// Establish a connection (l4) to the given peer using its settings and an optional bind address.
 pub async fn connect<P>(peer: &P, bind_to: Option<InetSocketAddr>) -> Result<Stream>
@@ -37,68 +44,78 @@ where
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
     let peer_addr = peer.address();
-    let mut stream: Stream = match peer_addr {
-        SocketAddr::Inet(addr) => {
-            let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
-                if peer.tcp_fast_open() {
-                    set_tcp_fastopen_connect(socket.as_raw_fd())?;
-                }
-                if let Some(recv_buf) = peer.tcp_recv_buf() {
-                    debug!("Setting recv buf size");
-                    set_recv_buf(socket.as_raw_fd(), recv_buf)?;
-                }
-                Ok(())
-            });
-            let conn_res = match peer.connection_timeout() {
-                Some(t) => pingora_timeout::timeout(t, connect_future)
-                    .await
-                    .explain_err(ConnectTimedout, |_| {
-                        format!("timeout {t:?} connecting to server {peer}")
-                    })?,
-                None => connect_future.await,
-            };
-            match conn_res {
-                Ok(socket) => {
-                    debug!("connected to new server: {}", peer.address());
-                    Ok(socket.into())
-                }
-                Err(e) => {
-                    let c = format!("Fail to connect to {peer}");
-                    match e.etype() {
-                        SocketError | BindError => Error::e_because(InternalError, c, e),
-                        _ => Err(e.more_context(c)),
+    let mut stream: Stream =
+        if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
+            custom_l4.connect(peer_addr).await?
+        } else {
+            match peer_addr {
+                SocketAddr::Inet(addr) => {
+                    let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
+                        if peer.tcp_fast_open() {
+                            set_tcp_fastopen_connect(socket.as_raw_fd())?;
+                        }
+                        if let Some(recv_buf) = peer.tcp_recv_buf() {
+                            debug!("Setting recv buf size");
+                            set_recv_buf(socket.as_raw_fd(), recv_buf)?;
+                        }
+                        if let Some(dscp) = peer.dscp() {
+                            debug!("Setting dscp");
+                            set_dscp(socket.as_raw_fd(), dscp)?;
+                        }
+                        Ok(())
+                    });
+                    let conn_res = match peer.connection_timeout() {
+                        Some(t) => pingora_timeout::timeout(t, connect_future)
+                            .await
+                            .explain_err(ConnectTimedout, |_| {
+                                format!("timeout {t:?} connecting to server {peer}")
+                            })?,
+                        None => connect_future.await,
+                    };
+                    match conn_res {
+                        Ok(socket) => {
+                            debug!("connected to new server: {}", peer.address());
+                            Ok(socket.into())
+                        }
+                        Err(e) => {
+                            let c = format!("Fail to connect to {peer}");
+                            match e.etype() {
+                                SocketError | BindError => Error::e_because(InternalError, c, e),
+                                _ => Err(e.more_context(c)),
+                            }
+                        }
                     }
                 }
-            }
-        }
-        SocketAddr::Unix(addr) => {
-            let connect_future = connect_uds(
-                addr.as_pathname()
-                    .expect("non-pathname unix sockets not supported as peer"),
-            );
-            let conn_res = match peer.connection_timeout() {
-                Some(t) => pingora_timeout::timeout(t, connect_future)
-                    .await
-                    .explain_err(ConnectTimedout, |_| {
-                        format!("timeout {t:?} connecting to server {peer}")
-                    })?,
-                None => connect_future.await,
-            };
-            match conn_res {
-                Ok(socket) => {
-                    debug!("connected to new server: {}", peer.address());
-                    Ok(socket.into())
-                }
-                Err(e) => {
-                    let c = format!("Fail to connect to {peer}");
-                    match e.etype() {
-                        SocketError | BindError => Error::e_because(InternalError, c, e),
-                        _ => Err(e.more_context(c)),
+                SocketAddr::Unix(addr) => {
+                    let connect_future = connect_uds(
+                        addr.as_pathname()
+                            .expect("non-pathname unix sockets not supported as peer"),
+                    );
+                    let conn_res = match peer.connection_timeout() {
+                        Some(t) => pingora_timeout::timeout(t, connect_future)
+                            .await
+                            .explain_err(ConnectTimedout, |_| {
+                                format!("timeout {t:?} connecting to server {peer}")
+                            })?,
+                        None => connect_future.await,
+                    };
+                    match conn_res {
+                        Ok(socket) => {
+                            debug!("connected to new server: {}", peer.address());
+                            Ok(socket.into())
+                        }
+                        Err(e) => {
+                            let c = format!("Fail to connect to {peer}");
+                            match e.etype() {
+                                SocketError | BindError => Error::e_because(InternalError, c, e),
+                                _ => Err(e.more_context(c)),
+                            }
+                        }
                     }
                 }
-            }
-        }
-    }?;
+            }?
+        };
+
     let tracer = peer.get_tracer();
     if let Some(t) = tracer {
         t.0.on_connected();
@@ -243,6 +260,29 @@ mod tests {
         peer.options.connection_timeout = Some(std::time::Duration::from_millis(1)); //1ms
         let new_session = connect(&peer, None).await;
         assert_eq!(new_session.unwrap_err().etype(), &ConnectTimedout)
+    }
+
+    #[tokio::test]
+    async fn test_custom_connect() {
+        #[derive(Debug)]
+        struct MyL4;
+        #[async_trait]
+        impl Connect for MyL4 {
+            async fn connect(&self, _addr: &SocketAddr) -> Result<Stream> {
+                tokio::net::TcpStream::connect("1.1.1.1:80")
+                    .await
+                    .map(|s| s.into())
+                    .or_fail()
+            }
+        }
+        // :79 shouldn't be able to be connected to
+        let mut peer = BasicPeer::new("1.1.1.1:79");
+        peer.options.custom_l4 = Some(std::sync::Arc::new(MyL4 {}));
+
+        let new_session = connect(&peer, None).await;
+
+        // but MyL4 connects to :80 instead
+        assert!(new_session.is_ok());
     }
 
     #[tokio::test]

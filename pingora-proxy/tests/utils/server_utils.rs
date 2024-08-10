@@ -39,6 +39,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 pub struct ExampleProxyHttps {}
 
@@ -230,6 +231,17 @@ impl ProxyHttp for ExampleProxyHttp {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
+
+        let write_timeout = req
+            .headers
+            .get("x-write-timeout")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
+        let min_rate = req
+            .headers
+            .get("x-min-rate")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if !downstream_compression {
             // enable upstream compression for all requests by default
@@ -240,6 +252,13 @@ impl ProxyHttp for ExampleProxyHttp {
                 .get_mut::<ResponseCompression>()
                 .unwrap()
                 .adjust_level(0);
+        }
+
+        if let Some(min_rate) = min_rate {
+            session.set_min_send_rate(min_rate);
+        }
+        if let Some(write_timeout) = write_timeout {
+            session.set_write_timeout(Duration::from_secs(write_timeout));
         }
 
         Ok(false)
@@ -454,6 +473,9 @@ impl ProxyHttp for ExampleProxyCache {
                 CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
                 CachePhase::Miss => upstream_response.insert_header("x-cache-status", "miss")?,
                 CachePhase::Stale => upstream_response.insert_header("x-cache-status", "stale")?,
+                CachePhase::StaleUpdating => {
+                    upstream_response.insert_header("x-cache-status", "stale-updating")?
+                }
                 CachePhase::Expired => {
                     upstream_response.insert_header("x-cache-status", "expired")?
                 }

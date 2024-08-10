@@ -98,10 +98,7 @@ impl<SV> HttpProxy<SV> {
         );
 
         match ret {
-            Ok((_first, _second)) => {
-                client_session.respect_keepalive();
-                (true, true, None)
-            }
+            Ok((_first, _second)) => (true, true, None),
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -548,6 +545,11 @@ impl<SV> HttpProxy<SV> {
         // this var is to signal if downstream finish sending the body, which shouldn't be
         // affected by the request_body_filter
         let end_of_body = end_of_body || data.is_none();
+
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
 
         self.inner
             .request_body_filter(session, &mut data, end_of_body, ctx)

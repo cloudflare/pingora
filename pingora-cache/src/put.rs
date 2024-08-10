@@ -119,7 +119,7 @@ impl<C: CachePut> CachePutCtx<C> {
                 .handle();
             for item in evicted {
                 // TODO: warn/log the error
-                let _ = self.storage.purge(&item, &trace).await;
+                let _ = self.storage.purge(&item, PurgeType::Eviction, &trace).await;
             }
         }
 

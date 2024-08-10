@@ -165,7 +165,9 @@ impl<SV> HttpProxy<SV> {
                                     } else {
                                         break None;
                                     }
-                                } // else continue to serve stale
+                                }
+                                // else continue to serve stale
+                                session.cache.set_stale_updating();
                             } else if session.cache.is_cache_lock_writer() {
                                 // stale while revalidate logic for the writer
                                 let will_serve_stale = session.cache.can_serve_stale_updating()
@@ -182,6 +184,7 @@ impl<SV> HttpProxy<SV> {
                                         new_app.process_subrequest(subrequest, sub_req_ctx).await;
                                     });
                                     // continue to serve stale for this request
+                                    session.cache.set_stale_updating();
                                 } else {
                                     // return to fetch from upstream
                                     break None;

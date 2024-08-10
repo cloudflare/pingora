@@ -6,8 +6,7 @@ jobs:
   pingora:
     strategy:
       matrix:
-        # TODO: add nightly
-        toolchain: [1.78, 1.72]
+        toolchain: [nightly, 1.72, 1.80.0]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -46,7 +45,9 @@ jobs:
         run: cargo test --verbose --doc
 
       - name: Run cargo clippy
-        run: cargo clippy --all-targets --all -- --deny=warnings
+        run: |
+          [[ ${{ matrix.toolchain }} == nightly ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
 
       - name: Run cargo audit
-        uses: actions-rust-lang/audit@v1
+        run: |
+          [[ ${{ matrix.toolchain }} == nightly ]] || (cargo install cargo-audit && cargo audit)

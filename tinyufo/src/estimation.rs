@@ -36,23 +36,36 @@ impl Estimator {
 
     fn optimal(items: usize) -> Self {
         let (slots, hashes) = Self::optimal_paras(items);
-        Self::new(hashes, slots)
+        Self::new(hashes, slots, RandomState::new)
     }
 
     fn compact(items: usize) -> Self {
         let (slots, hashes) = Self::optimal_paras(items / 100);
-        Self::new(hashes, slots)
+        Self::new(hashes, slots, RandomState::new)
     }
 
-    /// Create a new `Estimator` with the given amount of hashes and columns (slots).
-    pub fn new(hashes: usize, slots: usize) -> Self {
+    #[cfg(test)]
+    fn seeded(items: usize) -> Self {
+        let (slots, hashes) = Self::optimal_paras(items);
+        Self::new(hashes, slots, || RandomState::with_seeds(2, 3, 4, 5))
+    }
+
+    #[cfg(test)]
+    fn seeded_compact(items: usize) -> Self {
+        let (slots, hashes) = Self::optimal_paras(items / 100);
+        Self::new(hashes, slots, || RandomState::with_seeds(2, 3, 4, 5))
+    }
+
+    /// Create a new `Estimator` with the given amount of hashes and columns (slots) using
+    /// the given random source.
+    pub fn new(hashes: usize, slots: usize, random: impl Fn() -> RandomState) -> Self {
         let mut estimator = Vec::with_capacity(hashes);
         for _ in 0..hashes {
             let mut slot = Vec::with_capacity(slots);
             for _ in 0..slots {
                 slot.push(AtomicU8::new(0));
             }
-            estimator.push((slot.into_boxed_slice(), RandomState::new()));
+            estimator.push((slot.into_boxed_slice(), random()));
         }
 
         Estimator {
@@ -156,6 +169,26 @@ impl TinyLfu {
     pub fn new_compact(cache_size: usize) -> Self {
         Self {
             estimator: Estimator::compact(cache_size),
+            window_counter: Default::default(),
+            // 8x: just a heuristic to balance the memory usage and accuracy
+            window_limit: cache_size * 8,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_seeded(cache_size: usize) -> Self {
+        Self {
+            estimator: Estimator::seeded(cache_size),
+            window_counter: Default::default(),
+            // 8x: just a heuristic to balance the memory usage and accuracy
+            window_limit: cache_size * 8,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_compact_seeded(cache_size: usize) -> Self {
+        Self {
+            estimator: Estimator::seeded_compact(cache_size),
             window_counter: Default::default(),
             // 8x: just a heuristic to balance the memory usage and accuracy
             window_limit: cache_size * 8,

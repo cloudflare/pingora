@@ -306,7 +306,12 @@ impl Storage for MemCache {
         Ok(Box::new(miss_handler))
     }
 
-    async fn purge(&'static self, key: &CompactCacheKey, _trace: &SpanHandle) -> Result<bool> {
+    async fn purge(
+        &'static self,
+        key: &CompactCacheKey,
+        _type: PurgeType,
+        _trace: &SpanHandle,
+    ) -> Result<bool> {
         // This usually purges the primary key because, without a lookup, the variance key is usually
         // empty
         let hash = key.combined();
@@ -525,7 +530,9 @@ mod test {
 
         assert!(cache.temp.read().contains_key(&hash));
 
-        let result = cache.purge(&key, &Span::inactive().handle()).await;
+        let result = cache
+            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .await;
         assert!(result.is_ok());
 
         assert!(!cache.temp.read().contains_key(&hash));
@@ -551,7 +558,9 @@ mod test {
 
         assert!(cache.cached.read().contains_key(&hash));
 
-        let result = cache.purge(&key, &Span::inactive().handle()).await;
+        let result = cache
+            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .await;
         assert!(result.is_ok());
 
         assert!(!cache.cached.read().contains_key(&hash));

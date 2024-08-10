@@ -276,6 +276,31 @@ pub fn set_tcp_fastopen_backlog(_fd: RawFd, _backlog: usize) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn set_dscp(fd: RawFd, value: u8) -> Result<()> {
+    use super::socket::SocketAddr;
+    use pingora_error::OkOrErr;
+
+    let sock = SocketAddr::from_raw_fd(fd, false);
+    let addr = sock
+        .as_ref()
+        .and_then(|s| s.as_inet())
+        .or_err(SocketError, "failed to set dscp, invalid IP socket")?;
+
+    if addr.is_ipv6() {
+        set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_TCLASS, value as c_int)
+            .or_err(SocketError, "failed to set dscp (IPV6_TCLASS)")
+    } else {
+        set_opt(fd, libc::IPPROTO_IP, libc::IP_TOS, value as c_int)
+            .or_err(SocketError, "failed to set dscp (IP_TOS)")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_dscp(_fd: RawFd, _value: u8) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub fn get_socket_cookie(fd: RawFd) -> io::Result<u64> {
     get_opt_sized::<c_ulonglong>(fd, libc::SOL_SOCKET, libc::SO_COOKIE)
 }
@@ -344,13 +369,10 @@ fn wrap_os_connect_error(e: std::io::Error, context: String) -> Box<Error> {
             Error::because(InternalError, context, e)
         }
         _ => match e.raw_os_error() {
-            Some(code) => match code {
-                libc::ENETUNREACH | libc::EHOSTUNREACH => {
-                    Error::because(ConnectNoRoute, context, e)
-                }
-                _ => Error::because(ConnectError, context, e),
-            },
-            None => Error::because(ConnectError, context, e),
+            Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => {
+                Error::because(ConnectNoRoute, context, e)
+            }
+            _ => Error::because(ConnectError, context, e),
         },
     }
 }

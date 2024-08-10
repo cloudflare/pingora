@@ -35,9 +35,6 @@
 //!
 //! See `examples/load_balancer.rs` for a detailed example.
 
-// enable nightly feature async trait so that the docs are cleaner
-#![cfg_attr(doc_async_trait, feature(async_fn_in_trait))]
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::FutureExt;
@@ -108,6 +105,14 @@ impl<SV> HttpProxy<SV> {
             server_options: None,
             downstream_modules: HttpModules::new(),
         }
+    }
+
+    fn handle_init_modules(&mut self)
+    where
+        SV: ProxyHttp,
+    {
+        self.inner
+            .init_downstream_modules(&mut self.downstream_modules);
     }
 
     async fn handle_new_request(
@@ -222,7 +227,8 @@ impl<SV> HttpProxy<SV> {
                     }),
                 )
             }
-            Err(e) => {
+            Err(mut e) => {
+                e.as_up();
                 let new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
                 (false, Some(new_err.into_up()))
             }
@@ -739,7 +745,10 @@ use pingora_core::services::listening::Service;
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>> {
+pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
+where
+    SV: ProxyHttp,
+{
     http_proxy_service_with_name(conf, inner, "Pingora HTTP Proxy Service")
 }
 
@@ -750,11 +759,11 @@ pub fn http_proxy_service_with_name<SV>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
-) -> Service<HttpProxy<SV>> {
+) -> Service<HttpProxy<SV>>
+where
+    SV: ProxyHttp,
+{
     let mut proxy = HttpProxy::new(inner, conf.clone());
-    // Add disabled downstream compression module by default
-    proxy
-        .downstream_modules
-        .add_module(ResponseCompressionBuilder::enable(0));
+    proxy.handle_init_modules();
     Service::new(name.to_string(), proxy)
 }

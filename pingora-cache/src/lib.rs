@@ -44,7 +44,7 @@ pub use key::CacheKey;
 use lock::{CacheLock, LockStatus, Locked};
 pub use memory::MemCache;
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, Storage};
+pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -77,6 +77,8 @@ pub enum CachePhase {
     Miss,
     /// A staled (expired) asset is found
     Stale,
+    /// A staled (expired) asset was found, but another request is revalidating it
+    StaleUpdating,
     /// A staled (expired) asset was found, so a fresh one was fetched
     Expired,
     /// A staled (expired) asset was found, and it was revalidated to be fresh
@@ -96,6 +98,7 @@ impl CachePhase {
             CachePhase::Hit => "hit",
             CachePhase::Miss => "miss",
             CachePhase::Stale => "stale",
+            CachePhase::StaleUpdating => "stale-updating",
             CachePhase::Expired => "expired",
             CachePhase::Revalidated => "revalidated",
             CachePhase::RevalidatedNoCache(_) => "revalidated-nocache",
@@ -260,7 +263,7 @@ impl HttpCache {
         use CachePhase::*;
         match self.phase {
             Disabled(_) | Bypass | Miss | Expired | Revalidated | RevalidatedNoCache(_) => true,
-            Hit | Stale => false,
+            Hit | Stale | StaleUpdating => false,
             Uninit | CacheKey => false, // invalid states for this call, treat them as false to keep it simple
         }
     }
@@ -344,10 +347,10 @@ impl HttpCache {
     /// - `storage`: the cache storage backend that implements [storage::Storage]
     /// - `eviction`: optionally the eviction manager, without it, nothing will be evicted from the storage
     /// - `predictor`: optionally a cache predictor. The cache predictor predicts whether something is likely
-    /// to be cacheable or not. This is useful because the proxy can apply different types of optimization to
-    /// cacheable and uncacheable requests.
+    ///   to be cacheable or not. This is useful because the proxy can apply different types of optimization to
+    ///   cacheable and uncacheable requests.
     /// - `cache_lock`: optionally a cache lock which handles concurrent lookups to the same asset. Without it
-    /// such lookups will all be allowed to fetch the asset independently.
+    ///   such lookups will all be allowed to fetch the asset independently.
     pub fn enable(
         &mut self,
         storage: &'static (dyn storage::Storage + Sync),
@@ -493,7 +496,8 @@ impl HttpCache {
         match self.phase {
             // from CacheKey: set state to miss during cache lookup
             // from Bypass: response became cacheable, set state to miss to cache
-            CachePhase::CacheKey | CachePhase::Bypass => {
+            // from Stale: waited for cache lock, then retried and found asset was gone
+            CachePhase::CacheKey | CachePhase::Bypass | CachePhase::Stale => {
                 self.phase = CachePhase::Miss;
                 self.inner_mut().traces.start_miss_span();
             }
@@ -508,6 +512,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::Hit
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => self.inner_mut().body_reader.as_mut().unwrap(),
             _ => panic!("wrong phase {:?}", self.phase),
@@ -543,6 +548,7 @@ impl HttpCache {
             | CachePhase::Miss
             | CachePhase::Expired
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => {
                 let inner = self.inner_mut();
@@ -658,7 +664,10 @@ impl HttpCache {
                     let handle = span.handle();
                     for item in evicted {
                         // TODO: warn/log the error
-                        let _ = inner.storage.purge(&item, &handle).await;
+                        let _ = inner
+                            .storage
+                            .purge(&item, PurgeType::Eviction, &handle)
+                            .await;
                     }
                 }
                 inner.traces.finish_miss_span();
@@ -782,6 +791,14 @@ impl HttpCache {
         // TODO: remove this asset from cache once finished?
     }
 
+    /// Mark this asset as stale, but being updated separately from this request.
+    pub fn set_stale_updating(&mut self) {
+        match self.phase {
+            CachePhase::Stale => self.phase = CachePhase::StaleUpdating,
+            _ => panic!("wrong phase {:?}", self.phase),
+        }
+    }
+
     /// Update the variance of the [CacheMeta].
     ///
     /// Note that this process may change the lookup `key`, and eventually (when the asset is
@@ -850,6 +867,7 @@ impl HttpCache {
         match self.phase {
             // TODO: allow in Bypass phase?
             CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Expired
             | CachePhase::Hit
             | CachePhase::Revalidated
@@ -878,6 +896,7 @@ impl HttpCache {
         match self.phase {
             CachePhase::Miss
             | CachePhase::Stale
+            | CachePhase::StaleUpdating
             | CachePhase::Expired
             | CachePhase::Hit
             | CachePhase::Revalidated
@@ -1002,7 +1021,7 @@ impl HttpCache {
 
     /// Whether this request's cache hit is staled
     fn has_staled_asset(&self) -> bool {
-        self.phase == CachePhase::Stale
+        matches!(self.phase, CachePhase::Stale | CachePhase::StaleUpdating)
     }
 
     /// Whether this asset is staled and stale if error is allowed
@@ -1063,7 +1082,10 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 let mut span = inner.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                let result = inner.storage.purge(&key, &span.handle()).await;
+                let result = inner
+                    .storage
+                    .purge(&key, PurgeType::Invalidation, &span.handle())
+                    .await;
                 // FIXME: also need to remove from eviction manager
                 span.set_tag(|| trace::Tag::new("purged", matches!(result, Ok(true))));
                 result
