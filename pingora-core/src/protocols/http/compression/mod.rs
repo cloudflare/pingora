@@ -597,8 +597,8 @@ fn compressible(resp: &ResponseHeader) -> bool {
 fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) {
     use http::header::{HeaderValue, VARY};
 
-    if let Some(existing) = resp.headers.get(VARY) {
-        let already_present = existing
+    let already_present = resp.headers.get_all(VARY).iter().any(|existing| {
+        existing
             .as_bytes()
             .split(|b| *b == b',')
             .map(|mut v| {
@@ -619,19 +619,11 @@ fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) 
                 }
                 v
             })
-            .any(|v| v == b"*" || v.eq_ignore_ascii_case(value.as_ref()));
+            .any(|v| v == b"*" || v.eq_ignore_ascii_case(value.as_ref()))
+    });
 
-        // Prepend our value to the existing header unless already present
-        if !already_present {
-            let mut header = Vec::new();
-            header.extend_from_slice(value.as_ref());
-            header.extend_from_slice(b", ");
-            header.extend_from_slice(existing.as_bytes());
-            resp.insert_header(&VARY, HeaderValue::from_bytes(&header).unwrap())
-                .unwrap();
-        }
-    } else {
-        resp.insert_header(&VARY, HeaderValue::from_name(value.clone()))
+    if !already_present {
+        resp.append_header(&VARY, HeaderValue::from_name(value.clone()))
             .unwrap();
     }
 }
@@ -640,14 +632,25 @@ fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) 
 fn test_add_vary_header() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
-    assert_eq!(header.headers.get("Vary").unwrap(), "accept-encoding");
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["accept-encoding"]
+    );
 
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("Vary", "Accept-Language").unwrap();
     add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
     assert_eq!(
-        header.headers.get("Vary").unwrap(),
-        "accept-encoding, Accept-Language"
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["Accept-Language", "accept-encoding"]
     );
 
     let mut header = ResponseHeader::build(200, None).unwrap();
@@ -656,14 +659,25 @@ fn test_add_vary_header() {
         .unwrap();
     add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
     assert_eq!(
-        header.headers.get("Vary").unwrap(),
-        "Accept-Language, Accept-Encoding"
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["Accept-Language, Accept-Encoding"]
     );
 
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("Vary", "*").unwrap();
     add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
-    assert_eq!(header.headers.get("Vary").unwrap(), "*");
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["*"]
+    );
 }
 
 fn adjust_response_header(resp: &mut ResponseHeader, action: &Action) {
