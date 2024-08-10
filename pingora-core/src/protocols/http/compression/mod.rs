@@ -19,7 +19,6 @@
 use super::HttpTask;
 
 use bytes::Bytes;
-use http::header::ACCEPT_RANGES;
 use log::warn;
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -208,6 +207,17 @@ impl ResponseCompressionCtx {
                 if end {
                     self.0 = CtxInner::BodyPhase(None);
                     return;
+                }
+
+                if depends_on_accept_encoding(
+                    resp,
+                    levels.iter().any(|level| *level != 0),
+                    decompress_enable,
+                ) {
+                    // The response depends on the Accept-Encoding header, make sure to indicate it
+                    // in the Vary response header.
+                    // https://www.rfc-editor.org/rfc/rfc9110#name-vary
+                    add_vary_header(resp, &http::header::ACCEPT_ENCODING);
                 }
 
                 let action = decide_action(resp, accept_encoding);
@@ -428,6 +438,19 @@ fn test_accept_encoding_req_header() {
     assert_eq!(ac_list[1], Algorithm::Gzip);
 }
 
+// test whether the response depends on Accept-Encoding header
+fn depends_on_accept_encoding(
+    resp: &ResponseHeader,
+    compress_enabled: bool,
+    decompress_enabled: &[bool],
+) -> bool {
+    use http::header::CONTENT_ENCODING;
+
+    (decompress_enabled.iter().any(|enabled| *enabled)
+        && resp.headers.get(CONTENT_ENCODING).is_some())
+        || (compress_enabled && compressible(resp))
+}
+
 // filter response header to see if (de)compression is needed
 fn decide_action(resp: &ResponseHeader, accept_encoding: &[Algorithm]) -> Action {
     use http::header::CONTENT_ENCODING;
@@ -580,14 +603,104 @@ fn compressible(resp: &ResponseHeader) -> bool {
     }
 }
 
+// add Vary header with the specified value or extend an existing Vary header value
+fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) {
+    use http::header::{HeaderValue, VARY};
+
+    let already_present = resp.headers.get_all(VARY).iter().any(|existing| {
+        existing
+            .as_bytes()
+            .split(|b| *b == b',')
+            .map(|mut v| {
+                // This is equivalent to slice.trim_ascii() which is unstable
+                while let [first, rest @ ..] = v {
+                    if first.is_ascii_whitespace() {
+                        v = rest;
+                    } else {
+                        break;
+                    }
+                }
+                while let [rest @ .., last] = v {
+                    if last.is_ascii_whitespace() {
+                        v = rest;
+                    } else {
+                        break;
+                    }
+                }
+                v
+            })
+            .any(|v| v == b"*" || v.eq_ignore_ascii_case(value.as_ref()))
+    });
+
+    if !already_present {
+        resp.append_header(&VARY, HeaderValue::from_name(value.clone()))
+            .unwrap();
+    }
+}
+
+#[test]
+fn test_add_vary_header() {
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["accept-encoding"]
+    );
+
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("Vary", "Accept-Language").unwrap();
+    add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["Accept-Language", "accept-encoding"]
+    );
+
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header
+        .insert_header("Vary", "Accept-Language, Accept-Encoding")
+        .unwrap();
+    add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["Accept-Language, Accept-Encoding"]
+    );
+
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("Vary", "*").unwrap();
+    add_vary_header(&mut header, &http::header::ACCEPT_ENCODING);
+    assert_eq!(
+        header
+            .headers
+            .get_all("Vary")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["*"]
+    );
+}
+
 fn adjust_response_header(resp: &mut ResponseHeader, action: &Action) {
-    use http::header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
+    use http::header::{
+        HeaderValue, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING,
+    };
 
     fn set_stream_headers(resp: &mut ResponseHeader) {
         // because the transcoding is streamed, content length is not known ahead
         resp.remove_header(&CONTENT_LENGTH);
         // remove Accept-Ranges header because range requests will no longer work
         resp.remove_header(&ACCEPT_RANGES);
+
         // we stream body now TODO: chunked is for h1 only
         resp.insert_header(&TRANSFER_ENCODING, HeaderValue::from_static("chunked"))
             .unwrap();
@@ -616,6 +729,7 @@ fn test_adjust_response_header() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-length", "20").unwrap();
     header.insert_header("content-encoding", "gzip").unwrap();
+    header.insert_header("accept-ranges", "bytes").unwrap();
     adjust_response_header(&mut header, &Noop);
     assert_eq!(
         header.headers.get("content-encoding").unwrap().as_bytes(),
@@ -631,6 +745,7 @@ fn test_adjust_response_header() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-length", "20").unwrap();
     header.insert_header("content-encoding", "gzip").unwrap();
+    header.insert_header("accept-ranges", "bytes").unwrap();
     adjust_response_header(&mut header, &Decompress(Gzip));
     assert!(header.headers.get("content-encoding").is_none());
     assert!(header.headers.get("content-length").is_none());
@@ -638,6 +753,7 @@ fn test_adjust_response_header() {
         header.headers.get("transfer-encoding").unwrap().as_bytes(),
         b"chunked"
     );
+    assert!(header.headers.get("accept-ranges").is_none());
 
     // compress
     let mut header = ResponseHeader::build(200, None).unwrap();
