@@ -22,6 +22,7 @@ use daemon::daemonize;
 use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
+use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
 use tokio::signal::unix;
@@ -62,14 +63,14 @@ pub struct Server {
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
     shutdown_recv: ShutdownWatch,
-    /// the parsed server configuration
+    /// The parsed server configuration
     pub configuration: Arc<ServerConf>,
-    /// the parser command line options
+    /// The parser command line options
     pub options: Option<Opt>,
-    /// the Sentry DSN
+    /// The Sentry ClientOptions.
     ///
-    /// Panics and other events sentry captures will send to this DSN **only in release mode**
-    pub sentry: Option<String>,
+    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
+    pub sentry: Option<ClientOptions>,
 }
 
 // TODO: delete the pid when exit
@@ -256,10 +257,11 @@ impl Server {
 
         /* only init sentry in release builds */
         #[cfg(not(debug_assertions))]
-        let _guard = match self.sentry.as_ref() {
-            Some(uri) => Some(sentry::init(uri.as_str())),
-            None => None,
-        };
+        let _guard = self
+            .sentry
+            .as_ref()
+            .map(|opts| sentry::init(opts.clone()))
+            .expect("sentry ClientOptions are valid");
 
         if self.options.as_ref().map_or(false, |o| o.test) {
             info!("Server Test passed, exiting");
@@ -303,10 +305,11 @@ impl Server {
 
         /* only init sentry in release builds */
         #[cfg(not(debug_assertions))]
-        let _guard = match self.sentry.as_ref() {
-            Some(uri) => Some(sentry::init(uri.as_str())),
-            None => None,
-        };
+        let _guard = self
+            .sentry
+            .as_ref()
+            .map(|opts| sentry::init(opts.clone()))
+            .expect("sentry ClientOptions are valid");
 
         let mut runtimes: Vec<Runtime> = Vec::new();
 
