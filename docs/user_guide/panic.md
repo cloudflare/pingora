@@ -4,7 +4,12 @@ Any panic that happens to particular requests does not affect other ongoing requ
 
 In order to monitor the panics, Pingora server has built-in Sentry integration.
 ```rust
-my_server.sentry = Some("SENTRY_DSN");
+my_server.sentry = Some(
+    sentry::ClientOptions{
+        dsn: "SENTRY_DSN".into_dsn().unwrap(),
+        ..Default::default()
+    }
+);
 ```
 
 Even though a panic is not fatal in Pingora, it is still not the preferred way to handle failures like network timeouts. Panics should be reserved for unexpected logic errors.
