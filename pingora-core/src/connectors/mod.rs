@@ -15,7 +15,7 @@
 //! Connecting to servers
 
 pub mod http;
-mod l4;
+pub mod l4;
 mod offload;
 mod tls;
 

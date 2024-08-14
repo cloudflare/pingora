@@ -34,7 +34,7 @@ pub trait Connect: std::fmt::Debug {
 }
 
 /// Establish a connection (l4) to the given peer using its settings and an optional bind address.
-pub async fn connect<P>(peer: &P, bind_to: Option<InetSocketAddr>) -> Result<Stream>
+pub(crate) async fn connect<P>(peer: &P, bind_to: Option<InetSocketAddr>) -> Result<Stream>
 where
     P: Peer + Send + Sync,
 {
