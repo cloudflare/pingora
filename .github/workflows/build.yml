@@ -50,4 +50,4 @@ jobs:
 
       - name: Run cargo audit
         run: |
-          [[ ${{ matrix.toolchain }} == nightly ]] || (cargo install cargo-audit && cargo audit)
+          [[ ${{ matrix.toolchain }} != 1.80.0 ]] || (cargo install cargo-audit && cargo audit)
