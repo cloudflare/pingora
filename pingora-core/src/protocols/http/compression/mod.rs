@@ -451,6 +451,34 @@ fn depends_on_accept_encoding(
         || (compress_enabled && compressible(resp))
 }
 
+#[test]
+fn test_decide_on_accept_encoding() {
+    let mut resp = ResponseHeader::build(200, None).unwrap();
+    resp.insert_header("content-length", "50").unwrap();
+    resp.insert_header("content-type", "text/html").unwrap();
+    resp.insert_header("content-encoding", "gzip").unwrap();
+
+    // enabled
+    assert!(depends_on_accept_encoding(&resp, false, &[true]));
+
+    // decompress disabled => disabled
+    assert!(!depends_on_accept_encoding(&resp, false, &[false]));
+
+    // no content-encoding => disabled
+    resp.remove_header("content-encoding");
+    assert!(!depends_on_accept_encoding(&resp, false, &[true]));
+
+    // compress enabled and compressible response => enabled
+    assert!(depends_on_accept_encoding(&resp, true, &[false]));
+
+    // compress disabled and compressible response => disabled
+    assert!(!depends_on_accept_encoding(&resp, false, &[false]));
+
+    // compress enabled and not compressible response => disabled
+    resp.insert_header("content-type", "text/html+zip").unwrap();
+    assert!(!depends_on_accept_encoding(&resp, true, &[false]));
+}
+
 // filter response header to see if (de)compression is needed
 fn decide_action(resp: &ResponseHeader, accept_encoding: &[Algorithm]) -> Action {
     use http::header::CONTENT_ENCODING;
