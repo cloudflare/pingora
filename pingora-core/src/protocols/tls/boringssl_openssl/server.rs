@@ -14,7 +14,7 @@
 
 //! TLS server specific implementation
 
-use super::SslStream;
+use crate::protocols::tls::SslStream;
 use crate::protocols::{Shutdown, IO};
 use crate::tls::ext;
 use crate::tls::ext::ssl_from_acceptor;

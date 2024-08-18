@@ -14,8 +14,8 @@
 
 //! TLS client specific implementation
 
-use super::SslStream;
 use crate::protocols::raw_connect::ProxyDigest;
+use crate::protocols::tls::SslStream;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, TimingDigest, IO,
 };
