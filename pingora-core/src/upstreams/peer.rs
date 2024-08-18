@@ -67,7 +67,7 @@ pub trait Peer: Display + Clone {
     fn tls(&self) -> bool;
     /// The SNI to send, if TLS is used
     fn sni(&self) -> &str;
-    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
+    /// To decide whether a [`Peer`] can use the connection established by another [`Peer`].
     ///
     /// The connections to two peers are considered reusable to each other if their reuse hashes are
     /// the same
