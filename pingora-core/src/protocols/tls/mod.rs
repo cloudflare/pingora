@@ -14,9 +14,13 @@
 
 //! The TLS layer implementations
 
-pub mod client;
 pub mod digest;
-pub mod server;
+
+#[cfg(feature = "some_tls")]
+mod boringssl_openssl;
+
+#[cfg(feature = "some_tls")]
+pub use boringssl_openssl::*;
 
 #[cfg(not(feature = "some_tls"))]
 pub mod dummy_tls;

@@ -16,7 +16,7 @@ use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::sync::{Arc, Once};
 
-use super::ConnectorOptions;
+use crate::connectors::ConnectorOptions;
 use crate::protocols::tls::client::handshake;
 use crate::protocols::tls::SslStream;
 use crate::protocols::IO;
