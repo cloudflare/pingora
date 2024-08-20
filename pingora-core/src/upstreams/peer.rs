@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connectors::L4Connect;
+use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -110,8 +110,8 @@ pub trait Peer: Display + Clone {
             None => None,
         }
     }
-    /// Which local source address this connection should be bind to.
-    fn bind_to(&self) -> Option<&InetSocketAddr> {
+    /// Information about the local source address this connection should be bound to.
+    fn bind_to(&self) -> Option<&BindTo> {
         match self.get_peer_options() {
             Some(opt) => opt.bind_to.as_ref(),
             None => None,
@@ -243,7 +243,7 @@ impl Peer for BasicPeer {
         !self.sni.is_empty()
     }
 
-    fn bind_to(&self) -> Option<&InetSocketAddr> {
+    fn bind_to(&self) -> Option<&BindTo> {
         None
     }
 
@@ -294,7 +294,7 @@ impl Scheme {
 /// See [`Peer`] for the meaning of the fields
 #[derive(Clone, Debug)]
 pub struct PeerOptions {
-    pub bind_to: Option<InetSocketAddr>,
+    pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
     pub total_connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
@@ -365,7 +365,7 @@ impl PeerOptions {
 
 impl Display for PeerOptions {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        if let Some(b) = self.bind_to {
+        if let Some(b) = self.bind_to.as_ref() {
             write!(f, "bind_to: {:?},", b)?;
         }
         if let Some(t) = self.connection_timeout {
