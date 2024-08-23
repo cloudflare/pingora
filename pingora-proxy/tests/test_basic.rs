@@ -15,6 +15,7 @@
 mod utils;
 
 use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
+#[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
 
@@ -233,6 +234,7 @@ async fn test_h2_to_h1_upload() {
     assert_eq!(body, payload);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_simple_proxy_uds() {
     init();
@@ -262,6 +264,7 @@ async fn test_simple_proxy_uds() {
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn test_simple_proxy_uds_peer() {
     init();

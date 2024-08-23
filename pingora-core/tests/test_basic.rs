@@ -15,6 +15,7 @@
 mod utils;
 
 use hyper::Client;
+#[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use utils::init;
 
@@ -51,6 +52,7 @@ async fn test_https_http2() {
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }
 
+#[cfg(unix)]
 #[cfg(feature = "some_tls")]
 #[tokio::test]
 async fn test_uds() {
