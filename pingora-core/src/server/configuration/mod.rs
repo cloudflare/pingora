@@ -118,7 +118,7 @@ impl Default for ServerConf {
 
 /// Command-line options
 ///
-/// Call `Opt::from_args()` to build this object from the process's command line arguments.
+/// Call `Opt::parse_args()` to build this object from the process's command line arguments.
 #[derive(Parser, Debug, Default)]
 #[clap(name = "basic", long_about = None)]
 pub struct Opt {
