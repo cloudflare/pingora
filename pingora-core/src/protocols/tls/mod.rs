@@ -23,9 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::protocols::digest::TimingDigest;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, UniqueID, IO,
-};
+use crate::protocols::{GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest};
 
 #[cfg(not(feature = "rustls"))]
 pub(crate) mod boringssl_openssl;
@@ -56,33 +54,6 @@ pub trait InnerTlsStream {
 
     /// Return selected ALPN if any
     fn selected_alpn_proto(&mut self) -> Option<ALPN>;
-}
-
-impl GetSocketDigest for Box<dyn IO + Send> {
-    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-        (**self).get_socket_digest()
-    }
-    fn set_socket_digest(&mut self, socket_digest: SocketDigest) {
-        (**self).set_socket_digest(socket_digest)
-    }
-}
-
-impl GetTimingDigest for Box<dyn IO + Send> {
-    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        vec![]
-    }
-}
-
-impl GetProxyDigest for Box<dyn IO + Send> {
-    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        (**self).get_proxy_digest()
-    }
-}
-
-impl UniqueID for Box<dyn IO + Send> {
-    fn id(&self) -> i32 {
-        (**self).id()
-    }
 }
 
 /// The protocol for Application-Layer Protocol Negotiation

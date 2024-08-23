@@ -66,10 +66,7 @@ fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>>
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake(
-    acceptor: &Acceptor,
-    io: Box<dyn IO + Send>,
-) -> Result<TlsStream<Box<dyn IO + Send>>> {
+pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
     let mut stream = prepare_tls_stream(acceptor, io)?;
     stream
         .accept()
@@ -79,11 +76,11 @@ pub async fn handshake(
 }
 
 /// Perform TLS handshake for the given connection with the given configuration and callbacks
-pub async fn handshake_with_callback(
+pub async fn handshake_with_callback<S: IO>(
     acceptor: &Acceptor,
-    io: Box<dyn IO + Send>,
+    io: S,
     callbacks: &TlsAcceptCallbacks,
-) -> pingora_error::Result<TlsStream<Box<dyn IO + Send>>> {
+) -> pingora_error::Result<TlsStream<S>> {
     let mut tls_stream = prepare_tls_stream(acceptor, io)?;
     let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
@@ -148,5 +145,5 @@ async fn test_async_cert() {
     });
 
     let acceptor = TlsSettings::with_callbacks(cb).unwrap().build();
-    acceptor.handshake(Box::new(server)).await.unwrap();
+    acceptor.handshake(server).await.unwrap();
 }

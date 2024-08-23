@@ -23,11 +23,7 @@ use tls::Acceptor;
 pub use tls::{TlsSettings, ALPN};
 
 pub use crate::protocols::tls::server::TlsAccept;
-#[cfg(not(feature = "rustls"))]
-use crate::protocols::tls::TlsStream as TlsStreamProvider;
-#[cfg(feature = "rustls")]
-use crate::protocols::tls::TlsStream as TlsStreamProvider;
-use crate::protocols::{Stream, IO};
+use crate::protocols::Stream;
 use crate::server::ListenFds;
 
 mod l4;
@@ -85,8 +81,7 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(self) -> Result<Stream> {
         if let Some(tls) = self.tls {
-            let tls_stream: TlsStreamProvider<Box<dyn IO + Send>> =
-                tls.handshake(Box::new(self.l4)).await?;
+            let tls_stream = tls.handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))

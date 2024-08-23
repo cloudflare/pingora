@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use pingora_error::Result;
 
 use crate::protocols::tls::TlsStream;
-use crate::protocols::{Shutdown, IO};
+use crate::protocols::Shutdown;
 
 #[cfg(not(feature = "rustls"))]
 use crate::tls::ssl::SslRef;
@@ -47,18 +47,6 @@ impl<S> Shutdown for TlsStream<S>
 where
     S: AsyncRead + AsyncWrite + Sync + Unpin + Send,
 {
-    async fn shutdown(&mut self) {
-        match <Self as AsyncWriteExt>::shutdown(self).await {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("TLS shutdown failed, {e}");
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl Shutdown for Box<dyn IO + Send> {
     async fn shutdown(&mut self) {
         match <Self as AsyncWriteExt>::shutdown(self).await {
             Ok(()) => {}

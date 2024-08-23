@@ -113,10 +113,7 @@ impl TlsSettings {
 }
 
 impl Acceptor {
-    pub async fn handshake(
-        &self,
-        stream: Box<dyn IO + Send>,
-    ) -> Result<TlsStream<Box<dyn IO + Send>>> {
+    pub async fn handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {
