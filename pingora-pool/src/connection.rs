@@ -27,7 +27,10 @@ use tokio::sync::{oneshot, watch, Notify, OwnedMutexGuard};
 use super::lru::Lru;
 
 type GroupKey = u64;
+#[cfg(unix)]
 type ID = i32;
+#[cfg(windows)]
+type ID = usize;
 
 /// the metadata of a connection
 #[derive(Clone, Debug)]

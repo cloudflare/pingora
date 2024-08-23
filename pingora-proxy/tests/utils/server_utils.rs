@@ -279,6 +279,7 @@ impl ProxyHttp for ExampleProxyHttp {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
+        #[cfg(unix)]
         if req.headers.contains_key("x-uds-peer") {
             return Ok(Box::new(HttpPeer::new_uds(
                 "/tmp/nginx-test.sock",
