@@ -1077,9 +1077,6 @@ mod test_cache {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_cache_lock_network_error.txt";
 
-        // FIXME: Dangling lock happens in this test because the first request aborted without
-        // properly release the lock. This is a bug
-
         let task1 = tokio::spawn(async move {
             let res = reqwest::Client::new()
                 .get(url)
