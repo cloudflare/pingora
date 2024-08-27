@@ -607,6 +607,8 @@ impl<SV> HttpProxy<SV> {
         };
 
         if let Some(e) = final_error.as_ref() {
+            // If we have errored and are still holding a cache lock, release it.
+            session.cache.disable(NoCacheReason::InternalError);
             let status = self.inner.fail_to_proxy(&mut session, e, &mut ctx).await;
 
             // final error will have > 0 status unless downstream connection is dead
