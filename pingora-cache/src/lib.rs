@@ -499,6 +499,11 @@ impl HttpCache {
             // from Stale: waited for cache lock, then retried and found asset was gone
             CachePhase::CacheKey | CachePhase::Bypass | CachePhase::Stale => {
                 self.phase = CachePhase::Miss;
+                // It's possible that we've set the meta on lookup and have come back around
+                // here after not being able to acquire the cache lock, and our item has since
+                // purged or expired. We should be sure that the meta is not set in this case
+                // as there shouldn't be a meta set for cache misses.
+                self.inner_mut().meta = None;
                 self.inner_mut().traces.start_miss_span();
             }
             _ => panic!("wrong phase {:?}", self.phase),
