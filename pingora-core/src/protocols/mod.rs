@@ -18,14 +18,14 @@ mod digest;
 pub mod http;
 pub mod l4;
 pub mod raw_connect;
-pub mod ssl;
+pub mod tls;
 
 pub use digest::{
     Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
     TimingDigest,
 };
 pub use l4::ext::TcpKeepalive;
-pub use ssl::ALPN;
+pub use tls::ALPN;
 
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -53,7 +53,7 @@ pub trait Ssl {
     }
 
     /// Return the [`ssl::SslDigest`] for logging
-    fn get_ssl_digest(&self) -> Option<Arc<ssl::SslDigest>> {
+    fn get_ssl_digest(&self) -> Option<Arc<tls::SslDigest>> {
         None
     }
 

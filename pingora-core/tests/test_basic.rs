@@ -18,6 +18,7 @@ use hyper::Client;
 use hyperlocal::{UnixClientExt, Uri};
 use utils::init;
 
+#[cfg(feature = "some_tls")]
 #[tokio::test]
 async fn test_http() {
     init();
@@ -25,6 +26,7 @@ async fn test_http() {
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
+#[cfg(feature = "some_tls")]
 #[tokio::test]
 async fn test_https_http2() {
     init();
@@ -49,6 +51,7 @@ async fn test_https_http2() {
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }
 
+#[cfg(feature = "some_tls")]
 #[tokio::test]
 async fn test_uds() {
     init();

@@ -143,6 +143,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for SslStream<S> 
 }
 
 #[tokio::test]
+#[cfg(feature = "some_tls")]
 async fn test_async_cert() {
     use tokio::io::AsyncReadExt;
     let acceptor = ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls())

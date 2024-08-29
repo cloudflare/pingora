@@ -16,14 +16,14 @@ use log::debug;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
-use crate::protocols::ssl::{
+use crate::protocols::tls::{
     server::{handshake, handshake_with_callback, TlsAcceptCallbacks},
     SslStream,
 };
 use crate::protocols::IO;
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 
-pub use crate::protocols::ssl::ALPN;
+pub use crate::protocols::tls::ALPN;
 
 pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 

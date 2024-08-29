@@ -103,6 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_connect_tls() {
         let connector = Connector::new(None);
         let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
