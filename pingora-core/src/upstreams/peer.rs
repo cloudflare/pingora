@@ -36,7 +36,7 @@ use crate::protocols::TcpKeepalive;
 use crate::tls::x509::X509;
 use crate::utils::{get_organization_unit, CertKey};
 
-pub use crate::protocols::ssl::ALPN;
+pub use crate::protocols::tls::ALPN;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {

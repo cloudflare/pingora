@@ -26,7 +26,7 @@ use std::{fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::Acceptor;
 
-pub use crate::protocols::ssl::server::TlsAccept;
+pub use crate::protocols::tls::server::TlsAccept;
 pub use l4::{ServerAddress, TcpSocketOptions};
 pub use tls::{TlsSettings, ALPN};
 
@@ -213,6 +213,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_listen_tls() {
         use tokio::io::AsyncReadExt;
 

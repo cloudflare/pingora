@@ -17,8 +17,8 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::sync::{Arc, Once};
 
 use super::ConnectorOptions;
-use crate::protocols::ssl::client::handshake;
-use crate::protocols::ssl::SslStream;
+use crate::protocols::tls::client::handshake;
+use crate::protocols::tls::SslStream;
 use crate::protocols::IO;
 use crate::tls::ext::{
     add_host, clear_error_stack, ssl_add_chain_cert, ssl_set_groups_list,

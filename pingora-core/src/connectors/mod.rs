@@ -365,6 +365,7 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(feature = "some_tls")]
 mod tests {
     use pingora_error::ErrorType;
 

@@ -18,6 +18,9 @@ pub mod client;
 pub mod digest;
 pub mod server;
 
+#[cfg(not(feature = "some_tls"))]
+pub mod dummy_tls;
+
 use crate::protocols::digest::TimingDigest;
 use crate::protocols::{Ssl, UniqueID};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};

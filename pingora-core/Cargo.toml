@@ -79,6 +79,7 @@ jemallocator = "0.5"
 
 [features]
 default = ["openssl"]
-openssl = ["pingora-openssl"]
-boringssl = ["pingora-boringssl"]
+openssl = ["pingora-openssl", "some_tls"]
+boringssl = ["pingora-boringssl", "some_tls"]
 patched_http1 = []
+some_tls = []

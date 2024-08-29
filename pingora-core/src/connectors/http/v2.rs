@@ -460,6 +460,7 @@ mod tests {
     use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -472,6 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -497,6 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_h2_single_stream() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
@@ -528,6 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "some_tls")]
     async fn test_h2_multiple_stream() {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
