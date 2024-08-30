@@ -76,9 +76,27 @@ reqwest = { version = "0.11", features = ["rustls"], default-features = false }
 hyperlocal = "0.8"
 hyper = "0.14"
 jemallocator = "0.5"
+iai-callgrind = "0.13.1"
+axum = { version = "0.7.5", features = ["http2"] }
+axum-server = { version = "0.7.1", features = ["tls-rustls"] }
 
 [features]
 default = ["openssl"]
 openssl = ["pingora-openssl"]
 boringssl = ["pingora-boringssl"]
 patched_http1 = []
+
+[[bench]]
+name = "tls_connector"
+harness = false
+
+[[example]]
+name = "bench_server"
+
+
+[[bench]]
+name = "tls_acceptor"
+harness = false
+
+[[example]]
+name = "bench_client"
