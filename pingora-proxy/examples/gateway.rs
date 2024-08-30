@@ -36,7 +36,7 @@ pub struct MyGateway {
 #[async_trait]
 impl ProxyHttp for MyGateway {
     type CTX = ();
-    fn new_ctx(&self) -> Self::CTX {}
+    fn new_ctx(&self, _session: &Session) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         if session.req_header().uri.path().starts_with("/login")

@@ -236,7 +236,7 @@ impl ALPN {
         }
     }
 
-    pub(crate) fn from_wire_selected(raw: &[u8]) -> Option<Self> {
+    pub fn from_wire_selected(raw: &[u8]) -> Option<Self> {
         match raw {
             b"http/1.1" => Some(Self::H1),
             b"h2" => Some(Self::H2),
