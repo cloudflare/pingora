@@ -26,7 +26,7 @@ pub use boringssl_openssl::*;
 pub mod dummy_tls;
 
 use crate::protocols::digest::TimingDigest;
-use crate::protocols::{Ssl, UniqueID};
+use crate::protocols::{Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use log::warn;
 use pingora_error::{ErrorType::*, OrErr, Result};
@@ -169,7 +169,7 @@ impl<T> UniqueID for SslStream<T>
 where
     T: UniqueID,
 {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         self.ssl.get_ref().id()
     }
 }

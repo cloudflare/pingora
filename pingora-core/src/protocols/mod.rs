@@ -32,6 +32,11 @@ use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+#[cfg(unix)]
+pub type UniqueIDType = i32;
+#[cfg(windows)]
+pub type UniqueIDType = usize;
+
 /// Define how a protocol should shutdown its connection.
 #[async_trait]
 pub trait Shutdown {
@@ -42,7 +47,7 @@ pub trait Shutdown {
 pub trait UniqueID {
     /// The ID returned should be unique among all existing connections of the same type.
     /// But ID can be recycled after a connection is shutdown.
-    fn id(&self) -> i32;
+    fn id(&self) -> UniqueIDType;
 }
 
 /// Interface to get TLS info
@@ -126,7 +131,7 @@ mod ext_io_impl {
         async fn shutdown(&mut self) -> () {}
     }
     impl UniqueID for Mock {
-        fn id(&self) -> i32 {
+        fn id(&self) -> UniqueIDType {
             0
         }
     }
@@ -154,7 +159,7 @@ mod ext_io_impl {
         async fn shutdown(&mut self) -> () {}
     }
     impl<T> UniqueID for Cursor<T> {
-        fn id(&self) -> i32 {
+        fn id(&self) -> UniqueIDType {
             0
         }
     }
@@ -182,7 +187,7 @@ mod ext_io_impl {
         async fn shutdown(&mut self) -> () {}
     }
     impl UniqueID for DuplexStream {
-        fn id(&self) -> i32 {
+        fn id(&self) -> UniqueIDType {
             0
         }
     }
@@ -204,15 +209,27 @@ mod ext_io_impl {
     }
 }
 
+#[cfg(unix)]
 pub(crate) trait ConnFdReusable {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool;
 }
 
+#[cfg(windows)]
+pub(crate) trait ConnSockReusable {
+    fn check_sock_match<V: AsRawSocket>(&self, sock: V) -> bool;
+}
+
 use l4::socket::SocketAddr;
 use log::{debug, error};
+#[cfg(unix)]
 use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
-use std::{net::SocketAddr as InetSocketAddr, os::unix::prelude::AsRawFd, path::Path};
+#[cfg(unix)]
+use std::os::unix::prelude::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+use std::{net::SocketAddr as InetSocketAddr, path::Path};
 
+#[cfg(unix)]
 impl ConnFdReusable for SocketAddr {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool {
         match self {
@@ -225,6 +242,16 @@ impl ConnFdReusable for SocketAddr {
     }
 }
 
+#[cfg(windows)]
+impl ConnSockReusable for SocketAddr {
+    fn check_sock_match<V: AsRawSocket>(&self, sock: V) -> bool {
+        match self {
+            SocketAddr::Inet(addr) => addr.check_sock_match(sock),
+        }
+    }
+}
+
+#[cfg(unix)]
 impl ConnFdReusable for Path {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool {
         let fd = fd.as_raw_fd();
@@ -252,6 +279,7 @@ impl ConnFdReusable for Path {
     }
 }
 
+#[cfg(unix)]
 impl ConnFdReusable for InetSocketAddr {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool {
         let fd = fd.as_raw_fd();
