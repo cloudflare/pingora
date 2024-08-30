@@ -97,7 +97,7 @@ async fn tls_post_data(client_reuse: bool, version: Version, data: Vec<String>) 
 
     // wait for all responses
     while let Some(res) = req_set.join_next().await {
-        let _ = res.unwrap();
+        res.unwrap();
     }
 }
 
