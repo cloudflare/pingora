@@ -344,7 +344,7 @@ impl HttpSession {
         Ok(end_stream)
     }
 
-    /// Return a string `$METHOD $PATH $HOST`. Mostly for logging and debug purpose
+    /// Return a string `$METHOD $PATH, Host: $HOST`. Mostly for logging and debug purpose
     pub fn request_summary(&self) -> String {
         format!(
             "{} {}, Host: {}:{}",
