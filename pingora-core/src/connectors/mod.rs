@@ -195,10 +195,28 @@ impl TransportConnector {
                         let mut stream = l.into_inner();
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
+                        #[cfg(unix)]
                         if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
                             Some(stream)
                         } else {
                             None
+                        }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::io::{AsRawSocket, RawSocket};
+                            struct WrappedRawSocket(RawSocket);
+                            impl AsRawSocket for WrappedRawSocket {
+                                fn as_raw_socket(&self) -> RawSocket {
+                                    self.0
+                                }
+                            }
+                            if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
+                                && test_reusable_stream(&mut stream)
+                            {
+                                Some(stream)
+                            } else {
+                                None
+                            }
                         }
                     }
                     Err(_) => {
@@ -372,6 +390,7 @@ mod tests {
     use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
     use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     // 192.0.2.1 is effectively a black hole
@@ -403,9 +422,11 @@ mod tests {
         assert!(reused);
     }
 
+    #[cfg(unix)]
     const MOCK_UDS_PATH: &str = "/tmp/test_unix_transport_connector.sock";
 
     // one-off mock server
+    #[cfg(unix)]
     async fn mock_connect_server() {
         let _ = std::fs::remove_file(MOCK_UDS_PATH);
         let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
@@ -416,6 +437,7 @@ mod tests {
         }
         let _ = std::fs::remove_file(MOCK_UDS_PATH);
     }
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_uds() {
         tokio::spawn(async {

@@ -19,6 +19,7 @@ use pingora_cache::lock::WritePermit;
 use pingora_core::protocols::raw_connect::ProxyDigest;
 use pingora_core::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, TimingDigest, UniqueID,
+    UniqueIDType,
 };
 use std::io::Cursor;
 use std::sync::Arc;
@@ -68,7 +69,7 @@ impl AsyncWrite for DummyIO {
 }
 
 impl UniqueID for DummyIO {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         0 // placeholder
     }
 }

@@ -93,6 +93,8 @@ impl<T> SslStream<T> {
 
 use std::ops::{Deref, DerefMut};
 
+use super::UniqueIDType;
+
 impl<T> Deref for SslStream<T> {
     type Target = InnerSsl<T>;
 
@@ -162,7 +164,7 @@ impl<T> UniqueID for SslStream<T>
 where
     T: UniqueID,
 {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         self.ssl.get_ref().id()
     }
 }

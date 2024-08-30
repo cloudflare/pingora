@@ -35,7 +35,6 @@ http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 lru = { workspace = true }
-nix = "~0.24.3"
 clap = { version = "3.2.25", features = ["derive"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -46,7 +45,6 @@ libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
 thread_local = "1.0"
 prometheus = "0.13"
-daemonize = "0.5.0"
 sentry = { version = "0.26", features = [
     "backtrace",
     "contexts",
@@ -69,13 +67,22 @@ tokio-test = "0.4"
 zstd = "0"
 httpdate = "1"
 
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5.0"
+nix = "~0.24.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+hyperlocal = "0.8"
+jemallocator = "0.5"
+
 [dev-dependencies]
 matches = "0.1"
 env_logger = "0.9"
 reqwest = { version = "0.11", features = ["rustls"], default-features = false }
-hyperlocal = "0.8"
 hyper = "0.14"
-jemallocator = "0.5"
 
 [features]
 default = ["openssl"]
