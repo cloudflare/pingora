@@ -4,7 +4,7 @@ use iai_callgrind::{
 };
 use iai_callgrind::{Pipe, Stdin};
 use once_cell::sync::Lazy;
-use reqwest::{Certificate, Client, StatusCode, Version};
+use reqwest::{Certificate, Client, Response, StatusCode, Version};
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -51,11 +51,11 @@ pub static CLIENT_HTTP2: Lazy<Client> = Lazy::new(client_http2);
 /// using with client: None instantiates a new client and performs a full handshake
 /// providing Some(client) will re-use the provided client/session
 async fn post_data(client_reuse: bool, version: Version, port: u16, data: String) {
-    let client = if client_reuse {
+    let resp = if client_reuse {
         // NOTE: do not perform TLS handshake for each request
         match version {
-            Version::HTTP_11 => &*CLIENT_HTTP11,
-            Version::HTTP_2 => &*CLIENT_HTTP2,
+            Version::HTTP_11 => do_post(port, data, &CLIENT_HTTP11).await,
+            Version::HTTP_2 => do_post(port, data, &CLIENT_HTTP2).await,
             _ => {
                 panic!("HTTP version not supported.")
             }
@@ -63,20 +63,13 @@ async fn post_data(client_reuse: bool, version: Version, port: u16, data: String
     } else {
         // NOTE: perform TLS handshake for each request
         match version {
-            Version::HTTP_11 => &client_http11(),
-            Version::HTTP_2 => &client_http2(),
+            Version::HTTP_11 => do_post(port, data, &client_http11()).await,
+            Version::HTTP_2 => do_post(port, data, &client_http2()).await,
             _ => {
                 panic!("HTTP version not supported.")
             }
         }
     };
-
-    let resp = client
-        .post(format! {"https://openrusty.org:{}", port})
-        .body(data)
-        .send()
-        .await
-        .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.version(), version);
@@ -84,6 +77,15 @@ async fn post_data(client_reuse: bool, version: Version, port: u16, data: String
     // read full response, important for consistent tests
     let _resp_body = resp.text().await.unwrap();
     // println!("resp_body: {}", resp_body)
+}
+
+async fn do_post(port: u16, data: String, client: &Client) -> Response {
+    client
+        .post(format! {"https://openrusty.org:{}", port})
+        .body(data)
+        .send()
+        .await
+        .unwrap()
 }
 
 async fn tls_post_data(client_reuse: bool, version: Version, data: Vec<String>) {
