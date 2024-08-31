@@ -399,6 +399,19 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    async fn cache_hit_filter(
+        &self,
+        session: &Session,
+        _meta: &CacheMeta,
+        _ctx: &mut Self::CTX,
+    ) -> Result<bool> {
+        // allow test header to control force expiry
+        if session.get_header_bytes("x-force-expire") != b"" {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn cache_vary_filter(
         &self,
         meta: &CacheMeta,
