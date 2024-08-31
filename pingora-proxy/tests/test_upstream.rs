@@ -1517,6 +1517,43 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_streaming_multiple_writers() {
+        // multiple streaming writers don't conflict
+        init();
+        let url = "http://127.0.0.1:6148/slow_body/test_cache_streaming_multiple_writers.txt";
+        let task1 = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-set-hello", "everyone")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello everyone!");
+        });
+
+        let task2 = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                // don't allow using the other streaming write's result
+                .header("x-force-expire", "1")
+                .header("x-set-hello", "todo el mundo")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello todo el mundo!");
+        });
+
+        task1.await.unwrap();
+        task2.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_range_request() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_range_request/now";

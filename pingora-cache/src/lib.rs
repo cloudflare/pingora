@@ -612,7 +612,15 @@ impl HttpCache {
                     // Downstream read and upstream write can be decoupled
                     let body_reader = inner
                         .storage
-                        .lookup(key, &inner.traces.get_miss_span())
+                        .lookup_streaming_write(
+                            key,
+                            inner
+                                .miss_handler
+                                .as_ref()
+                                .expect("miss handler already set")
+                                .streaming_write_tag(),
+                            &inner.traces.get_miss_span(),
+                        )
                         .await?;
 
                     if let Some((_meta, body_reader)) = body_reader {
