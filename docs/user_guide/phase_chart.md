@@ -1,7 +1,8 @@
 Pingora proxy phases without caching
 ```mermaid
  graph TD;
-    start("new request")-->request_filter;
+    start("new request")-->early_request_filter;
+    early_request_filter-->request_filter;
     request_filter-->upstream_peer;
 
     upstream_peer-->Connect{{IO: connect to upstream}};

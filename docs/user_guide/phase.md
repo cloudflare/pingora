@@ -16,7 +16,8 @@ The pingora-proxy HTTP proxy framework supports highly programmable proxy behavi
 Pingora-proxy allows users to insert arbitrary logic into the life of a request.
 ```mermaid
  graph TD;
-    start("new request")-->request_filter;
+    start("new request")-->early_request_filter;
+    early_request_filter-->request_filter;
     request_filter-->upstream_peer;
 
     upstream_peer-->Connect{{IO: connect to upstream}};
@@ -52,9 +53,12 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
 * The reason both `upstream_response_*_filter()` and `response_*_filter()` exist is for HTTP caching integration reasons (still WIP).
 
 
-### `request_filter()`
+### `early_request_filter()`
 This is the first phase of every request.
 
+This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
+
+### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context.
 
 ### `proxy_upstream_filter()`
