@@ -56,7 +56,7 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
 ### `early_request_filter()`
 This is the first phase of every request.
 
-This function is similar to `request_filter()` but execute before any other logic especially the downstream modules.
+This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context.

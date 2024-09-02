@@ -69,9 +69,9 @@ pub trait ProxyHttp {
 
     /// Handle the incoming request before any downstream module is executed.
     ///
-    /// This function is similar to [Self::request_filter()] but execute before any other logic
-    /// especially the downstream modules. The main purpose of this function is to provide finer
-    /// grained control of behavior of the modules.
+    /// This function is similar to [Self::request_filter()] but executes before any other logic,
+    /// including downstream module logic. The main purpose of this function is to provide finer
+    /// grained control of the behavior of the modules.
     ///
     /// Note that because this function is executed before any module that might provide access
     /// control or rate limiting, logic should stay in request_filter() if it can in order to be
