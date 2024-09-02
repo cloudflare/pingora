@@ -121,7 +121,7 @@ fn main() {
     let mut my_proxy = pingora_proxy::http_proxy_service(
         &my_server.configuration,
         MyGateway {
-            req_metric: register_int_counter!("reg_counter", "Number of requests").unwrap(),
+            req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
         },
     );
     my_proxy.add_tcp("0.0.0.0:6191");
