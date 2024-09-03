@@ -14,7 +14,7 @@
 
 //! Metadata for caching
 
-use http::Extensions;
+pub use http::Extensions;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};

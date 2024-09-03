@@ -719,10 +719,15 @@ impl HttpCache {
                 // that requires cacheable_filter to take a mut header and just return InternalMeta
 
                 // update new meta with old meta's created time
-                let created = inner.meta.as_ref().unwrap().0.internal.created;
+                let old_meta = inner.meta.take().unwrap();
+                let created = old_meta.0.internal.created;
                 meta.0.internal.created = created;
                 // meta.internal.updated was already set to new meta's `created`,
                 // no need to set `updated` here
+                // Merge old extensions with new ones. New exts take precedence if they conflict.
+                let mut extensions = old_meta.0.extensions;
+                extensions.extend(meta.0.extensions);
+                meta.0.extensions = extensions;
 
                 inner.meta.replace(meta);
 
