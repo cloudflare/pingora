@@ -21,6 +21,7 @@ use key::{CacheHashKey, HashBinary};
 use lock::WritePermit;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
+use rustracing::tag::Tag;
 use std::time::{Duration, Instant, SystemTime};
 use trace::CacheTraceCTX;
 
@@ -1047,7 +1048,7 @@ impl HttpCache {
     /// Check [Self::is_cache_locked()], panic if this request doesn't have a read lock.
     pub async fn cache_lock_wait(&mut self) -> LockStatus {
         let inner = self.inner_mut();
-        let _span = inner.traces.child("cache_lock");
+        let mut span = inner.traces.child("cache_lock");
         let lock = inner.lock.take(); // remove the lock from self
         if let Some(Locked::Read(r)) = lock {
             let now = Instant::now();
@@ -1059,7 +1060,10 @@ impl HttpCache {
                     .lock_duration
                     .map_or(lock_duration, |d| d + lock_duration),
             );
-            r.lock_status() // TODO: tag the span with lock status
+            let status = r.lock_status();
+            let tag_value: &'static str = status.into();
+            span.set_tag(|| Tag::new("status", tag_value));
+            status
         } else {
             // should always call is_cache_locked() before this function
             panic!("cache_lock_wait on wrong type of lock")
