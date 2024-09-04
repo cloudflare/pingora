@@ -100,12 +100,14 @@ impl CacheLock {
     }
 }
 
+use log::warn;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
+use strum::IntoStaticStr;
 use tokio::sync::Semaphore;
 
 /// Status which the read locks could possibly see.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoStaticStr)]
 pub enum LockStatus {
     /// Waiting for the writer to populate the asset
     Waiting,
@@ -180,7 +182,7 @@ impl LockCore {
     }
 
     fn lock_status(&self) -> LockStatus {
-        self.lock_status.load(Ordering::Relaxed).into()
+        self.lock_status.load(Ordering::SeqCst).into()
     }
 }
 
@@ -197,11 +199,22 @@ impl ReadLock {
             return;
         }
 
-        // TODO: should subtract now - start so that the lock don't wait beyond start + timeout
-        // Also need to be careful not to wake everyone up at the same time
+        // TODO: need to be careful not to wake everyone up at the same time
         // (maybe not an issue because regular cache lock release behaves that way)
-        let _ = timeout(self.0.timeout, self.0.lock.acquire()).await;
-        // permit is returned to Semaphore right away
+        if let Some(duration) = self.0.timeout.checked_sub(self.0.lock_start.elapsed()) {
+            match timeout(duration, self.0.lock.acquire()).await {
+                Ok(Ok(_)) => { // permit is returned to Semaphore right away
+                }
+                Ok(Err(e)) => {
+                    warn!("error acquiring semaphore {e:?}")
+                }
+                Err(_) => {
+                    self.0
+                        .lock_status
+                        .store(LockStatus::Timeout.into(), Ordering::SeqCst);
+                }
+            }
+        }
     }
 
     /// Test if it is still locked
@@ -211,7 +224,7 @@ impl ReadLock {
 
     /// Whether the lock is expired, e.g., the writer has been holding the lock for too long
     pub fn expired(&self) -> bool {
-        // NOTE: this whether the lock is currently expired
+        // NOTE: this is whether the lock is currently expired
         // not whether it was timed out during wait()
         self.0.lock_start.elapsed() >= self.0.timeout
     }

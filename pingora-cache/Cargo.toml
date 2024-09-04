@@ -43,6 +43,7 @@ lru = { workspace = true }
 ahash = { workspace = true }
 hex = "0.4"
 httparse = { workspace = true }
+strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
