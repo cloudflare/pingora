@@ -14,7 +14,6 @@
 
 //! BoringSSL & OpenSSL TLS stream specific implementation
 
-use async_trait::async_trait;
 use log::warn;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,10 +21,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 
-use crate::listeners::ALPN;
 use crate::protocols::digest::{GetSocketDigest, SocketDigest, TimingDigest};
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::tls::InnerTlsStream;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{GetProxyDigest, GetTimingDigest};
 use crate::tls::error::ErrorStack;
@@ -58,10 +55,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
     }
 }
 
-#[async_trait]
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     /// Connect to the remote TLS server as a client
-    async fn connect(&mut self) -> Result<()> {
+    pub(crate) async fn connect(&mut self) -> Result<()> {
         Self::clear_error();
         match Pin::new(&mut self.0).connect().await {
             Ok(_) => Ok(()),
@@ -70,7 +66,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
     }
 
     /// Finish the TLS handshake from client as a server
-    async fn accept(&mut self) -> Result<()> {
+    pub(crate) async fn accept(&mut self) -> Result<()> {
         Self::clear_error();
         match Pin::new(&mut self.0).accept().await {
             Ok(_) => Ok(()),
@@ -78,13 +74,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
         }
     }
 
-    fn digest(&mut self) -> Option<Arc<SslDigest>> {
+    pub(crate) fn digest(&mut self) -> Option<Arc<SslDigest>> {
         Some(Arc::new(SslDigest::from_ssl(self.0.ssl())))
-    }
-
-    fn selected_alpn_proto(&mut self) -> Option<ALPN> {
-        let ssl = self.0.ssl();
-        ALPN::from_wire_selected(ssl.selected_alpn_protocol()?)
     }
 }
 

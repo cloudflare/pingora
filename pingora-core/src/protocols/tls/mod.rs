@@ -44,6 +44,9 @@ pub struct TlsStream<T> {
     timing: TimingDigest,
 }
 
+// NOTE: keeping trait for documentation purpose
+// switched to direct implementations to eliminate redirections in within the call-graph
+// the below trait is required for InnerStream<T> to be implemented
 #[async_trait]
 pub trait InnerTlsStream {
     async fn connect(&mut self) -> Result<()>;
@@ -51,9 +54,6 @@ pub trait InnerTlsStream {
 
     /// Return the [`ssl::SslDigest`] for logging
     fn digest(&mut self) -> Option<Arc<SslDigest>>;
-
-    /// Return selected ALPN if any
-    fn selected_alpn_proto(&mut self) -> Option<ALPN>;
 }
 
 /// The protocol for Application-Layer Protocol Negotiation

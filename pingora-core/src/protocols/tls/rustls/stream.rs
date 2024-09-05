@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
 use pingora_error::ErrorType::{AcceptError, ConnectError, TLSHandshakeFailure};
 use pingora_error::{Error, ImmutStr, OrErr, Result};
 use pingora_rustls::NoDebug;
@@ -24,10 +23,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::listeners::tls::Acceptor;
-use crate::listeners::ALPN;
 use crate::protocols::digest::{GetSocketDigest, SocketDigest, TimingDigest};
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::tls::InnerTlsStream;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{GetProxyDigest, GetTimingDigest};
 
@@ -67,11 +64,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
         })
     }
 }
-
-#[async_trait]
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     /// Connect to the remote TLS server as a client
-    async fn connect(&mut self) -> Result<()> {
+    pub(crate) async fn connect(&mut self) -> Result<()> {
         let connect = &mut (*self.connect);
 
         if let Some(ref mut connect) = connect {
@@ -92,7 +87,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
 
     /// Finish the TLS handshake from client as a server
     /// no-op implementation within Rustls, handshake is performed during creation of stream.
-    async fn accept(&mut self) -> Result<()> {
+    pub(crate) async fn accept(&mut self) -> Result<()> {
         let accept = &mut (*self.accept);
 
         if let Some(ref mut accept) = accept {
@@ -111,20 +106,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerTlsStream for InnerStream<T>
         }
     }
 
-    fn digest(&mut self) -> Option<Arc<SslDigest>> {
+    pub(crate) fn digest(&mut self) -> Option<Arc<SslDigest>> {
         Some(Arc::new(SslDigest::from_stream(&self.stream)))
-    }
-
-    fn selected_alpn_proto(&mut self) -> Option<ALPN> {
-        if let Some(stream) = self.stream.as_ref() {
-            let proto = stream.get_ref().1.alpn_protocol();
-            match proto {
-                None => None,
-                Some(raw) => ALPN::from_wire_selected(raw),
-            }
-        } else {
-            None
-        }
     }
 }
 
