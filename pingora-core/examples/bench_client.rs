@@ -10,63 +10,106 @@ use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV11;
 use pingora_core::protocols::http::v2::client::Http2Session;
 use pingora_http::RequestHeader;
 use reqwest::Version;
-use std::io::ErrorKind::Unsupported;
 
 #[allow(dead_code, unused_imports)]
 #[path = "../benches/utils/mod.rs"]
 mod bench_utils;
+use crate::bench_utils::TLS_HTTP11_PORT;
 use bench_utils::{
-    generate_random_ascii_data, wait_for_tcp_connect, CERT_PATH, KEY_PATH, TLS_HTTP2_PORT,
+    generate_random_ascii_data, http_version_parser, wait_for_tcp_connect, CERT_PATH, KEY_PATH,
+    TLS_HTTP2_PORT,
 };
 use pingora_core::protocols::http::client::HttpSession;
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(long, parse(try_from_str = http_version_parser))]
+    http_version: Version,
+
+    #[clap(long, action = clap::ArgAction::Set)]
+    stream_reuse: bool,
+
+    #[clap(long)]
+    request_count: i32,
+
+    #[clap(long)]
+    request_size: usize,
+
+    #[clap(long, default_value = "1")]
+    parallel_connectors: u16,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args = Args::parse();
+    println!("{:?}", args);
+
+    println!("Waiting for TCP connect...");
+    wait_for_tcp_connect(args.http_version, args.parallel_connectors).await;
+    println!("TCP connect successful.");
+
+    println!("Sending benchmark requests...");
+    connector_tls_post_data(
+        args.stream_reuse,
+        args.http_version,
+        args.parallel_connectors,
+        generate_random_ascii_data(args.request_count, args.request_size),
+    )
+    .await;
+    println!("Benchmark requests successfully sent.");
+    println!("Waiting for server(s) to gracefully shutdown...");
+}
+
+async fn connector_tls_post_data(
+    client_reuse: bool,
+    version: Version,
+    parallel_connectors: u16,
+    data: Vec<String>,
+) {
+    match version {
+        Version::HTTP_11 => {
+            for i in 0..parallel_connectors {
+                let (connector, peer) = connector_http11_session(i as i32).await;
+                post_http11(client_reuse, connector, peer, data.clone()).await;
+            }
+        }
+        Version::HTTP_2 => {
+            for i in 0..parallel_connectors {
+                let (connector, peer) = connector_http2(i as i32).await;
+                post_http2(client_reuse, connector, peer, data.clone()).await;
+            }
+        }
+        _ => {
+            panic!("HTTP version not supported.")
+        }
+    };
+}
 
 const DEFAULT_POOL_SIZE: usize = 2;
 const HTTP_HOST: &str = "openrusty.org";
 const SERVER_IP: &str = "127.0.0.1";
 
-fn get_tls_connector_options() -> ConnectorOptions {
-    let mut options = ConnectorOptions::new(DEFAULT_POOL_SIZE);
-    options.ca_file = Some(CERT_PATH.clone());
-    options.cert_key_file = Some((CERT_PATH.clone(), KEY_PATH.clone()));
-    options
-}
-
-async fn connector_http11_session() -> (ConnectorV11, HttpPeer) {
+async fn connector_http11_session(port_offset: i32) -> (ConnectorV11, HttpPeer) {
     let connector = ConnectorV11::new(Some(get_tls_connector_options()));
-    let peer = get_http_peer(TLS_HTTP2_PORT as i32);
+    let peer = get_http_peer(TLS_HTTP11_PORT as i32 + port_offset);
 
     (connector, peer)
 }
 
-async fn connector_http2() -> (ConnectorV2, HttpPeer) {
+async fn connector_http2(port_offset: i32) -> (ConnectorV2, HttpPeer) {
     let connector = ConnectorV2::new(Some(get_tls_connector_options()));
-    let mut peer = get_http_peer(TLS_HTTP2_PORT as i32);
+    let mut peer = get_http_peer(TLS_HTTP2_PORT as i32 + port_offset);
     peer.options.set_http_version(2, 2);
     peer.options.max_h2_streams = 1;
 
     (connector, peer)
 }
 
-async fn session_new_http2(connector: &ConnectorV2, peer: HttpPeer) -> Http2Session {
-    let http2_session = connector.new_http_session(&peer).await.unwrap();
-    match http2_session {
-        HttpSession::H1(_) => panic!("expect h2"),
-        HttpSession::H2(h2_stream) => h2_stream,
-    }
-}
-
-async fn session_new_http11(connector: &ConnectorV11, peer: HttpPeer) -> HttpSessionV11 {
-    let (http_session, reused) = connector.get_http_session(&peer).await.unwrap();
-    assert!(!reused);
-    http_session
-}
-
-async fn session_reuse_http2(connector: &ConnectorV2, peer: HttpPeer) -> Http2Session {
-    connector.reused_http_session(&peer).await.unwrap().unwrap()
-}
-
-async fn session_reuse_http11(connector: &ConnectorV11, peer: HttpPeer) -> HttpSessionV11 {
-    connector.reused_http_session(&peer).await.unwrap()
+fn get_tls_connector_options() -> ConnectorOptions {
+    let mut options = ConnectorOptions::new(DEFAULT_POOL_SIZE);
+    options.ca_file = Some(CERT_PATH.clone());
+    options.cert_key_file = Some((CERT_PATH.clone(), KEY_PATH.clone()));
+    options
 }
 
 fn get_http_peer(port: i32) -> HttpPeer {
@@ -121,7 +164,6 @@ async fn post_http11(
         }
     }
 }
-
 async fn post_http2(client_reuse: bool, connector: ConnectorV2, peer: HttpPeer, data: Vec<String>) {
     let mut first = true;
     for d in data {
@@ -167,60 +209,24 @@ async fn post_http2(client_reuse: bool, connector: ConnectorV2, peer: HttpPeer, 
     }
 }
 
-async fn connector_tls_post_data(client_reuse: bool, version: Version, data: Vec<String>) {
-    match version {
-        Version::HTTP_11 => {
-            let (connector, peer) = connector_http11_session().await;
-            post_http11(client_reuse, connector, peer, data).await;
-        }
-        Version::HTTP_2 => {
-            let (connector, peer) = connector_http2().await;
-            post_http2(client_reuse, connector, peer, data).await;
-        }
-        _ => {
-            panic!("HTTP version not supported.")
-        }
-    };
+async fn session_new_http11(connector: &ConnectorV11, peer: HttpPeer) -> HttpSessionV11 {
+    let (http_session, reused) = connector.get_http_session(&peer).await.unwrap();
+    assert!(!reused);
+    http_session
 }
 
-fn http_version_parser(version: &str) -> Result<Version, std::io::Error> {
-    match version {
-        "HTTP/1.1" => Ok(Version::HTTP_11),
-        "HTTP/2.0" => Ok(Version::HTTP_2),
-        _ => Err(std::io::Error::from(Unsupported)),
+async fn session_new_http2(connector: &ConnectorV2, peer: HttpPeer) -> Http2Session {
+    let http2_session = connector.new_http_session(&peer).await.unwrap();
+    match http2_session {
+        HttpSession::H1(_) => panic!("expect h2"),
+        HttpSession::H2(h2_stream) => h2_stream,
     }
 }
 
-#[derive(Parser, Debug)]
-struct Args {
-    #[clap(long, parse(try_from_str = http_version_parser))]
-    http_version: Version,
-
-    #[clap(long, action = clap::ArgAction::Set)]
-    stream_reuse: bool,
-
-    #[clap(long)]
-    request_count: i32,
-
-    #[clap(long)]
-    request_size: usize,
+async fn session_reuse_http2(connector: &ConnectorV2, peer: HttpPeer) -> Http2Session {
+    connector.reused_http_session(&peer).await.unwrap().unwrap()
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let args = Args::parse();
-    println!("{:?}", args);
-
-    println!("Waiting for TCP connect...");
-    wait_for_tcp_connect(args.http_version).await;
-    println!("TCP connect successful.");
-
-    println!("Starting to send benchmark requests.");
-    connector_tls_post_data(
-        args.stream_reuse,
-        args.http_version,
-        generate_random_ascii_data(args.request_count, args.request_size),
-    )
-    .await;
-    println!("Successfully sent benchmark requests.");
+async fn session_reuse_http11(connector: &ConnectorV11, peer: HttpPeer) -> HttpSessionV11 {
+    connector.reused_http_session(&peer).await.unwrap()
 }
