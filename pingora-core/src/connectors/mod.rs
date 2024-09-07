@@ -174,11 +174,13 @@ impl TransportConnector {
         let stream = if let Some(rt) = rt {
             let peer = peer.clone();
             let tls_ctx = self.tls_ctx.clone();
-            rt.spawn(async move { do_connect(&peer, bind_to, alpn_override, &tls_ctx.ctx).await })
-                .await
-                .or_err(InternalError, "offload runtime failure")??
+            rt.spawn(
+                async move { do_connect(&peer, bind_to, alpn_override, tls_ctx.context()).await },
+            )
+            .await
+            .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
+            do_connect(peer, bind_to, alpn_override, self.tls_ctx.context()).await?
         };
 
         Ok(stream)
@@ -437,7 +439,7 @@ mod tests {
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let connector = Connector::new(None);
-        let stream = do_connect(peer, None, None, &connector.ctx).await;
+        let stream = do_connect(peer, None, None, connector.context()).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (

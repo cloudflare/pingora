@@ -94,7 +94,7 @@ fn init_ssl_cert_env_vars() {
     INIT_CA_ENV.call_once(openssl_probe::init_ssl_cert_env_vars);
 }
 
-pub(crate) struct TlsConnectorCtx(pub(crate) SslConnector);
+pub(super) struct TlsConnectorCtx(SslConnector);
 
 impl TlsConnectorContext for TlsConnectorCtx {
     fn as_any(&self) -> &dyn Any {
@@ -162,15 +162,16 @@ impl TlsConnectorContext for TlsConnectorCtx {
     }
 }
 
-pub(super) async fn connect<T, P>(
+pub(super) async fn connect<T, P, C>(
     stream: T,
     peer: &P,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
+    tls_ctx: &Arc<C>,
 ) -> Result<TlsStream<T>>
 where
     T: IO,
     P: Peer + Send + Sync,
+    C: TlsConnectorContext + Send + Sync,
 {
     let ctx = tls_ctx.as_any().downcast_ref::<TlsConnectorCtx>().unwrap();
     let mut ssl_conf = ctx.0.configure().unwrap();

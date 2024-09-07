@@ -40,16 +40,20 @@ pub(crate) mod rustls;
 
 #[derive(Clone)]
 pub struct Connector {
-    pub(crate) ctx: Arc<dyn TlsConnectorContext + Send + Sync>, // Arc to support clone
+    ctx: Arc<TlsConnectorCtx>, // Arc to support clone
 }
 
 impl Connector {
     pub fn new(options: Option<ConnectorOptions>) -> Self {
         TlsConnectorCtx::build_connector(options)
     }
+
+    pub fn context(&self) -> &Arc<impl TlsConnectorContext> {
+        &self.ctx
+    }
 }
 
-pub(crate) trait TlsConnectorContext {
+pub trait TlsConnectorContext {
     fn as_any(&self) -> &dyn Any;
 
     fn build_connector(options: Option<ConnectorOptions>) -> Connector
@@ -57,12 +61,16 @@ pub(crate) trait TlsConnectorContext {
         Self: Sized;
 }
 
-pub(super) async fn do_connect<P: Peer + Send + Sync>(
+pub(super) async fn do_connect<P, C>(
     peer: &P,
     bind_to: Option<SocketAddr>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
-) -> Result<Stream> {
+    tls_ctx: &Arc<C>,
+) -> Result<Stream>
+where
+    P: Peer + Send + Sync,
+    C: TlsConnectorContext + Send + Sync,
+{
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
     let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
@@ -79,12 +87,16 @@ pub(super) async fn do_connect<P: Peer + Send + Sync>(
     }
 }
 
-async fn do_connect_inner<P: Peer + Send + Sync>(
+async fn do_connect_inner<P, C>(
     peer: &P,
     bind_to: Option<SocketAddr>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
-) -> Result<Stream> {
+    tls_ctx: &Arc<C>,
+) -> Result<Stream>
+where
+    P: Peer + Send + Sync,
+    C: TlsConnectorContext + Send + Sync,
+{
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
         let tls_stream = tls_connect(stream, peer, alpn_override, tls_ctx).await?;

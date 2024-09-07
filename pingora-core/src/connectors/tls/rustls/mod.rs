@@ -41,7 +41,7 @@ use crate::upstreams::peer::Peer;
 
 use super::{replace_leftmost_underscore, Connector, TlsConnectorContext};
 
-pub(crate) struct TlsConnectorCtx {
+pub(super) struct TlsConnectorCtx {
     config: RusTlsClientConfig,
     ca_certs: RootCertStore,
 }
@@ -110,15 +110,16 @@ impl TlsConnectorContext for TlsConnectorCtx {
     }
 }
 
-pub(super) async fn connect<T, P>(
+pub(super) async fn connect<T, P, C>(
     stream: T,
     peer: &P,
     alpn_override: Option<ALPN>,
-    tls_ctx: &Arc<dyn TlsConnectorContext + Send + Sync>,
+    tls_ctx: &Arc<C>,
 ) -> Result<TlsStream<T>>
 where
     T: IO,
     P: Peer + Send + Sync,
+    C: TlsConnectorContext + Send + Sync,
 {
     let ctx = tls_ctx.as_any().downcast_ref::<TlsConnectorCtx>().unwrap();
     let mut config = ctx.config.clone();
