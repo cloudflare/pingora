@@ -11,7 +11,6 @@ use pingora_core::protocols::http::v2::client::Http2Session;
 use pingora_http::RequestHeader;
 use reqwest::Version;
 
-#[allow(dead_code, unused_imports)]
 #[path = "../benches/utils/mod.rs"]
 mod bench_utils;
 use crate::bench_utils::TLS_HTTP11_PORT;

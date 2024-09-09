@@ -32,55 +32,32 @@ binary_benchmark_group!(
             // NOTE: for usage with callgrind::start_instrumentation() & stop_instrumentation()
             //"--instr-atstart=no"
     ]);
-    benchmarks = bench_client_sequential, bench_client_parallel
+    benchmarks = bench_client
 );
 
 static SEQUENTIAL_REQUEST_COUNT: i32 = 64;
 static SEQUENTIAL_REQUEST_SIZE: usize = 64;
-#[binary_benchmark]
-#[bench::http_11_handshake_always(setup = start_servers(Version::HTTP_11, 1),
-    args = [false, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
-#[bench::http_11_handshake_once(setup = start_servers(Version::HTTP_11, 1),
-    args = [true, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
-#[bench::http_2_handshake_always(setup = start_servers(Version::HTTP_2, 1),
-    args = [false, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
-#[bench::http_2_handshake_once(setup = start_servers(Version::HTTP_2, 1),
-    args = [true, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
-fn bench_client_sequential(
-    stream_reuse: bool,
-    http_version: Version,
-    request_count: i32,
-    request_size: usize,
-) -> Command {
-    let path = format!(
-        "{}/../target/release/examples/bench_client",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    Command::new(path)
-        // TODO: currently a workaround to keep the setup function running parallel with benchmark execution
-        .stdin(Stdin::Setup(Pipe::Stderr))
-        .args([
-            format!("--stream-reuse={}", stream_reuse),
-            format!("--http-version={:?}", http_version),
-            format!("--request-count={}", request_count),
-            format!("--request-size={}", request_size),
-        ])
-        .build()
-}
-
 static PARALLEL_CONNECTORS: u16 = 16;
 static PARALLEL_REQUEST_COUNT: i32 = SEQUENTIAL_REQUEST_COUNT / PARALLEL_CONNECTORS as i32;
 static PARALLEL_REQUEST_SIZE: usize = 64;
 #[binary_benchmark]
-#[bench::http_11_handshake_always(setup = start_servers(Version::HTTP_11, PARALLEL_CONNECTORS),
+#[bench::seq_http_11_handshake_always(setup = start_servers(Version::HTTP_11, 1),
+    args = [1, false, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
+#[bench::seq_http_11_handshake_once(setup = start_servers(Version::HTTP_11, 1),
+    args = [1, true, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
+#[bench::seq_http_2_handshake_always(setup = start_servers(Version::HTTP_2, 1),
+    args = [1, false, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
+#[bench::seq_http_2_handshake_once(setup = start_servers(Version::HTTP_2, 1),
+    args = [1, true, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE])]
+#[bench::par_http_11_handshake_always(setup = start_servers(Version::HTTP_11, PARALLEL_CONNECTORS),
     args = [PARALLEL_CONNECTORS, false, Version::HTTP_11, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE])]
-#[bench::http_11_handshake_once(setup = start_servers(Version::HTTP_11, PARALLEL_CONNECTORS),
+#[bench::par_http_11_handshake_once(setup = start_servers(Version::HTTP_11, PARALLEL_CONNECTORS),
     args = [PARALLEL_CONNECTORS, true, Version::HTTP_11, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE])]
-#[bench::http_2_handshake_always(setup = start_servers(Version::HTTP_2, PARALLEL_CONNECTORS),
+#[bench::par_http_2_handshake_always(setup = start_servers(Version::HTTP_2, PARALLEL_CONNECTORS),
     args = [PARALLEL_CONNECTORS, false, Version::HTTP_2, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE])]
-#[bench::http_2_handshake_once(setup = start_servers(Version::HTTP_2, PARALLEL_CONNECTORS),
+#[bench::par_http_2_handshake_once(setup = start_servers(Version::HTTP_2, PARALLEL_CONNECTORS),
     args = [PARALLEL_CONNECTORS, true, Version::HTTP_2, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE])]
-fn bench_client_parallel(
+fn bench_client(
     parallel_connectors: u16,
     stream_reuse: bool,
     http_version: Version,

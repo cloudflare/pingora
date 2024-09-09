@@ -12,7 +12,6 @@ use std::time::Duration;
 mod test_utils;
 use test_utils::EchoApp;
 
-#[allow(dead_code, unused_imports)]
 #[path = "../benches/utils/mod.rs"]
 mod bench_utils;
 use bench_utils::{http_version_parser, CERT_PATH, KEY_PATH, TLS_HTTP11_PORT, TLS_HTTP2_PORT};

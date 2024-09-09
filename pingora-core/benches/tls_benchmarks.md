@@ -131,6 +131,7 @@ target/iai/
 
 ### Parameters
 Server and client benchmark are parameterized with the following options:
+- number of parallel acceptors/connectors and servers/clients
 - client/session re-use
 - HTTP version `1.1|2.0`
 - number of requests

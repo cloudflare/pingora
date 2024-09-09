@@ -1,26 +1,20 @@
 use ahash::{HashMap, HashMapExt};
 use iai_callgrind::{
     binary_benchmark, binary_benchmark_group, main, BinaryBenchmarkConfig, Command,
-    FlamegraphConfig, Stdio, Tool, ValgrindTool,
+    FlamegraphConfig, Tool, ValgrindTool,
 };
 use iai_callgrind::{Pipe, Stdin};
-use log::{debug, info, LevelFilter};
-use regex::Regex;
 use reqwest::blocking::Client;
-use reqwest::{Certificate, Error, Response, StatusCode, Version};
+use reqwest::{Certificate, StatusCode, Version};
 use std::env;
 use std::fs::File;
-use std::io::{Read, Stdout};
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use tokio::task::JoinSet;
 
 mod utils;
 
-use utils::{
-    generate_random_ascii_data, http_version_to_port, wait_for_tcp_connect, CERT_PATH,
-    TLS_HTTP11_PORT, TLS_HTTP2_PORT,
-};
+use utils::{generate_random_ascii_data, http_version_to_port, wait_for_tcp_connect, CERT_PATH};
 
 main!(binary_benchmark_groups = tls_acceptor);
 
@@ -37,45 +31,32 @@ binary_benchmark_group!(
             // NOTE: for usage with callgrind::start_instrumentation() & stop_instrumentation()
             //"--instr-atstart=no"
     ]);
-    benchmarks = bench_server_sequential, bench_server_parallel
+    benchmarks = bench_server
 );
 
 static SEQUENTIAL_REQUEST_COUNT: i32 = 64;
 static SEQUENTIAL_REQUEST_SIZE: usize = 64;
-#[binary_benchmark]
-#[bench::http_11_handshake_always(args = (Version::HTTP_11),
-    setup = send_requests(1, false, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
-#[bench::http_11_handshake_once(args = (Version::HTTP_11),
-    setup = send_requests(1, true, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
-#[bench::http_2_handshake_always(args = (Version::HTTP_2),
-    setup = send_requests(1, false, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
-#[bench::http_2_handshake_once(args = (Version::HTTP_2),
-    setup = send_requests(1, true, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
-fn bench_server_sequential(http_version: Version) -> Command {
-    let path = format!(
-        "{}/../target/release/examples/bench_server",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    Command::new(path)
-        // TODO: currently a workaround to keep the setup function running parallel with benchmark execution
-        .stdin(Stdin::Setup(Pipe::Stderr))
-        .args([format!("--http-version={:?}", http_version)])
-        .build()
-}
-
 static PARALLEL_ACCEPTORS: u16 = 16;
 static PARALLEL_REQUEST_COUNT: i32 = SEQUENTIAL_REQUEST_COUNT / PARALLEL_ACCEPTORS as i32;
 static PARALLEL_REQUEST_SIZE: usize = 64;
 #[binary_benchmark]
-#[bench::http_11_handshake_always(args = (PARALLEL_ACCEPTORS, Version::HTTP_11),
+#[bench::seq_http_11_handshake_always(args = (1, Version::HTTP_11),
+    setup = send_requests(1, false, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
+#[bench::seq_http_11_handshake_once(args = (1, Version::HTTP_11),
+    setup = send_requests(1, true, Version::HTTP_11, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
+#[bench::seq_http_2_handshake_always(args = (1, Version::HTTP_2),
+    setup = send_requests(1, false, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
+#[bench::seq_http_2_handshake_once(args = (1, Version::HTTP_2),
+    setup = send_requests(1, true, Version::HTTP_2, SEQUENTIAL_REQUEST_COUNT, SEQUENTIAL_REQUEST_SIZE))]
+#[bench::par_http_11_handshake_always(args = (PARALLEL_ACCEPTORS, Version::HTTP_11),
     setup = send_requests(PARALLEL_ACCEPTORS, false, Version::HTTP_11, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE))]
-#[bench::http_11_handshake_once(args = (PARALLEL_ACCEPTORS, Version::HTTP_11),
+#[bench::par_http_11_handshake_once(args = (PARALLEL_ACCEPTORS, Version::HTTP_11),
     setup = send_requests(PARALLEL_ACCEPTORS, true, Version::HTTP_11, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE))]
-#[bench::http_2_handshake_always(args = (PARALLEL_ACCEPTORS, Version::HTTP_2),
+#[bench::par_http_2_handshake_always(args = (PARALLEL_ACCEPTORS, Version::HTTP_2),
     setup = send_requests(PARALLEL_ACCEPTORS, false, Version::HTTP_2, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE))]
-#[bench::http_2_handshake_once(args = (PARALLEL_ACCEPTORS, Version::HTTP_2),
+#[bench::par_http_2_handshake_once(args = (PARALLEL_ACCEPTORS, Version::HTTP_2),
     setup = send_requests(PARALLEL_ACCEPTORS, true, Version::HTTP_2, PARALLEL_REQUEST_COUNT, PARALLEL_REQUEST_SIZE))]
-fn bench_server_parallel(parallel_acceptors: u16, http_version: Version) -> Command {
+fn bench_server(parallel_acceptors: u16, http_version: Version) -> Command {
     let path = format!(
         "{}/../target/release/examples/bench_server",
         env!("CARGO_MANIFEST_DIR")
