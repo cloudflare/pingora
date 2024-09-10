@@ -18,7 +18,6 @@ use std::fs::File;
 use std::io::BufReader;
 
 use log::{error, warn};
-pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;

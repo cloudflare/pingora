@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::fmt;
+use core::fmt::Formatter;
 use pingora_error::ErrorType::{AcceptError, ConnectError, TLSHandshakeFailure};
 use pingora_error::{Error, ImmutStr, OrErr, Result};
-use pingora_rustls::NoDebug;
 use pingora_rustls::TlsAcceptor as RusTlsAcceptor;
 use pingora_rustls::TlsStream as RusTlsStream;
 use pingora_rustls::{Accept, Connect, ServerName, TlsConnector};
@@ -28,11 +29,31 @@ use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{GetProxyDigest, GetTimingDigest};
 
-#[derive(Debug)]
 pub struct InnerStream<T> {
     pub(crate) stream: Option<RusTlsStream<T>>,
-    connect: NoDebug<Option<Connect<T>>>,
-    accept: NoDebug<Option<Accept<T>>>,
+    connect: Option<Connect<T>>,
+    accept: Option<Accept<T>>,
+}
+
+impl<T: Debug> Debug for InnerStream<T> {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("InnerStream")
+            .field("stream", &self.stream)
+            .field("connect", {
+                if self.connect.is_some() {
+                    &"Some(Connect<T>)"
+                } else {
+                    &"None"
+                }
+            })
+            .field("accept", {
+                if self.accept.is_some() {
+                    &"Some(Accept<T>)"
+                } else {
+                    &"None"
+                }
+            }).finish()
+    }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
@@ -47,8 +68,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
     ) -> Result<Self> {
         let connect = connector.connect(server.to_owned(), stream);
         Ok(InnerStream {
-            accept: None.into(),
-            connect: Some(connect).into(),
+            accept: None,
+            connect: Some(connect),
             stream: None,
         })
     }
@@ -58,8 +79,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
         let accept = tls_acceptor.accept(stream);
 
         Ok(InnerStream {
-            accept: Some(accept).into(),
-            connect: None.into(),
+            accept: Some(accept),
+            connect: None,
             stream: None,
         })
     }
@@ -67,14 +88,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     /// Connect to the remote TLS server as a client
     pub(crate) async fn connect(&mut self) -> Result<()> {
-        let connect = &mut (*self.connect);
+        let connect = &mut self.connect;
 
         if let Some(ref mut connect) = connect {
             let stream = connect
                 .await
                 .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
             self.stream = Some(RusTlsStream::Client(stream));
-            self.connect = None.into();
+            self.connect = None;
 
             Ok(())
         } else {
@@ -88,14 +109,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     /// Finish the TLS handshake from client as a server
     /// no-op implementation within Rustls, handshake is performed during creation of stream.
     pub(crate) async fn accept(&mut self) -> Result<()> {
-        let accept = &mut (*self.accept);
-
-        if let Some(ref mut accept) = accept {
+        if let Some(ref mut accept) = &mut self.accept {
             let stream = accept
                 .await
                 .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
             self.stream = Some(RusTlsStream::Server(stream));
-            self.connect = None.into();
+            self.connect = None;
 
             Ok(())
         } else {
