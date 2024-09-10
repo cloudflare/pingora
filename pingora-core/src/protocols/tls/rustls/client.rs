@@ -14,7 +14,7 @@
 
 //! Rustls TLS client specific implementation
 
-use crate::protocols::tls::rustls::TlsStream;
+use crate::protocols::tls::rustls::stream::TlsStream;
 use crate::protocols::IO;
 use pingora_error::ErrorType::TLSHandshakeFailure;
 use pingora_error::{Error, OrErr, Result};
@@ -28,9 +28,7 @@ pub async fn handshake<S: IO>(
 ) -> Result<TlsStream<S>> {
     let mut stream = TlsStream::from_connector(connector, domain, io)
         .await
-        .explain_err(TLSHandshakeFailure, |e| {
-            format!("tip: tls stream error: {e}")
-        })?;
+        .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;
 
     let handshake_result = stream.connect().await;
     match handshake_result {

@@ -14,6 +14,7 @@
 
 //! BoringSSL & OpenSSL TLS server specific implementation
 
+use crate::protocols::Ssl;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -21,9 +22,9 @@ use pingora_error::ErrorType::{TLSHandshakeFailure, TLSWantX509Lookup};
 use pingora_error::{OrErr, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::protocols::tls::boringssl_openssl::TlsStream;
 use crate::protocols::tls::server::{ResumableAccept, TlsAcceptCallbacks};
-use crate::protocols::{Ssl, IO};
+use crate::protocols::tls::TlsStream;
+use crate::protocols::IO;
 use crate::tls::ext;
 use crate::tls::ext::ssl_from_acceptor;
 use crate::tls::ssl::SslAcceptor;
@@ -57,7 +58,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> 
 }
 
 fn prepare_tls_stream<S: IO>(acceptor: &SslAcceptor, io: S) -> Result<TlsStream<S>> {
-    let ssl = ssl_from_acceptor(&acceptor)
+    let ssl = ssl_from_acceptor(acceptor)
         .explain_err(TLSHandshakeFailure, |e| format!("ssl_acceptor error: {e}"))?;
     TlsStream::new(ssl, io).explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
@@ -82,7 +83,7 @@ pub(crate) async fn handshake_with_callback<S: IO>(
     let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
         // safety: we do hold a mut ref of tls_stream
-        let ssl_mut = unsafe { ext::ssl_mut(tls_stream.0.ssl()) };
+        let ssl_mut = unsafe { ext::ssl_mut(tls_stream.stream.ssl()) };
         callbacks.certificate_callback(ssl_mut).await;
         Pin::new(&mut tls_stream)
             .resume_accept()

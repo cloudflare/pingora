@@ -14,17 +14,6 @@
 
 //! The TLS layer implementations
 
-use async_trait::async_trait;
-use pingora_error::Result;
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncRead, AsyncWrite};
-
-use crate::protocols::digest::TimingDigest;
-use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest};
-
 #[cfg(not(feature = "rustls"))]
 pub(crate) mod boringssl_openssl;
 #[cfg(feature = "rustls")]
@@ -32,29 +21,9 @@ pub(crate) mod rustls;
 pub mod server;
 
 #[cfg(not(feature = "rustls"))]
-use boringssl_openssl::stream::InnerStream;
+pub(crate) use boringssl_openssl::stream::TlsStream;
 #[cfg(feature = "rustls")]
-use rustls::stream::InnerStream;
-
-/// The TLS connection
-#[derive(Debug)]
-pub struct TlsStream<T> {
-    tls: InnerStream<T>,
-    digest: Option<Arc<SslDigest>>,
-    timing: TimingDigest,
-}
-
-// NOTE: keeping trait for documentation purpose
-// switched to direct implementations to eliminate redirections in within the call-graph
-// the below trait is required for InnerStream<T> to be implemented
-#[async_trait]
-pub trait InnerTlsStream {
-    async fn connect(&mut self) -> Result<()>;
-    async fn accept(&mut self) -> Result<()>;
-
-    /// Return the [`ssl::SslDigest`] for logging
-    fn digest(&mut self) -> Option<Arc<SslDigest>>;
-}
+pub(crate) use rustls::stream::TlsStream;
 
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug)]
@@ -147,84 +116,4 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
-}
-
-impl<S> GetSocketDigest for TlsStream<S>
-where
-    S: GetSocketDigest,
-{
-    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-        self.tls.get_socket_digest()
-    }
-    fn set_socket_digest(&mut self, socket_digest: SocketDigest) {
-        self.tls.set_socket_digest(socket_digest)
-    }
-}
-
-impl<S> GetTimingDigest for TlsStream<S>
-where
-    S: GetTimingDigest,
-{
-    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        let mut ts_vec = self.tls.get_timing_digest();
-        ts_vec.push(Some(self.timing.clone()));
-        ts_vec
-    }
-    fn get_read_pending_time(&self) -> Duration {
-        self.tls.get_read_pending_time()
-    }
-
-    fn get_write_pending_time(&self) -> Duration {
-        self.tls.get_write_pending_time()
-    }
-}
-
-impl<S> GetProxyDigest for TlsStream<S>
-where
-    S: GetProxyDigest,
-{
-    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        self.tls.get_proxy_digest()
-    }
-}
-
-impl<T> TlsStream<T> {
-    pub fn ssl_digest(&self) -> Option<Arc<SslDigest>> {
-        self.digest.clone()
-    }
-}
-
-impl<T> TlsStream<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    /// Connect to the remote TLS server as a client
-    pub(crate) async fn connect(&mut self) -> Result<()> {
-        self.tls.connect().await?;
-        self.timing.established_ts = SystemTime::now();
-        self.digest = self.tls.digest();
-        Ok(())
-    }
-
-    /// Finish the TLS handshake from client as a server
-    pub(crate) async fn accept(&mut self) -> Result<()> {
-        self.tls.accept().await?;
-        self.timing.established_ts = SystemTime::now();
-        self.digest = self.tls.digest();
-        Ok(())
-    }
-}
-
-impl<T> Deref for TlsStream<T> {
-    type Target = InnerStream<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.tls
-    }
-}
-
-impl<T> DerefMut for TlsStream<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.tls
-    }
 }

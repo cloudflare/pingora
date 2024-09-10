@@ -16,7 +16,7 @@
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 
-use crate::protocols::tls::boringssl_openssl::TlsStream;
+use crate::protocols::tls::TlsStream;
 use crate::protocols::IO;
 use crate::tls::ssl::ConnectConfiguration;
 
