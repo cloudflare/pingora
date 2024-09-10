@@ -14,10 +14,7 @@
 
 //! Rustls TLS listener specific implementation
 
-use std::any::Any;
 use std::sync::Arc;
-
-use async_trait::async_trait;
 
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, ErrorSource, ImmutStr, OrErr, Result};
@@ -25,28 +22,18 @@ use pingora_rustls::load_certs_key_file;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
-use crate::listeners::tls::{TlsAcceptor, TlsAcceptorBuilder};
 use crate::listeners::ALPN;
 
-pub(super) struct TlsAcceptorBuil {
+pub struct TlsAcceptorBuil {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
     key_path: String,
 }
 
-struct TlsAcc {
-    acceptor: RusTlsAcceptor,
-}
+pub(super) struct TlsAcc(pub(super) RusTlsAcceptor);
 
-#[async_trait]
-impl TlsAcceptor for TlsAcc {
-    fn get_acceptor(&self) -> &dyn Any {
-        &self.acceptor
-    }
-}
-
-impl TlsAcceptorBuilder for TlsAcceptorBuil {
-    fn build(self: Box<Self>) -> Box<dyn TlsAcceptor + Send + Sync> {
+impl TlsAcceptorBuil {
+    pub(super) fn build(self) -> TlsAcc {
         let (certs, key) = load_certs_key_file(&self.cert_path, &self.key_path).expect(
             format!(
                 "Failed to load provided certificates \"{}\" or key \"{}\".",
@@ -68,15 +55,13 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
             config.alpn_protocols = alpn_protocols;
         }
 
-        Box::new(TlsAcc {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
-        })
+        TlsAcc(RusTlsAcceptor::from(Arc::new(config)))
     }
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub(super) fn set_alpn(&mut self, alpn: ALPN) {
         self.alpn_protocols = Some(alpn.to_wire_protocols());
     }
 
-    fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
+    pub(super) fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
     {
@@ -87,7 +72,7 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
         })
     }
 
-    fn acceptor_with_callbacks() -> Result<Self>
+    pub(super) fn acceptor_with_callbacks() -> Result<Self>
     where
         Self: Sized,
     {
@@ -100,9 +85,5 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
             )),
             None,
         ))
-    }
-
-    fn as_any(&mut self) -> &mut dyn Any {
-        self as &mut dyn Any
     }
 }

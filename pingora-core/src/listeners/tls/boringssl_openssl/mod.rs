@@ -14,31 +14,22 @@
 
 //! BoringSSL & OpenSSL listener specific implementation
 
-use crate::listeners::tls::{NativeBuilder, TlsAcceptor, TlsAcceptorBuilder};
 use crate::listeners::{TlsSettings, ALPN};
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-use async_trait::async_trait;
-use core::any::Any;
 use pingora_error::{ErrorType, OrErr, Result};
+use std::ops::{Deref, DerefMut};
+
 const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
-struct TlsAcc(SslAcceptor);
-pub(super) struct TlsAcceptorBuil(SslAcceptorBuilder);
+pub struct TlsAcceptorBuil(SslAcceptorBuilder);
+pub(super) struct TlsAcc(pub(super) SslAcceptor);
 
-#[async_trait]
-impl TlsAcceptor for TlsAcc {
-    fn get_acceptor(&self) -> &dyn Any {
-        &self.0
-    }
-}
-
-impl TlsAcceptorBuilder for TlsAcceptorBuil {
-    fn build(self: Box<Self>) -> Box<dyn TlsAcceptor + Send + Sync> {
-        let builder = (*self).0;
-        Box::new(TlsAcc(SslAcceptorBuilder::build(builder)))
+impl TlsAcceptorBuil {
+    pub(super) fn build(self) -> TlsAcc {
+        TlsAcc(SslAcceptorBuilder::build(self.0))
     }
 
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub(super) fn set_alpn(&mut self, alpn: ALPN) {
         match alpn {
             ALPN::H2H1 => self.0.set_alpn_select_callback(alpn::prefer_h2),
             ALPN::H1 => self.0.set_alpn_select_callback(alpn::h1_only),
@@ -46,7 +37,7 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
         }
     }
 
-    fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
+    pub(super) fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
     {
@@ -65,7 +56,7 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
         Ok(TlsAcceptorBuil(accept_builder))
     }
 
-    fn acceptor_with_callbacks() -> Result<Self>
+    pub(super) fn acceptor_with_callbacks() -> Result<Self>
     where
         Self: Sized,
     {
@@ -75,24 +66,12 @@ impl TlsAcceptorBuilder for TlsAcceptorBuil {
         )?;
         Ok(TlsAcceptorBuil(accept_builder))
     }
-
-    fn as_any(&mut self) -> &mut dyn Any {
-        self as &mut dyn Any
-    }
-}
-
-impl NativeBuilder for Box<dyn TlsAcceptorBuilder + Send + Sync> {
-    type Builder = SslAcceptorBuilder;
-
-    fn native(&mut self) -> &mut Self::Builder {
-        self.as_any().downcast_mut::<Self::Builder>().unwrap()
-    }
 }
 
 impl From<SslAcceptorBuilder> for TlsSettings {
     fn from(settings: SslAcceptorBuilder) -> Self {
         TlsSettings {
-            accept_builder: Box::new(TlsAcceptorBuil(settings)),
+            accept_builder: TlsAcceptorBuil(settings),
             callbacks: None,
         }
     }
@@ -123,5 +102,19 @@ mod alpn {
             Some(p) => Ok(p),
             _ => Err(AlpnError::ALERT_FATAL), // cannot agree
         }
+    }
+}
+
+impl Deref for TlsAcceptorBuil {
+    type Target = SslAcceptorBuilder;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for TlsAcceptorBuil {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }

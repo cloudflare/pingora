@@ -16,14 +16,12 @@ use core::fmt;
 use core::fmt::Formatter;
 use pingora_error::ErrorType::{AcceptError, ConnectError, TLSHandshakeFailure};
 use pingora_error::{Error, ImmutStr, OrErr, Result};
-use pingora_rustls::TlsAcceptor as RusTlsAcceptor;
-use pingora_rustls::TlsStream as RusTlsStream;
 use pingora_rustls::{Accept, Connect, ServerName, TlsConnector};
+use pingora_rustls::{TlsAcceptor, TlsStream as RusTlsStream};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::listeners::tls::Acceptor;
 use crate::protocols::digest::{GetSocketDigest, SocketDigest, TimingDigest};
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::SslDigest;
@@ -52,7 +50,8 @@ impl<T: Debug> Debug for InnerStream<T> {
                 } else {
                     &"None"
                 }
-            }).finish()
+            })
+            .finish()
     }
 }
 
@@ -74,9 +73,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
         })
     }
 
-    pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
-        let tls_acceptor = acceptor.inner().downcast_ref::<RusTlsAcceptor>().unwrap();
-        let accept = tls_acceptor.accept(stream);
+    pub(crate) async fn from_acceptor(acceptor: &TlsAcceptor, stream: T) -> Result<Self> {
+        let accept = acceptor.accept(stream);
 
         Ok(InnerStream {
             accept: Some(accept),

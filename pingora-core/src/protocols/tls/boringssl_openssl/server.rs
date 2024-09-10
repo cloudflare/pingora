@@ -17,12 +17,10 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
-
 use pingora_error::ErrorType::{TLSHandshakeFailure, TLSWantX509Lookup};
 use pingora_error::{OrErr, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::listeners::tls::Acceptor;
 use crate::protocols::tls::boringssl_openssl::TlsStream;
 use crate::protocols::tls::server::{ResumableAccept, TlsAcceptCallbacks};
 use crate::protocols::{Ssl, IO};
@@ -58,15 +56,14 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> 
     }
 }
 
-fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
-    let ssl_acceptor = acceptor.inner().downcast_ref::<SslAcceptor>().unwrap();
-    let ssl = ssl_from_acceptor(ssl_acceptor)
+fn prepare_tls_stream<S: IO>(acceptor: &SslAcceptor, io: S) -> Result<TlsStream<S>> {
+    let ssl = ssl_from_acceptor(&acceptor)
         .explain_err(TLSHandshakeFailure, |e| format!("ssl_acceptor error: {e}"))?;
     TlsStream::new(ssl, io).explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
+pub(crate) async fn handshake<S: IO>(acceptor: &SslAcceptor, io: S) -> Result<TlsStream<S>> {
     let mut stream = prepare_tls_stream(acceptor, io)?;
     stream
         .accept()
@@ -76,8 +73,8 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
 }
 
 /// Perform TLS handshake for the given connection with the given configuration and callbacks
-pub async fn handshake_with_callback<S: IO>(
-    acceptor: &Acceptor,
+pub(crate) async fn handshake_with_callback<S: IO>(
+    acceptor: &SslAcceptor,
     io: S,
     callbacks: &TlsAcceptCallbacks,
 ) -> pingora_error::Result<TlsStream<S>> {

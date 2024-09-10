@@ -141,14 +141,15 @@ pub fn main() {
     // NOTE: dynamic certificate callback is only supported with BoringSSL/OpenSSL
     #[cfg(not(feature = "rustls"))]
     {
-        use pingora_core::listeners::tls::NativeBuilder;
+        use std::ops::DerefMut;
 
         let dynamic_cert = boringssl_openssl::DynamicCert::new(&cert_path, &key_path);
         tls_settings = pingora::listeners::TlsSettings::with_callbacks(dynamic_cert).unwrap();
         // by default intermediate supports both TLS 1.2 and 1.3. We force to tls 1.2 just for the demo
+
         tls_settings
-            .get_builder()
-            .native()
+            .deref_mut()
+            .deref_mut()
             .set_max_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
             .unwrap();
     }

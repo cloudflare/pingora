@@ -14,13 +14,13 @@
 
 //! Rustls TLS server specific implementation
 
-use crate::listeners::tls::Acceptor;
 use crate::protocols::tls::rustls::TlsStream;
 use crate::protocols::tls::server::{ResumableAccept, TlsAcceptCallbacks};
 use crate::protocols::IO;
 use async_trait::async_trait;
 use log::warn;
 use pingora_error::{ErrorType::*, OrErr, Result};
+use pingora_rustls::TlsAcceptor;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -48,14 +48,14 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for TlsStream<S> 
     }
 }
 
-async fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
+async fn prepare_tls_stream<S: IO>(acceptor: &TlsAcceptor, io: S) -> Result<TlsStream<S>> {
     TlsStream::from_acceptor(acceptor, io)
         .await
         .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
+pub(crate) async fn handshake<S: IO>(acceptor: &TlsAcceptor, io: S) -> Result<TlsStream<S>> {
     let mut stream = prepare_tls_stream(acceptor, io).await?;
     stream
         .accept()
@@ -66,8 +66,8 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
 
 /// Perform TLS handshake for the given connection with the given configuration and callbacks
 /// callbacks are currently not supported within pingora Rustls and are ignored
-pub async fn handshake_with_callback<S: IO>(
-    acceptor: &Acceptor,
+pub(crate) async fn handshake_with_callback<S: IO>(
+    acceptor: &TlsAcceptor,
     io: S,
     _callbacks: &TlsAcceptCallbacks,
 ) -> Result<TlsStream<S>> {

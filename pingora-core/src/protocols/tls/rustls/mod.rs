@@ -20,14 +20,13 @@ use std::task::{Context, Poll};
 
 use pingora_error::ErrorType::{InternalError, TLSHandshakeFailure};
 use pingora_error::{OrErr, Result};
-use pingora_rustls::TlsStream as RusTlsStream;
 use pingora_rustls::{hash_certificate, ServerName, TlsConnector};
+use pingora_rustls::{TlsAcceptor, TlsStream as RusTlsStream};
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 use x509_parser::nom::AsBytes;
 
 use crate::utils::tls::rustls::get_organization_serial;
 
-use crate::listeners::tls::Acceptor;
 use crate::protocols::tls::rustls::stream::InnerStream;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{Ssl, UniqueID, ALPN};
@@ -69,7 +68,7 @@ where
     ///
     /// Using RustTLS the stream is only returned after the handshake.
     /// The caller does therefor not need to perform [`Self::accept()`].
-    pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
+    pub(crate) async fn from_acceptor(acceptor: &TlsAcceptor, stream: T) -> Result<Self> {
         let tls = InnerStream::from_acceptor(acceptor, stream)
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;

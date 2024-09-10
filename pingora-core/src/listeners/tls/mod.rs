@@ -12,48 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
-
-use async_trait::async_trait;
-use log::debug;
-
-#[cfg(not(feature = "rustls"))]
-use crate::listeners::tls::boringssl_openssl::TlsAcceptorBuil;
-#[cfg(feature = "rustls")]
-use crate::listeners::tls::rustls::TlsAcceptorBuil;
-#[cfg(not(feature = "rustls"))]
-use crate::protocols::tls::boringssl_openssl::server::{handshake, handshake_with_callback};
-#[cfg(feature = "rustls")]
-use crate::protocols::tls::rustls::server::{handshake, handshake_with_callback};
 use crate::protocols::tls::server::TlsAcceptCallbacks;
 use crate::protocols::tls::TlsStream;
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
+#[cfg(not(feature = "rustls"))]
+use crate::{
+    listeners::tls::boringssl_openssl::{TlsAcc, TlsAcceptorBuil},
+    protocols::tls::boringssl_openssl::server::{handshake, handshake_with_callback},
+};
+#[cfg(feature = "rustls")]
+use crate::{
+    listeners::tls::rustls::{TlsAcc, TlsAcceptorBuil},
+    protocols::tls::rustls::server::{handshake, handshake_with_callback},
+};
+use log::debug;
 use pingora_error::Result;
+use std::ops::{Deref, DerefMut};
 
 #[cfg(not(feature = "rustls"))]
-pub mod boringssl_openssl;
+pub(crate) mod boringssl_openssl;
 #[cfg(feature = "rustls")]
 pub(crate) mod rustls;
 
 pub struct Acceptor {
-    ssl_acceptor: Box<dyn TlsAcceptor + Send + Sync>,
+    tls_acceptor: TlsAcc,
     callbacks: Option<TlsAcceptCallbacks>,
-}
-
-#[async_trait]
-pub trait TlsAcceptor {
-    fn get_acceptor(&self) -> &dyn Any;
 }
 
 /// The TLS settings of a listening endpoint
 pub struct TlsSettings {
-    accept_builder: Box<dyn TlsAcceptorBuilder + Send + Sync>,
+    accept_builder: TlsAcceptorBuil,
     callbacks: Option<TlsAcceptCallbacks>,
 }
 
-pub trait TlsAcceptorBuilder: Any {
-    fn build(self: Box<Self>) -> Box<dyn TlsAcceptor + Send + Sync>;
+// NOTE: keeping trait for documentation purpose
+// switched to direct implementations to eliminate redirections in within the call-graph
+// the below trait needs to be implemented for TlsAcceptorBuil
+pub trait TlsAcceptorBuilder {
+    type TlsAcceptor; // TlsAcc
+    fn build(self) -> Self::TlsAcceptor;
     fn set_alpn(&mut self, alpn: ALPN);
     fn acceptor_intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
@@ -61,12 +59,6 @@ pub trait TlsAcceptorBuilder: Any {
     fn acceptor_with_callbacks() -> Result<Self>
     where
         Self: Sized;
-    fn as_any(&mut self) -> &mut dyn Any;
-}
-
-pub trait NativeBuilder {
-    type Builder;
-    fn native(&mut self) -> &mut Self::Builder;
 }
 
 impl TlsSettings {
@@ -75,7 +67,7 @@ impl TlsSettings {
     /// Return error if the provided certificate and private key are invalid or not found.
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self> {
         Ok(TlsSettings {
-            accept_builder: Box::new(TlsAcceptorBuil::acceptor_intermediate(cert_path, key_path)?),
+            accept_builder: TlsAcceptorBuil::acceptor_intermediate(cert_path, key_path)?,
             callbacks: None,
         })
     }
@@ -84,7 +76,7 @@ impl TlsSettings {
     /// is needed to provide the certificate during the TLS handshake.
     pub fn with_callbacks(callbacks: TlsAcceptCallbacks) -> Result<Self> {
         Ok(TlsSettings {
-            accept_builder: Box::new(TlsAcceptorBuil::acceptor_with_callbacks()?),
+            accept_builder: TlsAcceptorBuil::acceptor_with_callbacks()?,
             callbacks: Some(callbacks),
         })
     }
@@ -102,13 +94,9 @@ impl TlsSettings {
 
     pub(crate) fn build(self) -> Acceptor {
         Acceptor {
-            ssl_acceptor: self.accept_builder.build(),
+            tls_acceptor: self.accept_builder.build(),
             callbacks: self.callbacks,
         }
-    }
-
-    pub fn get_builder(&mut self) -> &mut Box<dyn TlsAcceptorBuilder + Send + Sync> {
-        &mut (self.accept_builder)
     }
 }
 
@@ -117,13 +105,23 @@ impl Acceptor {
         debug!("new tls session");
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(self, stream, cb).await
+            handshake_with_callback(&self.tls_acceptor.0, stream, cb).await
         } else {
-            handshake(self, stream).await
+            handshake(&self.tls_acceptor.0, stream).await
         }
     }
+}
 
-    pub(crate) fn inner(&self) -> &dyn Any {
-        self.ssl_acceptor.get_acceptor()
+impl Deref for TlsSettings {
+    type Target = TlsAcceptorBuil;
+
+    fn deref(&self) -> &Self::Target {
+        &self.accept_builder
+    }
+}
+
+impl DerefMut for TlsSettings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.accept_builder
     }
 }
