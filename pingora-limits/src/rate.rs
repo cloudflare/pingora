@@ -48,7 +48,11 @@ impl Rate {
 
     /// Create a new `Rate` with the given interval and Estimator config with the given amount of hashes and columns (slots).
     #[inline]
-    pub fn new_with_estimator_config(interval: std::time::Duration, hashes: usize, slots: usize) -> Self {
+    pub fn new_with_estimator_config(
+        interval: std::time::Duration,
+        hashes: usize,
+        slots: usize,
+    ) -> Self {
         Rate {
             red_slot: Estimator::new(hashes, slots),
             blue_slot: Estimator::new(hashes, slots),
