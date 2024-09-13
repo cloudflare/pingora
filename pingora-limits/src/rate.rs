@@ -43,9 +43,19 @@ const SLOTS: usize = 1024; // This value can be lower if interval is short (key 
 impl Rate {
     /// Create a new `Rate` with the given interval.
     pub fn new(interval: std::time::Duration) -> Self {
+        Rate::new_with_estimator_config(interval, HASHES, SLOTS)
+    }
+
+    /// Create a new `Rate` with the given interval and Estimator config with the given amount of hashes and columns (slots).
+    #[inline]
+    pub fn new_with_estimator_config(
+        interval: std::time::Duration,
+        hashes: usize,
+        slots: usize,
+    ) -> Self {
         Rate {
-            red_slot: Estimator::new(HASHES, SLOTS),
-            blue_slot: Estimator::new(HASHES, SLOTS),
+            red_slot: Estimator::new(hashes, slots),
+            blue_slot: Estimator::new(hashes, slots),
             red_or_blue: AtomicBool::new(true),
             start: Instant::now(),
             reset_interval_ms: interval.as_millis() as u64, // should be small not to overflow
