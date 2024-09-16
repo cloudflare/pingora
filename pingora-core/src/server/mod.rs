@@ -22,6 +22,7 @@ use daemon::daemonize;
 use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
+#[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
@@ -70,6 +71,8 @@ pub struct Server {
     /// The Sentry ClientOptions.
     ///
     /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
+    #[cfg(feature = "sentry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
     pub sentry: Option<ClientOptions>,
 }
 
@@ -116,7 +119,7 @@ impl Server {
                         Err(e) => {
                             error!("Unable to send listener sockets to new process: {e}");
                             // sentry log error on fd send failure
-                            #[cfg(not(debug_assertions))]
+                            #[cfg(all(not(debug_assertions), feature = "sentry"))]
                             sentry::capture_error(&e);
                         }
                     }
@@ -191,6 +194,7 @@ impl Server {
             shutdown_recv: rx,
             configuration: Arc::new(conf),
             options: Some(opt),
+            #[cfg(feature = "sentry")]
             sentry: None,
         }
     }
@@ -231,6 +235,7 @@ impl Server {
             shutdown_recv: rx,
             configuration: Arc::new(conf),
             options: opt,
+            #[cfg(feature = "sentry")]
             sentry: None,
         })
     }
@@ -256,7 +261,7 @@ impl Server {
         debug!("{:#?}", self.options);
 
         /* only init sentry in release builds */
-        #[cfg(not(debug_assertions))]
+        #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
         if self.options.as_ref().map_or(false, |o| o.test) {
@@ -271,7 +276,7 @@ impl Server {
             }
             Err(e) => {
                 // sentry log error on fd load failure
-                #[cfg(not(debug_assertions))]
+                #[cfg(all(not(debug_assertions), feature = "sentry"))]
                 sentry::capture_error(&e);
 
                 error!("Bootstrap failed on error: {:?}, exiting.", e);
@@ -300,7 +305,7 @@ impl Server {
         }
 
         /* only init sentry in release builds */
-        #[cfg(not(debug_assertions))]
+        #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
         let mut runtimes: Vec<Runtime> = Vec::new();
