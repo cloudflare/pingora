@@ -248,7 +248,7 @@ impl EvictionManager for Manager {
             })?;
             let mut buffer = Vec::with_capacity(8192);
             file.read_to_end(&mut buffer)
-                .or_err(InternalError, "fail to write to {file_path}")?;
+                .or_err(InternalError, "fail to read from {file_path}")?;
             Ok::<Vec<u8>, BError>(buffer)
         })
         .await
