@@ -138,9 +138,20 @@ mod alpn {
     use super::*;
     use crate::tls::ssl::{select_next_proto, AlpnError, SslRef};
 
+    fn valid_alpn(alpn_in: &[u8]) -> bool {
+        if alpn_in.is_empty() {
+            return false;
+        }
+        // TODO: can add more thorough validation here.
+        true
+    }
+
     // A standard implementation provided by the SSL lib is used below
 
     pub fn prefer_h2<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::NOACK);
+        }
         match select_next_proto(ALPN::H2H1.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::NOACK), // unknown ALPN, just ignore it. Most clients will fallback to h1
@@ -148,6 +159,9 @@ mod alpn {
     }
 
     pub fn h1_only<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::NOACK);
+        }
         match select_next_proto(ALPN::H1.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::NOACK), // unknown ALPN, just ignore it. Most clients will fallback to h1
@@ -155,6 +169,9 @@ mod alpn {
     }
 
     pub fn h2_only<'a>(_ssl: &mut SslRef, alpn_in: &'a [u8]) -> Result<&'a [u8], AlpnError> {
+        if !valid_alpn(alpn_in) {
+            return Err(AlpnError::ALERT_FATAL);
+        }
         match select_next_proto(ALPN::H2.to_wire_preference(), alpn_in) {
             Some(p) => Ok(p),
             _ => Err(AlpnError::ALERT_FATAL), // cannot agree
