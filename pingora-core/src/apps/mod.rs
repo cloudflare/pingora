@@ -20,6 +20,7 @@ pub mod prometheus_http_app;
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
 use log::{debug, error};
+use std::future::poll_fn;
 use std::sync::Arc;
 
 use crate::protocols::http::v2::server;
@@ -148,11 +149,19 @@ where
                 Ok(c) => c,
             };
 
+            let mut shutdown = shutdown.clone();
             loop {
                 // this loop ends when the client decides to close the h2 conn
                 // TODO: add a timeout?
-                let h2_stream =
-                    server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
+                let h2_stream = tokio::select! {
+                    _ = shutdown.changed() => {
+                        h2_conn.graceful_shutdown();
+                        let _ = poll_fn(|cx| h2_conn.poll_closed(cx))
+                            .await.map_err(|e| error!("H2 error waiting for shutdown {e}"));
+                        return None;
+                    }
+                    h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream
+                };
                 let h2_stream = match h2_stream {
                     Err(e) => {
                         // It is common for the client to just disconnect TCP without properly
