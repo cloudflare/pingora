@@ -126,12 +126,20 @@ where
                 }
                 Ok(c) => c,
             };
+            let mut shutdown = shutdown.clone();
 
             loop {
                 // this loop ends when the client decides to close the h2 conn
                 // TODO: add a timeout?
-                let h2_stream =
-                    server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()).await;
+                let h2_stream = tokio::select! {
+                    _ = shutdown.changed() => {
+                        h2_conn.graceful_shutdown();
+                        // continue to the next loop to wait for client disconnect before returning.
+                        // the client will disconnect when all in flight streams are closed.
+                        continue;
+                    }
+                    h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream
+                };
                 let h2_stream = match h2_stream {
                     Err(e) => {
                         // It is common for the client to just disconnect TCP without properly
