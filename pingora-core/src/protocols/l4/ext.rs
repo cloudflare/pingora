@@ -378,6 +378,46 @@ pub fn get_socket_cookie(_fd: RawFd) -> io::Result<u64> {
     Ok(0) // SO_COOKIE is a Linux concept
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_original_dest(fd: RawFd) -> Result<Option<SocketAddr>> {
+    use super::socket;
+    use pingora_error::OkOrErr;
+    use std::net::{SocketAddrV4, SocketAddrV6};
+
+    let sock = socket::SocketAddr::from_raw_fd(fd, false);
+    let addr = sock
+        .as_ref()
+        .and_then(|s| s.as_inet())
+        .or_err(SocketError, "failed get original dest, invalid IP socket")?;
+
+    let dest = if addr.is_ipv4() {
+        get_opt_sized::<libc::sockaddr_in>(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST).map(|addr| {
+            SocketAddr::V4(SocketAddrV4::new(
+                u32::from_be(addr.sin_addr.s_addr).into(),
+                u16::from_be(addr.sin_port),
+            ))
+        })
+    } else {
+        get_opt_sized::<libc::sockaddr_in6>(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST).map(
+            |addr| {
+                SocketAddr::V6(SocketAddrV6::new(
+                    addr.sin6_addr.s6_addr.into(),
+                    u16::from_be(addr.sin6_port),
+                    addr.sin6_flowinfo,
+                    addr.sin6_scope_id,
+                ))
+            },
+        )
+    };
+    dest.or_err(SocketError, "failed to get original dest")
+        .map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_original_dest(_fd: RawFd) -> Result<Option<SocketAddr>> {
+    Ok(None)
+}
+
 /// connect() to the given address while optionally binding to the specific source address and port range.
 ///
 /// The `set_socket` callback can be used to tune the socket before `connect()` is called.
