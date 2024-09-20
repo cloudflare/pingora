@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
-use super::l4::ext::{get_recv_buf, get_tcp_info, TCP_INFO};
+use super::l4::ext::{get_original_dest, get_recv_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
@@ -70,6 +70,8 @@ pub struct SocketDigest {
     pub peer_addr: OnceCell<Option<SocketAddr>>,
     /// Local socket address
     pub local_addr: OnceCell<Option<SocketAddr>>,
+    /// Original destination address
+    pub original_dst: OnceCell<Option<SocketAddr>>,
 }
 
 impl SocketDigest {
@@ -79,6 +81,7 @@ impl SocketDigest {
             raw_fd,
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
+            original_dst: OnceCell::new(),
         }
     }
 
@@ -157,6 +160,17 @@ impl SocketDigest {
         } else {
             None
         }
+    }
+
+    pub fn original_dst(&self) -> Option<&SocketAddr> {
+        self.original_dst
+            .get_or_init(|| {
+                get_original_dest(self.raw_fd)
+                    .ok()
+                    .flatten()
+                    .map(SocketAddr::Inet)
+            })
+            .as_ref()
     }
 }
 
