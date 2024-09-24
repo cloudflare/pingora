@@ -82,12 +82,11 @@ pub fn daemonize(conf: &ServerConf) {
         Some(user) => {
             let user_cstr = CString::new(user.as_str()).unwrap();
 
-            #[cfg(target_os = "macos")]
-            let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as i32) };
-            #[cfg(target_os = "freebsd")]
-            let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as u32) };
-            #[cfg(target_os = "linux")]
             let group_id = unsafe { gid_for_username(&user_cstr) };
+            #[cfg(target_os = "macos")]
+            let group_id = group_id.map(|gid| gid as i32);
+            #[cfg(target_os = "freebsd")]
+            let group_id = group_id.map(|gid| gid as u32);
 
             daemonize
                 .privileged_action(move || {
