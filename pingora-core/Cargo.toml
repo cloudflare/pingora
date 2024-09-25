@@ -51,7 +51,7 @@ sentry = { version = "0.26", features = [
     "panic",
     "reqwest",
     "rustls",
-], default-features = false }
+], default-features = false, optional = true }
 regex = "1"
 percent-encoding = "2.1"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
@@ -85,8 +85,9 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = ["openssl"]
+default = ["openssl", "sentry"]
 openssl = ["pingora-openssl", "some_tls"]
 boringssl = ["pingora-boringssl", "some_tls"]
 patched_http1 = []
 some_tls = []
+sentry = ["dep:sentry"]
