@@ -74,6 +74,23 @@ mod test {
     }
 
     #[test]
+    fn test_deserialize_with_dict() {
+        let dict = gen_test_dict();
+        let serde = crate::HeaderSerde::new(Some(dict));
+        let serde_no_dict = crate::HeaderSerde::new(None);
+        let header = gen_test_header();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let compressed_no_dict = serde_no_dict.serialize(&header).unwrap();
+
+        let from_dict_header = serde.deserialize(&compressed).unwrap();
+        let from_no_dict_header = serde_no_dict.deserialize(&compressed_no_dict).unwrap();
+
+        assert_eq!(from_dict_header.status, from_no_dict_header.status);
+        assert_eq!(from_dict_header.headers, from_no_dict_header.headers);
+    }
+
+    #[test]
     fn test_ser_de_with_dict() {
         let dict = gen_test_dict();
         let serde = crate::HeaderSerde::new(Some(dict));
