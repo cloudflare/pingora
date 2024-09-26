@@ -425,7 +425,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _reused: bool,
         _peer: &HttpPeer,
-        _fd: std::os::unix::io::RawFd,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         _digest: Option<&Digest>,
         _ctx: &mut Self::CTX,
     ) -> Result<()>

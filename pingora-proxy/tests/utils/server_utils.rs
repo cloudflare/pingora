@@ -192,7 +192,8 @@ impl ProxyHttp for ExampleProxyHttps {
         _http_session: &mut Session,
         reused: bool,
         _peer: &HttpPeer,
-        _fd: std::os::unix::io::RawFd,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         digest: Option<&Digest>,
         ctx: &mut CTX,
     ) -> Result<()> {
@@ -311,7 +312,8 @@ impl ProxyHttp for ExampleProxyHttp {
         _http_session: &mut Session,
         reused: bool,
         _peer: &HttpPeer,
-        _fd: std::os::unix::io::RawFd,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         digest: Option<&Digest>,
         ctx: &mut CTX,
     ) -> Result<()> {
@@ -544,6 +546,7 @@ fn test_main() {
     let mut proxy_service_http =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
     proxy_service_http.add_tcp("0.0.0.0:6147");
+    #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
 
     let mut proxy_service_h2c =

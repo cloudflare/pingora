@@ -17,10 +17,15 @@ use log::debug;
 use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
 use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
+#[cfg(unix)]
+use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
-    connect_uds, connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
+    connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -102,16 +107,21 @@ where
             match peer_addr {
                 SocketAddr::Inet(addr) => {
                     let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
+                        #[cfg(unix)]
+                        let raw = socket.as_raw_fd();
+                        #[cfg(windows)]
+                        let raw = socket.as_raw_socket();
+
                         if peer.tcp_fast_open() {
-                            set_tcp_fastopen_connect(socket.as_raw_fd())?;
+                            set_tcp_fastopen_connect(raw)?;
                         }
                         if let Some(recv_buf) = peer.tcp_recv_buf() {
                             debug!("Setting recv buf size");
-                            set_recv_buf(socket.as_raw_fd(), recv_buf)?;
+                            set_recv_buf(raw, recv_buf)?;
                         }
                         if let Some(dscp) = peer.dscp() {
                             debug!("Setting dscp");
-                            set_dscp(socket.as_raw_fd(), dscp)?;
+                            set_dscp(raw, dscp)?;
                         }
                         Ok(())
                     });
@@ -137,6 +147,7 @@ where
                         }
                     }
                 }
+                #[cfg(unix)]
                 SocketAddr::Unix(addr) => {
                     let connect_future = connect_uds(
                         addr.as_pathname()
@@ -179,7 +190,10 @@ where
     }
     stream.set_nodelay()?;
 
+    #[cfg(unix)]
     let digest = SocketDigest::from_raw_fd(stream.as_raw_fd());
+    #[cfg(windows)]
+    let digest = SocketDigest::from_raw_socket(stream.as_raw_socket());
     digest
         .peer_addr
         .set(Some(peer_addr.clone()))
@@ -217,6 +231,7 @@ pub(crate) fn bind_to_random<P: Peer>(
             InetSocketAddr::V4(_) => bind_to_ips(v4_list),
             InetSocketAddr::V6(_) => bind_to_ips(v6_list),
         },
+        #[cfg(unix)]
         SocketAddr::Unix(_) => None,
     };
 
@@ -235,6 +250,7 @@ pub(crate) fn bind_to_random<P: Peer>(
 
 use crate::protocols::raw_connect;
 
+#[cfg(unix)]
 async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
     // safe to unwrap
     let proxy = peer.get_proxy().unwrap();
@@ -275,6 +291,11 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
     Ok(*stream)
 }
 
+#[cfg(windows)]
+async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
+    panic!("peer proxy not supported on windows")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +303,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     #[tokio::test]
@@ -359,6 +381,7 @@ mod tests {
         assert!(new_session.is_ok());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_connect_proxy_fail() {
         let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
@@ -376,9 +399,11 @@ mod tests {
         assert!(!e.retry());
     }
 
+    #[cfg(unix)]
     const MOCK_UDS_PATH: &str = "/tmp/test_unix_connect_proxy.sock";
 
     // one-off mock server
+    #[cfg(unix)]
     async fn mock_connect_server() {
         let _ = std::fs::remove_file(MOCK_UDS_PATH);
         let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
@@ -410,10 +435,12 @@ mod tests {
         assert!(new_session.is_ok());
     }
 
+    #[cfg(unix)]
     const MOCK_BAD_UDS_PATH: &str = "/tmp/test_unix_bad_connect_proxy.sock";
 
     // one-off mock bad proxy
     // closes connection upon accepting
+    #[cfg(unix)]
     async fn mock_connect_bad_server() {
         let _ = std::fs::remove_file(MOCK_BAD_UDS_PATH);
         let listener = UnixListener::bind(MOCK_BAD_UDS_PATH).unwrap();
@@ -424,6 +451,7 @@ mod tests {
         let _ = std::fs::remove_file(MOCK_BAD_UDS_PATH);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_proxy_conn_closed() {
         tokio::spawn(async {

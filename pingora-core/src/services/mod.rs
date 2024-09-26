@@ -23,7 +23,9 @@
 
 use async_trait::async_trait;
 
-use crate::server::{ListenFds, ShutdownWatch};
+#[cfg(unix)]
+use crate::server::ListenFds;
+use crate::server::ShutdownWatch;
 
 pub mod background;
 pub mod listening;
@@ -33,13 +35,17 @@ pub mod listening;
 pub trait Service: Sync + Send {
     /// This function will be called when the server is ready to start the service.
     ///
-    /// - `fds`: a collection of listening file descriptors. During zero downtime restart
+    /// - `fds` (Unix only): a collection of listening file descriptors. During zero downtime restart
     /// the `fds` would contain the listening sockets passed from the old service, services should
     /// take the sockets they need to use then. If the sockets the service looks for don't appear in
     /// the collection, the service should create its own listening sockets and then put them into
     /// the collection in order for them to be passed to the next server.
     /// - `shutdown`: the shutdown signal this server would receive.
-    async fn start_service(&mut self, fds: Option<ListenFds>, mut shutdown: ShutdownWatch);
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] fds: Option<ListenFds>,
+        mut shutdown: ShutdownWatch,
+    );
 
     /// The name of the service, just for logging and naming the threads assigned to this service
     ///

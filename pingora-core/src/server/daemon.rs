@@ -54,6 +54,7 @@ unsafe fn gid_for_username(name: &CString) -> Option<libc::gid_t> {
 }
 
 /// Start a server instance as a daemon.
+#[cfg(unix)]
 pub fn daemonize(conf: &ServerConf) {
     // TODO: customize working dir
 
