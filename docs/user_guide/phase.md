@@ -26,7 +26,8 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
     Connect--connection failure-->fail_to_connect;
 
     connected_to_upstream-->upstream_request_filter;
-    upstream_request_filter --> SendReq{{IO: send request to upstream}};
+    upstream_request_filter --> request_body_filter;
+    request_body_filter --> SendReq{{IO: send request to upstream}};
     SendReq-->RecvResp{{IO: read response from upstream}};
     RecvResp-->upstream_response_filter-->response_filter-->upstream_response_body_filter-->response_body_filter-->logging-->endreq("request done");
 
@@ -60,6 +61,9 @@ This function is similar to `request_filter()` but executes before any other log
 
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context.
+
+### `request_body_filter()`
+This phase is triggered after a response body is ready to send to upstream. It will be called every time a piece of request body is received.
 
 ### `proxy_upstream_filter()`
 This phase determines if we should continue to the upstream to serve a response. If we short-circuit, a 502 is returned by default, but a different response can be implemented.
