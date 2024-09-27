@@ -162,10 +162,23 @@ impl SocketDigest {
         }
     }
 
+    #[cfg(unix)]
     pub fn original_dst(&self) -> Option<&SocketAddr> {
         self.original_dst
             .get_or_init(|| {
                 get_original_dest(self.raw_fd)
+                    .ok()
+                    .flatten()
+                    .map(SocketAddr::Inet)
+            })
+            .as_ref()
+    }
+
+    #[cfg(windows)]
+    pub fn original_dst(&self) -> Option<&SocketAddr> {
+        self.original_dst
+            .get_or_init(|| {
+                get_original_dest(self.raw_sock)
                     .ok()
                     .flatten()
                     .map(SocketAddr::Inet)
