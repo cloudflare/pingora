@@ -19,6 +19,7 @@ use futures::FutureExt;
 use log::{debug, error};
 
 use pingora_error::{ErrorType::*, OrErr, Result};
+#[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -28,7 +29,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, Interest, ReadBuf};
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -148,6 +151,7 @@ struct RawStreamWrapper {
     /// store the last rx timestamp of the stream.
     pub(crate) rx_ts: Option<SystemTime>,
     /// enable reading rx timestamp
+    #[cfg(target_os = "linux")]
     pub(crate) enable_rx_ts: bool,
     #[cfg(target_os = "linux")]
     /// This can be reused across multiple recvmsg calls. The cmsg buffer may
@@ -161,12 +165,14 @@ impl RawStreamWrapper {
         RawStreamWrapper {
             stream,
             rx_ts: None,
+            #[cfg(target_os = "linux")]
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
             reusable_cmsg_space: nix::cmsg_space!(nix::sys::time::TimeSpec),
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn enable_rx_ts(&mut self, enable_rx_ts: bool) {
         self.enable_rx_ts = enable_rx_ts;
     }
@@ -791,6 +797,7 @@ impl AccumulatedDuration {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
     use std::sync::Arc;
