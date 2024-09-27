@@ -423,7 +423,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     }
     .or_err(SocketError, "failed to create socket")?;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         ip_bind_addr_no_port(socket.as_raw_fd(), true).or_err(
             SocketError,
