@@ -413,8 +413,13 @@ pub fn get_original_dest(fd: RawFd) -> Result<Option<SocketAddr>> {
         .map(Some)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn get_original_dest(_fd: RawFd) -> Result<Option<SocketAddr>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn get_original_dest(_sock: RawSocket) -> Result<Option<SocketAddr>> {
     Ok(None)
 }
 
