@@ -26,7 +26,7 @@ pingora-pool = { version = "0.3.0", path = "../pingora-pool" }
 pingora-error = { version = "0.3.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.3.0", path = "../pingora-timeout" }
 pingora-http = { version = "0.3.0", path = "../pingora-http" }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 futures = "0.3"
 async-trait = { workspace = true }
 httparse = { workspace = true }
