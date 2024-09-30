@@ -28,6 +28,9 @@ use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
 
+// https://datatracker.ietf.org/doc/html/rfc9113#section-3.4
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
 pub trait ServerApp {
@@ -102,11 +105,29 @@ where
 {
     async fn process_new(
         self: &Arc<Self>,
-        stream: Stream,
+        mut stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
-        let h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
-        // TODO: allow h2c and http/1.1 to co-exist
+        let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
+
+        // try to read h2 preface
+        if h2c {
+            let mut buf = [0u8; H2_PREFACE.len()];
+            let peeked = stream
+                .try_peek(&mut buf)
+                .await
+                .map_err(|e| {
+                    // this error is normal when h1 reuse and close the connection
+                    debug!("Read error while peeking h2c preface {e}");
+                    e
+                })
+                .ok()?;
+            // not all streams support peeking
+            if peeked {
+                // turn off h2c (use h1) if h2 preface doesn't exist
+                h2c = buf == H2_PREFACE;
+            }
+        }
         if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
             // create a shared connection digest
             let digest = Arc::new(Digest {
