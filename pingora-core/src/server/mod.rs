@@ -352,7 +352,7 @@ impl Server {
 
     /// Start the server
     ///
-    /// This function will block forever until the server needs to quit. So this would be the last
+    /// This function will block forever until the server needs to quit or reload. So this would be the last
     /// function to call for this object.
     ///
     /// Note: this function may fork the process for daemonization, so any additional threads created
