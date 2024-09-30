@@ -167,6 +167,28 @@ async fn test_h2c_to_h2c() {
 }
 
 #[tokio::test]
+async fn test_h1_on_h2c_port() {
+    init();
+
+    let client = hyper::client::Client::builder()
+        .http2_only(false)
+        .build_http();
+
+    let mut req = hyper::Request::builder()
+        .uri("http://127.0.0.1:6146")
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut()
+        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+
+    let body = res.into_body().data().await.unwrap().unwrap();
+    assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
 async fn test_h2_to_h2_host_override() {
     init();
     let client = reqwest::Client::builder()

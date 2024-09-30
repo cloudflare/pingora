@@ -71,6 +71,17 @@ pub trait Ssl {
     }
 }
 
+/// The ability peek data before consuming it
+#[async_trait]
+pub trait Peek {
+    /// Peek data but not consuming it. This call should block until some data
+    /// is sent.
+    /// Return `false` if peeking is not supported/allowed.
+    async fn try_peek(&mut self, _buf: &mut [u8]) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
 use std::any::Any;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -84,6 +95,7 @@ pub trait IO:
     + GetTimingDigest
     + GetProxyDigest
     + GetSocketDigest
+    + Peek
     + Unpin
     + Debug
     + Send
@@ -104,6 +116,7 @@ impl<
             + GetTimingDigest
             + GetProxyDigest
             + GetSocketDigest
+            + Peek
             + Unpin
             + Debug
             + Send
@@ -154,6 +167,8 @@ mod ext_io_impl {
         }
     }
 
+    impl Peek for Mock {}
+
     use std::io::Cursor;
 
     #[async_trait]
@@ -181,6 +196,7 @@ mod ext_io_impl {
             None
         }
     }
+    impl<T> Peek for Cursor<T> {}
 
     use tokio::io::DuplexStream;
 
@@ -209,6 +225,8 @@ mod ext_io_impl {
             None
         }
     }
+
+    impl Peek for DuplexStream {}
 }
 
 #[cfg(unix)]

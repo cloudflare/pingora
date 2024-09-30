@@ -26,7 +26,7 @@ pub use boringssl_openssl::*;
 pub mod dummy_tls;
 
 use crate::protocols::digest::TimingDigest;
-use crate::protocols::{Ssl, UniqueID, UniqueIDType};
+use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use log::warn;
 use pingora_error::{ErrorType::*, OrErr, Result};
@@ -183,6 +183,9 @@ impl<T> Ssl for SslStream<T> {
         self.ssl_digest()
     }
 }
+
+// TODO: implement Peek if needed
+impl<T> Peek for SslStream<T> {}
 
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug)]
