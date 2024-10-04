@@ -41,8 +41,9 @@ pub use l4::{ServerAddress, TcpSocketOptions};
 #[async_trait]
 pub trait TlsAccept {
     // TODO: return error?
-    /// This function is called in the middle of a TLS handshake. Structs who implement this function
-    /// should provide tls certificate and key to the [TlsRef] via [ext::ssl_use_certificate] and [ext::ssl_use_private_key].
+    /// This function is called in the middle of a TLS handshake. Structs who
+    /// implement this function should provide tls certificate and key to the
+    /// [TlsRef] via `ssl_use_certificate` and `ssl_use_private_key`.
     async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
         // does nothing by default
     }

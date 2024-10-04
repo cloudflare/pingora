@@ -18,7 +18,7 @@ name = "pingora"
 path = "src/lib.rs"
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["document-features"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -28,6 +28,10 @@ pingora-timeout = { version = "0.3.0", path = "../pingora-timeout" }
 pingora-load-balancing = { version = "0.3.0", path = "../pingora-load-balancing", optional = true, default-features = false }
 pingora-proxy = { version = "0.3.0", path = "../pingora-proxy", optional = true, default-features = false }
 pingora-cache = { version = "0.3.0", path = "../pingora-cache", optional = true, default-features = false }
+
+# Only used for documenting features, but doesn't work in any other dependency 
+# group :(
+document-features = { version = "0.2.10", optional = true }
 
 [dev-dependencies]
 clap = { version = "3.2.25", features = ["derive"] }
@@ -50,6 +54,15 @@ jemallocator = "0.5"
 
 [features]
 default = []
+
+#! ### Tls
+#! Tls is provided by adding one of these features. If no tls-providing feature
+#! is added, only unencrypted http. Only one tls-providing feature can be
+#! selected at a time
+
+## Use [OpenSSL](https://crates.io/crates/openssl) for tls 
+##
+## Requires native openssl libraries and build tooling
 openssl = [
     "pingora-core/openssl",
     "pingora-proxy?/openssl",
@@ -57,6 +70,10 @@ openssl = [
     "pingora-load-balancing?/openssl",
     "openssl_derived",
 ]
+
+## Use [BoringSSL](https://crates.io/crates/boring) for tls 
+##
+## Requires native boring libraries and build tooling
 boringssl = [
     "pingora-core/boringssl",
     "pingora-proxy?/boringssl",
@@ -64,11 +81,11 @@ boringssl = [
     "pingora-load-balancing?/boringssl",
     "openssl_derived",
 ]
-proxy = ["pingora-proxy"]
-lb = ["pingora-load-balancing", "proxy"]
-cache = ["pingora-cache"]
-time = []
-sentry = ["pingora-core/sentry"]
+
+# Coming soon
+# ## Use  [rustls](https://crates.io/crates/rustls) for tls
+# ##
+# ## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
 rustls = [
     "pingora-core/rustls",
     "pingora-proxy?/rustls",
@@ -76,5 +93,32 @@ rustls = [
     "pingora-load-balancing?/rustls",
     "any_tls",
 ]
+
+#! ### Pingora extensions
+
+## Include the [proxy](crate::proxy) module
+##
+## This feature will include and export `pingora_proxy::prelude::*`
+proxy = ["pingora-proxy"]
+
+## Include the [lb](crate::lb) (load-balancing) module
+##
+## This feature will include and export `pingora_load_balancing::prelude::*`
+lb = ["pingora-load-balancing", "proxy"]
+
+## Include the [cache](crate::cache) module
+##
+## This feature will include and export `pingora_cache::prelude::*`
+cache = ["pingora-cache"]
+
+## Enable time/scheduling functionality
+time = []
+
+## Enable sentry for error notifications
+sentry = ["pingora-core/sentry"]
+
+# These features are intentionally not documented
 openssl_derived = ["any_tls"]
 any_tls = []
+patched_http1 = ["pingora-core/patched_http1"]
+document-features = ["dep:document-features", "proxy", "lb", "cache", "time", "sentry"]

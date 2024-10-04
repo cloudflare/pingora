@@ -59,7 +59,7 @@ pub trait Ssl {
         None
     }
 
-    /// Return the [`ssl::SslDigest`] for logging
+    /// Return the [`tls::SslDigest`] for logging
     fn get_ssl_digest(&self) -> Option<Arc<tls::SslDigest>> {
         None
     }

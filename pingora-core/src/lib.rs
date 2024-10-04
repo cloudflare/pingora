@@ -37,6 +37,10 @@
 //! # Optional features
 //! `boringssl`: Switch the internal TLS library from OpenSSL to BoringSSL.
 
+// This enables the feature that labels modules that are only available with
+// certain pingora features
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod apps;
 pub mod connectors;
 pub mod listeners;

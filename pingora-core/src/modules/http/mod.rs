@@ -14,9 +14,11 @@
 
 //! Modules for HTTP traffic.
 //!
-//! [HttpModule]s define request and response filters to use while running an [HttpServer]
+//! [HttpModule]s define request and response filters to use while running an
+//! [HttpServer](crate::apps::http_app::HttpServer)
 //! application.
-//! See the [ResponseCompression] module for an example of how to implement a basic module.
+//! See the [ResponseCompression](crate::modules::http::compression::ResponseCompression)
+//! module for an example of how to implement a basic module.
 
 pub mod compression;
 pub mod grpc_web;

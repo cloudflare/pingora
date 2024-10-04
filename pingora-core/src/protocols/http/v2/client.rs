@@ -310,7 +310,7 @@ impl Http2Session {
         Some(self.conn.digest())
     }
 
-    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
+    /// Return a mutable [Digest] reference for the connection
     ///
     /// Will return `None` if multiple H2 streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
