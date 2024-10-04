@@ -258,6 +258,86 @@ mod test {
         ctx.parser.finish().unwrap();
         ctx.finish().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_cache_put_204_invalid_body() {
+        let key = CacheKey::new("", "b", "1");
+        let span = Span::inactive();
+        let put = TestCachePut();
+        let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
+        let payload = b"HTTP/1.1 204 OK\r\n\
+        Date: Thu, 26 Apr 2018 05:42:05 GMT\r\n\
+        Content-Type: text/html; charset=utf-8\r\n\
+        Connection: keep-alive\r\n\
+        X-Frame-Options: SAMEORIGIN\r\n\
+        Cache-Control: public, max-age=1\r\n\
+        Server: origin-server\r\n\
+        Content-Length: 4\r\n\r\n";
+        // here we skip mocking a real http session for simplicity
+        let res = ctx.do_cache_put(payload).await.unwrap();
+        assert!(res.is_none()); // cacheable
+                                // 204 should not have body, invalid client input may try to pass one
+        let res = ctx.do_cache_put(b"rust").await.unwrap();
+        assert!(res.is_none()); // still cacheable
+        ctx.parser.finish().unwrap();
+        ctx.finish().await.unwrap();
+
+        let span = Span::inactive();
+        let (meta, mut hit) = CACHE_BACKEND
+            .lookup(&key, &span.handle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meta.headers().get("date").unwrap(),
+            "Thu, 26 Apr 2018 05:42:05 GMT"
+        );
+        // just treated as empty body
+        // (TODO: should we reset content-length/transfer-encoding
+        // headers on 204/304?)
+        let data = hit.read_body().await.unwrap().unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_put_extra_body() {
+        let key = CacheKey::new("", "c", "1");
+        let span = Span::inactive();
+        let put = TestCachePut();
+        let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
+        let payload = b"HTTP/1.1 200 OK\r\n\
+        Date: Thu, 26 Apr 2018 05:42:05 GMT\r\n\
+        Content-Type: text/html; charset=utf-8\r\n\
+        Connection: keep-alive\r\n\
+        X-Frame-Options: SAMEORIGIN\r\n\
+        Cache-Control: public, max-age=1\r\n\
+        Server: origin-server\r\n\
+        Content-Length: 4\r\n\r\n";
+        // here we skip mocking a real http session for simplicity
+        let res = ctx.do_cache_put(payload).await.unwrap();
+        assert!(res.is_none()); // cacheable
+                                // pass in more extra request body that needs to be drained
+        let res = ctx.do_cache_put(b"rustab").await.unwrap();
+        assert!(res.is_none()); // still cacheable
+        let res = ctx.do_cache_put(b"cdef").await.unwrap();
+        assert!(res.is_none()); // still cacheable
+        ctx.parser.finish().unwrap();
+        ctx.finish().await.unwrap();
+
+        let span = Span::inactive();
+        let (meta, mut hit) = CACHE_BACKEND
+            .lookup(&key, &span.handle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            meta.headers().get("date").unwrap(),
+            "Thu, 26 Apr 2018 05:42:05 GMT"
+        );
+        let data = hit.read_body().await.unwrap().unwrap();
+        // body only contains specified content-length bounds
+        assert_eq!(data, "rust");
+    }
 }
 
 // maybe this can simplify some logic in pingora::h1
@@ -322,6 +402,14 @@ mod parse_response {
         }
 
         pub fn inject_data(&mut self, data: &[u8]) -> Result<Vec<HttpTask>> {
+            if self.state.is_done() {
+                // just ignore extra response body after parser is done
+                // could be invalid body appended to a no-content status
+                // or invalid body after content-length
+                // TODO: consider propagating an error to the client
+                return Ok(vec![]);
+            }
+
             self.put_data(data);
 
             let mut tasks = vec![];
@@ -424,7 +512,7 @@ mod parse_response {
                 PartialChunkedBody(seen) => {
                     let parsed = httparse::parse_chunk_size(&self.buf).map_err(|e| {
                         self.state = Done(seen);
-                        Error::explain(INVALID_CHUNK, format!("Invalid chucked encoding: {e:?}"))
+                        Error::explain(INVALID_CHUNK, format!("Invalid chunked encoding: {e:?}"))
                     })?;
                     match parsed {
                         httparse::Status::Complete((header_len, body_len)) => {
@@ -432,7 +520,7 @@ mod parse_response {
                             let total_chunk_size =
                                 header_len + body_len as usize + CHUNK_DELIMITER_SIZE;
                             if self.buf.len() < total_chunk_size {
-                                // wait for the full chunk tob read
+                                // wait for the full chunk to be read
                                 // Note that we have to buffer the entire chunk in this design
                                 Ok(None)
                             } else {
@@ -751,6 +839,114 @@ mod parse_response {
             };
             assert_eq!(data.as_ref().unwrap(), "y");
             assert!(!eos);
+        }
+
+        #[test]
+        fn test_no_body_content_length() {
+            let input = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 1);
+            let HttpTask::Header(header, eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 200);
+            assert!(eos);
+
+            parser.finish().unwrap();
+        }
+
+        #[test]
+        fn test_no_body_304_no_content_length() {
+            let input = b"HTTP/1.1 304 Not Modified\r\nCache-Control: public, max-age=10\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 1);
+            let HttpTask::Header(header, eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 304);
+            assert!(eos);
+
+            parser.finish().unwrap();
+        }
+
+        #[test]
+        fn test_204_with_chunked_body() {
+            let input = b"HTTP/1.1 204 No Content\r\nCache-Control: public, max-age=10\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 1);
+            let HttpTask::Header(header, eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 204);
+            assert!(eos);
+
+            // 204 should not have a body, parser ignores bad input
+            let output = parser.inject_data(b"4\r\nrust\r\n0\r\n\r\n").unwrap();
+            assert!(output.is_empty());
+            parser.finish().unwrap();
+        }
+
+        #[test]
+        fn test_204_with_content_length() {
+            let input = b"HTTP/1.1 204 No Content\r\nCache-Control: public, max-age=10\r\nContent-Length: 4\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 1);
+            let HttpTask::Header(header, eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 204);
+            assert!(eos);
+
+            // 204 should not have a body, parser ignores bad input
+            let output = parser.inject_data(b"rust").unwrap();
+            assert!(output.is_empty());
+            parser.finish().unwrap();
+        }
+
+        #[test]
+        fn test_200_with_zero_content_length_more_data() {
+            let input = b"HTTP/1.1 200 OK\r\nCache-Control: public, max-age=10\r\nContent-Length: 0\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 1);
+            let HttpTask::Header(header, eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 200);
+            assert!(eos);
+
+            let output = parser.inject_data(b"rust").unwrap();
+            assert!(output.is_empty());
+            parser.finish().unwrap();
+        }
+
+        #[test]
+        fn test_no_body_chunked() {
+            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(input).unwrap();
+
+            assert_eq!(output.len(), 2);
+            let HttpTask::Header(header, _eos) = &output[0] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(header.status, 200);
+
+            let HttpTask::Body(data, eos) = &output[1] else {
+                panic!("{:?}", output);
+            };
+            assert_eq!(data.as_ref().unwrap(), "");
+            assert!(eos);
+            parser.finish().unwrap();
         }
     }
 }
