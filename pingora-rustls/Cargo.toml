@@ -1,7 +1,6 @@
 [package]
 name = "pingora-rustls"
 version = "0.3.0"
-authors = ["Harald Gutmann <harald@gutmann.one>"]
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/cloudflare/pingora"
@@ -11,7 +10,6 @@ description = """
 RusTLS async APIs for Pingora.
 """
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "pingora_rustls"
 path = "src/lib.rs"

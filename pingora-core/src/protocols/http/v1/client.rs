@@ -639,7 +639,7 @@ impl HttpSession {
         &self.digest
     }
 
-    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
+    /// Return a mutable [Digest] reference for the connection.
     pub fn digest_mut(&mut self) -> &mut Digest {
         &mut self.digest
     }

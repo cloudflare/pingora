@@ -161,7 +161,7 @@ impl HttpSession {
         }
     }
 
-    /// Return a mutable [Digest] reference for the connection, see [`digest`] for more details.
+    /// Return a mutable [Digest] reference for the connection.
     ///
     /// Will return `None` if this is an H2 session and multiple streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
