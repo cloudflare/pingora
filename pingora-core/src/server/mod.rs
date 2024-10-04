@@ -22,6 +22,7 @@ use daemon::daemonize;
 use log::{debug, error, info, warn};
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
+#[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
@@ -67,6 +68,7 @@ pub struct Server {
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
     pub options: Option<Opt>,
+    #[cfg(feature = "sentry")]
     /// The Sentry ClientOptions.
     ///
     /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
@@ -191,6 +193,7 @@ impl Server {
             shutdown_recv: rx,
             configuration: Arc::new(conf),
             options: Some(opt),
+            #[cfg(feature = "sentry")]
             sentry: None,
         }
     }
@@ -231,6 +234,7 @@ impl Server {
             shutdown_recv: rx,
             configuration: Arc::new(conf),
             options: opt,
+            #[cfg(feature = "sentry")]
             sentry: None,
         })
     }

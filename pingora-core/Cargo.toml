@@ -51,7 +51,7 @@ sentry = { version = "0.26", features = [
     "panic",
     "reqwest",
     "rustls",
-], default-features = false }
+], default-features = false, optional = true }
 regex = "1"
 percent-encoding = "2.1"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
@@ -77,7 +77,9 @@ windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 [dev-dependencies]
 matches = "0.1"
 env_logger = "0.9"
-reqwest = { version = "0.11", features = ["rustls"], default-features = false }
+reqwest = { version = "0.11", features = [
+    "rustls-tls",
+], default-features = false }
 hyper = "0.14"
 
 [target.'cfg(unix)'.dev-dependencies]
@@ -88,5 +90,6 @@ jemallocator = "0.5"
 default = ["openssl"]
 openssl = ["pingora-openssl", "some_tls"]
 boringssl = ["pingora-boringssl", "some_tls"]
+sentry = ["dep:sentry"]
 patched_http1 = []
 some_tls = []

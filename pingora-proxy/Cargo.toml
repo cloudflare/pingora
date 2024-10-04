@@ -37,7 +37,7 @@ regex = "1"
 [dev-dependencies]
 reqwest = { version = "0.11", features = [
     "gzip",
-    "rustls",
+    "rustls-tls",
 ], default-features = false }
 tokio-test = "0.4"
 env_logger = "0.9"
@@ -58,6 +58,7 @@ hyperlocal = "0.8"
 default = ["openssl"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl"]
 boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl"]
+sentry = ["pingora-core/sentry"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
