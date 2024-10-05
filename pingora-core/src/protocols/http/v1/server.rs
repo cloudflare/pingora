@@ -1010,6 +1010,13 @@ impl HttpSession {
     pub fn stream(&self) -> &Stream {
         &self.underlying_stream
     }
+
+    /// Consume `self`, the underlying stream will be returned and can be used
+    /// directly, for example, in the case of HTTP upgrade. The stream is not
+    /// flushed prior to being returned.
+    pub fn into_inner(self) -> Stream {
+        self.underlying_stream
+    }
 }
 
 // Regex to parse request line that has illegal chars in it
