@@ -11,9 +11,7 @@ mod app;
 mod service;
 
 pub fn main() {
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -31,6 +29,7 @@ pub fn main() {
         loop {
             let conf_filename = conf_filename.clone();
             let upgrade = upgrade.clone();
+            let upgrade_for_store = upgrade.clone();
             let task = tokio::spawn(async move {
                 let opt = Opt {
                     conf: conf_filename,
@@ -70,7 +69,7 @@ pub fn main() {
                 _ = reload_signal.recv() => {
                     #[cfg(target_os = "linux")]
                     {
-                        upgrade.store(true, Ordering::SeqCst);
+                        upgrade_for_store.store(true, Ordering::SeqCst);
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
