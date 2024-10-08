@@ -85,9 +85,12 @@ impl ConnectionRef {
             release_lock: Arc::new(Mutex::new(())),
         }))
     }
+
     pub fn more_streams_allowed(&self) -> bool {
+        let current = self.0.current_streams.load(Ordering::Relaxed);
         !self.is_shutting_down()
-            && self.0.max_streams > self.0.current_streams.load(Ordering::Relaxed)
+            && self.0.max_streams > current
+            && self.0.connection_stub.0.current_max_send_streams() > current
     }
 
     pub fn is_idle(&self) -> bool {
