@@ -94,39 +94,45 @@ impl Server {
         let mut graceful_terminate_signal = unix::signal(unix::SignalKind::terminate()).unwrap();
         let mut fast_shutdown_signal = unix::signal(unix::SignalKind::interrupt()).unwrap();
         let mut reload_signal = unix::signal(unix::SignalKind::hangup()).unwrap();
-        tokio::select! {
-            _ = fast_shutdown_signal.recv() => {
-                info!("SIGINT received, exiting");
-                (ShutdownType::Quick, false)
-            },
-            _ = graceful_terminate_signal.recv() => {
-                // we receive a graceful terminate, all instances are instructed to stop
-                info!("SIGTERM received, gracefully exiting");
-                // graceful shutdown if there are listening sockets
-                info!("Broadcasting graceful shutdown");
-                match self.shutdown_watch.send(true) {
-                    Ok(_) => { info!("Graceful shutdown started!"); }
-                    Err(e) => {
-                        error!("Graceful shutdown broadcast failed: {e}");
+
+        loop {
+            tokio::select! {
+                _ = fast_shutdown_signal.recv() => {
+                    info!("SIGINT received, exiting");
+                    return (ShutdownType::Quick, false)
+                },
+                _ = graceful_terminate_signal.recv() => {
+                    // we receive a graceful terminate, all instances are instructed to stop
+                    info!("SIGTERM received, gracefully exiting");
+                    // graceful shutdown if there are listening sockets
+                    info!("Broadcasting graceful shutdown");
+                    match self.shutdown_watch.send(true) {
+                        Ok(_) => { info!("Graceful shutdown started!"); }
+                        Err(e) => {
+                            error!("Graceful shutdown broadcast failed: {e}");
+                        }
                     }
+                    info!("Broadcast graceful shutdown complete");
+                    return (ShutdownType::Graceful, false)
                 }
-                info!("Broadcast graceful shutdown complete");
-                (ShutdownType::Graceful, false)
-            }
-            _ = graceful_upgrade_signal.recv() => {
-                info!("SIGQUIT received, sending socks and gracefully exiting");
-                self.handle_gracefull_upgrade_signal().await;
-                (ShutdownType::Graceful, false)
-            },
-            _ = reload_signal.recv() => {
-                info!("SIGHUP received, sending socks and gracefully reloading");
-                self.handle_gracefull_upgrade_signal().await;
-                (ShutdownType::Graceful, true)
+                _ = graceful_upgrade_signal.recv() => {
+                    info!("SIGQUIT received, sending socks and gracefully exiting");
+                    self.handle_gracefull_upgrade_signal(false).await;
+                    return (ShutdownType::Graceful, false)
+                },
+                _ = reload_signal.recv() => {
+                    info!("SIGHUP received, sending socks and gracefully reloading");
+                    // ensure that sending socks is successful before exiting
+                    if !self.handle_gracefull_upgrade_signal(true).await {
+                        continue;
+                    }
+                    return (ShutdownType::Graceful, true)
+                }
             }
         }
     }
 
-    async fn handle_gracefull_upgrade_signal(&self) {
+    async fn handle_gracefull_upgrade_signal(&self, reload: bool) -> bool {
         // TODO: still need to select! on signals in case a fast shutdown is needed
         // aka: move below to another task and only kick it off here
         if let Some(fds) = &self.listen_fds {
@@ -142,6 +148,10 @@ impl Server {
                     // sentry log error on fd send failure
                     #[cfg(all(not(debug_assertions), feature = "sentry"))]
                     sentry::capture_error(&e);
+
+                    if reload {
+                        return false;
+                    }
                 }
             }
             sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
@@ -154,13 +164,14 @@ impl Server {
                 Err(e) => {
                     error!("Graceful shutdown broadcast failed: {e}");
                     // switch to fast shutdown
-                    return;
+                    return true;
                 }
             }
             info!("Broadcast graceful shutdown complete");
         } else {
             info!("No socks to send, shutting down.");
         }
+        true
     }
 
     fn run_service(

@@ -26,19 +26,36 @@ pub fn main() {
         let upgrade = Arc::new(AtomicBool::new(args_opt.upgrade));
         let conf_filename = args_opt.conf;
 
+        let (server_stop_tx, mut server_stop_rx) = tokio::sync::mpsc::channel::<bool>(1);
+
         loop {
             let conf_filename = conf_filename.clone();
             let upgrade = upgrade.clone();
+            #[cfg(target_os = "linux")]
             let upgrade_for_store = upgrade.clone();
-            let task = tokio::spawn(async move {
+
+            let server_stop_tx = server_stop_tx.clone();
+            tokio::spawn(async move {
                 let opt = Opt {
                     conf: conf_filename,
                     upgrade: upgrade.load(Ordering::SeqCst),
                     ..Opt::default()
                 };
                 let opt = Some(opt);
-                let mut my_server = Server::new(opt).unwrap();
-                my_server.try_bootstrap().unwrap();
+                let mut my_server = match Server::new(opt) {
+                    Ok(server) => server,
+                    Err(e) => {
+                        error!("Create server error: {:?}", e);
+                        return;
+                    }
+                };
+                match my_server.try_bootstrap() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Bootstrap error: {:?}", e);
+                        return;
+                    }
+                }
 
                 let mut echo_service_http = service::echo::echo_service_http();
 
@@ -57,12 +74,16 @@ pub fn main() {
                     tokio::task::spawn_blocking(move || match my_server.run_server(false) {
                         Ok(reload) => {
                             info!("Reload: {}", reload);
+                            reload
                         }
                         Err(e) => {
                             error!("Failed to run server: {}", e);
+                            false
                         }
                     });
-                server_task.await.unwrap();
+                if !server_task.await.unwrap() {
+                    server_stop_tx.send(true).await.unwrap();
+                }
             });
 
             tokio::select! {
@@ -76,7 +97,7 @@ pub fn main() {
                         info!("Upgrade is only supported on Linux");
                     }
                 }
-                _ = task => {
+                _ = server_stop_rx.recv() => {
                     info!("Server task finished");
                     break;
                 }

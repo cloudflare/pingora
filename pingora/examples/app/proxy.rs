@@ -36,6 +36,7 @@ enum DuplexEvent {
 }
 
 impl ProxyApp {
+    #[allow(dead_code)]
     pub fn new(proxy_to: BasicPeer) -> Self {
         ProxyApp {
             client_connector: TransportConnector::new(None),

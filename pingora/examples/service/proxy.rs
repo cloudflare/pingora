@@ -17,6 +17,7 @@ use pingora_core::listeners::Listeners;
 use pingora_core::services::listening::Service;
 use pingora_core::upstreams::peer::BasicPeer;
 
+#[allow(dead_code)]
 pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
     let proxy_to = BasicPeer::new(proxy_addr);
 
@@ -27,6 +28,7 @@ pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
     )
 }
 
+#[allow(dead_code)]
 pub fn proxy_service_tls(
     addr: &str,
     proxy_addr: &str,
