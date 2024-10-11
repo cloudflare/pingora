@@ -309,7 +309,23 @@ impl<SV> HttpProxy<SV> {
             }
             loop {
                 match session.cache.hit_handler().read_body().await {
-                    Ok(body) => {
+                    Ok(mut body) => {
+                        let end = body.is_none();
+                        match self
+                            .inner
+                            .response_body_filter(session, &mut body, end, ctx)
+                        {
+                            Ok(Some(duration)) => {
+                                trace!("delaying response for {duration:?}");
+                                time::sleep(duration).await;
+                            }
+                            Ok(None) => { /* continue */ }
+                            Err(e) => {
+                                // body is being sent, don't treat downstream as reusable
+                                return (false, Some(e));
+                            }
+                        }
+
                         if let Some(b) = body {
                             // write to downstream
                             if let Err(e) = session
