@@ -51,6 +51,7 @@ pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
     // listeners sent from the old process for graceful upgrade
+    #[cfg(unix)]
     upgrade_listeners: Option<ListenFds>,
 }
 
