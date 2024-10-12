@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "openssl_derived")]
-mod boringssl_openssl;
-
-#[cfg(feature = "openssl_derived")]
-pub use boringssl_openssl::*;
+pub fn rustls() {
+    todo!()
+}

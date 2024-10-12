@@ -14,9 +14,6 @@
 
 //! TLS information from the TLS connection
 
-use crate::tls::{hash::MessageDigest, ssl::SslRef};
-use crate::utils;
-
 /// The TLS connection information
 #[derive(Clone, Debug)]
 pub struct SslDigest {
@@ -30,36 +27,4 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
-}
-
-impl SslDigest {
-    pub fn from_ssl(ssl: &SslRef) -> Self {
-        let cipher = match ssl.current_cipher() {
-            Some(c) => c.name(),
-            None => "",
-        };
-
-        let (cert_digest, org, sn) = match ssl.peer_certificate() {
-            Some(cert) => {
-                let cert_digest = match cert.digest(MessageDigest::sha256()) {
-                    Ok(c) => c.as_ref().to_vec(),
-                    Err(_) => Vec::new(),
-                };
-                (
-                    cert_digest,
-                    utils::get_organization(&cert),
-                    utils::get_serial(&cert).ok(),
-                )
-            }
-            None => (Vec::new(), None, None),
-        };
-
-        SslDigest {
-            cipher,
-            version: ssl.version_str(),
-            organization: org,
-            serial_number: sn,
-            cert_digest,
-        }
-    }
 }

@@ -65,6 +65,7 @@ name = "lru_serde"
 harness = false
 
 [features]
-default = ["openssl"]
+default = []
 openssl = ["pingora-core/openssl"]
 boringssl = ["pingora-core/boringssl"]
+rustls = ["pingora-core/rustls"]

@@ -33,11 +33,11 @@ use std::time::Duration;
 
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
+use crate::protocols::tls::CaType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
-use crate::tls::x509::X509;
-use crate::utils::{get_organization_unit, CertKey};
+use crate::utils::tls::{get_organization_unit, CertKey};
 
 pub use crate::protocols::tls::ALPN;
 
@@ -148,7 +148,7 @@ pub trait Peer: Display + Clone {
     /// Get the CA cert to use to validate the server cert.
     ///
     /// If not set, the default CAs will be used.
-    fn get_ca(&self) -> Option<&Arc<Box<[X509]>>> {
+    fn get_ca(&self) -> Option<&Arc<CaType>> {
         match self.get_peer_options() {
             Some(opt) => opt.ca.as_ref(),
             None => None,
@@ -316,7 +316,7 @@ pub struct PeerOptions {
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
     pub alpn: ALPN,
-    pub ca: Option<Arc<Box<[X509]>>>,
+    pub ca: Option<Arc<CaType>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,

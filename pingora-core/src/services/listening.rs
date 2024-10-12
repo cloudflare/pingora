@@ -19,7 +19,8 @@
 //! more endpoints to listen to.
 
 use crate::apps::ServerApp;
-use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TlsSettings, TransportStack};
+use crate::listeners::tls::TlsSettings;
+use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TransportStack};
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;

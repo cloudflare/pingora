@@ -375,6 +375,7 @@ mod test {
         assert!(tcp_check.check(&backend).await.is_err());
     }
 
+    #[cfg(feature = "any_tls")]
     #[tokio::test]
     async fn test_tls_check() {
         let tls_check = TcpHealthCheck::new_tls("one.one.one.one");
@@ -387,6 +388,7 @@ mod test {
         assert!(tls_check.check(&backend).await.is_ok());
     }
 
+    #[cfg(feature = "any_tls")]
     #[tokio::test]
     async fn test_https_check() {
         let https_check = HttpHealthCheck::new("one.one.one.one", true);

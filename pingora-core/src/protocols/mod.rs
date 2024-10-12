@@ -55,7 +55,7 @@ pub trait UniqueID {
 /// Interface to get TLS info
 pub trait Ssl {
     /// Return the TLS info if the connection is over TLS
-    fn get_ssl(&self) -> Option<&crate::tls::ssl::SslRef> {
+    fn get_ssl(&self) -> Option<&TlsRef> {
         None
     }
 
@@ -66,8 +66,7 @@ pub trait Ssl {
 
     /// Return selected ALPN if any
     fn selected_alpn_proto(&self) -> Option<ALPN> {
-        let ssl = self.get_ssl()?;
-        ALPN::from_wire_selected(ssl.selected_alpn_protocol()?)
+        None
     }
 }
 
@@ -248,6 +247,8 @@ use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::{net::SocketAddr as InetSocketAddr, path::Path};
+
+use crate::protocols::tls::TlsRef;
 
 #[cfg(unix)]
 impl ConnFdReusable for SocketAddr {
