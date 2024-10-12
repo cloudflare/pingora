@@ -17,11 +17,15 @@
 pub mod http;
 pub mod l4;
 mod offload;
+
+#[cfg(feature = "any_tls")]
 mod tls;
+
+#[cfg(not(feature = "any_tls"))]
+use crate::tls::connectors as tls;
 
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
-use crate::tls::ssl::SslConnector;
 use crate::upstreams::peer::{Peer, ALPN};
 
 pub use l4::Connect as L4Connect;
@@ -34,6 +38,7 @@ use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tls::TlsConnector;
 use tokio::sync::Mutex;
 
 /// The options to configure a [TransportConnector]
@@ -293,7 +298,7 @@ async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    tls_ctx: &TlsConnector,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
@@ -316,7 +321,7 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    tls_ctx: &TlsConnector,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
@@ -383,12 +388,12 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
 }
 
 #[cfg(test)]
-#[cfg(feature = "some_tls")]
+#[cfg(feature = "any_tls")]
 mod tests {
     use pingora_error::ErrorType;
+    use tls::Connector;
 
     use super::*;
-    use crate::tls::ssl::SslMethod;
     use crate::upstreams::peer::BasicPeer;
     use tokio::io::AsyncWriteExt;
     #[cfg(unix)]
@@ -498,8 +503,8 @@ mod tests {
     /// This assumes that the connection will fail to on the peer and returns
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
-        let ssl_connector = SslConnector::builder(SslMethod::tls()).unwrap().build();
-        let stream = do_connect(peer, None, None, &ssl_connector).await;
+        let tls_connector = Connector::new(None);
+        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (

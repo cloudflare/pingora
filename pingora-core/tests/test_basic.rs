@@ -14,23 +14,20 @@
 
 mod utils;
 
-use hyper::Client;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "any_tls"))]
 use hyperlocal::{UnixClientExt, Uri};
-use utils::init;
 
-#[cfg(feature = "some_tls")]
 #[tokio::test]
 async fn test_http() {
-    init();
+    utils::init();
     let res = reqwest::get("http://127.0.0.1:6145").await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
-#[cfg(feature = "some_tls")]
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_https_http2() {
-    init();
+    utils::init();
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -53,12 +50,12 @@ async fn test_https_http2() {
 }
 
 #[cfg(unix)]
-#[cfg(feature = "some_tls")]
+#[cfg(feature = "any_tls")]
 #[tokio::test]
 async fn test_uds() {
-    init();
+    utils::init();
     let url = Uri::new("/tmp/echo.sock", "/").into();
-    let client = Client::unix();
+    let client = hyper::Client::unix();
 
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);

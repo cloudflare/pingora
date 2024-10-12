@@ -16,6 +16,7 @@ use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::sync::{Arc, Once};
 
+use crate::connectors::tls::replace_leftmost_underscore;
 use crate::connectors::ConnectorOptions;
 use crate::protocols::tls::client::handshake;
 use crate::protocols::tls::SslStream;
@@ -30,6 +31,8 @@ use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
+
+pub type TlsConnector = SslConnector;
 
 const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
     :AES-256-GCM-SHA384\
@@ -147,33 +150,6 @@ impl Connector {
     }
 }
 
-/*
-    OpenSSL considers underscores in hostnames non-compliant.
-    We replace the underscore in the leftmost label as we must support these
-    hostnames for wildcard matches and we have not patched OpenSSL.
-
-    https://github.com/openssl/openssl/issues/12566
-
-    > The labels must follow the rules for ARPANET host names.  They must
-    > start with a letter, end with a letter or digit, and have as interior
-    > characters only letters, digits, and hyphen.  There are also some
-    > restrictions on the length.  Labels must be 63 characters or less.
-    - https://datatracker.ietf.org/doc/html/rfc1034#section-3.5
-*/
-fn replace_leftmost_underscore(sni: &str) -> Option<String> {
-    // wildcard is only leftmost label
-    if let Some((leftmost, rest)) = sni.split_once('.') {
-        // if not a subdomain or leftmost does not contain underscore return
-        if !rest.contains('.') || !leftmost.contains('_') {
-            return None;
-        }
-        // we have a subdomain, replace underscores
-        let leftmost = leftmost.replace('_', "-");
-        return Some(format!("{leftmost}.{rest}"));
-    }
-    None
-}
-
 pub(crate) async fn connect<T, P>(
     stream: T,
     peer: &P,
@@ -281,43 +257,5 @@ where
             ),
         },
         None => connect_future.await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_replace_leftmost_underscore() {
-        let none_cases = [
-            "",
-            "some",
-            "some.com",
-            "1.1.1.1:5050",
-            "dog.dot.com",
-            "dog.d_t.com",
-            "dog.dot.c_m",
-            "d_g.com",
-            "_",
-            "dog.c_m",
-        ];
-
-        for case in none_cases {
-            assert!(replace_leftmost_underscore(case).is_none(), "{}", case);
-        }
-
-        assert_eq!(
-            Some("bb-b.some.com".to_string()),
-            replace_leftmost_underscore("bb_b.some.com")
-        );
-        assert_eq!(
-            Some("a-a-a.some.com".to_string()),
-            replace_leftmost_underscore("a_a_a.some.com")
-        );
-        assert_eq!(
-            Some("-.some.com".to_string()),
-            replace_leftmost_underscore("_.some.com")
-        );
     }
 }

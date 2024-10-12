@@ -82,7 +82,7 @@ fn entry_point(opt: Option<Opt>) {
     listeners.add_uds("/tmp/echo.sock", None);
 
     let mut tls_settings =
-        pingora_core::listeners::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     tls_settings.enable_h2();
     listeners.add_tls_with_settings("0.0.0.0:6146", None, tls_settings);
 

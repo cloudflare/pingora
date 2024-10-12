@@ -13,15 +13,38 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
+use std::path::Path;
 use std::process;
 use std::{thread, time};
 
 pub static MOCK_ORIGIN: Lazy<bool> = Lazy::new(init);
 
 fn init() -> bool {
+    #[cfg(feature = "rustls")]
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_rustls.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    #[cfg(feature = "openssl_derived")]
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_boringssl_openssl.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+
+    #[cfg(feature = "any_tls")]
+    {
+        let mut dst_cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
+        dst_cert_path = format!(
+            "{}/tests/utils/conf/keys/server.crt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
+    }
+
     // TODO: figure out a way to kill openresty when exiting
     process::Command::new("pkill")
-        .args(["-F", "/tmp/mock_origin.pid"])
+        .args(["-F", "/tmp/pingora_mock_origin.pid"])
         .spawn()
         .unwrap();
     let _origin = thread::spawn(|| {

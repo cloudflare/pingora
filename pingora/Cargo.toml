@@ -49,21 +49,32 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = ["openssl"]
+default = []
 openssl = [
     "pingora-core/openssl",
     "pingora-proxy?/openssl",
     "pingora-cache?/openssl",
     "pingora-load-balancing?/openssl",
+    "openssl_derived",
 ]
 boringssl = [
     "pingora-core/boringssl",
     "pingora-proxy?/boringssl",
     "pingora-cache?/boringssl",
     "pingora-load-balancing?/boringssl",
+    "openssl_derived",
 ]
 proxy = ["pingora-proxy"]
 lb = ["pingora-load-balancing", "proxy"]
 cache = ["pingora-cache"]
 time = []
 sentry = ["pingora-core/sentry"]
+rustls = [
+    "pingora-core/rustls",
+    "pingora-proxy?/rustls",
+    "pingora-cache?/rustls",
+    "pingora-load-balancing?/rustls",
+    "any_tls",
+]
+openssl_derived = ["any_tls"]
+any_tls = []
