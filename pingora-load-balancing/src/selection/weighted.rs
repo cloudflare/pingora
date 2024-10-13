@@ -38,12 +38,25 @@ impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
             "support up to 2^16 backends"
         );
         let backends = Vec::from_iter(backends.iter().cloned()).into_boxed_slice();
-        let mut weighted = Vec::with_capacity(backends.len());
+
+        // Greatest common divisor for all weighted
+        let mut g = 0usize;
+        let mut total = 0usize;
+        for (_, b) in backends.iter().enumerate() {
+            g = gcd(g, b.weight);
+            total += b.weight;
+        }
+        if g == 0 {
+            g = 1;
+        }
+
+        let mut weighted = Vec::with_capacity(total/g);
         for (index, b) in backends.iter().enumerate() {
-            for _ in 0..b.weight {
+            for _ in 0..b.weight/g {
                 weighted.push(index as u16);
             }
         }
+
         Weighted {
             backends,
             weighted: weighted.into_boxed_slice(),
@@ -98,6 +111,15 @@ impl<H: SelectionAlgorithm> BackendIter for WeightedIterator<H> {
             Some(&self.backend.backends[self.index as usize % len])
         }
     }
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let tmp = a % b;
+        a = b;
+        b = tmp;
+    }
+    a
 }
 
 #[cfg(test)]
@@ -204,5 +226,22 @@ mod test {
         }
         let b2_count = *count.get(&b2).unwrap();
         assert!((70..=90).contains(&b2_count));
+    }
+
+    #[test]
+    fn test_gcd() {
+        assert_eq!(gcd(0, 0), 0);
+
+        assert_eq!(gcd(0, 1), 1);
+        assert_eq!(gcd(1, 0), 1);
+
+        assert_eq!(gcd(0, 5), 5);
+        assert_eq!(gcd(5, 0), 5);
+
+        assert_eq!(gcd(3, 5), 1);
+        assert_eq!(gcd(8, 9), 1);
+
+        assert_eq!(gcd(2, 6), 2);
+        assert_eq!(gcd(6, 2), 2);
     }
 }
