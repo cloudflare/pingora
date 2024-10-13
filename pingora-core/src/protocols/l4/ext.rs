@@ -203,7 +203,7 @@ fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<()> {
     Ok(())
 }
@@ -262,8 +262,13 @@ pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
     get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn get_tcp_info(_fd: RawFd) -> io::Result<TCP_INFO> {
+    Ok(unsafe { TCP_INFO::new() })
+}
+
+#[cfg(windows)]
+pub fn get_tcp_info(_fd: RawSocket) -> io::Result<TCP_INFO> {
     Ok(unsafe { TCP_INFO::new() })
 }
 
@@ -458,7 +463,7 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
 
 async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     addr: &SocketAddr,
-    bind_to: Option<&BindTo>,
+    _bind_to: Option<&BindTo>,
     set_socket: F,
 ) -> Result<TcpStream> {
     let socket = if addr.is_ipv4() {
@@ -475,7 +480,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             "failed to set socket opts IP_BIND_ADDRESS_NO_PORT",
         )?;
 
-        if let Some(bind_to) = bind_to {
+        if let Some(bind_to) = _bind_to {
             if let Some((low, high)) = bind_to.port_range() {
                 ip_local_port_range(socket.as_raw_fd(), low, high)
                     .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
@@ -489,12 +494,6 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
         }
     }
 
-    #[cfg(windows)]
-    if let Some(baddr) = bind_to {
-        socket
-            .bind(*baddr)
-            .or_err_with(BindError, || format!("failed to bind to socket {}", *baddr))?;
-    };
     // TODO: add support for bind on other platforms
 
     set_socket(&socket)?;
