@@ -26,6 +26,7 @@
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use std::sync::Arc;
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;
@@ -128,6 +129,7 @@ impl NoStealRuntime {
     }
 
     fn init_pools(&self) -> (Box<[Handle]>, Vec<Control>) {
+        println!("init_pools");
         let mut pools = Vec::with_capacity(self.threads);
         let mut controls = Vec::with_capacity(self.threads);
         for _ in 0..self.threads {
@@ -138,6 +140,7 @@ impl NoStealRuntime {
             let join = std::thread::Builder::new()
                 .name(self.name.clone())
                 .spawn(move || {
+                    println!("create thread thd id {:?}",     thread::current().id());
                     CURRENT_HANDLE.get_or(|| pools_ref);
                     if let Ok(timeout) = rt.block_on(rx) {
                         rt.shutdown_timeout(timeout);
@@ -231,10 +234,15 @@ fn test_no_steal_runtime() {
 
     let rt = Runtime::new_no_steal(2, "test");
     let handle = rt.get_handle();
+    println!("thd id {:?}",     thread::current().id());
+
     let ret = handle.block_on(async {
         sleep(Duration::from_secs(1)).await;
         let handle = current_handle();
         let join = handle.spawn(async {
+            println!("test_no_steal_runtime");
+            println!("thd id {:?}",     thread::current().id());
+
             sleep(Duration::from_secs(1)).await;
         });
         join.await.unwrap();
@@ -242,6 +250,42 @@ fn test_no_steal_runtime() {
     });
 
     assert_eq!(ret, 1);
+}
+
+#[test]
+fn test_no_steal_runtime2() {
+    use tokio::time::{sleep, Duration};
+
+    let rt = Runtime::new_no_steal(2, "test");
+    let handle = rt.get_handle();
+    println!("main thd id {:?}",     thread::current().id());
+
+    let join = handle.spawn(async {
+        println!("test_no_steal_runtime");
+        println!("spawn thd id {:?}",     thread::current().id());
+
+        sleep(Duration::from_secs(1)).await;
+    });
+    // join.await.unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+}
+
+
+#[test]
+fn test_no_steal_runtime3() {
+    use tokio::time::{sleep, Duration};
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let handle = rt.handle();
+    println!("thd id {:?}",     thread::current().id());
+
+    let join = handle.spawn(async {
+        println!("test_no_steal_runtime");
+        println!("thd id {:?}",     thread::current().id());
+
+        sleep(Duration::from_secs(1)).await;
+    });
+    std::thread::sleep(Duration::from_secs(10));
 }
 
 #[test]
