@@ -56,7 +56,7 @@ sentry = { version = "0.26", features = [
 regex = "1"
 percent-encoding = "2.1"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
-socket2 = { version = "0", features = ["all"] }
+socket2 = { version = ">=0.4, <1.0.0", features = ["all"] }
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 sfv = "0"
 rand = "0.8"
