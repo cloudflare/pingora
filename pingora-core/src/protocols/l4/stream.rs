@@ -296,6 +296,7 @@ impl AsyncWrite for RawStreamWrapper {
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
             }
         }
@@ -310,6 +311,7 @@ impl AsyncWrite for RawStreamWrapper {
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
+                #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
             }
         }

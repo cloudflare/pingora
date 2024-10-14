@@ -91,6 +91,7 @@ impl SocketDigest {
             raw_sock,
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
+            original_dst: OnceCell::new(),
         }
     }
 

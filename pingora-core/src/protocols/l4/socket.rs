@@ -246,7 +246,6 @@ impl std::net::ToSocketAddrs for SocketAddr {
     }
 }
 
-#[cfg(unix)]
 impl From<StdSockAddr> for SocketAddr {
     fn from(sockaddr: StdSockAddr) -> Self {
         SocketAddr::Inet(sockaddr)
