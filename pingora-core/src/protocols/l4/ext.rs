@@ -203,8 +203,13 @@ fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> {
     Ok(())
 }
 
@@ -262,8 +267,13 @@ pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
     get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub fn get_tcp_info(_fd: RawFd) -> io::Result<TCP_INFO> {
+    Ok(unsafe { TCP_INFO::new() })
+}
+
+#[cfg(windows)]
+pub fn get_tcp_info(_fd: RawSocket) -> io::Result<TCP_INFO> {
     Ok(unsafe { TCP_INFO::new() })
 }
 
@@ -490,10 +500,12 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     }
 
     #[cfg(windows)]
-    if let Some(baddr) = bind_to {
-        socket
-            .bind(*baddr)
-            .or_err_with(BindError, || format!("failed to bind to socket {}", *baddr))?;
+    if let Some(bind_to) = bind_to {
+        if let Some(baddr) = bind_to.addr {
+            socket
+                .bind(baddr)
+                .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
+        };
     };
     // TODO: add support for bind on other platforms
 
