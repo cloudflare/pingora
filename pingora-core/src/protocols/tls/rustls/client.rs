@@ -28,9 +28,7 @@ pub async fn handshake<S: IO>(
 ) -> Result<TlsStream<S>> {
     let mut stream = TlsStream::from_connector(connector, domain, io)
         .await
-        .explain_err(TLSHandshakeFailure, |e| {
-            format!("tip: tls stream error: {e}")
-        })?;
+        .or_err(TLSHandshakeFailure, "tls stream error")?;
 
     let handshake_result = stream.connect().await;
     match handshake_result {

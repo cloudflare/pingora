@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 log = "0.4.21"
+pingora-error = {version = "0.3.0", path = "../pingora-error"}
 ring = "0.17.8"
 rustls = "0.23.12"
 rustls-native-certs = "0.7.1"
@@ -23,7 +24,3 @@ rustls-pemfile = "2.1.2"
 rustls-pki-types = "1.7.0"
 tokio-rustls = "0.26.0"
 no_debug = "3.1.0"
-
-[dev-dependencies]
-tokio-test = "0.4.3"
-tokio = { workspace = true, features = ["full"] }

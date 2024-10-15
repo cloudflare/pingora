@@ -82,10 +82,9 @@ boringssl = [
     "openssl_derived",
 ]
 
-# Coming soon
-# ## Use  [rustls](https://crates.io/crates/rustls) for tls
-# ##
-# ## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
+## Use  [rustls](https://crates.io/crates/rustls) for tls
+##
+## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
 rustls = [
     "pingora-core/rustls",
     "pingora-proxy?/rustls",

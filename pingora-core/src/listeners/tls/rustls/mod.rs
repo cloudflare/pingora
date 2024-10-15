@@ -18,8 +18,8 @@ use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
 use log::debug;
 use pingora_error::ErrorType::InternalError;
-use pingora_error::{Error, ErrorSource, ImmutStr, OrErr, Result};
-use pingora_rustls::load_certs_key_file;
+use pingora_error::{Error, OrErr, Result};
+use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -38,21 +38,29 @@ pub struct Acceptor {
 }
 
 impl TlsSettings {
+    /// Create a Rustls acceptor based on the current setting for certificates,
+    /// keys, and protocols.
+    ///
+    /// _NOTE_ This function will panic if there is an error in loading
+    /// certificate files or constructing the builder
+    ///
+    /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        let (certs, key) =
-            load_certs_key_file(&self.cert_path, &self.key_path).unwrap_or_else(|| {
-                panic!(
-                    "Failed to load provided certificates \"{}\" or key \"{}\".",
-                    self.cert_path, self.key_path
-                )
-            });
+        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
+        else {
+            panic!(
+                "Failed to load provided certificates \"{}\" or key \"{}\".",
+                self.cert_path, self.key_path
+            )
+        };
 
+        // TODO - Add support for client auth & custom CA support
         let mut config =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {}", e)
+                    format!("Failed to create server listener config: {e}")
                 })
                 .unwrap();
 
@@ -92,14 +100,10 @@ impl TlsSettings {
         Self: Sized,
     {
         // TODO: verify if/how callback in handshake can be done using Rustls
-        Err(Error::create(
+        Error::e_explain(
             InternalError,
-            ErrorSource::Internal,
-            Some(ImmutStr::from(
-                "Certificate callbacks are not supported with feature \"rustls\".",
-            )),
-            None,
-        ))
+            "Certificate callbacks are not supported with feature \"rustls\".",
+        )
     }
 }
 

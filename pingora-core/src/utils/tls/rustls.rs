@@ -12,26 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::protocols::tls::CertWrapper;
+use ouroboros::self_referencing;
 use pingora_error::Result;
+use pingora_rustls::CertificateDer;
 use std::hash::{Hash, Hasher};
-use x509_parser::prelude::FromDer;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
-pub fn get_organization_serial(cert: &[u8]) -> (Option<String>, String) {
-    let serial = get_serial(cert).expect("Failed to get serial for certificate.");
-    (get_organization(cert), serial)
+/// Get the organization and serial number associated with the given certificate
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_organization_serial(x509cert: &WrappedX509) -> Result<(Option<String>, String)> {
+    let serial = get_serial(x509cert)?;
+    Ok((get_organization(x509cert), serial))
 }
 
-pub fn get_serial(cert: &[u8]) -> Result<String> {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
-    Ok(x509cert.raw_serial_as_string())
+fn get_organization_serial_x509(
+    x509cert: &X509Certificate<'_>,
+) -> Result<(Option<String>, String)> {
+    let serial = x509cert.raw_serial_as_string();
+    Ok((get_organization_x509(x509cert), serial))
+}
+
+/// Get the serial number associated with the given certificate
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_serial(x509cert: &WrappedX509) -> Result<String> {
+    Ok(x509cert.borrow_cert().raw_serial_as_string())
 }
 
 /// Return the organization associated with the X509 certificate.
-pub fn get_organization(cert: &[u8]) -> Option<String> {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_organization(x509cert: &WrappedX509) -> Option<String> {
+    get_organization_x509(x509cert.borrow_cert())
+}
+
+/// Return the organization associated with the X509 certificate.
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_organization_x509(x509cert: &X509Certificate<'_>) -> Option<String> {
     x509cert
         .subject
         .iter_organization()
@@ -40,16 +55,20 @@ pub fn get_organization(cert: &[u8]) -> Option<String> {
         .reduce(|cur, next| cur + &next)
 }
 
-/// Return the organization unit associated with the X509 certificate.
-pub fn get_organization_unit(cert: &CertWrapper) -> Option<String> {
-    get_organization_unit_bytes(&cert.0)
+/// Return the organization associated with the X509 certificate (as bytes).
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_organization_serial_bytes(cert: &[u8]) -> Result<(Option<String>, String)> {
+    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
+        .expect("Failed to parse certificate from DER format.");
+
+    get_organization_serial_x509(&x509cert)
 }
 
 /// Return the organization unit associated with the X509 certificate.
-pub fn get_organization_unit_bytes(cert: &[u8]) -> Option<String> {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_organization_unit(x509cert: &WrappedX509) -> Option<String> {
     x509cert
+        .borrow_cert()
         .subject
         .iter_organizational_unit()
         .filter_map(|a| a.as_str().ok())
@@ -57,10 +76,11 @@ pub fn get_organization_unit_bytes(cert: &[u8]) -> Option<String> {
         .reduce(|cur, next| cur + &next)
 }
 
-pub fn get_common_name(cert: &[u8]) -> Option<String> {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
+/// Get a combination of the common names for the given certificate
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_common_name(x509cert: &WrappedX509) -> Option<String> {
     x509cert
+        .borrow_cert()
         .subject
         .iter_common_name()
         .filter_map(|a| a.as_str().ok())
@@ -68,20 +88,49 @@ pub fn get_common_name(cert: &[u8]) -> Option<String> {
         .reduce(|cur, next| cur + &next)
 }
 
-/// Return the organization unit associated with the X509 certificate.
-pub fn get_not_after(cert: &[u8]) -> String {
-    let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(cert)
-        .expect("Failed to parse certificate from DER format.");
-    x509cert.validity.not_after.to_string()
+/// Get the `not_after` field for the valid time period for the given cert
+/// see https://en.wikipedia.org/wiki/X.509#Structure_of_a_certificate
+pub fn get_not_after(x509cert: &WrappedX509) -> String {
+    x509cert.borrow_cert().validity.not_after.to_string()
 }
 
 /// This type contains a list of one or more certificates and an associated private key. The leaf
-/// certificate should always be first. The certificates and keys are stored in Vec<u8> DER encoded
-/// form for usage within OpenSSL/BoringSSL & RusTLS.
-#[derive(Clone)]
+/// certificate should always be first.
 pub struct CertKey {
-    certificates: Vec<Vec<u8>>,
     key: Vec<u8>,
+    certificates: Vec<WrappedX509>,
+}
+
+#[self_referencing]
+#[derive(Debug)]
+pub struct WrappedX509 {
+    raw_cert: Vec<u8>,
+
+    #[borrows(raw_cert)]
+    #[covariant]
+    cert: X509Certificate<'this>,
+}
+
+fn parse_x509<C>(raw_cert: &C) -> X509Certificate<'_>
+where
+    C: AsRef<[u8]>,
+{
+    X509Certificate::from_der(raw_cert.as_ref())
+        .expect("Failed to parse certificate from DER format.")
+        .1
+}
+
+impl Clone for CertKey {
+    fn clone(&self) -> Self {
+        CertKey {
+            key: self.key.clone(),
+            certificates: self
+                .certificates
+                .iter()
+                .map(|wrapper| WrappedX509::new(wrapper.borrow_raw_cert().clone(), parse_x509))
+                .collect::<Vec<_>>(),
+        }
+    }
 }
 
 impl CertKey {
@@ -92,12 +141,18 @@ impl CertKey {
             "expected a non-empty vector of certificates in CertKey::new"
         );
 
-        CertKey { certificates, key }
+        CertKey {
+            key,
+            certificates: certificates
+                .into_iter()
+                .map(|raw_cert| WrappedX509::new(raw_cert, parse_x509))
+                .collect::<Vec<_>>(),
+        }
     }
 
     /// Peek at the leaf certificate.
-    pub fn leaf(&self) -> &Vec<u8> {
-        // This is safe due to the assertion above.
+    pub fn leaf(&self) -> &WrappedX509 {
+        // This is safe due to the assertion in creation of a `CertKey`
         &self.certificates[0]
     }
 
@@ -107,7 +162,7 @@ impl CertKey {
     }
 
     /// Return a slice of intermediate certificates. An empty slice means there are none.
-    pub fn intermediates(&self) -> Vec<&Vec<u8>> {
+    pub fn intermediates(&self) -> Vec<&WrappedX509> {
         self.certificates.iter().skip(1).collect()
     }
 
@@ -119,6 +174,12 @@ impl CertKey {
     /// Return the serial from the leaf certificate.
     pub fn serial(&self) -> String {
         get_serial(self.leaf()).unwrap()
+    }
+}
+
+impl WrappedX509 {
+    pub fn not_after(&self) -> String {
+        self.borrow_cert().validity.not_after.to_string()
     }
 }
 
@@ -137,7 +198,7 @@ impl std::fmt::Display for CertKey {
         if let Some(cn) = get_common_name(leaf) {
             // Write CN if it exists
             write!(f, "CN: {cn},")?;
-        } else if let Some(org_unit) = get_organization_unit_bytes(leaf) {
+        } else if let Some(org_unit) = get_organization_unit(leaf) {
             // CA cert might not have CN, so print its unit name instead
             write!(f, "Org Unit: {org_unit},")?;
         }
@@ -153,5 +214,11 @@ impl Hash for CertKey {
                 serial.hash(state)
             }
         }
+    }
+}
+
+impl<'a> From<&'a WrappedX509> for CertificateDer<'static> {
+    fn from(value: &'a WrappedX509) -> Self {
+        CertificateDer::from(value.borrow_raw_cert().as_slice().to_owned())
     }
 }

@@ -21,8 +21,8 @@ use pingora_error::{
     OrErr, Result,
 };
 use pingora_rustls::{
-    load_ca_file_into_store, load_certs_key_file, load_platform_certs_incl_env_into_store, version,
-    CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
+    load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
+    version, CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
     TlsConnector as RusTlsConnector,
 };
 
@@ -37,18 +37,21 @@ pub struct Connector {
 }
 
 impl Connector {
+    /// Create a new connector based on the optional configurations. If no
+    /// configurations are provided, no customized certificates or keys will be
+    /// used
     pub fn new(config_opt: Option<ConnectorOptions>) -> Self {
-        TlsConnector::build_connector(config_opt)
+        TlsConnector::build_connector(config_opt).unwrap()
     }
 }
 
 pub(crate) struct TlsConnector {
-    config: RusTlsClientConfig,
-    ca_certs: RootCertStore,
+    config: Arc<RusTlsClientConfig>,
+    ca_certs: Arc<RootCertStore>,
 }
 
 impl TlsConnector {
-    pub(crate) fn build_connector(options: Option<ConnectorOptions>) -> Connector
+    pub(crate) fn build_connector(options: Option<ConnectorOptions>) -> Result<Connector>
     where
         Self: Sized,
     {
@@ -65,16 +68,16 @@ impl TlsConnector {
 
             if let Some(conf) = options.as_ref() {
                 if let Some(ca_file_path) = conf.ca_file.as_ref() {
-                    load_ca_file_into_store(ca_file_path, &mut ca_certs);
+                    load_ca_file_into_store(ca_file_path, &mut ca_certs)?;
                 } else {
-                    load_platform_certs_incl_env_into_store(&mut ca_certs);
+                    load_platform_certs_incl_env_into_store(&mut ca_certs)?;
                 }
                 if let Some((cert, key)) = conf.cert_key_file.as_ref() {
-                    certs_key = load_certs_key_file(cert, key);
+                    certs_key = load_certs_and_key_files(cert, key)?;
                 }
                 // TODO: support SSLKEYLOGFILE
             } else {
-                load_platform_certs_incl_env_into_store(&mut ca_certs);
+                load_platform_certs_incl_env_into_store(&mut ca_certs)?;
             }
 
             (ca_certs, certs_key)
@@ -92,19 +95,19 @@ impl TlsConnector {
                     Err(err) => {
                         // TODO: is there a viable alternative to the panic?
                         // falling back to no client auth... does not seem to be reasonable.
-                        panic!(
-                            "{}",
-                            format!("Failed to configure client auth cert/key. Error: {}", err)
-                        );
+                        panic!("Failed to configure client auth cert/key. Error: {}", err);
                     }
                 }
             }
             None => builder.with_no_client_auth(),
         };
 
-        Connector {
-            ctx: Arc::new(TlsConnector { config, ca_certs }),
-        }
+        Ok(Connector {
+            ctx: Arc::new(TlsConnector {
+                config: Arc::new(config),
+                ca_certs: Arc::new(ca_certs),
+            }),
+        })
     }
 }
 
@@ -118,34 +121,30 @@ where
     T: IO,
     P: Peer + Send + Sync,
 {
-    let mut config = tls_ctx.config.clone();
+    let config = &tls_ctx.config;
 
     // TODO: setup CA/verify cert store from peer
-    // looks like the fields are always None
-    // peer.get_ca()
-
+    // peer.get_ca() returns None by default. It must be replaced by the
+    // implementation of `peer`
     let key_pair = peer.get_client_cert_key();
-    let updated_config: Option<RusTlsClientConfig> = match key_pair {
+    let mut updated_config_opt: Option<RusTlsClientConfig> = match key_pair {
         None => None,
         Some(key_arc) => {
             debug!("setting client cert and key");
 
             let mut cert_chain = vec![];
             debug!("adding leaf certificate to mTLS cert chain");
-            cert_chain.push(key_arc.leaf().to_owned());
+            cert_chain.push(key_arc.leaf());
 
             debug!("adding intermediate certificates to mTLS cert chain");
             key_arc
                 .intermediates()
                 .to_owned()
                 .iter()
-                .map(|i| i.to_vec())
+                .copied()
                 .for_each(|i| cert_chain.push(i));
 
-            let certs: Vec<CertificateDer> = cert_chain
-                .into_iter()
-                .map(|c| c.as_slice().to_owned().into())
-                .collect();
+            let certs: Vec<CertificateDer> = cert_chain.into_iter().map(|c| c.into()).collect();
             let private_key: PrivateKeyDer =
                 key_arc.key().as_slice().to_owned().try_into().unwrap();
 
@@ -153,60 +152,49 @@ where
                 &version::TLS12,
                 &version::TLS13,
             ])
-            .with_root_certificates(tls_ctx.ca_certs.clone());
+            .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
+            debug!("added root ca certificates");
 
-            let updated_config = builder
-                .with_client_auth_cert(certs, private_key)
-                .explain_err(InvalidCert, |e| {
-                    format!(
-                        "Failed to use peer cert/key to update Rustls config: {:?}",
-                        e
-                    )
-                })?;
+            let updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
+                InvalidCert,
+                "Failed to use peer cert/key to update Rustls config",
+            )?;
             Some(updated_config)
         }
     };
 
     if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
-        config.alpn_protocols = alpn.to_wire_protocols();
+        let alpn_protocols = alpn.to_wire_protocols();
+        if let Some(updated_config) = updated_config_opt.as_mut() {
+            updated_config.alpn_protocols = alpn_protocols;
+        } else {
+            let mut updated_config = RusTlsClientConfig::clone(config);
+            updated_config.alpn_protocols = alpn_protocols;
+            updated_config_opt = Some(updated_config);
+        }
     }
 
     // TODO: curve setup from peer
     // - second key share from peer, currently only used in boringssl with PQ features
 
-    let tls_conn = if let Some(cfg) = updated_config {
+    let tls_conn = if let Some(cfg) = updated_config_opt {
         RusTlsConnector::from(Arc::new(cfg))
     } else {
-        RusTlsConnector::from(Arc::new(config))
+        RusTlsConnector::from(Arc::clone(config))
     };
 
-    // TODO: for consistent behaviour between TLS providers some additions are required
+    // TODO: for consistent behavior between TLS providers some additions are required
     // - allowing to disable verification
-    // - the validation/replace logic would need adjustments to match the boringssl/openssl behaviour
-    //   implementing a custom certificate_verifier could be used to achieve matching behaviour
+    // - the validation/replace logic would need adjustments to match the boringssl/openssl behavior
+    //   implementing a custom certificate_verifier could be used to achieve matching behavior
     //let d_conf = config.dangerous();
     //d_conf.set_certificate_verifier(...);
 
     let mut domain = peer.sni().to_string();
-    if peer.sni().is_empty() {
-        // use ip in case SNI is not present
-        // TODO: disable validation
-        domain = peer.address().as_inet().unwrap().ip().to_string()
-    }
-
     if peer.verify_cert() && peer.verify_hostname() {
         // TODO: streamline logic with replacing first underscore within TLS implementations
         if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
             domain = sni_s;
-        }
-        if let Some(alt_cn) = peer.alternative_cn() {
-            if !alt_cn.is_empty() {
-                domain = alt_cn.to_string();
-                // TODO: streamline logic with replacing first underscore within TLS implementations
-                if let Some(alt_cn_s) = replace_leftmost_underscore(alt_cn) {
-                    domain = alt_cn_s;
-                }
-            }
         }
     }
 
