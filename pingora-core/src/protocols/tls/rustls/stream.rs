@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult};
+use std::io::Result as IoResult;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,11 +21,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{tls::SslDigest, TimingDigest};
+use crate::protocols::{tls::SslDigest, Peek, TimingDigest};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
 };
-use crate::utils::tls::get_organization_serial;
+use crate::utils::tls::get_organization_serial_bytes;
 use pingora_error::ErrorType::{AcceptError, ConnectError, InternalError, TLSHandshakeFailure};
 use pingora_error::{Error, ImmutStr, OrErr, Result};
 use pingora_rustls::TlsStream as RusTlsStream;
@@ -58,12 +58,9 @@ where
     /// Using RustTLS the stream is only returned after the handshake.
     /// The caller does therefor not need to perform [`Self::connect()`].
     pub async fn from_connector(connector: &TlsConnector, domain: &str, stream: T) -> Result<Self> {
-        let server = ServerName::try_from(domain)
-            .map_err(|e| IoError::new(IoErrorKind::InvalidInput, e))
-            .explain_err(InternalError, |e| {
-                format!("failed to parse domain: {}, error: {}", domain, e)
-            })?
-            .to_owned();
+        let server = ServerName::try_from(domain).or_err_with(InternalError, || {
+            format!("Invalid Input: Failed to parse domain: {domain}")
+        })?;
 
         let tls = InnerStream::from_connector(connector, server, stream)
             .await
@@ -243,11 +240,11 @@ impl<T> Ssl for TlsStream<T> {
     }
 }
 
+/// Create a new TLS connection from the given `stream`
+///
+/// The caller needs to perform [`Self::connect()`] or [`Self::accept()`] to perform TLS
+/// handshake after.
 impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
-    /// Create a new TLS connection from the given `stream`
-    ///
-    /// The caller needs to perform [`Self::connect()`] or [`Self::accept()`] to perform TLS
-    /// handshake after.
     pub(crate) async fn from_connector(
         connector: &TlsConnector,
         server: ServerName<'_>,
@@ -277,19 +274,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     pub(crate) async fn connect(&mut self) -> Result<()> {
         let connect = &mut (*self.connect);
 
-        if let Some(ref mut connect) = connect {
+        if let Some(connect) = connect.take() {
             let stream = connect
                 .await
-                .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
+                .or_err(TLSHandshakeFailure, "tls connect error")?;
             self.stream = Some(RusTlsStream::Client(stream));
-            self.connect = None.into();
 
             Ok(())
         } else {
-            Err(Error::explain(
+            Error::e_explain(
                 ConnectError,
                 ImmutStr::from("TLS connect not available to perform handshake."),
-            ))
+            )
         }
     }
 
@@ -298,12 +294,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     pub(crate) async fn accept(&mut self) -> Result<()> {
         let accept = &mut (*self.accept);
 
-        if let Some(ref mut accept) = accept {
+        if let Some(ref mut accept) = accept.take() {
             let stream = accept
                 .await
                 .explain_err(TLSHandshakeFailure, |e| format!("tls connect error: {e}"))?;
             self.stream = Some(RusTlsStream::Server(stream));
-            self.connect = None.into();
 
             Ok(())
         } else {
@@ -375,34 +370,27 @@ impl SslDigest {
         let cipher_suite = session.negotiated_cipher_suite();
         let peer_certificates = session.peer_certificates();
 
-        let cipher = match cipher_suite {
-            Some(suite) => suite.suite().as_str().unwrap_or_default(),
-            None => "",
-        };
+        let cipher = cipher_suite
+            .and_then(|suite| suite.suite().as_str())
+            .unwrap_or_default();
 
-        let version = match protocol {
-            Some(proto) => proto.as_str().unwrap_or_default(),
-            None => "",
-        };
+        let version = protocol
+            .and_then(|proto| proto.as_str())
+            .unwrap_or_default();
 
-        let cert_digest = match peer_certificates {
-            Some(certs) => match certs.first() {
-                Some(cert) => hash_certificate(cert.clone()),
-                None => vec![],
-            },
-            None => vec![],
-        };
+        let cert_digest = peer_certificates
+            .and_then(|certs| certs.first())
+            .map(|cert| hash_certificate(cert))
+            .unwrap_or_default();
 
-        let (organization, serial_number) = match peer_certificates {
-            Some(certs) => match certs.first() {
-                Some(cert) => {
-                    let (organization, serial) = get_organization_serial(cert.as_bytes());
-                    (organization, Some(serial))
-                }
-                None => (None, None),
-            },
-            None => (None, None),
-        };
+        let (organization, serial_number) = peer_certificates
+            .and_then(|certs| certs.first())
+            .map(|cert| get_organization_serial_bytes(cert.as_bytes()))
+            .transpose()
+            .ok()
+            .flatten()
+            .map(|(organization, serial)| (organization, Some(serial)))
+            .unwrap_or_default();
 
         SslDigest {
             cipher,
@@ -413,3 +401,5 @@ impl SslDigest {
         }
     }
 }
+
+impl<S> Peek for TlsStream<S> {}

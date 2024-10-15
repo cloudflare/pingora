@@ -66,11 +66,11 @@ fn load_key(path: &str) -> PKey<Private> {
 #[cfg(feature = "rustls")]
 fn load_cert(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
-    load_pem_file_ca(&path)
+    load_pem_file_ca(&path).unwrap()
 }
 
 #[cfg(feature = "rustls")]
 fn load_key(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
-    load_pem_file_private_key(&path)
+    load_pem_file_private_key(&path).unwrap()
 }

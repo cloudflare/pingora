@@ -566,7 +566,7 @@ async fn test_tls_underscore_non_sub_sni_verify_host() {
     assert_eq!(headers[header::CONNECTION], "close");
 }
 
-#[cfg(feature = "any_tls")]
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_alt_verify_host() {
     init();
@@ -585,7 +585,7 @@ async fn test_tls_alt_verify_host() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-#[cfg(feature = "any_tls")]
+#[cfg(feature = "openssl_derived")]
 #[tokio::test]
 async fn test_tls_underscore_sub_alt_verify_host() {
     init();

@@ -17,20 +17,9 @@ pub mod server;
 mod stream;
 
 pub use stream::*;
-use x509_parser::prelude::FromDer;
 
-pub type CaType = [Box<CertWrapper>];
+use crate::utils::tls::WrappedX509;
 
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct CertWrapper(pub [u8]);
-
-impl CertWrapper {
-    pub fn not_after(&self) -> String {
-        let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(&self.0)
-            .expect("Failed to parse certificate from DER format.");
-        x509cert.validity.not_after.to_string()
-    }
-}
+pub type CaType = [WrappedX509];
 
 pub struct TlsRef;

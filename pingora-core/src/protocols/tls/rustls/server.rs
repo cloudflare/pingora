@@ -80,10 +80,9 @@ pub async fn handshake_with_callback<S: IO>(
             .resume_accept()
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
-        Ok(tls_stream)
-    } else {
-        Ok(tls_stream)
     }
+
+    Ok(tls_stream)
 }
 
 #[async_trait]
