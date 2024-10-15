@@ -23,6 +23,12 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
+#[cfg(feature = "rustls")]
+mod rustls;
+
+#[cfg(feature = "rustls")]
+pub use rustls::*;
+
 #[cfg(not(feature = "any_tls"))]
 pub mod noop_tls;
 

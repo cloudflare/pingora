@@ -18,6 +18,12 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
+#[cfg(feature = "rustls")]
+mod rustls;
+
+#[cfg(feature = "rustls")]
+pub use rustls::*;
+
 ///    OpenSSL considers underscores in hostnames non-compliant.
 ///    We replace the underscore in the leftmost label as we must support these
 ///    hostnames for wildcard matches and we have not patched OpenSSL.
