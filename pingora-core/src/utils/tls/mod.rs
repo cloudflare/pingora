@@ -17,3 +17,9 @@ mod boringssl_openssl;
 
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
+
+#[cfg(feature = "rustls")]
+mod rustls;
+
+#[cfg(feature = "rustls")]
+pub use rustls::*;

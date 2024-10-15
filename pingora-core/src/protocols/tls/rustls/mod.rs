@@ -12,14 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "openssl_derived")]
-mod boringssl_openssl;
+pub mod client;
+pub mod server;
+mod stream;
 
-#[cfg(feature = "openssl_derived")]
-pub use boringssl_openssl::*;
+pub use stream::*;
+use x509_parser::prelude::FromDer;
 
-#[cfg(feature = "rustls")]
-mod rustls;
+pub type CaType = [Box<CertWrapper>];
 
-#[cfg(feature = "rustls")]
-pub use rustls::*;
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct CertWrapper(pub [u8]);
+
+impl CertWrapper {
+    pub fn not_after(&self) -> String {
+        let (_, x509cert) = x509_parser::certificate::X509Certificate::from_der(&self.0)
+            .expect("Failed to parse certificate from DER format.");
+        x509cert.validity.not_after.to_string()
+    }
+}
+
+pub struct TlsRef;
