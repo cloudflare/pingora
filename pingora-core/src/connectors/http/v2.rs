@@ -48,8 +48,6 @@ pub(crate) struct ConnectionRefInner {
     closed: watch::Receiver<bool>,
     ping_timeout_occurred: Arc<AtomicBool>,
     id: UniqueIDType,
-    // max concurrent streams this connection is allowed to create
-    max_streams: usize,
     // how many concurrent streams already active
     current_streams: AtomicUsize,
     // The connection is gracefully shutting down, no more stream is allowed
@@ -61,6 +59,14 @@ pub(crate) struct ConnectionRefInner {
     pub(crate) release_lock: Arc<Mutex<()>>,
 }
 
+impl ConnectionRefInner {
+    // The max streams would be updated by Settings frame after the http2 connection is set up.
+    // The instant value is stored in h2::SendRequest.
+    fn get_max_streams(&self) -> usize {
+        self.connection_stub.0.current_max_send_streams()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionRef(Arc<ConnectionRefInner>);
 
@@ -70,7 +76,6 @@ impl ConnectionRef {
         closed: watch::Receiver<bool>,
         ping_timeout_occurred: Arc<AtomicBool>,
         id: UniqueIDType,
-        max_streams: usize,
         digest: Digest,
     ) -> Self {
         ConnectionRef(Arc::new(ConnectionRefInner {
@@ -78,7 +83,6 @@ impl ConnectionRef {
             closed,
             ping_timeout_occurred,
             id,
-            max_streams,
             current_streams: AtomicUsize::new(0),
             shutting_down: false.into(),
             digest,
@@ -87,7 +91,7 @@ impl ConnectionRef {
     }
     pub fn more_streams_allowed(&self) -> bool {
         !self.is_shutting_down()
-            && self.0.max_streams > self.0.current_streams.load(Ordering::Relaxed)
+            && self.0.get_max_streams() > self.0.current_streams.load(Ordering::Relaxed)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -129,7 +133,7 @@ impl ConnectionRef {
         // Atomically check if the current_stream is over the limit
         // load(), compare and then fetch_add() cannot guarantee the same
         let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
-        if current_streams >= self.0.max_streams {
+        if current_streams >= self.0.get_max_streams() {
             // already over the limit, reset the counter to the previous value
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
@@ -449,7 +453,6 @@ async fn handshake(
         closed_rx,
         ping_timeout_occurred,
         id,
-        max_allowed_streams,
         digest,
     ))
 }
