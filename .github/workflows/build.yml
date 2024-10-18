@@ -6,7 +6,7 @@ jobs:
   pingora:
     strategy:
       matrix:
-        toolchain: [nightly, 1.72, 1.81.0]
+        toolchain: [nightly, 1.72, 1.82.0]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -46,8 +46,8 @@ jobs:
 
       - name: Run cargo clippy
         run: |
-          [[ ${{ matrix.toolchain }} != 1.81.0 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
+          [[ ${{ matrix.toolchain }} != 1.82.0 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
 
       - name: Run cargo audit
         run: |
-          [[ ${{ matrix.toolchain }} != 1.81.0 ]] || (cargo install cargo-audit && cargo audit)
+          [[ ${{ matrix.toolchain }} != 1.82.0 ]] || (cargo install cargo-audit && cargo audit)
