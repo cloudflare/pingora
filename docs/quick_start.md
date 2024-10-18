@@ -19,7 +19,7 @@ cargo new load_balancer
 In your project's `cargo.toml` file add the following to your dependencies
 ```
 async-trait="0.1"
-pingora = { version = "0.1", features = [ "lb" ] }
+pingora = { version = "0.3", features = [ "lb" ] }
 ```
 
 ### Create a pingora server
