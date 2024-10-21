@@ -45,7 +45,7 @@ impl Connector {
     }
 }
 
-pub(crate) struct TlsConnector {
+pub struct TlsConnector {
     config: Arc<RusTlsClientConfig>,
     ca_certs: Arc<RootCertStore>,
 }
