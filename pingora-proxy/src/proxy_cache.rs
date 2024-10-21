@@ -442,7 +442,7 @@ impl<SV> HttpProxy<SV> {
                             // the request to fail when the chunked response exceeds the maximum
                             // file size again.
                             if session.cache.max_file_size_bytes().is_some()
-                                && !header.headers.contains_key(header::CONTENT_LENGTH)
+                                && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
                                 session.cache.disable(NoCacheReason::ResponseTooLarge);
                                 return Ok(());
@@ -450,7 +450,7 @@ impl<SV> HttpProxy<SV> {
 
                             session.cache.response_became_cacheable();
 
-                            if header.status == StatusCode::OK {
+                            if meta.response_header().status == StatusCode::OK {
                                 self.inner.cache_miss(session, ctx);
                             } else {
                                 // we've allowed caching on the next request,
@@ -467,7 +467,7 @@ impl<SV> HttpProxy<SV> {
                         // on the cache, validate that the response does not exceed the maximum asset size.
                         if session.cache.enabled() {
                             if let Some(max_file_size) = session.cache.max_file_size_bytes() {
-                                let content_length_hdr = header.headers.get(header::CONTENT_LENGTH);
+                                let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
                                 if let Some(content_length) =
                                     header_value_content_length(content_length_hdr)
                                 {

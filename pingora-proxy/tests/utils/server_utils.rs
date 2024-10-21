@@ -463,7 +463,12 @@ impl ProxyHttp for ExampleProxyCache {
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
         let cc = CacheControl::from_resp_headers(resp);
-        Ok(resp_cacheable(cc.as_ref(), resp, false, &CACHE_DEFAULT))
+        Ok(resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            false,
+            &CACHE_DEFAULT,
+        ))
     }
 
     fn upstream_response_filter(

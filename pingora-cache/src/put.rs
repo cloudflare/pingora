@@ -24,8 +24,8 @@ use pingora_core::protocols::http::{
 /// The interface to define cache put behavior
 pub trait CachePut {
     /// Return whether to cache the asset according to the given response header.
-    fn cacheable(&self, response: &ResponseHeader) -> RespCacheable {
-        let cc = cache_control::CacheControl::from_resp_headers(response);
+    fn cacheable(&self, response: ResponseHeader) -> RespCacheable {
+        let cc = cache_control::CacheControl::from_resp_headers(&response);
         filters::resp_cacheable(cc.as_ref(), response, false, Self::cache_defaults())
     }
 
@@ -130,10 +130,10 @@ impl<C: CachePut> CachePutCtx<C> {
         let tasks = self.parser.inject_data(data)?;
         for task in tasks {
             match task {
-                HttpTask::Header(header, _eos) => match self.cache_put.cacheable(&header) {
+                HttpTask::Header(header, _eos) => match self.cache_put.cacheable(*header) {
                     RespCacheable::Cacheable(meta) => {
                         if let Some(max_file_size_bytes) = self.max_file_size_bytes {
-                            let content_length_hdr = header.headers.get(header::CONTENT_LENGTH);
+                            let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
                             if let Some(content_length) =
                                 header_value_content_length(content_length_hdr)
                             {
