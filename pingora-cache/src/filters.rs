@@ -35,7 +35,7 @@ pub fn request_cacheable(req_header: &ReqHeader) -> bool {
 /// argument so that caller has the flexibility to choose to use, change or ignore it.
 pub fn resp_cacheable(
     cache_control: Option<&CacheControl>,
-    resp_header: &ResponseHeader,
+    mut resp_header: ResponseHeader,
     authorization_present: bool,
     defaults: &CacheMetaDefaults,
 ) -> RespCacheable {
@@ -43,7 +43,7 @@ pub fn resp_cacheable(
     let expire_time = calculate_fresh_until(
         now,
         cache_control,
-        resp_header,
+        &resp_header,
         authorization_present,
         defaults,
     );
@@ -51,16 +51,15 @@ pub fn resp_cacheable(
         let (stale_while_revalidate_sec, stale_if_error_sec) =
             calculate_serve_stale_sec(cache_control, defaults);
 
-        let mut cloned_header = resp_header.clone();
         if let Some(cc) = cache_control {
-            cc.strip_private_headers(&mut cloned_header);
+            cc.strip_private_headers(&mut resp_header);
         }
         return Cacheable(CacheMeta::new(
             fresh_until,
             now,
             stale_while_revalidate_sec,
             stale_if_error_sec,
-            cloned_header,
+            resp_header,
         ));
     }
     Uncacheable(NoCacheReason::OriginNotCache)
@@ -237,12 +236,12 @@ mod tests {
     }
 
     fn resp_cacheable_wrapper(
-        resp: &ResponseHeader,
+        resp: ResponseHeader,
         defaults: &CacheMetaDefaults,
         authorization_present: bool,
     ) -> Option<CacheMeta> {
         if let Cacheable(meta) = resp_cacheable(
-            CacheControl::from_resp_headers(resp).as_ref(),
+            CacheControl::from_resp_headers(&resp).as_ref(),
             resp,
             authorization_present,
             defaults,
@@ -256,7 +255,7 @@ mod tests {
     #[test]
     fn test_resp_cacheable() {
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=12345")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=12345")]),
             &DEFAULTS,
             false,
         );
@@ -278,14 +277,14 @@ mod tests {
     #[test]
     fn test_resp_uncacheable_directives() {
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "private, max-age=12345")]),
+            build_response(200, &[(CACHE_CONTROL, "private, max-age=12345")]),
             &DEFAULTS,
             false,
         );
         assert!(meta.is_none());
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "no-store, max-age=12345")]),
+            build_response(200, &[(CACHE_CONTROL, "no-store, max-age=12345")]),
             &DEFAULTS,
             false,
         );
@@ -294,32 +293,32 @@ mod tests {
 
     #[test]
     fn test_resp_cache_authorization() {
-        let meta = resp_cacheable_wrapper(&build_response(200, &[]), &DEFAULTS, true);
+        let meta = resp_cacheable_wrapper(build_response(200, &[]), &DEFAULTS, true);
         assert!(meta.is_none());
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
             &DEFAULTS,
             true,
         );
         assert!(meta.is_none());
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "s-maxage=10")]),
+            build_response(200, &[(CACHE_CONTROL, "s-maxage=10")]),
             &DEFAULTS,
             true,
         );
         assert!(meta.unwrap().is_fresh(SystemTime::now()));
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "public, max-age=10")]),
+            build_response(200, &[(CACHE_CONTROL, "public, max-age=10")]),
             &DEFAULTS,
             true,
         );
         assert!(meta.unwrap().is_fresh(SystemTime::now()));
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "must-revalidate")]),
+            build_response(200, &[(CACHE_CONTROL, "must-revalidate")]),
             &DEFAULTS,
             true,
         );
@@ -329,7 +328,7 @@ mod tests {
     #[test]
     fn test_resp_zero_max_age() {
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=0, public")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=0, public")]),
             &DEFAULTS,
             false,
         );
@@ -346,7 +345,7 @@ mod tests {
 
         // future expires is cacheable
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(EXPIRES, &fmt_http_date(five_sec_time))]),
+            build_response(200, &[(EXPIRES, &fmt_http_date(five_sec_time))]),
             &DEFAULTS,
             false,
         );
@@ -361,7 +360,7 @@ mod tests {
 
         // even on default uncacheable statuses
         let meta = resp_cacheable_wrapper(
-            &build_response(206, &[(EXPIRES, &fmt_http_date(five_sec_time))]),
+            build_response(206, &[(EXPIRES, &fmt_http_date(five_sec_time))]),
             &DEFAULTS,
             false,
         );
@@ -372,7 +371,7 @@ mod tests {
     fn test_resp_past_expires() {
         // cacheable, but expired
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(EXPIRES, "Fri, 15 May 2015 15:34:21 GMT")]),
+            build_response(200, &[(EXPIRES, "Fri, 15 May 2015 15:34:21 GMT")]),
             &BYPASS_CACHE_DEFAULTS,
             false,
         );
@@ -387,21 +386,21 @@ mod tests {
         // invalid cases, according to parser
         // (but should be stale according to RFC)
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(EXPIRES, "Mon, 13 Feb 0002 12:00:00 GMT")]),
+            build_response(200, &[(EXPIRES, "Mon, 13 Feb 0002 12:00:00 GMT")]),
             &BYPASS_CACHE_DEFAULTS,
             false,
         );
         assert!(!meta.unwrap().is_fresh(SystemTime::now()));
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(EXPIRES, "Fri, 01 Dec 99999 16:00:00 GMT")]),
+            build_response(200, &[(EXPIRES, "Fri, 01 Dec 99999 16:00:00 GMT")]),
             &BYPASS_CACHE_DEFAULTS,
             false,
         );
         assert!(!meta.unwrap().is_fresh(SystemTime::now()));
 
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(EXPIRES, "0")]),
+            build_response(200, &[(EXPIRES, "0")]),
             &BYPASS_CACHE_DEFAULTS,
             false,
         );
@@ -419,7 +418,7 @@ mod tests {
 
         // multiple expires = uncacheable
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[
                     (EXPIRES, &fmt_http_date(five_sec_time)),
@@ -433,7 +432,7 @@ mod tests {
 
         // unless the default is cacheable
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[
                     (EXPIRES, &fmt_http_date(five_sec_time)),
@@ -453,7 +452,7 @@ mod tests {
             .unwrap();
         // cache-control takes precedence over expires
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[
                     (EXPIRES, &fmt_http_date(five_sec_time)),
@@ -470,7 +469,7 @@ mod tests {
     fn test_resp_stale_while_revalidate() {
         // respect defaults
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
             &DEFAULTS,
             false,
         );
@@ -485,7 +484,7 @@ mod tests {
 
         // override with stale-while-revalidate
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[(CACHE_CONTROL, "max-age=10, stale-while-revalidate=5")],
             ),
@@ -509,7 +508,7 @@ mod tests {
     fn test_resp_stale_if_error() {
         // respect defaults
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=10")]),
             &DEFAULTS,
             false,
         );
@@ -523,7 +522,7 @@ mod tests {
 
         // override with stale-if-error
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[(
                     CACHE_CONTROL,
@@ -548,7 +547,7 @@ mod tests {
 
         // never serve stale
         let meta = resp_cacheable_wrapper(
-            &build_response(200, &[(CACHE_CONTROL, "max-age=10, stale-if-error=0")]),
+            build_response(200, &[(CACHE_CONTROL, "max-age=10, stale-if-error=0")]),
             &DEFAULTS,
             false,
         );
@@ -564,7 +563,7 @@ mod tests {
     #[test]
     fn test_resp_status_cache_defaults() {
         // 200 response
-        let meta = resp_cacheable_wrapper(&build_response(200, &[]), &DEFAULTS, false);
+        let meta = resp_cacheable_wrapper(build_response(200, &[]), &DEFAULTS, false);
         assert!(meta.is_some());
 
         let meta = meta.unwrap();
@@ -580,7 +579,7 @@ mod tests {
         ));
 
         // 404 response, different ttl
-        let meta = resp_cacheable_wrapper(&build_response(404, &[]), &DEFAULTS, false);
+        let meta = resp_cacheable_wrapper(build_response(404, &[]), &DEFAULTS, false);
         assert!(meta.is_some());
 
         let meta = meta.unwrap();
@@ -596,12 +595,12 @@ mod tests {
         ));
 
         // 206 marked uncacheable (no cache TTL)
-        let meta = resp_cacheable_wrapper(&build_response(206, &[]), &DEFAULTS, false);
+        let meta = resp_cacheable_wrapper(build_response(206, &[]), &DEFAULTS, false);
         assert!(meta.is_none());
 
         // default uncacheable status with explicit Cache-Control is cacheable
         let meta = resp_cacheable_wrapper(
-            &build_response(206, &[(CACHE_CONTROL, "public, max-age=10")]),
+            build_response(206, &[(CACHE_CONTROL, "public, max-age=10")]),
             &DEFAULTS,
             false,
         );
@@ -620,7 +619,7 @@ mod tests {
         ));
 
         // 416 matches any status
-        let meta = resp_cacheable_wrapper(&build_response(416, &[]), &DEFAULTS, false);
+        let meta = resp_cacheable_wrapper(build_response(416, &[]), &DEFAULTS, false);
         assert!(meta.is_some());
 
         let meta = meta.unwrap();
@@ -636,7 +635,7 @@ mod tests {
     fn test_resp_cache_no_cache_fields() {
         // check #field-names are stripped from the cache header
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[
                     (SET_COOKIE, "my-cookie"),
@@ -652,7 +651,7 @@ mod tests {
         assert!(!meta.headers().contains_key("Something"));
 
         let meta = resp_cacheable_wrapper(
-            &build_response(
+            build_response(
                 200,
                 &[
                     (SET_COOKIE, "my-cookie"),
