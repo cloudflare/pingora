@@ -153,6 +153,7 @@ impl<SV> HttpProxy<SV> {
                                 {
                                     // Put the write lock in the request
                                     session.cache.set_write_lock(write_lock);
+                                    session.cache.tag_as_subrequest();
                                     // and then let it go to upstream
                                     break None;
                                 }
