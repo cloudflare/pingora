@@ -1142,6 +1142,14 @@ impl HttpCache {
             predictor.mark_uncacheable(self.cache_key(), reason);
         }
     }
+
+    /// Tag all spans as being part of a subrequest.
+    pub fn tag_as_subrequest(&mut self) {
+        self.inner_mut()
+            .traces
+            .cache_span
+            .set_tag(|| Tag::new("is_subrequest", true))
+    }
 }
 
 /// Set the header compression dictionary, which helps serialize http header.
