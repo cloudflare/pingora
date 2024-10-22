@@ -58,6 +58,7 @@ pub struct HttpCache {
     phase: CachePhase,
     // Box the rest so that a disabled HttpCache struct is small
     inner: Option<Box<HttpCacheInner>>,
+    digest: HttpCacheDigest,
 }
 
 /// This reflects the phase of HttpCache during the lifetime of a request
@@ -153,6 +154,29 @@ impl NoCacheReason {
     }
 }
 
+/// Information collected about the caching operation that will not be cleared
+#[derive(Debug, Default)]
+pub struct HttpCacheDigest {
+    pub lock_duration: Option<Duration>,
+    // time spent in cache lookup and reading the header
+    pub lookup_duration: Option<Duration>,
+}
+
+/// Convenience function to add a duration to an optional duration
+fn add_duration_to_opt(target_opt: &mut Option<Duration>, to_add: Duration) {
+    *target_opt = Some(target_opt.map_or(to_add, |existing| existing + to_add));
+}
+
+impl HttpCacheDigest {
+    fn add_lookup_duration(&mut self, extra_lookup_duration: Duration) {
+        add_duration_to_opt(&mut self.lookup_duration, extra_lookup_duration)
+    }
+
+    fn add_lock_duration(&mut self, extra_lock_duration: Duration) {
+        add_duration_to_opt(&mut self.lock_duration, extra_lock_duration)
+    }
+}
+
 /// Response cacheable decision
 ///
 ///
@@ -225,9 +249,6 @@ struct HttpCacheInner {
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
     pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
     pub cache_lock: Option<&'static CacheLock>,
-    pub lock_duration: Option<Duration>,
-    // time spent in cache lookup and reading the header
-    pub lookup_duration: Option<Duration>,
     pub traces: trace::CacheTraceCTX,
 }
 
@@ -239,6 +260,7 @@ impl HttpCache {
         HttpCache {
             phase: CachePhase::Disabled(NoCacheReason::NeverEnabled),
             inner: None,
+            digest: HttpCacheDigest::default(),
         }
     }
 
@@ -374,8 +396,6 @@ impl HttpCache {
                     predictor,
                     lock: None,
                     cache_lock,
-                    lock_duration: None,
-                    lookup_duration: None,
                     traces: CacheTraceCTX::new(),
                 }));
             }
@@ -934,18 +954,16 @@ impl HttpCache {
         match self.phase {
             // Stale is allowed here because stale-> cache_lock -> lookup again
             CachePhase::CacheKey | CachePhase::Stale => {
-                let inner = self.inner_mut();
+                let inner = self
+                    .inner
+                    .as_mut()
+                    .expect("Cache phase is checked and should have inner");
                 let mut span = inner.traces.child("lookup");
                 let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
                 let now = Instant::now();
                 let result = inner.storage.lookup(key, &span.handle()).await?;
-                let lookup_duration = now.elapsed();
                 // one request may have multiple lookups
-                inner.lookup_duration = Some(
-                    inner
-                        .lookup_duration
-                        .map_or(lookup_duration, |d| d + lookup_duration),
-                );
+                self.digest.add_lookup_duration(now.elapsed());
                 let result = result.and_then(|(meta, header)| {
                     if let Some(ts) = inner.valid_after {
                         if meta.created() < ts {
@@ -1067,13 +1085,8 @@ impl HttpCache {
         if let Some(Locked::Read(r)) = lock {
             let now = Instant::now();
             r.wait().await;
-            let lock_duration = now.elapsed();
             // it's possible for a request to be locked more than once
-            inner.lock_duration = Some(
-                inner
-                    .lock_duration
-                    .map_or(lock_duration, |d| d + lock_duration),
-            );
+            self.digest.add_lock_duration(now.elapsed());
             let status = r.lock_status();
             let tag_value: &'static str = status.into();
             span.set_tag(|| Tag::new("status", tag_value));
@@ -1086,14 +1099,12 @@ impl HttpCache {
 
     /// How long did this request wait behind the read lock
     pub fn lock_duration(&self) -> Option<Duration> {
-        // FIXME: this duration is lost when cache is disabled
-        self.inner.as_ref().and_then(|i| i.lock_duration)
+        self.digest.lock_duration
     }
 
     /// How long did this request spent on cache lookup and reading the header
     pub fn lookup_duration(&self) -> Option<Duration> {
-        // FIXME: this duration is lost when cache is disabled
-        self.inner.as_ref().and_then(|i| i.lookup_duration)
+        self.digest.lookup_duration
     }
 
     /// Delete the asset from the cache storage
