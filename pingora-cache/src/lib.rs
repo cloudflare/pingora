@@ -976,7 +976,8 @@ impl HttpCache {
     /// - return false if the current meta doesn't match the variance, need to cache_lookup() again
     pub fn cache_vary_lookup(&mut self, variance: HashBinary, meta: &CacheMeta) -> bool {
         match self.phase {
-            CachePhase::CacheKey => {
+            // Stale is allowed here because stale-> cache_lock -> lookup again
+            CachePhase::CacheKey | CachePhase::Stale => {
                 let inner = self.inner_mut();
                 // make sure that all variances found are fresher than this asset
                 // this is because when purging all the variance, only the primary slot is deleted
