@@ -424,6 +424,34 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
         self.queues.admit(key, data, weight, false, &self.buckets)
     }
 
+    /// Remove the given key from the cache if it exists
+    ///
+    /// Returns Some(T) if the key was found and removed, None otherwise
+    pub fn remove(&self, key: &K) -> Option<T> {
+        let key = self.random_status.hash_one(key);
+
+        // Get data and update weights
+        let result = self.buckets.get_map(&key, |bucket| {
+            let data = bucket.data.clone();
+            let weight = bucket.weight;
+
+            // Update weight based on queue location
+            if bucket.queue.is_main() {
+                self.queues.main_weight.fetch_sub(weight as usize, SeqCst);
+            } else {
+                self.queues.small_weight.fetch_sub(weight as usize, SeqCst);
+            }
+
+            data
+        });
+
+        // If we found and processed the item, remove it from buckets
+        if result.is_some() {
+            self.buckets.remove(&key);
+        }
+
+        result
+    }
     /// Always put the key value to the [TinyUfo]
     ///
     /// Return a list of [KV] of key and `T` that are evicted
@@ -727,5 +755,36 @@ mod tests {
         for k in remaining {
             assert_eq!(cache.peek_queue(k), Some(SMALL));
         }
+    }
+    #[test]
+    fn test_remove() {
+        let mut cache = TinyUfo::new(5, 5);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+
+        cache.put(1, 1, 1);
+        cache.put(2, 2, 2);
+        cache.put(3, 3, 2);
+
+        assert_eq!(cache.remove(&1), Some(1));
+        assert_eq!(cache.remove(&3), Some(3));
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&3), None);
+
+        // Verify empty keys get evicted when cache fills up
+        // Fill cache to trigger eviction
+        cache.put(5, 5, 2);
+        cache.put(6, 6, 2);
+        cache.put(7, 7, 2);
+
+        // The removed items (1, 3) should be naturally evicted now
+        // and new items should be in cache
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&3), None);
+        assert!(cache.get(&5).is_some() || cache.get(&6).is_some() || cache.get(&7).is_some());
+
+        // Test weights after eviction cycles
+        let total_weight =
+            cache.queues.small_weight.load(SeqCst) + cache.queues.main_weight.load(SeqCst);
+        assert!(total_weight <= 5); // Should not exceed limit
     }
 }
