@@ -22,6 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate Cargo.lock
+        # https://github.com/rustsec/audit-check/issues/27
+        run: cargo generate-lockfile
+
       - name: Audit Check
         # https://github.com/rustsec/audit-check/issues/2
         uses: rustsec/audit-check@master
