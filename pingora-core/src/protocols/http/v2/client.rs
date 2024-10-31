@@ -16,6 +16,7 @@
 // TODO: this module needs a refactor
 
 use bytes::Bytes;
+use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
@@ -194,10 +195,6 @@ impl Http2Session {
             return Ok(None);
         };
 
-        if body_reader.is_end_stream() {
-            return Ok(None);
-        }
-
         let fut = body_reader.data();
         let res = match self.read_timeout {
             Some(t) => timeout(t, fut)
@@ -232,6 +229,42 @@ impl Http2Session {
         self.response_body_reader
             .as_ref()
             .map_or(false, |reader| reader.is_end_stream())
+    }
+
+    /// Check whether stream finished with error.
+    /// Like `response_finished`, but also attempts to poll the h2 stream for errors that may have
+    /// caused the stream to terminate, and returns them as `H2Error`s.
+    pub fn check_response_end_or_error(&mut self) -> Result<bool> {
+        let Some(reader) = self.response_body_reader.as_mut() else {
+            // response is not even read
+            return Ok(false);
+        };
+
+        if !reader.is_end_stream() {
+            return Ok(false);
+        }
+
+        // https://github.com/hyperium/h2/issues/806
+        // The fundamental issue is that h2::RecvStream may return `is_end_stream` true
+        // when the stream was naturally closed via END_STREAM /OR/ if there was an error
+        // while reading data frames that forced the closure.
+        // The h2 API as-is makes it difficult to determine which situation is occurring.
+        //
+        // `poll_data` should be returning None after `is_end_stream`, if the stream
+        // is truly expecting no more data to be sent.
+        // https://docs.rs/h2/latest/h2/struct.RecvStream.html#method.is_end_stream
+        // So poll the data once to check this condition. If an error is returned, that indicates
+        // that the stream closed due to an error e.g. h2 protocol error.
+        match reader.data().now_or_never() {
+            Some(None) => Ok(true),
+            Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
+            Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),
+            None => {
+                // RecvStream data() should be ready to poll after the stream ends,
+                // this indicates an unexpected change in the h2 crate
+                panic!("data() not ready after end stream")
+            }
+        }
     }
 
     /// Read the optional trailer headers
