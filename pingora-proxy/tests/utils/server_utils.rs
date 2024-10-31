@@ -359,11 +359,18 @@ impl ProxyHttp for ExampleProxyCache {
             .headers
             .get("x-port")
             .map_or("8000", |v| v.to_str().unwrap());
-        let peer = Box::new(HttpPeer::new(
+
+        let mut peer = Box::new(HttpPeer::new(
             format!("127.0.0.1:{}", port),
             false,
             "".to_string(),
         ));
+
+        if session.get_header_bytes("x-h2") == b"true" {
+            // default is 1, 1
+            peer.options.set_http_version(2, 2);
+        }
+
         Ok(peer)
     }
 
