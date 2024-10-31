@@ -10,7 +10,7 @@ Pingora is battle tested as it has been serving more than 40 million Internet re
 ## Feature highlights
 * Async Rust: fast and reliable
 * HTTP 1/2 end to end proxy
-* TLS over OpenSSL or BoringSSL
+* TLS over OpenSSL, BoringSSL or rustls(experimental).
 * gRPC and websocket proxying
 * Graceful reload
 * Customizable load balancing and failover strategies
@@ -49,6 +49,8 @@ API docs are also available for all the crates.
 Linux is our tier 1 environment and main focus.
 
 We will try our best for most code to compile for Unix environments. This is for developers and users to have an easier time developing with Pingora in Unix-like environments like macOS (though some features might be missing)
+
+Windows support is preliminary by community's best effort only.
 
 Both x86_64 and aarch64 architectures will be supported.
 
