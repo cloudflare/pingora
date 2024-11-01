@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0](https://github.com/cloudflare/pingora/compare/0.3.0...0.4.0) - 2024-11-01
+
+### 🚀 Features
+- [Add preliminary rustls support](https://github.com/cloudflare/pingora/commit/354a6ee1e99b82e23fc0f27a37d8bf41e62b2dc5)
+- [Add experimental support for windows](https://github.com/cloudflare/pingora/commit/4aadba12727afe6178f3b9fc2a3cad2223ac7b2e)
+- [Add the option to use no TLS implementation](https://github.com/cloudflare/pingora/commit/d8f3ffae77ddc1edd285ab1d517a1b6748ce3d58)
+- [Add support for gRPC-web module to bridge gRPC-web client requests to gRPC server requests](https://github.com/cloudflare/pingora/commit/9917177c646a0ab58197f15ec57a3bcbe1e0a201)
+- [Add the support for h2c and http1 to coexist](https://github.com/cloudflare/pingora/commit/792d5fd3c14c1cd588b155ddf09c09a4c125a26b)
+- [Add the support for custom L4 connector](https://github.com/cloudflare/pingora/commit/7c122e7f36de5c946ac960a1691c5dd41f26e6e6)
+- [Support opaque extension field in Backend](https://github.com/cloudflare/pingora/commit/999e379064d2c1266a267abdf9f4f41b14bffcf5)
+- [Add the ability to ignore informational responses when proxying downstream](https://github.com/cloudflare/pingora/commit/be97e35031cf4f5a01191f1848bdf491bd9f0d62)
+- [Add un-gzip support and allow decompress by algorithm](https://github.com/cloudflare/pingora/commit/e1c6e57db3e613991eda3160d15f81e0669ea066)
+- [Add the ability to observe backend health status](https://github.com/cloudflare/pingora/commit/8a0c73f174a27a87c54426a748c4818b10de9425)
+- [Add the support for passing sentry release](https://github.com/cloudflare/pingora/commit/07a970e413009ee62fc4c15e0820ae1aa036af22)
+- [Add the support for binding to local port ranges](https://github.com/cloudflare/pingora/commit/d1d7a87b761eeb4f71fcaa3f7c4ae8e32f1d93c8)
+- [Support retrieving rx timestamp for TcpStream](https://github.com/cloudflare/pingora/commit/d811795938cee5a6eb7cd46399cef17210a0d0c5)
+
+### 🐛 Bug Fixes
+- [Handle bare IPv6 address in raw connect Host](https://github.com/cloudflare/pingora/commit/9f50e6ccb09db2940eec6fc170a1e9e9b14a95d0)
+- [Set proper response headers when compression is enabled](https://github.com/cloudflare/pingora/commit/55049c4e7983055551b34feee397c736ffc912bb)
+- [Check the current advertised h2 max streams](https://github.com/cloudflare/pingora/commit/7419b1967e7686b00aefb7bcd2a4dfe59b31e639)
+- Other bug fixes and improvements
+
+
+### ⚙️ Changes and Miscellaneous Tasks
+- [Make sentry an optional feature](https://github.com/cloudflare/pingora/commit/ab1b717bf587723c1c537d6549a8f8096f0900d4)
+- [Make timeouts Sync](https://github.com/cloudflare/pingora/commit/18db42cd2cb892432fd7896f0da7e9d19221214b)
+- [Retry all h2 connection when encountering graceful shutdown](https://github.com/cloudflare/pingora/commit/11b5882a422774cffbd14d9a9ea7dfc9dc98b02c)
+- [Make l4 module pub to expose Connect](https://github.com/cloudflare/pingora/commit/91702bb0c0c5e1f2d5e2f40a19a3f340bb5a6d82)
+- [Auto snake case set-cookie header when downgrade to from h2 to http1.1](https://github.com/cloudflare/pingora/commit/2c6190c634f2a5dd2f00e8597902f2b735a9d84f)
+- [shutdown h2 connection gracefully with GOAWAYs](https://github.com/cloudflare/pingora/commit/04d7cfeef6205d2cf33ad5704a363ee107250771)
+- Other API signature updates
+
 ## [0.3.0](https://github.com/cloudflare/pingora/compare/0.2.0...0.3.0) - 2024-07-12
 
 ### 🚀 Features
