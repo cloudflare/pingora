@@ -936,6 +936,27 @@ pub(crate) mod range_filter {
             return RangeType::None;
         };
 
+        // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
+        // with resumable downloads.
+        // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
+        // Note that the RFC wants strong validation, and suggests that
+        // "A valid entity-tag can be distinguished from a valid HTTP-date
+        // by examining the first three characters for a DQUOTE,"
+        // but this current etag matching behavior most closely mirrors nginx.
+        if let Some(if_range) = req.headers.get(IF_RANGE) {
+            let ir = if_range.as_bytes();
+            let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
+                resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
+            } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
+                last_modified == if_range
+            } else {
+                false
+            };
+            if !matches {
+                return RangeType::None;
+            }
+        }
+
         // TODO: we can also check Accept-Range header from resp. Nginx gives uses the option
         // see proxy_force_ranges
 
@@ -1013,6 +1034,61 @@ pub(crate) mod range_filter {
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes */10"
         );
+    }
+
+    #[test]
+    fn test_if_range() {
+        const DATE: &str = "Fri, 07 Jul 2023 22:03:29 GMT";
+        const ETAG: &str = "\"1234\"";
+
+        fn gen_req() -> RequestHeader {
+            let mut req = RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
+            req.append_header("Range", "bytes=0-1").unwrap();
+            req
+        }
+        fn gen_resp() -> ResponseHeader {
+            let mut resp = ResponseHeader::build(200, Some(1)).unwrap();
+            resp.append_header("Content-Length", "10").unwrap();
+            resp.append_header("Last-Modified", DATE).unwrap();
+            resp.append_header("ETag", ETAG).unwrap();
+            resp
+        }
+
+        // matching Last-Modified date
+        let mut req = gen_req();
+        req.insert_header("If-Range", DATE).unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(
+            RangeType::new_single(0, 2),
+            range_header_filter(&req, &mut resp)
+        );
+
+        // non-matching date
+        let mut req = gen_req();
+        req.insert_header("If-Range", "Fri, 07 Jul 2023 22:03:25 GMT")
+            .unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+
+        // match ETag
+        let mut req = gen_req();
+        req.insert_header("If-Range", ETAG).unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(
+            RangeType::new_single(0, 2),
+            range_header_filter(&req, &mut resp)
+        );
+
+        // non-matching ETags do not result in range
+        let mut req = gen_req();
+        req.insert_header("If-Range", "\"4567\"").unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+
+        let mut req = gen_req();
+        req.insert_header("If-Range", "1234").unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
     }
 
     pub struct RangeBodyFilter {
