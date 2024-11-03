@@ -18,7 +18,6 @@ path = "src/lib.rs"
 [dependencies]
 ahash = { workspace = true }
 flurry = "0.5"
-parking_lot = "0"
 crossbeam-queue = "0"
 crossbeam-skiplist = "0"
 
