@@ -250,7 +250,7 @@ impl<SV> HttpProxy<SV> {
             }
             HttpTask::Body(data, eos) => self
                 .inner
-                .upstream_response_body_filter(session, data, *eos, ctx),
+                .upstream_response_body_filter(session, data, *eos, ctx)?,
             HttpTask::Trailer(Some(trailers)) => self
                 .inner
                 .upstream_response_trailer_filter(session, trailers, ctx)?,
