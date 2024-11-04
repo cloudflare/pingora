@@ -140,11 +140,6 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
     ) {
-        if let Err(e) = stack.listen().await {
-            error!("Listen() failed: {e}");
-            return;
-        }
-
         // the accept loop, until the system is shutting down
         loop {
             let new_io = tokio::select! { // TODO: consider biased for perf reason?
@@ -211,10 +206,15 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         shutdown: ShutdownWatch,
     ) {
         let runtime = current_handle();
-        let endpoints = self.listeners.build(
-            #[cfg(unix)]
-            fds,
-        );
+        let endpoints = self
+            .listeners
+            .build(
+                #[cfg(unix)]
+                fds,
+            )
+            .await
+            .expect("Failed to build listeners");
+
         let app_logic = self
             .app_logic
             .take()

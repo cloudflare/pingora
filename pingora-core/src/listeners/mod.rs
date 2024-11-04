@@ -58,36 +58,35 @@ struct TransportStackBuilder {
 }
 
 impl TransportStackBuilder {
-    pub fn build(&mut self, #[cfg(unix)] upgrade_listeners: Option<ListenFds>) -> TransportStack {
-        TransportStack {
-            l4: ListenerEndpoint::new(self.l4.clone()),
+    pub async fn build(
+        &mut self,
+        #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
+    ) -> Result<TransportStack> {
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(self.l4.clone());
+
+        #[cfg(unix)]
+        let l4 = builder.listen(upgrade_listeners).await?;
+
+        #[cfg(windows)]
+        let l4 = builder.listen().await?;
+
+        Ok(TransportStack {
+            l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
-            #[cfg(unix)]
-            upgrade_listeners,
-        }
+        })
     }
 }
 
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
-    // listeners sent from the old process for graceful upgrade
-    #[cfg(unix)]
-    upgrade_listeners: Option<ListenFds>,
 }
 
 impl TransportStack {
     pub fn as_str(&self) -> &str {
         self.l4.as_str()
-    }
-
-    pub async fn listen(&mut self) -> Result<()> {
-        self.l4
-            .listen(
-                #[cfg(unix)]
-                self.upgrade_listeners.take(),
-            )
-            .await
     }
 
     pub async fn accept(&mut self) -> Result<UninitializedStream> {
@@ -199,19 +198,24 @@ impl Listeners {
         self.stacks.push(TransportStackBuilder { l4, tls })
     }
 
-    pub(crate) fn build(
+    pub(crate) async fn build(
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
-    ) -> Vec<TransportStack> {
-        self.stacks
-            .iter_mut()
-            .map(|b| {
-                b.build(
+    ) -> Result<Vec<TransportStack>> {
+        let mut stacks = Vec::with_capacity(self.stacks.len());
+
+        for b in self.stacks.iter_mut() {
+            let new_stack = b
+                .build(
                     #[cfg(unix)]
                     upgrade_listeners.clone(),
                 )
-            })
-            .collect()
+                .await?;
+
+            stacks.push(new_stack);
+        }
+
+        Ok(stacks)
     }
 
     pub(crate) fn cleanup(&self) {
@@ -234,14 +238,17 @@ mod test {
         let mut listeners = Listeners::tcp(addr1);
         listeners.add_tcp(addr2);
 
-        let listeners = listeners.build(
-            #[cfg(unix)]
-            None,
-        );
+        let listeners = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+
         assert_eq!(listeners.len(), 2);
         for mut listener in listeners {
             tokio::spawn(async move {
-                listener.listen().await.unwrap();
                 // just try to accept once
                 let stream = listener.accept().await.unwrap();
                 stream.handshake().await.unwrap();
@@ -269,11 +276,12 @@ mod test {
                 #[cfg(unix)]
                 None,
             )
+            .await
+            .unwrap()
             .pop()
             .unwrap();
 
         tokio::spawn(async move {
-            listener.listen().await.unwrap();
             // just try to accept once
             let stream = listener.accept().await.unwrap();
             let mut stream = stream.handshake().await.unwrap();
