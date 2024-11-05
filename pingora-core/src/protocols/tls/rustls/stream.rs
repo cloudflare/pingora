@@ -216,7 +216,13 @@ impl<T> UniqueID for TlsStream<T>
 where
     T: UniqueID,
 {
+    #[cfg(not(target_os = "windows"))]
     fn id(&self) -> i32 {
+        self.tls.stream.as_ref().unwrap().get_ref().0.id()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn id(&self) -> usize {
         self.tls.stream.as_ref().unwrap().get_ref().0.id()
     }
 }
