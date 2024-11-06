@@ -492,14 +492,14 @@ impl HttpCache {
                         inner.lock = Some(lock.lock(key));
                     }
                 }
-                inner.traces.log_meta(&meta);
+                inner.traces.start_hit_span(phase, hit_status);
+                inner.traces.log_meta_in_hit_span(&meta);
                 if let Some(eviction) = inner.eviction {
                     // TODO: make access() accept CacheKey
                     let cache_key = key.to_compact();
                     // FIXME: get size
                     eviction.access(&cache_key, 0, meta.0.internal.fresh_until);
                 }
-                inner.traces.start_hit_span(phase, hit_status);
                 inner.meta = Some(meta);
                 inner.body_reader = Some(hit_handler);
             }
@@ -717,7 +717,8 @@ impl HttpCache {
             // TODO: store the staled meta somewhere else for future use?
             CachePhase::Stale | CachePhase::Miss => {
                 let inner = self.inner_mut();
-                inner.traces.log_meta(&meta);
+                // TODO: have a separate expired span?
+                inner.traces.log_meta_in_miss_span(&meta);
                 inner.meta = Some(meta);
             }
             _ => panic!("wrong phase {:?}", self.phase),
