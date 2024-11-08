@@ -18,7 +18,7 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
-use log::{debug, error, warn};
+use log::{debug, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, error_resp, HttpTask};
+use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -893,31 +893,6 @@ impl HttpSession {
             }
             _ => Some(self.underlying_stream),
         }
-    }
-
-    /// Return a error response to the client. This default error response comes with `cache-control: private, no-store`.
-    /// It has no response body.
-    pub async fn respond_error(&mut self, error_status_code: u16) {
-        let (resp, resp_tmp) = match error_status_code {
-            /* commmon error responses are pre-generated */
-            502 => (Some(&*error_resp::HTTP_502_RESPONSE), None),
-            400 => (Some(&*error_resp::HTTP_400_RESPONSE), None),
-            _ => (
-                None,
-                Some(error_resp::gen_error_response(error_status_code)),
-            ),
-        };
-
-        let resp = match resp {
-            Some(r) => r,
-            None => resp_tmp.as_ref().unwrap(),
-        };
-
-        self.write_response_header_ref(resp)
-            .await
-            .unwrap_or_else(|e| {
-                error!("failed to send error response to downstream: {}", e);
-            });
     }
 
     /// Write a `100 Continue` response to the client.

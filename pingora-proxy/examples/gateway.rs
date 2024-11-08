@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use clap::Parser;
 use log::info;
 use prometheus::register_int_counter;
@@ -42,7 +43,9 @@ impl ProxyHttp for MyGateway {
         if session.req_header().uri.path().starts_with("/login")
             && !check_login(session.req_header())
         {
-            let _ = session.respond_error(403).await;
+            let _ = session
+                .respond_error_with_body(403, Bytes::from_static(b"no way!"))
+                .await;
             // true: early return as the response is already written
             return Ok(true);
         }
@@ -103,7 +106,7 @@ impl ProxyHttp for MyGateway {
     }
 }
 
-// RUST_LOG=INFO cargo run --example load_balancer
+// RUST_LOG=INFO cargo run --example gateway
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
 // curl 127.0.0.1:6190/family/ -H "Host: one.one.one.one"
 // curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: password"

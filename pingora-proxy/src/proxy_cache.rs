@@ -295,7 +295,13 @@ impl<SV> HttpProxy<SV> {
             }
             Err(e) => {
                 // TODO: more logging and error handling
-                session.as_mut().respond_error(500).await;
+                session
+                    .as_mut()
+                    .respond_error(500)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("failed to send error response to downstream: {e}");
+                    });
                 // we have not write anything dirty to downstream, it is still reusable
                 return (true, Some(e));
             }

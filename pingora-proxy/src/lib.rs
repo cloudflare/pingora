@@ -143,9 +143,14 @@ impl<SV> HttpProxy<SV> {
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {}", e);
+                error!("Fail to proxy: {e}");
                 if matches!(e.etype, InvalidHTTPHeader) {
-                    downstream_session.respond_error(400).await;
+                    downstream_session
+                        .respond_error(400)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("failed to send error response to downstream: {e}");
+                        });
                 } // otherwise the connection must be broken, no need to send anything
                 downstream_session.shutdown().await;
                 return None;
@@ -344,16 +349,16 @@ impl Session {
         &self.downstream_session
     }
 
-    /// Write HTTP response with the given error code to the downstream
+    /// Write HTTP response with the given error code to the downstream.
     pub async fn respond_error(&mut self, error: u16) -> Result<()> {
-        let resp = HttpSession::generate_error(error);
-        self.write_response_header(Box::new(resp), true)
+        self.as_downstream_mut().respond_error(error).await
+    }
+
+    /// Write HTTP response with the given error code to the downstream with a body.
+    pub async fn respond_error_with_body(&mut self, error: u16, body: Bytes) -> Result<()> {
+        self.as_downstream_mut()
+            .respond_error_with_body(error, body)
             .await
-            .unwrap_or_else(|e| {
-                self.downstream_session.set_keepalive(None);
-                error!("failed to send error response to downstream: {e}");
-            });
-        Ok(())
     }
 
     /// Write the given HTTP response header to the downstream
