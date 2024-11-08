@@ -372,7 +372,6 @@ pub trait ProxyHttp {
     where
         Self::CTX: Send + Sync,
     {
-        let server_session = session.as_mut();
         let code = match e.etype() {
             HTTPStatus(code) => *code,
             _ => {
@@ -392,7 +391,9 @@ pub trait ProxyHttp {
             }
         };
         if code > 0 {
-            server_session.respond_error(code).await
+            session.respond_error(code).await.unwrap_or_else(|e| {
+                error!("failed to send error response to downstream: {e}");
+            });
         }
         code
     }

@@ -22,7 +22,6 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use log::error;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
@@ -294,10 +293,23 @@ impl Session {
         }
     }
 
-    /// Send error response to client
-    pub async fn respond_error(&mut self, error: u16) {
-        let resp = Self::generate_error(error);
+    /// Send error response to client using a pre-generated error message.
+    pub async fn respond_error(&mut self, error: u16) -> Result<()> {
+        self.respond_error_with_body(error, Bytes::default()).await
+    }
 
+    /// Send error response to client using a pre-generated error message and custom body.
+    pub async fn respond_error_with_body(&mut self, error: u16, body: Bytes) -> Result<()> {
+        let mut resp = Self::generate_error(error);
+        if !body.is_empty() {
+            // error responses have a default content-length of zero
+            resp.set_content_length(body.len())?
+        }
+        self.write_error_response(resp, body).await
+    }
+
+    /// Send an error response to a client with a response header and body.
+    pub async fn write_error_response(&mut self, resp: ResponseHeader, body: Bytes) -> Result<()> {
         // TODO: we shouldn't be closing downstream connections on internally generated errors
         // and possibly other upstream connect() errors (connection refused, timeout, etc)
         //
@@ -306,11 +318,12 @@ impl Session {
         // rather than a misleading the client with 'keep-alive'
         self.set_keepalive(None);
 
-        self.write_response_header(Box::new(resp))
-            .await
-            .unwrap_or_else(|e| {
-                error!("failed to send error response to downstream: {e}");
-            });
+        self.write_response_header(Box::new(resp)).await?;
+        if !body.is_empty() {
+            self.write_response_body(body, true).await?;
+            self.finish_body().await?;
+        }
+        Ok(())
     }
 
     /// Whether there is no request body

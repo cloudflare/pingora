@@ -492,6 +492,11 @@ impl ResponseHeader {
     pub fn as_owned_parts(&self) -> RespParts {
         clone_resp_parts(&self.base)
     }
+
+    /// Helper function to set the HTTP content length on the response header.
+    pub fn set_content_length(&mut self, len: usize) -> Result<()> {
+        self.insert_header(http::header::CONTENT_LENGTH, len)
+    }
 }
 
 fn clone_req_parts(me: &ReqParts) -> ReqParts {
@@ -753,5 +758,19 @@ mod tests {
         req.set_send_end_stream(false);
         // Some(false)
         assert!(!req.send_end_stream().unwrap());
+    }
+
+    #[test]
+    fn set_test_set_content_length() {
+        let mut resp = ResponseHeader::new(None);
+        resp.set_content_length(10).unwrap();
+
+        assert_eq!(
+            b"10",
+            resp.headers
+                .get(http::header::CONTENT_LENGTH)
+                .map(|d| d.as_bytes())
+                .unwrap()
+        );
     }
 }
