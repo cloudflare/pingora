@@ -1,13 +1,19 @@
 ### Pingora Tutorial
 
+The Cargo.lock and Cargo.toml are provided in the Pingora crate if you so choose to use them. Both have been labeled with the prefix of `tutorial_` so you will need to change their names before starting this tutorial. Having that will prevent you from needing to cargo add any crates that may be required to start up any of this code. If you don't want to use that then we will also make sure to point out the exact imports that we're using in each section.
+
+So with that out of the way, lets begin our Pingora tutorial.
+
 ## Introduction
 
-Before we begin building a full proxy server, we need a simple server to test and demonstrate our proxy’s functionality. In this tutorial, we’ll start by setting up a basic test web server in Rust that will display a simple message when accessed. This will help us verify that our proxy server is routing requests correctly.
-Step 1: Start the Test Web Server
+Before we begin building a full proxy server, we need a simple server to test and demonstrate our proxy’s functionality. In this tutorial, we’ll start by setting up a basic test web server in Rust that will display a simple message when accessed. This will help us verify that our proxy server is routing requests correctly. The server has alreadydy been built in it's entirety inside of the pingora_tutorial/src/test_server.rs, but this tutorial will explain the code inside that folder so you better understand it and are able to run or modify the code as you see fit.
 
-## Step 1 creating the server
+Thank you for using pingora
+
+## Step 1: Start the Test Web Server
 
 To begin, let’s create a basic server function that listens on a specified address and handles incoming client connections. This server will allow us to test the future code we’ll write for the proxy server.
+
 ```rust
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

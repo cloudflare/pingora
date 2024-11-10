@@ -1,21 +1,8 @@
-// Copyright 2024 Cloudflare, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use async_trait::async_trait;
 use std::sync::Arc;
 
 use pingora_core::{prelude::*, services::background::GenBackgroundService};
+use pingora_core::upstreams::peer::HttpPeer;
 use pingora_load_balancing::{
     health_check::TcpHealthCheck,
     selection::{BackendIter, BackendSelection, RoundRobin},
@@ -31,10 +18,19 @@ struct Router {
 #[async_trait]
 impl ProxyHttp for Router {
     type CTX = ();
-    fn new_ctx(&self) {}
 
-    async fn upstream_peer(&self, session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
-        // determine LB cluster based on request uri
+    // Corrected the `new_ctx` method to return `Self::CTX`
+    fn new_ctx(&self) -> Self::CTX {
+        ()
+    }
+
+    // Updated the return type to `Result<Box<HttpPeer>>`
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        // Determine LB cluster based on request URI
         let cluster = if session.req_header().uri.path().starts_with("/one/") {
             &self.cluster_one
         } else {
@@ -42,13 +38,17 @@ impl ProxyHttp for Router {
         };
 
         let upstream = cluster
-            .select(b"", 256) // hash doesn't matter for round robin
+            .select(b"", 256) // Hash doesn't matter for round robin
             .unwrap();
 
-        println!("upstream peer is: {upstream:?}");
+        println!("upstream peer is: {:?}", upstream);
 
-        // Set SNI to one.one.one.one
-        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+        // Create a new HttpPeer instance and wrap it in a Box
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            true,
+            "one.one.one.one".to_string(),
+        ));
         Ok(peer)
     }
 }
@@ -72,7 +72,7 @@ fn main() {
     let mut my_server = Server::new(None).unwrap();
     my_server.bootstrap();
 
-    // build multiple clusters
+    // Build multiple clusters
     let cluster_one = build_cluster_service::<RoundRobin>(&["1.1.1.1:443", "127.0.0.1:343"]);
     let cluster_two = build_cluster_service::<RoundRobin>(&["1.0.0.1:443", "127.0.0.2:343"]);
 
