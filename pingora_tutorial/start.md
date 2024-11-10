@@ -4,7 +4,7 @@ The Cargo.lock and Cargo.toml are provided in the Pingora crate if you so choose
 
 So with that out of the way, lets begin our Pingora tutorial.
 
-## Introduction
+### Introduction
 
 Before we begin building a full proxy server, we need a simple server to test and demonstrate our proxy’s functionality. In this tutorial, we’ll start by setting up a basic test web server in Rust that will display a simple message when accessed. This will help us verify that our proxy server is routing requests correctly. The server has already been built in it's entirety inside of the `pingora_tutorial/src/test_server.rs`. This tutorial will explain the code inside that folder so you better understand it and are able to run or modify the code as you see fit.
 
@@ -38,7 +38,7 @@ pub fn start_test_server(address: &str) -> std::io::Result<()> {
 }
 ```
 
-## Imports:
+### Imports:
 
 ```rust
 use std::io::{Read, Write};
@@ -52,7 +52,7 @@ use std::thread;
 
 `std::thread`: This imports Rust’s threading capabilities, allowing us to spawn new threads for each client connection to handle multiple clients concurrently.
 
-## Function Declaration:
+### Function Declaration:
 
 ```rust
 pub fn start_test_server(address: &str) -> std::io::Result<()> {
@@ -61,7 +61,7 @@ pub fn start_test_server(address: &str) -> std::io::Result<()> {
 `start_test_server` is a function that takes an address parameter of type `&str` (a string slice).
 It returns a `Result<(), std::io::Error>`. This indicates that the function might return an `std::io::Error` if there’s a problem, such as if the address is already in use.
 
-## Binding the Listener:
+### Binding the Listener:
 
 ```rust    
 let listener = TcpListener::bind(address)?;
@@ -71,7 +71,7 @@ let listener = TcpListener::bind(address)?;
 
 This listener will listen for incoming connections on the specified address.
 
-## Console Output:
+### Console Output:
 
 ```rust 
 println!("Test server running on {}", address);
@@ -79,7 +79,7 @@ println!("Test server running on {}", address);
 
 Prints a message to the console to indicate that the test server has started successfully and is running on the specified address.
 
-## Handling Incoming Connections:
+### Handling Incoming Connections:
 
 ```rust
 for stream in listener.incoming() {
@@ -88,7 +88,7 @@ for stream in listener.incoming() {
 `listener.incoming()` is an iterator that yields incoming connections. Each connection is represented as a `TcpStream`, allowing data transfer with a client.
 We use a `for` loop to handle each incoming connection individually.
 
-## Match Statement and Threading:
+### Match Statement and Threading:
 
 ```rust
     match stream {
@@ -111,7 +111,7 @@ This enables handling multiple client connections concurrently.
 
 `Err(e)`: If there’s an error accepting a connection, `eprintln!` outputs an error message to the console.
 
-## Return Value:
+### Return Value:
 
 ```rust
     Ok(())
@@ -120,7 +120,7 @@ This enables handling multiple client connections concurrently.
 
 Returns `Ok(())`, indicating that the function completed successfully if there were no binding errors.
 
-# Step 2: Display a Response Message
+## Step 2: Display a Response Message
 
 To confirm that our server is working correctly, we’ll add a function to respond with a simple HTML message, “Hello. You made it!” This will help us know when we have successfully reached the test server.
 
@@ -149,14 +149,14 @@ Content-Type: text/html
 }
 ```
 
-## Code: Displaying a Response Message
+### Code: Displaying a Response Message
 
 ```rust
 // Function to handle each client and respond with a "Hello. You made it!" page
 fn handle_test_client(mut stream: TcpStream) {
 ```
 
-## Function Declaration:
+### Function Declaration:
 
 `handle_test_client` takes a mutable `TcpStream` called stream as input, representing an open connection with a client.
 This function will read the client’s request and write back a simple HTML response.
@@ -165,18 +165,18 @@ This function will read the client’s request and write back a simple HTML resp
 let mut buffer = [0; 512];
 ```
 
-## Buffer Initialization:
+### Buffer Initialization:
 `let mut buffer = [0; 512];` creates a buffer, a fixed-size array of 512 bytes, to temporarily hold data read from the client.
 512 bytes is generally enough to capture an HTTP request from the client.
 ```rust
     if stream.read(&mut buffer).is_ok() {
 ```
-## Reading from the Client:
+### Reading from the Client:
         
 `stream.read(&mut buffer).is_ok()`: Reads data from the client into buffer. The `is_ok()` check ensures that reading was successful.
 We’re not inspecting the content of the request in this example; we simply need to know the client connected to respond with our message.
 
-## HTTP Response:
+### HTTP Response:
 
 ```rust
         let response = r#"HTTP/1.1 200 OK
@@ -199,7 +199,7 @@ The response includes:
 
 This message will be displayed in the client’s browser when they successfully reach the server.
 
-## Writing the Response:
+### Writing the Response:
 
 ```rust
 if stream.write_all(response.as_bytes()).is_err() {
