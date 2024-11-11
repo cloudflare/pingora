@@ -15,6 +15,7 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
+use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
 
 // add scheme and authority as required by h2 lib
@@ -571,6 +572,31 @@ pub(crate) async fn pipe_2to1_response(
 
     match client.check_response_end_or_error() {
         Ok(eos) => {
+            // XXX: the h2 crate won't check for content-length underflow
+            // if a header frame with END_STREAM is sent without data frames
+            // As stated by RFC, "204 or 304 responses contain no content,
+            // as does the response to a HEAD request"
+            // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+            let req_header = client.request_header().expect("must have sent req");
+            if eos
+                && req_header.method != Method::HEAD
+                && resp_header.status != StatusCode::NO_CONTENT
+                && resp_header.status != StatusCode::NOT_MODIFIED
+                // RFC technically allows for leading zeroes
+                // https://datatracker.ietf.org/doc/html/rfc9110#name-content-length
+                && resp_header
+                    .headers
+                    .get(CONTENT_LENGTH)
+                    .is_some_and(|cl| cl.as_bytes().iter().any(|b| *b != b'0'))
+            {
+                let _ = tx
+                    .send(HttpTask::Failed(
+                        Error::explain(H2Error, "non-zero content-length on EOS headers frame")
+                            .into_up(),
+                    ))
+                    .await;
+                return Ok(());
+            }
             tx.send(HttpTask::Header(resp_header, eos))
                 .await
                 .or_err(InternalError, "sending h2 headers to pipe")?;

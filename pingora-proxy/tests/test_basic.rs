@@ -269,6 +269,30 @@ async fn test_h2_to_h1_upload() {
     assert_eq!(body, payload);
 }
 
+#[tokio::test]
+#[cfg(feature = "any_tls")]
+async fn test_h2_head() {
+    init();
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let res = client
+        .head("https://127.0.0.1:6150/set_content_length")
+        .header("sni", "openrusty.org")
+        .header("x-h2", "true")
+        .header("x-set-content-length", "11")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    let body = res.text().await.unwrap();
+    // should not be any body, despite content-length
+    assert_eq!(body, "");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_simple_proxy_uds() {
