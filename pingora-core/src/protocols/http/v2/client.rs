@@ -307,6 +307,11 @@ impl Http2Session {
         .or_err(ReadError, "while reading h2 trailers")
     }
 
+    /// The request header if it is already sent
+    pub fn request_header(&self) -> Option<&RequestHeader> {
+        self.req_sent.as_deref()
+    }
+
     /// The response header if it is already read
     pub fn response_header(&self) -> Option<&ResponseHeader> {
         self.response_header.as_ref()
