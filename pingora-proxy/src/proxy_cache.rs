@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use http::StatusCode;
+use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
@@ -450,14 +450,16 @@ impl<SV> HttpProxy<SV> {
 
                             session.cache.response_became_cacheable();
 
-                            if meta.response_header().status == StatusCode::OK {
+                            if session.req_header().method == Method::GET
+                                && meta.response_header().status == StatusCode::OK
+                            {
                                 self.inner.cache_miss(session, ctx);
                             } else {
                                 // we've allowed caching on the next request,
                                 // but do not cache _this_ request if bypassed and not 200
                                 // (We didn't run upstream request cache filters to strip range or condition headers,
-                                // so this could be an uncacheable response e.g. 206 or 304.
-                                // Exclude all non-200 for simplicity, may expand allowable codes in the future.)
+                                // so this could be an uncacheable response e.g. 206 or 304 or HEAD.
+                                // Exclude all non-200/GET for simplicity, may expand allowable codes in the future.)
                                 fill_cache = false;
                                 session.cache.disable(NoCacheReason::Deferred);
                             }
