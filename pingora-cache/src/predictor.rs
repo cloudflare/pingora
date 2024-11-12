@@ -120,7 +120,7 @@ where
             // CacheLockGiveUp: the writer will set OriginNotCache (if applicable)
             // readers don't need to do it
             NeverEnabled | StorageError | InternalError | Deferred | CacheLockGiveUp
-            | CacheLockTimeout => {
+            | CacheLockTimeout | DeclinedToUpstream | UpstreamError => {
                 return None;
             }
             // Skip certain NoCacheReason::Custom according to user

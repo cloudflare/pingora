@@ -409,6 +409,7 @@ impl<SV> HttpProxy<SV> {
                     .cache_http_task(session, &task, ctx, serve_from_cache)
                     .await
                 {
+                    session.cache.disable(NoCacheReason::StorageError);
                     if serve_from_cache.is_miss_body() {
                         // if the response stream cache body during miss but write fails, it has to
                         // give up the entire request
