@@ -667,8 +667,18 @@ impl<SV> HttpProxy<SV> {
                         None,
                         None,
                     );
-                    self.inner
+                    if self
+                        .inner
                         .should_serve_stale(session, ctx, Some(&http_status_error))
+                    {
+                        // no more need to keep the write lock
+                        session
+                            .cache
+                            .release_write_lock(NoCacheReason::UpstreamError);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false // not 304, not stale if error status code
                 }
@@ -711,6 +721,11 @@ impl<SV> HttpProxy<SV> {
             error,
             self.inner.request_summary(session, ctx)
         );
+
+        // no more need to hang onto the cache lock
+        session
+            .cache
+            .release_write_lock(NoCacheReason::UpstreamError);
 
         Some(self.proxy_cache_hit(session, ctx).await)
     }

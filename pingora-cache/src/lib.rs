@@ -125,8 +125,12 @@ pub enum NoCacheReason {
     ///
     /// This happens when the cache predictor predicted that this request is not cacheable, but
     /// the response turns out to be OK to cache. However, it might be too large to re-enable caching
-    /// for this request.
+    /// for this request
     Deferred,
+    /// Due to the proxy upstream filter declining the current request from going upstream
+    DeclinedToUpstream,
+    /// Due to the upstream being unreachable or otherwise erroring during proxying
+    UpstreamError,
     /// The writer of the cache lock sees that the request is not cacheable (Could be OriginNotCache)
     CacheLockGiveUp,
     /// This request waited too long for the writer of the cache lock to finish, so this request will
@@ -147,6 +151,8 @@ impl NoCacheReason {
             StorageError => "StorageError",
             InternalError => "InternalError",
             Deferred => "Deferred",
+            DeclinedToUpstream => "DeclinedToUpstream",
+            UpstreamError => "UpstreamError",
             CacheLockGiveUp => "CacheLockGiveUp",
             CacheLockTimeout => "CacheLockTimeout",
             Custom(s) => s,
@@ -299,9 +305,44 @@ impl HttpCache {
             .is_some()
     }
 
+    /// Release the cache lock if the current request is a cache writer.
+    ///
+    /// Generally callers should prefer using `disable` when a cache lock should be released
+    /// due to an error to clear all cache context. This function is for releasing the cache lock
+    /// while still keeping the cache around for reading, e.g. when serving stale.
+    pub fn release_write_lock(&mut self, reason: NoCacheReason) {
+        use NoCacheReason::*;
+        if let Some(inner) = self.inner.as_mut() {
+            let lock = inner.lock.take();
+            if let Some(Locked::Write(_r)) = lock {
+                let lock_status = match reason {
+                    // let the next request try to fetch it
+                    InternalError | StorageError | Deferred | UpstreamError => {
+                        LockStatus::TransientError
+                    }
+                    // depends on why the proxy upstream filter declined the request,
+                    // for now still allow next request try to acquire to avoid thundering herd
+                    DeclinedToUpstream => LockStatus::TransientError,
+                    // no need for the lock anymore
+                    OriginNotCache | ResponseTooLarge => LockStatus::GiveUp,
+                    // not sure which LockStatus make sense, we treat it as GiveUp for now
+                    Custom(_) => LockStatus::GiveUp,
+                    // should never happen, NeverEnabled shouldn't hold a lock
+                    NeverEnabled => panic!("NeverEnabled holds a write lock"),
+                    CacheLockGiveUp | CacheLockTimeout => {
+                        panic!("CacheLock* are for cache lock readers only")
+                    }
+                };
+                inner
+                    .cache_lock
+                    .unwrap()
+                    .release(inner.key.as_ref().unwrap(), lock_status);
+            }
+        }
+    }
+
     /// Disable caching
     pub fn disable(&mut self, reason: NoCacheReason) {
-        use NoCacheReason::*;
         match self.phase {
             CachePhase::Disabled(_) => {
                 // replace reason
@@ -309,28 +350,7 @@ impl HttpCache {
             }
             _ => {
                 self.phase = CachePhase::Disabled(reason);
-                if let Some(inner) = self.inner.as_mut() {
-                    let lock = inner.lock.take();
-                    if let Some(Locked::Write(_r)) = lock {
-                        let lock_status = match reason {
-                            // let the next request try to fetch it
-                            InternalError | StorageError | Deferred => LockStatus::TransientError,
-                            // no need for the lock anymore
-                            OriginNotCache | ResponseTooLarge => LockStatus::GiveUp,
-                            // not sure which LockStatus make sense, we treat it as GiveUp for now
-                            Custom(_) => LockStatus::GiveUp,
-                            // should never happen, NeverEnabled shouldn't hold a lock
-                            NeverEnabled => panic!("NeverEnabled holds a write lock"),
-                            CacheLockGiveUp | CacheLockTimeout => {
-                                panic!("CacheLock* are for cache lock readers only")
-                            }
-                        };
-                        inner
-                            .cache_lock
-                            .unwrap()
-                            .release(inner.key.as_ref().unwrap(), lock_status);
-                    }
-                }
+                self.release_write_lock(reason);
                 // log initial disable reason
                 self.inner_mut()
                     .traces
@@ -824,6 +844,8 @@ impl HttpCache {
             CachePhase::Stale => {
                 // replace cache meta header
                 self.inner_mut().meta.as_mut().unwrap().0.header = header;
+                // upstream request done, release write lock
+                self.release_write_lock(reason);
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
