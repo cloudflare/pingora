@@ -351,20 +351,17 @@ mod parse_response {
         ErrorType::{self, *},
     };
 
-    pub const INVALID_CHUNK: ErrorType = ErrorType::new("InvalidChunk");
     pub const INCOMPLETE_BODY: ErrorType = ErrorType::new("IncompleteHttpBody");
 
     const MAX_HEADERS: usize = 256;
     const INIT_HEADER_BUF_SIZE: usize = 4096;
-    const CHUNK_DELIMITER_SIZE: usize = 2; // \r\n
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum ParseState {
         Init,
         PartialHeader,
         PartialBodyContentLength(usize, usize),
-        PartialChunkedBody(usize),
-        PartialHttp10Body(usize),
+        PartialBody(usize),
         Done(usize),
         Invalid(httparse::Error),
     }
@@ -379,9 +376,7 @@ mod parse_response {
         fn read_body(&self) -> bool {
             matches!(
                 self,
-                Self::PartialBodyContentLength(..)
-                    | Self::PartialChunkedBody(_)
-                    | Self::PartialHttp10Body(_)
+                Self::PartialBodyContentLength(..) | Self::PartialBody(_)
             )
         }
     }
@@ -509,49 +504,15 @@ mod parse_response {
                     }
                     Ok(Some(self.buf.split_to(end).freeze()))
                 }
-                PartialChunkedBody(seen) => {
-                    let parsed = httparse::parse_chunk_size(&self.buf).map_err(|e| {
-                        self.state = Done(seen);
-                        Error::explain(INVALID_CHUNK, format!("Invalid chunked encoding: {e:?}"))
-                    })?;
-                    match parsed {
-                        httparse::Status::Complete((header_len, body_len)) => {
-                            // 4\r\nRust\r\n: header: "4\r\n", body: "Rust", "\r\n"
-                            let total_chunk_size =
-                                header_len + body_len as usize + CHUNK_DELIMITER_SIZE;
-                            if self.buf.len() < total_chunk_size {
-                                // wait for the full chunk to be read
-                                // Note that we have to buffer the entire chunk in this design
-                                Ok(None)
-                            } else {
-                                if body_len == 0 {
-                                    self.state = Done(seen);
-                                } else {
-                                    self.state = PartialChunkedBody(seen + body_len as usize);
-                                }
-                                let mut chunk_bytes = self.buf.split_to(total_chunk_size);
-                                let mut chunk_body = chunk_bytes.split_off(header_len);
-                                chunk_body.truncate(body_len as usize);
-                                // Note that the final 0 sized chunk will return an empty Bytes
-                                // instead of not None
-                                Ok(Some(chunk_body.freeze()))
-                            }
-                        }
-                        httparse::Status::Partial => {
-                            // not even a full chunk, continue waiting for more data
-                            Ok(None)
-                        }
-                    }
-                }
-                PartialHttp10Body(seen) => {
-                    self.state = PartialHttp10Body(seen + self.buf.len());
+                PartialBody(seen) => {
+                    self.state = PartialBody(seen + self.buf.len());
                     Ok(Some(self.buf.split().freeze()))
                 }
             }
         }
 
         pub fn finish(&mut self) -> Result<()> {
-            if let ParseState::PartialHttp10Body(seen) = self.state {
+            if let ParseState::PartialBody(seen) = self.state {
                 self.state = ParseState::Done(seen);
             }
             if !self.state.is_done() {
@@ -572,12 +533,6 @@ mod parse_response {
             // these status codes cannot have body by definition
             return ParseState::Done(0);
         }
-        if let Some(encoding) = resp.headers.get(http::header::TRANSFER_ENCODING) {
-            // TODO: case sensitive?
-            if encoding.as_bytes() == b"chunked" {
-                return ParseState::PartialChunkedBody(0);
-            }
-        }
         if let Some(cl) = resp.headers.get(http::header::CONTENT_LENGTH) {
             // ignore invalid header value
             if let Some(cl) = std::str::from_utf8(cl.as_bytes())
@@ -591,7 +546,10 @@ mod parse_response {
                 };
             }
         }
-        ParseState::PartialHttp10Body(0)
+        // HTTP/1.0 and chunked encoding are both treated as PartialBody
+        // The response body payload should _not_ be chunked encoded
+        // even if the Transfer-Encoding: chunked header is added
+        ParseState::PartialBody(0)
     }
 
     #[cfg(test)]
@@ -684,7 +642,7 @@ mod parse_response {
 
         #[test]
         fn test_body_chunked() {
-            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nrust\r\n";
+            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nrust";
             let mut parser = ResponseParse::new();
             let output = parser.inject_data(input).unwrap();
 
@@ -699,14 +657,6 @@ mod parse_response {
             };
             assert_eq!(data.as_ref().unwrap(), "rust");
             assert!(!eos);
-
-            let output = parser.inject_data(b"0\r\n\r\n").unwrap();
-            assert_eq!(output.len(), 1);
-            let HttpTask::Body(data, eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(data.as_ref().unwrap(), "");
-            assert!(eos);
 
             parser.finish().unwrap();
         }
@@ -755,8 +705,8 @@ mod parse_response {
         }
 
         #[test]
-        fn test_body_chunked_early() {
-            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nrust\r\n";
+        fn test_body_chunked_partial_chunk() {
+            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nru";
             let mut parser = ResponseParse::new();
             let output = parser.inject_data(input).unwrap();
 
@@ -769,75 +719,15 @@ mod parse_response {
             let HttpTask::Body(data, eos) = &output[1] else {
                 panic!("{:?}", output);
             };
-            assert_eq!(data.as_ref().unwrap(), "rust");
+            assert_eq!(data.as_ref().unwrap(), "ru");
             assert!(!eos);
-
-            parser.finish().unwrap_err();
-        }
-
-        #[test]
-        fn test_body_chunked_partial_chunk() {
-            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nru";
-            let mut parser = ResponseParse::new();
-            let output = parser.inject_data(input).unwrap();
-
-            assert_eq!(output.len(), 1);
-            let HttpTask::Header(header, _eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(header.status, 200);
 
             let output = parser.inject_data(b"st\r\n").unwrap();
             assert_eq!(output.len(), 1);
             let HttpTask::Body(data, eos) = &output[0] else {
                 panic!("{:?}", output);
             };
-            assert_eq!(data.as_ref().unwrap(), "rust");
-            assert!(!eos);
-        }
-
-        #[test]
-        fn test_body_chunked_partial_chunk_head() {
-            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r";
-            let mut parser = ResponseParse::new();
-            let output = parser.inject_data(input).unwrap();
-
-            assert_eq!(output.len(), 1);
-            let HttpTask::Header(header, _eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(header.status, 200);
-
-            let output = parser.inject_data(b"\nrust\r\n").unwrap();
-            assert_eq!(output.len(), 1);
-            let HttpTask::Body(data, eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(data.as_ref().unwrap(), "rust");
-            assert!(!eos);
-        }
-
-        #[test]
-        fn test_body_chunked_many_chunks() {
-            let input =
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nrust\r\n1\r\ny\r\n";
-            let mut parser = ResponseParse::new();
-            let output = parser.inject_data(input).unwrap();
-
-            assert_eq!(output.len(), 3);
-            let HttpTask::Header(header, _eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(header.status, 200);
-            let HttpTask::Body(data, eos) = &output[1] else {
-                panic!("{:?}", output);
-            };
-            assert!(!eos);
-            assert_eq!(data.as_ref().unwrap(), "rust");
-            let HttpTask::Body(data, eos) = &output[2] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(data.as_ref().unwrap(), "y");
+            assert_eq!(data.as_ref().unwrap(), "st\r\n");
             assert!(!eos);
         }
 
@@ -926,26 +816,6 @@ mod parse_response {
 
             let output = parser.inject_data(b"rust").unwrap();
             assert!(output.is_empty());
-            parser.finish().unwrap();
-        }
-
-        #[test]
-        fn test_no_body_chunked() {
-            let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-            let mut parser = ResponseParse::new();
-            let output = parser.inject_data(input).unwrap();
-
-            assert_eq!(output.len(), 2);
-            let HttpTask::Header(header, _eos) = &output[0] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(header.status, 200);
-
-            let HttpTask::Body(data, eos) = &output[1] else {
-                panic!("{:?}", output);
-            };
-            assert_eq!(data.as_ref().unwrap(), "");
-            assert!(eos);
             parser.finish().unwrap();
         }
     }
