@@ -216,7 +216,7 @@ impl<T> UniqueID for TlsStream<T>
 where
     T: UniqueID,
 {
-    fn id(&self) -> i32 {
+    fn id(&self) -> UniqueIDType {
         self.tls.stream.as_ref().unwrap().get_ref().0.id()
     }
 }
