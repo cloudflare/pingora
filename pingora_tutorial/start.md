@@ -161,18 +161,21 @@ fn handle_test_client(mut stream: TcpStream) {
 `handle_test_client` takes a mutable `TcpStream` called stream as input, representing an open connection with a client.
 This function will read the client’s request and write back a simple HTML response.
 
+### Buffer Initialization:
+
 ```rust
 let mut buffer = [0; 512];
 ```
 
-### Buffer Initialization:
 `let mut buffer = [0; 512];` creates a buffer, a fixed-size array of 512 bytes, to temporarily hold data read from the client.
 512 bytes is generally enough to capture an HTTP request from the client.
+
+### Reading from the Client:
+
 ```rust
     if stream.read(&mut buffer).is_ok() {
 ```
-### Reading from the Client:
-        
+
 `stream.read(&mut buffer).is_ok()`: Reads data from the client into buffer. The `is_ok()` check ensures that reading was successful.
 We’re not inspecting the content of the request in this example; we simply need to know the client connected to respond with our message.
 
