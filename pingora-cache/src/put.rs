@@ -17,6 +17,7 @@
 use crate::*;
 use bytes::Bytes;
 use http::header;
+use log::warn;
 use pingora_core::protocols::http::{
     v1::common::header_value_content_length, HttpTask, ServerSession,
 };
@@ -112,15 +113,19 @@ impl<C: CachePut> CachePutCtx<C> {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
             let evicted = eviction.admit(cache_key, size, meta.0.internal.fresh_until);
-            // TODO: make this async
+            // actual eviction can be done async
             let trace = self
                 .trace
                 .child("cache put eviction", |o| o.start())
                 .handle();
-            for item in evicted {
-                // TODO: warn/log the error
-                let _ = self.storage.purge(&item, PurgeType::Eviction, &trace).await;
-            }
+            let storage = self.storage;
+            tokio::task::spawn(async move {
+                for item in evicted {
+                    if let Err(e) = storage.purge(&item, PurgeType::Eviction, &trace).await {
+                        warn!("Failed to purge {item} during eviction for cache put: {e}");
+                    }
+                }
+            });
         }
 
         Ok(())
