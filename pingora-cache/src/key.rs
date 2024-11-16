@@ -18,6 +18,7 @@ use super::*;
 
 use blake2::{Blake2b, Digest};
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 // 16-byte / 128-bit key: large enough to avoid collision
 const KEY_SIZE: usize = 16;
@@ -136,6 +137,16 @@ pub struct CompactCacheKey {
     // save 8 bytes for non-variance but waste 8 bytes for variance vs, store flat 16 bytes
     pub variance: Option<Box<HashBinary>>,
     pub user_tag: Box<str>, // the len should be small to keep memory usage bounded
+}
+
+impl Display for CompactCacheKey {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "{}", hex2str(&self.primary))?;
+        if let Some(var) = &self.variance {
+            write!(f, ", variance: {}", hex2str(var.as_ref()))?;
+        }
+        write!(f, ", user_tag: {}", self.user_tag)
+    }
 }
 
 impl CacheHashKey for CompactCacheKey {

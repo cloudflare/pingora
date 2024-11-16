@@ -19,6 +19,7 @@
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
 use key::{CacheHashKey, HashBinary};
 use lock::WritePermit;
+use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use rustracing::tag::Tag;
@@ -751,16 +752,18 @@ impl HttpCache {
                     let cache_key = key.to_compact();
                     let meta = inner.meta.as_ref().unwrap();
                     let evicted = eviction.admit(cache_key, size, meta.0.internal.fresh_until);
-                    // TODO: make this async
+                    // actual eviction can be done async
                     let span = inner.traces.child("eviction");
                     let handle = span.handle();
-                    for item in evicted {
-                        // TODO: warn/log the error
-                        let _ = inner
-                            .storage
-                            .purge(&item, PurgeType::Eviction, &handle)
-                            .await;
-                    }
+                    let storage = inner.storage;
+                    tokio::task::spawn(async move {
+                        for item in evicted {
+                            if let Err(e) = storage.purge(&item, PurgeType::Eviction, &handle).await
+                            {
+                                warn!("Failed to purge {item} during eviction for finish miss handler: {e}");
+                            }
+                        }
+                    });
                 }
                 inner.traces.finish_miss_span();
                 Ok(())
