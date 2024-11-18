@@ -13,7 +13,11 @@
 // limitations under the License.
 
 use super::*;
-use pingora_cache::{key::HashBinary, CacheKey, CacheMeta, RespCacheable, RespCacheable::*};
+use pingora_cache::{
+    key::HashBinary,
+    CacheKey, CacheMeta, ForcedInvalidationKind,
+    RespCacheable::{self, *},
+};
 use std::time::Duration;
 
 /// The interface to control the HTTP proxy
@@ -129,21 +133,23 @@ pub trait ProxyHttp {
         session.cache.cache_miss();
     }
 
-    /// This filter is called after a successful cache lookup and before the cache asset is ready to
-    /// be used.
+    /// This filter is called after a successful cache lookup and before the
+    /// cache asset is ready to be used.
     ///
-    /// This filter allow the user to log or force expire the asset.
-    // flex purge, other filtering, returns whether asset is should be force expired or not
+    /// This filter allows the user to log or force invalidate the asset.
+    ///
+    /// The value returned indicates if the force invalidation should be used,
+    /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
         _session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-    ) -> Result<bool>
+    ) -> Result<Option<ForcedInvalidationKind>>
     where
         Self::CTX: Send + Sync,
     {
-        Ok(false)
+        Ok(None)
     }
 
     /// Decide if a request should continue to upstream after not being served from cache.

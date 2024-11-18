@@ -21,12 +21,12 @@ use http::HeaderValue;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
-use pingora_cache::VarianceBuilder;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
+use pingora_cache::{ForcedInvalidationKind, PurgeType, VarianceBuilder};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
@@ -415,12 +415,15 @@ impl ProxyHttp for ExampleProxyCache {
         session: &Session,
         _meta: &CacheMeta,
         _ctx: &mut Self::CTX,
-    ) -> Result<bool> {
-        // allow test header to control force expiry
-        if session.get_header_bytes("x-force-expire") != b"" {
-            return Ok(true);
+    ) -> Result<Option<ForcedInvalidationKind>> {
+        // allow test header to control force expiry/miss
+        if session.get_header_bytes("x-force-miss") != b"" {
+            return Ok(Some(ForcedInvalidationKind::ForceMiss));
         }
-        Ok(false)
+        if session.get_header_bytes("x-force-expire") != b"" {
+            return Ok(Some(ForcedInvalidationKind::ForceExpired));
+        }
+        Ok(None)
     }
 
     fn cache_vary_filter(
