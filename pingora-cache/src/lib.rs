@@ -23,6 +23,7 @@ use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use rustracing::tag::Tag;
 use std::time::{Duration, Instant, SystemTime};
+use strum::IntoStaticStr;
 use trace::CacheTraceCTX;
 
 pub mod cache_control;
@@ -210,34 +211,59 @@ impl RespCacheable {
     }
 }
 
+/// Indicators of which level of purge logic to apply to an asset. As in should
+/// the purged file be revalidated or re-retrieved altogether
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedInvalidationKind {
+    /// Indicates the asset should be considered stale and revalidated
+    ForceExpired,
+
+    /// Indicates the asset should be considered absent and treated like a miss
+    /// instead of a hit
+    ForceMiss,
+}
+
 /// Freshness state of cache hit asset
 ///
 ///
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, IntoStaticStr, PartialEq, Eq)]
+#[strum(serialize_all = "snake_case")]
 pub enum HitStatus {
+    /// The asset's freshness directives indicate it has expired
     Expired,
+
+    /// The asset was marked as expired, and should be treated as stale
     ForceExpired,
+
+    /// The asset was marked as absent, and should be treated as a miss
+    ForceMiss,
+
+    /// An error occurred while processing the asset, so it should be treated as
+    /// a miss
     FailedHitFilter,
+
+    /// The asset is not expired
     Fresh,
 }
 
 impl HitStatus {
     /// For displaying cache hit status
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Expired => "expired",
-            Self::ForceExpired => "force_expired",
-            Self::FailedHitFilter => "failed_hit_filter",
-            Self::Fresh => "fresh",
-        }
+        self.into()
     }
 
     /// Whether cached asset can be served as fresh
     pub fn is_fresh(&self) -> bool {
-        match self {
-            Self::Expired | Self::ForceExpired | Self::FailedHitFilter => false,
-            Self::Fresh => true,
-        }
+        *self == HitStatus::Fresh
+    }
+
+    /// Check whether the hit status should be treated as a miss. A forced miss
+    /// is obviously treated as a miss. A hit-filter failure is treated as a
+    /// miss because we can't use the asset as an actual hit. If we treat it as
+    /// expired, we still might not be able to use it even if revalidation
+    /// succeeds.
+    pub fn is_treated_as_miss(self) -> bool {
+        matches!(self, HitStatus::ForceMiss | HitStatus::FailedHitFilter)
     }
 }
 
@@ -496,34 +522,46 @@ impl HttpCache {
     ///
     /// The `hit_status` enum allows the caller to force expire assets.
     pub fn cache_found(&mut self, meta: CacheMeta, hit_handler: HitHandler, hit_status: HitStatus) {
-        match self.phase {
-            // Stale allowed because of cache lock and then retry
-            CachePhase::CacheKey | CachePhase::Stale => {
-                self.phase = if hit_status.is_fresh() {
-                    CachePhase::Hit
-                } else {
-                    CachePhase::Stale
-                };
-                let phase = self.phase;
-                let inner = self.inner_mut();
-                let key = inner.key.as_ref().unwrap();
-                if phase == CachePhase::Stale {
-                    if let Some(lock) = inner.cache_lock.as_ref() {
-                        inner.lock = Some(lock.lock(key));
-                    }
-                }
-                inner.traces.start_hit_span(phase, hit_status);
-                inner.traces.log_meta_in_hit_span(&meta);
-                if let Some(eviction) = inner.eviction {
-                    // TODO: make access() accept CacheKey
-                    let cache_key = key.to_compact();
-                    // FIXME: get size
-                    eviction.access(&cache_key, 0, meta.0.internal.fresh_until);
-                }
-                inner.meta = Some(meta);
-                inner.body_reader = Some(hit_handler);
+        // Stale allowed because of cache lock and then retry
+        if !matches!(self.phase, CachePhase::CacheKey | CachePhase::Stale) {
+            panic!("wrong phase {:?}", self.phase)
+        }
+
+        self.phase = match hit_status {
+            HitStatus::Fresh => CachePhase::Hit,
+            HitStatus::Expired | HitStatus::ForceExpired => CachePhase::Stale,
+            HitStatus::FailedHitFilter | HitStatus::ForceMiss => self.phase,
+        };
+
+        let phase = self.phase;
+        let inner = self.inner_mut();
+
+        let key = inner.key.as_ref().unwrap();
+
+        // The cache lock might not be set for stale hit or hits treated as
+        // misses, so we need to initialize it here
+        if phase == CachePhase::Stale || hit_status.is_treated_as_miss() {
+            if let Some(lock) = inner.cache_lock.as_ref() {
+                inner.lock = Some(lock.lock(key));
             }
-            _ => panic!("wrong phase {:?}", self.phase),
+        }
+
+        if hit_status.is_treated_as_miss() {
+            // Clear the body and meta for hits that are treated as misses
+            inner.body_reader = None;
+            inner.meta = None;
+        } else {
+            // Set the metadata appropriately for legit hits
+            inner.traces.start_hit_span(phase, hit_status);
+            inner.traces.log_meta_in_hit_span(&meta);
+            if let Some(eviction) = inner.eviction {
+                // TODO: make access() accept CacheKey
+                let cache_key = key.to_compact();
+                // FIXME(PINGORA-1914): get size
+                eviction.access(&cache_key, 0, meta.0.internal.fresh_until);
+            }
+            inner.meta = Some(meta);
+            inner.body_reader = Some(hit_handler);
         }
     }
 
