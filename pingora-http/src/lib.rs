@@ -129,18 +129,18 @@ impl RequestHeader {
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid method")?;
         if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
+            // Replace backslashes with forward slashes
+            let normalized_path = p.replace('\\', "/");
+            let uri = Uri::from_maybe_shared(normalized_path)
                 .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
             req.base.uri = uri;
             // keep raw_path empty, no need to store twice
         } else {
             // put a valid utf-8 path into base for read only access
             let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
+            // Replace backslashes with forward slashes
+            let normalized_path = lossy_str.replace('\\', "/");
+            let uri = Uri::from_maybe_shared(normalized_path)
                 .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
             req.base.uri = uri;
             req.raw_path_fallback = path.to_vec();
@@ -656,6 +656,12 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"FoO: Bar\r\n");
+    }
+
+    #[test]
+    fn test_hostname() {
+        let req = RequestHeader::build("GET", b"https://example.com/foo?bar=baz", None).unwrap();
+        assert_eq!(req.uri.host(), Some("example.com"));
     }
 
     #[test]
