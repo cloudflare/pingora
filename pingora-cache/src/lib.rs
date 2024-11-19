@@ -457,9 +457,19 @@ impl HttpCache {
         }
     }
 
+    // Get the cache parent tracing span
+    pub fn get_cache_span(&self) -> Option<trace::SpanHandle> {
+        self.inner.as_ref().map(|i| i.traces.get_cache_span())
+    }
+
     // Get the cache `miss` tracing span
-    pub fn get_miss_span(&mut self) -> Option<trace::SpanHandle> {
-        self.inner.as_mut().map(|i| i.traces.get_miss_span())
+    pub fn get_miss_span(&self) -> Option<trace::SpanHandle> {
+        self.inner.as_ref().map(|i| i.traces.get_miss_span())
+    }
+
+    // Get the cache `hit` tracing span
+    pub fn get_hit_span(&self) -> Option<trace::SpanHandle> {
+        self.inner.as_ref().map(|i| i.traces.get_hit_span())
     }
 
     // shortcut to access inner, panic if phase is disabled
