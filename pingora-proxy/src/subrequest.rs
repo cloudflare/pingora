@@ -124,7 +124,7 @@ pub(crate) struct Ctx {
 
 use crate::HttpSession;
 
-pub(crate) fn create_dummy_session(parsed_session: &HttpSession) -> HttpSession {
+pub fn create_dummy_session(parsed_session: &HttpSession) -> HttpSession {
     // TODO: check if there is req body, we don't capture the body for now
     HttpSession::new_http1(Box::new(DummyIO::new(&parsed_session.to_h1_raw())))
 }
