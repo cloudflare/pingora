@@ -229,14 +229,16 @@ impl<SV> HttpProxy<SV> {
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            self.send_body_to2(
-                session,
-                Some(buffer),
-                downstream_state.is_done(),
-                client_body,
-                ctx,
-            )
-            .await?;
+            let request_done = self
+                .send_body_to2(
+                    session,
+                    Some(buffer),
+                    downstream_state.is_done(),
+                    client_body,
+                    ctx,
+                )
+                .await?;
+            downstream_state.maybe_finished(request_done);
         }
 
         let mut response_state = ResponseStateMachine::new();
