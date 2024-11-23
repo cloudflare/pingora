@@ -51,3 +51,7 @@ jobs:
       - name: Run cargo audit
         run: |
           [[ ${{ matrix.toolchain }} != 1.82.0 ]] || (cargo install cargo-audit && cargo audit)
+
+      - name: Run cargo machete
+        run: |
+          [[ ${{ matrix.toolchain }} != 1.72.0 ]] || (cargo install cargo-machete && cargo machete)
