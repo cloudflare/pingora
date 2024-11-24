@@ -188,8 +188,8 @@ pub fn hash_key(key: &str) -> HashBinary {
 impl CacheKey {
     fn primary_hasher(&self) -> Blake3 {
         let mut hasher = Blake3::new();
-        hasher.update(&self.namespace.as_bytes());
-        hasher.update(&self.primary.as_bytes());
+        hasher.update(self.namespace.as_bytes());
+        hasher.update(self.primary.as_bytes());
         hasher
     }
 
