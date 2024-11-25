@@ -18,7 +18,6 @@
 
 use super::*;
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 impl<H> SelectionAlgorithm for H
 where
@@ -31,18 +30,6 @@ where
         let mut hasher = H::default();
         hasher.write(key);
         hasher.finish()
-    }
-}
-
-/// Round Robin selection
-pub struct RoundRobin(AtomicUsize);
-
-impl SelectionAlgorithm for RoundRobin {
-    fn new() -> Self {
-        Self(AtomicUsize::new(0))
-    }
-    fn next(&self, _key: &[u8]) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed) as u64
     }
 }
 
