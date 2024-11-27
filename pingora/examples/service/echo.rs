@@ -15,6 +15,7 @@
 use crate::app::echo::{EchoApp, HttpEchoApp};
 use pingora::services::listening::Service;
 
+#[allow(dead_code)]
 pub fn echo_service() -> Service<EchoApp> {
     Service::new("Echo Service".to_string(), EchoApp)
 }
