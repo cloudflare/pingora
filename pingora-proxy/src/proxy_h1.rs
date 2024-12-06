@@ -226,15 +226,14 @@ impl<SV> HttpProxy<SV> {
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            self
-                .send_body_to_pipe(
-                    session,
-                    buffer,
-                    downstream_state.is_done(),
-                    send_permit,
-                    ctx,
-                )
-                .await?;
+            self.send_body_to_pipe(
+                session,
+                buffer,
+                downstream_state.is_done(),
+                send_permit,
+                ctx,
+            )
+            .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
