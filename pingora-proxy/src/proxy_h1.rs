@@ -226,7 +226,7 @@ impl<SV> HttpProxy<SV> {
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            let request_done = self
+            self
                 .send_body_to_pipe(
                     session,
                     buffer,
@@ -235,7 +235,6 @@ impl<SV> HttpProxy<SV> {
                     ctx,
                 )
                 .await?;
-            downstream_state.maybe_finished(request_done);
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -314,6 +313,8 @@ impl<SV> HttpProxy<SV> {
 
                 _ = tx.reserve(), if downstream_state.is_reading() && send_permit.is_err() => {
                     debug!("waiting for permit {send_permit:?}");
+                    // If tx is closed, downstream already finish its job.
+                    downstream_state.maybe_finished(tx.is_closed());
                     /* No permit, wait on more capacity to avoid starving.
                      * Otherwise this select only blocks on rx, which might send no data
                      * before the entire body is uploaded.

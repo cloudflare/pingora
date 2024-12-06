@@ -387,13 +387,15 @@ impl HttpSession {
 
     /// Whether there is no more body to read
     pub fn is_body_done(&self) -> bool {
-        self.request_body_reader.is_end_stream()
+        // Check no body in request
+        // Also check we hit end of stream if request carry body.
+        self.is_body_empty() || (self.body_read > 0 && self.request_body_reader.is_end_stream())
     }
 
-    /// Whether there is any body to read.
+    /// Whether there is any body to read. false means there no body in request.
     pub fn is_body_empty(&self) -> bool {
         self.body_read == 0
-            && (self.is_body_done()
+            && (self.request_body_reader.is_end_stream()
                 || self
                     .request_header
                     .headers
