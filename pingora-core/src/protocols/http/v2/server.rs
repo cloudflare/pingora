@@ -388,7 +388,7 @@ impl HttpSession {
     /// Whether there is no more body to read
     pub fn is_body_done(&self) -> bool {
         // Check no body in request
-        // Also check we hit end of stream if request carry body.
+        // Also check we hit end of stream
         self.is_body_empty() || self.request_body_reader.is_end_stream()
     }
 
