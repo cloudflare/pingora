@@ -81,13 +81,14 @@ reqwest = { version = "0.11", features = [
     "rustls-tls",
 ], default-features = false }
 hyper = "0.14"
+tempfile = "3.14.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["rustls"]
 openssl = ["pingora-openssl", "openssl_derived",]
 boringssl = ["pingora-boringssl", "openssl_derived",]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]

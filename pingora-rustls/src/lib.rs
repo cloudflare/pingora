@@ -24,9 +24,11 @@ use std::path::Path;
 use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
-pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
+pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream, server::WebPkiClientVerifier};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateRevocationListDer;
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -166,4 +168,17 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
     let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
+}
+
+/// Helper function to load CRLs from PEM files
+pub fn load_crls(paths: &[String]) -> Result<Vec<CertificateRevocationListDer<'static>>> {
+    let mut crls = Vec::new();
+    
+    for path in paths {
+        let crl = CertificateRevocationListDer::from_pem_file(path)
+            .explain_err(pingora_error::ErrorType::InternalError, |e| format!("Failed to load CRL: {e}"))?;
+        crls.push(crl);
+    }
+    
+    Ok(crls)
 }

@@ -13,7 +13,7 @@ members = [
     "pingora-http",
     "pingora-lru",
     "pingora-openssl",
-    "pingora-boringssl",
+    # "pingora-boringssl",
     "pingora-runtime",
     "pingora-rustls",
     "pingora-ketama",
