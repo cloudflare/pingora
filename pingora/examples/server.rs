@@ -158,10 +158,10 @@ pub fn main() {
     {
         tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     }
-    #[cfg(not(feature = "any_tls"))]
-    {
-        tls_settings = TlsSettings;
-    }
+    //#[cfg(not(feature = "any_tls"))]
+    //{
+    //    tls_settings = TlsSettings;
+    //}
 
     tls_settings.enable_h2();
     echo_service_http.add_tls_with_settings("0.0.0.0:6148", None, tls_settings);

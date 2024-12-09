@@ -52,7 +52,7 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["rustls"]
 
 #! ### Tls
 #! Tls is provided by adding one of these features. If no tls-providing feature
