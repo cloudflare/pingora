@@ -311,9 +311,9 @@ impl<SV> HttpProxy<SV> {
                 },
 
                 _ = tx.reserve(), if downstream_state.is_reading() && send_permit.is_err() => {
-                    // If tx is closed, downstream already finish its job.
+                    // If tx is closed, the upstream has already finished its job.
                     downstream_state.maybe_finished(tx.is_closed());
-                    debug!("waiting for permit {send_permit:?}, downstream closed {}", tx.is_closed());
+                    debug!("waiting for permit {send_permit:?}, upstream closed {}", tx.is_closed());
                     /* No permit, wait on more capacity to avoid starving.
                      * Otherwise this select only blocks on rx, which might send no data
                      * before the entire body is uploaded.
