@@ -82,6 +82,7 @@ reqwest = { version = "0.11", features = [
     "rustls-tls",
 ], default-features = false }
 hyper = "0.14"
+rstest = "0.23.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
