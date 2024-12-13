@@ -156,7 +156,9 @@ impl Server {
                 // graceful shutdown if there are listening sockets
                 info!("Broadcasting graceful shutdown");
                 match self.shutdown_watch.send(true) {
-                    Ok(_) => { info!("Graceful shutdown started!"); }
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
                     Err(e) => {
                         error!("Graceful shutdown broadcast failed: {e}");
                     }
@@ -172,10 +174,10 @@ impl Server {
                     let fds = fds.lock().await;
                     info!("Trying to send socks");
                     // XXX: this is blocking IO
-                    match fds.send_to_sock(
-                        self.configuration.as_ref().upgrade_sock.as_str())
-                    {
-                        Ok(_) => {info!("listener sockets sent");},
+                    match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                        Ok(_) => {
+                            info!("listener sockets sent");
+                        }
                         Err(e) => {
                             error!("Unable to send listener sockets to new process: {e}");
                             // sentry log error on fd send failure
@@ -187,7 +189,9 @@ impl Server {
                     info!("Broadcasting graceful shutdown");
                     // gracefully exiting
                     match self.shutdown_watch.send(true) {
-                        Ok(_) => { info!("Graceful shutdown started!"); }
+                        Ok(_) => {
+                            info!("Graceful shutdown started!");
+                        }
                         Err(e) => {
                             error!("Graceful shutdown broadcast failed: {e}");
                             // switch to fast shutdown
