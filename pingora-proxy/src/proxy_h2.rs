@@ -445,8 +445,7 @@ impl<SV> HttpProxy<SV> {
                         ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type =
-                            proxy_cache::range_filter::range_header_filter(req, &mut header);
+                        let range_type = self.inner.range_header_filter(req, &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }

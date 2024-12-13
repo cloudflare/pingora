@@ -18,6 +18,7 @@ use pingora_cache::{
     CacheKey, CacheMeta, ForcedInvalidationKind,
     RespCacheable::{self, *},
 };
+use proxy_cache::range_filter::{self};
 use std::time::Duration;
 
 /// The interface to control the HTTP proxy
@@ -214,6 +215,23 @@ pub trait ProxyHttp {
                 resp,
             ),
         )
+    }
+
+    /// This filter is called when cache is enabled to determine what byte range to return (in both
+    /// cache hit and miss cases) from the response body. It is only used when caching is enabled,
+    /// otherwise the upstream is responsible for any filtering. It allows users to define the range
+    /// this request is for via its return type `range_filter::RangeType`.
+    ///
+    /// It also allow users to modify the response header accordingly.
+    ///
+    /// The default implementation can handle a single-range as per [RFC7232].
+    fn range_header_filter(
+        &self,
+        req: &RequestHeader,
+        resp: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> range_filter::RangeType {
+        proxy_cache::range_filter::range_header_filter(req, resp)
     }
 
     /// Modify the request before it is sent to the upstream
