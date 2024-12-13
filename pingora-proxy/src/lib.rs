@@ -78,6 +78,7 @@ pub mod subrequest;
 
 use subrequest::Ctx as SubReqCtx;
 
+pub use proxy_cache::range_filter::{range_header_filter, RangeType};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::ProxyHttp;
 

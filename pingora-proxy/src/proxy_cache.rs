@@ -279,7 +279,7 @@ impl<SV> HttpProxy<SV> {
 
         // process range header if the cache storage supports seek
         let range_type = if seekable && !session.ignore_downstream_range {
-            range_header_filter(req, &mut header)
+            self.inner.range_header_filter(req, &mut header, ctx)
         } else {
             RangeType::None
         };
@@ -826,7 +826,7 @@ fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
 }
 
 // https://datatracker.ietf.org/doc/html/rfc7233#section-3
-pub(crate) mod range_filter {
+pub mod range_filter {
     use super::*;
     use http::header::*;
     use std::ops::Range;
