@@ -26,7 +26,7 @@ use std::os::unix::net::SocketAddr as StdUnixSockAddr;
 #[cfg(unix)]
 use tokio::net::unix::SocketAddr as TokioUnixSockAddr;
 
-/// [`SocketAddr`] is a storage type that contains either a Internet (IP address)
+/// [`SocketAddr`] is a storage type that contains either an Internet (IP address)
 /// socket address or a Unix domain socket address.
 #[derive(Debug, Clone)]
 pub enum SocketAddr {
