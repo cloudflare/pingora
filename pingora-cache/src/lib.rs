@@ -44,7 +44,7 @@ mod variance;
 
 use crate::max_file_size::MaxFileSizeMissHandler;
 pub use key::CacheKey;
-use lock::{CacheLock, LockStatus, Locked};
+use lock::{CacheKeyLock, LockStatus, Locked};
 pub use memory::MemCache;
 pub use meta::{CacheMeta, CacheMetaDefaults};
 pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
@@ -281,7 +281,7 @@ struct HttpCacheInner {
     pub eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
     pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
-    pub cache_lock: Option<&'static CacheLock>,
+    pub cache_lock: Option<&'static (dyn CacheKeyLock + Send + Sync)>,
     pub traces: trace::CacheTraceCTX,
 }
 
@@ -426,7 +426,7 @@ impl HttpCache {
         storage: &'static (dyn storage::Storage + Sync),
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
         predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
-        cache_lock: Option<&'static CacheLock>,
+        cache_lock: Option<&'static (dyn CacheKeyLock + Send + Sync)>,
     ) {
         match self.phase {
             CachePhase::Disabled(_) => {
