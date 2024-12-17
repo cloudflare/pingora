@@ -12,16 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
-use log::debug;
-use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
-use rand::seq::SliceRandom;
-use std::net::SocketAddr as InetSocketAddr;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
-
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
@@ -31,6 +21,15 @@ use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
+use async_trait::async_trait;
+use log::debug;
+use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
+use rand::seq::SliceRandom;
+use std::net::SocketAddr as InetSocketAddr;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 /// The interface to establish a L4 connection
 #[async_trait]
@@ -123,6 +122,14 @@ where
                             debug!("Setting dscp");
                             set_dscp(raw, dscp)?;
                         }
+
+                        if let Some(tweak_hook) = peer
+                            .get_peer_options()
+                            .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
+                        {
+                            tweak_hook(socket)?;
+                        }
+
                         Ok(())
                     });
                     let conn_res = match peer.connection_timeout() {
@@ -302,6 +309,8 @@ mod tests {
     use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     #[cfg(unix)]
     use tokio::net::UnixListener;
@@ -356,6 +365,26 @@ mod tests {
         peer.options.connection_timeout = Some(std::time::Duration::from_millis(1)); //1ms
         let new_session = connect(&peer, None).await;
         assert_eq!(new_session.unwrap_err().etype(), &ConnectTimedout)
+    }
+
+    #[tokio::test]
+    async fn test_tweak_hook() {
+        const INIT_FLAG: bool = false;
+
+        let flag = Arc::new(AtomicBool::new(INIT_FLAG));
+
+        let mut peer = BasicPeer::new("1.1.1.1:80");
+
+        let move_flag = Arc::clone(&flag);
+
+        peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |_| {
+            move_flag.fetch_xor(true, Ordering::SeqCst);
+            Ok(())
+        }));
+
+        connect(&peer, None).await.unwrap();
+
+        assert_eq!(!INIT_FLAG, flag.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
