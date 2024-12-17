@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use ahash::RandomState;
+use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -118,7 +119,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Fetch the key and return its value in addition to a [CacheStatus].
-    pub fn get(&self, key: &K) -> (Option<T>, CacheStatus) {
+    pub fn get<Q>(&self, key: &Q) -> (Option<T>, CacheStatus)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         let hashed_key = self.hasher.hash_one(key);
 
         if let Some(n) = self.store.get(&hashed_key) {
@@ -154,7 +159,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// Insert a key and value pair with an optional TTL into the cache.
     ///
     /// An item with zero TTL of zero will not be inserted.
-    pub fn put(&self, key: &K, value: T, ttl: Option<Duration>) {
+    pub fn put<Q>(&self, key: &Q, value: T, ttl: Option<Duration>)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         if let Some(t) = ttl {
             if t.is_zero() {
                 return;
@@ -167,7 +176,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Remove a key from the cache if it exists.
-    pub fn remove(&self, key: &K) {
+    pub fn remove<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         let hashed_key = self.hasher.hash_one(key);
         self.store.remove(&hashed_key);
     }
@@ -185,10 +198,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// This is equivalent to [MemoryCache::get] but for an arbitrary amount of keys.
-    pub fn multi_get<'a, I>(&self, keys: I) -> Vec<(Option<T>, CacheStatus)>
+    pub fn multi_get<'a, I, Q>(&self, keys: I) -> Vec<(Option<T>, CacheStatus)>
     where
-        I: Iterator<Item = &'a K>,
-        K: 'a,
+        I: Iterator<Item = &'a Q>,
+        Q: Hash + ?Sized + 'a,
+        K: Borrow<Q> + 'a,
     {
         let mut resp = Vec::with_capacity(keys.size_hint().0);
         for key in keys {
@@ -198,10 +212,14 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Same as [MemoryCache::multi_get] but returns the keys that are missing from the cache.
-    pub fn multi_get_with_miss<'a, I>(&self, keys: I) -> (Vec<(Option<T>, CacheStatus)>, Vec<&'a K>)
+    pub fn multi_get_with_miss<'a, I, Q>(
+        &self,
+        keys: I,
+    ) -> (Vec<(Option<T>, CacheStatus)>, Vec<&'a Q>)
     where
-        I: Iterator<Item = &'a K>,
-        K: 'a,
+        I: Iterator<Item = &'a Q>,
+        Q: Hash + ?Sized + 'a,
+        K: Borrow<Q> + 'a,
     {
         let mut resp = Vec::with_capacity(keys.size_hint().0);
         let mut missed = Vec::with_capacity(keys.size_hint().0 / 2);
@@ -334,5 +352,25 @@ mod tests {
         assert_eq!(resp[2].1, CacheStatus::Miss);
         assert_eq!(missed[0], &1);
         assert_eq!(missed[1], &3);
+    }
+
+    #[test]
+    fn test_get_with_mismatched_key() {
+        let cache: MemoryCache<String, ()> = MemoryCache::new(10);
+        let (res, hit) = cache.get("Hello");
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+    }
+
+    #[test]
+    fn test_put_get_with_mismatched_key() {
+        let cache: MemoryCache<String, i32> = MemoryCache::new(10);
+        let (res, hit) = cache.get("1");
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+        cache.put("1", 2, None);
+        let (res, hit) = cache.get("1");
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(hit, CacheStatus::Hit);
     }
 }
