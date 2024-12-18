@@ -16,10 +16,10 @@ cargo new load_balancer
 
 ### Include the Pingora Crate and Basic Dependencies
 
-In your project's `cargo.toml` file add the following to your dependencies
+In your project's `Cargo.toml` file add the following to your dependencies
 ```
-async-trait="0.1"
-pingora = { version = "0.3", features = [ "lb" ] }
+async-trait = "0.1"
+pingora = { version = "0.4", features = [ "lb", "openssl" ] }
 ```
 
 ### Create a pingora server
