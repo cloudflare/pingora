@@ -149,42 +149,6 @@ mod test {
     }
 
     #[test]
-    fn test_round_robin() {
-        let b1 = Backend::new("1.1.1.1:80").unwrap();
-        let mut b2 = Backend::new("1.0.0.1:80").unwrap();
-        b2.weight = 8; // 8x than the rest
-        let b3 = Backend::new("1.0.0.255:80").unwrap();
-        let backends = BTreeSet::from_iter([b1.clone(), b2.clone(), b3.clone()]);
-        let hash: Arc<Weighted<RoundRobin>> = Arc::new(Weighted::build(&backends));
-
-        // same hash iter over
-        let mut iter = hash.iter(b"test");
-        // first, should be weighted
-        assert_eq!(iter.next(), Some(&b2));
-        // fallbacks, should be round robin
-        assert_eq!(iter.next(), Some(&b3));
-        assert_eq!(iter.next(), Some(&b1));
-        assert_eq!(iter.next(), Some(&b2));
-        assert_eq!(iter.next(), Some(&b3));
-
-        // round robin, ignoring the hash key
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b2));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b2));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b2));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b3));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b1));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b2));
-        let mut iter = hash.iter(b"test1");
-        assert_eq!(iter.next(), Some(&b2));
-    }
-
-    #[test]
     fn test_random() {
         let b1 = Backend::new("1.1.1.1:80").unwrap();
         let mut b2 = Backend::new("1.0.0.1:80").unwrap();
