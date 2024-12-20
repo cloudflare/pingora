@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(buf, b"FoO: Bar\r\n");
 
         let mut resp = ResponseHeader::new(None);
-        req.insert_header("foo", "bar").unwrap();
+        resp.insert_header("foo", "bar").unwrap();
         resp.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(buf, b"foo: Bar\r\n");
 
         let mut resp = ResponseHeader::new_no_case(None);
-        req.insert_header("foo", "bar").unwrap();
+        resp.insert_header("foo", "bar").unwrap();
         resp.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
