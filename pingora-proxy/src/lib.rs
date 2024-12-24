@@ -65,7 +65,6 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
-const MAX_RETRIES: usize = 16;
 const TASK_BUFFER_SIZE: usize = 4;
 
 mod proxy_cache;
@@ -95,6 +94,7 @@ pub struct HttpProxy<SV> {
     shutdown: Notify,
     pub server_options: Option<HttpServerOptions>,
     pub downstream_modules: HttpModules,
+    max_retries: usize,
 }
 
 impl<SV> HttpProxy<SV> {
@@ -105,6 +105,7 @@ impl<SV> HttpProxy<SV> {
             shutdown: Notify::new(),
             server_options: None,
             downstream_modules: HttpModules::new(),
+            max_retries: conf.max_retries,
         }
     }
 
@@ -587,7 +588,7 @@ impl<SV> HttpProxy<SV> {
         let mut server_reuse = false;
         let mut proxy_error: Option<Box<Error>> = None;
 
-        while retries < MAX_RETRIES {
+        while retries < self.max_retries {
             retries += 1;
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
