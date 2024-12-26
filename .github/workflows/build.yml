@@ -6,6 +6,7 @@ jobs:
   pingora:
     strategy:
       matrix:
+        # nightly, MSRV, and latest stable
         toolchain: [nightly, 1.72, 1.82.0]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
@@ -51,3 +52,7 @@ jobs:
       - name: Run cargo audit
         run: |
           [[ ${{ matrix.toolchain }} != 1.82.0 ]] || (cargo install cargo-audit && cargo audit)
+
+      - name: Run cargo machete
+        run: |
+          [[ ${{ matrix.toolchain }} != 1.72.0 ]] || (cargo install cargo-machete && cargo machete)
