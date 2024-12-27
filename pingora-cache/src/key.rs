@@ -16,7 +16,7 @@
 
 use super::*;
 
-use blake2::{Blake2b, Digest};
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -62,10 +62,10 @@ pub trait CacheHashKey {
     fn combined_bin(&self) -> HashBinary {
         let key = self.primary_bin();
         if let Some(v) = self.variance_bin() {
-            let mut hasher = Blake2b128::new();
-            hasher.update(key);
-            hasher.update(v);
-            hasher.finalize().into()
+            let mut hasher = Blake3::new();
+            hasher.update(key.as_ref());
+            hasher.update(v.as_ref());
+            hasher_finalize(&hasher)
         } else {
             // if there is no variance, combined_bin should return the same as primary_bin
             key
@@ -164,37 +164,43 @@ impl CacheHashKey for CompactCacheKey {
 }
 
 /*
- * We use blake2 hashing, which is faster and more secure, to replace md5.
+ * We use blake3 hashing, which is faster and more secure, to replace blake2, md5.
  * We have not given too much thought on whether non-crypto hash can be safely
  * use because hashing performance is not critical.
  * Note: we should avoid hashes like ahash which does not have consistent output
  * across machines because it is designed purely for in memory hashtable
 */
 
-// hash output: we use 128 bits (16 bytes) hash which will map to 32 bytes hex string
-pub(crate) type Blake2b128 = Blake2b<blake2::digest::consts::U16>;
+pub(crate) type Blake3 = blake3::Hasher;
 
 /// helper function: hash str to u8
 pub fn hash_u8(key: &str) -> u8 {
-    let mut hasher = Blake2b128::new();
-    hasher.update(key);
+    let mut hasher = Blake3::new();
+    hasher.update(key.as_bytes());
     let raw = hasher.finalize();
-    raw[0]
+    raw.as_bytes()[0]
+}
+
+/// helper function: blake3 finalize to [HashBinary]
+pub fn hasher_finalize(hasher: &Hasher) -> HashBinary {
+    let mut out = [0; KEY_SIZE];
+    let mut out_reader = hasher.finalize_xof();
+    out_reader.fill(&mut out);
+    out
 }
 
 /// helper function: hash str to [HashBinary]
 pub fn hash_key(key: &str) -> HashBinary {
-    let mut hasher = Blake2b128::new();
-    hasher.update(key);
-    let raw = hasher.finalize();
-    raw.into()
+    let mut hasher = Blake3::new();
+    hasher.update(key.as_bytes());
+    hasher_finalize(&hasher)
 }
 
 impl CacheKey {
-    fn primary_hasher(&self) -> Blake2b128 {
-        let mut hasher = Blake2b128::new();
-        hasher.update(&self.namespace);
-        hasher.update(&self.primary);
+    fn primary_hasher(&self) -> Blake3 {
+        let mut hasher = Blake3::new();
+        hasher.update(self.namespace.as_bytes());
+        hasher.update(self.primary.as_bytes());
         hasher
     }
 
@@ -253,7 +259,7 @@ impl CacheHashKey for CacheKey {
         if let Some(primary_bin_override) = self.primary_bin_override {
             primary_bin_override
         } else {
-            self.primary_hasher().finalize().into()
+            hasher_finalize(&self.primary_hasher())
         }
     }
 
@@ -280,7 +286,7 @@ mod tests {
             user_tag: "1".into(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "211db469968e18af8a4c08b0aaca0901");
         assert!(key.variance().is_none());
         assert_eq!(key.combined(), hash);
         let compact = key.to_compact();
@@ -308,9 +314,9 @@ mod tests {
         assert_eq!(compact.combined(), hash);
 
         // make sure set_primary_bin_override overrides the primary key hash correctly
-        key.set_primary_bin_override(str2hex("004174d3e75a811a5b44c46b3856f3ee").unwrap());
+        key.set_primary_bin_override(str2hex("62c95cd5614e70a02be2e233e1d65c39").unwrap());
         let hash = key.primary();
-        assert_eq!(hash, "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(hash, "62c95cd5614e70a02be2e233e1d65c39");
         assert!(key.variance().is_none());
         assert_eq!(key.combined(), hash);
         let compact = key.to_compact();
@@ -329,16 +335,16 @@ mod tests {
             user_tag: "1".into(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "211db469968e18af8a4c08b0aaca0901");
         assert_eq!(key.variance().unwrap(), "00000000000000000000000000000000");
-        assert_eq!(key.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(key.combined(), "c0aa06d41a1e0d54846b7dd2a9a7d47c");
         let compact = key.to_compact();
-        assert_eq!(compact.primary(), "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(compact.primary(), "211db469968e18af8a4c08b0aaca0901");
         assert_eq!(
             compact.variance().unwrap(),
             "00000000000000000000000000000000"
         );
-        assert_eq!(compact.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(compact.combined(), "c0aa06d41a1e0d54846b7dd2a9a7d47c");
     }
 
     #[test]
@@ -346,21 +352,21 @@ mod tests {
         let key = CacheKey {
             namespace: "".into(),
             primary: "saaaad".into(),
-            primary_bin_override: str2hex("ac10f2aef117729f8dad056b3059eb7e"),
+            primary_bin_override: str2hex("211db469968e18af8a4c08b0aaca0901"),
             variance: Some([0u8; 16]),
             user_tag: "1".into(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "211db469968e18af8a4c08b0aaca0901");
         assert_eq!(key.variance().unwrap(), "00000000000000000000000000000000");
-        assert_eq!(key.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(key.combined(), "c0aa06d41a1e0d54846b7dd2a9a7d47c");
         let compact = key.to_compact();
-        assert_eq!(compact.primary(), "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(compact.primary(), "211db469968e18af8a4c08b0aaca0901");
         assert_eq!(
             compact.variance().unwrap(),
             "00000000000000000000000000000000"
         );
-        assert_eq!(compact.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(compact.combined(), "c0aa06d41a1e0d54846b7dd2a9a7d47c");
     }
 
     #[test]

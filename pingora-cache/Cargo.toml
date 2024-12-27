@@ -27,7 +27,6 @@ http = { workspace = true }
 indexmap = "1"
 once_cell = { workspace = true }
 regex = "1"
-blake2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 rmp-serde = "1"
 bytes = { workspace = true }
@@ -44,6 +43,7 @@ ahash = { workspace = true }
 hex = "0.4"
 httparse = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
+blake3 = "1.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
