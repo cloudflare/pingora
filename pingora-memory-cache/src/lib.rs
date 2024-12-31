@@ -33,6 +33,9 @@ pub enum CacheStatus {
     Expired,
     /// The key was not initially found but was found after awaiting a lock.
     LockHit,
+    /// The returned value was expired but still returned. The [Duration] is
+    /// how long it has been since its expiration time.
+    Stale(Duration),
 }
 
 impl CacheStatus {
@@ -43,14 +46,23 @@ impl CacheStatus {
             Self::Miss => "miss",
             Self::Expired => "expired",
             Self::LockHit => "lock_hit",
+            Self::Stale(_) => "stale",
         }
     }
 
     /// Returns whether this status represents a cache hit.
     pub fn is_hit(&self) -> bool {
         match self {
-            CacheStatus::Hit | CacheStatus::LockHit => true,
+            CacheStatus::Hit | CacheStatus::LockHit | CacheStatus::Stale(_) => true,
             CacheStatus::Miss | CacheStatus::Expired => false,
+        }
+    }
+
+    /// Returns the stale duration if any
+    pub fn stale(&self) -> Option<Duration> {
+        match self {
+            CacheStatus::Stale(time) => Some(*time),
+            _ => None,
         }
     }
 }
@@ -71,14 +83,20 @@ impl<T: Clone> Node<T> {
     }
 
     fn will_expire_at(&self, time: &Instant) -> bool {
-        match self.expire_on.as_ref() {
-            Some(t) => t <= time,
-            None => false,
-        }
+        self.stale_duration(time).is_some()
     }
 
     fn is_expired(&self) -> bool {
         self.will_expire_at(&Instant::now())
+    }
+
+    fn stale_duration(&self, time: &Instant) -> Option<Duration> {
+        let expire_time = self.expire_on?;
+        if &expire_time <= time {
+            Some(time.duration_since(expire_time))
+        } else {
+            None
+        }
     }
 }
 
@@ -107,8 +125,26 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
             if !n.is_expired() {
                 (Some(n.value), CacheStatus::Hit)
             } else {
-                // TODO: consider returning the staled value
                 (None, CacheStatus::Expired)
+            }
+        } else {
+            (None, CacheStatus::Miss)
+        }
+    }
+
+    /// Similar to [get], fetch the key and return its value in addition to a
+    /// [CacheStatus] but also return the value even if it is expired. When the
+    /// value is expired, the [Duration] of how long it has been stale will
+    /// also be returned.
+    pub fn get_stale(&self, key: &K) -> (Option<T>, CacheStatus) {
+        let hashed_key = self.hasher.hash_one(key);
+
+        if let Some(n) = self.store.get(&hashed_key) {
+            let stale_duration = n.stale_duration(&Instant::now());
+            if let Some(stale_duration) = stale_duration {
+                (Some(n.value), CacheStatus::Stale(stale_duration))
+            } else {
+                (Some(n.value), CacheStatus::Hit)
             }
         } else {
             (None, CacheStatus::Miss)
@@ -243,6 +279,20 @@ mod tests {
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Expired);
+    }
+
+    #[test]
+    fn test_get_stale() {
+        let cache: MemoryCache<i32, i32> = MemoryCache::new(10);
+        let (res, hit) = cache.get(&1);
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+        cache.put(&1, 2, Some(Duration::from_secs(1)));
+        sleep(Duration::from_millis(1100));
+        let (res, hit) = cache.get_stale(&1);
+        assert_eq!(res.unwrap(), 2);
+        // we slept 1100ms and the ttl is 1000ms
+        assert!(hit.stale().unwrap() >= Duration::from_millis(100));
     }
 
     #[test]
