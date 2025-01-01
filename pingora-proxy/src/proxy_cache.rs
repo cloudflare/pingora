@@ -1254,7 +1254,7 @@ impl ServeFromCache {
 
     pub fn enable_header_only(&mut self) {
         match self {
-            Self::CacheBody => *self = Self::Done, // TODO: make sure no body is read yet
+            Self::CacheBody | Self::CacheBodyMiss => *self = Self::Done, // TODO: make sure no body is read yet
             _ => *self = Self::CacheHeaderOnly,
         }
     }
