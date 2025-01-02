@@ -369,8 +369,7 @@ impl Server {
     }
 
     /// Start the server using [Self::run] and default [RunArgs].
-    #[allow(unused_mut)] // TODO: May not need to keep mut self in interface
-    pub fn run_forever(mut self) -> ! {
+    pub fn run_forever(self) -> ! {
         info!("Server starting");
 
         self.run(RunArgs::default());
