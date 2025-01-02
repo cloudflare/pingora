@@ -37,6 +37,7 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
 use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
+use crate::protocols::l4::quic::QuicConnection;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
@@ -46,6 +47,7 @@ use crate::upstreams::peer::Tracer;
 
 #[derive(Debug)]
 enum RawStream {
+    Quic(QuicConnection),
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -60,6 +62,7 @@ impl AsyncRead for RawStream {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self) {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
@@ -73,6 +76,7 @@ impl AsyncWrite for RawStream {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self) {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write(cx, buf),
@@ -84,6 +88,7 @@ impl AsyncWrite for RawStream {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self) {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_flush(cx),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
@@ -95,6 +100,7 @@ impl AsyncWrite for RawStream {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self) {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
@@ -110,6 +116,7 @@ impl AsyncWrite for RawStream {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self) {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
@@ -119,6 +126,7 @@ impl AsyncWrite for RawStream {
 
     fn is_write_vectored(&self) -> bool {
         match self {
+            RawStream::Quic(s) => s.is_write_vectored(),
             RawStream::Tcp(s) => s.is_write_vectored(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.is_write_vectored(),
@@ -130,6 +138,7 @@ impl AsyncWrite for RawStream {
 impl AsRawFd for RawStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         match self {
+            RawStream::Quic(s) => s.as_raw_fd(),
             RawStream::Tcp(s) => s.as_raw_fd(),
             RawStream::Unix(s) => s.as_raw_fd(),
         }
@@ -211,6 +220,7 @@ impl AsyncRead for RawStreamWrapper {
             unsafe {
                 let rs_wrapper = Pin::get_unchecked_mut(self);
                 match &mut rs_wrapper.stream {
+                    RawStream::Quic(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                     RawStream::Tcp(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                     RawStream::Unix(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                 }
@@ -220,6 +230,7 @@ impl AsyncRead for RawStreamWrapper {
         // Safety: Basic pin projection to get mutable stream
         let rs_wrapper = unsafe { Pin::get_unchecked_mut(self) };
         match &mut rs_wrapper.stream {
+            RawStream::Quic(s) => unsafe { Pin::new_unchecked(s).poll_read(cx, buf) },
             RawStream::Tcp(s) => {
                 loop {
                     ready!(s.poll_read_ready(cx))?;
@@ -273,6 +284,7 @@ impl AsyncWrite for RawStreamWrapper {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write(cx, buf),
@@ -284,6 +296,7 @@ impl AsyncWrite for RawStreamWrapper {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_flush(cx),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
@@ -295,6 +308,7 @@ impl AsyncWrite for RawStreamWrapper {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
@@ -310,6 +324,7 @@ impl AsyncWrite for RawStreamWrapper {
         // Safety: Basic enum pin projection
         unsafe {
             match &mut Pin::get_unchecked_mut(self).stream {
+                RawStream::Quic(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
@@ -410,6 +425,27 @@ impl Stream {
     pub(crate) fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
             self.rewind_read_buf.extend_from_slice(data);
+        }
+    }
+}
+
+impl From<QuicConnection> for Stream {
+    fn from(s: QuicConnection) -> Self {
+        Stream {
+            stream: BufStream::with_capacity(
+                BUF_READ_SIZE,
+                BUF_WRITE_SIZE,
+                RawStreamWrapper::new(RawStream::Quic(s)),
+            ),
+            rewind_read_buf: Vec::new(),
+            buffer_write: true,
+            established_ts: SystemTime::now(),
+            proxy_digest: None,
+            socket_digest: None,
+            tracer: None,
+            read_pending_time: AccumulatedDuration::new(),
+            write_pending_time: AccumulatedDuration::new(),
+            rx_ts: None,
         }
     }
 }
@@ -552,6 +588,7 @@ impl Drop for Stream {
         }
         /* use nodelay/local_addr function to detect socket status */
         let ret = match &self.stream.get_ref().stream {
+            RawStream::Quic(s) => s.io.local_addr().err(),
             RawStream::Tcp(s) => s.nodelay().err(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.local_addr().err(),

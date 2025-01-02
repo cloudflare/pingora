@@ -16,5 +16,6 @@
 
 pub mod ext;
 pub mod listener;
+pub mod quic;
 pub mod socket;
 pub mod stream;

@@ -27,17 +27,18 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::time::Duration;
-use tokio::net::TcpSocket;
+use tokio::net::{TcpSocket, UdpSocket};
 
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
+use crate::protocols::l4::quic::Listener as QuicListener;
 pub use crate::protocols::l4::stream::Stream;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
 use crate::server::ListenFds;
 
-const TCP_LISTENER_MAX_TRY: usize = 30;
-const TCP_LISTENER_TRY_STEP: Duration = Duration::from_secs(1);
+const LISTENER_MAX_TRY: usize = 30;
+const LISTENER_TRY_STEP: Duration = Duration::from_secs(1);
 // TODO: configurable backlog
 const LISTENER_BACKLOG: u32 = 65535;
 
@@ -45,14 +46,22 @@ const LISTENER_BACKLOG: u32 = 65535;
 #[derive(Clone, Debug)]
 pub enum ServerAddress {
     Tcp(String, Option<TcpSocketOptions>),
+    Udp(String, Option<UdpSocketOptions>, ServerProtocol),
     #[cfg(unix)]
     Uds(String, Option<Permissions>),
+}
+
+#[derive(Clone, Debug)]
+pub enum ServerProtocol {
+    // e.g. raw UDP, QUIC flavours/implementations/versions
+    Quic,
 }
 
 impl AsRef<str> for ServerAddress {
     fn as_ref(&self) -> &str {
         match &self {
             Self::Tcp(l, _) => l,
+            Self::Udp(l, _, _) => l,
             #[cfg(unix)]
             Self::Uds(l, _) => l,
         }
@@ -83,6 +92,21 @@ pub struct TcpSocketOptions {
     /// Enable TCP keepalive on accepted connections.
     /// See the [man page](https://man7.org/linux/man-pages/man7/tcp.7.html) for more information.
     pub tcp_keepalive: Option<TcpKeepalive>,
+    /// Specifies the server should set the following DSCP value on outgoing connections.
+    /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
+    pub dscp: Option<u8>,
+    // TODO: allow configuring reuseaddr, backlog, etc. from here?
+}
+
+/// UDP socket configuration options, this is used for setting options on
+/// listening sockets.
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub struct UdpSocketOptions {
+    /// IPV6_V6ONLY flag (if true, limit socket to IPv6 communication only).
+    /// This is mostly useful when binding to `[::]`, which on most Unix distributions
+    /// will bind to both IPv4 and IPv6 addresses by default.
+    pub ipv6_only: Option<bool>,
     /// Specifies the server should set the following DSCP value on outgoing connections.
     /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
     pub dscp: Option<u8>,
@@ -172,8 +196,48 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
     Ok(())
 }
 
+// currently, these options can only apply on sockets prior to calling bind()
+fn apply_udp_socket_options(
+    socket_ref: &socket2::Socket,
+    opt: Option<&UdpSocketOptions>,
+) -> Result<()> {
+    let Some(opt) = opt else {
+        return Ok(());
+    };
+
+    if let Some(ipv6_only) = opt.ipv6_only {
+        socket_ref
+            .set_only_v6(ipv6_only)
+            .or_err(BindError, "failed to set IPV6_V6ONLY")?;
+    }
+
+    #[cfg(unix)]
+    let raw = socket_ref.as_raw_fd();
+    #[cfg(windows)]
+    let raw = socket_ref.as_raw_socket();
+
+    if let Some(dscp) = opt.dscp {
+        set_dscp(raw, dscp)?;
+    }
+    Ok(())
+}
+
 fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
     match address {
+        ServerAddress::Udp(_, _, proto) => {
+            #[cfg(unix)]
+            let std_listener_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            #[cfg(windows)]
+            let std_listener_socket = unsafe { std::net::UdpSocket::from_raw_socket(fd as u64) };
+
+            match proto {
+                ServerProtocol::Quic => {
+                    let socket = UdpSocket::from_std(std_listener_socket)
+                        .or_err_with(BindError, || format!("Listen() failed on {address:?}"))?;
+                    Ok(QuicListener::from(socket).into())
+                }
+            }
+        }
         #[cfg(unix)]
         ServerAddress::Uds(addr, perm) => {
             let std_listener = unsafe { StdUnixListener::from_raw_fd(fd) };
@@ -233,13 +297,69 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
                     break Err(e).or_err_with(BindError, || format!("bind() failed on {addr}"));
                 }
                 try_count += 1;
-                if try_count >= TCP_LISTENER_MAX_TRY {
+                if try_count >= LISTENER_MAX_TRY {
                     break Err(e).or_err_with(BindError, || {
                         format!("bind() failed, after retries, {addr} still in use")
                     });
                 }
                 warn!("{addr} is in use, will try again");
-                tokio::time::sleep(TCP_LISTENER_TRY_STEP).await;
+                tokio::time::sleep(LISTENER_TRY_STEP).await;
+            }
+        }
+    }
+}
+
+async fn bind_udp_socket(addr: &str, opt: Option<UdpSocketOptions>) -> Result<std::net::UdpSocket> {
+    let mut try_count = 0;
+    loop {
+        let sock_addr = addr
+            .to_socket_addrs() // NOTE: this could invoke a blocking network lookup
+            .or_err_with(BindError, || format!("Invalid listen address {addr}"))?
+            .next() // take the first one for now
+            .unwrap(); // assume there is always at least one
+
+        let ty = socket2::Type::DGRAM;
+        let listener_socket = match sock_addr {
+            SocketAddr::V4(_) => socket2::Socket::new(
+                socket2::Domain::IPV4,
+                ty.nonblocking(),
+                Some(socket2::Protocol::UDP),
+            ),
+            SocketAddr::V6(_) => socket2::Socket::new(
+                socket2::Domain::IPV6,
+                ty.nonblocking(),
+                Some(socket2::Protocol::UDP),
+            ),
+        }
+        .or_err_with(BindError, || format!("fail to create address {sock_addr}"))?;
+
+        // NOTE: this is to preserve the current UdpListener::bind() behavior.
+        // We have a few tests relying on this behavior to allow multiple identical
+        // test servers to coexist.
+        listener_socket
+            .set_reuse_address(true)
+            .or_err(BindError, "fail to set_reuseaddr(true)")?;
+
+        apply_udp_socket_options(&listener_socket, opt.as_ref())?;
+
+        listener_socket
+            .set_nonblocking(true) // required using tokio::net::UdpSocket::from_std(socket)
+            .or_err(BindError, "fail to set_nonblocking(true)")?;
+
+        match listener_socket.bind(&(sock_addr.into())) {
+            Ok(()) => break Ok(listener_socket.into()),
+            Err(e) => {
+                if e.kind() != ErrorKind::AddrInUse {
+                    break Err(e).or_err_with(BindError, || format!("bind() failed on {addr}"));
+                }
+                try_count += 1;
+                if try_count >= LISTENER_MAX_TRY {
+                    break Err(e).or_err_with(BindError, || {
+                        format!("bind() failed, after retries, {addr} still in use")
+                    });
+                }
+                warn!("{addr} is in use, will try again");
+                tokio::time::sleep(LISTENER_TRY_STEP).await;
             }
         }
     }
@@ -250,6 +370,16 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
         #[cfg(unix)]
         ServerAddress::Uds(l, perm) => uds::bind(l, perm.clone()),
         ServerAddress::Tcp(l, opt) => bind_tcp(l, opt.clone()).await,
+        ServerAddress::Udp(l, opt, proto) => match proto {
+            ServerProtocol::Quic => {
+                let std_socket = bind_udp_socket(l, opt.clone())
+                    .await
+                    .or_err(BindError, "bind() failed")?;
+                let tokio_socket = UdpSocket::try_from(std_socket)
+                    .or_err(BindError, "failed to create UdpSocket")?;
+                Ok(Listener::from(QuicListener::from(tokio_socket)))
+            }
+        },
     }
 }
 

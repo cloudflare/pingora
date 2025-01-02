@@ -60,3 +60,14 @@ async fn test_uds() {
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_udp() {
+    use log::info;
+    use std::time::Duration;
+
+    utils::init();
+
+    info!("Startup completed..");
+    tokio::time::sleep(Duration::from_secs(300)).await;
+}

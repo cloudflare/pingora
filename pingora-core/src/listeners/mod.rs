@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use pingora_error::Result;
 use std::{fs::Permissions, sync::Arc};
 
-use l4::{ListenerEndpoint, Stream as L4Stream};
+use l4::{ListenerEndpoint, ServerProtocol, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
 pub use crate::protocols::tls::ALPN;
@@ -152,6 +152,11 @@ impl Listeners {
         let mut listeners = Self::new();
         listeners.add_tls(addr, cert_path, key_path)?;
         Ok(listeners)
+    }
+
+    /// Add a QUIC endpoint to `self`.
+    pub fn add_quic(&mut self, addr: &str) {
+        self.add_address(ServerAddress::Udp(addr.into(), None, ServerProtocol::Quic));
     }
 
     /// Add a TCP endpoint to `self`.

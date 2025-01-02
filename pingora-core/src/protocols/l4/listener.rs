@@ -24,14 +24,22 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 use crate::protocols::digest::{GetSocketDigest, SocketDigest};
+use crate::protocols::l4::quic::Listener as QuicListener;
 use crate::protocols::l4::stream::Stream;
 
 /// The type for generic listener for both TCP and Unix domain socket
 #[derive(Debug)]
 pub enum Listener {
+    Quic(QuicListener),
     Tcp(TcpListener),
     #[cfg(unix)]
     Unix(UnixListener),
+}
+
+impl From<QuicListener> for Listener {
+    fn from(s: QuicListener) -> Self {
+        Self::Quic(s)
+    }
 }
 
 impl From<TcpListener> for Listener {
@@ -51,6 +59,7 @@ impl From<UnixListener> for Listener {
 impl AsRawFd for Listener {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         match &self {
+            Self::Quic(l) => l.get_raw_fd(),
             Self::Tcp(l) => l.as_raw_fd(),
             Self::Unix(l) => l.as_raw_fd(),
         }
@@ -69,7 +78,29 @@ impl AsRawSocket for Listener {
 impl Listener {
     /// Accept a connection from the listening endpoint
     pub async fn accept(&self) -> io::Result<Stream> {
+        // TODO: changing to &mut self would help to simplify connection state locks for Quic
+        // not required for TCP/UDS, feasible to change to unique (mut) access?
         match &self {
+            Self::Quic(l) => {
+                // TODO: update digest when peer_addr changes;
+                // a Quic connection supports IP address switching;
+                // for multi-path a primary peer_addr needs to be selected
+                l.accept().await.map(|(stream, peer_addr)| {
+                    let mut s: Stream = stream.into();
+
+                    #[cfg(unix)]
+                    let digest = SocketDigest::from_raw_fd(s.as_raw_fd());
+                    #[cfg(windows)]
+                    let digest = SocketDigest::from_raw_socket(stream.as_raw_socket());
+
+                    digest
+                        .peer_addr
+                        .set(Some(peer_addr.into()))
+                        .expect("newly created OnceCell must be empty");
+                    s.set_socket_digest(digest);
+                    s
+                })
+            }
             Self::Tcp(l) => l.accept().await.map(|(stream, peer_addr)| {
                 let mut s: Stream = stream.into();
                 #[cfg(unix)]

@@ -86,6 +86,8 @@ fn entry_point(opt: Option<Opt>) {
     tls_settings.enable_h2();
     listeners.add_tls_with_settings("0.0.0.0:6146", None, tls_settings);
 
+    listeners.add_quic("0.0.0.0:6147");
+
     let echo_service_http =
         Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
 
