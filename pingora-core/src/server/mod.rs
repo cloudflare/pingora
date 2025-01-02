@@ -60,9 +60,15 @@ pub type ShutdownWatch = watch::Receiver<bool>;
 #[cfg(unix)]
 pub type ListenFds = Arc<Mutex<Fds>>;
 
+/// The type of shutdown process that has been requested.
 pub enum ShutdownSignal {
+    /// Send file descriptors to the new process before starting runtime shutdown with
+    /// [ServerConf::graceful_shutdown_timeout_seconds] timeout.
     GracefulUpgrade,
+    /// Wait for [ServerConf::grace_period_seconds] before starting runtime shutdown with
+    /// [ServerConf::graceful_shutdown_timeout_seconds] timeout.
     GracefulTerminate,
+    /// Shutdown with no timeout for runtime shutdown.
     FastShutdown,
 }
 
