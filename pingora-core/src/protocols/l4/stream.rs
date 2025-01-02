@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use log::{debug, error};
 
+use parking_lot::Mutex;
 use pingora_error::{ErrorType::*, OrErr, Result};
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
@@ -40,8 +41,8 @@ use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::l4::quic::QuicConnection;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-    TimingDigest, UniqueID, UniqueIDType,
+    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, QuicConnectionState,
+    Shutdown, SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
 };
 use crate::upstreams::peer::Tracer;
 
@@ -521,6 +522,16 @@ impl UniqueID for Stream {
     }
 }
 
+impl ConnectionState for Stream {
+    fn quic_connection_state(&self) -> Option<Arc<Mutex<QuicConnectionState>>> {
+        match &self.stream.get_ref().stream {
+            RawStream::Quic(s) => s.quic_connection_state(),
+            RawStream::Tcp(_) => None,
+            RawStream::Unix(_) => None,
+        }
+    }
+}
+
 impl Ssl for Stream {}
 
 #[async_trait]
@@ -588,7 +599,7 @@ impl Drop for Stream {
         }
         /* use nodelay/local_addr function to detect socket status */
         let ret = match &self.stream.get_ref().stream {
-            RawStream::Quic(s) => s.io.local_addr().err(),
+            RawStream::Quic(s) => s.local_addr().err(),
             RawStream::Tcp(s) => s.nodelay().err(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.local_addr().err(),

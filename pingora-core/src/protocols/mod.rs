@@ -30,6 +30,7 @@ pub use l4::ext::TcpKeepalive;
 pub use tls::ALPN;
 
 use async_trait::async_trait;
+use l4::quic::ConnectionState as QuicConnectionState;
 use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -50,6 +51,13 @@ pub trait UniqueID {
     /// The ID returned should be unique among all existing connections of the same type.
     /// But ID can be recycled after a connection is shutdown.
     fn id(&self) -> UniqueIDType;
+}
+
+/// Interface to get the raw connection for e.g. non-connection based network protocols like UDP/QUIC
+pub trait ConnectionState {
+    fn quic_connection_state(&self) -> Option<Arc<Mutex<QuicConnectionState>>> {
+        None
+    }
 }
 
 /// Interface to get TLS info
@@ -90,6 +98,7 @@ pub trait IO:
     + AsyncWrite
     + Shutdown
     + UniqueID
+    + ConnectionState
     + Ssl
     + GetTimingDigest
     + GetProxyDigest
@@ -111,6 +120,7 @@ impl<
             + AsyncWrite
             + Shutdown
             + UniqueID
+            + ConnectionState
             + Ssl
             + GetTimingDigest
             + GetProxyDigest
@@ -149,6 +159,7 @@ mod ext_io_impl {
             0
         }
     }
+    impl ConnectionState for Mock {}
     impl Ssl for Mock {}
     impl GetTimingDigest for Mock {
         fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
@@ -208,6 +219,7 @@ mod ext_io_impl {
             0
         }
     }
+    impl ConnectionState for DuplexStream {}
     impl Ssl for DuplexStream {}
     impl GetTimingDigest for DuplexStream {
         fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
@@ -238,17 +250,17 @@ pub(crate) trait ConnSockReusable {
     fn check_sock_match<V: AsRawSocket>(&self, sock: V) -> bool;
 }
 
+use crate::protocols::tls::TlsRef;
 use l4::socket::SocketAddr;
 use log::{debug, error};
 #[cfg(unix)]
 use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
+use parking_lot::Mutex;
 #[cfg(unix)]
 use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::{net::SocketAddr as InetSocketAddr, path::Path};
-
-use crate::protocols::tls::TlsRef;
 
 #[cfg(unix)]
 impl ConnFdReusable for SocketAddr {

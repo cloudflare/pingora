@@ -18,8 +18,8 @@ use core::task::{Context, Poll};
 use pingora_cache::lock::WritePermit;
 use pingora_core::protocols::raw_connect::ProxyDigest;
 use pingora_core::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl, TimingDigest,
-    UniqueID, UniqueIDType,
+    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl,
+    TimingDigest, UniqueID, UniqueIDType,
 };
 use std::io::Cursor;
 use std::sync::Arc;
@@ -73,6 +73,8 @@ impl UniqueID for DummyIO {
         0 // placeholder
     }
 }
+
+impl ConnectionState for DummyIO {}
 
 impl Ssl for DummyIO {}
 

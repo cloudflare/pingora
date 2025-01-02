@@ -22,7 +22,8 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{tls::TlsRef, Stream};
+use crate::protocols::{tls::TlsRef, ConnectionState, Stream};
+use crate::protocols::l4::quic::handshake as quic_handshake;
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -112,6 +113,9 @@ impl UninitializedStream {
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
+        } else if let Some(state) = self.l4.quic_connection_state() {
+            quic_handshake(state)?;
+            Ok(Box::new(self.l4))
         } else {
             Ok(Box::new(self.l4))
         }

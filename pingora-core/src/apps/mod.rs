@@ -23,8 +23,9 @@ use log::{debug, error};
 use std::future::poll_fn;
 use std::sync::Arc;
 
-use crate::protocols::http::v2::server;
-use crate::protocols::http::ServerSession;
+use crate::protocols::http::v2::server as h2_server;
+use crate::protocols::http::v3::server as h3_server;
+use crate::protocols::http::{HttpVersion, ServerSession};
 use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
@@ -57,12 +58,13 @@ pub trait ServerApp {
     /// This callback will be called once after the service stops listening to its endpoints.
     async fn cleanup(&self) {}
 }
+
 #[non_exhaustive]
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
-    /// Use HTTP/2 for plaintext.
-    pub h2c: bool,
+    /// HTTP version to use.
+    pub http_version: HttpVersion,
 }
 
 /// This trait defines the interface of an HTTP application.
@@ -84,7 +86,15 @@ pub trait HttpServerApp {
     /// every time a new HTTP/2 **connection** needs to be established.
     ///
     /// A `None` means to use the built-in default options. See [`server::H2Options`] for more details.
-    fn h2_options(&self) -> Option<server::H2Options> {
+    fn h2_options(&self) -> Option<h2_server::H2Options> {
+        None
+    }
+
+    /// Provide options on how HTTP/3 connection should be established. This function will be called
+    /// every time a new HTTP/3 **connection** needs to be established.
+    ///
+    /// A `None` means to use the built-in default options. See [`server::H2Options`] for more details.
+    fn h3_options(&self) -> Option<&h3_server::H3Options> {
         None
     }
 
@@ -109,10 +119,17 @@ where
         mut stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
-        let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
+        let mut http_version = self
+            .server_options()
+            .as_ref()
+            .map_or(HttpVersion::V1, |o| o.http_version);
+
+        if stream.quic_connection_state().is_some() {
+            http_version = HttpVersion::V3;
+        }
 
         // try to read h2 preface
-        if h2c {
+        if matches!(http_version, HttpVersion::V2) {
             let mut buf = [0u8; H2_PREFACE.len()];
             let peeked = stream
                 .try_peek(&mut buf)
@@ -126,10 +143,30 @@ where
             // not all streams support peeking
             if peeked {
                 // turn off h2c (use h1) if h2 preface doesn't exist
-                h2c = buf == H2_PREFACE;
+                http_version = match buf == H2_PREFACE {
+                    true => HttpVersion::V2,
+                    false => HttpVersion::V1,
+                };
             }
         }
-        if h2c || matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
+
+        // TODO: logic for Http3 to Http2/1 fallback. Requires Http2/1 listener being present.
+        if matches!(http_version, HttpVersion::V3)
+            && (matches!(stream.selected_alpn_proto(), Some(ALPN::H1))
+                || matches!(stream.selected_alpn_proto(), Some(ALPN::H2))
+                || matches!(stream.selected_alpn_proto(), Some(ALPN::H2H1)))
+        {
+            error!(
+                "Server is configured for {:?}. Received ALPN: {}. \
+             Fallback from Http3 to Http2/1 is currently not supported.",
+                http_version,
+                stream.selected_alpn_proto().unwrap()
+            )
+        }
+
+        if matches!(http_version, HttpVersion::V2)
+            || matches!(stream.selected_alpn_proto(), Some(ALPN::H2))
+        {
             // create a shared connection digest
             let digest = Arc::new(Digest {
                 ssl_digest: stream.get_ssl_digest(),
@@ -140,7 +177,7 @@ where
             });
 
             let h2_options = self.h2_options();
-            let h2_conn = server::handshake(stream, h2_options).await;
+            let h2_conn = h2_server::handshake(stream, h2_options).await;
             let mut h2_conn = match h2_conn {
                 Err(e) => {
                     error!("H2 handshake error {e}");
@@ -160,7 +197,7 @@ where
                             .await.map_err(|e| error!("H2 error waiting for shutdown {e}"));
                         return None;
                     }
-                    h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream
+                    h2_stream = h2_server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream
                 };
                 let h2_stream = match h2_stream {
                     Err(e) => {
@@ -175,6 +212,57 @@ where
                 let shutdown = shutdown.clone();
                 pingora_runtime::current_handle().spawn(async move {
                     app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
+                        .await;
+                });
+            }
+        } else if matches!(http_version, HttpVersion::V3) {
+            // create a shared connection digest
+            let digest = Arc::new(Digest {
+                ssl_digest: stream.get_ssl_digest(),
+                // TODO: log h3 handshake time
+                timing_digest: stream.get_timing_digest(),
+                proxy_digest: stream.get_proxy_digest(),
+                socket_digest: stream.get_socket_digest(),
+            });
+
+            let h3_options = self.h3_options();
+            let h3_conn = h3_server::handshake(stream, h3_options).await;
+            let mut h3_conn = match h3_conn {
+                Err(e) => {
+                    error!("H3 handshake error {e}");
+                    return None;
+                }
+                Ok(c) => c,
+            };
+
+            let mut shutdown = shutdown.clone();
+            loop {
+                // this loop ends when the client decides to close the h3 conn
+                // TODO: add a timeout?
+                let h3_stream = tokio::select! {
+                    _ = shutdown.changed() => {
+                        h3_conn.graceful_shutdown().await;
+                        let _ = poll_fn(|cx| h3_conn.poll_closed(cx))
+                            .await.map_err(|e| error!("H3 error waiting for shutdown {e}"));
+                        return None;
+                    }
+                    h3_stream = h3_server::HttpSession::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream
+                };
+
+                let h3_stream = match h3_stream {
+                    Err(e) => {
+                        // It is common for the client to just disconnect TCP without properly
+                        // closing H2. So we don't log the errors here
+                        debug!("H3 error when accepting new stream {e}");
+                        return None;
+                    }
+                    Ok(s) => s?, // None means the connection is ready to be closed
+                };
+
+                let app = self.clone();
+                let shutdown = shutdown.clone();
+                pingora_runtime::current_handle().spawn(async move {
+                    app.process_new_http(ServerSession::new_http3(h3_stream), &shutdown)
                         .await;
                 });
             }
