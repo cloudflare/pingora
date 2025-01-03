@@ -74,7 +74,7 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
-pub mod subrequest;
+mod subrequest;
 
 use subrequest::Ctx as SubReqCtx;
 
