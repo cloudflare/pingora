@@ -122,7 +122,7 @@ impl Http2Session {
     }
 
     /// Write a request body chunk
-    pub fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+    pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
@@ -133,7 +133,9 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        write_body(body_writer, data, end).map_err(|e| self.handle_err(e))?;
+        super::write_body(body_writer, data, end)
+            .await
+            .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
         Ok(())
     }
@@ -402,15 +404,6 @@ impl Http2Session {
         }
         e
     }
-}
-
-/// A helper function to write the request body
-pub fn write_body(send_body: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
-    let data_len = data.len();
-    send_body.reserve_capacity(data_len);
-    send_body
-        .send_data(data, end)
-        .or_err(WriteError, "while writing h2 request body")
 }
 
 /* helper functions */

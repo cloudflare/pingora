@@ -16,7 +16,7 @@ use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
-use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
+use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
 // add scheme and authority as required by h2 lib
 fn update_h2_scheme_authority(
@@ -150,7 +150,7 @@ impl<SV> HttpProxy<SV> {
 
         if !send_end_stream && body_empty {
             // send END_STREAM on empty DATA frame
-            match client_session.write_request_body(Bytes::new(), true) {
+            match client_session.write_request_body(Bytes::new(), true).await {
                 Ok(()) => debug!("sent empty DATA frame to h2"),
                 Err(e) => {
                     return (false, Some(e.into_up()));
@@ -547,11 +547,15 @@ impl<SV> HttpProxy<SV> {
 
         if let Some(data) = data {
             debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
+            write_body(client_body, data, end_of_body)
+                .await
+                .map_err(|e| e.into_up())?;
         } else {
             debug!("Read downstream body done");
             /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
+            write_body(client_body, Bytes::new(), true)
+                .await
+                .map_err(|e| e.into_up())?;
         }
 
         Ok(end_of_body)

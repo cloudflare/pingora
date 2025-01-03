@@ -14,5 +14,33 @@
 
 //! HTTP/2 implementation
 
+use crate::{Error, ErrorType::*, OrErr, Result};
+use bytes::Bytes;
+use h2::SendStream;
+
 pub mod client;
 pub mod server;
+
+/// A helper function to write the body of h2 streams.
+pub async fn write_body(writer: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
+    let mut remaining = data;
+    // Note: this loop allows to send the data frame even if data is empty in order to signal
+    // END_OF_STREAM to the peer.
+    loop {
+        writer.reserve_capacity(remaining.len());
+        match std::future::poll_fn(|cx| writer.poll_capacity(cx)).await {
+            None => return Error::e_explain(H2Error, "cannot reserve capacity"),
+            Some(ready) => {
+                let n = ready.or_err(H2Error, "while waiting for capacity")?;
+                let remaining_size = remaining.len();
+                let data_to_send = remaining.split_to(std::cmp::min(remaining_size, n));
+                writer
+                    .send_data(data_to_send, remaining.is_empty() && end)
+                    .or_err(WriteError, "while writing h2 request body")?;
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}

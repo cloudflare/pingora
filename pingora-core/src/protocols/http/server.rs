@@ -143,7 +143,7 @@ impl Session {
                 s.write_body(&data).await?;
                 Ok(())
             }
-            Self::H2(s) => s.write_body(data, end),
+            Self::H2(s) => s.write_body(data, end).await,
         }
     }
 
@@ -175,7 +175,7 @@ impl Session {
     pub async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         match self {
             Self::H1(s) => s.response_duplex_vec(tasks).await,
-            Self::H2(s) => s.response_duplex_vec(tasks),
+            Self::H2(s) => s.response_duplex_vec(tasks).await,
         }
     }
 
