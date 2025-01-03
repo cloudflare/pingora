@@ -62,7 +62,7 @@ impl HttpSession {
                 h1.write_body(&data).await?;
                 Ok(())
             }
-            HttpSession::H2(h2) => h2.write_request_body(data, end),
+            HttpSession::H2(h2) => h2.write_request_body(data, end).await,
         }
     }
 
