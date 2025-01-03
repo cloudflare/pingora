@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use log::{debug, error};
 
-use parking_lot::Mutex;
 use pingora_error::{ErrorType::*, OrErr, Result};
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
@@ -38,17 +37,17 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
 use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
-use crate::protocols::l4::quic::QuicConnection;
+use crate::protocols::l4::quic::Connection;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
-    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, QuicConnectionState,
+    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek,
     Shutdown, SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
 };
 use crate::upstreams::peer::Tracer;
 
 #[derive(Debug)]
 enum RawStream {
-    Quic(QuicConnection),
+    Quic(Connection),
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -430,8 +429,8 @@ impl Stream {
     }
 }
 
-impl From<QuicConnection> for Stream {
-    fn from(s: QuicConnection) -> Self {
+impl From<Connection> for Stream {
+    fn from(s: Connection) -> Self {
         Stream {
             stream: BufStream::with_capacity(
                 BUF_READ_SIZE,
@@ -523,11 +522,18 @@ impl UniqueID for Stream {
 }
 
 impl ConnectionState for Stream {
-    fn quic_connection_state(&self) -> Option<Arc<Mutex<QuicConnectionState>>> {
-        match &self.stream.get_ref().stream {
+    fn quic_connection_state(&mut self) -> Option<&mut Connection> {
+        match &mut self.stream.get_mut().stream {
             RawStream::Quic(s) => s.quic_connection_state(),
             RawStream::Tcp(_) => None,
             RawStream::Unix(_) => None,
+        }
+    }
+    fn is_quic_connection(&self) -> bool {
+        match &self.stream.get_ref().stream {
+            RawStream::Quic(s) => s.is_quic_connection(),
+            RawStream::Tcp(_) => false,
+            RawStream::Unix(_) => false
         }
     }
 }

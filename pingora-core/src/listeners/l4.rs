@@ -234,7 +234,7 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
                 ServerProtocol::Quic => {
                     let socket = UdpSocket::from_std(std_listener_socket)
                         .or_err_with(BindError, || format!("Listen() failed on {address:?}"))?;
-                    Ok(QuicListener::from(socket).into())
+                    Ok(QuicListener::try_from(socket)?.into())
                 }
             }
         }
@@ -377,7 +377,7 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
                     .or_err(BindError, "bind() failed")?;
                 let tokio_socket = UdpSocket::try_from(std_socket)
                     .or_err(BindError, "failed to create UdpSocket")?;
-                Ok(Listener::from(QuicListener::from(tokio_socket)))
+                Ok(Listener::from(QuicListener::try_from(tokio_socket)?))
             }
         },
     }

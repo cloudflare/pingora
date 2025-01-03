@@ -30,7 +30,6 @@ pub use l4::ext::TcpKeepalive;
 pub use tls::ALPN;
 
 use async_trait::async_trait;
-use l4::quic::ConnectionState as QuicConnectionState;
 use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -55,8 +54,11 @@ pub trait UniqueID {
 
 /// Interface to get the raw connection for e.g. non-connection based network protocols like UDP/QUIC
 pub trait ConnectionState {
-    fn quic_connection_state(&self) -> Option<Arc<Mutex<QuicConnectionState>>> {
+    fn quic_connection_state(&mut self) -> Option<&mut Connection> {
         None
+    }
+    fn is_quic_connection(&self) -> bool {
+        false
     }
 }
 
@@ -255,12 +257,12 @@ use l4::socket::SocketAddr;
 use log::{debug, error};
 #[cfg(unix)]
 use nix::sys::socket::{getpeername, SockaddrStorage, UnixAddr};
-use parking_lot::Mutex;
 #[cfg(unix)]
 use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::{net::SocketAddr as InetSocketAddr, path::Path};
+use crate::protocols::l4::quic::Connection;
 
 #[cfg(unix)]
 impl ConnFdReusable for SocketAddr {

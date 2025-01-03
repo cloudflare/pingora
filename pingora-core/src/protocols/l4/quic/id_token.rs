@@ -34,14 +34,15 @@ use std::net;
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
+pub(super) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
+    // TODO: implement token generation/validation using crypto
     let mut token = Vec::new();
 
     token.extend_from_slice(b"quiche");
 
     let addr = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+        net::IpAddr::V4(a) => a.octets().to_vec(),
+        net::IpAddr::V6(a) => a.octets().to_vec(),
     };
 
     token.extend_from_slice(&addr);
@@ -57,9 +58,10 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-fn validate_token<'a>(
+pub(super) fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
 ) -> Option<quiche::ConnectionId<'a>> {
+    // TODO: implement token generation/validation using crypto
     if token.len() < 6 {
         return None;
     }
@@ -71,8 +73,8 @@ fn validate_token<'a>(
     let token = &token[6..];
 
     let addr = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+        net::IpAddr::V4(a) => a.octets().to_vec(),
+        net::IpAddr::V6(a) => a.octets().to_vec(),
     };
 
     if token.len() < addr.len() || &token[..addr.len()] != addr.as_slice() {

@@ -99,14 +99,7 @@ pub async fn send_to(
     segment_size: usize, pacing: bool, enable_gso: bool,
 ) -> io::Result<usize> {
     if pacing && enable_gso {
-        match send_to_gso_pacing(socket, buf, send_info, segment_size) {
-            Ok(v) => {
-                return Ok(v);
-            },
-            Err(e) => {
-                return Err(e);
-            },
-        }
+        return send_to_gso_pacing(socket, buf, send_info, segment_size)
     }
 
     let mut off = 0;
@@ -156,8 +149,8 @@ pub fn set_txtime_sockopt(sock: &tokio::net::UdpSocket) -> io::Result<()> {
     use nix::sys::socket::setsockopt;
     use nix::sys::socket::sockopt::TxTime;
 
-    let config = nix::libc::sock_txtime {
-        clockid: nix::libc::CLOCK_MONOTONIC,
+    let config = libc::sock_txtime {
+        clockid: libc::CLOCK_MONOTONIC,
         flags: 0,
     };
 
