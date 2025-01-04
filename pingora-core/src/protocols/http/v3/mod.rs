@@ -14,4 +14,61 @@
 
 //! HTTP/3 implementation
 
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
+use log::warn;
+use quiche::h3::{Header, NameValue};
+use pingora_http::{RequestHeader, ResponseHeader};
+
 pub mod server;
+pub mod nohash;
+
+pub fn event_to_request_headers(list: &Vec<Header>) -> RequestHeader {
+    let (mut parts, _) = Request::new(()).into_parts();
+    let mut uri = Uri::builder();
+    let mut headers = HeaderMap::new();
+
+    for h in list {
+        match h.name() {
+            b":scheme" => uri = uri.scheme(h.value()),
+            b":authority" => uri = uri.authority(h.value()),
+            b":path" => uri = uri.path_and_query(h.value()),
+            b":method" => match h.value().try_into() {
+                Ok(v) => parts.method = v,
+                Err(_) => {
+                    warn!("Failed to parse method from input: {:?}", h.value())
+                }
+            },
+            _ => {
+                match HeaderName::from_bytes(h.name()) {
+                    Ok(k) => match HeaderValue::from_bytes(h.value()) {
+                        Ok(v) => {
+                            headers.append(k, v);
+                        }
+                        Err(_) => {
+                            warn!("Failed to parse header value from input: {:?}", h.value())
+                        }
+                    },
+                    Err(_) => {
+                        warn!("Failed to parse header name input: {:?}", h.name())
+                    }
+                };
+            }
+        }
+    }
+
+    parts.version = Version::HTTP_3;
+    parts.uri = uri.build().unwrap(); // TODO: use result
+    parts.headers = headers;
+    parts.into()
+}
+
+#[allow(unused)] // TODO: remove
+fn response_headers_to_event(resp: &ResponseHeader) -> Vec<Header> {
+    let mut qheaders: Vec<Header> = Vec::with_capacity(resp.headers.len() + 1);
+    qheaders.push(Header::new(b":status", resp.status.as_str().as_bytes()));
+
+    for (k, v) in &resp.headers {
+        qheaders.push(Header::new(k.as_str().as_bytes(), v.as_bytes()))
+    }
+    qheaders
+}

@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
-use quiche::{Config, ConnectionId, Header, RecvInfo, Type};
+use quiche::{Config, ConnectionId, Header, RecvInfo, Stats, Type};
 use ring::hmac::Key;
 use ring::rand::SystemRandom;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -16,8 +16,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
-use pingora_error::{BError, Error, ErrorType};
+use pingora_error::{BError, Error, ErrorType, Result};
 use quiche::Connection as QuicheConnection;
+use tokio::task::JoinHandle;
 use settings::Settings as QuicSettings;
 
 #[allow(unused)] // TODO: remove
@@ -27,6 +28,7 @@ pub(crate) mod tls_handshake;
 mod settings;
 
 use crate::protocols::ConnectionState;
+use crate::protocols::l4::quic::sendto::send_to;
 use crate::protocols::l4::stream::Stream as L4Stream;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
@@ -79,9 +81,11 @@ pub struct IncomingState {
 
 pub struct EstablishedState {
     socket: Arc<UdpSocket>,
-    connection: Arc<Mutex<QuicheConnection>>,
-    tx_notify: Arc<Notify>,
-    rx_waker: Arc<Mutex<Option<Waker>>>
+    tx_handle: JoinHandle<Result<()>>,
+
+    pub connection: Arc<Mutex<QuicheConnection>>,
+    pub tx_notify: Arc<Notify>,
+    pub rx_notify: Arc<Notify>,
 }
 
 pub enum ConnectionHandle {
@@ -114,7 +118,7 @@ pub(crate) enum HandshakeResponse {
 #[derive(Clone)]
 pub struct EstablishedHandle {
     connection: Arc<Mutex<QuicheConnection>>,
-    rx_waker: Arc<Mutex<Option<Waker>>>,
+    rx_notify: Arc<Notify>,
     tx_notify: Arc<Notify>,
 }
 
@@ -230,12 +234,8 @@ impl Listener {
                             // receive data into existing connection
                             match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
                                 Ok(_len) => {
+                                    e.rx_notify.notify_one();
                                     e.tx_notify.notify_one();
-
-                                    let mut rx_waker = e.rx_waker.lock();
-                                    if let Some(waker) = rx_waker.take() {
-                                        waker.wake_by_ref();
-                                    }
                                 }
                                 Err(e) => {
                                     // TODO: take action on errors, e.g close connection, send & remove
@@ -346,12 +346,161 @@ impl ConnectionHandle {
 
 impl Connection {
     fn establish(&mut self, state: EstablishedState) {
+        if cfg!(test) {
+            let conn = state.connection.lock();
+            debug_assert!(conn.is_established() || conn.is_in_early_data(),
+                          "connection must be established or ready for data")
+        }
         match self {
             Connection::Incoming(_) => {
                 let _ = mem::replace(self, Connection::Established(state));
             }
             Connection::Established(_) => {}
         }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        match self {
+            Connection::Incoming(_) => {}
+            Connection::Established(s) => {
+                if !s.tx_handle.is_finished() {
+                    s.tx_handle.abort();
+                    trace!("stopped connection tx task");
+                }
+            }
+        }
+    }
+}
+
+struct ConnectionTx {
+    socket: Arc<UdpSocket>,
+
+    connection: Arc<Mutex<QuicheConnection>>,
+    connection_id: String,
+
+    tx_notify: Arc<Notify>,
+    tx_stats: TxBurst,
+
+    gso_enabled: bool,
+    pacing_enabled: bool,
+}
+
+impl ConnectionTx {
+    async fn start_tx(mut self) -> Result<()> {
+        let id = self.connection_id;
+        let mut out = [0u8;MAX_IPV6_BUF_SIZE];
+
+        let mut finished_sending = false;
+        debug!("connection tx write");
+        'write: loop {
+            // update stats from connection
+            let max_send_burst = {
+                let conn = self.connection.lock();
+                self.tx_stats.max_send_burst(conn.stats(), conn.send_quantum())
+            };
+            let mut total_write = 0;
+            let mut dst_info = None;
+
+            // fill tx buffer with connection data
+            trace!("total_write={}, max_send_burst={}", total_write, max_send_burst);
+            'fill: while total_write < max_send_burst {
+                let send = {
+                    let mut conn = self.connection.lock();
+                    conn.send(&mut out[total_write..max_send_burst])
+                };
+
+                let (size, send_info) = match send {
+                    Ok((size, info)) => {
+                        debug!("connection sent to={:?}, length={}", info.to, size);
+                        (size, info)
+                    },
+                    Err(e) => {
+                        if e == quiche::Error::Done {
+                            trace!("connection send finished");
+                            finished_sending = true;
+                            break 'fill;
+                        }
+                        error!("connection send error: {:?}", e);
+                        /* TODO: close connection
+                            let mut conn = self.connection.lock();
+                            conn.close(false, 0x1, b"fail").ok();
+                         */
+                        break 'write Err(Error::explain(
+                            ErrorType::WriteError,
+                            format!("Connection {:?} send data to network failed with {:?}", id, e)));
+                    }
+                };
+
+                total_write += size;
+                // Use the first packet time to send, not the last.
+                let _ = dst_info.get_or_insert(send_info);
+            }
+
+            if total_write == 0 || dst_info.is_none() {
+                debug!("nothing to send, waiting for notification...");
+                self.tx_notify.notified().await;
+                continue;
+            }
+            let dst_info = dst_info.unwrap();
+
+            // send to network
+            if let Err(e) = send_to(
+                &self.socket,
+                &out[..total_write],
+                &dst_info,
+                self.tx_stats.max_datagram_size,
+                self.pacing_enabled,
+                self.gso_enabled,
+            ).await {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    error!("network socket would block");
+                    continue
+                }
+                break 'write Err(Error::explain(
+                    ErrorType::WriteError,
+                    format!("network send failed with {:?}", e)));
+            }
+            trace!("network sent to={} bytes={}", dst_info.to, total_write);
+
+            if finished_sending {
+                debug!("sending finished, waiting for notification...");
+                self.tx_notify.notified().await
+            }
+        }
+    }
+}
+
+pub struct TxBurst {
+    loss_rate: f64,
+    max_send_burst: usize,
+    max_datagram_size: usize
+}
+
+impl TxBurst {
+    fn new(max_send_udp_payload_size: usize) -> Self {
+        Self {
+            loss_rate: 0.0,
+            max_send_burst: MAX_IPV6_BUF_SIZE,
+            max_datagram_size: max_send_udp_payload_size,
+        }
+    }
+
+    fn max_send_burst(&mut self, stats: Stats, send_quantum: usize) -> usize {
+        // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
+        let loss_rate = stats.lost as f64 / stats.sent as f64;
+
+        if loss_rate > self.loss_rate + 0.001 {
+            self.max_send_burst = self.max_send_burst / 4 * 3;
+            // Minimum bound of 10xMSS.
+            self.max_send_burst =
+                self.max_send_burst.max(self.max_datagram_size * 10);
+            self.loss_rate = loss_rate;
+        }
+
+        send_quantum.min(self.max_send_burst) /
+            self.max_datagram_size * self.max_datagram_size
     }
 }
 

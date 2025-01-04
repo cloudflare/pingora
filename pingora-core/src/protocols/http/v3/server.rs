@@ -18,29 +18,84 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::uri::PathAndQuery;
 use http::HeaderMap;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType, OrErr, Result};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-
+use log::{debug, info, trace};
+use parking_lot::Mutex;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use pingora_http::{RequestHeader, ResponseHeader};
 
 use crate::protocols::http::HttpTask;
 pub use quiche::h3::Config as H3Options;
+use crate::protocols::l4::quic::Connection;
+use quiche::{Connection as QuicheConnection};
+use quiche::h3::{Connection as QuicheH3Connection, Event, Header};
+use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc::Receiver;
+use crate::protocols::http::v3::event_to_request_headers;
+use crate::protocols::http::v3::nohash::StreamIdHashMap;
+
+static H3_OPTIONS: OnceLock<H3Options> = OnceLock::new();
+
+const H3_SESSION_EVENTS_CHANNEL_SIZE : usize = 256;
 
 /// Perform HTTP/3 connection handshake with an established (QUIC) connection.
 ///
 /// The optional `options` allow to adjust certain HTTP/3 parameters and settings.
 /// See [`H3Options`] for more details.
-#[allow(unused)] // TODO: remove
-pub async fn handshake(io: Stream, options: Option<&H3Options>) -> Result<H3Connection> {
-    Ok(H3Connection { _l4stream: io })
+pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3Connection> {
+    let options = options.unwrap_or(H3_OPTIONS.get_or_init(|| H3Options::new().unwrap()));
+
+    let Some(conn) = io.quic_connection_state() else {
+        return Err(Error::explain(
+            ErrorType::ConnectError, "HTTP3 handshake only possible on Quic connections"));
+    };
+
+    let (conn_id, qconn, hconn,
+        tx_notify, rx_notify) = match conn {
+        Connection::Incoming(_) => {
+            return Err(Error::explain(
+                ErrorType::InternalError,
+                "connection needs to be established, invalid state"))
+        }
+        Connection::Established(state) => {
+            let conn_id;
+            let hconn = {
+                let mut qconn = state.connection.lock();
+                conn_id = qconn.trace_id().to_string();
+                quiche::h3::Connection::with_transport(&mut qconn, &options)
+                   .explain_err(ErrorType::ConnectError, |e| {
+                       format!("failed to create HTTP3 connection with {e}")
+                   })?
+            };
+            (conn_id, state.connection.clone(), hconn, state.tx_notify.clone(),  state.rx_notify.clone())
+        }
+    };
+
+    Ok(H3Connection {
+        _l4stream: io,
+        id: conn_id.to_string(),
+        quic_connection: qconn,
+        h3_connection: Arc::new(Mutex::new(hconn)),
+        tx_notify,
+        rx_notify,
+        sessions: Default::default(),
+    })
 }
 
 pub struct H3Connection {
     _l4stream: Stream, // ensure the stream will not be dropped until all sessions are
+    id: String,
+    quic_connection: Arc<Mutex<QuicheConnection>>,
+    h3_connection: Arc<Mutex<QuicheH3Connection>>,
+
+    tx_notify: Arc<Notify>,
+    rx_notify: Arc<Notify>,
+
+    sessions: StreamIdHashMap<mpsc::Sender<Event>>
 }
 
 impl H3Connection {
@@ -55,6 +110,17 @@ impl H3Connection {
 /// HTTP/3 server session
 #[allow(unused)] // TODO: remove
 pub struct HttpSession {
+    connection_id: String,
+    stream_id: u64,
+    quic_connection: Arc<Mutex<QuicheConnection>>,
+    h3_connection: Arc<Mutex<QuicheH3Connection>>,
+
+    tx_notify: Arc<Notify>,
+    event_rx: Receiver<Event>,
+
+    request_event_headers: Vec<Header>,
+    request_event_more_frames: bool,
+
     request_header: Option<RequestHeader>,
     // Remember what has been written
     response_written: Option<Box<ResponseHeader>>,
@@ -89,7 +155,118 @@ impl HttpSession {
         conn: &mut H3Connection,
         digest: Arc<Digest>,
     ) -> Result<Option<Self>> {
-        todo!();
+        'poll: loop {
+            let poll = {
+                let mut qconn = conn.quic_connection.lock();
+                let mut hconn = conn.h3_connection.lock();
+                // NOTE: poll() drives the entire Quic/HTTP3 connection
+                hconn.poll(&mut qconn)
+            };
+
+            match poll {
+                Ok((stream_id, ev)) => {
+                    if let Some(channel) = conn.sessions.get(&stream_id) {
+                        debug!(
+                            "HTTP3 Connection {} with stream id {} forward event {:?} to handler.",
+                            conn.id, stream_id, ev
+                        );
+                        channel.send(ev);
+                    } else {
+                        debug!(
+                            "HTTP3 Connection {} with stream id {} received event {:?}",
+                            conn.id, stream_id, &ev
+                        );
+                        match ev {
+                            Event::Data
+                            | Event::Finished
+                            | Event::Reset(_)
+                            | Event::PriorityUpdate => {
+                                debug_assert!(false, "event type requires corresponding session")
+                            }
+                            Event::GoAway => {
+                                info!("Received GoAway, dropping connection.");
+                                return Ok(None)
+                            },
+                            Event::Headers { list, more_frames: has_body } => {
+                                trace!(
+                                    "HTTP3 Connection {} request headers: {:?}, more_frames: {:?}",
+                                    conn.id,
+                                    &list,
+                                    &has_body
+                                );
+
+                                let (event_tx, event_rx) = mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
+                                let session = HttpSession {
+                                    connection_id: conn.id.clone(),
+                                    stream_id,
+
+                                    quic_connection: conn.quic_connection.clone(),
+                                    h3_connection: conn.h3_connection.clone(),
+
+                                    tx_notify: conn.tx_notify.clone(),
+                                    event_rx,
+
+                                    request_header: Some(event_to_request_headers(&list)),
+                                    response_written: None,
+
+                                    request_event_headers: list,
+                                    request_event_more_frames: has_body,
+
+                                    body_sent: 0,
+                                    send_ended: false,
+
+                                    digest
+                                };
+
+                                if let Some(_) = conn.sessions.insert(stream_id, event_tx) {
+                                    debug_assert!(false, "existing session is not allowed. {stream_id}")
+                                };
+                                return Ok(Some(session));
+                            }
+                        }
+                    }
+                }
+                Err(quiche::h3::Error::Done) => {
+                    debug!("H3Connection {} currently no events available.", conn.id);
+                    // TODO: in case PriorityUpdate was triggered take_priority_update should be called here
+                    let is_active;
+                    let timeout;
+                    {
+                        let mut qconn = conn.quic_connection.lock();
+                        if qconn.is_closed() {
+                            return Ok(None)
+                        }
+                        is_active = qconn.is_established() && !qconn.is_in_early_data();
+                        timeout = qconn.timeout();
+                    }
+
+                    if is_active {
+                        debug!("Quic connection {:?} is still active. Timeout: {:?}", conn.id, timeout);
+                        if let Some(timeout) = timeout {
+                            // race for new data on connection or timeout
+                            tokio::select! {
+                                _timeout = tokio::time::sleep(timeout) => {
+                                    let mut qconn = conn.quic_connection.lock();
+                                    qconn.on_timeout();
+                                }
+                                _data = conn.rx_notify.notified() => {}
+                            }
+                        };
+
+                        continue 'poll
+                    }
+
+                    debug!("H3Connection {} waiting for data", conn.id);
+                    continue 'poll;
+                }
+                Err(err) => {
+                    info!("Received error, dropping connection. {:?}", err);
+                    return Err(err).explain_err(ErrorType::H3Error, |e| {
+                        format!("While accepting new downstream requests. Error: {e}")
+                    })
+                }
+            }
+        }
     }
 
     /// The request sent from the client

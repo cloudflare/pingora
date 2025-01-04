@@ -65,6 +65,7 @@ fn send_to_gso_pacing(
     let cmsg_gso = ControlMessage::UdpGsoSegments(&segment_size);
 
     // Pacing option.
+    // TODO: fix & enable
     //let send_time = std_time_to_u64(&send_info.at);
     //let cmsg_txtime = ControlMessage::TxTime(&send_time);
 

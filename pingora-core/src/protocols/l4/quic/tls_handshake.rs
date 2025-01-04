@@ -6,9 +6,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use pingora_error::{Error, ErrorType, OrErr};
 use crate::protocols::ConnectionState;
-use crate::protocols::l4::quic::{Connection, EstablishedHandle, EstablishedState, HandshakeResponse, IncomingState, MAX_IPV6_UDP_PACKET_SIZE};
+use crate::protocols::l4::quic::{Connection, ConnectionTx, EstablishedHandle, EstablishedState, HandshakeResponse, IncomingState, TxBurst, MAX_IPV6_QUIC_DATAGRAM_SIZE, MAX_IPV6_UDP_PACKET_SIZE};
 use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
-use crate::protocols::l4::quic::sendto::set_txtime_sockopt;
+use crate::protocols::l4::quic::sendto::{detect_gso, set_txtime_sockopt};
 use crate::protocols::l4::stream::Stream as L4Stream;
 
 pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4Stream> {
@@ -201,6 +201,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
                 ErrorType::WriteError,
                 format!("sending handshake packet failed with {:?}", e)))?;
 
+        // FIXME: this should be looped till empty
         trace!("waiting for handshake response");
         if let Some(mut dgram) = udp_rx.recv().await {
             trace!("received handshake response");
@@ -235,8 +236,10 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     }
     trace!("handshake successful for connection {:?}", id);
 
-    let _max_send_udp_payload_size = conn.max_send_udp_payload_size();
-    let _pacing_enabled = match set_txtime_sockopt(&*socket) {
+    let max_send_udp_payload_size = conn.max_send_udp_payload_size();
+    // TODO: move to listener/socket creation
+    let gso_enabled = detect_gso(&*socket, MAX_IPV6_QUIC_DATAGRAM_SIZE);
+    let pacing_enabled = match set_txtime_sockopt(&*socket) {
         Ok(_) => {
             debug!("successfully set SO_TXTIME socket option");
             true
@@ -247,16 +250,33 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         },
     };
 
+    let tx_notify = Arc::new(Notify::new());
+    let rx_notify = Arc::new(Notify::new());
+    let connection_id = conn.trace_id().to_string();
+    let connection = Arc::new(Mutex::new(conn));
+
+    let tx = ConnectionTx {
+        socket: socket.clone(),
+        connection_id,
+        connection: connection.clone(),
+        tx_notify: tx_notify.clone(),
+        tx_stats: TxBurst::new(max_send_udp_payload_size),
+        gso_enabled,
+        pacing_enabled,
+    };
+
     let state = EstablishedState {
         socket: socket.clone(),
-        connection: Arc::new(Mutex::new(conn)),
-        tx_notify: Arc::new(Notify::new()),
-        rx_waker: Arc::new(Mutex::new(None)),
+        tx_handle: tokio::spawn(tx.start_tx()),
+
+        connection: connection.clone(),
+        rx_notify: rx_notify.clone(),
+        tx_notify: tx_notify.clone(),
     };
     let handle = EstablishedHandle {
-        connection: state.connection.clone(),
-        rx_waker: state.rx_waker.clone(),
-        tx_notify: state.tx_notify.clone()
+        connection,
+        rx_notify,
+        tx_notify
     };
 
     Ok(Some((state, handle)))
