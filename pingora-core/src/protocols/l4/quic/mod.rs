@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
-use pingora_error::{BError, Error, ErrorType, Result};
+use pingora_error::{BError, Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
 use settings::Settings as QuicSettings;
@@ -162,7 +162,7 @@ impl Listener {
     pub(crate) async fn accept(&self) -> io::Result<(L4Stream, SocketAddr)> {
         let mut rx_buf = [0u8; MAX_IPV6_BUF_SIZE];
 
-        trace!("endpoint rx loop");
+        debug!("endpoint rx loop");
         'read: loop {
             // receive from network and parse Quic header
             let (size, from) = self.socket.recv_from(&mut rx_buf).await?;
@@ -234,7 +234,7 @@ impl Listener {
                             // receive data into existing connection
                             match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
                                 Ok(_len) => {
-                                    e.rx_notify.notify_one();
+                                    e.rx_notify.notify_waiters();
                                     e.tx_notify.notify_one();
                                 }
                                 Err(e) => {
@@ -345,17 +345,34 @@ impl ConnectionHandle {
 }
 
 impl Connection {
-    fn establish(&mut self, state: EstablishedState) {
+    async fn establish(&mut self, state: EstablishedState) -> Result<()> {
         if cfg!(test) {
             let conn = state.connection.lock();
             debug_assert!(conn.is_established() || conn.is_in_early_data(),
                           "connection must be established or ready for data")
         }
         match self {
-            Connection::Incoming(_) => {
+            Connection::Incoming(s) => {
+                /*
+                // consume packets that potentially arrived during state transition
+                while !s.udp_rx.is_empty() {
+                    error!("consuming {} packets which arrived during state transition", s.udp_rx.len());
+                    let mut dgram= s.udp_rx.recv().await;
+                    if let Some(mut dgram) = dgram {
+                        let mut qconn = state.connection.lock();
+                        qconn.recv(&mut dgram.pkt.as_mut_slice(), dgram.recv_info).explain_err(
+                            ErrorType::ReadError,
+                            |e| format!("receiving dgram on quic connection failed with {:?}", e))?;
+                    }
+                }
+                s.udp_rx.close();
+                */
                 let _ = mem::replace(self, Connection::Established(state));
+                Ok(())
             }
-            Connection::Established(_) => {}
+            Connection::Established(_) => Err(Error::explain(
+                ErrorType::InternalError,
+                "establishing connection only possible on incoming connection"))
         }
     }
 }
@@ -548,7 +565,9 @@ impl AsyncWrite for Connection {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<pingora_error::Result<(), io::Error>> {
-        todo!()
+        // FIXME: this is called on l4::Stream::drop()
+        // correlates to the connection, check if stopping tx loop for connection & final flush is feasible
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(

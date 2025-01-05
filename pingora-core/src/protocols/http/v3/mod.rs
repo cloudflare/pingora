@@ -62,7 +62,6 @@ pub fn event_to_request_headers(list: &Vec<Header>) -> RequestHeader {
     parts.into()
 }
 
-#[allow(unused)] // TODO: remove
 fn response_headers_to_event(resp: &ResponseHeader) -> Vec<Header> {
     let mut qheaders: Vec<Header> = Vec::with_capacity(resp.headers.len() + 1);
     qheaders.push(Header::new(b":status", resp.status.as_str().as_bytes()));

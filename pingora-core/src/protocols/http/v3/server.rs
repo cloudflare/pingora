@@ -14,28 +14,31 @@
 
 //! HTTP/3 server session
 
+use std::fmt::Debug;
 use crate::protocols::{Digest, SocketAddr, Stream};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use http::uri::PathAndQuery;
-use http::HeaderMap;
+use http::{header, HeaderMap, HeaderName};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use log::{debug, info, trace};
+use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use pingora_http::{RequestHeader, ResponseHeader};
+use crate::protocols::http::date::get_cached_date;
 
 use crate::protocols::http::HttpTask;
 pub use quiche::h3::Config as H3Options;
-use crate::protocols::l4::quic::Connection;
-use quiche::{Connection as QuicheConnection};
-use quiche::h3::{Connection as QuicheH3Connection, Event, Header};
+use crate::protocols::l4::quic::{Connection, MAX_IPV6_QUIC_DATAGRAM_SIZE};
+use quiche::{h3, Connection as QuicheConnection};
+use quiche::h3::{Connection as QuicheH3Connection, Event, NameValue};
 use tokio::sync::{mpsc, Notify};
 use tokio::sync::mpsc::Receiver;
-use crate::protocols::http::v3::event_to_request_headers;
+use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::v3::{event_to_request_headers, response_headers_to_event};
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
 
 static H3_OPTIONS: OnceLock<H3Options> = OnceLock::new();
@@ -108,22 +111,29 @@ impl H3Connection {
 }
 
 /// HTTP/3 server session
-#[allow(unused)] // TODO: remove
 pub struct HttpSession {
     connection_id: String,
     stream_id: u64,
     quic_connection: Arc<Mutex<QuicheConnection>>,
     h3_connection: Arc<Mutex<QuicheH3Connection>>,
 
+    // trigger Quic send, continue ConnectionTx write loop
     tx_notify: Arc<Notify>,
+    // receive notification on Quic recv, used to check stream capacity
+    // as it only increases after MaxData or MaxStreamData frame was received
+    rx_notify: Arc<Notify>,
+
+    // HTTP3 event channel for this stream_id
     event_rx: Receiver<Event>,
 
-    request_event_headers: Vec<Header>,
-    request_event_more_frames: bool,
-
     request_header: Option<RequestHeader>,
+    read_ended: bool,
+    body_read: usize,
+    // buffered request body for retry logic
+    body_retry_buffer: Option<FixedBuffer>,
+
     // Remember what has been written
-    response_written: Option<Box<ResponseHeader>>,
+    response_header_written: Option<Box<ResponseHeader>>,
 
     // How many (application, not wire) response body bytes have been sent so far.
     body_sent: usize,
@@ -167,13 +177,16 @@ impl HttpSession {
                 Ok((stream_id, ev)) => {
                     if let Some(channel) = conn.sessions.get(&stream_id) {
                         debug!(
-                            "HTTP3 Connection {} with stream id {} forward event {:?} to handler.",
+                            "HTTP3 conn_id={} stream_id={} forward event={:?}",
                             conn.id, stream_id, ev
                         );
-                        channel.send(ev);
+                        channel.send(ev).await
+                            .explain_err(
+                                ErrorType::WriteError,
+                                |e| format!("failed to send on event channel with {}", e))?;
                     } else {
                         debug!(
-                            "HTTP3 Connection {} with stream id {} received event {:?}",
+                            "HTTP3 conn_id={} stream_id={} received event {:?}",
                             conn.id, stream_id, &ev
                         );
                         match ev {
@@ -187,12 +200,12 @@ impl HttpSession {
                                 info!("Received GoAway, dropping connection.");
                                 return Ok(None)
                             },
-                            Event::Headers { list, more_frames: has_body } => {
+                            Event::Headers { list, more_frames: stream_continues } => {
                                 trace!(
-                                    "HTTP3 Connection {} request headers: {:?}, more_frames: {:?}",
+                                    "HTTP3 conn_id={} request headers: {:?}, more_frames: {:?}",
                                     conn.id,
                                     &list,
-                                    &has_body
+                                    &stream_continues
                                 );
 
                                 let (event_tx, event_rx) = mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
@@ -204,14 +217,15 @@ impl HttpSession {
                                     h3_connection: conn.h3_connection.clone(),
 
                                     tx_notify: conn.tx_notify.clone(),
+                                    rx_notify: conn.rx_notify.clone(),
                                     event_rx,
 
+                                    read_ended: !stream_continues,
                                     request_header: Some(event_to_request_headers(&list)),
-                                    response_written: None,
+                                    body_read: 0,
+                                    body_retry_buffer: None,
 
-                                    request_event_headers: list,
-                                    request_event_more_frames: has_body,
-
+                                    response_header_written: None,
                                     body_sent: 0,
                                     send_ended: false,
 
@@ -227,7 +241,7 @@ impl HttpSession {
                     }
                 }
                 Err(quiche::h3::Error::Done) => {
-                    debug!("H3Connection {} currently no events available.", conn.id);
+                    debug!("HTTP3 conn_id={} no events available", conn.id);
                     // TODO: in case PriorityUpdate was triggered take_priority_update should be called here
                     let is_active;
                     let timeout;
@@ -256,7 +270,7 @@ impl HttpSession {
                         continue 'poll
                     }
 
-                    debug!("H3Connection {} waiting for data", conn.id);
+                    debug!("HTTP3 conn_id={} waiting for data", conn.id);
                     continue 'poll;
                 }
                 Err(err) => {
@@ -287,7 +301,45 @@ impl HttpSession {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        todo!();
+        self.data_finished_event().await?;
+        if self.read_ended {
+            return Ok(None)
+        }
+
+        let mut buf = [0u8; MAX_IPV6_QUIC_DATAGRAM_SIZE];
+        let size = match self.recv_body(&mut buf) {
+            Ok(size) => size,
+            Err(h3::Error::Done) => {
+                error!("recv_body: Done");
+                return Ok(Some(BytesMut::with_capacity(0).into()))
+            },
+            Err(e) => return Err(Error::explain(
+                ErrorType::ReadError, format!("reading body failed with {}", e)))
+        };
+
+        let mut data = BytesMut::with_capacity(size);
+        data.put_slice(&buf[..size]);
+        let data: Bytes = data.into();
+
+        self.body_read += size;
+        if let Some(buffer) = &mut self.body_retry_buffer {
+            buffer.write_to_buffer(&data);
+        }
+
+        trace!("ready body len={:?}", data.len());
+        Ok(Some(data))
+    }
+
+
+    fn recv_body(&self, out: &mut [u8]) -> h3::Result<(usize)> {
+        let mut qconn = self.quic_connection.lock();
+        let mut hconn = self.h3_connection.lock();
+        debug!(
+            "HTTP3 conn_id={} stream_id={} receiving body",
+            qconn.trace_id(),
+            self.stream_id
+        );
+        hconn.recv_body(&mut qconn, self.stream_id, out)
     }
 
     // the write_* don't have timeouts because the actual writing happens on the connection
@@ -302,12 +354,144 @@ impl HttpSession {
         mut header: Box<ResponseHeader>,
         end: bool,
     ) -> Result<()> {
-        todo!();
+        if self.send_ended {
+            // TODO: error or warn?
+            warn!("Http session already ended.");
+            return Ok(());
+        } else if self.response_header_written.as_ref().is_some() {
+            warn!("Response header is already sent, cannot send again");
+            return Ok(());
+        }
+
+        /* TODO: check if should that be as well handled like that?
+        if header.status.is_informational() {
+            // ignore informational response 1xx header because send_response() can only be called once
+            // https://github.com/hyperium/h2/issues/167
+            debug!("ignoring informational headers");
+            return Ok(());
+        } */
+
+        /* update headers */
+        header.insert_header(header::DATE, get_cached_date())?;
+
+        // TODO: check if this is correct for H3
+        // remove other h1 hop headers that cannot be present in H3
+        // https://httpwg.org/specs/rfc7540.html#n-connection-specific-header-fields
+        header.remove_header(&header::TRANSFER_ENCODING);
+        header.remove_header(&header::CONNECTION);
+        header.remove_header(&header::UPGRADE);
+        header.remove_header(&HeaderName::from_static("keep-alive"));
+        header.remove_header(&HeaderName::from_static("proxy-connection"));
+
+        let headers = response_headers_to_event(&header);
+        let sent = self.send_response(headers.as_slice(), end).await;
+
+        match sent {
+            Ok(()) => {
+                self.tx_notify.notify_one();
+            }
+            Err(h3::Error::Done) => {},
+            Err(e) => return Err(e)
+                .explain_err(
+                    ErrorType::WriteError,
+                    |e| format!("failed to write response to http3 connection with {}", e)),
+        }
+
+        self.response_header_written = Some(header);
+        self.send_ended = self.send_ended || end;
+        Ok(())
+    }
+
+    async fn send_response<T: NameValue + Debug>(
+        &self,
+        headers: &[T],
+        fin: bool,
+    ) -> h3::Result<()> {
+        let mut qconn = self.quic_connection.lock();
+        let mut hconn = self.h3_connection.lock();
+
+        // TODO: use qconn.stream_capacity(stream_id) or qconn.stream_writeable(stream_id)
+        // eventually retry in case send_response returns a StreamBlocked error
+        debug!(
+            "HTTP3 conn_id={} stream_id={} sending response headers={:?}, finished={}",
+            qconn.trace_id(),
+            self.stream_id,
+            headers,
+            fin
+        );
+        hconn.send_response(&mut qconn, self.stream_id, headers, fin)
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
     pub async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
-        todo!();
+        if self.send_ended {
+            // NOTE: in h1, we also track to see if content-length matches the data
+            // We have not tracked that in h3
+            warn!("Cannot write body after stream ended. Dropping the extra data.");
+            return Ok(());
+        } else if self.response_header_written.is_none() {
+            return Err(Error::explain(
+                ErrorType::H3Error,
+                "Trying to send the body before header being sent.",
+            ));
+        };
+
+        let mut sent_len = 0;
+        while sent_len < data.len() {
+            let capacity = self.stream_capacity().await
+                .explain_err(
+                    ErrorType::WriteError,
+                    |e| format!("Failed to acquire capacity on stream id {} with {}", self.stream_id, e))?;
+
+            let send;
+            if capacity > data.len() {
+                send = &data[sent_len..data.len()];
+            } else {
+                send = &data[sent_len..capacity];
+            }
+
+            match self.send_body(send, end).await {
+                Ok(sent_size) => {
+                    sent_len += sent_size;
+                    self.tx_notify.notify_one();
+                },
+                Err(_e) => {
+                    return Err(Error::explain(
+                        ErrorType::WriteError,
+                        format!("Writing h3 response body to downstream failed. {}", _e),
+                    ))
+                }
+            }
+        }
+
+        self.body_sent += sent_len;
+        self.send_ended = self.send_ended || end;
+        Ok(())
+    }
+
+    async fn send_body(&self, body: &[u8], fin: bool) -> h3::Result<usize> {
+        let mut qconn = self.quic_connection.lock();
+        let mut hconn = self.h3_connection.lock();
+
+        debug!("HTTP3 conn_id={} stream_id={} sending response body with length={:?}, finished={}",
+            self.connection_id, self.stream_id, body.len(), fin);
+
+        hconn.send_body(&mut qconn, self.stream_id, body, fin)
+    }
+
+    async fn stream_capacity(&self) -> quiche::Result<usize> {
+        let capacity;
+        {
+            let qconn = self.quic_connection.lock();
+            capacity = qconn.stream_capacity(self.stream_id)?;
+        }
+
+        if capacity > 0 {
+            Ok(capacity)
+        } else {
+            self.rx_notify.notified().await;
+            Box::pin(self.stream_capacity()).await
+        }
     }
 
     /// Write response trailers to the client, this also closes the stream.
@@ -334,7 +518,55 @@ impl HttpSession {
     pub async fn finish(&mut self) -> Result<()> {
         // TODO: check/validate with documentation on protocols::http::server::HttpSession
         // TODO: check/validate trailer sending
-        todo!();
+        if self.send_ended {
+            // already ended the stream
+            return Ok(());
+        }
+
+        // use an empty data frame to signal the end
+        self.send_body(&[], true)
+            .await
+            .explain_err(
+                ErrorType::WriteError,
+                |e| format! {"Writing h3 response body to downstream failed. {e}"},
+            )?;
+
+        self.send_ended = true;
+        // else: the response header is not sent, do nothing now.
+        // When send_response_body is dropped, an RST_STREAM will be sent
+
+        Ok(())
+    }
+
+    async fn data_finished_event(&mut self) -> Result<()> {
+        loop {
+            match self.event_rx.recv().await {
+                Some(ev) => {
+                    trace!("event {:?}", ev);
+                    match ev {
+                        Event::Finished => {
+                            self.read_ended = true;
+                            return Ok(())
+                        }
+                        Event::Headers { .. } => {
+                            debug_assert!(false, "Headers or Finished event when Data requested");
+                        },
+                        Event::Data => {
+                            return Ok(())
+                        }
+                        // TODO: handle events correctly
+                        Event::Reset(_) |
+                        Event::PriorityUpdate |
+                        Event::GoAway => {
+                            continue
+                        },
+                    }
+                }
+                None => return Err(Error::explain(
+                    ErrorType::ReadError,
+                    "HTTP3 Session event channel disconnected.")),
+            }
+        }
     }
 
     pub async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
@@ -397,7 +629,7 @@ impl HttpSession {
 
     /// Return the written response header. `None` if it is not written yet.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
-        self.response_written.as_deref()
+        self.response_header_written.as_deref()
     }
 
     /// Give up the stream abruptly.

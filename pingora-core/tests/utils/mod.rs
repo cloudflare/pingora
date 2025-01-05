@@ -22,13 +22,14 @@ use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use http::{Response, StatusCode};
 use pingora_timeout::timeout;
 use std::time::Duration;
 
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
+use pingora_core::protocols::l4::quic::{MAX_IPV6_BUF_SIZE, MAX_IPV6_UDP_PACKET_SIZE};
 
 #[derive(Clone)]
 pub struct EchoApp;
@@ -38,16 +39,27 @@ impl ServeHttp for EchoApp {
     async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
         // read timeout of 2s
         let read_timeout = 2000;
+        let body_future = async {
+            let mut body = BytesMut::with_capacity(MAX_IPV6_BUF_SIZE);
+            while let Ok(b) = http_stream.read_request_body().await {
+                match b {
+                    None => break, // finished reading request
+                    Some(b) => body.put(b)
+                }
+            }
+            if body.is_empty() {
+                body.put("no body!".as_bytes());
+            }
+            body.freeze()
+        };
+
         let body = match timeout(
             Duration::from_millis(read_timeout),
-            http_stream.read_request_body(),
+            body_future,
         )
         .await
         {
-            Ok(res) => match res.unwrap() {
-                Some(bytes) => bytes,
-                None => Bytes::from("no body!"),
-            },
+            Ok(res) => res,
             Err(_) => {
                 panic!("Timed out after {:?}ms", read_timeout);
             }
@@ -69,7 +81,9 @@ pub struct MyServer {
 }
 
 fn entry_point(opt: Option<Opt>) {
-    env_logger::init();
+    env_logger::builder()
+        .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
+        .init();
 
     let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
     let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));

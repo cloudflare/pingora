@@ -36,7 +36,8 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     if let Some(e_state) = e_state {
-        connection.establish(e_state);
+        connection.establish(e_state).await?;
+        error!("connection established");
         Ok(stream)
     } else {
         Err(Error::explain(ErrorType::HandshakeError, "handshake rejected or ignored"))
@@ -110,7 +111,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let token = dgram.header.token.as_ref().unwrap();
     // do stateless retry if the client didn't send a token
     if token.is_empty() {
-        debug!("stateless retry as Quic header token is empty");
+        trace!("stateless retry as Quic header token is empty");
 
         let hdr = &dgram.header;
         let new_token = mint_token(&hdr, &dgram.recv_info.from);
@@ -168,7 +169,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
     // Reuse the source connection ID we sent in the Retry packet,
     // instead of changing it again.
-    trace!("new Quic connection odcid={:?} dcid={:?} scid={:?} ", initial_dcid, hdr.dcid, hdr.scid);
+    debug!("new Quic connection odcid={:?} dcid={:?} scid={:?} ", initial_dcid, hdr.dcid, hdr.scid);
 
     let mut conn;
     {
@@ -186,7 +187,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             ErrorType::HandshakeError,
             format!("Recieving initial data failed. Error: {:?}", e)))?;
 
-    trace!("starting handshake for connection {:?}", id);
+    debug!("starting handshake for connection {:?}", id);
     // RSA handshake requires more than one packet
     while !conn.is_established() {
         trace!("creating handshake packet");
@@ -234,7 +235,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             }
         }
     }
-    trace!("handshake successful for connection {:?}", id);
+    debug!("handshake successful for connection {:?}", id);
 
     let max_send_udp_payload_size = conn.max_send_udp_payload_size();
     // TODO: move to listener/socket creation
