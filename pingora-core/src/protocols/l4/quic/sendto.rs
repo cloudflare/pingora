@@ -65,15 +65,13 @@ fn send_to_gso_pacing(
     let cmsg_gso = ControlMessage::UdpGsoSegments(&segment_size);
 
     // Pacing option.
-    // TODO: fix & enable
-    //let send_time = std_time_to_u64(&send_info.at);
-    //let cmsg_txtime = ControlMessage::TxTime(&send_time);
+    let send_time = std_time_to_u64(&send_info.at);
+    let cmsg_txtime = ControlMessage::TxTime(&send_time);
 
     match sendmsg(
         sockfd,
         &iov,
-        //        &[cmsg_gso, cmsg_txtime],
-        &[cmsg_gso],
+        &[cmsg_gso, cmsg_txtime],
         MsgFlags::empty(),
         Some(&dst),
     ) {

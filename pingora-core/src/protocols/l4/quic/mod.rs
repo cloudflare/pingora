@@ -16,19 +16,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
-use pingora_error::{BError, Error, ErrorType, OrErr, Result};
+use pingora_error::{BError, Error, ErrorType, Result};
 use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
 use settings::Settings as QuicSettings;
 
-#[allow(unused)] // TODO: remove
 mod sendto;
 mod id_token;
 pub(crate) mod tls_handshake;
 mod settings;
 
 use crate::protocols::ConnectionState;
-use crate::protocols::l4::quic::sendto::send_to;
+use crate::protocols::l4::quic::sendto::{detect_gso, send_to, set_txtime_sockopt};
 use crate::protocols::l4::stream::Stream as L4Stream;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
@@ -48,7 +47,7 @@ const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
 
 pub struct Listener {
     socket: Arc<UdpSocket>,
-    socket_addr: SocketAddr,
+    socket_details: SocketDetails,
 
     config: Arc<Mutex<Config>>,
     crypto: Crypto,
@@ -66,10 +65,11 @@ pub enum Connection {
 }
 
 pub struct IncomingState {
-    id: ConnectionId<'static>,
+    connection_id: ConnectionId<'static>,
     config: Arc<Mutex<Config>>,
 
     socket: Arc<UdpSocket>,
+    socket_details: SocketDetails,
     udp_rx: Receiver<UdpRecv>,
     response_tx: Sender<HandshakeResponse>,
 
@@ -79,10 +79,18 @@ pub struct IncomingState {
     reject: bool
 }
 
+#[derive(Clone)]
+struct SocketDetails {
+    addr: SocketAddr,
+    gso_enabled: bool,
+    pacing_enabled: bool,
+}
+
 pub struct EstablishedState {
     socket: Arc<UdpSocket>,
     tx_handle: JoinHandle<Result<()>>,
 
+    connection_id: String,
     pub connection: Arc<Mutex<QuicheConnection>>,
     pub tx_notify: Arc<Notify>,
     pub rx_notify: Arc<Notify>,
@@ -131,7 +139,7 @@ pub struct UdpRecv {
 impl TryFrom<UdpSocket> for Listener {
     type Error = BError;
 
-    fn try_from(io: UdpSocket) -> pingora_error::Result<Self, Self::Error> {
+    fn try_from(io: UdpSocket) -> Result<Self, Self::Error> {
         let addr = io.local_addr()
             .map_err(|e| Error::explain(
                 ErrorType::SocketError,
@@ -144,9 +152,25 @@ impl TryFrom<UdpSocket> for Listener {
 
         let settings = QuicSettings::try_default()?;
 
+        let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
+        let pacing_enabled = match set_txtime_sockopt(&io) {
+            Ok(_) => {
+                debug!("successfully set SO_TXTIME socket option");
+                true
+            },
+            Err(e) => {
+                debug!("setsockopt failed {:?}", e);
+                false
+            },
+        };
+
         Ok(Listener {
             socket: Arc::new(io),
-            socket_addr: addr,
+            socket_details: SocketDetails {
+                addr,
+                gso_enabled,
+                pacing_enabled,
+            },
 
             config: settings.get_config(),
             crypto: Crypto {
@@ -182,7 +206,7 @@ impl Listener {
             // connection needs to be able to update source_ids() or destination_ids()
 
             let recv_info = RecvInfo {
-                to: self.socket_addr,
+                to: self.socket_details.addr,
                 from,
             };
 
@@ -271,10 +295,11 @@ impl Listener {
 
             trace!("new incoming connection {:?}", conn_id);
             let connection = Connection::Incoming(IncomingState {
-                id: conn_id.clone(),
+                connection_id: conn_id.clone(),
                 config: self.config.clone(),
 
                 socket: self.socket.clone(),
+                socket_details: self.socket_details.clone(),
                 udp_rx,
                 response_tx,
 
@@ -345,7 +370,7 @@ impl ConnectionHandle {
 }
 
 impl Connection {
-    async fn establish(&mut self, state: EstablishedState) -> Result<()> {
+    fn establish(&mut self, state: EstablishedState) -> Result<()> {
         if cfg!(test) {
             let conn = state.connection.lock();
             debug_assert!(conn.is_established() || conn.is_in_early_data(),
@@ -353,20 +378,9 @@ impl Connection {
         }
         match self {
             Connection::Incoming(s) => {
-                /*
-                // consume packets that potentially arrived during state transition
-                while !s.udp_rx.is_empty() {
-                    error!("consuming {} packets which arrived during state transition", s.udp_rx.len());
-                    let mut dgram= s.udp_rx.recv().await;
-                    if let Some(mut dgram) = dgram {
-                        let mut qconn = state.connection.lock();
-                        qconn.recv(&mut dgram.pkt.as_mut_slice(), dgram.recv_info).explain_err(
-                            ErrorType::ReadError,
-                            |e| format!("receiving dgram on quic connection failed with {:?}", e))?;
-                    }
-                }
-                s.udp_rx.close();
-                */
+                debug_assert!(s.udp_rx.is_empty(),
+                              "udp rx channel must be empty when establishing the connection");
+                debug!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::Established(state));
                 Ok(())
             }
@@ -393,15 +407,13 @@ impl Drop for Connection {
 
 struct ConnectionTx {
     socket: Arc<UdpSocket>,
+    socket_details: SocketDetails,
 
     connection: Arc<Mutex<QuicheConnection>>,
     connection_id: String,
 
     tx_notify: Arc<Notify>,
     tx_stats: TxBurst,
-
-    gso_enabled: bool,
-    pacing_enabled: bool,
 }
 
 impl ConnectionTx {
@@ -468,8 +480,8 @@ impl ConnectionTx {
                 &out[..total_write],
                 &dst_info,
                 self.tx_stats.max_datagram_size,
-                self.pacing_enabled,
-                self.gso_enabled,
+                self.socket_details.pacing_enabled,
+                self.socket_details.gso_enabled,
             ).await {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     error!("network socket would block");
@@ -560,11 +572,11 @@ impl AsyncWrite for Connection {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<pingora_error::Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, io::Error>> {
         todo!()
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<pingora_error::Result<(), io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         // FIXME: this is called on l4::Stream::drop()
         // correlates to the connection, check if stopping tx loop for connection & final flush is feasible
         Poll::Ready(Ok(()))
@@ -573,7 +585,7 @@ impl AsyncWrite for Connection {
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<pingora_error::Result<(), io::Error>> {
+    ) -> Poll<Result<(), io::Error>> {
         todo!()
     }
 }
@@ -584,7 +596,7 @@ impl AsyncRead for Connection {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         todo!()
     }
 }

@@ -22,14 +22,14 @@ use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use http::{Response, StatusCode};
 use pingora_timeout::timeout;
 use std::time::Duration;
 
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
-use pingora_core::protocols::l4::quic::{MAX_IPV6_BUF_SIZE, MAX_IPV6_UDP_PACKET_SIZE};
+use pingora_core::protocols::l4::quic::{MAX_IPV6_BUF_SIZE};
 
 #[derive(Clone)]
 pub struct EchoApp;

@@ -6,9 +6,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use pingora_error::{Error, ErrorType, OrErr};
 use crate::protocols::ConnectionState;
-use crate::protocols::l4::quic::{Connection, ConnectionTx, EstablishedHandle, EstablishedState, HandshakeResponse, IncomingState, TxBurst, MAX_IPV6_QUIC_DATAGRAM_SIZE, MAX_IPV6_UDP_PACKET_SIZE};
+use crate::protocols::l4::quic::{Connection, ConnectionTx, EstablishedHandle, EstablishedState, HandshakeResponse, IncomingState, TxBurst, MAX_IPV6_UDP_PACKET_SIZE};
 use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
-use crate::protocols::l4::quic::sendto::{detect_gso, set_txtime_sockopt};
 use crate::protocols::l4::stream::Stream as L4Stream;
 
 pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4Stream> {
@@ -25,7 +24,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
                                  |e| format!("Sending HandshakeResponse failed with {}", e))?;
                 Some(e_state)
             } else {
-                debug!("handshake either rejected or ignored for connection {:?}", s.id);
+                debug!("handshake either rejected or ignored for connection {:?}", s.connection_id);
                 None
             }
         }
@@ -36,8 +35,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     if let Some(e_state) = e_state {
-        connection.establish(e_state).await?;
-        error!("connection established");
+        connection.establish(e_state)?;
         Ok(stream)
     } else {
         Err(Error::explain(ErrorType::HandshakeError, "handshake rejected or ignored"))
@@ -46,10 +44,11 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
 
 async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Option<(EstablishedState, EstablishedHandle)>> {
     let IncomingState {
-        id,
+        connection_id: conn_id,
         config,
 
         socket,
+        socket_details,
         udp_rx,
         dgram,
 
@@ -61,12 +60,12 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
     if *ignore {
         if let Err(_) = response_tx.send(HandshakeResponse::Ignored).await {
-            trace!("failed sending endpoint response for incoming connection id={:?}.", id)
+            trace!("connection {:?} failed sending endpoint response", conn_id)
         };
         return Ok(None);
     } else if *reject {
         if let Err(_) = response_tx.send(HandshakeResponse::Rejected).await {
-            trace!("failed sending endpoint response for incoming connection id={:?}.", id)
+            trace!("connection {:?} failed sending endpoint response", conn_id)
         };
         return Ok(None);
         // TODO: send to peer, return err if send fails
@@ -79,17 +78,15 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let mut out = [0u8; MAX_IPV6_UDP_PACKET_SIZE];
 
     if !quiche::version_is_supported(dgram.header.version) {
-        warn!("QUIC packet version received is not supported. Negotiating version...");
+        warn!("Quic packet version received is not supported. Negotiating version...");
         let size = quiche::negotiate_version(&dgram.header.scid, &dgram.header.dcid, &mut out)
-            .map_err(|e| Error::explain(
-                ErrorType::HandshakeError,
-                format!("Creating version negotiation packet failed. Error: {:?}", e)))?;
+            .explain_err(
+                ErrorType::HandshakeError, |_| "creating version negotiation packet failed")?;
 
         // send data to network
         send_dgram(&socket, &out[..size], dgram.recv_info.from).await
-            .map_err(|e| Error::explain(
-                ErrorType::WriteError,
-                format!("Sending version negotiation packet failed. Error: {:?}", e)))?;
+            .explain_err(
+                ErrorType::WriteError, |_| "sending version negotiation packet failed")?;
 
         // validate response
         if let Some(resp_dgram) = udp_rx.recv().await {
@@ -98,12 +95,11 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             } else {
                 return Err(Error::explain(
                     ErrorType::HandshakeError,
-                    "Version negotiation failed responded version is not supported.".to_string()));
+                    "version negotiation failed as responded version is not supported"));
             };
         } else {
             return Err(Error::explain(
-                ErrorType::HandshakeError,
-                "Version negotiation did not receive a response".to_string()));
+                ErrorType::HandshakeError,"version negotiation did not receive a response"));
         }
     };
 
@@ -118,18 +114,14 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         let size = quiche::retry(
             &hdr.scid,
             &hdr.dcid,
-            &id,
+            &conn_id,
             &new_token,
             hdr.version,
             &mut out,
-        ).map_err(|e| Error::explain(
-            ErrorType::HandshakeError,
-            format!("Creating retry packet failed. Error: {:?}", e)))?;
+        ).explain_err(ErrorType::HandshakeError, |_| "creating retry packet failed")?;
 
         send_dgram(&socket, &out[..size], dgram.recv_info.from).await
-            .map_err(|e| Error::explain(
-                ErrorType::WriteError,
-                format!("Sending retry packet failed. Error: {:?}", e)))?;
+            .explain_err(ErrorType::WriteError, |_| "sending retry packet failed")?;
 
         // validate response
         if let Some(resp_dgram) = udp_rx.recv().await {
@@ -161,7 +153,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     }
 
     // The destination id was not valid, so drop the connection.
-    if id.len() != hdr.dcid.len() {
+    if conn_id.len() != hdr.dcid.len() {
         return Err(Error::explain(
             ErrorType::HandshakeError,
             "Quic header has invalid destination connection id.".to_string()));
@@ -169,52 +161,52 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
     // Reuse the source connection ID we sent in the Retry packet,
     // instead of changing it again.
-    debug!("new Quic connection odcid={:?} dcid={:?} scid={:?} ", initial_dcid, hdr.dcid, hdr.scid);
+    debug!("new connection {:?} odcid={:?} scid={:?} ", hdr.dcid, initial_dcid, hdr.scid);
 
     let mut conn;
     {
         let mut config = config.lock();
         conn = quiche::accept(&hdr.dcid, Some(&initial_dcid), dgram.recv_info.to, dgram.recv_info.from, &mut config)
-            .map_err(|e| Error::explain(
-                ErrorType::HandshakeError,
-                format!("Connection instantiation failed. Error: {:?}", e)))?;
+            .explain_err(ErrorType::HandshakeError, |_| "connection instantiation failed")?;
     }
 
     // receive quic data into connection
     let buf = dgram.pkt.as_mut_slice();
     conn.recv(buf, dgram.recv_info)
-        .map_err(|e| Error::explain(
-            ErrorType::HandshakeError,
-            format!("Recieving initial data failed. Error: {:?}", e)))?;
+        .explain_err(ErrorType::HandshakeError, |_| "receiving initial data failed")?;
 
-    debug!("starting handshake for connection {:?}", id);
+    debug!("connection {:?} starting handshake", conn_id);
     // RSA handshake requires more than one packet
     while !conn.is_established() {
         trace!("creating handshake packet");
-        let (size, info) = conn.send(out.as_mut_slice())
-            .map_err(|e| Error::explain(
-                ErrorType::WriteError,
-                format!("creating handshake packet failed with {:?}", e)))?;
+        'tx: loop {
+            let (size, info) = match conn.send(out.as_mut_slice()) {
+                Ok((size, info)) => (size, info),
+                Err(quiche::Error::Done) => break 'tx,
+                Err(e) => return Err(e).explain_err(
+                    ErrorType::WriteError, |_| "creating handshake packet failed"),
+            };
 
-        trace!("sending handshake packet");
-        send_dgram(&socket, &out[..size], info.to).await
-            .map_err(|e| Error::explain(
-                ErrorType::WriteError,
-                format!("sending handshake packet failed with {:?}", e)))?;
+            trace!("sending handshake packet");
+            send_dgram(&socket, &out[..size], info.to).await
+                .explain_err(ErrorType::WriteError, |_| "sending handshake packet failed")?;
+        }
 
-        // FIXME: this should be looped till empty
         trace!("waiting for handshake response");
-        if let Some(mut dgram) = udp_rx.recv().await {
-            trace!("received handshake response");
-            let buf = dgram.pkt.as_mut_slice();
-            conn.recv(buf, dgram.recv_info)
-                .map_err(|e| Error::explain(
+        'rx: loop {
+            if let Some(mut dgram) = udp_rx.recv().await {
+                trace!("received handshake response");
+                conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
+                    .explain_err(
+                        ErrorType::HandshakeError, |_| "receiving handshake response failed")?;
+            } else {
+                return Err(Error::explain(
                     ErrorType::HandshakeError,
-                    format!("receiving handshake response failed with {:?}", e)))?;
-        } else {
-            return Err(Error::explain(
-                ErrorType::HandshakeError,
-                "finishing handshake failed, did not receive a response"));
+                    "finishing handshake failed, did not receive a response"));
+            }
+            if udp_rx.is_empty() {
+                break 'rx;
+            }
         }
 
         trace!("connection established={}, early_data={}, closed={}, draining={}, readable={}, timed_out={}, resumed={}",
@@ -235,21 +227,11 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             }
         }
     }
-    debug!("handshake successful for connection {:?}", id);
+    // stop accepting packets on mpsc channel
+    udp_rx.close();
+    debug!("connection {:?} handshake successful", conn_id);
 
     let max_send_udp_payload_size = conn.max_send_udp_payload_size();
-    // TODO: move to listener/socket creation
-    let gso_enabled = detect_gso(&*socket, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-    let pacing_enabled = match set_txtime_sockopt(&*socket) {
-        Ok(_) => {
-            debug!("successfully set SO_TXTIME socket option");
-            true
-        },
-        Err(e) => {
-            debug!("setsockopt failed {:?}", e);
-            false
-        },
-    };
 
     let tx_notify = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
@@ -258,18 +240,18 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
     let tx = ConnectionTx {
         socket: socket.clone(),
-        connection_id,
+        socket_details: socket_details.clone(),
+        connection_id: connection_id.clone(),
         connection: connection.clone(),
         tx_notify: tx_notify.clone(),
         tx_stats: TxBurst::new(max_send_udp_payload_size),
-        gso_enabled,
-        pacing_enabled,
     };
 
     let state = EstablishedState {
         socket: socket.clone(),
         tx_handle: tokio::spawn(tx.start_tx()),
 
+        connection_id: connection_id.clone(),
         connection: connection.clone(),
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
