@@ -14,15 +14,17 @@
 
 //! HTTP/3 implementation
 
+use std::fmt::Debug;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
 use log::warn;
 use quiche::h3::{Header, NameValue};
 use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_error::{ErrorType, OrErr, Result};
 
 pub mod server;
 pub mod nohash;
 
-pub fn event_to_request_headers(list: &Vec<Header>) -> RequestHeader {
+pub fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
     let (mut parts, _) = Request::new(()).into_parts();
     let mut uri = Uri::builder();
     let mut headers = HeaderMap::new();
@@ -57,9 +59,10 @@ pub fn event_to_request_headers(list: &Vec<Header>) -> RequestHeader {
     }
 
     parts.version = Version::HTTP_3;
-    parts.uri = uri.build().unwrap(); // TODO: use result
+    parts.uri = uri.build()
+        .explain_err(ErrorType::H3Error, |_| "failed to convert event parts to request uri")?;
     parts.headers = headers;
-    parts.into()
+    Ok(parts.into())
 }
 
 fn response_headers_to_event(resp: &ResponseHeader) -> Vec<Header> {
@@ -70,4 +73,17 @@ fn response_headers_to_event(resp: &ResponseHeader) -> Vec<Header> {
         qheaders.push(Header::new(k.as_str().as_bytes(), v.as_bytes()))
     }
     qheaders
+}
+
+fn headermap_to_headervec(headers: &HeaderMap) -> Vec<Header> {
+    headers
+        .iter()
+        .map(|(k, v)| Header::new(k.as_str().as_bytes(), v.as_bytes()))
+        .collect()
+}
+
+fn header_size<T: NameValue + Debug>(headers: &[T]) -> usize {
+    headers
+        .iter()
+        .fold(0, |acc, h| acc + h.value().len() + h.name().len() + 32)
 }

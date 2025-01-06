@@ -241,9 +241,10 @@ where
                 // TODO: add a timeout?
                 let h3_stream = tokio::select! {
                     _ = shutdown.changed() => {
-                        h3_conn.graceful_shutdown().await;
-                        let _ = poll_fn(|cx| h3_conn.poll_closed(cx))
-                            .await.map_err(|e| error!("H3 error waiting for shutdown {e}"));
+                        match h3_conn.graceful_shutdown().await {
+                            Ok(()) => {}
+                            Err(e) => { error!("H3 error waiting for shutdown {e}") }
+                        };
                         return None;
                     }
                     h3_stream = h3_server::HttpSession::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream

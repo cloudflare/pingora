@@ -183,13 +183,14 @@ impl Session {
         match self {
             Self::H1(_) => Ok(()), // TODO: support trailers for h1
             Self::H2(s) => s.write_trailers(trailers),
-            Self::H3(s) => s.write_trailers(trailers),
+            Self::H3(s) => s.write_trailers(trailers).await,
         }
     }
 
     /// Finish the life of this request.
     /// For H1, if connection reuse is supported, a Some(Stream) will be returned, otherwise None.
     /// For H2, always return None because H2 stream is not reusable.
+    /// for H3, this will send a FIN_STREAM frame on the underlying QUIC stream
     pub async fn finish(self) -> Result<Option<Stream>> {
         match self {
             Self::H1(mut s) => {
@@ -294,7 +295,7 @@ impl Session {
     /// Give up the http session abruptly.
     /// For H1 this will close the underlying connection
     /// For H2 this will send a RESET frame to end this stream
-    /// For H3 this will send a RESET_STREAM QUIC frame on the underlying QUIC stream
+    /// For H3 this will send a STOP_SENDING & RESET_STREAM QUIC frame on the underlying stream
     /// For H2 & H3 a call has no impact on the connection
     pub async fn shutdown(&mut self) {
         match self {

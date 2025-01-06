@@ -21,10 +21,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use http::uri::PathAndQuery;
 use http::{header, HeaderMap, HeaderName};
 use pingora_error::{Error, ErrorType, OrErr, Result};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
+use std::time::Duration;
 use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
@@ -34,19 +32,21 @@ use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::HttpTask;
 pub use quiche::h3::Config as H3Options;
 use crate::protocols::l4::quic::{Connection, MAX_IPV6_QUIC_DATAGRAM_SIZE};
-use quiche::{h3, Connection as QuicheConnection};
+use quiche::{h3, Connection as QuicheConnection, Shutdown};
 use quiche::h3::{Connection as QuicheH3Connection, Event, NameValue};
 use tokio::sync::{mpsc, Notify};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::mpsc::error::TrySendError;
 use crate::protocols::http::body_buffer::FixedBuffer;
-use crate::protocols::http::v3::{event_to_request_headers, response_headers_to_event};
+use crate::protocols::http::v3::{event_to_request_headers, header_size, headermap_to_headervec, response_headers_to_event};
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
 
 static H3_OPTIONS: OnceLock<H3Options> = OnceLock::new();
 
 const H3_SESSION_EVENTS_CHANNEL_SIZE : usize = 256;
 const H3_SESSION_DROP_CHANNEL_SIZE : usize = 1024;
+const BODY_BUF_LIMIT: usize = 1024 * 64;
+const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Perform HTTP/3 connection handshake with an established (QUIC) connection.
 ///
@@ -82,19 +82,21 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     let drop_sessions = mpsc::channel(H3_SESSION_DROP_CHANNEL_SIZE);
     Ok(H3Connection {
         _l4stream: io,
-        id: conn_id.to_string(),
+        connection_id: conn_id.to_string(),
         quic_connection: qconn,
         h3_connection: Arc::new(Mutex::new(hconn)),
         tx_notify,
         rx_notify,
         sessions: Default::default(),
         drop_sessions,
+        max_accepted_stream_id: 0,
+        received_goaway: None,
     })
 }
 
 pub struct H3Connection {
     _l4stream: Stream, // ensure the stream will not be dropped until all sessions are
-    id: String,
+    connection_id: String,
     quic_connection: Arc<Mutex<QuicheConnection>>,
     h3_connection: Arc<Mutex<QuicheH3Connection>>,
 
@@ -102,15 +104,52 @@ pub struct H3Connection {
     rx_notify: Arc<Notify>,
 
     sessions: StreamIdHashMap<Sender<Event>>,
-    drop_sessions: (Sender<u64>, Receiver<u64>)
+    drop_sessions: (Sender<u64>, Receiver<u64>),
+
+    max_accepted_stream_id: u64,
+    received_goaway: Option<u64>
 }
 
 impl H3Connection {
-    pub async fn graceful_shutdown(&mut self) {
-        todo!();
-    }
-    pub fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        todo!();
+    pub async fn graceful_shutdown(&mut self) -> Result<()> {
+        // send GOAWAY frame
+        {
+            let mut qconn = self.quic_connection.lock();
+            let mut hconn = self.h3_connection.lock();
+
+            debug!("H3 connection {} sending GoAway", self.connection_id);
+            hconn.send_goaway(&mut qconn,self.max_accepted_stream_id)
+                .explain_err(ErrorType::H3Error, |_| "failed to send graceful shutdown")?;
+            self.tx_notify.notify_one();
+        }
+
+        let drain = async {
+            while !self.sessions.is_empty() {
+                self.rx_notify.notified().await
+            }
+        };
+
+        // wait for open sessions to drain
+        let mut is_timeout = false;
+        tokio::select! {
+            _successful_drain = drain => { debug!("h3 successfully drained active sessions") }
+            _timeout = tokio::time::sleep(SHUTDOWN_GOAWAY_DRAIN_TIMEOUT) => { is_timeout = true }
+        }
+
+        // close quic connection
+        {
+            let mut qconn = self.quic_connection.lock();
+            qconn.close(false, 0x00, b"graceful shutdown")
+                .explain_err(ErrorType::H3Error, |_| "failed to close quic connection")?;
+            self.tx_notify.notify_one();
+        }
+
+        if is_timeout {
+            Err(Error::explain(
+                ErrorType::InternalError, "h3 session draining timed out with active sessions"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -133,7 +172,9 @@ pub struct HttpSession {
     // HTTP3 event channel for this stream_id
     event_rx: Receiver<Event>,
 
-    request_header: Option<RequestHeader>,
+    request_header: RequestHeader,
+    // required as separate field for has_body
+    request_has_body: bool,
     read_ended: bool,
     body_read: usize,
     // buffered request body for retry logic
@@ -168,7 +209,6 @@ impl Drop for HttpSession {
     }
 }
 
-#[allow(unused)] // TODO: remove
 impl HttpSession {
     /// Create a new [`HttpSession`] from the QUIC connection.
     /// This function returns a new HTTP/3 session when the provided HTTP/3 connection, `conn`,
@@ -197,10 +237,17 @@ impl HttpSession {
 
             match poll {
                 Ok((stream_id, ev)) => {
+                    if let Some(goaway_id) = conn.received_goaway {
+                        // do not accept new streams, continue processing existing streams
+                        if stream_id >= goaway_id   {
+                            continue 'poll;
+                        }
+                    }
+
                     if let Some(channel) = conn.sessions.get(&stream_id) {
                         debug!(
                             "H3 connection {} stream {} forward event={:?}",
-                            conn.id, stream_id, ev
+                            conn.connection_id, stream_id, ev
                         );
                         channel.send(ev).await
                             .explain_err(
@@ -209,7 +256,7 @@ impl HttpSession {
                     } else {
                         debug!(
                             "H3 connection {} stream {} received event {:?}",
-                            conn.id, stream_id, &ev
+                            conn.connection_id, stream_id, &ev
                         );
                         match ev {
                             Event::Data
@@ -219,20 +266,22 @@ impl HttpSession {
                                 debug_assert!(false, "event type requires corresponding session")
                             }
                             Event::GoAway => {
-                                info!("Received GoAway, dropping connection.");
-                                return Ok(None)
+                                info!("stream_id {} received GoAway", stream_id);
+                                conn.received_goaway = Some(stream_id);
                             },
-                            Event::Headers { list, more_frames: stream_continues } => {
+                            Event::Headers { list, more_frames } => {
                                 trace!(
                                     "H3 connection {} request headers={:?}, more_frames={:?}",
-                                    conn.id,
+                                    conn.connection_id,
                                     &list,
-                                    &stream_continues
+                                    &more_frames
                                 );
 
-                                let (event_tx, event_rx) = mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
+                                let (event_tx, event_rx) =
+                                    mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
+
                                 let session = HttpSession {
-                                    connection_id: conn.id.clone(),
+                                    connection_id: conn.connection_id.clone(),
                                     stream_id,
 
                                     quic_connection: conn.quic_connection.clone(),
@@ -244,8 +293,9 @@ impl HttpSession {
                                     rx_notify: conn.rx_notify.clone(),
                                     event_rx,
 
-                                    read_ended: !stream_continues,
-                                    request_header: Some(event_to_request_headers(&list)),
+                                    request_header: event_to_request_headers(&list)?,
+                                    request_has_body: more_frames,
+                                    read_ended: !more_frames,
                                     body_read: 0,
                                     body_retry_buffer: None,
 
@@ -257,28 +307,34 @@ impl HttpSession {
                                 };
 
                                 if let Some(_) = conn.sessions.insert(stream_id, event_tx) {
-                                    debug_assert!(false, "H3 connection {} stream {} existing session is not allowed", conn.id, stream_id)
+                                    debug_assert!(false, "H3 connection {} stream {} existing \
+                                    session is not allowed", conn.connection_id, stream_id)
                                 };
+
+                                conn.max_accepted_stream_id = session.stream_id;
                                 return Ok(Some(session));
                             }
                         }
                     }
                 }
                 Err(h3::Error::Done) => {
-                    debug!("H3 connection {} no events available", conn.id);
-                    // TODO: in case PriorityUpdate was triggered take_priority_update should be called here
+                    debug!("H3 connection {} no events available", conn.connection_id);
+                    // TODO: in case PriorityUpdate was triggered call take_priority_update() here
                     let timeout;
                     {
-                        let mut qconn = conn.quic_connection.lock();
+                        let qconn = conn.quic_connection.lock();
                         if qconn.is_closed() ||
                             !(qconn.is_established() || qconn.is_in_early_data()) {
-                            warn!("open sessions: {:?}", conn.sessions.keys());
+                            if conn.sessions.len() > 0 {
+                                warn!("h3 connection {} closed with open {} sessions",
+                                    conn.connection_id, conn.sessions.len());
+                            }
                             return Ok(None)
                         }
                         timeout = qconn.timeout();
                     }
 
-                    debug!("Quic connection {:?} is still active. Timeout: {:?}", conn.id, timeout);
+                    debug!("Quic connection {:?} is still active. Timeout: {:?}", conn.connection_id, timeout);
                     if let Some(timeout) = timeout {
                         // race for new data on connection or timeout
                         tokio::select! {
@@ -290,14 +346,19 @@ impl HttpSession {
                         }
                     };
 
-                    debug!("H3 connection {} waiting for data", conn.id);
+                    debug!("H3 connection {} waiting for data", conn.connection_id);
                     continue 'poll;
                 }
-                Err(err) => {
-                    info!("Received error, dropping connection. {:?}", err);
-                    return Err(err).explain_err(ErrorType::H3Error, |e| {
-                        format!("While accepting new downstream requests. Error: {e}")
-                    })
+                Err(e) => {
+                    // If an error occurs while processing data, the connection is closed with
+                    // the appropriate error code, using the transport’s close() method.
+
+                    // send the close() event
+                    conn.tx_notify.notify_one();
+
+                    error!("H3 connection closed with error {:?}.", e);
+                    return Err(e).explain_err(
+                        ErrorType::H3Error, |_| "while accepting new downstream requests")
                 }
             }
 
@@ -314,7 +375,7 @@ impl HttpSession {
     /// Different from its HTTP/1.X counterpart, this function never panics as the request is already
     /// read when established a new HTTP/3 stream.
     pub fn req_header(&self) -> &RequestHeader {
-        self.request_header.as_ref().unwrap()
+        &self.request_header
     }
 
     /// A mutable reference to request sent from the client
@@ -322,7 +383,7 @@ impl HttpSession {
     /// Different from its HTTP/1.X counterpart, this function never panics as the request is already
     /// read when established a new HTTP/3 stream.
     pub fn req_header_mut(&mut self) -> &mut RequestHeader {
-        self.request_header.as_mut().unwrap()
+        &mut self.request_header
     }
 
     /// Read request body bytes. `None` when there is no more body to read.
@@ -336,7 +397,7 @@ impl HttpSession {
         let size = match self.recv_body(&mut buf) {
             Ok(size) => size,
             Err(h3::Error::Done) => {
-                error!("recv_body: Done");
+                trace!("recv_body done");
                 return Ok(Some(BytesMut::with_capacity(0).into()))
             },
             Err(e) => return Err(Error::explain(
@@ -357,7 +418,7 @@ impl HttpSession {
     }
 
 
-    fn recv_body(&self, out: &mut [u8]) -> h3::Result<(usize)> {
+    fn recv_body(&self, out: &mut [u8]) -> h3::Result<usize> {
         let mut qconn = self.quic_connection.lock();
         let mut hconn = self.h3_connection.lock();
         debug!(
@@ -381,7 +442,6 @@ impl HttpSession {
         end: bool,
     ) -> Result<()> {
         if self.send_ended {
-            // TODO: error or warn?
             warn!("H3 session already ended");
             return Ok(());
         } else if self.response_header_written.as_ref().is_some() {
@@ -389,18 +449,17 @@ impl HttpSession {
             return Ok(());
         }
 
-        /* TODO: check if should that be as well handled like that?
         if header.status.is_informational() {
-            // ignore informational response 1xx header because send_response() can only be called once
+            // ignore informational response 1xx header
+            // send_response() can only be called once in case end = true
             // https://github.com/hyperium/h2/issues/167
             debug!("ignoring informational headers");
             return Ok(());
-        } */
+        }
 
         /* update headers */
         header.insert_header(header::DATE, get_cached_date())?;
 
-        // TODO: check if this is correct for H3
         // remove other h1 hop headers that cannot be present in H3
         // https://httpwg.org/specs/rfc7540.html#n-connection-specific-header-fields
         header.remove_header(&header::TRANSFER_ENCODING);
@@ -410,7 +469,7 @@ impl HttpSession {
         header.remove_header(&HeaderName::from_static("proxy-connection"));
 
         let headers = response_headers_to_event(&header);
-        let sent = self.send_response(headers.as_slice(), end).await;
+        self.send_response(headers.as_slice(), end).await?;
 
         self.response_header_written = Some(header);
         self.send_ended = self.send_ended || end;
@@ -422,11 +481,7 @@ impl HttpSession {
         headers: &[T],
         fin: bool,
     ) -> Result<()> {
-        let headers_len = headers
-            .iter()
-            .fold(0, |acc, h| acc + h.value().len() + h.name().len() + 32);
-
-        let capacity = self.stream_capacity(headers_len).await
+        self.stream_capacity(header_size(headers)).await
             .explain_err(
                 ErrorType::WriteError,
                 |_| format!("H3 connection {} failed to acquire capacity for stream {}",
@@ -450,8 +505,7 @@ impl HttpSession {
             }
             Err(h3::Error::Done) => { Ok(()) },
             Err(e) => Err(e).explain_err(
-                    ErrorType::WriteError,
-                    |_| "H3 connection failed to write response"),
+                    ErrorType::WriteError, |_| "H3 connection failed to write response"),
         }
     }
 
@@ -525,9 +579,57 @@ impl HttpSession {
     }
 
     /// Write response trailers to the client, this also closes the stream.
-    pub fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
-        // TODO: use async fn?
-        todo!();
+    pub async fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
+        if self.send_ended {
+            warn!("Tried to write trailers after end of stream, dropping them");
+            return Ok(());
+        } else if self.body_sent <= 0 {
+            return Err(Error::explain(
+                ErrorType::H3Error, "Trying to send trailers before body is sent."));
+        };
+
+        let headers = headermap_to_headervec(&trailers);
+        self.send_additional_headers(self.stream_id, headers.as_slice(), true, true).await?;
+
+        // sending trailers closes the stream
+        self.send_ended = true;
+        Ok(())
+    }
+
+    // NOTE: as of quiche/v0.22.0 only available in quiche.git/master
+    async fn send_additional_headers<T: NameValue + Debug>(
+        &self,
+        stream_id: u64,
+        headers: &[T],
+        is_trailer: bool,
+        fin: bool,
+    ) -> Result<()> {
+        self.stream_capacity(header_size(headers)).await
+            .explain_err(
+                ErrorType::WriteError,
+                |_| format!("H3 connection {} failed to acquire capacity for stream {}",
+                            self.connection_id, self.stream_id))?;
+
+        let mut qconn =  self.quic_connection.lock();
+        let mut hconn = self.h3_connection.lock();
+
+        debug!(
+            "H3 connection {} stream {} sending additional headers={:?}, is_trailer={:?} finished={}",
+            qconn.trace_id(),
+            self.stream_id,
+            headers,
+            is_trailer,
+            fin
+        );
+
+        match hconn.send_additional_headers(&mut qconn, stream_id, headers, is_trailer, fin) {
+            Ok(()) => {
+                self.tx_notify.notify_one();
+                Ok(())
+            }
+            Err(e) => Err(e).explain_err(
+                ErrorType::WriteError, |_| "H3 connection failed to write h3 trailers to downstream"),
+        }
     }
 
     /// Similar to [Self::write_response_header], this function takes a reference instead
@@ -546,24 +648,21 @@ impl HttpSession {
     /// Dropping this object without sending `end` will cause an error to the client, which will cause
     /// the client to treat this session as bad or incomplete.
     pub async fn finish(&mut self) -> Result<()> {
-        // TODO: check/validate with documentation on protocols::http::server::HttpSession
-        // TODO: check/validate trailer sending
         if self.send_ended {
             // already ended the stream
             return Ok(());
         }
 
-        // use an empty data frame to signal the end
-        self.send_body(&[], true)
-            .await
-            .explain_err(
-                ErrorType::WriteError,
-                |e| format! {"Writing h3 response body to downstream failed. {e}"},
-            )?;
-
-        self.send_ended = true;
+        if self.response_header_written.is_some() {
+            // use an empty data frame to signal the end
+            self.send_body(&[], true).await
+                .explain_err(
+                    ErrorType::WriteError,
+                    |e| format! {"Writing h3 response body to downstream failed. {e}"},
+                )?;
+            self.send_ended = true;
+        }
         // else: the response header is not sent, do nothing now.
-        // When send_response_body is dropped, an RST_STREAM will be sent
 
         Ok(())
     }
@@ -584,12 +683,58 @@ impl HttpSession {
                         Event::Data => {
                             return Ok(())
                         }
-                        // TODO: handle events correctly
-                        Event::Reset(_) |
-                        Event::PriorityUpdate |
+                        Event::Reset(error_code) => {
+                            return Err(Error::explain(
+                                ErrorType::H3Error,
+                                format!("stream was reset with error code {}", error_code)))
+                        }
+                        Event::PriorityUpdate => {
+                            // TODO: this step should be deferred until
+                            // h3::Connection::poll() returns Error::Done
+                            // see also h3::Connection::send_response_with_priority()
+
+                            /*
+                            // https://datatracker.ietf.org/doc/rfc9218/
+                            let mut hconn = self.h3_connection.lock();
+                            // field value has the same content as the header::Priority field
+                            let field_value = hconn.take_last_priority_update(self.stream_id)
+                                .explain_err(ErrorType::H3Error, "failed to receive priority update field value")?;
+                            */
+                            warn!("received unhandled priority update");
+                            continue
+                        }
                         Event::GoAway => {
+                            // RFC 9114 Section 5.2 & 7.2.6
+                            warn!("received unhandled go-away");
                             continue
                         },
+                    }
+                }
+                None => return Err(Error::explain(
+                    ErrorType::ReadError,
+                    "H3 session event channel disconnected")),
+            }
+        }
+    }
+
+    async fn reset_event(&mut self) -> Result<u64> {
+        loop {
+            match self.event_rx.recv().await {
+                Some(ev) => {
+                    trace!("event {:?}", ev);
+                    match ev {
+                        Event::Data |
+                        Event::Finished |
+                        Event::GoAway |
+                        Event::PriorityUpdate => {
+                            continue
+                        }
+                        Event::Headers { .. } => {
+                            continue
+                        }
+                        Event::Reset(error_code) => {
+                            return Ok(error_code)
+                        }
                     }
                 }
                 None => return Err(Error::explain(
@@ -619,7 +764,7 @@ impl HttpSession {
                     None => end,
                 },
                 HttpTask::Trailer(Some(trailers)) => {
-                    self.write_trailers(*trailers)?;
+                    self.write_trailers(*trailers).await?;
                     true
                 }
                 HttpTask::Trailer(None) => true,
@@ -666,13 +811,27 @@ impl HttpSession {
     ///
     /// This will send a `INTERNAL_ERROR` stream error to the client
     pub fn shutdown(&mut self) {
-        // TODO: check/validate with documentation on protocols::http::server::HttpSession
-        // TODO: should this set self.ended? it closes the stream which prevents further writes
-        todo!();
+        if !self.read_ended {
+            self.stream_shutdown(Shutdown::Read, 2u64);
+            // sent STOP_SENDING frame & stream_recv() will no longer return data
+            self.read_ended = true;
+        }
+        if !self.send_ended {
+            self.stream_shutdown(Shutdown::Write, 2u64);
+            // sent RESET_STREAM & stream_send() data will be ignored
+            self.send_ended = true;
+        }
     }
 
-    // This is a hack for pingora-proxy to create subrequests from h2 server session
-    // TODO: be able to convert from h3 to h1 subrequest
+    fn stream_shutdown(&self, direction: Shutdown, error_code: u64) {
+        let mut qconn = self.quic_connection.lock();
+        match qconn.stream_shutdown(self.stream_id, direction, error_code) {
+            Ok(()) => self.tx_notify.notify_one(),
+            Err(e) => warn!("h3 stream {} shutdown failed. {:?}", self.stream_id, e)
+        }
+    }
+
+    // This is a hack for pingora-proxy to create subrequests from h3 server session
     pub fn pseudo_raw_h1_request_header(&self) -> Bytes {
         let buf = http_req_header_to_wire(self.req_header()).unwrap(); // safe, None only when version unknown
         buf.freeze()
@@ -680,38 +839,61 @@ impl HttpSession {
 
     /// Whether there is no more body to read
     pub fn is_body_done(&self) -> bool {
-        todo!();
+        self.is_body_empty() || self.read_ended
     }
 
     /// Whether there is any body to read.
     pub fn is_body_empty(&self) -> bool {
-        todo!();
+            self.request_has_body || self
+                .request_header
+                .headers
+                .get(header::CONTENT_LENGTH)
+                .map_or(false, |cl| cl.as_bytes() == b"0")
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {
-        todo!();
+        self.body_retry_buffer
+            .as_ref()
+            .map_or_else(|| false, |r| r.is_truncated())
     }
 
     pub fn enable_retry_buffering(&mut self) {
-        todo!();
+        if self.body_retry_buffer.is_none() {
+            self.body_retry_buffer = Some(FixedBuffer::new(BODY_BUF_LIMIT))
+        }
     }
 
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
-        todo!();
+        self.body_retry_buffer.as_ref().and_then(|b| {
+            if b.is_truncated() {
+                None
+            } else {
+                b.get_buffer()
+            }
+        })
     }
 
     /// `async fn idle() -> Result<Reason, Error>;`
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
-    pub fn idle(&mut self) -> Idle {
-        Idle(self)
+    pub async fn idle(&mut self) -> Result<()> {
+        match self.reset_event().await {
+            Ok(_error_code) => { Ok(()) }
+            Err(e) => Err(e)
+        }
     }
 
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
-        todo!();
+        if no_body_expected || self.is_body_done() {
+            let reason = self.reset_event().await?;
+            Error::e_explain(ErrorType::H3Error,
+                             format!("Client closed H3, reason: {reason}"))
+        } else {
+            self.read_body_bytes().await
+        }
     }
 
     /// Return how many response body bytes (application, not wire) already sent downstream
@@ -721,7 +903,7 @@ impl HttpSession {
 
     /// Return how many request body bytes (application, not wire) already read from downstream
     pub fn body_bytes_read(&self) -> usize {
-        todo!();
+        self.body_read
     }
 
     /// Return the [Digest] of the connection.
@@ -742,20 +924,5 @@ impl HttpSession {
     /// Return the client (peer) address recorded in the connection digest.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         self.digest.socket_digest.as_ref().map(|d| d.peer_addr())?
-    }
-}
-
-/// The future to poll for an idle session.
-///
-/// Calling `.await` in this object will not return until the client decides to close this stream.
-#[allow(unused)] // TODO: remove
-pub struct Idle<'a>(&'a mut HttpSession);
-
-#[allow(unused)] // TODO: remove
-impl<'a> Future for Idle<'a> {
-    type Output = u64;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!();
     }
 }
