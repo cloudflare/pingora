@@ -24,8 +24,15 @@ pub mod server;
 /// A helper function to write the body of h2 streams.
 pub async fn write_body(writer: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
     let mut remaining = data;
-    // Note: this loop allows to send the data frame even if data is empty in order to signal
-    // END_OF_STREAM to the peer.
+
+    // Cannot poll 0 capacity, so send it directly.
+    if remaining.is_empty() {
+        writer
+            .send_data(remaining, end)
+            .or_err(WriteError, "while writing h2 request body")?;
+        return Ok(());
+    }
+
     loop {
         writer.reserve_capacity(remaining.len());
         match std::future::poll_fn(|cx| writer.poll_capacity(cx)).await {
