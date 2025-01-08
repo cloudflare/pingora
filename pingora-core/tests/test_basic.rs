@@ -69,5 +69,5 @@ async fn test_udp() {
     utils::init();
 
     info!("Startup completed..");
-    tokio::time::sleep(Duration::from_secs(300)).await;
+    tokio::time::sleep(Duration::from_secs(3600)).await;
 }

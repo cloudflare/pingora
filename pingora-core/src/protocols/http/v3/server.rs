@@ -22,7 +22,7 @@ use http::uri::PathAndQuery;
 use http::{header, HeaderMap, HeaderName};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
@@ -47,6 +47,7 @@ const H3_SESSION_EVENTS_CHANNEL_SIZE : usize = 256;
 const H3_SESSION_DROP_CHANNEL_SIZE : usize = 1024;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Perform HTTP/3 connection handshake with an established (QUIC) connection.
 ///
@@ -97,7 +98,6 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         drop_sessions,
         max_accepted_stream_id: 0,
         received_goaway: None,
-        requests_handled: 0
     })
 }
 
@@ -118,7 +118,6 @@ pub struct H3Connection {
 
     max_accepted_stream_id: u64,
     received_goaway: Option<u64>,
-    requests_handled: u64
 }
 
 impl Drop for H3Connection {
@@ -295,6 +294,13 @@ impl HttpSession {
                             Event::GoAway => {
                                 info!("stream_id {} received GoAway", stream_id);
                                 conn.received_goaway = Some(stream_id);
+
+                                let mut qconn = conn.quic_connection.lock();
+                                let mut hconn = conn.h3_connection.lock();
+                                hconn.send_goaway(&mut qconn, conn.max_accepted_stream_id)
+                                    .explain_err(
+                                        ErrorType::InternalError, |_| "failed to send goaway")?;
+                                conn.tx_notify.notify_waiters();
                             },
                             Event::Headers { list, more_frames } => {
                                 trace!(
@@ -347,16 +353,8 @@ impl HttpSession {
                 Err(h3::Error::Done) => {
                     debug!("H3 connection {:?} no events available", conn.connection_id);
                     // TODO: in case PriorityUpdate was triggered call take_priority_update() here
-                    let timeout;
-                    let is_closed;
-                    {
-                        let qconn = conn.quic_connection.lock();
-                        is_closed = qconn.is_closed() ||
-                            !(qconn.is_established() || qconn.is_in_early_data());
-                        timeout = qconn.timeout();
-                    }
 
-                    // housekeeping finished streams/requests
+                    // housekeeping finished sessions
                     while !conn.drop_sessions.1.is_empty() {
                         if let Some(stream_id) = conn.drop_sessions.1.recv().await {
                             match conn.sessions.remove(&stream_id) {
@@ -367,58 +365,87 @@ impl HttpSession {
                                 Some(_) => {
                                     debug!("connection {:?} stream {} removed from sessions",
                                         conn.connection_id, stream_id);
-                                    conn.requests_handled += 1;
                                 }
                             };
                         }
                     }
 
-                    // session was closed by remote
+                    let is_closed;
+                    let timeout;
+                    let timeout_now;
+                    {
+                        let qconn = conn.quic_connection.lock();
+                        is_closed = qconn.is_closed() ||
+                            !(qconn.is_established() || qconn.is_in_early_data());
+                        if is_closed {
+                            if let Some(e) = qconn.peer_error() {
+                                debug!("connection {:?} peer error reason: {}", conn.connection_id,
+                                    String::from_utf8_lossy(e.reason.as_slice()).to_string());
+                            }
+                            if let Some(e) = qconn.local_error() {
+                                debug!("connection {:?} local error reason: {}", conn.connection_id,
+                                    String::from_utf8_lossy(e.reason.as_slice()).to_string());
+                            }
+                        }
+                        timeout = qconn.timeout_instant();
+                        timeout_now = Instant::now();
+                    }
+
                     if is_closed {
                         if conn.sessions.len() > 0 {
                             warn!("H3 connection {:?} closed with open {} sessions",
                                 conn.connection_id, conn.sessions.len());
-                            error!("H3 connection open sessions {:?}", conn.sessions);
+                        } else {
+                            debug!("H3 connection {:?} closed", conn.connection_id);
                         }
-                        error!("h3 connection {:?} closed", conn.connection_id);
+
+                        conn.tx_notify.notify_waiters();
                         conn.tx_flushed.notified().await;
                         return Ok(None)
                     }
 
-                    // closing session
-                    if conn.sessions.is_empty() && conn.requests_handled > 0  {
-                        debug!("connection {:?} closing as no (more) outstanding requests", conn.connection_id);
-                        let res;
-                        {
-                            let mut qconn = conn.quic_connection.lock();
-                            res = qconn.close(true, 0x100, b"okthxbye");
-                        }
-                        match res {
-                            Ok(()) | Err(quiche::Error::Done) => {
-                                conn.tx_notify.notify_waiters();
-                                // ensure data is flushed before dropping the connection
-                                conn.tx_flushed.notified().await;
-                                return Ok(None)
-                            },
-                            Err(e) => Err(e).explain_err(
-                                ErrorType::H3Error, |_| "failed to close quic connection")?,
+                    // race for new data on connection or timeout
+                    tokio::select! {
+                        _data = conn.rx_notify.notified() => {}
+                        used_timeout_duration = async {
+                            // quiche timeout instants are on the initial calls very short
+                            // quiche timeout durations are sometimes 0ns, None would be expected
+                            // this can lead to premature closing of the connection
+                            // guarding with DEFAULT_CONNECTION_IDLE_TIMEOUT
+                            if timeout.is_none() {
+                                trace!("connection {:?} default timeout {:?}", conn.connection_id, DEFAULT_CONNECTION_IDLE_TIMEOUT);
+                                tokio::time::sleep(DEFAULT_CONNECTION_IDLE_TIMEOUT.into()).await;
+                                DEFAULT_CONNECTION_IDLE_TIMEOUT
+                            } else {
+                                if timeout < Instant::now().checked_add(DEFAULT_CONNECTION_IDLE_TIMEOUT) {
+                                    trace!("connection {:?} default timeout {:?}", conn.connection_id, DEFAULT_CONNECTION_IDLE_TIMEOUT);
+                                    tokio::time::sleep(DEFAULT_CONNECTION_IDLE_TIMEOUT.into()).await;
+                                    DEFAULT_CONNECTION_IDLE_TIMEOUT
+                                } else {
+                                    let timeout = timeout.unwrap();
+                                    let timeout_duration = timeout.duration_since(timeout_now);
+                                    tokio::time::sleep(timeout_duration.into()).await;
+                                    trace!("connection {:?} timeout {:?}", conn.connection_id, timeout_duration);
+                                    timeout_duration
+                                }
+                            }
+                        } => {
+                            if conn.sessions.len() > 0 {
+                                warn!("connection {:?} timeout {:?} reached with {} open sessions",
+                                    conn.connection_id, used_timeout_duration, conn.sessions.len());
+                            } else {
+                                {
+                                    let mut qconn = conn.quic_connection.lock();
+                                    qconn.on_timeout();
+                                }
+                                debug!("connection {:?} timed out {:?}", conn.connection_id, timeout);
+                            }
+
+                            conn.tx_notify.notify_waiters();
+                            conn.tx_flushed.notified().await;
+                            return Ok(None)
                         }
                     }
-
-                    debug!("Quic connection {:?} is still active. Timeout: {:?}", conn.connection_id, timeout);
-                    if let Some(timeout) = timeout {
-                        // race for new data on connection or timeout
-                        tokio::select! {
-                            _timeout = tokio::time::sleep(timeout) => {
-                                let mut qconn = conn.quic_connection.lock();
-                                qconn.on_timeout();
-                            }
-                            _data = conn.rx_notify.notified() => {}
-                        }
-                    };
-
-                    debug!("H3 connection {:?} waiting for data", conn.connection_id);
-                    continue 'poll;
                 }
                 Err(e) => {
                     // If an error occurs while processing data, the connection is closed with
@@ -725,6 +752,7 @@ impl HttpSession {
                     ErrorType::WriteError,
                     |e| format! {"Writing h3 response body to downstream failed. {e}"},
                 )?;
+            self.tx_notify.notify_waiters();
             self.send_ended = true;
         }
         // else: the response header is not sent, do nothing now.

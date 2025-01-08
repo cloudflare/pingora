@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, Notify};
-use pingora_error::{BError, Error, ErrorType, Result};
+use pingora_error::{BError, Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
 use settings::Settings as QuicSettings;
@@ -74,7 +74,7 @@ pub struct IncomingState {
     socket: Arc<UdpSocket>,
     socket_details: SocketDetails,
     udp_rx: Receiver<UdpRecv>,
-    response_tx: Sender<HandshakeResponse>,
+    response: Arc<Mutex<Option<HandshakeResponse>>>,
 
     dgram: UdpRecv,
 
@@ -118,7 +118,7 @@ impl Debug for ConnectionHandle {
 
 pub struct IncomingHandle {
     udp_tx: Sender<UdpRecv>,
-    response_rx: Receiver<HandshakeResponse>,
+    response: Arc<Mutex<Option<HandshakeResponse>>>,
 }
 
 pub(crate) enum HandshakeResponse {
@@ -242,6 +242,7 @@ impl Listener {
 
             let mut conn_id = header.dcid.clone();
             let mut udp_tx = None;
+
             {
                 let mut connections = self.connections.lock();
                 // send to corresponding connection
@@ -252,55 +253,37 @@ impl Listener {
                     handle = connections.get_mut(&conn_id);
                 };
 
-                trace!("connection {:?} dgram received from={} length={}", conn_id, from, size);
+                trace!("connection {:?} network received from={} length={}", conn_id, from, size);
 
                 if let Some(handle) = handle {
                     debug!("existing connection {:?} {:?} {:?}", conn_id, handle, header);
+                    let mut established_handle = None;
                     match handle {
                         ConnectionHandle::Incoming(i) => {
-                            match i.response_rx.try_recv() {
-                                Ok(msg) => {
-                                    match msg {
-                                        HandshakeResponse::Established(e) => {
-                                            debug!("received HandshakeResponse::Established");
-                                            // receive data into existing connection
-                                            match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
-                                                Ok(_len) => {
-                                                    e.rx_notify.notify_waiters();
-                                                    e.tx_notify.notify_waiters();
-                                                    // transition connection
-                                                    handle.establish(e);
-                                                    continue 'read;
-                                                }
-                                                Err(e) => {
-                                                    // TODO: take action on errors, e.g close connection, send & remove
-                                                    break 'read Err(e);
-                                                }
-                                            }
-                                        }
-                                        HandshakeResponse::Ignored
-                                        | HandshakeResponse::Rejected => {
-                                            connections.remove(&header.dcid);
-                                            continue 'read
-                                        }
+                            let resp;
+                            {
+                                resp = i.response.lock().take();
+                            }
+                            if let Some(resp) = resp {
+                                match resp {
+                                    HandshakeResponse::Established(e) => {
+                                        debug!("connection {:?} received HandshakeResponse::Established", conn_id);
+                                        // receive data into existing connection
+                                        established_handle = Some(e);
+                                    }
+                                    HandshakeResponse::Ignored
+                                    | HandshakeResponse::Rejected => {
+                                        connections.remove(&header.dcid);
+                                        continue 'read
                                     }
                                 }
-                                Err(e) => {
-                                    match e {
-                                        TryRecvError::Empty => {
-                                            udp_tx = Some(i.udp_tx.clone());
-                                        }
-                                        TryRecvError::Disconnected => {
-                                            warn!("dropping connection {:?} handshake response channel receiver disconnected.", &header.dcid);
-                                            connections.remove(&header.dcid);
-                                        }
-                                    };
-                                }
+                            } else {
+                                udp_tx = Some(i.udp_tx.clone());
                             }
                         }
                         ConnectionHandle::Established(e) => {
                             // receive data into existing connection
-                            match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
+                            match Self::recv_connection(&conn_id, e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
                                 Ok(_len) => {
                                     e.rx_notify.notify_waiters();
                                     e.tx_notify.notify_waiters();
@@ -310,6 +293,21 @@ impl Listener {
                                     // TODO: take action on errors, e.g close connection, send & remove
                                     break 'read Err(e);
                                 }
+                            }
+                        }
+                    }
+                    if let Some(e) = established_handle {
+                        match Self::recv_connection(&conn_id, e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
+                            Ok(_len) => {
+                                e.rx_notify.notify_waiters();
+                                e.tx_notify.notify_waiters();
+                                // transition connection
+                                handle.establish(e);
+                                continue 'read;
+                            }
+                            Err(e) => {
+                                // TODO: take action on errors, e.g close connection, send & remove
+                                break 'read Err(e);
                             }
                         }
                     }
@@ -336,7 +334,7 @@ impl Listener {
 
             // create incoming connection & handle
             let (udp_tx, udp_rx) = channel::<UdpRecv>(HANDSHAKE_PACKET_BUFFER_SIZE);
-            let (response_tx, response_rx) = channel::<HandshakeResponse>(1);
+            let response = Arc::new(Mutex::new(None));
 
             debug!("new incoming connection {:?}", conn_id);
             let connection = Connection::Incoming(IncomingState {
@@ -347,7 +345,7 @@ impl Listener {
                 socket: self.socket.clone(),
                 socket_details: self.socket_details.clone(),
                 udp_rx,
-                response_tx,
+                response: response.clone(),
 
                 dgram: UdpRecv {
                     pkt: rx_buf[..size].to_vec(),
@@ -360,7 +358,7 @@ impl Listener {
             });
             let handle = ConnectionHandle::Incoming(IncomingHandle {
                 udp_tx,
-                response_rx,
+                response,
             });
 
             {
@@ -372,17 +370,17 @@ impl Listener {
         }
     }
 
-    fn recv_connection(conn: &Mutex<QuicheConnection>, mut rx_buf: &mut [u8], recv_info: RecvInfo) -> io::Result<usize> {
+    fn recv_connection(conn_id: &ConnectionId<'_>, conn: &Mutex<QuicheConnection>, mut rx_buf: &mut [u8], recv_info: RecvInfo) -> io::Result<usize> {
         let size = rx_buf.len();
         let mut conn = conn.lock();
         match conn.recv(&mut rx_buf, recv_info) {
             Ok(len) => {
-                debug!("connection received: length={}", len);
+                debug!("connection {:?} received data length={}", conn_id, len);
                 debug_assert_eq!(size, len, "size received on connection not equal to len received from network.");
                 Ok(len)
             }
             Err(e) => {
-                error!("connection receive error: {:?}", e);
+                error!("connection {:?} receive error {:?}", conn_id, e);
                 Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     format!("Connection could not receive network data for {:?}. {:?}",
@@ -425,9 +423,32 @@ impl Connection {
         }
         match self {
             Connection::Incoming(s) => {
+                'drain: loop {
+                    match s.udp_rx.try_recv() {
+                        Ok(mut dgram) => {
+                            let mut conn = state.connection.lock();
+                            conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
+                                .explain_err(
+                                    ErrorType::HandshakeError, |_| "receiving dgram failed")?;
+                            debug!("connection {:?} dgram received while establishing", s.connection_id)
+                        }
+                        Err(e) => {
+                            match e {
+                                TryRecvError::Empty => {
+                                    // stop accepting packets
+                                    s.udp_rx.close();
+                                }
+                                TryRecvError::Disconnected => {
+                                    // remote already closed channel
+                                }
+                            }
+                            break 'drain;
+                        }
+                    }
+                }
                 debug_assert!(s.udp_rx.is_empty(),
                               "udp rx channel must be empty when establishing the connection");
-                debug!("connection {:?} established", state.connection_id);
+                error!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::Established(state));
                 Ok(())
             }
@@ -445,7 +466,7 @@ impl Drop for Connection {
             Connection::Established(s) => {
                 if !s.tx_handle.is_finished() {
                     s.tx_handle.abort();
-                    error!("stopped connection tx task");
+                    debug!("connection {:?} stopped tx task", s.connection_id);
                 }
             }
         }
@@ -516,7 +537,8 @@ impl ConnectionTx {
             }
 
             if total_write == 0 || dst_info.is_none() {
-                debug!("connection {:?} nothing to send, waiting for notification...", id);
+                trace!("connection {:?} nothing to send", id);
+                self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await;
                 continue;
             }
@@ -542,6 +564,7 @@ impl ConnectionTx {
             trace!("connection {:?} network sent to={} bytes={}", id, dst_info.to, total_write);
 
             if finished_sending {
+                trace!("connection {:?} finished sending", id);
                 // used during connection shutdown
                 self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await
@@ -626,8 +649,7 @@ impl AsyncWrite for Connection {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        // FIXME: this is called on l4::Stream::drop()
-        // correlates to the connection, check if stopping tx loop for connection & final flush is feasible
+        // this is called on l4::Stream::drop()
         Poll::Ready(Ok(()))
     }
 

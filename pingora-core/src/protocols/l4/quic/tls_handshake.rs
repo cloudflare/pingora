@@ -4,6 +4,7 @@ use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
 use quiche::ConnectionId;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
 use pingora_error::{Error, ErrorType, OrErr};
 use crate::protocols::ConnectionState;
@@ -18,14 +19,14 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     let e_state = match connection {
-        Connection::Incoming(s) => {
-            if let Some((e_state, e_handle)) = handshake_inner(s).await? {
-                s.response_tx.send(HandshakeResponse::Established(e_handle)).await
-                    .explain_err(ErrorType::WriteError,
-                                 |e| format!("Sending HandshakeResponse failed with {}", e))?;
+        Connection::Incoming(i) => {
+            if let Some(e_state) = handshake_inner(i).await? {
+                // send HANDSHAKE_DONE Quic frame on established connection
+                e_state.tx_notify.notify_waiters();
+                e_state.tx_flushed.notified().await;
                 Some(e_state)
             } else {
-                debug!("handshake either rejected or ignored for connection {:?}", s.connection_id);
+                debug!("handshake either rejected or ignored for connection {:?}", i.connection_id);
                 None
             }
         }
@@ -36,7 +37,6 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     if let Some(e_state) = e_state {
-        e_state.rx_notify.notified().await;
         connection.establish(e_state)?;
         Ok(stream)
     } else {
@@ -44,7 +44,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     }
 }
 
-async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Option<(EstablishedState, EstablishedHandle)>> {
+async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Option<EstablishedState>> {
     let IncomingState {
         connection_id: conn_id,
         config,
@@ -55,21 +55,23 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         udp_rx,
         dgram,
 
-        response_tx,
+        response,
 
         ignore,
         reject
     } = state;
 
     if *ignore {
-        if let Err(_) = response_tx.send(HandshakeResponse::Ignored).await {
-            trace!("connection {:?} failed sending endpoint response", conn_id)
-        };
+        {
+            let mut resp = response.lock();
+            *resp = Some(HandshakeResponse::Ignored)
+        }
         return Ok(None);
     } else if *reject {
-        if let Err(_) = response_tx.send(HandshakeResponse::Rejected).await {
-            trace!("connection {:?} failed sending endpoint response", conn_id)
-        };
+        {
+            let mut resp = response.lock();
+            *resp = Some(HandshakeResponse::Rejected)
+        }
         return Ok(None);
         // TODO: send to peer, return err if send fails
     }
@@ -224,17 +226,26 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             error!("connection {:?} local error reason: {}", conn_id, String::from_utf8_lossy(e.reason.as_slice()).to_string());
         }
     }
-    // stop accepting packets on mpsc channel
-    udp_rx.close();
-    debug!("connection {:?} handshake successful", conn_id);
 
     let max_send_udp_payload_size = conn.max_send_udp_payload_size();
-
-    let tx_notify = Arc::new(Notify::new());
-    let tx_flushed = Arc::new(Notify::new());
-    let rx_notify = Arc::new(Notify::new());
     let connection_id = conn_id;
     let connection = Arc::new(Mutex::new(conn));
+    let tx_notify = Arc::new(Notify::new());
+    let rx_notify = Arc::new(Notify::new());
+    let tx_flushed = Arc::new(Notify::new());
+
+    debug!("connection {:?} handshake successful, udp_rx {}", connection_id, udp_rx.len());
+    let handle = EstablishedHandle {
+        connection_id: connection_id.clone(),
+        connection: connection.clone(),
+        rx_notify: rx_notify.clone(),
+        tx_notify: tx_notify.clone()
+    };
+
+    {
+        let mut resp = response.lock();
+        *resp = Some(HandshakeResponse::Established(handle));
+    }
 
     let tx = ConnectionTx {
         socket: socket.clone(),
@@ -258,14 +269,8 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         tx_notify: tx_notify.clone(),
         tx_flushed: tx_flushed.clone(),
     };
-    let handle = EstablishedHandle {
-        connection_id: connection_id.clone(),
-        connection,
-        rx_notify,
-        tx_notify
-    };
 
-    Ok(Some((state, handle)))
+    Ok(Some(state))
 }
 
 
