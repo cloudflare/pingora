@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use pingora_error::{BError, Error, ErrorType, Result};
 use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
@@ -44,6 +44,7 @@ pub const MAX_IPV6_UDP_PACKET_SIZE: usize = 1452;
 pub const MAX_IPV6_QUIC_DATAGRAM_SIZE: usize = 1350;
 
 const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
+const CONNECTION_DROP_CHANNEL_SIZE : usize = 1024;
 
 pub struct Listener {
     socket: Arc<UdpSocket>,
@@ -53,6 +54,7 @@ pub struct Listener {
     crypto: Crypto,
 
     connections: Mutex<HashMap<ConnectionId<'static>, ConnectionHandle>>,
+    drop_connections: (Sender<ConnectionId<'static>>, Mutex<Receiver<ConnectionId<'static>>>)
 }
 
 pub struct Crypto {
@@ -67,6 +69,7 @@ pub enum Connection {
 pub struct IncomingState {
     connection_id: ConnectionId<'static>,
     config: Arc<Mutex<Config>>,
+    drop_connection: Sender<ConnectionId<'static>>,
 
     socket: Arc<UdpSocket>,
     socket_details: SocketDetails,
@@ -90,10 +93,12 @@ pub struct EstablishedState {
     socket: Arc<UdpSocket>,
     tx_handle: JoinHandle<Result<()>>,
 
-    connection_id: String,
+    pub(crate) connection_id: ConnectionId<'static>,
     pub connection: Arc<Mutex<QuicheConnection>>,
-    pub tx_notify: Arc<Notify>,
+    pub drop_connection: Sender<ConnectionId<'static>>,
     pub rx_notify: Arc<Notify>,
+    pub tx_notify: Arc<Notify>,
+    pub tx_flushed: Arc<Notify>,
 }
 
 pub enum ConnectionHandle {
@@ -125,6 +130,7 @@ pub(crate) enum HandshakeResponse {
 
 #[derive(Clone)]
 pub struct EstablishedHandle {
+    connection_id: ConnectionId<'static>,
     connection: Arc<Mutex<QuicheConnection>>,
     rx_notify: Arc<Notify>,
     tx_notify: Arc<Notify>,
@@ -164,6 +170,7 @@ impl TryFrom<UdpSocket> for Listener {
             },
         };
 
+        let drop_connections = mpsc::channel(CONNECTION_DROP_CHANNEL_SIZE);
         Ok(Listener {
             socket: Arc::new(io),
             socket_details: SocketDetails {
@@ -178,6 +185,7 @@ impl TryFrom<UdpSocket> for Listener {
             },
 
             connections: Default::default(),
+            drop_connections: (drop_connections.0, Mutex::new(drop_connections.1))
         })
     }
 }
@@ -191,6 +199,29 @@ impl Listener {
             // receive from network and parse Quic header
             let (size, from) = self.socket.recv_from(&mut rx_buf).await?;
 
+            // cleanup connections
+            {
+                let mut drop_conn = self.drop_connections.1.lock();
+                let mut conn = self.connections.lock();
+                'housekeep: loop {
+                    match drop_conn.try_recv() {
+                        Ok(drop_id) => {
+                            match conn.remove(&drop_id) {
+                                None => error!("failed to remove connection handle {:?}", drop_id),
+                                Some(_) => debug!("removed connection handle {:?} from connections", drop_id)
+                            }
+                        }
+                        Err(e) => match e {
+                            TryRecvError::Empty => break 'housekeep,
+                            TryRecvError::Disconnected => {
+                                debug_assert!(false, "drop connections receiver disconnected");
+                                break 'housekeep
+                            }
+                        }
+                    };
+                }
+            }
+
             // parse the Quic packet's header
             let header = match Header::from_slice(rx_buf[..size].as_mut(), quiche::MAX_CONN_ID_LEN) {
                 Ok(hdr) => hdr,
@@ -200,7 +231,6 @@ impl Listener {
                     continue 'read;
                 }
             };
-            trace!("dgram received from={} length={}", from, size);
 
             // TODO: allow for connection id updates during lifetime
             // connection needs to be able to update source_ids() or destination_ids()
@@ -221,18 +251,32 @@ impl Listener {
                     conn_id = Self::gen_cid(&self.crypto.key, &header);
                     handle = connections.get_mut(&conn_id);
                 };
+
+                trace!("connection {:?} dgram received from={} length={}", conn_id, from, size);
+
                 if let Some(handle) = handle {
-                    trace!("existing connection {:?} {:?}", conn_id, handle);
+                    debug!("existing connection {:?} {:?} {:?}", conn_id, handle, header);
                     match handle {
                         ConnectionHandle::Incoming(i) => {
                             match i.response_rx.try_recv() {
                                 Ok(msg) => {
                                     match msg {
                                         HandshakeResponse::Established(e) => {
+                                            debug!("received HandshakeResponse::Established");
                                             // receive data into existing connection
-                                            Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info)?;
-                                            // transition connection
-                                            handle.establish(e)
+                                            match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
+                                                Ok(_len) => {
+                                                    e.rx_notify.notify_waiters();
+                                                    e.tx_notify.notify_waiters();
+                                                    // transition connection
+                                                    handle.establish(e);
+                                                    continue 'read;
+                                                }
+                                                Err(e) => {
+                                                    // TODO: take action on errors, e.g close connection, send & remove
+                                                    break 'read Err(e);
+                                                }
+                                            }
                                         }
                                         HandshakeResponse::Ignored
                                         | HandshakeResponse::Rejected => {
@@ -259,7 +303,8 @@ impl Listener {
                             match Self::recv_connection(e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
                                 Ok(_len) => {
                                     e.rx_notify.notify_waiters();
-                                    e.tx_notify.notify_one();
+                                    e.tx_notify.notify_waiters();
+                                    continue 'read;
                                 }
                                 Err(e) => {
                                     // TODO: take action on errors, e.g close connection, send & remove
@@ -293,10 +338,11 @@ impl Listener {
             let (udp_tx, udp_rx) = channel::<UdpRecv>(HANDSHAKE_PACKET_BUFFER_SIZE);
             let (response_tx, response_rx) = channel::<HandshakeResponse>(1);
 
-            trace!("new incoming connection {:?}", conn_id);
+            debug!("new incoming connection {:?}", conn_id);
             let connection = Connection::Incoming(IncomingState {
                 connection_id: conn_id.clone(),
                 config: self.config.clone(),
+                drop_connection: self.drop_connections.0.clone(),
 
                 socket: self.socket.clone(),
                 socket_details: self.socket_details.clone(),
@@ -362,6 +408,7 @@ impl ConnectionHandle {
     fn establish(&mut self, handle: EstablishedHandle) {
         match self {
             ConnectionHandle::Incoming(_) => {
+                debug!("connection handle {:?} established", handle.connection_id);
                 let _ = mem::replace(self, ConnectionHandle::Established(handle));
             }
             ConnectionHandle::Established(_) => {}
@@ -398,7 +445,7 @@ impl Drop for Connection {
             Connection::Established(s) => {
                 if !s.tx_handle.is_finished() {
                     s.tx_handle.abort();
-                    trace!("stopped connection tx task");
+                    error!("stopped connection tx task");
                 }
             }
         }
@@ -410,9 +457,10 @@ struct ConnectionTx {
     socket_details: SocketDetails,
 
     connection: Arc<Mutex<QuicheConnection>>,
-    connection_id: String,
+    connection_id: ConnectionId<'static>,
 
     tx_notify: Arc<Notify>,
+    tx_flushed: Arc<Notify>,
     tx_stats: TxBurst,
 }
 
@@ -422,7 +470,7 @@ impl ConnectionTx {
         let mut out = [0u8;MAX_IPV6_BUF_SIZE];
 
         let mut finished_sending = false;
-        debug!("connection tx write");
+        debug!("connection {:?} tx write", id);
         'write: loop {
             // update stats from connection
             let max_send_burst = {
@@ -433,7 +481,7 @@ impl ConnectionTx {
             let mut dst_info = None;
 
             // fill tx buffer with connection data
-            trace!("total_write={}, max_send_burst={}", total_write, max_send_burst);
+            trace!("connection {:?} total_write={}, max_send_burst={}", id, total_write, max_send_burst);
             'fill: while total_write < max_send_burst {
                 let send = {
                     let mut conn = self.connection.lock();
@@ -442,16 +490,16 @@ impl ConnectionTx {
 
                 let (size, send_info) = match send {
                     Ok((size, info)) => {
-                        debug!("connection sent to={:?}, length={}", info.to, size);
+                        debug!("connection {:?} sent to={:?}, length={}", id, info.to, size);
                         (size, info)
                     },
                     Err(e) => {
                         if e == quiche::Error::Done {
-                            trace!("connection send finished");
+                            trace!("connection {:?} send finished", id);
                             finished_sending = true;
                             break 'fill;
                         }
-                        error!("connection send error: {:?}", e);
+                        error!("connection {:?} send error: {:?}", id, e);
                         /* TODO: close connection
                             let mut conn = self.connection.lock();
                             conn.close(false, 0x1, b"fail").ok();
@@ -468,7 +516,7 @@ impl ConnectionTx {
             }
 
             if total_write == 0 || dst_info.is_none() {
-                debug!("nothing to send, waiting for notification...");
+                debug!("connection {:?} nothing to send, waiting for notification...", id);
                 self.tx_notify.notified().await;
                 continue;
             }
@@ -484,17 +532,18 @@ impl ConnectionTx {
                 self.socket_details.gso_enabled,
             ).await {
                 if e.kind() == io::ErrorKind::WouldBlock {
-                    error!("network socket would block");
+                    error!("connection {:?} network socket would block", id);
                     continue
                 }
                 break 'write Err(Error::explain(
                     ErrorType::WriteError,
-                    format!("network send failed with {:?}", e)));
+                    format!("connection {:?} network send failed with {:?}", id, e)));
             }
-            trace!("network sent to={} bytes={}", dst_info.to, total_write);
+            trace!("connection {:?} network sent to={} bytes={}", id, dst_info.to, total_write);
 
             if finished_sending {
-                debug!("sending finished, waiting for notification...");
+                // used during connection shutdown
+                self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await
             }
         }

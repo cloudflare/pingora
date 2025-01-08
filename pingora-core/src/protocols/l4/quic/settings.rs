@@ -33,7 +33,7 @@ impl Settings {
         // config.log_keys() && config.set_keylog(); // logging SSL secrets
         // config.set_ticket_key() // session ticket signer key material
 
-        config.enable_early_data();
+        //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
 
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)

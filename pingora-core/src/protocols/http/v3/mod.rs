@@ -36,24 +36,16 @@ pub fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
             b":path" => uri = uri.path_and_query(h.value()),
             b":method" => match h.value().try_into() {
                 Ok(v) => parts.method = v,
-                Err(_) => {
-                    warn!("Failed to parse method from input: {:?}", h.value())
-                }
+                Err(_) => warn!("Failed to parse method from input: {:?}", h.value())
             },
-            _ => {
-                match HeaderName::from_bytes(h.name()) {
-                    Ok(k) => match HeaderValue::from_bytes(h.value()) {
-                        Ok(v) => {
-                            headers.append(k, v);
-                        }
-                        Err(_) => {
-                            warn!("Failed to parse header value from input: {:?}", h.value())
-                        }
+            _ => match HeaderName::from_bytes(h.name()) {
+                Ok(k) => match HeaderValue::from_bytes(h.value()) {
+                    Ok(v) => {
+                        headers.append(k, v);
                     },
-                    Err(_) => {
-                        warn!("Failed to parse header name input: {:?}", h.name())
-                    }
-                };
+                    Err(_) => warn!("Failed to parse header value from input: {:?}", h.value()),
+                },
+                Err(_) => warn!("Failed to parse header name input: {:?}", h.name()),
             }
         }
     }

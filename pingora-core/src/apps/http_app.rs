@@ -67,7 +67,7 @@ where
                 return None;
             }
         }
-        trace!("{:?}", http.req_header());
+        //trace!("{:?}", http.req_header());
         if *shutdown.borrow() {
             http.set_keepalive(None);
         } else {
@@ -97,13 +97,10 @@ where
                 ),
             }
         }
-        match http.finish().await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("HTTP server fails to finish the request: {e}");
-                None
-            }
-        }
+        http.finish().await.unwrap_or_else(|e| {
+            error!("HTTP server fails to finish the request: {e}");
+            None
+        })
     }
 }
 

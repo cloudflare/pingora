@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
+use quiche::ConnectionId;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use pingora_error::{Error, ErrorType, OrErr};
@@ -35,6 +36,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     if let Some(e_state) = e_state {
+        e_state.rx_notify.notified().await;
         connection.establish(e_state)?;
         Ok(stream)
     } else {
@@ -46,6 +48,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let IncomingState {
         connection_id: conn_id,
         config,
+        drop_connection,
 
         socket,
         socket_details,
@@ -84,7 +87,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
                 ErrorType::HandshakeError, |_| "creating version negotiation packet failed")?;
 
         // send data to network
-        send_dgram(&socket, &out[..size], dgram.recv_info.from).await
+        send_dgram(conn_id, &socket, &out[..size], dgram.recv_info.from).await
             .explain_err(
                 ErrorType::WriteError, |_| "sending version negotiation packet failed")?;
 
@@ -107,7 +110,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let token = dgram.header.token.as_ref().unwrap();
     // do stateless retry if the client didn't send a token
     if token.is_empty() {
-        trace!("stateless retry as Quic header token is empty");
+        trace!("connection {:?} stateless retry as Quic header token is empty", conn_id);
 
         let hdr = &dgram.header;
         let new_token = mint_token(&hdr, &dgram.recv_info.from);
@@ -120,7 +123,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             &mut out,
         ).explain_err(ErrorType::HandshakeError, |_| "creating retry packet failed")?;
 
-        send_dgram(&socket, &out[..size], dgram.recv_info.from).await
+        send_dgram(&conn_id, &socket, &out[..size], dgram.recv_info.from).await
             .explain_err(ErrorType::WriteError, |_| "sending retry packet failed")?;
 
         // validate response
@@ -178,7 +181,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     debug!("connection {:?} starting handshake", conn_id);
     // RSA handshake requires more than one packet
     while !conn.is_established() {
-        trace!("creating handshake packet");
+        trace!("connection {:?} creating handshake packet", conn_id);
         'tx: loop {
             let (size, info) = match conn.send(out.as_mut_slice()) {
                 Ok((size, info)) => (size, info),
@@ -187,15 +190,15 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
                     ErrorType::WriteError, |_| "creating handshake packet failed"),
             };
 
-            trace!("sending handshake packet");
-            send_dgram(&socket, &out[..size], info.to).await
+            trace!("connection {:?} sending handshake packet", conn_id);
+            send_dgram(&conn_id, &socket, &out[..size], info.to).await
                 .explain_err(ErrorType::WriteError, |_| "sending handshake packet failed")?;
         }
 
-        trace!("waiting for handshake response");
+        trace!("connection {:?} waiting for handshake response", conn_id);
         'rx: loop {
             if let Some(mut dgram) = udp_rx.recv().await {
-                trace!("received handshake response");
+                trace!("connection {:?} received handshake response", conn_id);
                 conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
                     .explain_err(
                         ErrorType::HandshakeError, |_| "receiving handshake response failed")?;
@@ -209,22 +212,16 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
             }
         }
 
-        trace!("connection established={}, early_data={}, closed={}, draining={}, readable={}, timed_out={}, resumed={}",
-                conn.is_established(), conn.is_in_early_data(), conn.is_closed(),
+        trace!("connection {:?} established={}, early_data={}, closed={}, draining={}, readable={}, timed_out={}, resumed={}",
+                conn_id, conn.is_established(), conn.is_in_early_data(), conn.is_closed(),
                 conn.is_draining(), conn.is_readable(), conn.is_timed_out(), conn.is_resumed());
 
-        trace!("connection peer_error={:?}, local_error={:?}", conn.peer_error(), conn.local_error());
-        match conn.peer_error() {
-            None => {}
-            Some(e) => {
-                error!("{}", String::from_utf8_lossy(e.reason.as_slice()).to_string())
-            }
+        trace!("connection {:?} peer_error={:?}, local_error={:?}", conn_id, conn.peer_error(), conn.local_error());
+        if let Some(e) = conn.peer_error() {
+            error!("connection {:?} peer error reason: {}", conn_id, String::from_utf8_lossy(e.reason.as_slice()).to_string());
         }
-        match conn.local_error() {
-            None => {}
-            Some(e) => {
-                error!("{}", String::from_utf8_lossy(e.reason.as_slice()).to_string())
-            }
+        if let Some(e) = conn.local_error() {
+            error!("connection {:?} local error reason: {}", conn_id, String::from_utf8_lossy(e.reason.as_slice()).to_string());
         }
     }
     // stop accepting packets on mpsc channel
@@ -234,8 +231,9 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let max_send_udp_payload_size = conn.max_send_udp_payload_size();
 
     let tx_notify = Arc::new(Notify::new());
+    let tx_flushed = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
-    let connection_id = conn.trace_id().to_string();
+    let connection_id = conn_id;
     let connection = Arc::new(Mutex::new(conn));
 
     let tx = ConnectionTx {
@@ -244,6 +242,7 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         connection_id: connection_id.clone(),
         connection: connection.clone(),
         tx_notify: tx_notify.clone(),
+        tx_flushed: tx_flushed.clone(),
         tx_stats: TxBurst::new(max_send_udp_payload_size),
     };
 
@@ -253,10 +252,14 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
         connection_id: connection_id.clone(),
         connection: connection.clone(),
+        drop_connection: drop_connection.clone(),
+
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
+        tx_flushed: tx_flushed.clone(),
     };
     let handle = EstablishedHandle {
+        connection_id: connection_id.clone(),
         connection,
         rx_notify,
         tx_notify
@@ -267,11 +270,11 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
 
 // connection io tx directly via socket
-async fn send_dgram(io: &Arc<UdpSocket>, buf: &[u8], to: SocketAddr) -> pingora_error::Result<usize> {
+async fn send_dgram(id: &ConnectionId<'_>, io: &Arc<UdpSocket>, buf: &[u8], to: SocketAddr) -> pingora_error::Result<usize> {
     match io.send_to(buf, &to).await {
         Ok(sent) => {
             debug_assert_eq!(sent, buf.len(), "amount of network sent data does not correspond to packet size");
-            trace!("sent dgram to={:?} length={:?} ", to, buf.len());
+            trace!("connection {:?} sent dgram to={:?} length={:?} ", id, to, buf.len());
             Ok(sent)
         }
         Err(e) => {
