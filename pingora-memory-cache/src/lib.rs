@@ -141,7 +141,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// [CacheStatus] but also return the value even if it is expired. When the
     /// value is expired, the [Duration] of how long it has been stale will
     /// also be returned.
-    pub fn get_stale(&self, key: &K) -> (Option<T>, CacheStatus) {
+    pub fn get_stale<Q>(&self, key: &Q) -> (Option<T>, CacheStatus)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         let hashed_key = self.hasher.hash_one(key);
 
         if let Some(n) = self.store.get(&hashed_key) {
