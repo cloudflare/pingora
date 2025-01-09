@@ -823,8 +823,14 @@ impl HttpSession {
         }
     }
 
+    /// Sets the downstream read timeout. This will trigger if we're unable
+    /// to read from the stream after `timeout`.
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = Some(timeout);
+    }
+
     /// Sets the downstream write timeout. This will trigger if we're unable
-    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     pub fn set_write_timeout(&mut self, timeout: Duration) {
         self.write_timeout = Some(timeout);

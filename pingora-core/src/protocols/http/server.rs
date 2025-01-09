@@ -188,8 +188,19 @@ impl Session {
         }
     }
 
+    /// Sets the downstream read timeout. This will trigger if we're unable
+    /// to read from the stream after `timeout`.
+    /// 
+    /// This is a noop for h2.
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_write_timeout(timeout),
+            Self::H2(_) => {}
+        }
+    }
+
     /// Sets the downstream write timeout. This will trigger if we're unable
-    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     ///
     /// This is a noop for h2.
