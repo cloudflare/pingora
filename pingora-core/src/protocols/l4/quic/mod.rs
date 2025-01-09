@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::{io, mem};
 use std::fmt::{Debug, Formatter};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
@@ -91,14 +92,12 @@ struct SocketDetails {
 
 pub struct EstablishedState {
     socket: Arc<UdpSocket>,
-    tx_handle: JoinHandle<Result<()>>,
-
     pub(crate) connection_id: ConnectionId<'static>,
-    pub connection: Arc<Mutex<QuicheConnection>>,
-    pub drop_connection: Sender<ConnectionId<'static>>,
-    pub rx_notify: Arc<Notify>,
-    pub tx_notify: Arc<Notify>,
-    pub tx_flushed: Arc<Notify>,
+    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
+    pub(crate) drop_connection: Sender<ConnectionId<'static>>,
+    pub(crate) rx_notify: Arc<Notify>,
+    pub(crate) tx_notify: Arc<Notify>,
+    tx_handle: JoinHandle<Result<()>>,
 }
 
 pub enum ConnectionHandle {
@@ -197,7 +196,18 @@ impl Listener {
         debug!("endpoint rx loop");
         'read: loop {
             // receive from network and parse Quic header
-            let (size, from) = self.socket.recv_from(&mut rx_buf).await?;
+            let (size, from) = match self.socket.try_recv_from(&mut rx_buf) {
+                Ok((size, from)) => (size, from),
+                Err(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        // no more UDP packets to read for now, wait  for new packets
+                        self.socket.readable().await?;
+                        continue 'read;
+                    } else {
+                        return Err(e)
+                    }
+                }
+            };
 
             // cleanup connections
             {
@@ -448,7 +458,7 @@ impl Connection {
                 }
                 debug_assert!(s.udp_rx.is_empty(),
                               "udp rx channel must be empty when establishing the connection");
-                error!("connection {:?} established", state.connection_id);
+                debug!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::Established(state));
                 Ok(())
             }
@@ -481,7 +491,6 @@ struct ConnectionTx {
     connection_id: ConnectionId<'static>,
 
     tx_notify: Arc<Notify>,
-    tx_flushed: Arc<Notify>,
     tx_stats: TxBurst,
 }
 
@@ -491,6 +500,7 @@ impl ConnectionTx {
         let mut out = [0u8;MAX_IPV6_BUF_SIZE];
 
         let mut finished_sending = false;
+        let mut continue_write = false;
         debug!("connection {:?} tx write", id);
         'write: loop {
             // update stats from connection
@@ -534,13 +544,18 @@ impl ConnectionTx {
                 total_write += size;
                 // Use the first packet time to send, not the last.
                 let _ = dst_info.get_or_insert(send_info);
+
+                if size < self.tx_stats.max_datagram_size {
+                    continue_write = true;
+                    break 'fill
+                }
             }
 
             if total_write == 0 || dst_info.is_none() {
                 trace!("connection {:?} nothing to send", id);
-                self.tx_flushed.notify_waiters();
+                //self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await;
-                continue;
+                continue 'write;
             }
             let dst_info = dst_info.unwrap();
 
@@ -563,11 +578,15 @@ impl ConnectionTx {
             }
             trace!("connection {:?} network sent to={} bytes={}", id, dst_info.to, total_write);
 
+            if continue_write {
+                continue 'write;
+            }
+
             if finished_sending {
                 trace!("connection {:?} finished sending", id);
-                // used during connection shutdown
-                self.tx_flushed.notify_waiters();
-                self.tx_notify.notified().await
+                //self.tx_flushed.notify_waiters();
+                self.tx_notify.notified().await;
+                continue 'write;
             }
         }
     }

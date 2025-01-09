@@ -4,7 +4,6 @@ use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
 use quiche::ConnectionId;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
 use pingora_error::{Error, ErrorType, OrErr};
 use crate::protocols::ConnectionState;
@@ -23,7 +22,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
             if let Some(e_state) = handshake_inner(i).await? {
                 // send HANDSHAKE_DONE Quic frame on established connection
                 e_state.tx_notify.notify_waiters();
-                e_state.tx_flushed.notified().await;
+                //e_state.tx_flushed.notified().await;
                 Some(e_state)
             } else {
                 debug!("handshake either rejected or ignored for connection {:?}", i.connection_id);
@@ -232,7 +231,6 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
     let connection = Arc::new(Mutex::new(conn));
     let tx_notify = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
-    let tx_flushed = Arc::new(Notify::new());
 
     debug!("connection {:?} handshake successful, udp_rx {}", connection_id, udp_rx.len());
     let handle = EstablishedHandle {
@@ -252,8 +250,8 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
         socket_details: socket_details.clone(),
         connection_id: connection_id.clone(),
         connection: connection.clone(),
+
         tx_notify: tx_notify.clone(),
-        tx_flushed: tx_flushed.clone(),
         tx_stats: TxBurst::new(max_send_udp_payload_size),
     };
 
@@ -267,7 +265,6 @@ async fn handshake_inner(state: &mut IncomingState) -> pingora_error::Result<Opt
 
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
-        tx_flushed: tx_flushed.clone(),
     };
 
     Ok(Some(state))

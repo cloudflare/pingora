@@ -47,7 +47,7 @@ const H3_SESSION_EVENTS_CHANNEL_SIZE : usize = 256;
 const H3_SESSION_DROP_CHANNEL_SIZE : usize = 1024;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_millis(25);
+const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Perform HTTP/3 connection handshake with an established (QUIC) connection.
 ///
@@ -75,7 +75,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
                    ErrorType::ConnectError, |_| "failed to create H3 connection")?
             };
             state.tx_notify.notify_waiters();
-            state.tx_flushed.notified().await;
+            //state.tx_flushed.notified().await;
 
             (state.connection_id.clone(), state.connection.clone(), state.drop_connection.clone(), hconn,
              state.tx_notify.clone(), state.tx_flushed.clone(), state.rx_notify.clone())
@@ -94,8 +94,10 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         tx_notify,
         tx_flushed,
         rx_notify,
+
         sessions: Default::default(),
         drop_sessions,
+
         max_accepted_stream_id: 0,
         received_goaway: None,
     })
@@ -191,6 +193,7 @@ pub struct HttpSession {
 
     // trigger Quic send, continue ConnectionTx write loop
     tx_notify: Arc<Notify>,
+    tx_flushed: Arc<Notify>,
     // receive notification on Quic recv, used to check stream capacity
     // as it only increases after MaxData or MaxStreamData frame was received
     rx_notify: Arc<Notify>,
@@ -323,6 +326,7 @@ impl HttpSession {
                                     drop_session: conn.drop_sessions.0.clone(),
 
                                     tx_notify: conn.tx_notify.clone(),
+                                    tx_flushed: conn.tx_flushed.clone(),
                                     rx_notify: conn.rx_notify.clone(),
                                     event_rx,
 
@@ -400,7 +404,7 @@ impl HttpSession {
                         }
 
                         conn.tx_notify.notify_waiters();
-                        conn.tx_flushed.notified().await;
+                        //conn.tx_flushed.notified().await;
                         return Ok(None)
                     }
 
@@ -408,6 +412,7 @@ impl HttpSession {
                     tokio::select! {
                         _data = conn.rx_notify.notified() => {}
                         used_timeout_duration = async {
+                            // FIXME: check if this is still an issue
                             // quiche timeout instants are on the initial calls very short
                             // quiche timeout durations are sometimes 0ns, None would be expected
                             // this can lead to premature closing of the connection
@@ -442,7 +447,7 @@ impl HttpSession {
                             }
 
                             conn.tx_notify.notify_waiters();
-                            conn.tx_flushed.notified().await;
+                            //conn.tx_flushed.notified().await;
                             return Ok(None)
                         }
                     }
@@ -616,22 +621,25 @@ impl HttpSession {
         };
 
         let mut sent_len = 0;
+        let mut fin = end;
         while sent_len < data.len() {
-            let required = cmp::min(data.len(), MAX_IPV6_QUIC_DATAGRAM_SIZE);
+            let required = cmp::min(data.len() - sent_len, MAX_IPV6_QUIC_DATAGRAM_SIZE);
             let capacity = self.stream_capacity(required).await
                 .explain_err(
                     ErrorType::WriteError,
                     |e| format!("Failed to acquire capacity on stream id {} with {}", self.stream_id, e))?;
 
             let send;
-            if capacity > data.len() {
+            if capacity > data.len() - sent_len {
                 send = &data[sent_len..data.len()];
             } else {
-                send = &data[sent_len..capacity];
+                send = &data[sent_len..sent_len + capacity];
             }
 
-            match self.send_body(send, end).await {
+            fin = sent_len + send.len() == data.len() && end;
+            match self.send_body(send, fin) {
                 Ok(sent_size) => {
+                    debug_assert_eq!(sent_size, send.len());
                     sent_len += sent_size;
                     self.tx_notify.notify_waiters();
                 },
@@ -639,13 +647,15 @@ impl HttpSession {
                         ErrorType::WriteError, |_| "writing h3 response body to downstream")
             }
         }
+        debug_assert_eq!(fin, end);
+        debug_assert_eq!(sent_len, data.len());
 
         self.body_sent += sent_len;
         self.send_ended = self.send_ended || end;
         Ok(())
     }
 
-    async fn send_body(&self, body: &[u8], fin: bool) -> h3::Result<usize> {
+    fn send_body(&self, body: &[u8], fin: bool) -> h3::Result<usize> {
         let mut qconn = self.quic_connection.lock();
         let mut hconn = self.h3_connection.lock();
 
@@ -665,6 +675,8 @@ impl HttpSession {
         if capacity >= required {
             Ok(capacity)
         } else {
+            self.tx_notify.notify_waiters();
+            //self.tx_flushed.notified().await;
             self.rx_notify.notified().await;
             Box::pin(self.stream_capacity(required)).await
         }
@@ -747,7 +759,7 @@ impl HttpSession {
 
         if self.response_header_written.is_some() {
             // use an empty data frame to signal the end
-            self.send_body(&[], true).await
+            self.send_body(&[], true)
                 .explain_err(
                     ErrorType::WriteError,
                     |e| format! {"Writing h3 response body to downstream failed. {e}"},
