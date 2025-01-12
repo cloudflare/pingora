@@ -420,10 +420,12 @@ impl Server {
         #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
-        let mut runtimes: Vec<Runtime> = Vec::new();
+        // Holds tuples of runtimes and their service name.
+        let mut runtimes: Vec<(Runtime, String)> = Vec::new();
 
         while let Some(service) = self.services.pop() {
             let threads = service.threads().unwrap_or(conf.threads);
+            let name = service.name().to_string();
             let runtime = Server::run_service(
                 service,
                 #[cfg(unix)]
@@ -433,7 +435,7 @@ impl Server {
                 conf.work_stealing,
                 self.configuration.listener_tasks_per_fd,
             );
-            runtimes.push(runtime);
+            runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
@@ -467,20 +469,23 @@ impl Server {
                     .unwrap_or(5),
             ),
         };
-        let shutdowns: Vec<_> = runtimes
+        let shutdowns: Vec<(_, String)> = runtimes
             .into_iter()
-            .map(|rt| {
+            .map(|(rt, name)| {
                 info!("Waiting for runtimes to exit!");
-                thread::spawn(move || {
+                let join = thread::spawn(move || {
                     rt.shutdown_timeout(shutdown_timeout);
                     thread::sleep(shutdown_timeout)
-                })
+                });
+                (join, name)
             })
             .collect();
-        for shutdown in shutdowns {
+        for (shutdown, name) in shutdowns {
+            info!("Waiting for service runtime {} to exit", name);
             if let Err(e) = shutdown.join() {
-                error!("Failed to shutdown runtime: {:?}", e);
+                error!("Failed to shutdown service runtime {}: {:?}", name, e);
             }
+            debug!("Service runtime {} has exited", name);
         }
     }
 
