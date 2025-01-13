@@ -15,6 +15,7 @@
 //! HTTP/3 server session
 
 use std::cmp;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -36,7 +37,6 @@ use quiche::{h3, Connection as QuicheConnection, ConnectionId, Shutdown};
 use quiche::h3::{Connection as QuicheH3Connection, Event, NameValue};
 use tokio::sync::{mpsc, Notify};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::mpsc::error::TrySendError;
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::v3::{event_to_request_headers, header_size, headermap_to_headervec, response_headers_to_event};
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
@@ -44,7 +44,7 @@ use crate::protocols::http::v3::nohash::StreamIdHashMap;
 static H3_OPTIONS: OnceLock<H3Options> = OnceLock::new();
 
 const H3_SESSION_EVENTS_CHANNEL_SIZE : usize = 256;
-const H3_SESSION_DROP_CHANNEL_SIZE : usize = 1024;
+const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -62,7 +62,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     };
 
     let (conn_id, qconn, drop_qconn, hconn,
-        tx_notify, tx_flushed, rx_notify) = match conn {
+        tx_notify, rx_notify) = match conn {
         Connection::Incoming(_) => {
             return Err(Error::explain(
                 ErrorType::InternalError,
@@ -78,11 +78,10 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
             //state.tx_flushed.notified().await;
 
             (state.connection_id.clone(), state.connection.clone(), state.drop_connection.clone(), hconn,
-             state.tx_notify.clone(), state.tx_flushed.clone(), state.rx_notify.clone())
+             state.tx_notify.clone(), state.rx_notify.clone())
         }
     };
 
-    let drop_sessions = mpsc::channel(H3_SESSION_DROP_CHANNEL_SIZE);
     Ok(H3Connection {
         _l4stream: io,
         connection_id: conn_id,
@@ -92,11 +91,10 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         h3_connection: Arc::new(Mutex::new(hconn)),
 
         tx_notify,
-        tx_flushed,
         rx_notify,
 
         sessions: Default::default(),
-        drop_sessions,
+        drop_sessions: Arc::new(Mutex::new(VecDeque::with_capacity(H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY))),
 
         max_accepted_stream_id: 0,
         received_goaway: None,
@@ -106,17 +104,16 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
 pub struct H3Connection {
     _l4stream: Stream, // ensure the stream will not be dropped until all sessions are
     connection_id: ConnectionId<'static>,
-    drop_quic_connection: Sender<ConnectionId<'static>>,
+    drop_quic_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
     quic_connection: Arc<Mutex<QuicheConnection>>,
     h3_connection: Arc<Mutex<QuicheH3Connection>>,
 
     tx_notify: Arc<Notify>,
-    tx_flushed: Arc<Notify>,
     rx_notify: Arc<Notify>,
 
     sessions: StreamIdHashMap<Sender<Event>>,
-    drop_sessions: (Sender<u64>, Receiver<u64>),
+    drop_sessions: Arc<Mutex<VecDeque<u64>>>,
 
     max_accepted_stream_id: u64,
     received_goaway: Option<u64>,
@@ -124,16 +121,9 @@ pub struct H3Connection {
 
 impl Drop for H3Connection {
     fn drop(&mut self) {
-        match self.drop_quic_connection.try_send(self.connection_id.clone()) {
-            Ok(()) => debug!("drop connection {:?}", self.connection_id),
-            Err(e) => {
-                let conn_id = match e {
-                    TrySendError::Full(id) => id,
-                    TrySendError::Closed(id) => id
-                };
-                warn!("failed send drop connection {:?} request", conn_id)
-            }
-        }
+        let mut drop_quic_connection = self.drop_quic_connection.lock();
+        drop_quic_connection.push_back(self.connection_id.clone());
+        debug!("drop connection {:?}", self.connection_id);
     }
 }
 
@@ -179,6 +169,24 @@ impl H3Connection {
             Ok(())
         }
     }
+
+    async fn sessions_housekeeping(&mut self) {
+        let mut drop_sessions = self.drop_sessions.lock();
+
+        // housekeeping finished sessions
+        while let Some(stream_id) = drop_sessions.pop_front() {
+            match self.sessions.remove(&stream_id) {
+                None => {
+                    warn!("connection {:?} failed to remove stream {} from sessions",
+                        self.connection_id, stream_id)
+                }
+                Some(_) => {
+                    debug!("connection {:?} stream {} removed from sessions",
+                                        self.connection_id, stream_id);
+                }
+            };
+        }
+    }
 }
 
 /// HTTP/3 server session
@@ -189,11 +197,10 @@ pub struct HttpSession {
     h3_connection: Arc<Mutex<QuicheH3Connection>>,
 
     // notify during drop to remove event_tx from active sessions
-    drop_session: Sender<u64>,
+    drop_session: Arc<Mutex<VecDeque<u64>>>,
 
     // trigger Quic send, continue ConnectionTx write loop
     tx_notify: Arc<Notify>,
-    tx_flushed: Arc<Notify>,
     // receive notification on Quic recv, used to check stream capacity
     // as it only increases after MaxData or MaxStreamData frame was received
     rx_notify: Arc<Notify>,
@@ -225,16 +232,9 @@ pub struct HttpSession {
 
 impl Drop for HttpSession {
     fn drop(&mut self) {
-        match self.drop_session.try_send(self.stream_id) {
-            Ok(()) => debug!("H3 connection {:?} drop stream {}", self.connection_id, self.stream_id),
-            Err(e) => {
-                let id = match e {
-                    TrySendError::Full(id) => id,
-                    TrySendError::Closed(id) => id
-                };
-                warn!("H3 connection {:?} stream {} failed notify drop session", self.connection_id, id)
-            }
-        }
+        let mut drop_sessions = self.drop_session.lock();
+        drop_sessions.push_back(self.stream_id);
+        debug!("H3 connection {:?} drop stream {}", self.connection_id, self.stream_id);
     }
 }
 
@@ -323,10 +323,9 @@ impl HttpSession {
                                     quic_connection: conn.quic_connection.clone(),
                                     h3_connection: conn.h3_connection.clone(),
 
-                                    drop_session: conn.drop_sessions.0.clone(),
+                                    drop_session: conn.drop_sessions.clone(),
 
                                     tx_notify: conn.tx_notify.clone(),
-                                    tx_flushed: conn.tx_flushed.clone(),
                                     rx_notify: conn.rx_notify.clone(),
                                     event_rx,
 
@@ -358,21 +357,7 @@ impl HttpSession {
                     debug!("H3 connection {:?} no events available", conn.connection_id);
                     // TODO: in case PriorityUpdate was triggered call take_priority_update() here
 
-                    // housekeeping finished sessions
-                    while !conn.drop_sessions.1.is_empty() {
-                        if let Some(stream_id) = conn.drop_sessions.1.recv().await {
-                            match conn.sessions.remove(&stream_id) {
-                                None => {
-                                    debug_assert!(false, "failed to remove stream from sessions");
-                                    warn!("failed to remove stream from sessions")
-                                }
-                                Some(_) => {
-                                    debug!("connection {:?} stream {} removed from sessions",
-                                        conn.connection_id, stream_id);
-                                }
-                            };
-                        }
-                    }
+                    conn.sessions_housekeeping().await;
 
                     let is_closed;
                     let timeout;
@@ -435,9 +420,10 @@ impl HttpSession {
                                 }
                             }
                         } => {
+                            conn.sessions_housekeeping().await;
                             if conn.sessions.len() > 0 {
-                                warn!("connection {:?} timeout {:?} reached with {} open sessions",
-                                    conn.connection_id, used_timeout_duration, conn.sessions.len());
+                                warn!("connection {:?} timeout {:?} reached with {} open sessions {:?}",
+                                    conn.connection_id, used_timeout_duration, conn.sessions.len(), conn.sessions);
                             } else {
                                 {
                                     let mut qconn = conn.quic_connection.lock();
@@ -447,7 +433,6 @@ impl HttpSession {
                             }
 
                             conn.tx_notify.notify_waiters();
-                            //conn.tx_flushed.notified().await;
                             return Ok(None)
                         }
                     }

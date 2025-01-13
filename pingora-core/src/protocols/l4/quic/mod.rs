@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::{io, mem};
 use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use pingora_error::{BError, Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
@@ -45,7 +45,7 @@ pub const MAX_IPV6_UDP_PACKET_SIZE: usize = 1452;
 pub const MAX_IPV6_QUIC_DATAGRAM_SIZE: usize = 1350;
 
 const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
-const CONNECTION_DROP_CHANNEL_SIZE : usize = 1024;
+const CONNECTION_DROP_DEQUE_INITIAL_SIZE: usize = 1024;
 
 pub struct Listener {
     socket: Arc<UdpSocket>,
@@ -55,7 +55,7 @@ pub struct Listener {
     crypto: Crypto,
 
     connections: Mutex<HashMap<ConnectionId<'static>, ConnectionHandle>>,
-    drop_connections: (Sender<ConnectionId<'static>>, Mutex<Receiver<ConnectionId<'static>>>)
+    drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 }
 
 pub struct Crypto {
@@ -70,7 +70,7 @@ pub enum Connection {
 pub struct IncomingState {
     connection_id: ConnectionId<'static>,
     config: Arc<Mutex<Config>>,
-    drop_connection: Sender<ConnectionId<'static>>,
+    drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
     socket: Arc<UdpSocket>,
     socket_details: SocketDetails,
@@ -94,7 +94,7 @@ pub struct EstablishedState {
     socket: Arc<UdpSocket>,
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
-    pub(crate) drop_connection: Sender<ConnectionId<'static>>,
+    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
     pub(crate) rx_notify: Arc<Notify>,
     pub(crate) tx_notify: Arc<Notify>,
     tx_handle: JoinHandle<Result<()>>,
@@ -169,7 +169,6 @@ impl TryFrom<UdpSocket> for Listener {
             },
         };
 
-        let drop_connections = mpsc::channel(CONNECTION_DROP_CHANNEL_SIZE);
         Ok(Listener {
             socket: Arc::new(io),
             socket_details: SocketDetails {
@@ -184,7 +183,7 @@ impl TryFrom<UdpSocket> for Listener {
             },
 
             connections: Default::default(),
-            drop_connections: (drop_connections.0, Mutex::new(drop_connections.1))
+            drop_connections: Arc::new(Mutex::new(VecDeque::with_capacity(CONNECTION_DROP_DEQUE_INITIAL_SIZE)))
         })
     }
 }
@@ -211,24 +210,13 @@ impl Listener {
 
             // cleanup connections
             {
-                let mut drop_conn = self.drop_connections.1.lock();
+                let mut drop_conn = self.drop_connections.lock();
                 let mut conn = self.connections.lock();
-                'housekeep: loop {
-                    match drop_conn.try_recv() {
-                        Ok(drop_id) => {
-                            match conn.remove(&drop_id) {
-                                None => error!("failed to remove connection handle {:?}", drop_id),
-                                Some(_) => debug!("removed connection handle {:?} from connections", drop_id)
-                            }
-                        }
-                        Err(e) => match e {
-                            TryRecvError::Empty => break 'housekeep,
-                            TryRecvError::Disconnected => {
-                                debug_assert!(false, "drop connections receiver disconnected");
-                                break 'housekeep
-                            }
-                        }
-                    };
+                while let Some(drop_id) = drop_conn.pop_front() {
+                    match conn.remove(&drop_id) {
+                        None => warn!("failed to remove connection handle {:?} from connections", drop_id),
+                        Some(_) => debug!("removed connection handle {:?} from connections", drop_id)
+                    }
                 }
             }
 
@@ -350,7 +338,7 @@ impl Listener {
             let connection = Connection::Incoming(IncomingState {
                 connection_id: conn_id.clone(),
                 config: self.config.clone(),
-                drop_connection: self.drop_connections.0.clone(),
+                drop_connection: self.drop_connections.clone(),
 
                 socket: self.socket.clone(),
                 socket_details: self.socket_details.clone(),
