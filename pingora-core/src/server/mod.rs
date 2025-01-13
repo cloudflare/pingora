@@ -73,11 +73,19 @@ pub enum ShutdownSignal {
     FastShutdown,
 }
 
+/// Watcher of a shutdown signal, e.g., [UnixShutdownSignalWatch] for Unix-like
+/// platforms.
 #[async_trait]
 pub trait ShutdownSignalWatch {
+    /// Returns the desired shutdown type once one has been requested.
     async fn recv(&self) -> ShutdownSignal;
 }
 
+/// A Unix shutdown watcher that awaits for Unix signals.
+/// 
+/// - `SIGQUIT`: graceful upgrade
+/// - `SIGTERM`: graceful terminate
+/// - `SIGINT`: fast shutdown
 #[cfg(unix)]
 pub struct UnixShutdownSignalWatch;
 
@@ -103,7 +111,9 @@ impl ShutdownSignalWatch for UnixShutdownSignalWatch {
     }
 }
 
+/// Arguments to configure running of the pingora server.
 pub struct RunArgs {
+    /// Signal for initating shutdown
     #[cfg(unix)]
     pub shutdown_signal: Box<dyn ShutdownSignalWatch>,
 }
