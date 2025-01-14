@@ -14,15 +14,15 @@
 
 //! HTTP/3 implementation
 
-use std::fmt::Debug;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
 use log::warn;
-use quiche::h3::{Header, NameValue};
-use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_error::{ErrorType, OrErr, Result};
+use pingora_http::{RequestHeader, ResponseHeader};
+use quiche::h3::{Header, NameValue};
+use std::fmt::Debug;
 
-pub mod server;
 pub mod nohash;
+pub mod server;
 
 pub fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
     let (mut parts, _) = Request::new(()).into_parts();
@@ -36,23 +36,24 @@ pub fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
             b":path" => uri = uri.path_and_query(h.value()),
             b":method" => match h.value().try_into() {
                 Ok(v) => parts.method = v,
-                Err(_) => warn!("Failed to parse method from input: {:?}", h.value())
+                Err(_) => warn!("Failed to parse method from input: {:?}", h.value()),
             },
             _ => match HeaderName::from_bytes(h.name()) {
                 Ok(k) => match HeaderValue::from_bytes(h.value()) {
                     Ok(v) => {
                         headers.append(k, v);
-                    },
+                    }
                     Err(_) => warn!("Failed to parse header value from input: {:?}", h.value()),
                 },
                 Err(_) => warn!("Failed to parse header name input: {:?}", h.name()),
-            }
+            },
         }
     }
 
     parts.version = Version::HTTP_3;
-    parts.uri = uri.build()
-        .explain_err(ErrorType::H3Error, |_| "failed to convert event parts to request uri")?;
+    parts.uri = uri.build().explain_err(ErrorType::H3Error, |_| {
+        "failed to convert event parts to request uri"
+    })?;
     parts.headers = headers;
     Ok(parts.into())
 }

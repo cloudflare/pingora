@@ -89,7 +89,7 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["boringssl"]
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived", "dep:quiche", "dep:ring"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]

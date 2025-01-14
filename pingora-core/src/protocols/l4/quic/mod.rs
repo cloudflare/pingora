@@ -1,32 +1,32 @@
+use log::{debug, error, trace};
+use parking_lot::Mutex;
+use pingora_error::{Error, ErrorType, OrErr, Result};
+use quiche::Connection as QuicheConnection;
+use quiche::{Config, ConnectionId, Header, RecvInfo, Stats};
+use ring::hmac::Key;
 use std::collections::{HashMap, VecDeque};
-use std::{io, mem};
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use log::{debug, error, trace};
-use parking_lot::Mutex;
-use quiche::{Config, ConnectionId, Header, RecvInfo, Stats};
-use ring::hmac::Key;
+use std::{io, mem};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
-use pingora_error::{Error, ErrorType, OrErr, Result};
-use quiche::Connection as QuicheConnection;
 use tokio::task::JoinHandle;
 
-mod sendto;
 pub(crate) mod id_token;
-pub(crate) mod tls_handshake;
-mod settings;
 mod listener;
+mod sendto;
+mod settings;
+pub(crate) mod tls_handshake;
 
-use crate::protocols::ConnectionState;
 use crate::protocols::l4::quic::sendto::send_to;
+use crate::protocols::ConnectionState;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
@@ -77,7 +77,7 @@ pub struct IncomingState {
     pub(crate) dgram: UdpRecv,
 
     pub(crate) ignore: bool,
-    pub(crate) reject: bool
+    pub(crate) reject: bool,
 }
 
 #[derive(Clone)]
@@ -154,8 +154,10 @@ impl Connection {
     pub(crate) fn establish(&mut self, state: EstablishedState) -> Result<()> {
         if cfg!(test) {
             let conn = state.connection.lock();
-            debug_assert!(conn.is_established() || conn.is_in_early_data(),
-                          "connection must be established or ready for data")
+            debug_assert!(
+                conn.is_established() || conn.is_in_early_data(),
+                "connection must be established or ready for data"
+            )
         }
         match self {
             Connection::Incoming(s) => {
@@ -164,9 +166,13 @@ impl Connection {
                         Ok(mut dgram) => {
                             let mut conn = state.connection.lock();
                             conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
-                                .explain_err(
-                                    ErrorType::HandshakeError, |_| "receiving dgram failed")?;
-                            debug!("connection {:?} dgram received while establishing", s.connection_id)
+                                .explain_err(ErrorType::HandshakeError, |_| {
+                                    "receiving dgram failed"
+                                })?;
+                            debug!(
+                                "connection {:?} dgram received while establishing",
+                                s.connection_id
+                            )
                         }
                         Err(e) => {
                             match e {
@@ -182,15 +188,18 @@ impl Connection {
                         }
                     }
                 }
-                debug_assert!(s.udp_rx.is_empty(),
-                              "udp rx channel must be empty when establishing the connection");
+                debug_assert!(
+                    s.udp_rx.is_empty(),
+                    "udp rx channel must be empty when establishing the connection"
+                );
                 debug!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::Established(state));
                 Ok(())
             }
             Connection::Established(_) => Err(Error::explain(
                 ErrorType::InternalError,
-                "establishing connection only possible on incoming connection"))
+                "establishing connection only possible on incoming connection",
+            )),
         }
     }
 }
@@ -223,7 +232,7 @@ pub(crate) struct ConnectionTx {
 impl ConnectionTx {
     pub(crate) async fn start_tx(mut self) -> Result<()> {
         let id = self.connection_id;
-        let mut out = [0u8;MAX_IPV6_BUF_SIZE];
+        let mut out = [0u8; MAX_IPV6_BUF_SIZE];
 
         let mut finished_sending = false;
         let mut continue_write = false;
@@ -232,13 +241,19 @@ impl ConnectionTx {
             // update stats from connection
             let max_send_burst = {
                 let conn = self.connection.lock();
-                self.tx_stats.max_send_burst(conn.stats(), conn.send_quantum())
+                self.tx_stats
+                    .max_send_burst(conn.stats(), conn.send_quantum())
             };
             let mut total_write = 0;
             let mut dst_info = None;
 
             // fill tx buffer with connection data
-            trace!("connection {:?} total_write={}, max_send_burst={}", id, total_write, max_send_burst);
+            trace!(
+                "connection {:?} total_write={}, max_send_burst={}",
+                id,
+                total_write,
+                max_send_burst
+            );
             'fill: while total_write < max_send_burst {
                 let send = {
                     let mut conn = self.connection.lock();
@@ -249,7 +264,7 @@ impl ConnectionTx {
                     Ok((size, info)) => {
                         debug!("connection {:?} sent to={:?}, length={}", id, info.to, size);
                         (size, info)
-                    },
+                    }
                     Err(e) => {
                         if e == quiche::Error::Done {
                             trace!("connection {:?} send finished", id);
@@ -258,12 +273,16 @@ impl ConnectionTx {
                         }
                         error!("connection {:?} send error: {:?}", id, e);
                         /* TODO: close connection
-                            let mut conn = self.connection.lock();
-                            conn.close(false, 0x1, b"fail").ok();
-                         */
+                           let mut conn = self.connection.lock();
+                           conn.close(false, 0x1, b"fail").ok();
+                        */
                         break 'write Err(Error::explain(
                             ErrorType::WriteError,
-                            format!("Connection {:?} send data to network failed with {:?}", id, e)));
+                            format!(
+                                "Connection {:?} send data to network failed with {:?}",
+                                id, e
+                            ),
+                        ));
                     }
                 };
 
@@ -273,7 +292,7 @@ impl ConnectionTx {
 
                 if size < self.tx_stats.max_datagram_size {
                     continue_write = true;
-                    break 'fill
+                    break 'fill;
                 }
             }
 
@@ -292,16 +311,24 @@ impl ConnectionTx {
                 self.tx_stats.max_datagram_size,
                 self.socket_details.pacing_enabled,
                 self.socket_details.gso_enabled,
-            ).await {
+            )
+            .await
+            {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     error!("connection {:?} network socket would block", id);
-                    continue
+                    continue;
                 }
                 break 'write Err(Error::explain(
                     ErrorType::WriteError,
-                    format!("connection {:?} network send failed with {:?}", id, e)));
+                    format!("connection {:?} network send failed with {:?}", id, e),
+                ));
             }
-            trace!("connection {:?} network sent to={} bytes={}", id, dst_info.to, total_write);
+            trace!(
+                "connection {:?} network sent to={} bytes={}",
+                id,
+                dst_info.to,
+                total_write
+            );
 
             if continue_write {
                 continue 'write;
@@ -319,7 +346,7 @@ impl ConnectionTx {
 pub struct TxStats {
     loss_rate: f64,
     max_send_burst: usize,
-    max_datagram_size: usize
+    max_datagram_size: usize,
 }
 
 impl TxStats {
@@ -338,13 +365,11 @@ impl TxStats {
         if loss_rate > self.loss_rate + 0.001 {
             self.max_send_burst = self.max_send_burst / 4 * 3;
             // Minimum bound of 10xMSS.
-            self.max_send_burst =
-                self.max_send_burst.max(self.max_datagram_size * 10);
+            self.max_send_burst = self.max_send_burst.max(self.max_datagram_size * 10);
             self.loss_rate = loss_rate;
         }
 
-        send_quantum.min(self.max_send_burst) /
-            self.max_datagram_size * self.max_datagram_size
+        send_quantum.min(self.max_send_burst) / self.max_datagram_size * self.max_datagram_size
     }
 }
 
@@ -352,7 +377,7 @@ impl AsRawFd for Connection {
     fn as_raw_fd(&self) -> RawFd {
         match self {
             Connection::Incoming(s) => s.socket.as_raw_fd(),
-            Connection::Established(s) => s.socket.as_raw_fd()
+            Connection::Established(s) => s.socket.as_raw_fd(),
         }
     }
 }
@@ -365,12 +390,11 @@ impl Debug for Listener {
     }
 }
 
-
 impl Connection {
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Connection::Incoming(s) => s.socket.local_addr(),
-            Connection::Established(s) => s.socket.local_addr()
+            Connection::Established(s) => s.socket.local_addr(),
         }
     }
 }
@@ -396,10 +420,7 @@ impl AsyncWrite for Connection {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         todo!()
     }
 }

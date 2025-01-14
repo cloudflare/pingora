@@ -22,8 +22,8 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{tls::TlsRef, ConnectionState, Stream};
 use crate::protocols::tls::quic::handshake as quic_handshake;
+use crate::protocols::{tls::TlsRef, ConnectionState, Stream};
 
 #[cfg(unix)]
 use crate::server::ListenFds;

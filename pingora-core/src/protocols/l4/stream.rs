@@ -40,8 +40,8 @@ use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::l4::quic::Connection;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
-    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek,
-    Shutdown, SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
+    ConnectionState, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
+    SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
 };
 use crate::upstreams::peer::Tracer;
 
@@ -533,7 +533,7 @@ impl ConnectionState for Stream {
         match &self.stream.get_ref().stream {
             RawStream::Quic(s) => s.is_quic_connection(),
             RawStream::Tcp(_) => false,
-            RawStream::Unix(_) => false
+            RawStream::Unix(_) => false,
         }
     }
 }

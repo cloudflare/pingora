@@ -26,7 +26,7 @@
 
 use std::cmp;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::unix::io::AsRawFd;
 
 /// For Linux, try to detect GSO is available.
 #[cfg(target_os = "linux")]
@@ -46,7 +46,9 @@ pub fn detect_gso(_socket: &mio::net::UdpSocket, _segment_size: usize) -> bool {
 /// Send packets using sendmsg() with GSO.
 #[cfg(target_os = "linux")]
 fn send_to_gso_pacing(
-    socket: &tokio::net::UdpSocket, buf: &[u8], send_info: &quiche::SendInfo,
+    socket: &tokio::net::UdpSocket,
+    buf: &[u8],
+    send_info: &quiche::SendInfo,
     segment_size: usize,
 ) -> io::Result<usize> {
     use nix::sys::socket::sendmsg;
@@ -54,7 +56,6 @@ fn send_to_gso_pacing(
     use nix::sys::socket::MsgFlags;
     use nix::sys::socket::SockaddrStorage;
     use std::io::IoSlice;
-    use std::os::unix::io::AsRawFd;
 
     let iov = [IoSlice::new(buf)];
     let segment_size = segment_size as u16;
@@ -83,7 +84,9 @@ fn send_to_gso_pacing(
 /// For non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
 fn send_to_gso_pacing(
-    _socket: &mio::net::UdpSocket, _buf: &[u8], _send_info: &quiche::SendInfo,
+    _socket: &mio::net::UdpSocket,
+    _buf: &[u8],
+    _send_info: &quiche::SendInfo,
     _segment_size: usize,
 ) -> io::Result<usize> {
     panic!("send_to_gso() should not be called on non-linux platforms");
@@ -94,11 +97,15 @@ fn send_to_gso_pacing(
 /// When GSO and SO_TXTIME are enabled, send packets using send_to_gso().
 /// Otherwise, send packets using socket.send_to().
 pub async fn send_to(
-    socket: &tokio::net::UdpSocket, buf: &[u8], send_info: &quiche::SendInfo,
-    segment_size: usize, pacing: bool, enable_gso: bool,
+    socket: &tokio::net::UdpSocket,
+    buf: &[u8],
+    send_info: &quiche::SendInfo,
+    segment_size: usize,
+    pacing: bool,
+    enable_gso: bool,
 ) -> io::Result<usize> {
     if pacing && enable_gso {
-        return send_to_gso_pacing(socket, buf, send_info, segment_size)
+        return send_to_gso_pacing(socket, buf, send_info, segment_size);
     }
 
     let mut off = 0;
@@ -111,7 +118,7 @@ pub async fn send_to(
         match socket.send_to(&buf[off..off + pkt_len], send_info.to).await {
             Ok(v) => {
                 written += v;
-            },
+            }
             Err(e) => return Err(e),
         }
 
@@ -126,8 +133,7 @@ pub async fn send_to(
 fn std_time_to_u64(time: &std::time::Instant) -> u64 {
     const NANOS_PER_SEC: u64 = 1_000_000_000;
 
-    const INSTANT_ZERO: std::time::Instant =
-        unsafe { std::mem::transmute(std::time::UNIX_EPOCH) };
+    const INSTANT_ZERO: std::time::Instant = unsafe { std::mem::transmute(std::time::UNIX_EPOCH) };
 
     let raw_time = time.duration_since(INSTANT_ZERO);
 

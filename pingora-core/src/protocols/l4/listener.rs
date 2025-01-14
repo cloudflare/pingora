@@ -55,8 +55,6 @@ impl From<UnixListener> for Listener {
     }
 }
 
-
-
 #[cfg(windows)]
 impl AsRawSocket for Listener {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
@@ -75,7 +73,7 @@ impl Listener {
                 // a Quic connection supports IP address switching;
                 // for multi-path a primary peer_addr needs to be selected
                 l.accept().await.map(|(stream, peer_addr)| {
-                    let mut s: Stream = stream.into();
+                    let mut s: Stream = stream;
 
                     #[cfg(unix)]
                     let digest = SocketDigest::from_raw_fd(s.as_raw_fd());

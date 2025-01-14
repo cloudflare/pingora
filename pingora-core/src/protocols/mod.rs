@@ -252,6 +252,7 @@ pub(crate) trait ConnSockReusable {
     fn check_sock_match<V: AsRawSocket>(&self, sock: V) -> bool;
 }
 
+use crate::protocols::l4::quic::Connection;
 use crate::protocols::tls::TlsRef;
 use l4::socket::SocketAddr;
 use log::{debug, error};
@@ -262,7 +263,6 @@ use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::{net::SocketAddr as InetSocketAddr, path::Path};
-use crate::protocols::l4::quic::Connection;
 
 #[cfg(unix)]
 impl ConnFdReusable for SocketAddr {

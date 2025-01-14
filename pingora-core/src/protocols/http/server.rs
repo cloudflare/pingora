@@ -57,10 +57,7 @@ impl Session {
 
     /// Whether the session is HTTP/3.
     pub fn is_http3(&self) -> bool {
-        match self {
-            Session::H3(_) => true,
-            _ => false,
-        }
+        matches!(self, Session::H3(_))
     }
 
     /// The session HTTP version.

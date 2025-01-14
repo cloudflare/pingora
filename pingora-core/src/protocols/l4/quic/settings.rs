@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use parking_lot::Mutex;
-use quiche::Config;
-use pingora_error::{ErrorType, OrErr, Result};
 use crate::protocols::l4::quic::MAX_IPV6_QUIC_DATAGRAM_SIZE;
+use parking_lot::Mutex;
+use pingora_error::{ErrorType, OrErr, Result};
+use quiche::Config;
+use std::sync::Arc;
 
 pub struct Settings {
     config: Arc<Mutex<Config>>,
@@ -30,8 +30,8 @@ impl Settings {
         // config.verify_peer(); default server = false; client = true
         // config.discover_pmtu(false); // default false
         config.grease(false); // default true
-        // config.log_keys() && config.set_keylog(); // logging SSL secrets
-        // config.set_ticket_key() // session ticket signer key material
+                              // config.log_keys() && config.set_keylog(); // logging SSL secrets
+                              // config.set_ticket_key() // session ticket signer key material
 
         //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
 
@@ -78,7 +78,7 @@ impl Settings {
         // config.set_disable_dcid_reuse(false) // default false
 
         Ok(Self {
-            config: Arc::new(Mutex::new(config))
+            config: Arc::new(Mutex::new(config)),
         })
     }
 
@@ -89,6 +89,8 @@ impl Settings {
 
 impl From<Config> for Settings {
     fn from(config: Config) -> Self {
-        Self { config: Arc::new(Mutex::new(config)) }
+        Self {
+            config: Arc::new(Mutex::new(config)),
+        }
     }
 }

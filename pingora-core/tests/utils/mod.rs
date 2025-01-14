@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
-use pingora_core::protocols::l4::quic::{MAX_IPV6_BUF_SIZE};
+use pingora_core::protocols::l4::quic::MAX_IPV6_BUF_SIZE;
 
 #[derive(Clone)]
 pub struct EchoApp;
@@ -44,7 +44,7 @@ impl ServeHttp for EchoApp {
             while let Ok(b) = http_stream.read_request_body().await {
                 match b {
                     None => break, // finished reading request
-                    Some(b) => body.put(b)
+                    Some(b) => body.put(b),
                 }
             }
             if body.is_empty() {
@@ -53,12 +53,7 @@ impl ServeHttp for EchoApp {
             body.freeze()
         };
 
-        let body = match timeout(
-            Duration::from_millis(read_timeout),
-            body_future,
-        )
-        .await
-        {
+        let body = match timeout(Duration::from_millis(read_timeout), body_future).await {
             Ok(res) => res,
             Err(_) => {
                 panic!("Timed out after {:?}ms", read_timeout);
