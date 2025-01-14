@@ -77,10 +77,8 @@ impl AsRawSocket for Listener {
 
 impl Listener {
     /// Accept a connection from the listening endpoint
-    pub async fn accept(&self) -> io::Result<Stream> {
-        // TODO: changing to &mut self would help to simplify connection state locks for Quic
-        // not required for TCP/UDS, feasible to change to unique (mut) access?
-        match &self {
+    pub async fn accept(&mut self) -> io::Result<Stream> {
+        match self {
             Self::Quic(l) => {
                 // TODO: update digest when peer_addr changes;
                 // a Quic connection supports IP address switching;

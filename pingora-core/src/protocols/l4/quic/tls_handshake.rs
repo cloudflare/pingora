@@ -22,7 +22,6 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
             if let Some(e_state) = handshake_inner(i).await? {
                 // send HANDSHAKE_DONE Quic frame on established connection
                 e_state.tx_notify.notify_waiters();
-                //e_state.tx_flushed.notified().await;
                 Some(e_state)
             } else {
                 debug!("handshake either rejected or ignored for connection {:?}", i.connection_id);

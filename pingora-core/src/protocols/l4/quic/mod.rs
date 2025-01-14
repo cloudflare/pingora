@@ -54,7 +54,7 @@ pub struct Listener {
     config: Arc<Mutex<Config>>,
     crypto: Crypto,
 
-    connections: Mutex<HashMap<ConnectionId<'static>, ConnectionHandle>>,
+    connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
     drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 }
 
@@ -189,7 +189,7 @@ impl TryFrom<UdpSocket> for Listener {
 }
 
 impl Listener {
-    pub(crate) async fn accept(&self) -> io::Result<(L4Stream, SocketAddr)> {
+    pub(crate) async fn accept(&mut self) -> io::Result<(L4Stream, SocketAddr)> {
         let mut rx_buf = [0u8; MAX_IPV6_BUF_SIZE];
 
         debug!("endpoint rx loop");
@@ -211,9 +211,8 @@ impl Listener {
             // cleanup connections
             {
                 let mut drop_conn = self.drop_connections.lock();
-                let mut conn = self.connections.lock();
                 while let Some(drop_id) = drop_conn.pop_front() {
-                    match conn.remove(&drop_id) {
+                    match self.connections.remove(&drop_id) {
                         None => warn!("failed to remove connection handle {:?} from connections", drop_id),
                         Some(_) => debug!("removed connection handle {:?} from connections", drop_id)
                     }
@@ -241,72 +240,69 @@ impl Listener {
             let mut conn_id = header.dcid.clone();
             let mut udp_tx = None;
 
-            {
-                let mut connections = self.connections.lock();
-                // send to corresponding connection
-                let mut handle;
-                handle = connections.get_mut(&conn_id);
-                if handle.is_none() {
-                    conn_id = Self::gen_cid(&self.crypto.key, &header);
-                    handle = connections.get_mut(&conn_id);
-                };
+            // send to corresponding connection
+            let mut handle;
+            handle = self.connections.get_mut(&conn_id);
+            if handle.is_none() {
+                conn_id = Self::gen_cid(&self.crypto.key, &header);
+                handle = self.connections.get_mut(&conn_id);
+            };
 
-                trace!("connection {:?} network received from={} length={}", conn_id, from, size);
+            trace!("connection {:?} network received from={} length={}", conn_id, from, size);
 
-                if let Some(handle) = handle {
-                    debug!("existing connection {:?} {:?} {:?}", conn_id, handle, header);
-                    let mut established_handle = None;
-                    match handle {
-                        ConnectionHandle::Incoming(i) => {
-                            let resp;
-                            {
-                                resp = i.response.lock().take();
-                            }
-                            if let Some(resp) = resp {
-                                match resp {
-                                    HandshakeResponse::Established(e) => {
-                                        debug!("connection {:?} received HandshakeResponse::Established", conn_id);
-                                        // receive data into existing connection
-                                        established_handle = Some(e);
-                                    }
-                                    HandshakeResponse::Ignored
-                                    | HandshakeResponse::Rejected => {
-                                        connections.remove(&header.dcid);
-                                        continue 'read
-                                    }
-                                }
-                            } else {
-                                udp_tx = Some(i.udp_tx.clone());
-                            }
+            if let Some(handle) = handle {
+                debug!("existing connection {:?} {:?} {:?}", conn_id, handle, header);
+                let mut established_handle = None;
+                match handle {
+                    ConnectionHandle::Incoming(i) => {
+                        let resp;
+                        {
+                            resp = i.response.lock().take();
                         }
-                        ConnectionHandle::Established(e) => {
-                            // receive data into existing connection
-                            match Self::recv_connection(&conn_id, e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
-                                Ok(_len) => {
-                                    e.rx_notify.notify_waiters();
-                                    e.tx_notify.notify_waiters();
-                                    continue 'read;
+                        if let Some(resp) = resp {
+                            match resp {
+                                HandshakeResponse::Established(e) => {
+                                    debug!("connection {:?} received HandshakeResponse::Established", conn_id);
+                                    // receive data into existing connection
+                                    established_handle = Some(e);
                                 }
-                                Err(e) => {
-                                    // TODO: take action on errors, e.g close connection, send & remove
-                                    break 'read Err(e);
+                                HandshakeResponse::Ignored
+                                | HandshakeResponse::Rejected => {
+                                    self.connections.remove(&header.dcid);
+                                    continue 'read
                                 }
                             }
+                        } else {
+                            udp_tx = Some(i.udp_tx.clone());
                         }
                     }
-                    if let Some(e) = established_handle {
+                    ConnectionHandle::Established(e) => {
+                        // receive data into existing connection
                         match Self::recv_connection(&conn_id, e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
                             Ok(_len) => {
                                 e.rx_notify.notify_waiters();
                                 e.tx_notify.notify_waiters();
-                                // transition connection
-                                handle.establish(e);
                                 continue 'read;
                             }
                             Err(e) => {
                                 // TODO: take action on errors, e.g close connection, send & remove
                                 break 'read Err(e);
                             }
+                        }
+                    }
+                }
+                if let Some(e) = established_handle {
+                    match Self::recv_connection(&conn_id, e.connection.as_ref(), &mut rx_buf[..size], recv_info) {
+                        Ok(_len) => {
+                            e.rx_notify.notify_waiters();
+                            e.tx_notify.notify_waiters();
+                            // transition connection
+                            handle.establish(e);
+                            continue 'read;
+                        }
+                        Err(e) => {
+                            // TODO: take action on errors, e.g close connection, send & remove
+                            break 'read Err(e);
                         }
                     }
                 }
@@ -359,11 +355,7 @@ impl Listener {
                 response,
             });
 
-            {
-                let mut connections = self.connections.lock();
-                connections.insert(conn_id, handle);
-            }
-
+            self.connections.insert(conn_id, handle);
             return Ok((connection.into(), from))
         }
     }
@@ -541,7 +533,6 @@ impl ConnectionTx {
 
             if total_write == 0 || dst_info.is_none() {
                 trace!("connection {:?} nothing to send", id);
-                //self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await;
                 continue 'write;
             }
@@ -572,7 +563,6 @@ impl ConnectionTx {
 
             if finished_sending {
                 trace!("connection {:?} finished sending", id);
-                //self.tx_flushed.notify_waiters();
                 self.tx_notify.notified().await;
                 continue 'write;
             }
