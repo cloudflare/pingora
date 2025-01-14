@@ -140,6 +140,13 @@ impl Listeners {
         listeners
     }
 
+    /// Create a new [`Listeners`] with a QUIC server endpoint from the given string.
+    pub fn quic(&mut self, addr: &str) -> Self {
+        let mut listeners = Self::new();
+        listeners.add_address(ServerAddress::Udp(addr.into(), None, ServerProtocol::Quic));
+        listeners
+    }
+
     /// Create a new [`Listeners`] with a Unix domain socket endpoint from the given string.
     #[cfg(unix)]
     pub fn uds(addr: &str, perm: Option<Permissions>) -> Self {

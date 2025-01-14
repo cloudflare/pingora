@@ -536,12 +536,10 @@ mod tests {
         assert!(!context.contains("total-connection timeout"));
     }
 
-    /*
     #[tokio::test]
     async fn test_do_connect_without_total_timeout() {
         let peer = BasicPeer::new(BLACK_HOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
     }
-     */
 }

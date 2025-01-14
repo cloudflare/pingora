@@ -58,7 +58,6 @@ pub trait ServerApp {
     /// This callback will be called once after the service stops listening to its endpoints.
     async fn cleanup(&self) {}
 }
-
 #[non_exhaustive]
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
@@ -238,7 +237,6 @@ where
             let mut shutdown = shutdown.clone();
             loop {
                 // this loop ends when the client decides to close the h3 conn
-                // TODO: add a timeout?
                 let h3_stream = tokio::select! {
                     _ = shutdown.changed() => {
                         match h3_conn.graceful_shutdown().await {

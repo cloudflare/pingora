@@ -659,7 +659,7 @@ impl HttpSession {
                         )
                     })?;
 
-            let send= if capacity > data.len() - sent_len {
+            let send = if capacity > data.len() - sent_len {
                 &data[sent_len..data.len()]
             } else {
                 &data[sent_len..sent_len + capacity]

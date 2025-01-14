@@ -31,7 +31,7 @@ pub use rustls::*;
 
 #[cfg(not(feature = "any_tls"))]
 pub mod noop_tls;
-pub(crate) mod quic;
+pub mod quic;
 
 #[cfg(not(feature = "any_tls"))]
 pub use noop_tls::*;
