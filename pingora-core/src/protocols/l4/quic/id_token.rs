@@ -34,7 +34,7 @@ use std::net;
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-pub(super) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
+pub(crate) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
     // TODO: implement token generation/validation using crypto
     let mut token = Vec::new();
 
@@ -58,7 +58,7 @@ pub(super) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8>
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-pub(super) fn validate_token<'a>(
+pub(crate) fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
 ) -> Option<quiche::ConnectionId<'a>> {
     // TODO: implement token generation/validation using crypto

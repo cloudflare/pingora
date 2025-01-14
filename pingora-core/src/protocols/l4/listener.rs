@@ -55,16 +55,7 @@ impl From<UnixListener> for Listener {
     }
 }
 
-#[cfg(unix)]
-impl AsRawFd for Listener {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        match &self {
-            Self::Quic(l) => l.get_raw_fd(),
-            Self::Tcp(l) => l.as_raw_fd(),
-            Self::Unix(l) => l.as_raw_fd(),
-        }
-    }
-}
+
 
 #[cfg(windows)]
 impl AsRawSocket for Listener {

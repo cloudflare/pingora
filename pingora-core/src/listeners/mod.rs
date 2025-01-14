@@ -23,7 +23,7 @@ pub mod tls;
 pub use crate::tls::listeners as tls;
 
 use crate::protocols::{tls::TlsRef, ConnectionState, Stream};
-use crate::protocols::l4::quic::tls_handshake::handshake as quic_handshake;
+use crate::protocols::tls::quic::handshake as quic_handshake;
 
 #[cfg(unix)]
 use crate::server::ListenFds;

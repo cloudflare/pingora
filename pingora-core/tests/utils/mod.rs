@@ -104,8 +104,7 @@ fn entry_point(opt: Option<Opt>) {
 
     let mut echo_service_http =
         Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
-
-    echo_service_http.threads = Some(8);
+    echo_service_http.threads = Some(4);
 
     my_server.add_service(echo_service_http);
     my_server.run_forever();
