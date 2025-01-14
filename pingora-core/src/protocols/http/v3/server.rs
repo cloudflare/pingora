@@ -75,7 +75,6 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
                    ErrorType::ConnectError, |_| "failed to create H3 connection")?
             };
             state.tx_notify.notify_waiters();
-            //state.tx_flushed.notified().await;
 
             (state.connection_id.clone(), state.connection.clone(), state.drop_connection.clone(), hconn,
              state.tx_notify.clone(), state.rx_notify.clone())
@@ -389,7 +388,6 @@ impl HttpSession {
                         }
 
                         conn.tx_notify.notify_waiters();
-                        //conn.tx_flushed.notified().await;
                         return Ok(None)
                     }
 
@@ -552,6 +550,9 @@ impl HttpSession {
 
         let headers = response_headers_to_event(&header);
         self.send_response(headers.as_slice(), end).await?;
+        if end {
+            self.tx_notify.notify_waiters();
+        }
 
         self.response_header_written = Some(header);
         self.send_ended = self.send_ended || end;
@@ -581,10 +582,7 @@ impl HttpSession {
         );
 
         match hconn.send_response(&mut qconn, self.stream_id, headers, fin) {
-            Ok(()) => {
-                self.tx_notify.notify_waiters();
-                Ok(())
-            }
+            Ok(()) => { Ok(()) },
             Err(h3::Error::Done) => { Ok(()) },
             Err(e) => Err(e).explain_err(
                     ErrorType::WriteError, |_| "H3 connection failed to write response"),
@@ -626,7 +624,6 @@ impl HttpSession {
                 Ok(sent_size) => {
                     debug_assert_eq!(sent_size, send.len());
                     sent_len += sent_size;
-                    self.tx_notify.notify_waiters();
                 },
                 Err(e) => return Err(e).explain_err(
                         ErrorType::WriteError, |_| "writing h3 response body to downstream")
@@ -634,6 +631,9 @@ impl HttpSession {
         }
         debug_assert_eq!(fin, end);
         debug_assert_eq!(sent_len, data.len());
+        if end {
+            self.tx_notify.notify_waiters();
+        }
 
         self.body_sent += sent_len;
         self.send_ended = self.send_ended || end;
@@ -661,7 +661,6 @@ impl HttpSession {
             Ok(capacity)
         } else {
             self.tx_notify.notify_waiters();
-            //self.tx_flushed.notified().await;
             self.rx_notify.notified().await;
             Box::pin(self.stream_capacity(required)).await
         }
