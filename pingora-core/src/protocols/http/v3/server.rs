@@ -17,6 +17,8 @@
 use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::{BufMut, Bytes, BytesMut};
 use http::uri::PathAndQuery;
@@ -650,20 +652,22 @@ impl HttpSession {
         hconn.send_body(&mut qconn, self.stream_id, body, fin)
     }
 
-    async fn stream_capacity(&self, required: usize) -> quiche::Result<usize> {
-        let capacity;
-        {
-            let qconn = self.quic_connection.lock();
-            capacity = qconn.stream_capacity(self.stream_id)?;
-        }
+    fn stream_capacity(&self, required: usize) -> Pin<Box<dyn Future<Output = quiche::Result<usize>> + Send + '_>> {
+        Box::pin(async move {
+            let capacity;
+            {
+                let qconn = self.quic_connection.lock();
+                capacity = qconn.stream_capacity(self.stream_id)?;
+            }
 
-        if capacity >= required {
-            Ok(capacity)
-        } else {
-            self.tx_notify.notify_waiters();
-            self.rx_notify.notified().await;
-            Box::pin(self.stream_capacity(required)).await
-        }
+            if capacity >= required {
+                Ok(capacity)
+            } else {
+                self.tx_notify.notify_waiters();
+                self.rx_notify.notified().await;
+                self.stream_capacity(required).await
+            }
+        })
     }
 
     /// Write response trailers to the client, this also closes the stream.
