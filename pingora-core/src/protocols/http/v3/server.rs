@@ -30,7 +30,7 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
@@ -51,7 +51,6 @@ const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
 const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Perform HTTP/3 connection handshake with an established (QUIC) connection.
 ///
@@ -394,7 +393,6 @@ impl HttpSession {
 
                     let is_closed;
                     let timeout;
-                    let timeout_now;
                     {
                         let qconn = conn.quic_connection.lock();
                         is_closed = qconn.is_closed()
@@ -415,8 +413,7 @@ impl HttpSession {
                                 );
                             }
                         }
-                        timeout = qconn.timeout_instant();
-                        timeout_now = Instant::now();
+                        timeout = qconn.timeout();
                     }
 
                     if is_closed {
@@ -437,43 +434,26 @@ impl HttpSession {
                     // race for new data on connection or timeout
                     tokio::select! {
                         _data = conn.rx_notify.notified() => {}
-                        used_timeout_duration = async {
-                            // FIXME: check if this is still an issue
-                            // quiche timeout instants are on the initial calls very short
-                            // quiche timeout durations are sometimes 0ns, None would be expected
-                            // this can lead to premature closing of the connection
-                            // guarding with DEFAULT_CONNECTION_IDLE_TIMEOUT
+                        _timedout = async {
                             if let Some(timeout) = timeout {
-                                if Some(timeout) < Instant::now().checked_add(DEFAULT_CONNECTION_IDLE_TIMEOUT) {
-                                    trace!("connection {:?} default timeout {:?}", conn.connection_id, DEFAULT_CONNECTION_IDLE_TIMEOUT);
-                                    tokio::time::sleep(DEFAULT_CONNECTION_IDLE_TIMEOUT).await;
-                                    DEFAULT_CONNECTION_IDLE_TIMEOUT
-                                } else {
-                                    let timeout_duration = timeout.duration_since(timeout_now);
-                                    tokio::time::sleep(timeout_duration).await;
-                                    trace!("connection {:?} timeout {:?}", conn.connection_id, timeout_duration);
-                                    timeout_duration
-                                }
+                                debug!("connection {:?} timeout {:?}", conn.connection_id, timeout);
+                                tokio::time::sleep(timeout).await
                             } else {
-                                trace!("connection {:?} default timeout {:?}", conn.connection_id, DEFAULT_CONNECTION_IDLE_TIMEOUT);
-                                tokio::time::sleep(DEFAULT_CONNECTION_IDLE_TIMEOUT).await;
-                                DEFAULT_CONNECTION_IDLE_TIMEOUT
+                                debug!("connection {:?} timeout not present", conn.connection_id);
+                                tokio::time::sleep(Duration::MAX).await
                             }
                         } => {
                             conn.sessions_housekeeping().await;
                             if !conn.sessions.is_empty() {
-                                warn!("connection {:?} timeout {:?} reached with {} open sessions {:?}",
-                                    conn.connection_id, used_timeout_duration, conn.sessions.len(), conn.sessions);
-                            } else {
-                                {
-                                    let mut qconn = conn.quic_connection.lock();
-                                    qconn.on_timeout();
-                                }
+                                warn!("connection {:?} timed out with {} open sessions",
+                                    conn.connection_id, conn.sessions.len());
+                            }
+                            let mut qconn = conn.quic_connection.lock();
+                            // closes connection
+                            qconn.on_timeout();
+                            if let Some(timeout) = timeout {
                                 debug!("connection {:?} timed out {:?}", conn.connection_id, timeout);
                             }
-
-                            conn.tx_notify.notify_waiters();
-                            return Ok(None)
                         }
                     }
                 }
