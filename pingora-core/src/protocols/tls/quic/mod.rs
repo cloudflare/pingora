@@ -1,7 +1,7 @@
 use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
 use crate::protocols::l4::quic::{
     Connection, ConnectionTx, EstablishedHandle, EstablishedState, HandshakeResponse,
-    IncomingState, TxStats, MAX_IPV6_UDP_PACKET_SIZE,
+    IncomingState, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE,
 };
 use crate::protocols::l4::stream::Stream as L4Stream;
 use crate::protocols::ConnectionState;
@@ -65,7 +65,6 @@ async fn handshake_inner(
         configs,
         drop_connection,
 
-        socket,
         socket_details,
         udp_rx,
         dgram,
@@ -73,7 +72,6 @@ async fn handshake_inner(
         response,
 
         ignore,
-        reject,
     } = state;
 
     if *ignore {
@@ -82,20 +80,11 @@ async fn handshake_inner(
             *resp = Some(HandshakeResponse::Ignored)
         }
         return Ok(None);
-    } else if *reject {
-        {
-            let mut resp = response.lock();
-            *resp = Some(HandshakeResponse::Rejected)
-        }
-        return Ok(None);
-        // TODO: send to peer, return err if send fails
     }
 
+    let socket = &socket_details.io;
     let initial_dcid = dgram.header.dcid.clone();
-
-    // TODO: use correct buf sizes for IPv4 & IPv6
-    // for now use IPv6 values as they are smaller, should work as well on IPv4
-    let mut out = [0u8; MAX_IPV6_UDP_PACKET_SIZE];
+    let mut out = [0u8; MAX_IPV6_QUIC_DATAGRAM_SIZE];
 
     if !quiche::version_is_supported(dgram.header.version) {
         warn!("Quic packet version received is not supported. Negotiating version...");
@@ -316,7 +305,6 @@ async fn handshake_inner(
     }
 
     let tx = ConnectionTx {
-        socket: socket.clone(),
         socket_details: socket_details.clone(),
         connection_id: connection_id.clone(),
         connection: connection.clone(),
@@ -326,17 +314,17 @@ async fn handshake_inner(
     };
 
     let state = EstablishedState {
-        socket: socket.clone(),
-        tx_handle: tokio::spawn(tx.start_tx()),
-
         connection_id: connection_id.clone(),
         connection: connection.clone(),
-        drop_connection: drop_connection.clone(),
 
         http3_config: configs.http3().clone(),
 
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
+
+        tx_handle: tokio::spawn(tx.start()),
+        drop_connection: drop_connection.clone(),
+        socket: socket.clone(),
     };
 
     Ok(Some(state))

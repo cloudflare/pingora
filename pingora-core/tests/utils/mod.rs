@@ -95,7 +95,7 @@ fn entry_point(opt: Option<Opt>) {
     tls_settings.enable_h2();
     listeners.add_tls_with_settings("0.0.0.0:6146", None, tls_settings);
 
-    let configs = QuicHttp3Configs::from_cert_key_path(&cert_path, &key_path).unwrap();
+    let configs = QuicHttp3Configs::from_cert_key_paths(&cert_path, &key_path).unwrap();
     listeners.add_quic("0.0.0.0:6147", configs);
 
     let mut echo_service_http =

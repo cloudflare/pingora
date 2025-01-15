@@ -117,6 +117,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     })
 }
 
+/// corresponds to a [`quiche::h3::Connection`] and links [`H3Session`]s to Quic IO
 pub struct H3Connection {
     _l4stream: Stream, // ensure the stream will not be dropped until all sessions are
     connection_id: ConnectionId<'static>,
@@ -213,7 +214,10 @@ impl H3Connection {
 }
 
 /// HTTP/3 server session
-pub struct HttpSession {
+/// [`H3Session`]s contain the converted [`quiche::h3::Event::Headers`] as
+/// [`pingora_http::RequestHeader`]. The [`H3Session`] is built around [`pingora_http`] structs and
+/// converts to [`quiche::h3::Event`] where needed.
+pub struct H3Session {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) stream_id: u64,
     quic_connection: Arc<Mutex<QuicheConnection>>,
@@ -253,7 +257,7 @@ pub struct HttpSession {
     digest: Arc<Digest>,
 }
 
-impl Drop for HttpSession {
+impl Drop for H3Session {
     fn drop(&mut self) {
         let mut drop_sessions = self.drop_session.lock();
         drop_sessions.push_back(self.stream_id);
@@ -264,8 +268,8 @@ impl Drop for HttpSession {
     }
 }
 
-impl HttpSession {
-    /// Create a new [`HttpSession`] from the QUIC connection.
+impl H3Session {
+    /// Create a new [`H3Session`] from the QUIC connection.
     /// This function returns a new HTTP/3 session when the provided HTTP/3 connection, `conn`,
     /// establishes a new HTTP/3 stream to this server.
     ///
@@ -346,7 +350,7 @@ impl HttpSession {
                                 let (event_tx, event_rx) =
                                     mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
 
-                                let session = HttpSession {
+                                let session = H3Session {
                                     connection_id: conn.connection_id.clone(),
                                     stream_id,
 
@@ -476,17 +480,11 @@ impl HttpSession {
     }
 
     /// The request sent from the client
-    ///
-    /// Different from its HTTP/1.X counterpart, this function never panics as the request is already
-    /// read when established a new HTTP/3 stream.
     pub fn req_header(&self) -> &RequestHeader {
         &self.request_header
     }
 
     /// A mutable reference to request sent from the client
-    ///
-    /// Different from its HTTP/1.X counterpart, this function never panics as the request is already
-    /// read when established a new HTTP/3 stream.
     pub fn req_header_mut(&mut self) -> &mut RequestHeader {
         &mut self.request_header
     }
@@ -540,8 +538,7 @@ impl HttpSession {
     // not here.
 
     /// Write the response header to the client.
-    /// # the `end` flag
-    /// `end` marks the end of this session.
+    /// the `end` flag marks the end of this session.
     /// If the `end` flag is set, no more header or body can be sent to the client.
     pub async fn write_response_header(
         &mut self,
@@ -946,7 +943,7 @@ impl HttpSession {
 
     /// Give up the stream abruptly.
     ///
-    /// This will send a `INTERNAL_ERROR` stream error to the client
+    /// This will send a `STOP_SENDING` and a `RESET_STREAM` for the Quic stream to the client.
     pub fn shutdown(&mut self) {
         if !self.read_ended {
             self.stream_shutdown(Shutdown::Read, 2u64);
@@ -974,7 +971,7 @@ impl HttpSession {
         buf.freeze()
     }
 
-    /// Whether there is no more body to read
+    /// Whether there is no more body to read.
     pub fn is_body_done(&self) -> bool {
         self.is_body_empty() || self.read_ended
     }
@@ -1011,7 +1008,6 @@ impl HttpSession {
         })
     }
 
-    /// `async fn idle() -> Result<Reason, Error>;`
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
@@ -1022,7 +1018,7 @@ impl HttpSession {
         }
     }
 
-    /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
+    /// Similar to `read_body_bytes()` but will be pending after `Ok(None)` is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {

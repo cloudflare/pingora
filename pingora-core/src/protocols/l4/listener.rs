@@ -15,6 +15,7 @@
 //! Listeners
 
 use std::io;
+use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
@@ -118,6 +119,17 @@ impl Listener {
                 s.set_socket_digest(digest);
                 s
             }),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl AsRawFd for Listener {
+    fn as_raw_fd(&self) -> RawFd {
+        match &self {
+            Self::Quic(l) => l.get_raw_fd(),
+            Self::Tcp(l) => l.as_raw_fd(),
+            Self::Unix(l) => l.as_raw_fd(),
         }
     }
 }

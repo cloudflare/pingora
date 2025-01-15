@@ -1,8 +1,8 @@
 use crate::protocols::l4::quic::sendto::{detect_gso, set_txtime_sockopt};
 use crate::protocols::l4::quic::{
-    Connection, ConnectionHandle, Crypto, HandshakeResponse, IncomingHandle, IncomingState,
-    Listener, SocketDetails, UdpRecv, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
-    HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE, MAX_IPV6_QUIC_DATAGRAM_SIZE,
+    Connection, ConnectionHandle, HandshakeResponse, IncomingHandle, IncomingState, SocketDetails,
+    UdpRecv, CONNECTION_DROP_DEQUE_INITIAL_SIZE, HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
+    MAX_IPV6_QUIC_DATAGRAM_SIZE,
 };
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
@@ -10,7 +10,8 @@ use pingora_error::{BError, Error, ErrorType};
 use quiche::{ConnectionId, Header, RecvInfo, Type};
 use ring::hmac::Key;
 use ring::rand::SystemRandom;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fmt::{Debug, Formatter};
 use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -22,55 +23,26 @@ use tokio::sync::mpsc::channel;
 use crate::protocols::l4::quic::QuicHttp3Configs;
 use quiche::Connection as QuicheConnection;
 
-impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
-    type Error = BError;
+/// The [`Listener`] contains a [`HashMap`] linking [`quiche::ConnectionId`] to [`ConnectionHandle`]
+/// the `Listener::accept` method returns [`Connection`]s and is responsible to forward network
+/// UDP packets to the according `Connection` through the corresponding [`ConnectionHandle`].
+///
+/// In the [`ConnectionHandle::Incoming`] state the UDP packets are forwarded through a
+/// [`tokio::sync::mpsc::channel`].
+// Once the state is [`ConnectionHandle::Established`] the packets are directly received on
+// the [`quiche::Connection`].
+pub struct Listener {
+    socket_details: SocketDetails,
 
-    fn try_from(
-        (io, configs): (UdpSocket, QuicHttp3Configs),
-    ) -> pingora_error::Result<Self, Self::Error> {
-        let addr = io.local_addr().map_err(|e| {
-            Error::explain(
-                ErrorType::SocketError,
-                format!("failed to get local address from socket: {}", e),
-            )
-        })?;
-        let rng = SystemRandom::new();
-        let key = Key::generate(ring::hmac::HMAC_SHA256, &rng).map_err(|e| {
-            Error::explain(
-                ErrorType::InternalError,
-                format!("failed to generate listener key: {}", e),
-            )
-        })?;
+    configs: QuicHttp3Configs,
+    crypto: Crypto,
 
-        let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-        let pacing_enabled = match set_txtime_sockopt(&io) {
-            Ok(_) => {
-                debug!("successfully set SO_TXTIME socket option");
-                true
-            }
-            Err(e) => {
-                debug!("setsockopt failed {:?}", e);
-                false
-            }
-        };
+    connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
+    drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+}
 
-        Ok(Listener {
-            socket: Arc::new(io),
-            socket_details: SocketDetails {
-                addr,
-                gso_enabled,
-                pacing_enabled,
-            },
-
-            configs,
-            crypto: Crypto { key },
-
-            connections: Default::default(),
-            drop_connections: Arc::new(Mutex::new(VecDeque::with_capacity(
-                CONNECTION_DROP_DEQUE_INITIAL_SIZE,
-            ))),
-        })
-    }
+pub struct Crypto {
+    key: Key,
 }
 
 impl Listener {
@@ -82,12 +54,12 @@ impl Listener {
         debug!("endpoint rx loop");
         'read: loop {
             // receive from network and parse Quic header
-            let (size, from) = match self.socket.try_recv_from(&mut rx_buf) {
+            let (size, from) = match self.socket_details.io.try_recv_from(&mut rx_buf) {
                 Ok((size, from)) => (size, from),
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         // no more UDP packets to read for now, wait  for new packets
-                        self.socket.readable().await?;
+                        self.socket_details.io.readable().await?;
                         continue 'read;
                     } else {
                         return Err(e);
@@ -170,7 +142,7 @@ impl Listener {
                                     established_handle = Some(e.clone());
                                     needs_establish = Some(e);
                                 }
-                                HandshakeResponse::Ignored | HandshakeResponse::Rejected => {
+                                HandshakeResponse::Ignored => {
                                     // drop connection
                                     self.connections.remove(&header.dcid);
                                     continue 'read;
@@ -248,7 +220,6 @@ impl Listener {
 
                 configs: self.configs.clone(),
 
-                socket: self.socket.clone(),
                 socket_details: self.socket_details.clone(),
                 udp_rx,
                 response: response.clone(),
@@ -260,7 +231,6 @@ impl Listener {
                 },
 
                 ignore: false,
-                reject: false,
             });
             let handle = ConnectionHandle::Incoming(IncomingHandle { udp_tx, response });
 
@@ -289,7 +259,7 @@ impl Listener {
             Err(e) => {
                 error!("connection {:?} receive error {:?}", conn_id, e);
                 Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
+                    ErrorKind::BrokenPipe,
                     format!(
                         "Connection could not receive network data for {:?}. {:?}",
                         conn.destination_id(),
@@ -308,18 +278,66 @@ impl Listener {
         conn_id
     }
 
-    pub(super) fn get_raw_fd(&self) -> RawFd {
-        self.socket.as_raw_fd()
+    pub(crate) fn get_raw_fd(&self) -> RawFd {
+        self.socket_details.io.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
-impl AsRawFd for crate::protocols::l4::listener::Listener {
-    fn as_raw_fd(&self) -> RawFd {
-        match &self {
-            Self::Quic(l) => l.get_raw_fd(),
-            Self::Tcp(l) => l.as_raw_fd(),
-            Self::Unix(l) => l.as_raw_fd(),
-        }
+impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
+    type Error = BError;
+
+    fn try_from(
+        (io, configs): (UdpSocket, QuicHttp3Configs),
+    ) -> pingora_error::Result<Self, Self::Error> {
+        let addr = io.local_addr().map_err(|e| {
+            Error::explain(
+                ErrorType::SocketError,
+                format!("failed to get local address from socket: {}", e),
+            )
+        })?;
+        let rng = SystemRandom::new();
+        let key = Key::generate(ring::hmac::HMAC_SHA256, &rng).map_err(|e| {
+            Error::explain(
+                ErrorType::InternalError,
+                format!("failed to generate listener key: {}", e),
+            )
+        })?;
+
+        let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
+        let pacing_enabled = match set_txtime_sockopt(&io) {
+            Ok(_) => {
+                debug!("successfully set SO_TXTIME socket option");
+                true
+            }
+            Err(e) => {
+                debug!("setsockopt failed {:?}", e);
+                false
+            }
+        };
+
+        Ok(Listener {
+            socket_details: SocketDetails {
+                io: Arc::new(io),
+                addr,
+                gso_enabled,
+                pacing_enabled,
+            },
+
+            configs,
+            crypto: Crypto { key },
+
+            connections: Default::default(),
+            drop_connections: Arc::new(Mutex::new(VecDeque::with_capacity(
+                CONNECTION_DROP_DEQUE_INITIAL_SIZE,
+            ))),
+        })
+    }
+}
+
+impl Debug for Listener {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Listener")
+            .field("io", &self.socket_details.io)
+            .finish()
     }
 }

@@ -165,7 +165,7 @@ async fn test_quic_http3_timeout() -> Result<()> {
     let config = Config::new()
         .with_connect_to("127.0.0.1:6147".to_string())
         .with_host_port("openrusty.org:6147".to_string())
-        .with_idle_timeout(60000)
+        .with_idle_timeout(3000)
         .verify_peer(false)
         .build()
         .unwrap();

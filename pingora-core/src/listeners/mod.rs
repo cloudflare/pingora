@@ -35,10 +35,9 @@ use std::{fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, ServerProtocol, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
-use crate::listeners::l4::UdpSocketOptions;
 use crate::protocols::l4::quic::QuicHttp3Configs;
 pub use crate::protocols::tls::ALPN;
-pub use l4::{ServerAddress, TcpSocketOptions};
+pub use l4::{ServerAddress, TcpSocketOptions, UdpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
@@ -181,7 +180,7 @@ impl Listeners {
         ));
     }
 
-    /// Add a QUIC endpoint to `self`, with the given [`UdpSocketOptions`].
+    /// Add a QUIC endpoint to `self`, with the given [`UdpSocketOptions`] and [`QuicHttp3Configs`].
     pub fn add_quic_with_settings(
         &mut self,
         addr: &str,

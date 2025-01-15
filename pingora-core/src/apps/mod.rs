@@ -245,7 +245,7 @@ where
                         };
                         return None;
                     }
-                    h3_stream = h3_server::HttpSession::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream
+                    h3_stream = h3_server::H3Session::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream
                 };
 
                 let h3_stream = match h3_stream {

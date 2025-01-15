@@ -24,7 +24,7 @@ use std::fmt::Debug;
 pub mod nohash;
 pub mod server;
 
-pub fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
+fn event_to_request_headers(list: &Vec<Header>) -> Result<RequestHeader> {
     let (mut parts, _) = Request::new(()).into_parts();
     let mut uri = Uri::builder();
     let mut headers = HeaderMap::new();

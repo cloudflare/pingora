@@ -4,8 +4,7 @@ use pingora_error::{Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use quiche::{h3, Config};
 use quiche::{ConnectionId, Header, RecvInfo, Stats};
-use ring::hmac::Key;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
@@ -20,56 +19,55 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-pub(crate) mod id_token;
 mod listener;
 mod sendto;
-pub(crate) mod tls_handshake;
+
+pub(crate) mod id_token;
+pub(crate) use listener::Listener;
 
 use crate::protocols::l4::quic::sendto::send_to;
 use crate::protocols::ConnectionState;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
-// UDP header 8 bytes, IPv6 Header 40 bytes
+/// UDP header 8 bytes, IPv6 Header 40 bytes
 pub const MAX_IPV6_BUF_SIZE: usize = 65487;
 
-// 1500(Ethernet) - 20(IPv4 header) - 8(UDP header) = 1472.
+// 1500(Ethernet MTU) - 20(IPv4 header) - 8(UDP header) = 1472.
 //pub const MAX_IPV4_UDP_PACKET_SIZE: usize = 1472;
-// 1500(Ethernet) - 40(IPv6 header) - 8(UDP header) = 1452
+/// 1500(Ethernet MTU) - 40(IPv6 header) - 8(UDP header) = 1452
 pub const MAX_IPV6_UDP_PACKET_SIZE: usize = 1452;
 
 //pub const MAX_IPV4_QUIC_DATAGRAM_SIZE: usize = 1370;
+// TODO: validate size (possibly 1200 is the standard)
 pub const MAX_IPV6_QUIC_DATAGRAM_SIZE: usize = 1350;
 
+/// max. amount of [`UdpRecv`] messages on the `tokio::sync::mpsc::channel`
 const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
+/// initial size for the connection drop deque
 const CONNECTION_DROP_DEQUE_INITIAL_SIZE: usize = 1024;
 
-pub struct Listener {
-    socket: Arc<UdpSocket>,
-    socket_details: SocketDetails,
+// TODO: potentially split more into separate modules
+// as of now it is not fully clear which parts will be re-used for the [`Connector`]
 
-    configs: QuicHttp3Configs,
-    crypto: Crypto,
-
-    connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
-    drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
-}
-
-pub struct Crypto {
-    key: Key,
-}
-
+/// A [`Connection`] corresponds to a [`ConnectionHandle`].
+///
+/// They are created having the variants [`Connection::Incoming`] / [`ConnectionHandle::Incoming`]
+/// and are transitioned to the [`Connection::Established`] / [`ConnectionHandle::Established`]
+/// variants once the TLS handshake was successful.
 pub enum Connection {
+    /// new connection during handshake
     Incoming(IncomingState),
+    /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
     Established(EstablishedState),
 }
 
+/// corresponds to a new connection before the handshake is completed
 pub struct IncomingState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) configs: QuicHttp3Configs,
     pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
-    pub(crate) socket: Arc<UdpSocket>,
     pub(crate) socket_details: SocketDetails,
     pub(crate) udp_rx: Receiver<UdpRecv>,
     pub(crate) response: Arc<Mutex<Option<HandshakeResponse>>>,
@@ -77,29 +75,41 @@ pub struct IncomingState {
     pub(crate) dgram: UdpRecv,
 
     pub(crate) ignore: bool,
-    pub(crate) reject: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct SocketDetails {
+    pub(crate) io: Arc<UdpSocket>,
     addr: SocketAddr,
     gso_enabled: bool,
     pacing_enabled: bool,
 }
 
+/// can be used to wait for network data or trigger network sending
 pub struct EstablishedState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
-    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+
     pub(crate) http3_config: Arc<h3::Config>,
+
+    /// is used to wait for new data received on the connection
+    /// (e.g. after [`quiche::h3::Connection.poll()`] returned [`quiche::h3::Error::Done`])
     pub(crate) rx_notify: Arc<Notify>,
+    /// is used to trigger a transmit loop which sends all connection data until [`quiche::h3::Error::Done`]
     pub(crate) tx_notify: Arc<Notify>,
-    pub(crate) socket: Arc<UdpSocket>,
+
+    /// handle for the ConnectionTx task
     pub(crate) tx_handle: JoinHandle<Result<()>>,
+    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+    pub(crate) socket: Arc<UdpSocket>,
 }
 
+/// A [`ConnectionHandle`] corresponds to a [`Connection`].
+/// For further details please refer to [`Connection`].
 pub enum ConnectionHandle {
+    /// new connection handle during handshake
     Incoming(IncomingHandle),
+    /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
     Established(EstablishedHandle),
 }
 
@@ -113,6 +123,7 @@ impl Debug for ConnectionHandle {
     }
 }
 
+/// used to forward data from the UDP socket during the handshake
 pub struct IncomingHandle {
     udp_tx: Sender<UdpRecv>,
     response: Arc<Mutex<Option<HandshakeResponse>>>,
@@ -121,10 +132,10 @@ pub struct IncomingHandle {
 pub(crate) enum HandshakeResponse {
     Established(EstablishedHandle),
     Ignored,
-    Rejected,
-    // TODO: TimedOut,
+    // TODO: TimedOut
 }
 
+/// is used to forward data from the UDP socket to the Quic connection
 #[derive(Clone)]
 pub struct EstablishedHandle {
     pub(crate) connection_id: ConnectionId<'static>,
@@ -133,6 +144,7 @@ pub struct EstablishedHandle {
     pub(crate) tx_notify: Arc<Notify>,
 }
 
+/// the message format used on the [`tokio::sync::mpsc::channel`] during the handshake phase
 pub struct UdpRecv {
     pub(crate) pkt: Vec<u8>,
     pub(crate) header: Header<'static>,
@@ -219,8 +231,9 @@ impl Drop for Connection {
     }
 }
 
-pub(crate) struct ConnectionTx {
-    pub(crate) socket: Arc<UdpSocket>,
+/// connections transmit task sends data from the [`quiche::Connection`] to the UDP socket
+/// the actor is notified through the `tx_notify` and flushes all connection data to the network
+pub struct ConnectionTx {
     pub(crate) socket_details: SocketDetails,
 
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
@@ -230,8 +243,12 @@ pub(crate) struct ConnectionTx {
     pub(crate) tx_stats: TxStats,
 }
 
+/// During establishing a [`ConnectionTx`] task is started being responsible to write data from
+/// the [`quiche::Connection`] to the `[UdpSocket`].
+/// The connections `Rx` path is part of the [`Listener::accept`] which distributes the datagrams
+/// to the according connections.
 impl ConnectionTx {
-    pub(crate) async fn start_tx(mut self) -> Result<()> {
+    pub(crate) async fn start(mut self) -> Result<()> {
         let id = self.connection_id;
         let mut out = [0u8; MAX_IPV6_BUF_SIZE];
 
@@ -306,7 +323,7 @@ impl ConnectionTx {
 
             // send to network
             if let Err(e) = send_to(
-                &self.socket,
+                &self.socket_details.io,
                 &out[..total_write],
                 &dst_info,
                 self.tx_stats.max_datagram_size,
@@ -344,6 +361,7 @@ impl ConnectionTx {
     }
 }
 
+/// used within [`ConnectionTx`] to keep track of the maximum send burst
 pub struct TxStats {
     loss_rate: f64,
     max_send_burst: usize,
@@ -374,28 +392,20 @@ impl TxStats {
     }
 }
 
-impl AsRawFd for Connection {
-    fn as_raw_fd(&self) -> RawFd {
+impl Connection {
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
-            Connection::Incoming(s) => s.socket.as_raw_fd(),
-            Connection::Established(s) => s.socket.as_raw_fd(),
+            Connection::Incoming(s) => s.socket_details.io.local_addr(),
+            Connection::Established(s) => s.socket.local_addr(),
         }
     }
 }
 
-impl Debug for Listener {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Listener")
-            .field("io", &self.socket)
-            .finish()
-    }
-}
-
-impl Connection {
-    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+impl AsRawFd for Connection {
+    fn as_raw_fd(&self) -> RawFd {
         match self {
-            Connection::Incoming(s) => s.socket.local_addr(),
-            Connection::Established(s) => s.socket.local_addr(),
+            Connection::Incoming(s) => s.socket_details.io.as_raw_fd(),
+            Connection::Established(s) => s.socket.as_raw_fd(),
         }
     }
 }
@@ -426,7 +436,9 @@ impl AsyncWrite for Connection {
     }
 }
 
-#[allow(unused_variables)] // TODO: remove
+// TODO: consider usage for Quic/Connection/Datagrams
+// is there be any source for data in this area (e.g. L4/UDP -> Quic/Dgram, Media Over Quic, ...)
+#[allow(unused_variables)]
 impl AsyncRead for Connection {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -447,6 +459,9 @@ impl ConnectionState for Connection {
     }
 }
 
+/// contains configs for Quic [`quiche::Config`] and Http3 [`quiche::h3::Config`]
+///
+/// the configs can be supplied during the [`crate::listeners::Listeners`] creation
 #[derive(Clone)]
 pub struct QuicHttp3Configs {
     quic: Arc<Mutex<Config>>,
@@ -474,8 +489,8 @@ impl QuicHttp3Configs {
         // quic.verify_peer(); default server = false; client = true
         // quic.discover_pmtu(false); // default false
         quic.grease(false); // default true
-                           // quic.log_keys() && config.set_keylog(); // logging SSL secrets
-                           // quic.set_ticket_key() // session ticket signer key material
+                            // quic.log_keys() && config.set_keylog(); // logging SSL secrets
+                            // quic.set_ticket_key() // session ticket signer key material
 
         //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
 
@@ -529,7 +544,7 @@ impl QuicHttp3Configs {
         })
     }
 
-    pub fn from_cert_key_path(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Self> {
+    pub fn from_cert_key_paths(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Self> {
         Ok(Self {
             quic: Arc::new(Mutex::new(Self::new_quic(
                 cert_chain_pem_file,
