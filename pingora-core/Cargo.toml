@@ -67,7 +67,7 @@ zstd = "0"
 httpdate = "1"
 x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
-quiche = { git = 'https://github.com/cloudflare/quiche.git', rev = "1fd4557", optional = true }
+quiche = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca", optional = true }
 ring = { version = "0.17.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -83,6 +83,7 @@ reqwest = { version = "0.11", features = [
     "rustls-tls",
 ], default-features = false }
 hyper = "0.14"
+h3i = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca" }
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
