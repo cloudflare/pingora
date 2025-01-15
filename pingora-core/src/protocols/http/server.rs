@@ -194,7 +194,7 @@ impl Session {
     /// This is a noop for h2.
     pub fn set_read_timeout(&mut self, timeout: Duration) {
         match self {
-            Self::H1(s) => s.set_write_timeout(timeout),
+            Self::H1(s) => s.set_read_timeout(timeout),
             Self::H2(_) => {}
         }
     }
@@ -218,7 +218,7 @@ impl Session {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.
+    /// is greater than zero, a send rate of zero is a noop.x
     ///
     /// This is a noop for h2.
     pub fn set_min_send_rate(&mut self, rate: usize) {
