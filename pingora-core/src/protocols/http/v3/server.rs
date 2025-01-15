@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
@@ -45,8 +45,6 @@ use quiche::{h3, Connection as QuicheConnection, ConnectionId, Shutdown};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Notify};
 
-static H3_OPTIONS: OnceLock<H3Options> = OnceLock::new();
-
 const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
 const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
@@ -57,8 +55,6 @@ const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// The optional `options` allow to adjust certain HTTP/3 parameters and settings.
 /// See [`H3Options`] for more details.
 pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3Connection> {
-    let options = options.unwrap_or(H3_OPTIONS.get_or_init(|| H3Options::new().unwrap()));
-
     let Some(conn) = io.quic_connection_state() else {
         return Err(Error::explain(
             ErrorType::ConnectError,
@@ -75,8 +71,14 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         }
         Connection::Established(state) => {
             let hconn = {
+                let http3_config = if let Some(h3_options) = options {
+                    h3_options
+                } else {
+                    &state.http3_config
+                };
+
                 let mut qconn = state.connection.lock();
-                h3::Connection::with_transport(&mut qconn, options)
+                h3::Connection::with_transport(&mut qconn, http3_config)
                     .explain_err(ErrorType::ConnectError, |_| {
                         "failed to create H3 connection"
                     })?

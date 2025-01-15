@@ -2,7 +2,8 @@ use log::{debug, error, trace};
 use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
-use quiche::{Config, ConnectionId, Header, RecvInfo, Stats};
+use quiche::{h3, Config};
+use quiche::{ConnectionId, Header, RecvInfo, Stats};
 use ring::hmac::Key;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
@@ -22,7 +23,6 @@ use tokio::task::JoinHandle;
 pub(crate) mod id_token;
 mod listener;
 mod sendto;
-mod settings;
 pub(crate) mod tls_handshake;
 
 use crate::protocols::l4::quic::sendto::send_to;
@@ -48,7 +48,7 @@ pub struct Listener {
     socket: Arc<UdpSocket>,
     socket_details: SocketDetails,
 
-    config: Arc<Mutex<Config>>,
+    configs: QuicHttp3Configs,
     crypto: Crypto,
 
     connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
@@ -66,7 +66,7 @@ pub enum Connection {
 
 pub struct IncomingState {
     pub(crate) connection_id: ConnectionId<'static>,
-    pub(crate) config: Arc<Mutex<Config>>,
+    pub(crate) configs: QuicHttp3Configs,
     pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
     pub(crate) socket: Arc<UdpSocket>,
@@ -91,6 +91,7 @@ pub struct EstablishedState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
     pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+    pub(crate) http3_config: Arc<h3::Config>,
     pub(crate) rx_notify: Arc<Notify>,
     pub(crate) tx_notify: Arc<Notify>,
     pub(crate) socket: Arc<UdpSocket>,
@@ -443,5 +444,130 @@ impl ConnectionState for Connection {
 
     fn is_quic_connection(&self) -> bool {
         true
+    }
+}
+
+#[derive(Clone)]
+pub struct QuicHttp3Configs {
+    quic: Arc<Mutex<Config>>,
+    http3: Arc<h3::Config>,
+}
+
+impl QuicHttp3Configs {
+    pub fn new_quic(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
+        let mut quic = Config::new(quiche::PROTOCOL_VERSION)
+            .explain_err(ErrorType::InternalError, |_| {
+                "Failed to create quiche config."
+            })?;
+
+        quic.load_cert_chain_from_pem_file(cert_chain_pem_file)
+            .explain_err(ErrorType::FileReadError, |_| {
+                "Could not load certificate chain from pem file."
+            })?;
+
+        quic.load_priv_key_from_pem_file(priv_key_pem_file)
+            .explain_err(ErrorType::FileReadError, |_| {
+                "Could not load private key from pem file."
+            })?;
+
+        // quic.load_verify_locations_from_file() for CA's
+        // quic.verify_peer(); default server = false; client = true
+        // quic.discover_pmtu(false); // default false
+        quic.grease(false); // default true
+                           // quic.log_keys() && config.set_keylog(); // logging SSL secrets
+                           // quic.set_ticket_key() // session ticket signer key material
+
+        //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
+
+        quic.set_application_protos(h3::APPLICATION_PROTOCOL)
+            .explain_err(ErrorType::InternalError, |_| {
+                "Failed to set application protocols."
+            })?;
+
+        // quic.set_application_protos_wire_format();
+        // quic.set_max_amplification_factor(3); // anti-amplification limit factor; default 3
+
+        quic.set_max_idle_timeout(60 * 1000); // default ulimited
+        quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
+        quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
+        quic.set_initial_max_data(10_000_000); // 10 Mb
+        quic.set_initial_max_stream_data_bidi_local(1_000_000); // 1 Mb
+        quic.set_initial_max_stream_data_bidi_remote(1_000_000); // 1 Mb
+        quic.set_initial_max_stream_data_uni(1_000_000); // 1 Mb
+        quic.set_initial_max_streams_bidi(100);
+        quic.set_initial_max_streams_uni(100);
+
+        // quic.set_ack_delay_exponent(3); // default 3
+        // quic.set_max_ack_delay(25); // default 25
+        // quic.set_active_connection_id_limit(2); // default 2
+        // quic.set_disable_active_migration(false); // default false
+
+        // quic.set_active_connection_id_limit(2); // default 2
+        // quic.set_disable_active_migration(false); // default false
+        // quic.set_cc_algorithm_name("cubic"); // default cubic
+        // quic.set_initial_congestion_window_packets(10); // default 10
+        // quic.set_cc_algorithm(CongestionControlAlgorithm::CUBIC); // default CongestionControlAlgorithm::CUBIC
+
+        // quic.enable_hystart(true); // default true
+        // quic.enable_pacing(true); // default true
+        // quic.set_max_pacing_rate(); // default ulimited
+
+        //config.enable_dgram(false); // default false
+
+        // quic.set_path_challenge_recv_max_queue_len(3); // default 3
+        // quic.set_max_connection_window(MAX_CONNECTION_WINDOW); // default 24 Mb
+        // quic.set_max_stream_window(MAX_STREAM_WINDOW); // default 16 Mb
+        // quic.set_stateless_reset_token(None) // default None
+        // quic.set_disable_dcid_reuse(false) // default false
+
+        Ok(quic)
+    }
+
+    fn new_http3() -> Result<h3::Config> {
+        h3::Config::new().explain_err(ErrorType::InternalError, |_| {
+            "failed to create new h3::Config"
+        })
+    }
+
+    pub fn from_cert_key_path(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Self> {
+        Ok(Self {
+            quic: Arc::new(Mutex::new(Self::new_quic(
+                cert_chain_pem_file,
+                priv_key_pem_file,
+            )?)),
+            http3: Arc::new(Self::new_http3()?),
+        })
+    }
+
+    pub fn new(quic: Config, http3: h3::Config) -> Self {
+        Self {
+            quic: Arc::new(Mutex::new(quic)),
+            http3: Arc::new(http3),
+        }
+    }
+
+    pub fn try_from(quic: Config) -> Result<Self> {
+        let http3 = h3::Config::new().explain_err(ErrorType::InternalError, |_| {
+            "failed to create new h3::Config"
+        })?;
+
+        Ok(Self {
+            quic: Arc::new(Mutex::new(quic)),
+            http3: Arc::new(http3),
+        })
+    }
+
+    pub fn quic(&self) -> &Arc<Mutex<Config>> {
+        &self.quic
+    }
+    pub fn http3(&self) -> &Arc<h3::Config> {
+        &self.http3
+    }
+}
+
+impl Debug for QuicHttp3Configs {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut dbg = f.debug_struct("Configs");
+        dbg.finish()
     }
 }

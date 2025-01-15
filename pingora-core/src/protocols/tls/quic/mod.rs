@@ -62,7 +62,7 @@ async fn handshake_inner(
 ) -> pingora_error::Result<Option<EstablishedState>> {
     let IncomingState {
         connection_id: conn_id,
-        config,
+        configs,
         drop_connection,
 
         socket,
@@ -206,7 +206,7 @@ async fn handshake_inner(
 
     let mut conn;
     {
-        let mut config = config.lock();
+        let mut config = configs.quic().lock();
         conn = quiche::accept(
             &hdr.dcid,
             Some(&initial_dcid),
@@ -332,6 +332,8 @@ async fn handshake_inner(
         connection_id: connection_id.clone(),
         connection: connection.clone(),
         drop_connection: drop_connection.clone(),
+
+        http3_config: configs.http3().clone(),
 
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),

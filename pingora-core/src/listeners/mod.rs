@@ -35,6 +35,8 @@ use std::{fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, ServerProtocol, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
+use crate::listeners::l4::UdpSocketOptions;
+use crate::protocols::l4::quic::QuicHttp3Configs;
 pub use crate::protocols::tls::ALPN;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
@@ -140,11 +142,16 @@ impl Listeners {
         listeners
     }
 
-    /// Create a new [`Listeners`] with a QUIC server endpoint from the given string.
-    pub fn quic(&mut self, addr: &str) -> Self {
+    /// Create a new [`Listeners`] with a QUIC server endpoint from the given string and
+    /// according [`QuicHttp3Configs`].
+    pub fn quic(&mut self, addr: &str, configs: QuicHttp3Configs) -> Result<Self> {
         let mut listeners = Self::new();
-        listeners.add_address(ServerAddress::Udp(addr.into(), None, ServerProtocol::Quic));
-        listeners
+        listeners.add_address(ServerAddress::Udp(
+            addr.into(),
+            None,
+            ServerProtocol::Quic(configs),
+        ));
+        Ok(listeners)
     }
 
     /// Create a new [`Listeners`] with a Unix domain socket endpoint from the given string.
@@ -166,8 +173,26 @@ impl Listeners {
     }
 
     /// Add a QUIC endpoint to `self`.
-    pub fn add_quic(&mut self, addr: &str) {
-        self.add_address(ServerAddress::Udp(addr.into(), None, ServerProtocol::Quic));
+    pub fn add_quic(&mut self, addr: &str, configs: QuicHttp3Configs) {
+        self.add_address(ServerAddress::Udp(
+            addr.into(),
+            None,
+            ServerProtocol::Quic(configs),
+        ));
+    }
+
+    /// Add a QUIC endpoint to `self`, with the given [`UdpSocketOptions`].
+    pub fn add_quic_with_settings(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<UdpSocketOptions>,
+        configs: QuicHttp3Configs,
+    ) {
+        self.add_address(ServerAddress::Udp(
+            addr.into(),
+            sock_opt,
+            ServerProtocol::Quic(configs),
+        ));
     }
 
     /// Add a TCP endpoint to `self`.

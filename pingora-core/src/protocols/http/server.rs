@@ -265,7 +265,7 @@ impl Session {
         match self {
             Self::H1(s) => s.set_ignore_info_resp(ignore),
             Self::H2(_) => {} // always ignored
-            Self::H3(_) => {} // TODO: check if there is a need for an implementation
+            Self::H3(_) => {} // always ignored
         }
     }
 

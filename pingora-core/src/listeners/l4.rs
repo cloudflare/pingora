@@ -17,6 +17,7 @@ use pingora_error::{
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
 };
+use std::fmt::Debug;
 use std::fs::Permissions;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -31,7 +32,7 @@ use tokio::net::{TcpSocket, UdpSocket};
 
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
-use crate::protocols::l4::quic::Listener as QuicListener;
+use crate::protocols::l4::quic::{Listener as QuicListener, QuicHttp3Configs};
 pub use crate::protocols::l4::stream::Stream;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
@@ -54,7 +55,7 @@ pub enum ServerAddress {
 #[derive(Clone, Debug)]
 pub enum ServerProtocol {
     // e.g. raw UDP, QUIC flavours/implementations/versions
-    Quic,
+    Quic(QuicHttp3Configs),
 }
 
 impl AsRef<str> for ServerAddress {
@@ -231,10 +232,10 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
             let std_listener_socket = unsafe { std::net::UdpSocket::from_raw_socket(fd as u64) };
 
             match proto {
-                ServerProtocol::Quic => {
+                ServerProtocol::Quic(conf) => {
                     let socket = UdpSocket::from_std(std_listener_socket)
                         .or_err_with(BindError, || format!("Listen() failed on {address:?}"))?;
-                    Ok(QuicListener::try_from(socket)?.into())
+                    Ok(QuicListener::try_from((socket, conf.clone()))?.into())
                 }
             }
         }
@@ -371,13 +372,16 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
         ServerAddress::Uds(l, perm) => uds::bind(l, perm.clone()),
         ServerAddress::Tcp(l, opt) => bind_tcp(l, opt.clone()).await,
         ServerAddress::Udp(l, opt, proto) => match proto {
-            ServerProtocol::Quic => {
+            ServerProtocol::Quic(conf) => {
                 let std_socket = bind_udp_socket(l, opt.clone())
                     .await
                     .or_err(BindError, "bind() failed")?;
                 let tokio_socket = UdpSocket::try_from(std_socket)
                     .or_err(BindError, "failed to create UdpSocket")?;
-                Ok(Listener::from(QuicListener::try_from(tokio_socket)?))
+                Ok(Listener::from(QuicListener::try_from((
+                    tokio_socket,
+                    conf.clone(),
+                ))?))
             }
         },
     }

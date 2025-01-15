@@ -19,12 +19,15 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::channel;
 
+use crate::protocols::l4::quic::QuicHttp3Configs;
 use quiche::Connection as QuicheConnection;
 
-impl TryFrom<UdpSocket> for Listener {
+impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
     type Error = BError;
 
-    fn try_from(io: UdpSocket) -> pingora_error::Result<Self, Self::Error> {
+    fn try_from(
+        (io, configs): (UdpSocket, QuicHttp3Configs),
+    ) -> pingora_error::Result<Self, Self::Error> {
         let addr = io.local_addr().map_err(|e| {
             Error::explain(
                 ErrorType::SocketError,
@@ -38,8 +41,6 @@ impl TryFrom<UdpSocket> for Listener {
                 format!("failed to generate listener key: {}", e),
             )
         })?;
-
-        let settings = crate::protocols::l4::quic::settings::Settings::try_default()?;
 
         let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
         let pacing_enabled = match set_txtime_sockopt(&io) {
@@ -61,7 +62,7 @@ impl TryFrom<UdpSocket> for Listener {
                 pacing_enabled,
             },
 
-            config: settings.get_config(),
+            configs,
             crypto: Crypto { key },
 
             connections: Default::default(),
@@ -131,7 +132,7 @@ impl Listener {
 
             let mut conn_id = header.dcid.clone();
             let mut udp_tx = None;
-
+            let mut established_handle = None;
             // send to corresponding connection
             let mut handle;
             handle = self.connections.get_mut(&conn_id);
@@ -152,7 +153,7 @@ impl Listener {
                     "existing connection {:?} {:?} {:?}",
                     conn_id, handle, header
                 );
-                let mut established_handle = None;
+                let mut needs_establish = None;
                 match handle {
                     ConnectionHandle::Incoming(i) => {
                         let resp;
@@ -166,10 +167,11 @@ impl Listener {
                                         "connection {:?} received HandshakeResponse::Established",
                                         conn_id
                                     );
-                                    // receive data into existing connection
-                                    established_handle = Some(e);
+                                    established_handle = Some(e.clone());
+                                    needs_establish = Some(e);
                                 }
                                 HandshakeResponse::Ignored | HandshakeResponse::Rejected => {
+                                    // drop connection
                                     self.connections.remove(&header.dcid);
                                     continue 'read;
                                 }
@@ -179,48 +181,37 @@ impl Listener {
                         }
                     }
                     ConnectionHandle::Established(e) => {
-                        // receive data into existing connection
-                        match Self::recv_connection(
-                            &conn_id,
-                            e.connection.as_ref(),
-                            &mut rx_buf[..size],
-                            recv_info,
-                        ) {
-                            Ok(_len) => {
-                                e.rx_notify.notify_waiters();
-                                e.tx_notify.notify_waiters();
-                                continue 'read;
-                            }
-                            Err(e) => {
-                                // TODO: take action on errors, e.g close connection, send & remove
-                                break 'read Err(e);
-                            }
-                        }
+                        established_handle = Some(e.clone());
                     }
                 }
-                if let Some(e) = established_handle {
-                    match Self::recv_connection(
-                        &conn_id,
-                        e.connection.as_ref(),
-                        &mut rx_buf[..size],
-                        recv_info,
-                    ) {
-                        Ok(_len) => {
-                            e.rx_notify.notify_waiters();
-                            e.tx_notify.notify_waiters();
-                            // transition connection
-                            handle.establish(e);
-                            continue 'read;
-                        }
-                        Err(e) => {
-                            // TODO: take action on errors, e.g close connection, send & remove
-                            break 'read Err(e);
-                        }
-                    }
+                if let Some(e) = needs_establish {
+                    handle.establish(e)
                 }
             };
+
+            // receive data into existing connection
+            if let Some(e) = established_handle {
+                match Self::recv_connection(
+                    &conn_id,
+                    e.connection.as_ref(),
+                    &mut rx_buf[..size],
+                    recv_info,
+                ) {
+                    Ok(_len) => {
+                        e.rx_notify.notify_waiters();
+                        e.tx_notify.notify_waiters();
+                        // TODO: handle path events
+                        continue 'read;
+                    }
+                    Err(e) => {
+                        // TODO: take action on errors, e.g close connection, send & remove
+                        break 'read Err(e);
+                    }
+                }
+            }
+
+            // receive data on UDP channel
             if let Some(udp_tx) = udp_tx {
-                // receive data on UDP channel
                 match udp_tx
                     .send(UdpRecv {
                         pkt: rx_buf[..size].to_vec(),
@@ -253,8 +244,9 @@ impl Listener {
             debug!("new incoming connection {:?}", conn_id);
             let connection = Connection::Incoming(IncomingState {
                 connection_id: conn_id.clone(),
-                config: self.config.clone(),
                 drop_connection: self.drop_connections.clone(),
+
+                configs: self.configs.clone(),
 
                 socket: self.socket.clone(),
                 socket_details: self.socket_details.clone(),

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
-use pingora_core::protocols::l4::quic::MAX_IPV6_BUF_SIZE;
+use pingora_core::protocols::l4::quic::{QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
 
 #[derive(Clone)]
 pub struct EchoApp;
@@ -95,7 +95,8 @@ fn entry_point(opt: Option<Opt>) {
     tls_settings.enable_h2();
     listeners.add_tls_with_settings("0.0.0.0:6146", None, tls_settings);
 
-    listeners.add_quic("0.0.0.0:6147");
+    let configs = QuicHttp3Configs::from_cert_key_path(&cert_path, &key_path).unwrap();
+    listeners.add_quic("0.0.0.0:6147", configs);
 
     let mut echo_service_http =
         Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
