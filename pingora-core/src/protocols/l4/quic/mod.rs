@@ -253,9 +253,10 @@ impl ConnectionTx {
         let mut out = [0u8; MAX_IPV6_BUF_SIZE];
 
         let mut finished_sending = false;
-        let mut continue_write = false;
         debug!("connection {:?} tx write", id);
         'write: loop {
+            let mut continue_write = false;
+
             // update stats from connection
             let max_send_burst = {
                 let conn = self.connection.lock();
