@@ -14,7 +14,7 @@
 
 use crate::protocols::digest::TimingDigest;
 use crate::protocols::tls::{SslDigest, ALPN};
-use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
+use crate::protocols::{ConnectionState, Peek, Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use crate::utils::tls::{get_organization, get_serial};
 use log::warn;
@@ -168,6 +168,8 @@ where
         self.ssl.get_ref().id()
     }
 }
+
+impl<T> ConnectionState for SslStream<T> {}
 
 impl<T> Ssl for SslStream<T> {
     fn get_ssl(&self) -> Option<&ssl::SslRef> {
