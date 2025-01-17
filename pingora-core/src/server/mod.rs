@@ -82,7 +82,7 @@ pub trait ShutdownSignalWatch {
 }
 
 /// A Unix shutdown watcher that awaits for Unix signals.
-/// 
+///
 /// - `SIGQUIT`: graceful upgrade
 /// - `SIGTERM`: graceful terminate
 /// - `SIGINT`: fast shutdown
