@@ -67,7 +67,7 @@ fn update_h2_scheme_authority(
 }
 
 impl<SV> HttpProxy<SV> {
-    pub(crate) async fn proxy_1to2(
+    pub(crate) async fn proxy_down_to_up(
         &self,
         session: &mut Session,
         client_session: &mut Http2Session,
@@ -172,8 +172,8 @@ impl<SV> HttpProxy<SV> {
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
-            self.bidirection_1to2(session, &mut client_body, rx, ctx),
-            pipe_2to1_response(client_session, tx)
+            self.bidirection_down_to_up(session, &mut client_body, rx, ctx),
+            pipe_up_to_down_response(client_session, tx)
         );
 
         match ret {
@@ -207,14 +207,15 @@ impl<SV> HttpProxy<SV> {
             return (false, Some(e));
         }
 
-        let (server_session_reuse, error) =
-            self.proxy_1to2(session, client_session, peer, ctx).await;
+        let (server_session_reuse, error) = self
+            .proxy_down_to_up(session, client_session, peer, ctx)
+            .await;
 
         (server_session_reuse, error)
     }
 
     // returns whether server (downstream) session can be reused
-    async fn bidirection_1to2(
+    async fn bidirection_down_to_up(
         &self,
         session: &mut Session,
         client_body: &mut h2::SendStream<bytes::Bytes>,
@@ -563,7 +564,7 @@ impl<SV> HttpProxy<SV> {
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
-pub(crate) async fn pipe_2to1_response(
+pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
 ) -> Result<()> {
