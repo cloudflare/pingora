@@ -52,7 +52,7 @@ pub trait UniqueID {
     fn id(&self) -> UniqueIDType;
 }
 
-/// Interface to get the raw connection for e.g. non-connection based network protocols like UDP/QUIC
+/// Interface to get the connection state for e.g. for UDP/QUIC
 pub trait ConnectionState {
     fn quic_connection_state(&mut self) -> Option<&mut Connection> {
         None

@@ -23,10 +23,11 @@ mod listener;
 mod sendto;
 
 pub(crate) mod id_token;
-pub(crate) use listener::Listener;
-
+use crate::listeners::ALPN;
 use crate::protocols::l4::quic::sendto::send_to;
-use crate::protocols::ConnectionState;
+use crate::protocols::tls::{SslDigest, TlsRef};
+use crate::protocols::{ConnectionState, Ssl};
+pub(crate) use listener::Listener;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
@@ -402,6 +403,36 @@ impl Connection {
     }
 }
 
+impl Ssl for Connection {
+    /// Return the TLS info if the connection is over TLS
+    fn get_ssl(&self) -> Option<&TlsRef> {
+        None
+    }
+
+    /// Return the [`tls::SslDigest`] for logging
+    fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
+        match self {
+            Connection::Incoming(_) => None,
+            Connection::Established(s) => {
+                let mut conn = s.connection.lock();
+                let conn = &mut *conn;
+                Some(Arc::from(SslDigest::from_ssl(conn.as_mut())))
+            }
+        }
+    }
+
+    /// Return selected ALPN if any
+    fn selected_alpn_proto(&self) -> Option<ALPN> {
+        match self {
+            Connection::Incoming(_) => None,
+            Connection::Established(s) => {
+                let conn = s.connection.lock();
+                ALPN::from_wire_selected(conn.application_proto())
+            }
+        }
+    }
+}
+
 impl AsRawFd for Connection {
     fn as_raw_fd(&self) -> RawFd {
         match self {
@@ -503,7 +534,7 @@ impl QuicHttp3Configs {
         // quic.set_application_protos_wire_format();
         // quic.set_max_amplification_factor(3); // anti-amplification limit factor; default 3
 
-        quic.set_max_idle_timeout(60 * 1000); // default ulimited
+        quic.set_max_idle_timeout(600 * 1000); // default ulimited
         quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
         quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
         quic.set_initial_max_data(10_000_000); // 10 Mb
