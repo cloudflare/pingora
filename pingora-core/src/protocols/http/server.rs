@@ -190,7 +190,7 @@ impl Session {
 
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
-    /// 
+    ///
     /// This is a noop for h2.
     pub fn set_read_timeout(&mut self, timeout: Duration) {
         match self {
@@ -218,7 +218,7 @@ impl Session {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.x
+    /// is greater than zero, a send rate of zero is a noop.
     ///
     /// This is a noop for h2.
     pub fn set_min_send_rate(&mut self, rate: usize) {
