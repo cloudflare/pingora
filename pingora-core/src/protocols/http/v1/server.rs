@@ -946,7 +946,7 @@ impl HttpSession {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
         }
-        Ok(end_stream)
+        Ok(end_stream || self.body_writer.finished())
     }
 
     // TODO: use vectored write to avoid copying
@@ -992,7 +992,7 @@ impl HttpSession {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
         }
-        Ok(end_stream)
+        Ok(end_stream || self.body_writer.finished())
     }
 
     /// Get the reference of the [Stream] that this HTTP session is operating upon.
