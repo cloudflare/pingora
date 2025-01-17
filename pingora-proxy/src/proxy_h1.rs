@@ -382,7 +382,7 @@ impl<SV> HttpProxy<SV> {
                     }
                 },
 
-                task = serve_from_cache.next_http_task(&mut session.cache),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
 
                     let task = self.h1_response_filter(session, task?, ctx,

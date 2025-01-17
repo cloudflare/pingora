@@ -21,6 +21,7 @@ use pingora_cache::{ForcedInvalidationKind, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
+use range_filter::RangeBodyFilter;
 
 impl<SV> HttpProxy<SV> {
     // return bool: server_session can be reused, and error if any
@@ -1122,7 +1123,7 @@ pub mod range_filter {
     }
 
     pub struct RangeBodyFilter {
-        range: RangeType,
+        pub range: RangeType,
         current: usize,
     }
 
@@ -1204,13 +1205,13 @@ pub mod range_filter {
 // miss/revalidation/error.
 #[derive(Debug)]
 pub(crate) enum ServeFromCache {
-    Off,             // not using cache
-    CacheHeader,     // should serve cache header
-    CacheHeaderOnly, // should serve cache header
-    CacheBody,       // should serve cache body
+    Off,                 // not using cache
+    CacheHeader,         // should serve cache header
+    CacheHeaderOnly,     // should serve cache header
+    CacheBody(bool), // should serve cache body with a bool to indicate if it has already called seek on the hit handler
     CacheHeaderMiss, // should serve cache header but upstream response should be admitted to cache
-    CacheBodyMiss,   // should serve cache body but upstream response should be admitted to cache
-    Done,            // should serve cache body
+    CacheBodyMiss(bool), // should serve cache body but upstream response should be admitted to cache, bool to indicate seek status
+    Done,                // should serve cache body
 }
 
 impl ServeFromCache {
@@ -1223,7 +1224,7 @@ impl ServeFromCache {
     }
 
     pub fn is_miss(&self) -> bool {
-        matches!(self, Self::CacheHeaderMiss | Self::CacheBodyMiss)
+        matches!(self, Self::CacheHeaderMiss | Self::CacheBodyMiss(_))
     }
 
     pub fn is_miss_header(&self) -> bool {
@@ -1231,7 +1232,7 @@ impl ServeFromCache {
     }
 
     pub fn is_miss_body(&self) -> bool {
-        matches!(self, Self::CacheBodyMiss)
+        matches!(self, Self::CacheBodyMiss(_))
     }
 
     pub fn should_discard_upstream(&self) -> bool {
@@ -1254,13 +1255,17 @@ impl ServeFromCache {
 
     pub fn enable_header_only(&mut self) {
         match self {
-            Self::CacheBody | Self::CacheBodyMiss => *self = Self::Done, // TODO: make sure no body is read yet
+            Self::CacheBody(_) | Self::CacheBodyMiss(_) => *self = Self::Done, // TODO: make sure no body is read yet
             _ => *self = Self::CacheHeaderOnly,
         }
     }
 
     // This function is (best effort) cancel-safe to be used in select
-    pub async fn next_http_task(&mut self, cache: &mut HttpCache) -> Result<HttpTask> {
+    pub async fn next_http_task(
+        &mut self,
+        cache: &mut HttpCache,
+        range: &mut RangeBodyFilter,
+    ) -> Result<HttpTask> {
         if !cache.enabled() {
             // Cache is disabled due to internal error
             // TODO: if nothing is sent to eyeball yet, figure out a way to recovery by
@@ -1270,18 +1275,21 @@ impl ServeFromCache {
         match self {
             Self::Off => panic!("ProxyUseCache not enabled"),
             Self::CacheHeader => {
-                *self = Self::CacheBody;
+                *self = Self::CacheBody(true);
                 Ok(HttpTask::Header(cache_hit_header(cache), false)) // false for now
             }
             Self::CacheHeaderMiss => {
-                *self = Self::CacheBodyMiss;
+                *self = Self::CacheBodyMiss(true);
                 Ok(HttpTask::Header(cache_hit_header(cache), false)) // false for now
             }
             Self::CacheHeaderOnly => {
                 *self = Self::Done;
                 Ok(HttpTask::Header(cache_hit_header(cache), true))
             }
-            Self::CacheBody => {
+            Self::CacheBody(should_seek) => {
+                if *should_seek {
+                    self.maybe_seek_hit_handler(cache, range)?;
+                }
                 if let Some(b) = cache.hit_handler().read_body().await? {
                     Ok(HttpTask::Body(Some(b), false)) // false for now
                 } else {
@@ -1289,7 +1297,10 @@ impl ServeFromCache {
                     Ok(HttpTask::Done)
                 }
             }
-            Self::CacheBodyMiss => {
+            Self::CacheBodyMiss(should_seek) => {
+                if *should_seek {
+                    self.maybe_seek_miss_handler(cache, range)?;
+                }
                 // safety: called of enable_miss() call it only if the async_body_reader exist
                 if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
                     Ok(HttpTask::Body(Some(b), false)) // false for now
@@ -1300,5 +1311,48 @@ impl ServeFromCache {
             }
             Self::Done => Ok(HttpTask::Done),
         }
+    }
+
+    fn maybe_seek_miss_handler(
+        &mut self,
+        cache: &mut HttpCache,
+        range_filter: &mut RangeBodyFilter,
+    ) -> Result<()> {
+        if let RangeType::Single(range) = &range_filter.range {
+            // safety: called only if the async_body_reader exists
+            if cache.miss_body_reader().unwrap().can_seek() {
+                cache
+                    .miss_body_reader()
+                    // safety: called only if the async_body_reader exists
+                    .unwrap()
+                    .seek(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek miss handler")?;
+                // Because the miss body reader is seeking, we no longer need the
+                // RangeBodyFilter's help to return the requested byte range.
+                range_filter.range = RangeType::None;
+            }
+        }
+        *self = Self::CacheBodyMiss(false);
+        Ok(())
+    }
+
+    fn maybe_seek_hit_handler(
+        &mut self,
+        cache: &mut HttpCache,
+        range_filter: &mut RangeBodyFilter,
+    ) -> Result<()> {
+        if let RangeType::Single(range) = &range_filter.range {
+            if cache.hit_handler().can_seek() {
+                cache
+                    .hit_handler()
+                    .seek(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler")?;
+                // Because the hit handler is seeking, we no longer need the
+                // RangeBodyFilter's help to return the requested byte range.
+                range_filter.range = RangeType::None;
+            }
+        }
+        *self = Self::CacheBody(false);
+        Ok(())
     }
 }
