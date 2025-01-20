@@ -162,19 +162,20 @@ impl ConnectionRef {
     }
 }
 
-struct InUsePool {
+// FIXME: potentially lift to mod.rs
+pub(crate) struct InUsePool {
     // TODO: use pingora hashmap to shard the lock contention
     pools: RwLock<HashMap<u64, PoolNode<ConnectionRef>>>,
 }
 
 impl InUsePool {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         InUsePool {
             pools: RwLock::new(HashMap::new()),
         }
     }
 
-    fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
+    pub(crate) fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
         {
             let pools = self.pools.read();
             if let Some(pool) = pools.get(&reuse_hash) {
@@ -192,14 +193,14 @@ impl InUsePool {
     // retrieve a h2 conn ref to create a new stream
     // the caller should return the conn ref to this pool if there are still
     // capacity left for more streams
-    fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
+    pub(crate) fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
         let pools = self.pools.read();
         pools.get(&reuse_hash)?.get_any().map(|v| v.1)
     }
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
-    fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
+    pub(crate) fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
         let pools = self.pools.read();
         if let Some(pool) = pools.get(&reuse_hash) {
             pool.remove(id)
@@ -470,7 +471,7 @@ mod tests {
         peer.options.set_http_version(2, 2);
         let h2 = connector.new_http_session(&peer).await.unwrap();
         match h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
+            HttpSession::H1(_) | HttpSession::H3(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
         }
     }
@@ -485,7 +486,7 @@ mod tests {
         let h2 = connector.new_http_session(&peer).await.unwrap();
         match h2 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -497,7 +498,7 @@ mod tests {
         let h2 = connector.new_http_session(&peer).await.unwrap();
         match h2 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -510,8 +511,8 @@ mod tests {
         peer.options.max_h2_streams = 1;
         let h2 = connector.new_http_session(&peer).await.unwrap();
         let h2_1 = match h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
         };
 
         let id = h2_1.conn.id();
@@ -542,8 +543,8 @@ mod tests {
         peer.options.max_h2_streams = 3;
         let h2 = connector.new_http_session(&peer).await.unwrap();
         let h2_1 = match h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
         };
 
         let id = h2_1.conn.id();

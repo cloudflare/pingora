@@ -25,12 +25,14 @@ use std::os::windows::io::AsRawSocket;
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
-    connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
+    connect_udp_with as udp_connect, connect_with as tcp_connect, set_dscp, set_recv_buf,
+    set_tcp_fastopen_connect,
 };
+use crate::protocols::l4::quic::Connection;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
-use crate::upstreams::peer::Peer;
+use crate::upstreams::peer::{IpProto, Peer};
 
 /// The interface to establish a L4 connection
 #[async_trait]
@@ -99,10 +101,63 @@ where
             .await
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
+    let peer_ip_proto = peer.ip_proto();
+
     let peer_addr = peer.address();
-    let mut stream: Stream =
-        if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
-            custom_l4.connect(peer_addr).await?
+
+    // FIXME: should return an Connection::Outgoing, pre-handshake
+    // needs to be Udp socket enabled, currently code only handles TCP
+    let mut stream: Stream = if let Some(custom_l4) =
+        peer.get_peer_options().and_then(|o| o.custom_l4.as_ref())
+    {
+        custom_l4.connect(peer_addr).await?
+    } else {
+        if matches!(peer_ip_proto, IpProto::UDP) {
+            match peer_addr {
+                SocketAddr::Inet(addr) => {
+                    let connect_future = udp_connect(addr, bind_to.as_ref(), |socket| {
+                        #[cfg(unix)]
+                        let raw = socket.as_raw_fd();
+                        #[cfg(windows)]
+                        let raw = socket.as_raw_socket();
+
+                        if let Some(dscp) = peer.dscp() {
+                            debug!("Setting dscp");
+                            set_dscp(raw, dscp)?;
+                        }
+                        Ok(())
+                    });
+                    let conn_res = match peer.connection_timeout() {
+                        Some(t) => pingora_timeout::timeout(t, connect_future)
+                            .await
+                            .explain_err(ConnectTimedout, |_| {
+                                format!("timeout {t:?} connecting to server {peer}")
+                            })?,
+                        None => connect_future.await,
+                    };
+                    let socket = match conn_res {
+                        Ok(socket) => {
+                            debug!("connected to new server: {}", peer.address());
+                            Ok(socket.into())
+                        }
+                        Err(e) => {
+                            let c = format!("Fail to connect to {peer}");
+                            match e.etype() {
+                                SocketError | BindError => Error::e_because(InternalError, c, e),
+                                _ => Err(e.more_context(c)),
+                            }
+                        }
+                    }?;
+
+                    Connection::initiate_outgoing(socket)?.into()
+                }
+                SocketAddr::Unix(_addr) => {
+                    // TODO: tokio::net::UnixDatagram support could be an option
+                    // send_to(), recv_from() are using a file path with UnixDatagram
+                    // need to verify if Quic/quiche can handle paths as SocketAddr
+                    todo!()
+                }
+            }
         } else {
             match peer_addr {
                 SocketAddr::Inet(addr) => {
@@ -176,7 +231,8 @@ where
                     }
                 }
             }?
-        };
+        }
+    };
 
     let tracer = peer.get_tracer();
     if let Some(t) = tracer {

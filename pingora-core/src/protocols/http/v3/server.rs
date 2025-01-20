@@ -63,12 +63,6 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     };
 
     let (conn_id, qconn, drop_qconn, hconn, tx_notify, rx_notify) = match conn {
-        Connection::Incoming(_) => {
-            return Err(Error::explain(
-                ErrorType::InternalError,
-                "connection needs to be established, invalid state",
-            ))
-        }
         Connection::Established(state) => {
             let hconn = {
                 let http3_config = if let Some(h3_options) = options {
@@ -93,6 +87,12 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
                 state.tx_notify.clone(),
                 state.rx_notify.clone(),
             )
+        }
+        _ => {
+            return Err(Error::explain(
+                ErrorType::InternalError,
+                "connection needs to be established, invalid state",
+            ))
         }
     };
 

@@ -184,6 +184,7 @@ impl TransportConnector {
             do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
         };
 
+        // FIXME: here stream should be Connection::Established
         Ok(stream)
     }
 
@@ -327,7 +328,9 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     if peer.tls() {
         let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
         Ok(Box::new(tls_stream))
-    } else {
+    }
+    // FIXME:: call quic::handshake, return Connection::Established
+    else {
         Ok(Box::new(stream))
     }
 }
@@ -357,6 +360,7 @@ impl PreferredHttpVersion {
         let v = self.versions.read();
         v.get(&key)
             .copied()
+            // FIXME: H3 support
             .map(|v| if v == 1 { ALPN::H1 } else { ALPN::H2H1 })
     }
 }

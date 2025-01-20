@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::protocols::l4::ext::{create_udp_socket, set_dscp, set_tcp_fastopen_backlog};
+use crate::protocols::l4::listener::Listener;
+use crate::protocols::l4::quic::{Listener as QuicListener, QuicHttp3Configs};
+pub use crate::protocols::l4::stream::Stream;
+use crate::protocols::TcpKeepalive;
+#[cfg(unix)]
+use crate::server::ListenFds;
 use log::warn;
 use pingora_error::{
     ErrorType::{AcceptError, BindError},
@@ -29,14 +36,6 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::time::Duration;
 use tokio::net::{TcpSocket, UdpSocket};
-
-use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
-use crate::protocols::l4::listener::Listener;
-use crate::protocols::l4::quic::{Listener as QuicListener, QuicHttp3Configs};
-pub use crate::protocols::l4::stream::Stream;
-use crate::protocols::TcpKeepalive;
-#[cfg(unix)]
-use crate::server::ListenFds;
 
 const LISTENER_MAX_TRY: usize = 30;
 const LISTENER_TRY_STEP: Duration = Duration::from_secs(1);
@@ -319,20 +318,7 @@ async fn bind_udp_socket(addr: &str, opt: Option<UdpSocketOptions>) -> Result<st
             .next() // take the first one for now
             .unwrap(); // assume there is always at least one
 
-        let ty = socket2::Type::DGRAM;
-        let listener_socket = match sock_addr {
-            SocketAddr::V4(_) => socket2::Socket::new(
-                socket2::Domain::IPV4,
-                ty.nonblocking(),
-                Some(socket2::Protocol::UDP),
-            ),
-            SocketAddr::V6(_) => socket2::Socket::new(
-                socket2::Domain::IPV6,
-                ty.nonblocking(),
-                Some(socket2::Protocol::UDP),
-            ),
-        }
-        .or_err_with(BindError, || format!("fail to create address {sock_addr}"))?;
+        let listener_socket = create_udp_socket(&sock_addr)?;
 
         // NOTE: this is to preserve the current UdpListener::bind() behavior.
         // We have a few tests relying on this behavior to allow multiple identical

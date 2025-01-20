@@ -16,11 +16,13 @@
 
 #![allow(non_camel_case_types)]
 
+use crate::connectors::l4::BindTo;
 #[cfg(unix)]
 use libc::socklen_t;
 #[cfg(target_os = "linux")]
 use libc::{c_int, c_ulonglong, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use socket2::Socket;
 use std::io::{self, ErrorKind};
 use std::mem;
 use std::net::SocketAddr;
@@ -31,10 +33,7 @@ use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::net::{TcpSocket, TcpStream};
-
-use crate::connectors::l4::BindTo;
-
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 /// The (copy of) the kernel struct tcp_info returns
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -517,6 +516,100 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
         .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))
 }
 
+/// connect() to the given address while optionally binding to the specific source address and port range.
+///
+/// The `set_socket` callback can be used to tune the socket before `connect()` is called.
+///
+/// If a [`BindTo`] is set with a port range and fallback setting enabled this function will retry
+/// on EADDRNOTAVAIL ignoring the port range.
+///
+/// `IP_BIND_ADDRESS_NO_PORT` is used.
+/// `IP_LOCAL_PORT_RANGE` is used if a port range is set on [`BindTo`].
+pub(crate) async fn connect_udp_with<F: FnOnce(&UdpSocket) -> Result<()> + Clone>(
+    addr: &SocketAddr,
+    bind_to: Option<&BindTo>,
+    set_socket: F,
+) -> Result<UdpSocket> {
+    if bind_to.as_ref().map_or(false, |b| b.will_fallback()) {
+        // if we see an EADDRNOTAVAIL error clear the port range and try again
+        let connect_result = inner_udp_connect_with(addr, bind_to, set_socket.clone()).await;
+        if let Err(e) = connect_result.as_ref() {
+            if matches!(e.etype(), BindError) {
+                let mut new_bind_to = BindTo::default();
+                new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
+                // reset the port range
+                new_bind_to.set_port_range(None).unwrap();
+                return inner_udp_connect_with(addr, Some(&new_bind_to), set_socket).await;
+            }
+        }
+        connect_result
+    } else {
+        // not retryable
+        inner_udp_connect_with(addr, bind_to, set_socket).await
+    }
+}
+
+async fn inner_udp_connect_with<F: FnOnce(&UdpSocket) -> Result<()>>(
+    addr: &SocketAddr,
+    bind_to: Option<&BindTo>,
+    set_socket: F,
+) -> Result<UdpSocket> {
+    let socket = create_udp_socket(addr)?;
+
+    #[cfg(unix)]
+    {
+        ip_bind_addr_no_port(socket.as_raw_fd(), true).or_err(
+            SocketError,
+            "failed to set socket opts IP_BIND_ADDRESS_NO_PORT",
+        )?;
+
+        if let Some(bind_to) = bind_to {
+            if let Some((low, high)) = bind_to.port_range() {
+                ip_local_port_range(socket.as_raw_fd(), low, high)
+                    .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
+            }
+
+            if let Some(baddr) = bind_to.addr {
+                socket
+                    .bind(&baddr.into())
+                    .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let default_addr = match addr {
+            SocketAddr::V4(_) => SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
+            SocketAddr::V6(_) => SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0),
+        };
+        socket
+            .bind(&default_addr.into())
+            .or_err(SocketError, "failed to create socket")?;
+
+        if let Some(bind_to) = bind_to {
+            if let Some(baddr) = bind_to.addr {
+                socket
+                    .bind(&baddr.into())
+                    .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
+            }
+        };
+    }
+    // TODO: add support for bind on other platforms
+
+    // socket bind() is required for UDP, needs to be done before converting to tokio socket
+    let socket =
+        UdpSocket::from_std(socket.into()).or_err(SocketError, "failed to create socket")?;
+
+    set_socket(&socket)?;
+
+    socket
+        .connect(*addr)
+        .await
+        .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))?;
+    Ok(socket)
+}
+
 /// connect() to the given address while optionally binding to the specific source address.
 ///
 /// `IP_BIND_ADDRESS_NO_PORT` is used
@@ -577,6 +670,25 @@ pub fn set_tcp_keepalive(stream: &TcpStream, ka: &TcpKeepalive) -> Result<()> {
     set_keepalive(raw, ka).or_err(ConnectError, "failed to set keepalive")
 }
 
+pub fn create_udp_socket(addr: &SocketAddr) -> Result<Socket> {
+    let ty = socket2::Type::DGRAM;
+    let socket = match addr {
+        SocketAddr::V4(_) => Socket::new(
+            socket2::Domain::IPV4,
+            ty.nonblocking(),
+            Some(socket2::Protocol::UDP),
+        ),
+        SocketAddr::V6(_) => Socket::new(
+            socket2::Domain::IPV6,
+            ty.nonblocking(),
+            Some(socket2::Protocol::UDP),
+        ),
+    }
+    .or_err_with(BindError, || format!("fail to create socket {addr}"))?;
+
+    Ok(socket)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -620,5 +732,43 @@ mod test {
 
         // connect() return right away as the SYN goes out only when the first write() is called.
         assert!(connection_time.as_millis() < 4);
+    }
+
+    #[tokio::test]
+    async fn test_udp_connect() -> Result<()> {
+        use std::net::Ipv4Addr;
+
+        let addr = "127.0.0.1:7745".parse().unwrap();
+        let _remote = UdpSocket::bind(&addr);
+
+        let socket_default = connect_udp_with(&addr, None, |socket| {
+            assert_eq!(
+                socket.local_addr().unwrap(),
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+            );
+            Ok(())
+        })
+        .await?;
+
+        assert_eq!(socket_default.peer_addr().unwrap(), addr);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_udp_connect_bind_addr() -> Result<()> {
+        let addr = "127.0.0.1:7745".parse().unwrap();
+        let _remote = UdpSocket::bind(&addr);
+
+        let mut bind_to = BindTo::default();
+        bind_to.addr = Some("127.0.0.1:7750".parse().unwrap());
+
+        let socket_bind = connect_udp_with(&addr, Some(&bind_to), |socket| {
+            assert_eq!(socket.local_addr().unwrap(), bind_to.addr.unwrap());
+            Ok(())
+        })
+        .await?;
+
+        assert_eq!(socket_bind.peer_addr().unwrap(), addr);
+        Ok(())
     }
 }

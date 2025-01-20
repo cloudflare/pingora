@@ -1,15 +1,13 @@
-use crate::protocols::l4::quic::sendto::{detect_gso, set_txtime_sockopt};
 use crate::protocols::l4::quic::{
-    Connection, ConnectionHandle, HandshakeResponse, IncomingHandle, IncomingState, SocketDetails,
-    UdpRecv, CONNECTION_DROP_DEQUE_INITIAL_SIZE, HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
-    MAX_IPV6_QUIC_DATAGRAM_SIZE,
+    detect_gso_pacing, Connection, ConnectionHandle, Crypto, HandshakeResponse, IncomingHandle,
+    IncomingState, SocketDetails, UdpRecv, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
+    HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
 };
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
-use pingora_error::{BError, Error, ErrorType};
+use pingora_error::{BError, ErrorType, OrErr};
 use quiche::{ConnectionId, Header, RecvInfo, Type};
 use ring::hmac::Key;
-use ring::rand::SystemRandom;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::io;
@@ -39,10 +37,6 @@ pub struct Listener {
 
     connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
     drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
-}
-
-pub struct Crypto {
-    key: Key,
 }
 
 impl Listener {
@@ -289,31 +283,11 @@ impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
     fn try_from(
         (io, configs): (UdpSocket, QuicHttp3Configs),
     ) -> pingora_error::Result<Self, Self::Error> {
-        let addr = io.local_addr().map_err(|e| {
-            Error::explain(
-                ErrorType::SocketError,
-                format!("failed to get local address from socket: {}", e),
-            )
-        })?;
-        let rng = SystemRandom::new();
-        let key = Key::generate(ring::hmac::HMAC_SHA256, &rng).map_err(|e| {
-            Error::explain(
-                ErrorType::InternalError,
-                format!("failed to generate listener key: {}", e),
-            )
+        let addr = io.local_addr().explain_err(ErrorType::SocketError, |e| {
+            format!("failed to get local address from socket: {}", e)
         })?;
 
-        let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-        let pacing_enabled = match set_txtime_sockopt(&io) {
-            Ok(_) => {
-                debug!("successfully set SO_TXTIME socket option");
-                true
-            }
-            Err(e) => {
-                debug!("setsockopt failed {:?}", e);
-                false
-            }
-        };
+        let (gso_enabled, pacing_enabled) = detect_gso_pacing(&io);
 
         Ok(Listener {
             socket_details: SocketDetails {
@@ -324,7 +298,7 @@ impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
             },
 
             configs,
-            crypto: Crypto { key },
+            crypto: Crypto::new()?,
 
             connections: Default::default(),
             drop_connections: Arc::new(Mutex::new(VecDeque::with_capacity(

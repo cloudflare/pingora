@@ -21,6 +21,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use quiche::h3::{Header, NameValue};
 use std::fmt::Debug;
 
+pub mod client;
 pub mod nohash;
 pub mod server;
 

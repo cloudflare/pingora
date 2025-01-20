@@ -203,6 +203,15 @@ pub trait Peer: Display + Clone {
     fn get_tracer(&self) -> Option<Tracer> {
         None
     }
+
+    fn ip_proto(&self) -> IpProto {
+        IpProto::TCP
+    }
+}
+
+pub enum IpProto {
+    TCP,
+    UDP,
 }
 
 /// A simple TCP or TLS peer without many complicated settings.

@@ -1,7 +1,7 @@
 use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
 use crate::protocols::l4::quic::{
     Connection, ConnectionTx, EstablishedHandle, EstablishedState, HandshakeResponse,
-    IncomingState, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE,
+    IncomingState, OutgoingState, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE,
 };
 use crate::protocols::l4::stream::Stream as L4Stream;
 use crate::protocols::ConnectionState;
@@ -24,8 +24,15 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     };
 
     let e_state = match connection {
+        Connection::Established(_) => {
+            debug_assert!(false, "quic::handshake on already established connection");
+            return Err(Error::explain(
+                ErrorType::HandshakeError,
+                "handshake state not of type incoming",
+            ));
+        }
         Connection::Incoming(i) => {
-            if let Some(e_state) = handshake_inner(i).await? {
+            if let Some(e_state) = handshake_incoming(i).await? {
                 // send HANDSHAKE_DONE Quic frame on established connection
                 e_state.tx_notify.notify_waiters();
                 Some(e_state)
@@ -37,12 +44,16 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
                 None
             }
         }
-        Connection::Established(_) => {
-            debug_assert!(false, "quic::handshake on already established connection");
-            return Err(Error::explain(
-                ErrorType::HandshakeError,
-                "handshake state not of type incoming",
-            ));
+        Connection::Outgoing(o) => {
+            if let Some(_e_state) = handshake_outgoing(o).await? {
+                todo!();
+            } else {
+                debug!(
+                    "no handshake for connection",
+                    //o.connection_id
+                );
+                None
+            }
         }
     };
 
@@ -57,7 +68,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     }
 }
 
-async fn handshake_inner(
+async fn handshake_incoming(
     state: &mut IncomingState,
 ) -> pingora_error::Result<Option<EstablishedState>> {
     let IncomingState {
@@ -328,6 +339,12 @@ async fn handshake_inner(
     };
 
     Ok(Some(state))
+}
+
+async fn handshake_outgoing(
+    _state: &mut OutgoingState,
+) -> pingora_error::Result<Option<EstablishedState>> {
+    Ok(None)
 }
 
 // connection io tx directly via socket

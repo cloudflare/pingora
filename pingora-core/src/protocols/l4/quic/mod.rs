@@ -4,6 +4,8 @@ use pingora_error::{Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use quiche::{h3, Config};
 use quiche::{ConnectionId, Header, RecvInfo, Stats};
+use ring::hmac::Key;
+use ring::rand::SystemRandom;
 use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
@@ -22,9 +24,11 @@ use tokio::task::JoinHandle;
 mod listener;
 mod sendto;
 
+mod connector;
 pub(crate) mod id_token;
+
 use crate::listeners::ALPN;
-use crate::protocols::l4::quic::sendto::send_to;
+use crate::protocols::l4::quic::sendto::{detect_gso, send_to, set_txtime_sockopt};
 use crate::protocols::tls::{SslDigest, TlsRef};
 use crate::protocols::{ConnectionState, Ssl};
 pub(crate) use listener::Listener;
@@ -57,13 +61,21 @@ const CONNECTION_DROP_DEQUE_INITIAL_SIZE: usize = 1024;
 /// and are transitioned to the [`Connection::Established`] / [`ConnectionHandle::Established`]
 /// variants once the TLS handshake was successful.
 pub enum Connection {
-    /// new connection during handshake
+    /// new outgoing connection while in handshake phase
+    Outgoing(OutgoingState),
+    /// new incoming connection while in handshake phase
     Incoming(IncomingState),
     /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
     Established(EstablishedState),
 }
 
-/// corresponds to a new connection before the handshake is completed
+/// corresponds to a new outgoing (connector) connection before the handshake is completed
+pub struct OutgoingState {
+    //pub(crate) connection_id: ConnectionId<'static>,
+    pub(crate) socket_details: SocketDetails,
+}
+
+/// corresponds to a new incoming (listener) connection before the handshake is completed
 pub struct IncomingState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) configs: QuicHttp3Configs,
@@ -152,6 +164,24 @@ pub struct UdpRecv {
     pub(crate) recv_info: RecvInfo,
 }
 
+/// cryptographic for generation and validation of connection ids
+pub(crate) struct Crypto {
+    rng: SystemRandom,
+    key: Key,
+}
+
+impl Crypto {
+    fn new() -> Result<Self> {
+        let rng = SystemRandom::new();
+        let key = Key::generate(ring::hmac::HMAC_SHA256, &rng)
+            .explain_err(ErrorType::InternalError, |e| {
+                format!("failed to generate crypto key: {}", e)
+            })?;
+
+        Ok(Self { rng, key })
+    }
+}
+
 impl ConnectionHandle {
     fn establish(&mut self, handle: EstablishedHandle) {
         match self {
@@ -210,7 +240,7 @@ impl Connection {
                 let _ = mem::replace(self, Connection::Established(state));
                 Ok(())
             }
-            Connection::Established(_) => Err(Error::explain(
+            _ => Err(Error::explain(
                 ErrorType::InternalError,
                 "establishing connection only possible on incoming connection",
             )),
@@ -221,13 +251,14 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         match self {
-            Connection::Incoming(_) => {}
             Connection::Established(s) => {
                 if !s.tx_handle.is_finished() {
                     s.tx_handle.abort();
                     debug!("connection {:?} stopped tx task", s.connection_id);
                 }
             }
+            // FIXME: handle outgoing (stopping rx loop)
+            _ => {}
         }
     }
 }
@@ -398,6 +429,7 @@ impl Connection {
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Connection::Incoming(s) => s.socket_details.io.local_addr(),
+            Connection::Outgoing(s) => s.socket_details.io.local_addr(),
             Connection::Established(s) => s.socket.local_addr(),
         }
     }
@@ -412,23 +444,23 @@ impl Ssl for Connection {
     /// Return the [`tls::SslDigest`] for logging
     fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
         match self {
-            Connection::Incoming(_) => None,
             Connection::Established(s) => {
                 let mut conn = s.connection.lock();
                 let conn = &mut *conn;
                 Some(Arc::from(SslDigest::from_ssl(conn.as_mut())))
             }
+            _ => None,
         }
     }
 
     /// Return selected ALPN if any
     fn selected_alpn_proto(&self) -> Option<ALPN> {
         match self {
-            Connection::Incoming(_) => None,
             Connection::Established(s) => {
                 let conn = s.connection.lock();
                 ALPN::from_wire_selected(conn.application_proto())
             }
+            _ => None,
         }
     }
 }
@@ -436,6 +468,7 @@ impl Ssl for Connection {
 impl AsRawFd for Connection {
     fn as_raw_fd(&self) -> RawFd {
         match self {
+            Connection::Outgoing(s) => s.socket_details.io.as_raw_fd(),
             Connection::Incoming(s) => s.socket_details.io.as_raw_fd(),
             Connection::Established(s) => s.socket.as_raw_fd(),
         }
@@ -501,7 +534,22 @@ pub struct QuicHttp3Configs {
 }
 
 impl QuicHttp3Configs {
-    pub fn new_quic(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
+    pub fn new_quic_connector(trust_origin_ca_pem: Option<&str>) -> Result<Config> {
+        let mut quic = Config::new(quiche::PROTOCOL_VERSION)
+            .explain_err(ErrorType::InternalError, |_| {
+                "Failed to create quiche config."
+            })?;
+
+        if let Some(trust_origin_ca_pem) = trust_origin_ca_pem {
+            quic.load_verify_locations_from_file(trust_origin_ca_pem)
+                .explain_err(ErrorType::FileReadError, |_| {
+                    "Could not load trust CA from pem file."
+                })?;
+        };
+
+        Ok(quic)
+    }
+    pub fn new_quic_listener(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
         let mut quic = Config::new(quiche::PROTOCOL_VERSION)
             .explain_err(ErrorType::InternalError, |_| {
                 "Failed to create quiche config."
@@ -578,7 +626,7 @@ impl QuicHttp3Configs {
 
     pub fn from_cert_key_paths(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Self> {
         Ok(Self {
-            quic: Arc::new(Mutex::new(Self::new_quic(
+            quic: Arc::new(Mutex::new(Self::new_quic_listener(
                 cert_chain_pem_file,
                 priv_key_pem_file,
             )?)),
@@ -617,4 +665,19 @@ impl Debug for QuicHttp3Configs {
         let mut dbg = f.debug_struct("Configs");
         dbg.finish()
     }
+}
+
+fn detect_gso_pacing(io: &UdpSocket) -> (bool, bool) {
+    let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
+    let pacing_enabled = match set_txtime_sockopt(&io) {
+        Ok(_) => {
+            debug!("successfully set SO_TXTIME socket option");
+            true
+        }
+        Err(e) => {
+            debug!("setsockopt failed {:?}", e);
+            false
+        }
+    };
+    (gso_enabled, pacing_enabled)
 }

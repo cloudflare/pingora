@@ -22,17 +22,20 @@ use std::time::Duration;
 
 pub mod v1;
 pub mod v2;
+pub mod v3;
 
 pub struct Connector {
     h1: v1::Connector,
     h2: v2::Connector,
+    h3: v3::Connector,
 }
 
 impl Connector {
     pub fn new(options: Option<ConnectorOptions>) -> Self {
         Connector {
             h1: v1::Connector::new(options.clone()),
-            h2: v2::Connector::new(options),
+            h2: v2::Connector::new(options.clone()),
+            h3: v3::Connector::new(options),
         }
     }
 
@@ -72,8 +75,14 @@ impl Connector {
                 }
             }
             let session = self.h2.new_http_session(peer).await?;
-            Ok((session, false))
+            return Ok((session, false));
         }
+        /*
+        // FIXME: correctly route HTTP3
+        let Some(h3) = self.h3.reused_http_session(peer).await?; {
+            Ok((HttpSession::H3(h3), true))
+        }
+         */
     }
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
@@ -85,6 +94,7 @@ impl Connector {
         match session {
             HttpSession::H1(h1) => self.h1.release_http_session(h1, peer, idle_timeout).await,
             HttpSession::H2(h2) => self.h2.release_http_session(h2, peer, idle_timeout),
+            HttpSession::H3(h3) => self.h3.release_http_session(h3, peer, idle_timeout),
         }
     }
 
@@ -121,8 +131,8 @@ mod tests {
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         match &h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
+            _ => panic!("expect h2"),
         }
 
         connector.release_http_session(h2, &peer, None).await;
@@ -131,8 +141,8 @@ mod tests {
         // reused this time
         assert!(reused);
         match &h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
+            _ => panic!("expect h2"),
         }
     }
 
@@ -147,7 +157,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -156,7 +166,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -177,7 +187,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -189,7 +199,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -206,7 +216,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -216,7 +226,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 }
