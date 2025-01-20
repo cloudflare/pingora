@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 use crate::protocols::digest::{GetSocketDigest, SocketDigest};
-use crate::protocols::l4::quic::Listener as QuicListener;
+use crate::protocols::l4::quic::listener::Listener as QuicListener;
 use crate::protocols::l4::stream::Stream;
 
 /// The type for generic listener for both TCP and Unix domain socket

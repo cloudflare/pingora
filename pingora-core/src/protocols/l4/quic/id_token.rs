@@ -24,6 +24,10 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use log::trace;
+use quiche::{ConnectionId, Header};
+use ring::hmac::Key;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::net;
 
 /// Generate a stateless retry token.
@@ -83,4 +87,22 @@ pub(crate) fn validate_token<'a>(
     }
 
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+}
+
+pub(crate) fn generate_incoming_cid(key: &Key, hdr: &Header) -> ConnectionId<'static> {
+    let conn_id = ring::hmac::sign(key, &hdr.dcid);
+    let conn_id = conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN].to_vec();
+    // dcid
+    let conn_id = ConnectionId::from(conn_id);
+    trace!("generated incoming connection id {:?}", conn_id);
+    conn_id
+}
+
+pub(crate) fn generate_outgoing_cid(rng: &SystemRandom) -> ConnectionId<'static> {
+    let mut conn_id = [0; quiche::MAX_CONN_ID_LEN];
+    rng.fill(&mut conn_id[..]).unwrap();
+    // scid
+    let conn_id = ConnectionId::from(conn_id.to_vec());
+    trace!("generated outgoing connection id {:?}", conn_id);
+    conn_id
 }

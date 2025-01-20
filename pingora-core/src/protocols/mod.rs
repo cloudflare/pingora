@@ -57,6 +57,7 @@ pub trait ConnectionState {
     fn quic_connection_state(&mut self) -> Option<&mut Connection> {
         None
     }
+
     fn is_quic_connection(&self) -> bool {
         false
     }

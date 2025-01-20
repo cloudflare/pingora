@@ -3,12 +3,13 @@ use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
 use quiche::{h3, Config};
-use quiche::{ConnectionId, Header, RecvInfo, Stats};
+use quiche::{ConnectionId, Stats};
 use ring::hmac::Key;
 use ring::rand::SystemRandom;
-use std::collections::VecDeque;
+
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
+
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,21 +18,20 @@ use std::{io, mem};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
-mod listener;
-mod sendto;
-
-mod connector;
+pub(crate) mod connector;
 pub(crate) mod id_token;
+pub(crate) mod listener;
+mod sendto;
 
 use crate::listeners::ALPN;
 use crate::protocols::l4::quic::sendto::{detect_gso, send_to, set_txtime_sockopt};
 use crate::protocols::tls::{SslDigest, TlsRef};
 use crate::protocols::{ConnectionState, Ssl};
-pub(crate) use listener::Listener;
+
+use crate::protocols::l4::quic::connector::{OutgoingEstablishedState, OutgoingHandshakeState};
+use crate::protocols::l4::quic::listener::{IncomingEstablishedState, IncomingHandshakeState};
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
@@ -52,126 +52,44 @@ const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
 /// initial size for the connection drop deque
 const CONNECTION_DROP_DEQUE_INITIAL_SIZE: usize = 1024;
 
-// TODO: potentially split more into separate modules
-// as of now it is not fully clear which parts will be re-used for the [`Connector`]
-
-/// A [`Connection`] corresponds to a [`ConnectionHandle`].
+/// Represents a Quic [`Connection`] in either `Incoming` or `Outgoing` direction.
 ///
-/// They are created having the variants [`Connection::Incoming`] / [`ConnectionHandle::Incoming`]
-/// and are transitioned to the [`Connection::Established`] / [`ConnectionHandle::Established`]
+/// A [`Connection`] of variant `Incoming*` corresponds to a [`IncomingConnectionHandle`].
+/// They are created having e.g. the variants [`Connection::IncomingHandshake`] / [`IncomingConnectionHandle::Handshake`]
+/// and are transitioned to the [`Connection::IncomingEstablished`] / [`IncomingConnectionHandle::Established`]
 /// variants once the TLS handshake was successful.
+///
+/// `Outgoing` connections do not have corresponding handles as they are bound to a distinguished
+/// socket/quad-tuple and having a distinguished ConnectionRx task.
 pub enum Connection {
-    /// new outgoing connection while in handshake phase
-    Outgoing(OutgoingState),
-    /// new incoming connection while in handshake phase
-    Incoming(IncomingState),
-    /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
-    Established(EstablishedState),
-}
+    /// new incoming connection while in the handshake phase
+    IncomingHandshake(IncomingHandshakeState),
+    /// established incoming connection after successful handshake ([`quiche::Connection::is_established`])
+    IncomingEstablished(IncomingEstablishedState),
 
-/// corresponds to a new outgoing (connector) connection before the handshake is completed
-pub struct OutgoingState {
-    //pub(crate) connection_id: ConnectionId<'static>,
-    pub(crate) socket_details: SocketDetails,
-}
-
-/// corresponds to a new incoming (listener) connection before the handshake is completed
-pub struct IncomingState {
-    pub(crate) connection_id: ConnectionId<'static>,
-    pub(crate) configs: QuicHttp3Configs,
-    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
-
-    pub(crate) socket_details: SocketDetails,
-    pub(crate) udp_rx: Receiver<UdpRecv>,
-    pub(crate) response: Arc<Mutex<Option<HandshakeResponse>>>,
-
-    pub(crate) dgram: UdpRecv,
-
-    pub(crate) ignore: bool,
+    /// new outgoing connection while in the handshake phase
+    OutgoingHandshake(OutgoingHandshakeState),
+    /// established outgoing connection after successful handshake ([`quiche::Connection::is_established`])
+    OutgoingEstablished(OutgoingEstablishedState),
 }
 
 #[derive(Clone)]
 pub(crate) struct SocketDetails {
     pub(crate) io: Arc<UdpSocket>,
-    addr: SocketAddr,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) peer_addr: Option<SocketAddr>,
     gso_enabled: bool,
     pacing_enabled: bool,
 }
 
-/// can be used to wait for network data or trigger network sending
-pub struct EstablishedState {
-    pub(crate) connection_id: ConnectionId<'static>,
-    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
-
-    pub(crate) http3_config: Arc<h3::Config>,
-
-    /// is used to wait for new data received on the connection
-    /// (e.g. after [`quiche::h3::Connection.poll()`] returned [`quiche::h3::Error::Done`])
-    pub(crate) rx_notify: Arc<Notify>,
-    /// is used to trigger a transmit loop which sends all connection data until [`quiche::h3::Error::Done`]
-    pub(crate) tx_notify: Arc<Notify>,
-
-    /// handle for the ConnectionTx task
-    pub(crate) tx_handle: JoinHandle<Result<()>>,
-    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
-    pub(crate) socket: Arc<UdpSocket>,
-}
-
-/// A [`ConnectionHandle`] corresponds to a [`Connection`].
-/// For further details please refer to [`Connection`].
-pub enum ConnectionHandle {
-    /// new connection handle during handshake
-    Incoming(IncomingHandle),
-    /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
-    Established(EstablishedHandle),
-}
-
-impl Debug for ConnectionHandle {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ConnectionHandle")?;
-        match self {
-            ConnectionHandle::Incoming(_) => f.write_str("::Incoming"),
-            ConnectionHandle::Established(_) => f.write_str("::Established"),
-        }
-    }
-}
-
-/// used to forward data from the UDP socket during the handshake
-pub struct IncomingHandle {
-    udp_tx: Sender<UdpRecv>,
-    response: Arc<Mutex<Option<HandshakeResponse>>>,
-}
-
-pub(crate) enum HandshakeResponse {
-    Established(EstablishedHandle),
-    Ignored,
-    // TODO: TimedOut
-}
-
-/// is used to forward data from the UDP socket to the Quic connection
-#[derive(Clone)]
-pub struct EstablishedHandle {
-    pub(crate) connection_id: ConnectionId<'static>,
-    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
-    pub(crate) rx_notify: Arc<Notify>,
-    pub(crate) tx_notify: Arc<Notify>,
-}
-
-/// the message format used on the [`tokio::sync::mpsc::channel`] during the handshake phase
-pub struct UdpRecv {
-    pub(crate) pkt: Vec<u8>,
-    pub(crate) header: Header<'static>,
-    pub(crate) recv_info: RecvInfo,
-}
-
 /// cryptographic for generation and validation of connection ids
 pub(crate) struct Crypto {
-    rng: SystemRandom,
+    pub(crate) rng: SystemRandom,
     key: Key,
 }
 
 impl Crypto {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let rng = SystemRandom::new();
         let key = Key::generate(ring::hmac::HMAC_SHA256, &rng)
             .explain_err(ErrorType::InternalError, |e| {
@@ -182,94 +100,13 @@ impl Crypto {
     }
 }
 
-impl ConnectionHandle {
-    fn establish(&mut self, handle: EstablishedHandle) {
-        match self {
-            ConnectionHandle::Incoming(_) => {
-                debug!("connection handle {:?} established", handle.connection_id);
-                let _ = mem::replace(self, ConnectionHandle::Established(handle));
-            }
-            ConnectionHandle::Established(_) => {}
-        }
-    }
-}
-
-impl Connection {
-    pub(crate) fn establish(&mut self, state: EstablishedState) -> Result<()> {
-        if cfg!(test) {
-            let conn = state.connection.lock();
-            debug_assert!(
-                conn.is_established() || conn.is_in_early_data(),
-                "connection must be established or ready for data"
-            )
-        }
-        match self {
-            Connection::Incoming(s) => {
-                'drain: loop {
-                    match s.udp_rx.try_recv() {
-                        Ok(mut dgram) => {
-                            let mut conn = state.connection.lock();
-                            conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
-                                .explain_err(ErrorType::HandshakeError, |_| {
-                                    "receiving dgram failed"
-                                })?;
-                            debug!(
-                                "connection {:?} dgram received while establishing",
-                                s.connection_id
-                            )
-                        }
-                        Err(e) => {
-                            match e {
-                                TryRecvError::Empty => {
-                                    // stop accepting packets
-                                    s.udp_rx.close();
-                                }
-                                TryRecvError::Disconnected => {
-                                    // remote already closed channel
-                                }
-                            }
-                            break 'drain;
-                        }
-                    }
-                }
-                debug_assert!(
-                    s.udp_rx.is_empty(),
-                    "udp rx channel must be empty when establishing the connection"
-                );
-                debug!("connection {:?} established", state.connection_id);
-                let _ = mem::replace(self, Connection::Established(state));
-                Ok(())
-            }
-            _ => Err(Error::explain(
-                ErrorType::InternalError,
-                "establishing connection only possible on incoming connection",
-            )),
-        }
-    }
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        match self {
-            Connection::Established(s) => {
-                if !s.tx_handle.is_finished() {
-                    s.tx_handle.abort();
-                    debug!("connection {:?} stopped tx task", s.connection_id);
-                }
-            }
-            // FIXME: handle outgoing (stopping rx loop)
-            _ => {}
-        }
-    }
-}
-
 /// connections transmit task sends data from the [`quiche::Connection`] to the UDP socket
 /// the actor is notified through the `tx_notify` and flushes all connection data to the network
 pub struct ConnectionTx {
     pub(crate) socket_details: SocketDetails,
 
-    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
     pub(crate) connection_id: ConnectionId<'static>,
+    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
 
     pub(crate) tx_notify: Arc<Notify>,
     pub(crate) tx_stats: TxStats,
@@ -425,105 +262,6 @@ impl TxStats {
     }
 }
 
-impl Connection {
-    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        match self {
-            Connection::Incoming(s) => s.socket_details.io.local_addr(),
-            Connection::Outgoing(s) => s.socket_details.io.local_addr(),
-            Connection::Established(s) => s.socket.local_addr(),
-        }
-    }
-}
-
-impl Ssl for Connection {
-    /// Return the TLS info if the connection is over TLS
-    fn get_ssl(&self) -> Option<&TlsRef> {
-        None
-    }
-
-    /// Return the [`tls::SslDigest`] for logging
-    fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
-        match self {
-            Connection::Established(s) => {
-                let mut conn = s.connection.lock();
-                let conn = &mut *conn;
-                Some(Arc::from(SslDigest::from_ssl(conn.as_mut())))
-            }
-            _ => None,
-        }
-    }
-
-    /// Return selected ALPN if any
-    fn selected_alpn_proto(&self) -> Option<ALPN> {
-        match self {
-            Connection::Established(s) => {
-                let conn = s.connection.lock();
-                ALPN::from_wire_selected(conn.application_proto())
-            }
-            _ => None,
-        }
-    }
-}
-
-impl AsRawFd for Connection {
-    fn as_raw_fd(&self) -> RawFd {
-        match self {
-            Connection::Outgoing(s) => s.socket_details.io.as_raw_fd(),
-            Connection::Incoming(s) => s.socket_details.io.as_raw_fd(),
-            Connection::Established(s) => s.socket.as_raw_fd(),
-        }
-    }
-}
-
-impl Debug for Connection {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QuicConnection").finish()
-    }
-}
-
-#[allow(unused_variables)] // TODO: remove
-impl AsyncWrite for Connection {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        todo!()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        // this is called on l4::Stream::drop()
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        todo!()
-    }
-}
-
-// TODO: consider usage for Quic/Connection/Datagrams
-// is there be any source for data in this area (e.g. L4/UDP -> Quic/Dgram, Media Over Quic, ...)
-#[allow(unused_variables)]
-impl AsyncRead for Connection {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        todo!()
-    }
-}
-
-impl ConnectionState for Connection {
-    fn quic_connection_state(&mut self) -> Option<&mut Connection> {
-        Some(self)
-    }
-
-    fn is_quic_connection(&self) -> bool {
-        true
-    }
-}
-
 /// contains configs for Quic [`quiche::Config`] and Http3 [`quiche::h3::Config`]
 ///
 /// the configs can be supplied during the [`crate::listeners::Listeners`] creation
@@ -547,6 +285,13 @@ impl QuicHttp3Configs {
                 })?;
         };
 
+        quic.set_application_protos(h3::APPLICATION_PROTOCOL)
+            .explain_err(ErrorType::InternalError, |_| {
+                "Failed to set application protocols."
+            })?;
+
+        quic.grease(false); // default true
+
         Ok(quic)
     }
     pub fn new_quic_listener(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
@@ -569,8 +314,8 @@ impl QuicHttp3Configs {
         // quic.verify_peer(); default server = false; client = true
         // quic.discover_pmtu(false); // default false
         quic.grease(false); // default true
-                            // quic.log_keys() && config.set_keylog(); // logging SSL secrets
-                            // quic.set_ticket_key() // session ticket signer key material
+        // quic.log_keys() && config.set_keylog(); // logging SSL secrets
+        // quic.set_ticket_key() // session ticket signer key material
 
         //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
 
@@ -680,4 +425,193 @@ fn detect_gso_pacing(io: &UdpSocket) -> (bool, bool) {
         }
     };
     (gso_enabled, pacing_enabled)
+}
+
+impl Connection {
+    pub(crate) fn establish_incoming(&mut self, state: IncomingEstablishedState) -> Result<()> {
+        if cfg!(test) {
+            let conn = state.connection.lock();
+            debug_assert!(
+                conn.is_established() || conn.is_in_early_data(),
+                "connection must be established or ready for data"
+            )
+        }
+        match self {
+            Connection::IncomingHandshake(s) => {
+                'drain: loop {
+                    match s.udp_rx.try_recv() {
+                        Ok(mut dgram) => {
+                            let mut conn = state.connection.lock();
+                            conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
+                                .explain_err(ErrorType::HandshakeError, |_| {
+                                    "receiving dgram failed"
+                                })?;
+                            debug!(
+                                "connection {:?} dgram received while establishing",
+                                s.connection_id
+                            )
+                        }
+                        Err(e) => {
+                            match e {
+                                TryRecvError::Empty => {
+                                    // stop accepting packets
+                                    s.udp_rx.close();
+                                }
+                                TryRecvError::Disconnected => {
+                                    // remote already closed channel
+                                }
+                            }
+                            break 'drain;
+                        }
+                    }
+                }
+                debug_assert!(
+                    s.udp_rx.is_empty(),
+                    "udp rx channel must be empty when establishing the connection"
+                );
+                debug!("connection {:?} established", state.connection_id);
+                let _ = mem::replace(self, Connection::IncomingEstablished(state));
+                Ok(())
+            }
+            _ => Err(Error::explain(
+                ErrorType::InternalError,
+                "establishing connection only possible on incoming handshake connection",
+            )),
+        }
+    }
+
+    pub(crate) fn establish_outgoing(&mut self, state: OutgoingEstablishedState) -> Result<()> {
+        if cfg!(test) {
+            let conn = state.connection.lock();
+            debug_assert!(
+                conn.is_established() || conn.is_in_early_data(),
+                "connection must be established or ready for data"
+            )
+        }
+        match self {
+            Connection::OutgoingHandshake(_) => {
+                debug!("connection {:?} established", state.connection_id);
+                let _ = mem::replace(self, Connection::OutgoingEstablished(state));
+                Ok(())
+            }
+            _ => Err(Error::explain(
+                ErrorType::InternalError,
+                "establishing connection only possible on outgoing handshake connection",
+            )),
+        }
+    }
+
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Connection::IncomingHandshake(s) => s.socket_details.io.local_addr(),
+            Connection::IncomingEstablished(s) => s.socket.local_addr(),
+            Connection::OutgoingHandshake(s) => s.socket_details.io.local_addr(),
+            Connection::OutgoingEstablished(s) => s.socket.local_addr(),
+        }
+    }
+}
+
+impl Debug for Connection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicConnection").finish()
+    }
+}
+
+impl ConnectionState for Connection {
+    fn quic_connection_state(&mut self) -> Option<&mut Connection> {
+        Some(self)
+    }
+
+    fn is_quic_connection(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        match self {
+            Connection::IncomingEstablished(s) => {
+                if !s.tx_handle.is_finished() {
+                    s.tx_handle.abort();
+                    debug!("connection {:?} stopped tx task", s.connection_id);
+                }
+            }
+            // FIXME: handle outgoing (stopping rx loop)
+            _ => {}
+        }
+    }
+}
+
+impl Ssl for Connection {
+    /// Return the TLS info if the connection is over TLS
+    fn get_ssl(&self) -> Option<&TlsRef> {
+        None
+    }
+
+    /// Return the [`tls::SslDigest`] for logging
+    fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
+        match self {
+            Connection::IncomingEstablished(s) => {
+                let mut conn = s.connection.lock();
+                let conn = &mut *conn;
+                Some(Arc::from(SslDigest::from_ssl(conn.as_mut())))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return selected ALPN if any
+    fn selected_alpn_proto(&self) -> Option<ALPN> {
+        match self {
+            Connection::IncomingEstablished(s) => {
+                let conn = s.connection.lock();
+                ALPN::from_wire_selected(conn.application_proto())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl AsRawFd for Connection {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Connection::IncomingHandshake(s) => s.socket_details.io.as_raw_fd(),
+            Connection::IncomingEstablished(s) => s.socket.as_raw_fd(),
+            Connection::OutgoingHandshake(s) => s.socket_details.io.as_raw_fd(),
+            Connection::OutgoingEstablished(s) => s.socket.as_raw_fd(),
+        }
+    }
+}
+
+#[allow(unused_variables)] // TODO: remove
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        todo!()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // this is called on l4::Stream::drop()
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        todo!()
+    }
+}
+
+// TODO: consider usage for Quic/Connection/Datagrams
+// is there be any source for data in this area (e.g. L4/UDP -> Quic/Dgram, Media Over Quic, ...)
+#[allow(unused_variables)]
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        todo!()
+    }
 }

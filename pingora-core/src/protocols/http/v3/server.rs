@@ -63,7 +63,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     };
 
     let (conn_id, qconn, drop_qconn, hconn, tx_notify, rx_notify) = match conn {
-        Connection::Established(state) => {
+        Connection::IncomingEstablished(state) => {
             let hconn = {
                 let http3_config = if let Some(h3_options) = options {
                     h3_options
@@ -72,7 +72,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
                 };
 
                 let mut qconn = state.connection.lock();
-                h3::Connection::with_transport(&mut qconn, http3_config)
+                QuicheH3Connection::with_transport(&mut qconn, http3_config)
                     .explain_err(ErrorType::ConnectError, |_| {
                         "failed to create H3 connection"
                     })?

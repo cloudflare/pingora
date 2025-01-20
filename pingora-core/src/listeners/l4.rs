@@ -14,7 +14,8 @@
 
 use crate::protocols::l4::ext::{create_udp_socket, set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
-use crate::protocols::l4::quic::{Listener as QuicListener, QuicHttp3Configs};
+use crate::protocols::l4::quic::listener::Listener as QuicListener;
+use crate::protocols::l4::quic::QuicHttp3Configs;
 pub use crate::protocols::l4::stream::Stream;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]

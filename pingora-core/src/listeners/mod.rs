@@ -22,7 +22,7 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::tls::quic::handshake as quic_handshake;
+use crate::protocols::tls::quic::server::handshake as quic_handshake;
 use crate::protocols::{tls::TlsRef, ConnectionState, Stream};
 
 #[cfg(unix)]
@@ -143,7 +143,7 @@ impl Listeners {
 
     /// Create a new [`Listeners`] with a QUIC server endpoint from the given string and
     /// according [`QuicHttp3Configs`].
-    pub fn quic(&mut self, addr: &str, configs: QuicHttp3Configs) -> Result<Self> {
+    pub fn quic(addr: &str, configs: QuicHttp3Configs) -> Result<Self> {
         let mut listeners = Self::new();
         listeners.add_address(ServerAddress::Udp(
             addr.into(),

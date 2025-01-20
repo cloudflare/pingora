@@ -595,6 +595,16 @@ impl Peer for HttpPeer {
     fn get_tracer(&self) -> Option<Tracer> {
         self.options.tracer.clone()
     }
+
+    fn ip_proto(&self) -> IpProto {
+        if let Some(peer_options) = self.get_peer_options() {
+            match peer_options.alpn {
+                ALPN::H3 => return IpProto::UDP,
+                _ => {}
+            }
+        }
+        IpProto::TCP
+    }
 }
 
 /// The proxy settings to connect to the remote server, CONNECT only for now

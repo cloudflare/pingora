@@ -5,6 +5,7 @@ use crate::connectors::http::v2::{ConnectionRef, InUsePool};
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v2::client::Http2Session;
 use crate::protocols::http::v3::client::Http3Session;
+use crate::protocols::l4::quic::Crypto;
 use crate::upstreams::peer::Peer;
 use pingora_pool::ConnectionPool;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub struct Connector {
     in_use_pool: InUsePool,
     // the h3 connection idle pool
     idle_pool: Arc<ConnectionPool<ConnectionRef>>,
+    crypto: Option<Crypto>,
 }
 
 const DEFAULT_POOL_SIZE: usize = 128;
@@ -31,10 +33,12 @@ impl Connector {
             .as_ref()
             .map_or(DEFAULT_POOL_SIZE, |o| o.keepalive_pool_size);
         // connection offload is handled by the [TransportConnector]
+
         Self {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
+            crypto: Crypto::new().ok(),
         }
     }
 
@@ -90,4 +94,45 @@ impl Connector {
     ) {
         todo!()
     }
+    /*
+        /// Create a new Http3 connection to the given server
+        pub async fn new_http_session<P: Peer + Send + Sync + 'static>(
+            &self,
+            peer: &P,
+        ) -> Result<HttpSession> {
+            let stream = self.transport.new_stream(peer).await?;
+
+            // check alpn
+            match stream.selected_alpn_proto() {
+                Some(crate::protocols::tls::ALPN) => { /* continue */ }
+                Some(_) => {
+                    // H2 not supported
+                    return Ok(crate::protocols::http::client::HttpSession(Http1Session::new(stream)));
+                }
+                None => {
+                    // if tls but no ALPN, default to h1
+                    // else if plaintext and min http version is 1, this is most likely h1
+                    if peer.tls()
+                        || peer
+                        .get_peer_options()
+                        .map_or(true, |o| o.alpn.get_min_http_version() == 1)
+                    {
+                        return Ok(HttpSession::H1(Http1Session::new(stream)));
+                    }
+                    // else: min http version=H2 over plaintext, there is no ALPN anyways, we trust
+                    // the caller that the server speaks h2c
+                }
+            }
+            let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
+            let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+            let h2_stream = conn
+                .spawn_stream()
+                .await?
+                .expect("newly created connections should have at least one free stream");
+            if conn.more_streams_allowed() {
+                self.in_use_pool.insert(peer.reuse_hash(), conn);
+            }
+            Ok(HttpSession::H2(h2_stream))
+        }
+    */
 }

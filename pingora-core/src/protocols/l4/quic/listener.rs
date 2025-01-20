@@ -1,31 +1,111 @@
+use crate::protocols::l4::quic::id_token::generate_incoming_cid;
+use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::l4::quic::{
-    detect_gso_pacing, Connection, ConnectionHandle, Crypto, HandshakeResponse, IncomingHandle,
-    IncomingState, SocketDetails, UdpRecv, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
+    detect_gso_pacing, Connection, Crypto, SocketDetails, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
     HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
 };
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
 use pingora_error::{BError, ErrorType, OrErr};
-use quiche::{ConnectionId, Header, RecvInfo, Type};
-use ring::hmac::Key;
+use quiche::{h3, Connection as QuicheConnection, ConnectionId, Header, RecvInfo, Type};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
-use std::io;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::{io, mem};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
-use crate::protocols::l4::quic::QuicHttp3Configs;
-use quiche::Connection as QuicheConnection;
+/// corresponds to a new incoming (listener) connection before the handshake is completed
+pub struct IncomingHandshakeState {
+    pub(crate) connection_id: ConnectionId<'static>,
+    pub(crate) configs: QuicHttp3Configs,
+    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
-/// The [`Listener`] contains a [`HashMap`] linking [`quiche::ConnectionId`] to [`ConnectionHandle`]
-/// the `Listener::accept` method returns [`Connection`]s and is responsible to forward network
-/// UDP packets to the according `Connection` through the corresponding [`ConnectionHandle`].
+    pub(crate) socket_details: SocketDetails,
+    pub(crate) udp_rx: Receiver<UdpRecv>,
+    pub(crate) response: Arc<Mutex<Option<HandshakeResponse>>>,
+
+    pub(crate) dgram: UdpRecv,
+
+    pub(crate) ignore: bool,
+}
+
+/// can be used to wait for network data or trigger network sending
+pub struct IncomingEstablishedState {
+    pub(crate) connection_id: ConnectionId<'static>,
+    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
+
+    pub(crate) http3_config: Arc<h3::Config>,
+
+    /// is used to wait for new data received on the connection
+    /// (e.g. after [`quiche::h3::Connection.poll()`] returned [`quiche::h3::Error::Done`])
+    pub(crate) rx_notify: Arc<Notify>,
+    /// is used to trigger a transmit loop which sends all connection data until [`quiche::h3::Error::Done`]
+    pub(crate) tx_notify: Arc<Notify>,
+
+    pub(crate) socket: Arc<UdpSocket>,
+    /// handle for the ConnectionTx task
+    pub(crate) tx_handle: JoinHandle<pingora_error::Result<()>>,
+    pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+}
+
+/// A [`IncomingConnectionHandle`] corresponds to a [`IncomingConnection`].
+/// For further details please refer to [`IncomingConnection`].
+pub enum IncomingConnectionHandle {
+    /// new connection handle during handshake
+    Handshake(HandshakeHandle),
+    /// transitioned once the handshake is successful ([`quiche::Connection::is_established`])
+    Established(EstablishedHandle),
+}
+
+impl Debug for IncomingConnectionHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectionHandle")?;
+        match self {
+            IncomingConnectionHandle::Handshake(_) => f.write_str("::Incoming"),
+            IncomingConnectionHandle::Established(_) => f.write_str("::Established"),
+        }
+    }
+}
+
+/// used to forward data from the UDP socket during the handshake
+pub struct HandshakeHandle {
+    udp_tx: Sender<UdpRecv>,
+    response: Arc<Mutex<Option<HandshakeResponse>>>,
+}
+
+pub(crate) enum HandshakeResponse {
+    Established(EstablishedHandle),
+    Ignored,
+    // TODO: TimedOut
+}
+
+/// is used to forward data from the UDP socket to the Quic connection
+#[derive(Clone)]
+pub struct EstablishedHandle {
+    pub(crate) connection_id: ConnectionId<'static>,
+    pub(crate) connection: Arc<Mutex<QuicheConnection>>,
+    pub(crate) rx_notify: Arc<Notify>,
+    pub(crate) tx_notify: Arc<Notify>,
+}
+
+/// the message format used on the [`tokio::sync::mpsc::channel`] during the handshake phase
+pub struct UdpRecv {
+    pub(crate) pkt: Vec<u8>,
+    pub(crate) header: Header<'static>,
+    pub(crate) recv_info: RecvInfo,
+}
+
+/// The [`Listener`] contains a [`HashMap`] linking [`quiche::ConnectionId`] to [`IncomingConnectionHandle`]
+/// the `Listener::accept` method returns [`IncomingConnection`]s and is responsible to forward network
+/// UDP packets to the according `Connection` through the corresponding [`IncomingConnectionHandle`].
 ///
-/// In the [`ConnectionHandle::Incoming`] state the UDP packets are forwarded through a
+/// In the [`IncomingConnectionHandle::Handshake`] state the UDP packets are forwarded through a
 /// [`tokio::sync::mpsc::channel`].
 // Once the state is [`ConnectionHandle::Established`] the packets are directly received on
 // the [`quiche::Connection`].
@@ -35,7 +115,7 @@ pub struct Listener {
     configs: QuicHttp3Configs,
     crypto: Crypto,
 
-    connections: HashMap<ConnectionId<'static>, ConnectionHandle>,
+    connections: HashMap<ConnectionId<'static>, IncomingConnectionHandle>,
     drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 }
 
@@ -92,7 +172,7 @@ impl Listener {
             // connection needs to be able to update source_ids() or destination_ids()
 
             let recv_info = RecvInfo {
-                to: self.socket_details.addr,
+                to: self.socket_details.local_addr,
                 from,
             };
 
@@ -103,7 +183,7 @@ impl Listener {
             let mut handle;
             handle = self.connections.get_mut(&conn_id);
             if handle.is_none() {
-                conn_id = Self::gen_cid(&self.crypto.key, &header);
+                conn_id = generate_incoming_cid(&self.crypto.key, &header);
                 handle = self.connections.get_mut(&conn_id);
             };
 
@@ -121,7 +201,7 @@ impl Listener {
                 );
                 let mut needs_establish = None;
                 match handle {
-                    ConnectionHandle::Incoming(i) => {
+                    IncomingConnectionHandle::Handshake(i) => {
                         let resp;
                         {
                             resp = i.response.lock().take();
@@ -146,7 +226,7 @@ impl Listener {
                             udp_tx = Some(i.udp_tx.clone());
                         }
                     }
-                    ConnectionHandle::Established(e) => {
+                    IncomingConnectionHandle::Established(e) => {
                         established_handle = Some(e.clone());
                     }
                 }
@@ -208,7 +288,7 @@ impl Listener {
             let response = Arc::new(Mutex::new(None));
 
             debug!("new incoming connection {:?}", conn_id);
-            let connection = Connection::Incoming(IncomingState {
+            let connection = Connection::IncomingHandshake(IncomingHandshakeState {
                 connection_id: conn_id.clone(),
                 drop_connection: self.drop_connections.clone(),
 
@@ -226,7 +306,7 @@ impl Listener {
 
                 ignore: false,
             });
-            let handle = ConnectionHandle::Incoming(IncomingHandle { udp_tx, response });
+            let handle = IncomingConnectionHandle::Handshake(HandshakeHandle { udp_tx, response });
 
             self.connections.insert(conn_id, handle);
             return Ok((connection.into(), from));
@@ -264,14 +344,6 @@ impl Listener {
         }
     }
 
-    fn gen_cid(key: &Key, hdr: &Header) -> ConnectionId<'static> {
-        let conn_id = ring::hmac::sign(key, &hdr.dcid);
-        let conn_id = conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN].to_vec();
-        let conn_id = ConnectionId::from(conn_id);
-        trace!("generated connection id {:?}", conn_id);
-        conn_id
-    }
-
     pub(crate) fn get_raw_fd(&self) -> RawFd {
         self.socket_details.io.as_raw_fd()
     }
@@ -292,7 +364,8 @@ impl TryFrom<(UdpSocket, QuicHttp3Configs)> for Listener {
         Ok(Listener {
             socket_details: SocketDetails {
                 io: Arc::new(io),
-                addr,
+                local_addr: addr,
+                peer_addr: None,
                 gso_enabled,
                 pacing_enabled,
             },
@@ -313,5 +386,17 @@ impl Debug for Listener {
         f.debug_struct("Listener")
             .field("io", &self.socket_details.io)
             .finish()
+    }
+}
+
+impl IncomingConnectionHandle {
+    fn establish(&mut self, handle: EstablishedHandle) {
+        match self {
+            IncomingConnectionHandle::Handshake(_) => {
+                debug!("connection handle {:?} established", handle.connection_id);
+                let _ = mem::replace(self, IncomingConnectionHandle::Established(handle));
+            }
+            IncomingConnectionHandle::Established(_) => {}
+        }
     }
 }

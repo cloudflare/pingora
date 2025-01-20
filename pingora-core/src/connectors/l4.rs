@@ -102,16 +102,14 @@ where
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
     let peer_ip_proto = peer.ip_proto();
-
     let peer_addr = peer.address();
 
-    // FIXME: should return an Connection::Outgoing, pre-handshake
-    // needs to be Udp socket enabled, currently code only handles TCP
     let mut stream: Stream = if let Some(custom_l4) =
         peer.get_peer_options().and_then(|o| o.custom_l4.as_ref())
     {
         custom_l4.connect(peer_addr).await?
     } else {
+        // FIXME: consider directly using peers ALPN setting for proto selection
         if matches!(peer_ip_proto, IpProto::UDP) {
             match peer_addr {
                 SocketAddr::Inet(addr) => {
@@ -149,7 +147,8 @@ where
                         }
                     }?;
 
-                    Connection::initiate_outgoing(socket)?.into()
+                    // FIXME: supply configs & default configs
+                    Connection::initiate(socket, None)?.into()
                 }
                 SocketAddr::Unix(_addr) => {
                     // TODO: tokio::net::UnixDatagram support could be an option
@@ -638,5 +637,113 @@ mod tests {
         // low < high success
         bind_to.set_port_range(Some((1000, 2000))).unwrap();
         assert_eq!(bind_to.port_range, Some((1000, 2000)));
+    }
+}
+
+#[cfg(test)]
+mod quic_tests {
+    use crate::apps::http_app::ServeHttp;
+    use crate::connectors::l4::connect;
+    use crate::listeners::{Listeners, ALPN};
+    use crate::prelude::HttpPeer;
+    use crate::protocols::http::ServerSession;
+    use crate::protocols::l4::quic::{Connection, QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
+    use crate::protocols::ConnectionState;
+    use crate::server::Server;
+    use crate::services::listening::Service;
+    use async_trait::async_trait;
+    use bytes::{BufMut, BytesMut};
+    use http::{Response, StatusCode};
+    use log::{debug, info};
+    use pingora_error::Result;
+    use pingora_timeout::timeout;
+    use std::thread;
+    use std::time::Duration;
+    use crate::connectors::{do_connect, tls};
+
+    fn quic_listener() {
+        env_logger::builder()
+            .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
+            .init();
+
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+        let mut my_server = Server::new(None).unwrap();
+        my_server.bootstrap();
+
+        let configs = QuicHttp3Configs::from_cert_key_paths(&cert_path, &key_path).unwrap();
+        let listeners = Listeners::quic("0.0.0.0:6147", configs).unwrap();
+
+        let mut echo_service_http =
+            Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
+        echo_service_http.threads = Some(4);
+
+        my_server.add_service(echo_service_http);
+        my_server.run_forever();
+    }
+
+    #[tokio::test]
+    async fn test_connector_quic_http3() -> Result<()> {
+        let _server_handle = thread::spawn(|| {
+            quic_listener();
+        });
+        info!("Startup completed..");
+
+        let port = "6147";
+        let mut peer = Box::new(HttpPeer::new(
+            format!("127.0.0.1:{port}"),
+            false,
+            "openrusty.org".to_string(),
+        ));
+        peer.options.alpn = ALPN::H3;
+
+        let mut pre_handshake_stream = connect(&*peer, None).await?;
+        assert!(pre_handshake_stream.quic_connection_state().is_some());
+
+        let tls_connector = tls::Connector::new(None);
+        let mut stream = do_connect(&*peer, None, None, &tls_connector.ctx).await?;
+        assert!(stream.quic_connection_state().is_some());
+
+        let connection = stream.quic_connection_state().unwrap();
+        assert!(matches!(connection, Connection::OutgoingEstablished(_)));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    pub struct EchoApp;
+    #[async_trait]
+    impl ServeHttp for EchoApp {
+        async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
+            // read timeout of 2s
+            let read_timeout = 2000;
+            let body_future = async {
+                let mut body = BytesMut::with_capacity(MAX_IPV6_BUF_SIZE);
+                while let Ok(b) = http_stream.read_request_body().await {
+                    match b {
+                        None => break, // finished reading request
+                        Some(b) => body.put(b),
+                    }
+                }
+                if body.is_empty() {
+                    body.put("no body!".as_bytes());
+                }
+                body.freeze()
+            };
+
+            let body = match timeout(Duration::from_millis(read_timeout), body_future).await {
+                Ok(res) => res,
+                Err(_) => {
+                    panic!("Timed out after {:?}ms", read_timeout);
+                }
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/html")
+                .header(http::header::CONTENT_LENGTH, body.len())
+                .body(body.to_vec())
+                .unwrap()
+        }
     }
 }

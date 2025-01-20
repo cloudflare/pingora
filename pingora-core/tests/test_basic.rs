@@ -30,6 +30,7 @@ use h3i::config::Config;
 use h3i::frame::H3iFrame;
 use h3i::quiche::h3::frame::Frame;
 use h3i::quiche::h3::Header;
+use pingora_core::prelude::HttpPeer;
 
 #[tokio::test]
 async fn test_http() {
@@ -76,7 +77,7 @@ async fn test_uds() {
 }
 
 #[tokio::test]
-async fn test_quic_http3() -> Result<()> {
+async fn test_listener_quic_http3() -> Result<()> {
     utils::init();
     info!("Startup completed..");
 
@@ -158,7 +159,7 @@ async fn test_quic_http3() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_quic_http3_timeout() -> Result<()> {
+async fn test_listener_quic_http3_timeout() -> Result<()> {
     utils::init();
     info!("Startup completed..");
 
