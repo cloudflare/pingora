@@ -16,13 +16,13 @@
 
 #![allow(clippy::new_without_default)]
 
+use cf_rustracing::tag::Tag;
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
 use key::{CacheHashKey, HashBinary};
 use lock::WritePermit;
 use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
-use rustracing::tag::Tag;
 use std::time::{Duration, Instant, SystemTime};
 use strum::IntoStaticStr;
 use trace::CacheTraceCTX;

@@ -14,15 +14,15 @@
 
 //! Distributed tracing helpers
 
-use rustracing_jaeger::span::SpanContextState;
+use cf_rustracing_jaeger::span::SpanContextState;
 use std::time::SystemTime;
 
 use crate::{CacheMeta, CachePhase, HitStatus};
 
-pub use rustracing::tag::Tag;
+pub use cf_rustracing::tag::Tag;
 
-pub type Span = rustracing::span::Span<SpanContextState>;
-pub type SpanHandle = rustracing::span::SpanHandle<SpanContextState>;
+pub type Span = cf_rustracing::span::Span<SpanContextState>;
+pub type SpanHandle = cf_rustracing::span::SpanHandle<SpanContextState>;
 
 #[derive(Debug)]
 pub(crate) struct CacheTraceCTX {
