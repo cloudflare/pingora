@@ -185,7 +185,6 @@ impl TransportConnector {
             do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
         };
 
-        // FIXME: here stream should be Connection::Established
         Ok(stream)
     }
 
@@ -551,5 +550,101 @@ mod tests {
         let peer = BasicPeer::new(BLACK_HOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod quic_tests {
+    use std::thread;
+    use std::thread::JoinHandle;
+    use crate::apps::http_app::ServeHttp;
+    use crate::listeners::{Listeners, ALPN};
+    use crate::protocols::http::ServerSession;
+    use crate::protocols::l4::quic::{QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
+    use crate::server::Server;
+    use crate::services::listening::Service;
+    use async_trait::async_trait;
+    use bytes::{BufMut, BytesMut};
+    use http::{Response, StatusCode};
+    use std::time::Duration;
+    use log::info;
+    use pingora_timeout::timeout;
+    use pingora_error::Result;
+    use crate::prelude::HttpPeer;
+
+    pub(crate) fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
+        let port = 6147u16;
+        fn inner(port: u16) {
+            env_logger::builder()
+                .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
+                .init();
+
+            let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+            let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+            let mut my_server = Server::new(None).unwrap();
+            my_server.bootstrap();
+
+            let configs = QuicHttp3Configs::from_cert_key_paths(&cert_path, &key_path).unwrap();
+            let listeners = Listeners::quic(format!("0.0.0.0:{port}").as_str(), configs).unwrap();
+
+            let mut echo_service_http =
+                Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
+            echo_service_http.threads = Some(4);
+
+            my_server.add_service(echo_service_http);
+            my_server.run_forever();
+        }
+
+        let server_handle = thread::spawn(move || {
+            inner(port);
+        });
+
+        let mut peer = HttpPeer::new(
+            format!("127.0.0.1:{port}"),
+            false,
+            "openrusty.org".to_string(),
+        );
+        peer.options.alpn = ALPN::H3;
+
+        info!("Startup completed..");
+        Ok((server_handle, peer))
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct EchoApp;
+    #[async_trait]
+    impl ServeHttp for EchoApp {
+        async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
+            // read timeout of 2s
+            let read_timeout = 2000;
+            let body_future = async {
+                let mut body = BytesMut::with_capacity(MAX_IPV6_BUF_SIZE);
+                while let Ok(b) = http_stream.read_request_body().await {
+                    match b {
+                        None => break, // finished reading request
+                        Some(b) => body.put(b),
+                    }
+                }
+                if body.is_empty() {
+                    body.put("no body!".as_bytes());
+                }
+                body.freeze()
+            };
+
+            let body = match timeout(Duration::from_millis(read_timeout), body_future).await {
+                Ok(res) => res,
+                Err(_) => {
+                    panic!("Timed out after {:?}ms", read_timeout);
+                }
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/html")
+                .header(http::header::CONTENT_LENGTH, body.len())
+                .body(body.to_vec())
+                .unwrap()
+        }
     }
 }

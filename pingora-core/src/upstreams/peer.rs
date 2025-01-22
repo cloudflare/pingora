@@ -36,6 +36,7 @@ use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
+use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 
@@ -332,6 +333,10 @@ pub struct PeerOptions {
     pub h2_ping_interval: Option<Duration>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
+    // how many concurrent h3 stream are allowed in the same connection
+    pub max_h3_streams: usize,
+    // quic and http3 configs (quiche)
+    pub quic_http3_config: Option<QuicHttp3Configs>,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise
     // if `None`, the default curves will be used
@@ -366,6 +371,8 @@ impl PeerOptions {
             dscp: None,
             h2_ping_interval: None,
             max_h2_streams: 1,
+            max_h3_streams: 1,
+            quic_http3_config: None,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves

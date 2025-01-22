@@ -61,7 +61,7 @@ impl HttpSession {
                 Ok(())
             }
             HttpSession::H2(h2) => h2.write_request_header(req, false),
-            HttpSession::H3(h3) => h3.write_request_header(req, false),
+            HttpSession::H3(h3) => h3.write_request_header(req).await,
         }
     }
 
@@ -74,7 +74,7 @@ impl HttpSession {
                 Ok(())
             }
             HttpSession::H2(h2) => h2.write_request_body(data, end),
-            HttpSession::H3(h3) => h3.write_request_body(data, end),
+            HttpSession::H3(h3) => h3.write_request_body(data, end).await,
         }
     }
 

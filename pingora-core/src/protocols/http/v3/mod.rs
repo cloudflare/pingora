@@ -15,11 +15,23 @@
 //! HTTP/3 implementation
 
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
-use log::warn;
-use pingora_error::{ErrorType, OrErr, Result};
+use log::{error, trace, warn};
+use pingora_error::{Error, ErrorType, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use quiche::h3::{Header, NameValue};
+use quiche::h3::{Event, Header, NameValue};
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use http::uri::{Authority, Scheme};
+use parking_lot::Mutex;
+use quiche::Connection;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::Notify;
+use pingora_error::ErrorType::{H3Error, InvalidHTTPHeader, ReadError};
+use crate::protocols::http::HttpVersion;
+
+pub const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
+pub const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 
 pub mod client;
 pub mod nohash;
@@ -69,6 +81,59 @@ fn response_headers_to_event(resp: &ResponseHeader) -> Vec<Header> {
     qheaders
 }
 
+fn request_headers_to_event(req: &RequestHeader) -> Result<Vec<Header>> {
+    let mut qheaders: Vec<Header> = Vec::with_capacity(req.headers.len() + 4);
+    // only encrypted traffic supported in HTTP3
+    qheaders.push(Header::new(b":scheme".as_slice(),  Scheme::HTTPS.to_string().as_bytes()));
+
+    // use authority when present
+    let authority = if let Some(authority) = req.uri.authority() {
+        authority.clone()
+    } else {
+        // or use host header as authority
+        let host = req.headers.get(http::header::HOST);
+        let Some(host) = host else {
+            return Error::e_explain(InvalidHTTPHeader, "no authority header for h3");
+        };
+        // validate
+        Authority::try_from(host.as_bytes())
+            .explain_err(InvalidHTTPHeader, |_| format!("invalid authority from host {:?}", host))?
+    };
+    qheaders.push(Header::new(b":authority".as_slice(), authority.as_str().as_bytes()));
+
+    let Some(path) = req.uri.path_and_query() else {
+        return Error::e_explain(InvalidHTTPHeader, "no path header for h3");
+    };
+    qheaders.push(Header::new(b":path".as_slice(), path.as_str().as_bytes()));
+    qheaders.push(Header::new(b":method".as_slice(), req.method.as_str().as_bytes()));
+
+    // copy all other request headers
+    // the pseudo-headers starting with ":" need to be sent before regular headers
+    for (k, v) in &req.headers {
+        qheaders.push(Header::new(k.as_str().as_bytes(), v.as_bytes()))
+    }
+    Ok(qheaders)
+}
+
+fn event_to_response_headers(resp: &Vec<Header>) -> Result<ResponseHeader> {
+    // pseudo-headers have to be first, response only has a single valid pseudo header ":status"
+    // which MUST be included as per RFC9114 Section 4.3.2
+    let mut response = ResponseHeader::build(resp[0].value(), Some(resp.len() - 1))?;
+    response.set_version(Version::HTTP_3);
+
+    for h in &resp[1..] {
+        let k = HeaderName::from_bytes(h.name())
+            .explain_err(InvalidHTTPHeader,
+                         |_| format!("failed to parse header name {:?}", h.name()))?;
+        let v = HeaderValue::from_bytes(h.value())
+            .explain_err(InvalidHTTPHeader,
+                         |_| format!("failed to parse header value {:?}", h.value()))?;
+        response.append_header(k, v)?;
+    }
+
+    Ok(response)
+}
+
 fn headermap_to_headervec(headers: &HeaderMap) -> Vec<Header> {
     headers
         .iter()
@@ -76,8 +141,110 @@ fn headermap_to_headervec(headers: &HeaderMap) -> Vec<Header> {
         .collect()
 }
 
+fn headervec_to_headermap(headers: &Vec<Header>) -> Result<HeaderMap> {
+    let mut map = HeaderMap::with_capacity(headers.len());
+    for h in headers {
+        if h.name().len() > 0 && h.name()[0] == b":".as_slice()[0] {
+            let k = HeaderName::from_bytes(h.name())
+                .explain_err(InvalidHTTPHeader,
+                             |_| format!("failed to parse header name {:?}", h.name()))?;
+            let v = HeaderValue::from_bytes(h.value())
+                .explain_err(InvalidHTTPHeader,
+                             |_| format!("failed to parse header value {:?}", h.value()))?;
+            map.insert(k, v);
+        }
+    }
+    Ok(map)
+}
+
 fn header_size<T: NameValue + Debug>(headers: &[T]) -> usize {
     headers
         .iter()
         .fold(0, |acc, h| acc + h.value().len() + h.name().len() + 32)
+}
+
+fn stream_capacity<'a>(
+    conn: &'a Mutex<Connection>,
+    stream_id: u64,
+    required: usize,
+    rx_notify: &'a Notify,
+    tx_notify: &'a Notify
+) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+    Box::pin(async move {
+        let capacity;
+        {
+            let qconn = conn.lock();
+            let conn_id = qconn.trace_id();
+            capacity = qconn.stream_capacity(stream_id)
+                .explain_err(ErrorType::WriteError, |e| {
+                    format!(
+                        "H3 connection {} failed to acquire capacity for stream {} error {:?}",
+                        conn_id, stream_id, e
+                    )
+                })?;
+        }
+
+        // FIXME: handle capacity <= required e.g. required is gt configured send buffers
+        if capacity >= required {
+            Ok(capacity)
+        } else {
+            tx_notify.notify_waiters();
+            rx_notify.notified().await;
+            stream_capacity(conn, stream_id, required, rx_notify, tx_notify).await
+        }
+    })
+}
+
+async fn data_finished_event(stream_id: u64, event_rx: &mut Receiver<Event>) -> Result<()> {
+    loop {
+        match event_rx.recv().await {
+            Some(ev) => {
+                match ev {
+                    Event::Finished => {
+                        trace!("stream {} event {:?}", stream_id, ev);
+                        return Ok(());
+                    }
+                    Event::Headers { .. } => {
+                        debug_assert!(false, "Headers or Finished event when Data requested");
+                    }
+                    Event::Data => {
+                        trace!("stream {} event {:?}", stream_id, ev);
+                        return Ok(());
+                    }
+                    Event::Reset(error_code) => {
+                        return Err(Error::explain(
+                            H3Error,
+                            format!("stream was reset with error code {}", error_code),
+                        ))
+                    }
+                    Event::PriorityUpdate => {
+                        // TODO: this step should be deferred until
+                        // h3::Connection::poll() returns Error::Done
+                        // see also h3::Connection::send_response_with_priority()
+
+                        /*
+                        // https://datatracker.ietf.org/doc/rfc9218/
+                        let mut hconn = self.h3_connection.lock();
+                        // field value has the same content as the header::Priority field
+                        let field_value = hconn.take_last_priority_update(self.stream_id)
+                            .explain_err(H3Error, "failed to receive priority update field value")?;
+                        */
+                        warn!("received unhandled priority update");
+                        continue;
+                    }
+                    Event::GoAway => {
+                        // RFC 9114 Section 5.2 & 7.2.6
+                        warn!("received unhandled go-away");
+                        continue;
+                    }
+                }
+            }
+            None => {
+                return Err(Error::explain(
+                    ReadError,
+                    "H3 session event channel disconnected",
+                ))
+            }
+        }
+    }
 }

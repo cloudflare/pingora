@@ -49,9 +49,9 @@ impl Connection {
             format!("failed to get peer address from socket: {}", e)
         })?;
 
-        let configs = configs.unwrap_or(QuicHttp3Configs::try_from(
-            QuicHttp3Configs::new_quic_connector(None)?,
-        )?);
+        let configs = configs.unwrap_or(
+            QuicHttp3Configs::from_ca_file_path(None)?
+        );
 
         let (gso_enabled, pacing_enabled) = detect_gso_pacing(&io);
         Ok(Self::OutgoingHandshake(OutgoingHandshakeState {

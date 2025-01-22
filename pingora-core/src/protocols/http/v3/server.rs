@@ -22,21 +22,18 @@ use http::uri::PathAndQuery;
 use http::{header, HeaderMap, HeaderName};
 use log::{debug, error, info, trace, warn};
 use parking_lot::Mutex;
-use pingora_error::{Error, ErrorType, OrErr, Result};
+use pingora_error::{Error, OrErr, Result};
+use pingora_error::ErrorType::{ConnectError, H3Error, InternalError, ReadError, WriteError};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
-use crate::protocols::http::v3::{
-    event_to_request_headers, header_size, headermap_to_headervec, response_headers_to_event,
-};
+use crate::protocols::http::v3::{data_finished_event, event_to_request_headers, header_size, headermap_to_headervec, response_headers_to_event, stream_capacity, H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY, H3_SESSION_EVENTS_CHANNEL_SIZE};
 use crate::protocols::http::HttpTask;
 use crate::protocols::l4::quic::{Connection, MAX_IPV6_QUIC_DATAGRAM_SIZE};
 pub use quiche::h3::Config as H3Options;
@@ -45,8 +42,6 @@ use quiche::{h3, Connection as QuicheConnection, ConnectionId, Shutdown};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Notify};
 
-const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
-const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -57,7 +52,7 @@ const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3Connection> {
     let Some(conn) = io.quic_connection_state() else {
         return Err(Error::explain(
-            ErrorType::ConnectError,
+            ConnectError,
             "H3 handshake only possible on Quic connections",
         ));
     };
@@ -73,7 +68,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
 
                 let mut qconn = state.connection.lock();
                 QuicheH3Connection::with_transport(&mut qconn, http3_config)
-                    .explain_err(ErrorType::ConnectError, |_| {
+                    .explain_err(ConnectError, |_| {
                         "failed to create H3 connection"
                     })?
             };
@@ -90,7 +85,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         }
         _ => {
             return Err(Error::explain(
-                ErrorType::InternalError,
+                InternalError,
                 "connection needs to be established, invalid state",
             ))
         }
@@ -154,7 +149,7 @@ impl H3Connection {
             debug!("H3 connection {:?} sending GoAway", self.connection_id);
             hconn
                 .send_goaway(&mut qconn, self.max_accepted_stream_id)
-                .explain_err(ErrorType::H3Error, |_| "failed to send graceful shutdown")?;
+                .explain_err(H3Error, |_| "failed to send graceful shutdown")?;
             self.tx_notify.notify_waiters();
         }
 
@@ -176,13 +171,13 @@ impl H3Connection {
             let mut qconn = self.quic_connection.lock();
             qconn
                 .close(false, 0x00, b"graceful shutdown")
-                .explain_err(ErrorType::H3Error, |_| "failed to close quic connection")?;
+                .explain_err(H3Error, |_| "failed to close quic connection")?;
             self.tx_notify.notify_waiters();
         }
 
         if is_timeout {
             Err(Error::explain(
-                ErrorType::InternalError,
+                InternalError,
                 "h3 session draining timed out with active sessions",
             ))
         } else {
@@ -311,7 +306,7 @@ impl H3Session {
                         channel
                             .send(ev)
                             .await
-                            .explain_err(ErrorType::WriteError, |e| {
+                            .explain_err(WriteError, |e| {
                                 format!("failed to send on event channel with {}", e)
                             })?;
                     } else {
@@ -334,7 +329,7 @@ impl H3Session {
                                 let mut hconn = conn.h3_connection.lock();
                                 hconn
                                     .send_goaway(&mut qconn, conn.max_accepted_stream_id)
-                                    .explain_err(ErrorType::InternalError, |_| {
+                                    .explain_err(InternalError, |_| {
                                         "failed to send goaway"
                                     })?;
                                 conn.tx_notify.notify_waiters();
@@ -471,7 +466,7 @@ impl H3Session {
                     conn.tx_notify.notify_waiters();
 
                     error!("H3 connection closed with error {:?}.", e);
-                    return Err(e).explain_err(ErrorType::H3Error, |_| {
+                    return Err(e).explain_err(H3Error, |_| {
                         "while accepting new downstream requests"
                     });
                 }
@@ -491,10 +486,13 @@ impl H3Session {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        self.data_finished_event().await?;
         if self.read_ended {
             return Ok(None);
         }
+
+        // FIXME: this is wrong, required to wait for data event first?
+        data_finished_event(self.stream_id, &mut self.event_rx).await?;
+        self.read_ended = true;
 
         let mut buf = [0u8; MAX_IPV6_QUIC_DATAGRAM_SIZE];
         let size = match self.recv_body(&mut buf) {
@@ -505,7 +503,7 @@ impl H3Session {
             }
             Err(e) => {
                 return Err(Error::explain(
-                    ErrorType::ReadError,
+                    ReadError,
                     format!("reading body failed with {}", e),
                 ))
             }
@@ -584,14 +582,8 @@ impl H3Session {
     }
 
     async fn send_response<T: NameValue + Debug>(&self, headers: &[T], fin: bool) -> Result<()> {
-        self.stream_capacity(header_size(headers))
-            .await
-            .explain_err(ErrorType::WriteError, |_| {
-                format!(
-                    "H3 connection {:?} failed to acquire capacity for stream {}",
-                    self.connection_id, self.stream_id
-                )
-            })?;
+        stream_capacity(&self.quic_connection, self.stream_id, header_size(headers),
+                        &self.rx_notify, &self.tx_notify).await?;
 
         let mut qconn = self.quic_connection.lock();
         let mut hconn = self.h3_connection.lock();
@@ -604,7 +596,7 @@ impl H3Session {
         match hconn.send_response(&mut qconn, self.stream_id, headers, fin) {
             Ok(()) => Ok(()),
             Err(h3::Error::Done) => Ok(()),
-            Err(e) => Err(e).explain_err(ErrorType::WriteError, |_| {
+            Err(e) => Err(e).explain_err(WriteError, |_| {
                 "H3 connection failed to write response"
             }),
         }
@@ -613,13 +605,12 @@ impl H3Session {
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
     pub async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.send_ended {
-            // NOTE: in h1, we also track to see if content-length matches the data
-            // We have not tracked that in h3
+            // NOTE: within http3 content-length tracking is not available
             warn!("Cannot write body after stream ended. Dropping the extra data.");
             return Ok(());
         } else if self.response_header_written.is_none() {
             return Err(Error::explain(
-                ErrorType::H3Error,
+                H3Error,
                 "trying to send the body before header being sent",
             ));
         };
@@ -628,15 +619,8 @@ impl H3Session {
         let mut fin = end;
         while sent_len < data.len() {
             let required = cmp::min(data.len() - sent_len, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-            let capacity =
-                self.stream_capacity(required)
-                    .await
-                    .explain_err(ErrorType::WriteError, |e| {
-                        format!(
-                            "Failed to acquire capacity on stream id {} with {}",
-                            self.stream_id, e
-                        )
-                    })?;
+            let capacity = stream_capacity(&self.quic_connection, self.stream_id, required,
+                                           &self.rx_notify, &self.tx_notify).await?;
 
             let send = if capacity > data.len() - sent_len {
                 &data[sent_len..data.len()]
@@ -651,7 +635,7 @@ impl H3Session {
                     sent_len += sent_size;
                 }
                 Err(e) => {
-                    return Err(e).explain_err(ErrorType::WriteError, |_| {
+                    return Err(e).explain_err(WriteError, |_| {
                         "writing h3 response body to downstream"
                     })
                 }
@@ -683,37 +667,13 @@ impl H3Session {
         hconn.send_body(&mut qconn, self.stream_id, body, fin)
     }
 
-    fn stream_capacity(
-        &self,
-        required: usize,
-    ) -> Pin<Box<dyn Future<Output = quiche::Result<usize>> + Send + '_>> {
-        Box::pin(async move {
-            let capacity;
-            {
-                let qconn = self.quic_connection.lock();
-                capacity = qconn.stream_capacity(self.stream_id)?;
-            }
-
-            if capacity >= required {
-                Ok(capacity)
-            } else {
-                self.tx_notify.notify_waiters();
-                self.rx_notify.notified().await;
-                self.stream_capacity(required).await
-            }
-        })
-    }
-
     /// Write response trailers to the client, this also closes the stream.
     pub async fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
         if self.send_ended {
             warn!("Tried to write trailers after end of stream, dropping them");
             return Ok(());
         } else if self.body_sent == 0 {
-            return Err(Error::explain(
-                ErrorType::H3Error,
-                "Trying to send trailers before body is sent.",
-            ));
+            return Err(Error::explain(H3Error,"Trying to send trailers before body is sent."));
         };
 
         let headers = headermap_to_headervec(&trailers);
@@ -733,14 +693,8 @@ impl H3Session {
         is_trailer: bool,
         fin: bool,
     ) -> Result<()> {
-        self.stream_capacity(header_size(headers))
-            .await
-            .explain_err(ErrorType::WriteError, |_| {
-                format!(
-                    "H3 connection {:?} failed to acquire capacity for stream {}",
-                    self.connection_id, self.stream_id
-                )
-            })?;
+        stream_capacity(&self.quic_connection, self.stream_id, header_size(headers),
+                        &self.rx_notify, &self.tx_notify).await?;
 
         let mut qconn = self.quic_connection.lock();
         let mut hconn = self.h3_connection.lock();
@@ -759,7 +713,7 @@ impl H3Session {
                 self.tx_notify.notify_waiters();
                 Ok(())
             }
-            Err(e) => Err(e).explain_err(ErrorType::WriteError, |_| {
+            Err(e) => Err(e).explain_err(WriteError, |_| {
                 "H3 connection failed to write h3 trailers to downstream"
             }),
         }
@@ -789,7 +743,7 @@ impl H3Session {
         if self.response_header_written.is_some() {
             // use an empty data frame to signal the end
             self.send_body(&[], true).explain_err(
-                ErrorType::WriteError,
+                WriteError,
                 |e| format! {"Writing h3 response body to downstream failed. {e}"},
             )?;
             self.tx_notify.notify_waiters();
@@ -800,60 +754,7 @@ impl H3Session {
         Ok(())
     }
 
-    async fn data_finished_event(&mut self) -> Result<()> {
-        loop {
-            match self.event_rx.recv().await {
-                Some(ev) => {
-                    match ev {
-                        Event::Finished => {
-                            trace!("stream {} event {:?}", self.stream_id, ev);
-                            self.read_ended = true;
-                            return Ok(());
-                        }
-                        Event::Headers { .. } => {
-                            debug_assert!(false, "Headers or Finished event when Data requested");
-                        }
-                        Event::Data => {
-                            trace!("stream {} event {:?}", self.stream_id, ev);
-                            return Ok(());
-                        }
-                        Event::Reset(error_code) => {
-                            return Err(Error::explain(
-                                ErrorType::H3Error,
-                                format!("stream was reset with error code {}", error_code),
-                            ))
-                        }
-                        Event::PriorityUpdate => {
-                            // TODO: this step should be deferred until
-                            // h3::Connection::poll() returns Error::Done
-                            // see also h3::Connection::send_response_with_priority()
 
-                            /*
-                            // https://datatracker.ietf.org/doc/rfc9218/
-                            let mut hconn = self.h3_connection.lock();
-                            // field value has the same content as the header::Priority field
-                            let field_value = hconn.take_last_priority_update(self.stream_id)
-                                .explain_err(ErrorType::H3Error, "failed to receive priority update field value")?;
-                            */
-                            warn!("received unhandled priority update");
-                            continue;
-                        }
-                        Event::GoAway => {
-                            // RFC 9114 Section 5.2 & 7.2.6
-                            warn!("received unhandled go-away");
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    return Err(Error::explain(
-                        ErrorType::ReadError,
-                        "H3 session event channel disconnected",
-                    ))
-                }
-            }
-        }
-    }
 
     async fn reset_event(&mut self) -> Result<u64> {
         loop {
@@ -870,7 +771,7 @@ impl H3Session {
                 }
                 None => {
                     return Err(Error::explain(
-                        ErrorType::ReadError,
+                        ReadError,
                         "H3 session event channel disconnected",
                     ))
                 }
@@ -1024,7 +925,7 @@ impl H3Session {
         if no_body_expected || self.is_body_done() {
             let reason = self.reset_event().await?;
             Error::e_explain(
-                ErrorType::H3Error,
+                H3Error,
                 format!("Client closed H3, reason: {reason}"),
             )
         } else {

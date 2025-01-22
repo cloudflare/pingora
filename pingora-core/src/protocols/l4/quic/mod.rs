@@ -292,6 +292,22 @@ impl QuicHttp3Configs {
 
         quic.grease(false); // default true
 
+        quic.set_max_idle_timeout(600 * 1000); // default ulimited
+        quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
+        quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
+        quic.set_initial_max_data(10_000_000); // 10 Mb
+        quic.set_initial_max_stream_data_bidi_local(1_000_000); // 1 Mb
+        quic.set_initial_max_stream_data_bidi_remote(1_000_000); // 1 Mb
+        quic.set_initial_max_stream_data_uni(1_000_000); // 1 Mb
+        quic.set_initial_max_streams_bidi(100);
+        quic.set_initial_max_streams_uni(100);
+
+        quic.set_disable_active_migration(true); // default is false
+
+        // quic.set_active_connection_id_limit(2); // default 2
+        // quic.set_max_connection_window(conn_args.max_window); // default 24 Mb
+        // quic.set_max_stream_window(conn_args.max_stream_window); // default 16 Mb
+
         Ok(quic)
     }
     pub fn new_quic_listener(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
@@ -366,6 +382,13 @@ impl QuicHttp3Configs {
     fn new_http3() -> Result<h3::Config> {
         h3::Config::new().explain_err(ErrorType::InternalError, |_| {
             "failed to create new h3::Config"
+        })
+    }
+
+    pub fn from_ca_file_path(trust_origin_ca_pem: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            quic: Arc::new(Mutex::new(Self::new_quic_connector(trust_origin_ca_pem)?)),
+            http3: Arc::new(Self::new_http3()?),
         })
     }
 
@@ -564,6 +587,10 @@ impl Ssl for Connection {
     fn selected_alpn_proto(&self) -> Option<ALPN> {
         match self {
             Connection::IncomingEstablished(s) => {
+                let conn = s.connection.lock();
+                ALPN::from_wire_selected(conn.application_proto())
+            }
+            Connection::OutgoingEstablished(s) => {
                 let conn = s.connection.lock();
                 ALPN::from_wire_selected(conn.application_proto())
             }

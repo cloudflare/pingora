@@ -123,20 +123,10 @@ where
         tx_notify: tx_notify.clone(),
     };
 
-    let e_state = OutgoingEstablishedState {
-        connection_id: conn_id.clone(),
-        connection: connection.clone(),
-        http3_config: configs.http3().clone(),
-
-        socket: socket_details.io.clone(),
-        rx_notify: rx_notify.clone(),
-        tx_notify: tx_notify.clone(),
-
-        rx_handle: tokio::task::spawn(rx.start()),
-        tx_handle: tokio::task::spawn(tx.start()),
-    };
-
+    let rx_handle = tokio::task::spawn(rx.start());
     // starting the ConnectionTx task sent the initial handshake packet
+    let tx_handle = tokio::task::spawn(tx.start());
+
     loop {
         // wait for the response
         rx_notify.notified().await;
@@ -156,13 +146,28 @@ where
             handle_connection_errors(conn_id.clone(), conn.peer_error(), conn.local_error())?;
             if conn.is_established() {
                 // send HANDSHAKE_DONE Quic frame on established connection
-                e_state.tx_notify.notify_waiters();
+                tx_notify.notify_waiters();
                 break;
             }
         }
         // send connection data on ConnectionTx task to continue handshake
         tx_notify.notify_waiters();
     }
+
+
+    let e_state = OutgoingEstablishedState {
+        connection_id: conn_id.clone(),
+        connection: connection.clone(),
+
+        http3_config: configs.http3().clone(),
+
+        socket: socket_details.io.clone(),
+        rx_notify: rx_notify.clone(),
+        tx_notify: tx_notify.clone(),
+
+        rx_handle,
+        tx_handle,
+    };
 
     Ok(e_state)
 }

@@ -14,11 +14,15 @@
 
 //! Connecting to HTTP servers
 
+use std::collections::HashMap;
 use crate::connectors::ConnectorOptions;
 use crate::protocols::http::client::HttpSession;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
 use std::time::Duration;
+use parking_lot::RwLock;
+use pingora_pool::PoolNode;
+use crate::protocols::{UniqueID, UniqueIDType};
 
 pub mod v1;
 pub mod v2;
@@ -101,6 +105,54 @@ impl Connector {
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.h2.prefer_h1(peer);
+    }
+}
+
+
+// TODO: also use in v2, currently only used in v3
+pub(crate) struct InUsePool<T: UniqueID> {
+    // TODO: use pingora hashmap to shard the lock contention
+    pools: RwLock<HashMap<u64, PoolNode<T>>>,
+}
+
+impl<T: UniqueID> InUsePool<T> {
+    pub(crate) fn new() -> Self {
+        InUsePool {
+            pools: RwLock::new(HashMap::new()),
+        }
+    }
+    pub(crate) fn insert(&self, reuse_hash: u64, conn: T) {
+        {
+            let pools = self.pools.read();
+            if let Some(pool) = pools.get(&reuse_hash) {
+                pool.insert(conn.id(), conn);
+                return;
+            }
+        } // drop read lock
+
+        let pool = PoolNode::new();
+        pool.insert(conn.id(), conn);
+        let mut pools = self.pools.write();
+        pools.insert(reuse_hash, pool);
+    }
+
+    // retrieve a h2 conn ref to create a new stream
+    // the caller should return the conn ref to this pool if there are still
+    // capacity left for more streams
+    pub(crate) fn get(&self, reuse_hash: u64) -> Option<T> {
+        let pools = self.pools.read();
+        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
+    }
+
+    // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
+    // the caller should update the ref and then decide where to put it (in use pool or idle)
+    pub(crate) fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<T> {
+        let pools = self.pools.read();
+        if let Some(pool) = pools.get(&reuse_hash) {
+            pool.remove(id)
+        } else {
+            None
+        }
     }
 }
 

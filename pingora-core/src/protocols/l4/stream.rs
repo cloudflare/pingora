@@ -538,7 +538,15 @@ impl ConnectionState for Stream {
     }
 }
 
-impl Ssl for Stream {}
+impl Ssl for Stream {
+    fn selected_alpn_proto(&self) -> Option<ALPN> {
+        match &self.stream.get_ref().stream {
+            RawStream::Quic(s) => s.selected_alpn_proto(),
+            RawStream::Tcp(_) => None,
+            RawStream::Unix(_) => None,
+        }
+    }
+}
 
 #[async_trait]
 impl Peek for Stream {
@@ -829,6 +837,7 @@ pub mod async_write_vec {
 }
 
 pub use async_write_vec::AsyncWriteVec;
+use crate::listeners::ALPN;
 
 #[derive(Debug)]
 struct AccumulatedDuration {
