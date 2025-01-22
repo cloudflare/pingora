@@ -405,8 +405,8 @@ impl Storage for MemCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use cf_rustracing::span::Span;
     use once_cell::sync::Lazy;
-    use rustracing::span::Span;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();
