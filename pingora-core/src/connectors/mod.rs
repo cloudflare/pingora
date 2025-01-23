@@ -25,7 +25,7 @@ mod tls;
 use crate::tls::connectors as tls;
 
 use crate::protocols::tls::quic::client::handshake as quic_handshake;
-use crate::protocols::{ConnectionState, Stream};
+use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
 
@@ -326,15 +326,21 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
-        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
-        Ok(Box::new(tls_stream))
-    } else if stream.is_quic_connection() {
-        // TODO: use tls_ctx with boringssl & quiche
-        // currently tls_ctx is already built, but quiche only provides a Config::from_boring()
-        // accepting a SslContextBuilder, but calling only .build() on it, likely a SslContext
-        // should be possible when modifying quiche
-        let quic_stream = quic_handshake(stream, peer, alpn_override, tls_ctx).await?;
-        Ok(Box::new(quic_stream))
+        if peer.udp_http3() {
+            if !peer.tls() {
+                return Err(Error::explain(
+                    HandshakeError, "usage of HTTP3 requires enabled TLS for the peer"))
+            }
+            // TODO: use tls_ctx with boringssl & quiche
+            // tls_ctx is already built, but quiche only provides a Config::from_boring()
+            // accepting a SslContextBuilder, but internally calling only .build() on it,
+            // likely a SslContext it should be possible to adapt quiche to accept a SslConnector
+            let quic_stream = quic_handshake(stream, peer, alpn_override, tls_ctx).await?;
+            Ok(Box::new(quic_stream))
+        } else {
+            let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
+            Ok(Box::new(tls_stream))
+        }
     } else {
         Ok(Box::new(stream))
     }
@@ -558,7 +564,7 @@ pub(crate) mod quic_tests {
     use std::thread;
     use std::thread::JoinHandle;
     use crate::apps::http_app::ServeHttp;
-    use crate::listeners::{Listeners, ALPN};
+    use crate::listeners::Listeners;
     use crate::protocols::http::ServerSession;
     use crate::protocols::l4::quic::{QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
     use crate::server::Server;
@@ -602,10 +608,10 @@ pub(crate) mod quic_tests {
 
         let mut peer = HttpPeer::new(
             format!("127.0.0.1:{port}"),
-            false,
+            true,
             "openrusty.org".to_string(),
         );
-        peer.options.alpn = ALPN::H3;
+        peer.options.set_http_version(3, 3);
 
         info!("Startup completed..");
         Ok((server_handle, peer))

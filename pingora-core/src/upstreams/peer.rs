@@ -205,14 +205,13 @@ pub trait Peer: Display + Clone {
         None
     }
 
-    fn ip_proto(&self) -> IpProto {
-        IpProto::TCP
+    fn udp_http3(&self) -> bool {
+        let mut udp_http3 = false;
+        if let Some(alpn) = self.get_alpn() {
+            udp_http3 = matches!(alpn, &ALPN::H3)
+        }
+        udp_http3
     }
-}
-
-pub enum IpProto {
-    TCP,
-    UDP,
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -325,6 +324,7 @@ pub struct PeerOptions {
     pub verify_hostname: bool,
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
+    /// to enable HTTP3 the ALPN needs to be ALPN::H3
     pub alpn: ALPN,
     pub ca: Option<Arc<CaType>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
@@ -336,7 +336,7 @@ pub struct PeerOptions {
     // how many concurrent h3 stream are allowed in the same connection
     pub max_h3_streams: usize,
     // quic and http3 configs (quiche)
-    pub quic_http3_config: Option<QuicHttp3Configs>,
+    pub quic_http3_configs: Option<QuicHttp3Configs>,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise
     // if `None`, the default curves will be used
@@ -372,7 +372,7 @@ impl PeerOptions {
             h2_ping_interval: None,
             max_h2_streams: 1,
             max_h3_streams: 1,
-            quic_http3_config: None,
+            quic_http3_configs: None,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -383,6 +383,7 @@ impl PeerOptions {
     }
 
     /// Set the ALPN according to the `max` and `min` constrains.
+    /// HTTP3 is only supported when setting min & max to 3 which corresponds to an `ALPN::H3`
     pub fn set_http_version(&mut self, max: u8, min: u8) {
         self.alpn = ALPN::new(max, min);
     }
@@ -601,16 +602,6 @@ impl Peer for HttpPeer {
 
     fn get_tracer(&self) -> Option<Tracer> {
         self.options.tracer.clone()
-    }
-
-    fn ip_proto(&self) -> IpProto {
-        if let Some(peer_options) = self.get_peer_options() {
-            match peer_options.alpn {
-                ALPN::H3 => return IpProto::UDP,
-                _ => {}
-            }
-        }
-        IpProto::TCP
     }
 }
 

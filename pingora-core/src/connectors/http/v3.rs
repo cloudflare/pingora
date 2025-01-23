@@ -9,7 +9,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 use log::debug;
 use parking_lot::Mutex;
 use pingora_error::ErrorType::{H3Error, HandshakeError, InternalError};
-use pingora_error::{Error, ErrorType, OrErr, Result};
+use pingora_error::{Error, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 use quiche::h3::Event;
 use quiche::ConnectionId;
@@ -166,8 +166,8 @@ impl Connector {
         let pool_size = options
             .as_ref()
             .map_or(DEFAULT_POOL_SIZE, |o| o.keepalive_pool_size);
-        // connection offload is handled by the [TransportConnector]
 
+        // connection offload is handled by the [TransportConnector]
         Self {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
@@ -276,14 +276,11 @@ impl Connector {
         peer: &P,
     ) -> Result<HttpSession> {
         let stream = self.transport.new_stream(peer).await?;
-        // TODO: verify & check how this can fit into TCP/UDP picture
+
         // check alpn
         match stream.selected_alpn_proto() {
             Some(ALPN::H3) => { /* continue */ }
-            _ => {
-                // FIXME: correctly route ALPNs
-                return Err(Error::explain(ErrorType::InternalError, "alpn does not match h3"))
-            }
+            _ => return Err(Error::explain(InternalError, "peer ALPN is not H3"))
         }
 
         let max_h3_stream = peer.get_peer_options().map_or(1, |o| o.max_h3_streams);
@@ -400,7 +397,7 @@ async fn handshake(
 }
 
 #[cfg(test)]
-mod quic_tests {
+mod tests {
     use bytes::Bytes;
     use http::Version;
     use zstd::zstd_safe::WriteBuf;
@@ -408,6 +405,7 @@ mod quic_tests {
     use pingora_error::Result;
     use pingora_http::RequestHeader;
     use super::*;
+    use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
     async fn test_connector_quic_http3() -> Result<()> {
@@ -440,5 +438,18 @@ mod quic_tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_connect_h3() {
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        peer.options.set_http_version(3, 3);
+        let h3 = connector.new_http_session(&peer).await.unwrap();
+        match h3 {
+            HttpSession::H1(_) | HttpSession::H2(_) => panic!("expect h3"),
+            HttpSession::H3(_h3_session) => assert!(true),
+        }
     }
 }

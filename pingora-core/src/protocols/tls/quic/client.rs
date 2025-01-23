@@ -60,8 +60,8 @@ where
 pub(crate) async fn handshake_outgoing<P>(
     state: &mut OutgoingHandshakeState,
     peer: &P,
-    alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    _alpn_override: Option<ALPN>, // potentially HTTP09 could be supported
+    _tls_ctx: &SslConnector, // currently the SslConnector cannot be used with quiche, might be feasible
 ) -> pingora_error::Result<OutgoingEstablishedState>
 where
     P: Peer + Send + Sync,

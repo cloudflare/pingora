@@ -100,8 +100,7 @@ impl Http3Session {
         }
 
         let headers = request_headers_to_event(&req)?;
-        let stream_id = self.send_request(&headers, false).await?;
-        error!("stream_id {}", stream_id);
+        self.send_request(&headers, false).await?;
 
         self.request_header_written = Some(req);
         Ok(())

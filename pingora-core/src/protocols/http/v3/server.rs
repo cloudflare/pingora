@@ -490,7 +490,6 @@ impl H3Session {
             return Ok(None);
         }
 
-        // FIXME: this is wrong, required to wait for data event first?
         data_finished_event(self.stream_id, &mut self.event_rx).await?;
         self.read_ended = true;
 
