@@ -3,48 +3,85 @@ use super::HttpSession;
 use crate::connectors::http::InUsePool;
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v3::client::{Http3Poll, Http3Session};
-use crate::protocols::http::v3::nohash::StreamIdHashMap;
-use crate::protocols::http::v3::H3_SESSION_EVENTS_CHANNEL_SIZE;
 use crate::protocols::l4::quic::{Connection, Crypto};
 use crate::protocols::{Digest, Stream, UniqueID, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
-use log::{debug, error};
+use log::debug;
 use parking_lot::Mutex;
-use pingora_error::ErrorType::{H2Error, HandshakeError, InternalError};
+use pingora_error::ErrorType::{H3Error, HandshakeError, InternalError};
 use pingora_error::{Error, ErrorType, OrErr, Result};
-use pingora_pool::ConnectionPool;
+use pingora_pool::{ConnectionMeta, ConnectionPool};
 use quiche::h3::Event;
 use quiche::ConnectionId;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::Notify;
-use tokio::sync::mpsc;
+use tokio::sync::{watch, mpsc, Notify};
 use tokio::task::JoinHandle;
-use pingora_runtime::current_handle;
 // FIXME: ConnectorOptions contains CA file path from ServerConfig
 
+#[derive(Clone)]
 pub(crate) struct ConnectionRef(Arc<ConnectionRefInner>);
 
 impl ConnectionRef {
-    pub fn new(l4_stream: Stream, digest: Digest, conn_io: ConnectionIo,
-               add_sessions: Arc<Mutex<VecDeque<(u64, Sender<Event>)>>>,
+    pub fn new(l4_stream: Stream, conn_io: ConnectionIo, digest: Digest,
+               add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
                drop_sessions: Arc<Mutex<VecDeque<u64>>>,
+               idle_close: watch::Receiver<bool>,
                max_streams: usize, h3poll_task: JoinHandle<Result<()>>, ) -> Self {
 
         Self(Arc::new(ConnectionRefInner {
             l4_stream,
-            digest,
             conn_io,
+
+            digest,
             max_streams,
             current_streams: AtomicUsize::new(0),
-            max_initiated_stream_id: AtomicU64::new(0),
+            release_lock: Arc::new(Default::default()),
+
             add_sessions,
             drop_sessions,
-            h3poll_task
+            idle_close,
+            h3poll_task,
         }))
+    }
+}
+
+impl ConnectionRef {
+    pub(crate) fn conn_id(&self) -> &ConnectionId<'_> {
+        &self.0.conn_io.conn_id
+    }
+
+    pub(crate) fn conn_io(&self) -> &ConnectionIo {
+        &self.0.conn_io
+    }
+
+    pub(crate) fn digest(&self) -> &Digest {
+        &self.0.digest
+    }
+
+    pub(crate) fn add_session(&self, stream_id: u64, tx: mpsc::Sender<Event>) {
+        let mut add_sessions = self.0.add_sessions.lock();
+        add_sessions.push_back((stream_id, tx))
+    }
+
+    pub(crate) fn drop_session(&self, stream_id: u64) {
+        self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+        let mut drop_sessions = self.0.drop_sessions.lock();
+        drop_sessions.push_back(stream_id);
+    }
+
+    fn is_closed(&self) -> bool {
+        *self.0.idle_close.borrow()
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.conn_io().is_shutting_down()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.0.current_streams.load(Ordering::SeqCst) == 0
     }
 }
 
@@ -52,8 +89,11 @@ pub(crate) struct ConnectionRefInner {
     // avoid dropping stream, & used for UniqueIDType
     l4_stream: Stream,
 
-    digest: Digest,
+    // resources required for Http3, Quic & network IO
     conn_io: ConnectionIo,
+
+    // connection digest
+    digest: Digest,
 
     // max concurrent streams this connection is allowed to create
     max_streams: usize,
@@ -61,13 +101,15 @@ pub(crate) struct ConnectionRefInner {
     // how many concurrent streams already active
     current_streams: AtomicUsize,
 
-    // last initiated stream_id
-    max_initiated_stream_id: AtomicU64,
+    // lock is used during moving the connection across pools
+    release_lock: Arc<Mutex<()>>,
 
-    // to remove sessions from the H3Poll tasks
-    add_sessions: Arc<Mutex<VecDeque<(u64, Sender<Event>)>>>,
-    // to remove sessions from the H3Poll tasks
+    // add session to active sessions in Http3Poll task
+    add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
+    // remove session from active sessions in Http3Poll task
     drop_sessions: Arc<Mutex<VecDeque<u64>>>,
+    // watch for idle pool timeouts
+    idle_close: watch::Receiver<bool>,
 
     h3poll_task: JoinHandle<Result<()>>
 }
@@ -99,17 +141,21 @@ pub(crate) struct ConnectionIo {
 }
 
 
+impl ConnectionIo {
+    fn is_shutting_down(&self) -> bool {
+        let qconn = self.quic.lock();
+        qconn.is_draining()
+    }
+}
+
 /// Http3 connector
 pub struct Connector {
-    // just for creating connections, the Stream of h2 should be reused
+    // for creating connections, the Stream for h3 should be reused
     transport: TransportConnector,
-    // the h2 connection idle pool
-    //idle_pool: Arc<ConnectionPool<ConnectionRef>>,
-    // the pool of h2 connections that have ongoing streams
-    //in_use_pool: crate::connectors::http::v2::InUsePool,
-    in_use_pool: InUsePool<ConnectionRef>,
     // the h3 connection idle pool
     idle_pool: Arc<ConnectionPool<ConnectionRef>>,
+    // the pool of h3 connections that have ongoing streams
+    in_use_pool: InUsePool<ConnectionRef>,
     crypto: Option<Crypto>,
 }
 
@@ -157,6 +203,9 @@ impl Connector {
             .get(reuse_hash)
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
+            // lock the connection before adding a stream
+            // ensures that moving between pools and e.g. idle() checks is guarded
+            let _release_lock = conn.0.release_lock.lock_arc();
             let h3_stream = conn.spawn_stream().await?;
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
@@ -179,7 +228,46 @@ impl Connector {
         peer: &P,
         idle_timeout: Option<Duration>,
     ) {
-        todo!()
+        let id = session.conn().id();
+        let reuse_hash = peer.reuse_hash();
+        // get a ref to the connection, which we might need below, before dropping the h3
+        let conn = session.conn();
+
+        // The lock here is to make sure that in_use_pool.insert() below cannot be called after
+        // in_use_pool.release(), which would have put the conn entry in both pools.
+        // It also makes sure that only one conn will trigger the conn.is_idle() condition, which
+        // avoids putting the same conn into the idle_pool more than once.
+        let locked = conn.0.release_lock.lock_arc();
+        // TODO: should a stream_reset be called during drop?
+        // this drop() will both drop the actual stream and call the conn.release_stream()
+        drop(session);
+        // find and remove the conn stored in in_use_pool so that it could be put in the idle pool
+        // if necessary
+        let conn = self.in_use_pool.release(reuse_hash, id).unwrap_or(conn);
+        if conn.is_closed() || conn.is_shutting_down() {
+            // should never be put back to the pool
+            return;
+        }
+        if conn.is_idle() {
+            let meta = ConnectionMeta {
+                key: reuse_hash,
+                id,
+            };
+            let idle_closed = conn.0.idle_close.clone();
+            let (notify_evicted, watch_use) = self.idle_pool.put(&meta, conn);
+            drop(locked);
+            if let Some(to) = idle_timeout {
+                let pool = self.idle_pool.clone(); // clone the arc
+                let rt = pingora_runtime::current_handle();
+                rt.spawn(async move {
+                    pool.idle_timeout(&meta, to, notify_evicted, idle_closed, watch_use)
+                        .await;
+                });
+            }
+        } else {
+            self.in_use_pool.insert(reuse_hash, conn);
+            drop(locked);
+        }
     }
 
     /// Create a new Http3 connection to the given server
@@ -187,19 +275,7 @@ impl Connector {
         &self,
         peer: &P,
     ) -> Result<HttpSession> {
-        let mut stream = self.transport.new_stream(peer).await?;
-        error!("{:?}", stream.is_quic_connection());
-        if let Some(qconn) = stream.quic_connection_state() {
-            match qconn {
-                Connection::IncomingHandshake(_) => {}
-                Connection::IncomingEstablished(_) => {}
-                Connection::OutgoingHandshake(_) => {}
-                Connection::OutgoingEstablished(e) => {
-                    error!("established {:?}", qconn);
-                }
-            }
-        }
-        error!("{:?}", stream.selected_alpn_proto());
+        let stream = self.transport.new_stream(peer).await?;
         // TODO: verify & check how this can fit into TCP/UDP picture
         // check alpn
         match stream.selected_alpn_proto() {
@@ -238,11 +314,7 @@ impl ConnectionRef {
             return Ok(None);
         }
 
-        let h3_session = Http3Session::new(
-            self.0.conn_io.clone(),
-            self.0.add_sessions.clone(),
-            self.0.drop_sessions.clone())?;
-
+        let h3_session = Http3Session::new(self.clone())?;
         Ok(Some(h3_session))
     }
 
@@ -261,10 +333,9 @@ async fn handshake(
 ) -> Result<ConnectionRef> {
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
-        return Error::e_explain(H2Error, "zero max_stream configured");
+        return Error::e_explain(H3Error, "zero max_stream configured");
     }
 
-    let unique_id = stream.id();
     let digest = Digest {
         // NOTE: this field is always false because the digest is shared across all streams
         // The streams should log their own reuse info
@@ -305,21 +376,24 @@ async fn handshake(
 
     let add_sessions = Arc::new(Mutex::new(VecDeque::default()));
     let drop_sessions = Arc::new(Mutex::new(VecDeque::default()));
+    let (idle_close_tx, idle_close_rx) = watch::channel::<bool>(false);
 
     let h3poll = Http3Poll {
         conn_io: conn_io.clone(),
         sessions: Default::default(),
         add_sessions: add_sessions.clone(),
         drop_sessions: drop_sessions.clone(),
+        idle_close: idle_close_tx
     };
-    let h3poll_task = current_handle().spawn(h3poll.start());
+    let h3poll_task = pingora_runtime::current_handle().spawn(h3poll.start());
 
     Ok(ConnectionRef::new(
         stream,
-        digest,
         conn_io,
+        digest,
         add_sessions,
         drop_sessions,
+        idle_close_rx,
         max_streams,
         h3poll_task
     ))
@@ -327,7 +401,9 @@ async fn handshake(
 
 #[cfg(test)]
 mod quic_tests {
+    use bytes::Bytes;
     use http::Version;
+    use zstd::zstd_safe::WriteBuf;
     use crate::connectors::quic_tests::quic_listener_peer;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
@@ -345,8 +421,10 @@ mod quic_tests {
         req.insert_header(http::header::HOST, "openresty.org")?;
 
         session.write_request_header(Box::new(req)).await?;
+        session.write_request_body(Bytes::from(b"hello world".as_slice()), false).await?;
         session.finish_request_body().await?;
         session.read_response_header().await?;
+        let resp_body = session.read_response_body().await?;
 
         let resp = session.response_header();
 
@@ -354,6 +432,11 @@ mod quic_tests {
         if let Some(resp) = resp {
             assert_eq!(resp.status.as_str(), "200");
             assert_eq!(resp.version, Version::HTTP_3);
+        }
+
+        assert!(resp_body.is_some());
+        if let Some(resp_body) = resp_body {
+            assert_eq!(resp_body.as_slice(), b"hello world".as_slice())
         }
 
         Ok(())

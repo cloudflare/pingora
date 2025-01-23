@@ -15,7 +15,7 @@
 //! HTTP/3 implementation
 
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
-use log::{error, trace, warn};
+use log::{trace, warn};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use quiche::h3::{Event, Header, NameValue};
@@ -28,7 +28,6 @@ use quiche::Connection;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Notify;
 use pingora_error::ErrorType::{H3Error, InvalidHTTPHeader, ReadError};
-use crate::protocols::http::HttpVersion;
 
 pub const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
 pub const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
