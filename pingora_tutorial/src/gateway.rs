@@ -9,8 +9,8 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 
 fn check_login(req: &RequestHeader) -> bool {
-    // Implement your login check logic here
-    req.headers.get("Authorization")
+    req.headers
+        .get("Authorization")
         .map(|v| v.as_bytes() == b"password")
         .unwrap_or(false)
 }
@@ -27,54 +27,48 @@ impl ProxyHttp for MyGateway {
         ()
     }
 
+    // Decide whether to short-circuit this request (e.g. returning an error)
+    // before even forwarding to the upstream.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        if session.req_header().uri.path().starts_with("/login")
-            && !check_login(session.req_header())
-        {
+        // Check if the user is authorized for /login
+        if session.req_header().uri.path().starts_with("/login") && !check_login(session.req_header()) {
             let _ = session.respond_error(403).await;
-            // Return true to indicate early response
-            return Ok(true);
+            return Ok(true); // Stop further processing
         }
         Ok(false)
     }
 
+    // Choose the upstream server.
     async fn upstream_peer(
         &self,
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let addr = if session.req_header().uri.path().starts_with("/family") {
-            ("1.0.0.1", 443)
-        } else {
-            ("1.1.1.1", 443)
-        };
-
+        // Suppose your local server is listening on 127.0.0.1:3000, plain HTTP:
+        let addr = ("127.0.0.1", 3000);
         info!("Connecting to {:?}", addr);
 
-        let peer = Box::new(HttpPeer::new(
-            addr,
-            true,
-            "one.one.one.one".to_string(),
-        ));
+        // The second param is `false` if it's HTTP, `true` if it's HTTPS.
+        // The third param is used for SNI if HTTPS. If HTTP, it's typically a placeholder.
+        let peer = Box::new(HttpPeer::new(addr, false, "127.0.0.1".to_string()));
         Ok(peer)
     }
 
+    // After receiving a response from the upstream, optionally modify headers/status.
     async fn response_filter(
         &self,
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        // Replace existing header if any
         upstream_response
             .insert_header("Server", "MyGateway")
             .unwrap();
-        // Remove unsupported header
         upstream_response.remove_header("alt-svc");
-
         Ok(())
     }
 
+    // Called after we finish handling the request, for logging or additional metrics.
     async fn logging(
         &self,
         session: &mut Session,
@@ -84,12 +78,14 @@ impl ProxyHttp for MyGateway {
         let response_code = session
             .response_written()
             .map_or(0, |resp| resp.status.as_u16());
+
         info!(
             "Request to {} responded with status code {}",
             session.req_header().uri.path(),
             response_code
         );
 
+        // Prometheus counter
         self.req_metric.inc();
     }
 }
@@ -109,9 +105,11 @@ fn main() {
             req_metric,
         },
     );
+    // This is where the gateway listens for incoming traffic
     my_proxy.add_tcp("0.0.0.0:6191");
     my_server.add_service(my_proxy);
 
+    // Prometheus metrics service on port 6192
     let mut prometheus_service_http =
         pingora_core::services::listening::Service::prometheus_http_service();
     prometheus_service_http.add_tcp("127.0.0.1:6192");
