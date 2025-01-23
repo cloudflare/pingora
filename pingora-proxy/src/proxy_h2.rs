@@ -633,15 +633,26 @@ pub(crate) async fn pipe_up_to_down_response(
         };
         match client.check_response_end_or_error() {
             Ok(eos) => {
-                if data.is_empty() && !eos {
+                let empty = data.is_empty();
+                if empty && !eos {
                     /* it is normal to get 0 bytes because of multi-chunk
                      * don't write 0 bytes to downstream since it will be
                      * misread as the terminating chunk */
                     continue;
                 }
-                tx.send(HttpTask::Body(Some(data), eos))
+                let sent = tx
+                    .send(HttpTask::Body(Some(data), eos))
                     .await
-                    .or_err(InternalError, "sending h2 body to pipe")?;
+                    .or_err(InternalError, "sending h2 body to pipe");
+                // If the if the response with content-length is sent to an HTTP1 downstream,
+                // bidirection_down_to_up() could decide that the body has finished and exit without
+                // waiting for this function to signal the eos. In this case tx being closed is not
+                // an sign of error. It should happen if the only thing left for the h2 to send is
+                // an empty data frame with eos set.
+                if sent.is_err() && eos && empty {
+                    return Ok(());
+                }
+                sent?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
