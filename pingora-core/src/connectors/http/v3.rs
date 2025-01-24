@@ -55,7 +55,7 @@ impl ConnectionRef {
 
 impl ConnectionRef {
     pub(crate) fn conn_id(&self) -> &ConnectionId<'_> {
-        &self.0.conn_io.conn_id
+        &self.0.conn_io.id
     }
 
     pub(crate) fn conn_io(&self) -> &ConnectionIo {
@@ -131,10 +131,7 @@ impl Drop for ConnectionRefInner {
     fn drop(&mut self) {
         if !self.h3poll_task.is_finished() {
             self.h3poll_task.abort();
-            debug!(
-                "connection {:?} stopped Http3Poll task",
-                self.conn_io.conn_id
-            )
+            debug!("connection {:?} stopped Http3Poll task", self.conn_io.id)
         }
     }
 }
@@ -355,7 +352,7 @@ async fn handshake(mut stream: Stream, max_streams: usize) -> Result<ConnectionR
             e_state.tx_notify.notify_waiters();
 
             ConnectionIo {
-                conn_id: e_state.connection_id.clone(),
+                id: e_state.connection_id.clone(),
                 quic: e_state.connection.clone(),
                 http3: Arc::new(Mutex::new(hconn)),
                 rx_notify: e_state.rx_notify.clone(),

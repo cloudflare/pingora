@@ -35,14 +35,13 @@ use pingora_error::ErrorType::{ConnectError, H3Error, InternalError, ReadError, 
 use pingora_error::{Error, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 pub use quiche::h3::Config as H3Options;
-use quiche::h3::{Connection as QuicheH3Connection, Event, NameValue};
-use quiche::{h3, Connection as QuicheConnection, ConnectionId};
+use quiche::h3::{self, Connection as QuicheH3Connection, Event, NameValue};
+use quiche::ConnectionId;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,29 +58,29 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         ));
     };
 
-    let (conn_id, qconn, drop_qconn, hconn, tx_notify, rx_notify) = match conn {
-        Connection::IncomingEstablished(state) => {
+    let (conn_io, drop_connections) = match conn {
+        Connection::IncomingEstablished(e_state) => {
             let hconn = {
                 let http3_config = if let Some(h3_options) = options {
                     h3_options
                 } else {
-                    &state.http3_config
+                    &e_state.http3_config
                 };
 
-                let mut qconn = state.connection.lock();
+                let mut qconn = e_state.connection.lock();
                 QuicheH3Connection::with_transport(&mut qconn, http3_config)
                     .explain_err(ConnectError, |_| "failed to create H3 connection")?
             };
-            state.tx_notify.notify_waiters();
+            e_state.tx_notify.notify_waiters();
 
-            (
-                state.connection_id.clone(),
-                state.connection.clone(),
-                state.drop_connection.clone(),
-                hconn,
-                state.tx_notify.clone(),
-                state.rx_notify.clone(),
-            )
+            let conn_io = ConnectionIo {
+                id: e_state.connection_id.clone(),
+                quic: e_state.connection.clone(),
+                http3: Arc::new(Mutex::new(hconn)),
+                rx_notify: e_state.rx_notify.clone(),
+                tx_notify: e_state.tx_notify.clone(),
+            };
+            (conn_io, e_state.drop_connection.clone())
         }
         _ => {
             return Err(Error::explain(
@@ -93,14 +92,9 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
 
     Ok(H3Connection {
         _l4stream: io,
-        connection_id: conn_id,
-        drop_quic_connection: drop_qconn,
 
-        quic_connection: qconn,
-        h3_connection: Arc::new(Mutex::new(hconn)),
-
-        tx_notify,
-        rx_notify,
+        conn_io,
+        drop_connections,
 
         sessions: Default::default(),
         drop_sessions: Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -114,15 +108,10 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
 
 /// corresponds to a [`quiche::h3::Connection`] and links [`H3Session`]s to Quic IO
 pub struct H3Connection {
-    _l4stream: Stream, // ensure the stream will not be dropped until all sessions are
-    connection_id: ConnectionId<'static>,
-    drop_quic_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
+    _l4stream: Stream, // ensure the stream will not be dropped until connection is closed
 
-    quic_connection: Arc<Mutex<QuicheConnection>>,
-    h3_connection: Arc<Mutex<QuicheH3Connection>>,
-
-    tx_notify: Arc<Notify>,
-    rx_notify: Arc<Notify>,
+    conn_io: ConnectionIo,
+    drop_connections: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 
     sessions: StreamIdHashMap<Sender<Event>>,
     drop_sessions: Arc<Mutex<VecDeque<u64>>>,
@@ -133,29 +122,33 @@ pub struct H3Connection {
 
 impl Drop for H3Connection {
     fn drop(&mut self) {
-        let mut drop_quic_connection = self.drop_quic_connection.lock();
-        drop_quic_connection.push_back(self.connection_id.clone());
-        debug!("drop connection {:?}", self.connection_id);
+        let mut drop_connections = self.drop_connections.lock();
+        drop_connections.push_back(self.conn_id().clone());
+        debug!("drop connection {:?}", self.conn_id());
     }
 }
 
 impl H3Connection {
+    fn conn_id(&self) -> &ConnectionId<'static> {
+        &self.conn_io.id
+    }
+
     pub async fn graceful_shutdown(&mut self) -> Result<()> {
         // send GOAWAY frame
         {
-            let mut qconn = self.quic_connection.lock();
-            let mut hconn = self.h3_connection.lock();
+            let mut qconn = self.conn_io.quic.lock();
+            let mut hconn = self.conn_io.http3.lock();
 
-            debug!("H3 connection {:?} sending GoAway", self.connection_id);
+            debug!("H3 connection {:?} sending GoAway", self.conn_id());
             hconn
                 .send_goaway(&mut qconn, self.max_accepted_stream_id)
                 .explain_err(H3Error, |_| "failed to send graceful shutdown")?;
-            self.tx_notify.notify_waiters();
+            self.conn_io.tx_notify.notify_waiters();
         }
 
         let drain = async {
             while !self.sessions.is_empty() {
-                self.rx_notify.notified().await
+                self.conn_io.rx_notify.notified().await
             }
         };
 
@@ -168,11 +161,11 @@ impl H3Connection {
 
         // close quic connection
         {
-            let mut qconn = self.quic_connection.lock();
+            let mut qconn = self.conn_io.quic.lock();
             qconn
                 .close(false, 0x00, b"graceful shutdown")
                 .explain_err(H3Error, |_| "failed to close quic connection")?;
-            self.tx_notify.notify_waiters();
+            self.conn_io.tx_notify.notify_waiters();
         }
 
         if is_timeout {
@@ -194,13 +187,15 @@ impl H3Connection {
                 None => {
                     warn!(
                         "connection {:?} failed to remove stream {} from sessions",
-                        self.connection_id, stream_id
+                        self.conn_id(),
+                        stream_id
                     )
                 }
                 Some(_) => {
                     debug!(
                         "connection {:?} stream {} removed from sessions",
-                        self.connection_id, stream_id
+                        self.conn_id(),
+                        stream_id
                     );
                 }
             };
@@ -213,18 +208,11 @@ impl H3Connection {
 /// [`pingora_http::RequestHeader`]. The [`H3Session`] is built around [`pingora_http`] structs and
 /// converts to [`quiche::h3::Event`] where needed.
 pub struct H3Session {
-    pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) stream_id: u64,
-
     conn_io: ConnectionIo,
 
-    // TODO: consolidate in ConnecitonIo
-    quic_connection: Arc<Mutex<QuicheConnection>>,
-    h3_connection: Arc<Mutex<QuicheH3Connection>>,
     // notify during drop to remove event_tx from active sessions
     drop_session: Arc<Mutex<VecDeque<u64>>>,
-    // trigger Quic send, continue ConnectionTx write loop
-    tx_notify: Arc<Notify>,
 
     // HTTP3 event channel for this stream_id
     event_rx: Receiver<Event>,
@@ -259,7 +247,8 @@ impl Drop for H3Session {
         drop_sessions.push_back(self.stream_id);
         debug!(
             "H3 connection {:?} drop stream {}",
-            self.connection_id, self.stream_id
+            self.conn_id(),
+            self.stream_id
         );
     }
 }
@@ -284,8 +273,8 @@ impl H3Session {
     ) -> Result<Option<Self>> {
         'poll: loop {
             let poll = {
-                let mut qconn = conn.quic_connection.lock();
-                let mut hconn = conn.h3_connection.lock();
+                let mut qconn = conn.conn_io.quic.lock();
+                let mut hconn = conn.conn_io.http3.lock();
                 // NOTE: poll() drives the entire Quic/HTTP3 connection
                 hconn.poll(&mut qconn)
             };
@@ -302,7 +291,9 @@ impl H3Session {
                     if let Some(channel) = conn.sessions.get(&stream_id) {
                         debug!(
                             "H3 connection {:?} stream {} forward event={:?}",
-                            conn.connection_id, stream_id, ev
+                            conn.conn_id(),
+                            stream_id,
+                            ev
                         );
                         channel.send(ev).await.explain_err(WriteError, |e| {
                             format!("failed to send on event channel with {}", e)
@@ -310,7 +301,9 @@ impl H3Session {
                     } else {
                         debug!(
                             "H3 connection {:?} stream {} received event {:?}",
-                            conn.connection_id, stream_id, &ev
+                            conn.conn_id(),
+                            stream_id,
+                            &ev
                         );
                         match ev {
                             Event::Data
@@ -323,17 +316,17 @@ impl H3Session {
                                 info!("stream_id {} received GoAway", stream_id);
                                 conn.received_goaway = Some(stream_id);
 
-                                let mut qconn = conn.quic_connection.lock();
-                                let mut hconn = conn.h3_connection.lock();
+                                let mut qconn = conn.conn_io.quic.lock();
+                                let mut hconn = conn.conn_io.http3.lock();
                                 hconn
                                     .send_goaway(&mut qconn, conn.max_accepted_stream_id)
                                     .explain_err(InternalError, |_| "failed to send goaway")?;
-                                conn.tx_notify.notify_waiters();
+                                conn.conn_io.tx_notify.notify_waiters();
                             }
                             Event::Headers { list, more_frames } => {
                                 trace!(
                                     "H3 connection {:?} request headers={:?}, more_frames={:?}",
-                                    conn.connection_id,
+                                    conn.conn_id(),
                                     &list,
                                     &more_frames
                                 );
@@ -343,20 +336,9 @@ impl H3Session {
 
                                 let session = H3Session {
                                     stream_id,
-                                    conn_io: ConnectionIo {
-                                        conn_id: conn.connection_id.clone(),
-                                        quic: conn.quic_connection.clone(),
-                                        http3: conn.h3_connection.clone(),
-                                        rx_notify: conn.rx_notify.clone(),
-                                        tx_notify: conn.tx_notify.clone(),
-                                    },
+                                    conn_io: conn.conn_io.clone(),
 
-                                    // TODO: consolidate in ConnectionIo
-                                    connection_id: conn.connection_id.clone(),
-                                    quic_connection: conn.quic_connection.clone(),
-                                    h3_connection: conn.h3_connection.clone(),
                                     drop_session: conn.drop_sessions.clone(),
-                                    tx_notify: conn.tx_notify.clone(),
 
                                     event_rx,
 
@@ -379,7 +361,8 @@ impl H3Session {
                                         false,
                                         "H3 connection {:?} stream {} existing \
                                     session is not allowed",
-                                        conn.connection_id, stream_id
+                                        conn.conn_id(),
+                                        stream_id
                                     )
                                 };
 
@@ -390,7 +373,7 @@ impl H3Session {
                     }
                 }
                 Err(h3::Error::Done) => {
-                    debug!("H3 connection {:?} no events available", conn.connection_id);
+                    debug!("H3 connection {:?} no events available", conn.conn_id());
                     // TODO: in case PriorityUpdate was triggered call take_priority_update() here
 
                     conn.sessions_housekeeping().await;
@@ -398,21 +381,21 @@ impl H3Session {
                     let is_closed;
                     let timeout;
                     {
-                        let qconn = conn.quic_connection.lock();
+                        let qconn = conn.conn_io.quic.lock();
                         is_closed = qconn.is_closed()
                             || !(qconn.is_established() || qconn.is_in_early_data());
                         if is_closed {
                             if let Some(e) = qconn.peer_error() {
                                 debug!(
                                     "connection {:?} peer error reason: {}",
-                                    conn.connection_id,
+                                    conn.conn_id(),
                                     String::from_utf8_lossy(e.reason.as_slice()).to_string()
                                 );
                             }
                             if let Some(e) = qconn.local_error() {
                                 debug!(
                                     "connection {:?} local error reason: {}",
-                                    conn.connection_id,
+                                    conn.conn_id(),
                                     String::from_utf8_lossy(e.reason.as_slice()).to_string()
                                 );
                             }
@@ -424,39 +407,39 @@ impl H3Session {
                         if !conn.sessions.is_empty() {
                             warn!(
                                 "H3 connection {:?} closed with open {} sessions",
-                                conn.connection_id,
+                                conn.conn_id(),
                                 conn.sessions.len()
                             );
                         } else {
-                            debug!("H3 connection {:?} closed", conn.connection_id);
+                            debug!("H3 connection {:?} closed", conn.conn_id());
                         }
 
-                        conn.tx_notify.notify_waiters();
+                        conn.conn_io.tx_notify.notify_waiters();
                         return Ok(None);
                     }
 
                     // race for new data on connection or timeout
                     tokio::select! {
-                        _data = conn.rx_notify.notified() => {}
+                        _data = conn.conn_io.rx_notify.notified() => {}
                         _timedout = async {
                             if let Some(timeout) = timeout {
-                                debug!("connection {:?} timeout {:?}", conn.connection_id, timeout);
+                                debug!("connection {:?} timeout {:?}", conn.conn_id(), timeout);
                                 tokio::time::sleep(timeout).await
                             } else {
-                                debug!("connection {:?} timeout not present", conn.connection_id);
+                                debug!("connection {:?} timeout not present", conn.conn_id());
                                 tokio::time::sleep(Duration::MAX).await
                             }
                         } => {
                             conn.sessions_housekeeping().await;
                             if !conn.sessions.is_empty() {
                                 warn!("connection {:?} timed out with {} open sessions",
-                                    conn.connection_id, conn.sessions.len());
+                                    conn.conn_id(), conn.sessions.len());
                             }
-                            let mut qconn = conn.quic_connection.lock();
+                            let mut qconn = conn.conn_io.quic.lock();
                             // closes connection
                             qconn.on_timeout();
                             if let Some(timeout) = timeout {
-                                debug!("connection {:?} timed out {:?}", conn.connection_id, timeout);
+                                debug!("connection {:?} timed out {:?}", conn.conn_id(), timeout);
                             }
                         }
                     }
@@ -466,7 +449,7 @@ impl H3Session {
                     // the appropriate error code, using the transport’s close() method.
 
                     // send the close() event
-                    conn.tx_notify.notify_waiters();
+                    conn.conn_io.tx_notify.notify_waiters();
 
                     error!("H3 connection closed with error {:?}.", e);
                     return Err(e)
@@ -554,7 +537,7 @@ impl H3Session {
         let headers = response_headers_to_event(&header);
         self.send_response(headers.as_slice(), end).await?;
         if end {
-            self.tx_notify.notify_waiters();
+            self.conn_io.tx_notify.notify_waiters();
         }
 
         self.response_header_written = Some(header);
@@ -564,15 +547,18 @@ impl H3Session {
 
     async fn send_response<T: NameValue + Debug>(&self, headers: &[T], fin: bool) -> Result<()> {
         self.conn_io
-            .stream_capacity(self.stream_id, header_size(headers))
+            .capacity(self.stream_id, header_size(headers))
             .await?;
 
-        let mut qconn = self.quic_connection.lock();
-        let mut hconn = self.h3_connection.lock();
+        let mut qconn = self.conn_io.quic.lock();
+        let mut hconn = self.conn_io.http3.lock();
 
         debug!(
             "H3 connection {:?} stream {} sending response headers={:?}, finished={}",
-            self.connection_id, self.stream_id, headers, fin
+            self.conn_id(),
+            self.stream_id,
+            headers,
+            fin
         );
 
         match hconn.send_response(&mut qconn, self.stream_id, headers, fin) {
@@ -632,24 +618,20 @@ impl H3Session {
         fin: bool,
     ) -> Result<()> {
         self.conn_io
-            .stream_capacity(self.stream_id, header_size(headers))
+            .capacity(self.stream_id, header_size(headers))
             .await?;
 
-        let mut qconn = self.quic_connection.lock();
-        let mut hconn = self.h3_connection.lock();
+        let mut qconn = self.conn_io.quic.lock();
+        let mut hconn = self.conn_io.http3.lock();
 
         debug!(
             "H3 connection {:?} stream {} sending additional headers={:?}, is_trailer={:?} finished={}",
-            self.connection_id,
-            self.stream_id,
-            headers,
-            is_trailer,
-            fin
+            self.conn_id(), self.stream_id, headers, is_trailer, fin
         );
 
         match hconn.send_additional_headers(&mut qconn, stream_id, headers, is_trailer, fin) {
             Ok(()) => {
-                self.tx_notify.notify_waiters();
+                self.conn_io.tx_notify.notify_waiters();
                 Ok(())
             }
             Err(e) => Err(e).explain_err(WriteError, |_| {
@@ -779,7 +761,7 @@ impl H3Session {
     /// This will send a `STOP_SENDING` and a `RESET_STREAM` for the Quic stream to the client.
     pub fn shutdown(&mut self) {
         self.conn_io
-            .shutdown_stream(self.stream_id, &mut self.read_ended, &mut self.send_ended);
+            .shutdown(self.stream_id, &mut self.read_ended, &mut self.send_ended);
     }
 
     // This is a hack for pingora-proxy to create subrequests from h3 server session
@@ -874,5 +856,9 @@ impl H3Session {
     /// Return the client (peer) address recorded in the connection digest.
     pub fn client_addr(&self) -> Option<&SocketAddr> {
         self.digest.socket_digest.as_ref().map(|d| d.peer_addr())?
+    }
+
+    fn conn_id(&self) -> &ConnectionId<'_> {
+        &self.conn_io.id
     }
 }

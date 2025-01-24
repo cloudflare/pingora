@@ -323,7 +323,7 @@ impl Http3Session {
             }
         };
         let conn_io = self.conn_io().clone();
-        conn_io.shutdown_stream(stream_id, &mut self.read_ended, &mut self.send_ended);
+        conn_io.shutdown(stream_id, &mut self.read_ended, &mut self.send_ended);
     }
 
     /// Return the [`ConnectionRef`] of the Http3Session
@@ -423,7 +423,7 @@ pub(crate) struct Http3Poll {
 
 impl Http3Poll {
     pub(crate) async fn start(mut self) -> Result<()> {
-        let conn_id = self.conn_io.conn_id.clone();
+        let conn_id = self.conn_io.id.clone();
         'poll: loop {
             let res = {
                 let mut qconn = self.conn_io.quic.lock();
@@ -494,7 +494,7 @@ impl Http3Poll {
             } else {
                 debug!(
                     "connection {:?} added stream id {} to sessions",
-                    self.conn_io.conn_id, stream_id
+                    self.conn_io.id, stream_id
                 )
             }
         }
@@ -507,7 +507,7 @@ impl Http3Poll {
             if let Some(_sender) = self.sessions.remove(&stream_id) {
                 debug!(
                     "connection {:?} removed stream id {} from sessions",
-                    self.conn_io.conn_id, stream_id
+                    self.conn_io.id, stream_id
                 )
             } else {
                 return Err(Error::explain(

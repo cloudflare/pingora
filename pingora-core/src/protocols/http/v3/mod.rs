@@ -44,7 +44,7 @@ pub mod server;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionIo {
-    pub(crate) conn_id: ConnectionId<'static>,
+    pub(crate) id: ConnectionId<'static>,
 
     pub(crate) quic: Arc<Mutex<quiche::Connection>>,
     pub(crate) http3: Arc<Mutex<quiche::h3::Connection>>,
@@ -52,7 +52,7 @@ pub(crate) struct ConnectionIo {
     // receive notification on Quic recv, used to check stream capacity
     // as it only increases after MaxData or MaxStreamData frame was received
     pub(crate) rx_notify: Arc<Notify>,
-
+    // trigger Quic send, continue ConnectionTx write loop
     pub(crate) tx_notify: Arc<Notify>,
 }
 
@@ -62,7 +62,7 @@ impl ConnectionIo {
         qconn.is_draining()
     }
 
-    fn stream_capacity(
+    fn capacity(
         &self,
         stream_id: u64,
         required: usize,
@@ -87,7 +87,7 @@ impl ConnectionIo {
             } else {
                 self.tx_notify.notify_waiters();
                 self.rx_notify.notified().await;
-                self.stream_capacity(stream_id, required).await
+                self.capacity(stream_id, required).await
             }
         })
     }
@@ -97,7 +97,7 @@ impl ConnectionIo {
         let mut fin = end;
         while sent_len < data.len() {
             let required = cmp::min(data.len() - sent_len, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-            let capacity = self.stream_capacity(stream_id, required).await?;
+            let capacity = self.capacity(stream_id, required).await?;
 
             let send = if capacity > data.len() - sent_len {
                 &data[sent_len..data.len()]
@@ -185,14 +185,15 @@ impl ConnectionIo {
     fn read_body_conn(&self, stream_id: u64, out: &mut [u8]) -> quiche::h3::Result<usize> {
         let mut qconn = self.quic.lock();
         let mut hconn = self.http3.lock();
+
         debug!(
             "H3 connection {:?} stream {} receiving body",
-            self.conn_id, stream_id
+            self.id, stream_id
         );
         hconn.recv_body(&mut qconn, stream_id, out)
     }
 
-    fn shutdown_stream(&self, stream_id: u64, read_ended: &mut bool, write_ended: &mut bool) {
+    fn shutdown(&self, stream_id: u64, read_ended: &mut bool, write_ended: &mut bool) {
         let mut qconn = self.quic.lock();
         if !*read_ended {
             // sent STOP_SENDING frame & stream_recv() will no longer return data
