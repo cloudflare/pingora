@@ -230,6 +230,7 @@ impl HealthCheck for HttpHealthCheck {
         let mut session = session.0;
         let req = Box::new(self.req.clone());
         session.write_request_header(req).await?;
+        session.finish_request_body().await?;
 
         if let Some(read_timeout) = peer.options.read_timeout {
             session.set_read_timeout(read_timeout);
