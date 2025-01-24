@@ -81,7 +81,11 @@ impl ConnectionRef {
     }
 
     fn is_idle(&self) -> bool {
-        self.0.current_streams.load(Ordering::SeqCst) == 0
+        self.0.current_streams.load(Ordering::Relaxed) == 0
+    }
+
+    pub(crate) fn release_stream(&self) {
+        self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -398,19 +402,18 @@ async fn handshake(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use bytes::Bytes;
     use http::Version;
     use zstd::zstd_safe::WriteBuf;
-    use crate::connectors::quic_tests::quic_listener_peer;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
-    use super::*;
+    use crate::connectors::quic_tests::quic_listener_peer;
     use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
-    async fn test_connector_quic_http3() -> Result<()> {
+    async fn test_listener_connector_quic_http3() -> Result<()> {
         let (_server_handle, peer) = quic_listener_peer()?;
-
 
         let connector = Connector::new(None);
         let mut session = connector.new_http_session(&peer).await?;
@@ -451,5 +454,78 @@ mod tests {
             HttpSession::H1(_) | HttpSession::H2(_) => panic!("expect h3"),
             HttpSession::H3(_h3_session) => assert!(true),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_h3_single_stream() {
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        peer.options.set_http_version(3, 3);
+        peer.options.max_h3_streams = 1;
+        let h3 = connector.new_http_session(&peer).await.unwrap();
+        let h3_1 = match h3 {
+            HttpSession::H3(h3_stream) => h3_stream,
+            _ => panic!("expect h3"),
+        };
+
+        let id = h3_1.conn().id();
+
+        assert!(connector
+            .reused_http_session(&peer)
+            .await
+            .unwrap()
+            .is_none());
+
+        connector.release_http_session(h3_1, &peer, None);
+
+        let h3_2 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_2.conn().id());
+
+        connector.release_http_session(h3_2, &peer, None);
+
+        let h3_3 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_3.conn().id());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_h3_multiple_stream() {
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        peer.options.set_http_version(3, 3);
+        peer.options.max_h3_streams = 3;
+        let h3 = connector.new_http_session(&peer).await.unwrap();
+        let h3_1 = match h3 {
+            HttpSession::H3(h3_stream) => h3_stream,
+            _ => panic!("expect h3"),
+        };
+
+        let id = h3_1.conn().id();
+
+        let h3_2 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_2.conn().id());
+        let h3_3 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_3.conn().id());
+
+        // max stream is 3 for now
+        assert!(connector
+            .reused_http_session(&peer)
+            .await
+            .unwrap()
+            .is_none());
+
+        connector.release_http_session(h3_1, &peer, None);
+
+        let h3_4 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_4.conn().id());
+
+        connector.release_http_session(h3_2, &peer, None);
+        connector.release_http_session(h3_3, &peer, None);
+        connector.release_http_session(h3_4, &peer, None);
+
+        // all streams are released, now the connection is idle
+        let h3_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(id, h3_5.conn().id());
     }
 }

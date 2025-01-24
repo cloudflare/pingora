@@ -62,12 +62,13 @@ impl Http3Session {
 
 impl Drop for Http3Session {
     fn drop(&mut self) {
+        // TODO: clarify if a RESET_STREAM should be sent
         if let Some(stream_id) = self.stream_id {
             self.conn.drop_session(stream_id);
             debug!("connection {:?} dropping session with stream id {}",
             self.conn.conn_id(), stream_id)
         }
-        // TODO: clarify if a RESET_STREAM should be sent
+        self.conn.release_stream();
     }
 }
 
