@@ -101,9 +101,7 @@ where
         conn_id, local_addr, peer_addr
     );
 
-    let max_udp_payload_size = conn.max_send_udp_payload_size();
     let connection = Arc::new(Mutex::new(conn));
-
     let tx_notify = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
 
@@ -113,7 +111,7 @@ where
         connection_id: conn_id.clone(),
         connection: connection.clone(),
         tx_notify: tx_notify.clone(),
-        tx_stats: TxStats::new(max_udp_payload_size),
+        tx_stats: TxStats::new(),
     };
     let rx = ConnectionRx {
         socket_details: socket_details.clone(),
@@ -145,7 +143,7 @@ where
 
             handle_connection_errors(conn_id.clone(), conn.peer_error(), conn.local_error())?;
             if conn.is_established() {
-                // send HANDSHAKE_DONE Quic frame on established connection
+                // send response packets
                 tx_notify.notify_waiters();
                 break;
             }
@@ -153,7 +151,6 @@ where
         // send connection data on ConnectionTx task to continue handshake
         tx_notify.notify_waiters();
     }
-
 
     let e_state = OutgoingEstablishedState {
         connection_id: conn_id.clone(),

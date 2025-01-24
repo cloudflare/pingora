@@ -2,8 +2,8 @@ use log::{debug, error, trace};
 use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
+use quiche::ConnectionId;
 use quiche::{h3, Config};
-use quiche::{ConnectionId, Stats};
 use ring::hmac::Key;
 use ring::rand::SystemRandom;
 
@@ -126,12 +126,9 @@ impl ConnectionTx {
         'write: loop {
             let mut continue_write = false;
 
-            // update stats from connection
-            let max_send_burst = {
-                let conn = self.connection.lock();
-                self.tx_stats
-                    .max_send_burst(conn.stats(), conn.send_quantum())
-            };
+            // update tx stats & get current details
+            let (max_dgram_size, max_send_burst) = self.tx_stats.max_send_burst(&self.connection);
+
             let mut total_write = 0;
             let mut dst_info = None;
 
@@ -196,7 +193,7 @@ impl ConnectionTx {
                 &self.socket_details.io,
                 &out[..total_write],
                 &dst_info,
-                self.tx_stats.max_datagram_size,
+                max_dgram_size,
                 self.socket_details.pacing_enabled,
                 self.socket_details.gso_enabled,
             )
@@ -239,15 +236,27 @@ pub struct TxStats {
 }
 
 impl TxStats {
-    pub(crate) fn new(max_send_udp_payload_size: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             loss_rate: 0.0,
             max_send_burst: MAX_IPV6_BUF_SIZE,
-            max_datagram_size: max_send_udp_payload_size,
+            max_datagram_size: 0,
         }
     }
 
-    fn max_send_burst(&mut self, stats: Stats, send_quantum: usize) -> usize {
+    pub fn max_send_burst(&mut self, connection: &Mutex<quiche::Connection>) -> (usize, usize) {
+        let stats;
+        let send_quantum;
+        {
+            let conn = connection.lock();
+            let max_udp_send_payload_size = conn.max_send_udp_payload_size();
+            if self.max_datagram_size != max_udp_send_payload_size {
+                self.max_datagram_size = max_udp_send_payload_size
+            }
+            stats = conn.stats();
+            send_quantum = conn.send_quantum();
+        }
+
         // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
         let loss_rate = stats.lost as f64 / stats.sent as f64;
 
@@ -258,7 +267,10 @@ impl TxStats {
             self.loss_rate = loss_rate;
         }
 
-        send_quantum.min(self.max_send_burst) / self.max_datagram_size * self.max_datagram_size
+        let max_send_burst =
+            send_quantum.min(self.max_send_burst) / self.max_datagram_size * self.max_datagram_size;
+
+        (self.max_datagram_size, max_send_burst)
     }
 }
 
@@ -292,7 +304,7 @@ impl QuicHttp3Configs {
 
         quic.grease(false); // default true
 
-        quic.set_max_idle_timeout(600 * 1000); // default ulimited
+        quic.set_max_idle_timeout(60 * 1000); // default ulimited
         quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
         quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
         quic.set_initial_max_data(10_000_000); // 10 Mb
@@ -330,8 +342,8 @@ impl QuicHttp3Configs {
         // quic.verify_peer(); default server = false; client = true
         // quic.discover_pmtu(false); // default false
         quic.grease(false); // default true
-        // quic.log_keys() && config.set_keylog(); // logging SSL secrets
-        // quic.set_ticket_key() // session ticket signer key material
+                            // quic.log_keys() && config.set_keylog(); // logging SSL secrets
+                            // quic.set_ticket_key() // session ticket signer key material
 
         //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
 
@@ -343,7 +355,7 @@ impl QuicHttp3Configs {
         // quic.set_application_protos_wire_format();
         // quic.set_max_amplification_factor(3); // anti-amplification limit factor; default 3
 
-        quic.set_max_idle_timeout(600 * 1000); // default ulimited
+        quic.set_max_idle_timeout(60 * 1000); // default ulimited
         quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
         quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
         quic.set_initial_max_data(10_000_000); // 10 Mb

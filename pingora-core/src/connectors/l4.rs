@@ -12,15 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
-use log::debug;
-use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
-use rand::seq::SliceRandom;
-use std::net::SocketAddr as InetSocketAddr;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
@@ -32,6 +23,15 @@ use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
+use async_trait::async_trait;
+use log::debug;
+use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
+use rand::seq::SliceRandom;
+use std::net::SocketAddr as InetSocketAddr;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 /// The interface to establish a L4 connection
 #[async_trait]
@@ -102,19 +102,18 @@ where
     }
     let peer_addr = peer.address();
 
-    let mut stream: Stream = if let Some(custom_l4) =
-        peer.get_peer_options().and_then(|o| o.custom_l4.as_ref())
-    {
-        custom_l4.connect(peer_addr).await?
-    } else {
-        if peer.udp_http3() {
-            // create UDP sockets
-            inner_udp_connect(peer, &bind_to, peer_addr).await?
+    let mut stream: Stream =
+        if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
+            custom_l4.connect(peer_addr).await?
         } else {
-            // create TCP sockets
-            inner_tcp_connect(peer, bind_to, peer_addr).await?
-        }
-    };
+            if peer.udp_http3() {
+                // create UDP sockets
+                inner_udp_connect(peer, &bind_to, peer_addr).await?
+            } else {
+                // create TCP sockets
+                inner_tcp_connect(peer, bind_to, peer_addr).await?
+            }
+        };
 
     let tracer = peer.get_tracer();
     if let Some(t) = tracer {
@@ -141,9 +140,13 @@ where
     Ok(stream)
 }
 
-async fn inner_tcp_connect<P>(peer: &P, bind_to: Option<BindTo>, peer_addr: &SocketAddr) -> Result<Stream>
+async fn inner_tcp_connect<P>(
+    peer: &P,
+    bind_to: Option<BindTo>,
+    peer_addr: &SocketAddr,
+) -> Result<Stream>
 where
-    P: Peer + Send + Sync
+    P: Peer + Send + Sync,
 {
     match peer_addr {
         SocketAddr::Inet(addr) => {
@@ -219,9 +222,13 @@ where
     }
 }
 
-async fn inner_udp_connect<P>(peer: &P, bind_to: &Option<BindTo>, peer_addr: &SocketAddr) -> Result<Stream>
+async fn inner_udp_connect<P>(
+    peer: &P,
+    bind_to: &Option<BindTo>,
+    peer_addr: &SocketAddr,
+) -> Result<Stream>
 where
-    P: Peer + Send + Sync
+    P: Peer + Send + Sync,
 {
     match peer_addr {
         SocketAddr::Inet(addr) => {
@@ -272,7 +279,9 @@ where
             // needs verification if Quic/quiche can handle paths as SocketAddr
             // in send() & recv()
             Err(Error::explain(
-                BindError, "Unix Sockets for HTTP3 are not implemented"))
+                BindError,
+                "Unix Sockets for HTTP3 are not implemented",
+            ))
         }
     }
 }
@@ -662,10 +671,10 @@ mod tests {
 #[cfg(test)]
 mod quic_tests {
     use crate::connectors::l4::connect;
+    use crate::connectors::quic_tests::quic_listener_peer;
+    use crate::connectors::{do_connect, tls};
     use crate::protocols::l4::quic::Connection;
     use crate::protocols::ConnectionState;
-    use crate::connectors::{do_connect, tls};
-    use crate::connectors::quic_tests::quic_listener_peer;
     use pingora_error::Result;
 
     #[tokio::test]

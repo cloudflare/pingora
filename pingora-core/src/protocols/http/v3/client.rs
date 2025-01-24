@@ -1,26 +1,26 @@
-use std::cmp;
+use crate::connectors::http::v3::ConnectionRef;
+use crate::protocols::http::v3::nohash::StreamIdHashMap;
+use crate::protocols::http::v3::{
+    data_finished_event, event_to_response_headers, headervec_to_headermap,
+    request_headers_to_event, ConnectionIo, H3_SESSION_EVENTS_CHANNEL_SIZE,
+};
+use crate::protocols::l4::socket::SocketAddr;
+use crate::protocols::{Digest, UniqueID, UniqueIDType};
+use bytes::Bytes;
+use http::HeaderMap;
+use log::{debug, trace, warn};
+use parking_lot::Mutex;
+use pingora_error::ErrorType::{H3Error, InternalError, InvalidHTTPHeader, ReadError, WriteError};
+use pingora_error::{Error, ErrorType, OrErr, Result};
+use pingora_http::{RequestHeader, ResponseHeader};
+use quiche::h3;
+use quiche::h3::{Event, Header, NameValue};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::sync::Arc;
-use crate::connectors::http::v3::{ConnectionIo, ConnectionRef};
-use crate::protocols::l4::socket::SocketAddr;
-use crate::protocols::{Digest, UniqueID, UniqueIDType};
-use bytes::{BufMut, Bytes, BytesMut};
-use http::HeaderMap;
-use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
-use log::{debug, error, trace, warn};
-use parking_lot::Mutex;
-use quiche::{h3, Shutdown};
-use quiche::h3::{Event, Header, NameValue};
-use tokio::sync::{mpsc, watch};
 use tokio::sync::mpsc::{Receiver, Sender};
-use pingora_error::{Error, ErrorType, OrErr, Result};
-use pingora_error::ErrorType::{H3Error, InternalError, InvalidHTTPHeader, ReadError, WriteError};
-use crate::protocols::http::v3::{data_finished_event, event_to_response_headers, headervec_to_headermap, request_headers_to_event, stream_capacity, H3_SESSION_EVENTS_CHANNEL_SIZE};
-use crate::protocols::http::v3::nohash::StreamIdHashMap;
-use crate::protocols::l4::quic::MAX_IPV6_QUIC_DATAGRAM_SIZE;
-
+use tokio::sync::{mpsc, watch};
 
 pub struct Http3Session {
     conn: ConnectionRef,
@@ -44,12 +44,14 @@ pub struct Http3Session {
 
     // sent body bytes
     body_sent: usize,
-    // send is finished (Quic finished frame sent)
+    // sending body is finished (Quic stream FIN flag sent)
     send_ended: bool,
 
     // body bytes read
     body_read: usize,
-    // read is finished (Quic finished frame received)
+    // continue reading without waiting for new event
+    read_continue: bool,
+    // reading body is finished (Quic stream FIN flag received)
     read_ended: bool,
 }
 
@@ -59,14 +61,16 @@ impl Http3Session {
     }
 }
 
-
 impl Drop for Http3Session {
     fn drop(&mut self) {
         // TODO: clarify if a RESET_STREAM should be sent
         if let Some(stream_id) = self.stream_id {
             self.conn.drop_session(stream_id);
-            debug!("connection {:?} dropping session with stream id {}",
-            self.conn.conn_id(), stream_id)
+            debug!(
+                "connection {:?} dropping session with stream id {}",
+                self.conn.conn_id(),
+                stream_id
+            )
         }
         self.conn.release_stream();
     }
@@ -85,15 +89,13 @@ impl Http3Session {
             body_sent: 0,
             send_ended: false,
             body_read: 0,
+            read_continue: false,
             read_ended: false,
         })
     }
 
     /// Write the request header to the server
-    pub async fn write_request_header(
-        &mut self,
-        req: Box<RequestHeader>
-    ) -> Result<()> {
+    pub async fn write_request_header(&mut self, req: Box<RequestHeader>) -> Result<()> {
         if self.request_header_written.is_some() {
             // cannot send again
             warn!("request not sent as session already sent a request");
@@ -107,14 +109,19 @@ impl Http3Session {
         Ok(())
     }
 
-    async fn send_request<T: NameValue + Debug>(&mut self, headers: &[T], fin: bool) -> Result<u64> {
+    async fn send_request<T: NameValue + Debug>(
+        &mut self,
+        headers: &[T],
+        fin: bool,
+    ) -> Result<u64> {
         // sending the request creates the underlying quic stream & according stream id
         // it is not possible to check the stream capacity before sending the request
         let stream_id = {
             let mut qconn = self.conn_io().quic.lock();
             let mut hconn = self.conn_io().http3.lock();
 
-            hconn.send_request(&mut qconn, headers, fin)
+            hconn
+                .send_request(&mut qconn, headers, fin)
                 .explain_err(WriteError, |_| "failed to send http3 request headers")?
         };
 
@@ -125,8 +132,6 @@ impl Http3Session {
         self.conn.add_session(stream_id, tx);
         Ok(stream_id)
     }
-
-    // TODO: potentially refactor/unify with server side
 
     /// Write a request body chunk
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
@@ -140,58 +145,17 @@ impl Http3Session {
                 "trying to send the request body before request header being sent",
             ));
         };
-        let Some(stream_id) = self.stream_id else {
-            return Err(Error::explain(H3Error, "stream id not present"));
-        };
 
-        let mut sent_len = 0;
-        let mut fin = end;
-        while sent_len < data.len() {
-            let required = cmp::min(data.len() - sent_len, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-            let capacity = stream_capacity(&self.conn_io().quic, stream_id, required,
-                                           &self.conn_io().rx_notify, &self.conn_io().tx_notify).await?;
-
-            let send = if capacity > data.len() - sent_len {
-                &data[sent_len..data.len()]
-            } else {
-                &data[sent_len..sent_len + capacity]
-            };
-
-            fin = sent_len + send.len() == data.len() && end;
-            match self.send_body(send, fin) {
-                Ok(sent_size) => {
-                    debug_assert_eq!(sent_size, send.len());
-                    sent_len += sent_size;
-                }
-                Err(e) => {
-                    return Err(e).explain_err(WriteError, |_| {
-                        "writing h3 request body to downstream"
-                    })
-                }
-            }
-        }
-        debug_assert_eq!(fin, end);
-        debug_assert_eq!(sent_len, data.len());
-        if end {
-            self.conn_io().tx_notify.notify_waiters();
-        }
+        let sent_len = self
+            .conn_io()
+            .send_body(self.stream_id()?, &data, end)
+            .await?;
 
         self.body_sent += sent_len;
         self.send_ended = self.send_ended || end;
         Ok(())
     }
 
-
-    // TODO: potentially refactor/unify with server side
-    fn send_body(&self, body: &[u8], fin: bool) -> Result<usize> {
-        let mut qconn = self.conn_io().quic.lock();
-        let mut hconn = self.conn_io().http3.lock();
-
-        hconn.send_body(&mut qconn, self.stream_id()?, body, fin)
-            .explain_err(WriteError, |e| format!("failed to send http3 request body {:?}", e))
-    }
-
-    // TODO: potentially refactor/unify with server side
     /// Signal that the request body has ended
     pub fn finish_request_body(&mut self) -> Result<()> {
         if self.send_ended {
@@ -200,12 +164,7 @@ impl Http3Session {
         }
 
         if self.request_header_written.is_some() {
-            // use an empty data frame to signal the end
-            self.send_body(&[], true).explain_err(
-                WriteError,
-                |e| format! {"Writing h3 request body finished to downstream failed. {e}"},
-            )?;
-            self.conn_io().tx_notify.notify_waiters();
+            self.conn_io().finish_send(self.stream_id()?)?;
             self.send_ended = true;
         }
         // else: the response header is not sent, do nothing now.
@@ -217,7 +176,7 @@ impl Http3Session {
     pub async fn read_response_header(&mut self) -> Result<()> {
         if self.response_header.is_some() {
             // already received
-            return Ok(())
+            return Ok(());
         };
 
         let (headers, _) = headers_event(self.stream_id()?, self.event_rx()?).await?;
@@ -241,7 +200,6 @@ impl Http3Session {
         Ok(event_rx)
     }
 
-    // TODO: potentially refactor/unify with server side
     /// Read the response body
     ///
     /// `None` means, no more body to read
@@ -252,9 +210,19 @@ impl Http3Session {
 
         let read_timeout = self.read_timeout.clone();
         tokio::select! {
-            res = data_finished_event(self.stream_id()?, self.event_rx()?) => {
-                self.read_ended = true;
-                res?
+            res = async {
+                if !self.read_continue {
+                    data_finished_event(self.stream_id()?, self.event_rx()?).await
+                } else {
+                    Ok(false)
+                }
+            } => {
+                let finished = res?;
+                if finished {
+                    trace!("finished event received");
+                    self.read_ended = true;
+                    return Ok(None)
+                }
             },
             _timedout = async {
                 if let Some(read_timeout) = read_timeout {
@@ -267,43 +235,13 @@ impl Http3Session {
             }
         }
 
-        let mut buf = [0u8; MAX_IPV6_QUIC_DATAGRAM_SIZE];
-        let size = match self.recv_body(self.stream_id()?, &mut buf) {
-            Ok(size) => size,
-            Err(h3::Error::Done) => {
-                trace!("recv_body done");
-                return Ok(Some(BytesMut::with_capacity(0).into()));
-            }
-            Err(e) => {
-                return Err(Error::explain(
-                    ReadError,
-                    format!("reading body failed with {}", e),
-                ))
-            }
-        };
+        let (data, continue_read) = self.conn_io().read_body(self.stream_id()?)?;
+        self.body_read += data.len();
+        self.read_continue = continue_read;
 
-        let mut data = BytesMut::with_capacity(size);
-        data.put_slice(&buf[..size]);
-        let data: Bytes = data.into();
-
-        self.body_read += size;
-
-        trace!("ready body len={:?}", data.len());
+        trace!("read response body len={:?}", data.len());
         Ok(Some(data))
     }
-
-    // TODO: potentially refactor/unify with server side
-    // TODO: check if result type can be changed (requires Error::Done not being used)
-    fn recv_body(&self, stream_id: u64, out: &mut [u8]) -> h3::Result<usize> {
-        let mut qconn = self.conn_io().quic.lock();
-        let mut hconn = self.conn_io().http3.lock();
-        debug!(
-            "H3 connection {:?} stream {} receiving body",
-            qconn.trace_id(), stream_id
-        );
-        hconn.recv_body(&mut qconn, stream_id, out)
-    }
-
 
     /// Whether the response has ended
     pub fn response_finished(&self) -> bool {
@@ -327,7 +265,7 @@ impl Http3Session {
     pub async fn read_trailers(&mut self) -> Result<Option<HeaderMap>> {
         if !self.read_ended {
             warn!("trying to read trailers before body finished");
-            return Ok(None)
+            return Ok(None);
         };
 
         // RFC9110 Section 6.5.1
@@ -337,7 +275,8 @@ impl Http3Session {
         let mut client_accepts = false;
         if let Some(headers) = &self.request_header_written {
             if let Some(te_header) = headers.headers.get(http::header::TE) {
-                let te = te_header.to_str()
+                let te = te_header
+                    .to_str()
                     .explain_err(InvalidHTTPHeader, |_| "failed to parse TE header")?;
 
                 client_accepts = te.contains("trailers")
@@ -350,7 +289,7 @@ impl Http3Session {
         };
 
         if !(client_accepts && response_has_trailers) {
-            return Ok(None)
+            return Ok(None);
         }
 
         // as per RFC9114/Section 4.1 it is an optional SINGLE header frame
@@ -372,7 +311,6 @@ impl Http3Session {
         self.response_header.as_ref()
     }
 
-    // TODO: potentially refactor/unify with server side
     /// Give up the stream abruptly.
     ///
     /// This will send a `STOP_SENDING` and a `RESET_STREAM` for the Quic stream to the client.
@@ -380,30 +318,12 @@ impl Http3Session {
         let stream_id = match self.stream_id() {
             Ok(id) => id,
             Err(_) => {
-                error!("failed to shutdown session, no stream id present");
-                return
+                warn!("failed to shutdown session, no stream id present");
+                return;
             }
         };
-
-        if !self.read_ended {
-            self.stream_shutdown(stream_id, Shutdown::Read, 2u64);
-            // sent STOP_SENDING frame & stream_recv() will no longer return data
-            self.read_ended = true;
-        }
-        if !self.send_ended {
-            self.stream_shutdown(stream_id, Shutdown::Write, 2u64);
-            // sent RESET_STREAM & stream_send() data will be ignored
-            self.send_ended = true;
-        }
-    }
-
-    // TODO: potentially refactor/unify with server side
-    fn stream_shutdown(&self, stream_id: u64, direction: Shutdown, error_code: u64) {
-        let mut qconn = self.conn_io().quic.lock();
-        match qconn.stream_shutdown(stream_id, direction, error_code) {
-            Ok(()) => self.conn_io().tx_notify.notify_waiters(),
-            Err(e) => warn!("h3 stream {} shutdown failed. {:?}", stream_id, e),
-        }
+        let conn_io = self.conn_io().clone();
+        conn_io.shutdown_stream(stream_id, &mut self.read_ended, &mut self.send_ended);
     }
 
     /// Return the [`ConnectionRef`] of the Http3Session
@@ -423,7 +343,7 @@ impl Http3Session {
     ///
     /// Will return `None` if multiple H3 streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
-        todo!("needs an arc in order to get_mut successfully")
+        self.conn.digest_mut()
     }
 
     /// Return the server (peer) address recorded in the connection digest.
@@ -450,7 +370,10 @@ impl Http3Session {
     }
 }
 
-async fn headers_event(stream_id: u64, event_rx: &mut Receiver<Event>) -> Result<(Vec<Header>, bool)> {
+async fn headers_event(
+    stream_id: u64,
+    event_rx: &mut Receiver<Event>,
+) -> Result<(Vec<Header>, bool)> {
     loop {
         match event_rx.recv().await {
             Some(ev) => {
@@ -459,9 +382,7 @@ async fn headers_event(stream_id: u64, event_rx: &mut Receiver<Event>) -> Result
                     Event::Finished => {
                         debug_assert!(false, "Finished event when Headers requested");
                     }
-                    Event::Headers { list, more_frames } => {
-                        return Ok((list, more_frames))
-                    }
+                    Event::Headers { list, more_frames } => return Ok((list, more_frames)),
                     Event::Data => {
                         debug_assert!(false, "Data event when Headers requested");
                     }
@@ -509,7 +430,9 @@ impl Http3Poll {
                 if qconn.is_closed() {
                     self.idle_close.send_replace(true);
                     break 'poll Err(Error::explain(
-                        H3Error, format!("quic connection {:?} is closed stopping", conn_id)));
+                        H3Error,
+                        format!("quic connection {:?} is closed stopping", conn_id),
+                    ));
                 }
 
                 let mut hconn = self.conn_io.http3.lock();
@@ -524,13 +447,14 @@ impl Http3Poll {
 
                         // TODO: connection timeout racing
                         self.conn_io.rx_notify.notified().await;
-                        continue 'poll
+                        continue 'poll;
                     }
                     _ => {
-                        break 'poll Err(e).explain_err(
-                            H3Error,  |_| format!("failed to poll h3 connection {:?}" , e))
+                        break 'poll Err(e).explain_err(H3Error, |_| {
+                            format!("failed to poll h3 connection {:?}", e)
+                        })
                     }
-                }
+                },
             };
 
             let session = if let Some(session) = self.sessions.get_mut(&stream_id) {
@@ -540,12 +464,15 @@ impl Http3Poll {
                 let Some(session) = self.sessions.get_mut(&stream_id) else {
                     return Err(Error::explain(
                         InternalError,
-                        format!("missing session channel for stream id {}", stream_id)))
+                        format!("missing session channel for stream id {}", stream_id),
+                    ));
                 };
                 session
             };
 
-            session.send(ev).await
+            session
+                .send(ev)
+                .await
                 .explain_err(H3Error, |_| "failed to forward h3 event to session")?
         }
     }
@@ -555,28 +482,38 @@ impl Http3Poll {
         self.add_sessions()
     }
 
-    fn add_sessions(&mut self) -> Result<()>{
+    fn add_sessions(&mut self) -> Result<()> {
         let mut add_sessions = self.add_sessions.lock();
         while let Some((stream_id, sender)) = add_sessions.pop_front() {
             if let Some(_sender) = self.sessions.insert(stream_id, sender) {
                 debug_assert!(false, "stream id {} existed", stream_id);
                 return Err(Error::explain(
-                    InternalError, format!("stream id {} was already present in sessions", stream_id)))
+                    InternalError,
+                    format!("stream id {} was already present in sessions", stream_id),
+                ));
             } else {
-                debug!("connection {:?} added stream id {} to sessions", self.conn_io.conn_id, stream_id)
+                debug!(
+                    "connection {:?} added stream id {} to sessions",
+                    self.conn_io.conn_id, stream_id
+                )
             }
         }
         Ok(())
     }
 
-    fn drop_sessions(&mut self) -> Result<()>{
+    fn drop_sessions(&mut self) -> Result<()> {
         let mut drop_sessions = self.drop_sessions.lock();
         while let Some(stream_id) = drop_sessions.pop_front() {
             if let Some(_sender) = self.sessions.remove(&stream_id) {
-                debug!("connection {:?} removed stream id {} from sessions", self.conn_io.conn_id, stream_id)
+                debug!(
+                    "connection {:?} removed stream id {} from sessions",
+                    self.conn_io.conn_id, stream_id
+                )
             } else {
                 return Err(Error::explain(
-                    InternalError, format!("failed to remove session with stream id {}", stream_id)))
+                    InternalError,
+                    format!("failed to remove session with stream id {}", stream_id),
+                ));
             }
         }
         Ok(())

@@ -3,6 +3,7 @@ use super::HttpSession;
 use crate::connectors::http::InUsePool;
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v3::client::{Http3Poll, Http3Session};
+use crate::protocols::http::v3::ConnectionIo;
 use crate::protocols::l4::quic::{Connection, Crypto};
 use crate::protocols::{Digest, Stream, UniqueID, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
@@ -17,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, mpsc, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 // FIXME: ConnectorOptions contains CA file path from ServerConfig
 
@@ -25,12 +26,16 @@ use tokio::task::JoinHandle;
 pub(crate) struct ConnectionRef(Arc<ConnectionRefInner>);
 
 impl ConnectionRef {
-    pub fn new(l4_stream: Stream, conn_io: ConnectionIo, digest: Digest,
-               add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
-               drop_sessions: Arc<Mutex<VecDeque<u64>>>,
-               idle_close: watch::Receiver<bool>,
-               max_streams: usize, h3poll_task: JoinHandle<Result<()>>, ) -> Self {
-
+    pub fn new(
+        l4_stream: Stream,
+        conn_io: ConnectionIo,
+        digest: Digest,
+        add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
+        drop_sessions: Arc<Mutex<VecDeque<u64>>>,
+        idle_close: watch::Receiver<bool>,
+        max_streams: usize,
+        h3poll_task: JoinHandle<Result<()>>,
+    ) -> Self {
         Self(Arc::new(ConnectionRefInner {
             l4_stream,
             conn_io,
@@ -87,6 +92,10 @@ impl ConnectionRef {
     pub(crate) fn release_stream(&self) {
         self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
     }
+
+    pub fn digest_mut(&mut self) -> Option<&mut Digest> {
+        Arc::get_mut(&mut self.0).map(|inner| &mut inner.digest)
+    }
 }
 
 pub(crate) struct ConnectionRefInner {
@@ -115,14 +124,17 @@ pub(crate) struct ConnectionRefInner {
     // watch for idle pool timeouts
     idle_close: watch::Receiver<bool>,
 
-    h3poll_task: JoinHandle<Result<()>>
+    h3poll_task: JoinHandle<Result<()>>,
 }
 
 impl Drop for ConnectionRefInner {
     fn drop(&mut self) {
         if !self.h3poll_task.is_finished() {
             self.h3poll_task.abort();
-            debug!("connection {:?} stopped H3Poll task", self.conn_io.conn_id)
+            debug!(
+                "connection {:?} stopped Http3Poll task",
+                self.conn_io.conn_id
+            )
         }
     }
 }
@@ -130,25 +142,6 @@ impl Drop for ConnectionRefInner {
 impl UniqueID for ConnectionRef {
     fn id(&self) -> UniqueIDType {
         self.0.l4_stream.id()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ConnectionIo {
-    pub(crate) conn_id: ConnectionId<'static>,
-
-    pub(crate) quic: Arc<Mutex<quiche::Connection>>,
-    pub(crate) http3: Arc<Mutex<quiche::h3::Connection>>,
-
-    pub(crate) rx_notify: Arc<Notify>,
-    pub(crate) tx_notify: Arc<Notify>,
-}
-
-
-impl ConnectionIo {
-    fn is_shutting_down(&self) -> bool {
-        let qconn = self.quic.lock();
-        qconn.is_draining()
     }
 }
 
@@ -284,7 +277,7 @@ impl Connector {
         // check alpn
         match stream.selected_alpn_proto() {
             Some(ALPN::H3) => { /* continue */ }
-            _ => return Err(Error::explain(InternalError, "peer ALPN is not H3"))
+            _ => return Err(Error::explain(InternalError, "peer ALPN is not H3")),
         }
 
         let max_h3_stream = peer.get_peer_options().map_or(1, |o| o.max_h3_streams);
@@ -321,17 +314,14 @@ impl ConnectionRef {
 
     pub fn more_streams_allowed(&self) -> bool {
         let qconn = self.0.conn_io.quic.lock();
-        qconn.is_established() &&
-            !qconn.is_closed() &&
-            !qconn.is_draining() &&
-            qconn.peer_streams_left_bidi() > 0
+        qconn.is_established()
+            && !qconn.is_closed()
+            && !qconn.is_draining()
+            && qconn.peer_streams_left_bidi() > 0
     }
 }
 
-async fn handshake(
-    mut stream: Stream,
-    max_streams: usize
-) -> Result<ConnectionRef> {
+async fn handshake(mut stream: Stream, max_streams: usize) -> Result<ConnectionRef> {
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
         return Error::e_explain(H3Error, "zero max_stream configured");
@@ -347,13 +337,13 @@ async fn handshake(
         socket_digest: stream.get_socket_digest(),
     };
     let Some(quic_state) = stream.quic_connection_state() else {
-        return Err(Error::explain(InternalError, "stream is not a Quic stream"))
+        return Err(Error::explain(InternalError, "stream is not a Quic stream"));
     };
 
-    let conn_io =  match quic_state {
-        Connection::IncomingHandshake(_) |
-        Connection::IncomingEstablished(_) |
-        Connection::OutgoingHandshake(_) => {
+    let conn_io = match quic_state {
+        Connection::IncomingHandshake(_)
+        | Connection::IncomingEstablished(_)
+        | Connection::OutgoingHandshake(_) => {
             return Err(Error::explain(InternalError, "invalid Quic stream state"))
         }
         Connection::OutgoingEstablished(e_state) => {
@@ -362,6 +352,7 @@ async fn handshake(
                 quiche::h3::Connection::with_transport(&mut conn, &e_state.http3_config)
                     .explain_err(HandshakeError, |_| "during H3 handshake")
             }?;
+            e_state.tx_notify.notify_waiters();
 
             ConnectionIo {
                 conn_id: e_state.connection_id.clone(),
@@ -374,7 +365,6 @@ async fn handshake(
     };
     debug!("H3 handshake to server done.");
 
-
     let add_sessions = Arc::new(Mutex::new(VecDeque::default()));
     let drop_sessions = Arc::new(Mutex::new(VecDeque::default()));
     let (idle_close_tx, idle_close_rx) = watch::channel::<bool>(false);
@@ -384,7 +374,7 @@ async fn handshake(
         sessions: Default::default(),
         add_sessions: add_sessions.clone(),
         drop_sessions: drop_sessions.clone(),
-        idle_close: idle_close_tx
+        idle_close: idle_close_tx,
     };
     let h3poll_task = pingora_runtime::current_handle().spawn(h3poll.start());
 
@@ -396,20 +386,20 @@ async fn handshake(
         drop_sessions,
         idle_close_rx,
         max_streams,
-        h3poll_task
+        h3poll_task,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use crate::connectors::quic_tests::quic_listener_peer;
+    use crate::protocols::l4::quic::MAX_IPV6_QUIC_DATAGRAM_SIZE;
+    use crate::upstreams::peer::HttpPeer;
+    use bytes::{BufMut, BytesMut};
     use http::Version;
-    use zstd::zstd_safe::WriteBuf;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
-    use crate::connectors::quic_tests::quic_listener_peer;
-    use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
@@ -421,25 +411,31 @@ mod tests {
         let mut req = RequestHeader::build("GET", b"/", Some(3))?;
         req.insert_header(http::header::HOST, "openresty.org")?;
 
+        let body_base = "hello world\n";
+        let body_string = body_base.repeat(MAX_IPV6_QUIC_DATAGRAM_SIZE * 128 / body_base.len());
+        let mut body_send = BytesMut::new();
+        body_send.put(body_string.as_bytes());
+
         session.write_request_header(Box::new(req)).await?;
-        session.write_request_body(Bytes::from(b"hello world".as_slice()), false).await?;
+        session
+            .write_request_body(body_send.freeze(), false)
+            .await?;
         session.finish_request_body().await?;
         session.read_response_header().await?;
-        let resp_body = session.read_response_body().await?;
 
         let resp = session.response_header();
-
         assert!(resp.is_some());
         if let Some(resp) = resp {
             assert_eq!(resp.status.as_str(), "200");
             assert_eq!(resp.version, Version::HTTP_3);
         }
 
-        assert!(resp_body.is_some());
-        if let Some(resp_body) = resp_body {
-            assert_eq!(resp_body.as_slice(), b"hello world".as_slice())
+        let mut resp_body = BytesMut::new();
+        while let Some(body) = session.read_response_body().await? {
+            assert!(body.len() < MAX_IPV6_QUIC_DATAGRAM_SIZE * 64);
+            resp_body.put(body)
         }
-
+        assert_eq!(resp_body.as_ref(), body_string.as_bytes());
         Ok(())
     }
 

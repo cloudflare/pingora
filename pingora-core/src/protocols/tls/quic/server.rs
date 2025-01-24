@@ -277,7 +277,6 @@ async fn handshake_incoming(
         handle_connection_errors(conn_id.clone(), conn.peer_error(), conn.local_error())?;
     }
 
-    let max_send_udp_payload_size = conn.max_send_udp_payload_size();
     let connection_id = conn_id;
     let connection = Arc::new(Mutex::new(conn));
     let tx_notify = Arc::new(Notify::new());
@@ -306,7 +305,7 @@ async fn handshake_incoming(
         connection: connection.clone(),
 
         tx_notify: tx_notify.clone(),
-        tx_stats: TxStats::new(max_send_udp_payload_size),
+        tx_stats: TxStats::new(),
     };
 
     let e_state = IncomingEstablishedState {

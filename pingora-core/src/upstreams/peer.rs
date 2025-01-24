@@ -32,11 +32,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::connectors::{l4::BindTo, L4Connect};
+use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
-use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 

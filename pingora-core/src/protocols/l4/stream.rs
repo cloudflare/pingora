@@ -836,8 +836,8 @@ pub mod async_write_vec {
     }
 }
 
-pub use async_write_vec::AsyncWriteVec;
 use crate::listeners::ALPN;
+pub use async_write_vec::AsyncWriteVec;
 
 #[derive(Debug)]
 struct AccumulatedDuration {

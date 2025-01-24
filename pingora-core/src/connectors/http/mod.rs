@@ -14,15 +14,15 @@
 
 //! Connecting to HTTP servers
 
-use std::collections::HashMap;
 use crate::connectors::ConnectorOptions;
 use crate::protocols::http::client::HttpSession;
-use crate::upstreams::peer::Peer;
-use pingora_error::Result;
-use std::time::Duration;
-use parking_lot::RwLock;
-use pingora_pool::PoolNode;
 use crate::protocols::{UniqueID, UniqueIDType};
+use crate::upstreams::peer::Peer;
+use parking_lot::RwLock;
+use pingora_error::Result;
+use pingora_pool::PoolNode;
+use std::collections::HashMap;
+use std::time::Duration;
 
 pub mod v1;
 pub mod v2;
@@ -107,7 +107,6 @@ impl Connector {
         self.h2.prefer_h1(peer);
     }
 }
-
 
 // TODO: also use in v2, currently only used in v3
 pub(crate) struct InUsePool<T: UniqueID> {

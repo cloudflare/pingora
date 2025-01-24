@@ -4,7 +4,8 @@ use crate::protocols::l4::quic::{
     detect_gso_pacing, Connection, Crypto, SocketDetails, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
     HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
 };
-use log::{debug, error, trace, warn};
+use crate::protocols::l4::stream::Stream;
+use log::{debug, trace, warn};
 use parking_lot::Mutex;
 use pingora_error::{BError, ErrorType, OrErr};
 use quiche::{h3, Connection as QuicheConnection, ConnectionId, Header, RecvInfo, Type};
@@ -65,9 +66,9 @@ pub enum IncomingConnectionHandle {
 
 impl Debug for IncomingConnectionHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ConnectionHandle")?;
+        f.write_str("IncomingConnectionHandle")?;
         match self {
-            IncomingConnectionHandle::Handshake(_) => f.write_str("::Incoming"),
+            IncomingConnectionHandle::Handshake(_) => f.write_str("::Handshake"),
             IncomingConnectionHandle::Established(_) => f.write_str("::Established"),
         }
     }
@@ -120,9 +121,7 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub(crate) async fn accept(
-        &mut self,
-    ) -> io::Result<(crate::protocols::l4::stream::Stream, SocketAddr)> {
+    pub(crate) async fn accept(&mut self) -> io::Result<(Stream, SocketAddr)> {
         let mut rx_buf = [0u8; MAX_IPV6_BUF_SIZE];
 
         debug!("endpoint rx loop");
@@ -331,7 +330,7 @@ impl Listener {
                 Ok(len)
             }
             Err(e) => {
-                error!("connection {:?} receive error {:?}", conn_id, e);
+                trace!("connection {:?} receive error {:?}", conn_id, e);
                 Err(io::Error::new(
                     ErrorKind::BrokenPipe,
                     format!(

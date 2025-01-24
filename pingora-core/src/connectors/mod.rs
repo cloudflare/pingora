@@ -329,7 +329,9 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
         if peer.udp_http3() {
             if !peer.tls() {
                 return Err(Error::explain(
-                    HandshakeError, "usage of HTTP3 requires enabled TLS for the peer"))
+                    HandshakeError,
+                    "usage of HTTP3 requires enabled TLS for the peer",
+                ));
             }
             // TODO: use tls_ctx with boringssl & quiche
             // tls_ctx is already built, but quiche only provides a Config::from_boring()
@@ -561,10 +563,9 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod quic_tests {
-    use std::thread;
-    use std::thread::JoinHandle;
     use crate::apps::http_app::ServeHttp;
     use crate::listeners::Listeners;
+    use crate::prelude::HttpPeer;
     use crate::protocols::http::ServerSession;
     use crate::protocols::l4::quic::{QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
     use crate::server::Server;
@@ -572,11 +573,12 @@ pub(crate) mod quic_tests {
     use async_trait::async_trait;
     use bytes::{BufMut, BytesMut};
     use http::{Response, StatusCode};
-    use std::time::Duration;
     use log::info;
-    use pingora_timeout::timeout;
     use pingora_error::Result;
-    use crate::prelude::HttpPeer;
+    use pingora_timeout::timeout;
+    use std::thread;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
     pub(crate) fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
         let port = 6147u16;
@@ -622,8 +624,6 @@ pub(crate) mod quic_tests {
     #[async_trait]
     impl ServeHttp for EchoApp {
         async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
-            // read timeout of 2s
-            let read_timeout = 2000;
             let body_future = async {
                 let mut body = BytesMut::with_capacity(MAX_IPV6_BUF_SIZE);
                 while let Ok(b) = http_stream.read_request_body().await {
@@ -638,6 +638,8 @@ pub(crate) mod quic_tests {
                 body.freeze()
             };
 
+            // read timeout of 2s
+            let read_timeout = 2000;
             let body = match timeout(Duration::from_millis(read_timeout), body_future).await {
                 Ok(res) => res,
                 Err(_) => {
