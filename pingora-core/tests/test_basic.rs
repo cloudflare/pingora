@@ -30,7 +30,6 @@ use h3i::config::Config;
 use h3i::frame::H3iFrame;
 use h3i::quiche::h3::frame::Frame;
 use h3i::quiche::h3::Header;
-use pingora_core::prelude::HttpPeer;
 
 #[tokio::test]
 async fn test_http() {

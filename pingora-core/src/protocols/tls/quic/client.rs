@@ -3,8 +3,7 @@ use crate::protocols::l4::quic::connector::{
     ConnectionRx, OutgoingEstablishedState, OutgoingHandshakeState,
 };
 use crate::protocols::l4::quic::id_token::generate_outgoing_cid;
-use crate::protocols::l4::quic::{Connection, ConnectionTx, TxStats};
-use crate::protocols::tls::quic::handle_connection_errors;
+use crate::protocols::l4::quic::{handle_connection_errors, Connection, ConnectionTx, TxStats};
 use crate::protocols::IO;
 use crate::upstreams::peer::Peer;
 use log::{info, trace};
@@ -141,7 +140,7 @@ where
                 conn.local_error()
             );
 
-            handle_connection_errors(conn_id.clone(), conn.peer_error(), conn.local_error())?;
+            handle_connection_errors(&conn_id, conn.peer_error(), conn.local_error())?;
             if conn.is_established() {
                 // send response packets
                 tx_notify.notify_waiters();

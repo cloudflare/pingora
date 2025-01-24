@@ -10,6 +10,7 @@ use ring::rand::SystemRandom;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 
+use pingora_error::ErrorType::ConnectionClosed;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -653,4 +654,30 @@ impl AsyncRead for Connection {
     ) -> Poll<io::Result<()>> {
         todo!()
     }
+}
+
+pub(crate) fn handle_connection_errors(
+    conn_id: &ConnectionId<'_>,
+    local_error: Option<&quiche::ConnectionError>,
+    peer_error: Option<&quiche::ConnectionError>,
+) -> Result<()> {
+    if let Some(e) = local_error {
+        error!(
+            "connection {:?} local error {}",
+            conn_id,
+            String::from_utf8_lossy(e.reason.as_slice()).to_string()
+        );
+        return Err(e).explain_err(ConnectionClosed, |_| "local connection error");
+    }
+
+    if let Some(e) = peer_error {
+        error!(
+            "connection {:?} peer error {}",
+            conn_id,
+            String::from_utf8_lossy(e.reason.as_slice()).to_string()
+        );
+        return Err(e).explain_err(ConnectionClosed, |_| "peer connection error");
+    }
+
+    Ok(())
 }

@@ -4,17 +4,18 @@ use crate::protocols::http::v3::{
     data_finished_event, event_to_response_headers, headervec_to_headermap,
     request_headers_to_event, ConnectionIo, H3_SESSION_EVENTS_CHANNEL_SIZE,
 };
+use crate::protocols::l4::quic::handle_connection_errors;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::{Digest, UniqueID, UniqueIDType};
 use bytes::Bytes;
 use http::HeaderMap;
-use log::{debug, trace, warn};
+use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
 use pingora_error::ErrorType::{H3Error, InternalError, InvalidHTTPHeader, ReadError, WriteError};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use quiche::h3;
-use quiche::h3::{Event, Header, NameValue};
+use quiche::h3::{self, Event, Header, NameValue};
+use quiche::ConnectionId;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -439,28 +440,88 @@ impl Http3Poll {
                 hconn.poll(&mut qconn)
             };
 
+            // TODO: unify with server from_h3_conn
             let (stream_id, ev) = match res {
                 Ok((stream, ev)) => (stream, ev),
-                Err(e) => match e {
-                    h3::Error::Done => {
-                        self.sessions_housekeeping()?;
+                Err(h3::Error::Done) => {
+                    debug!("H3 connection {:?} no events available", self.conn_id());
 
-                        // TODO: connection timeout racing
-                        self.conn_io.rx_notify.notified().await;
-                        continue 'poll;
+                    self.sessions_housekeeping();
+
+                    let timeout;
+                    {
+                        let qconn = self.conn_io.quic.lock();
+                        let is_closed = qconn.is_closed()
+                            || !(qconn.is_established() || qconn.is_in_early_data());
+                        if is_closed {
+                            if !self.sessions.is_empty() {
+                                warn!(
+                                    "H3 connection {:?} closed with open {} sessions",
+                                    self.conn_id(),
+                                    self.sessions.len()
+                                );
+                            } else {
+                                debug!("H3 connection {:?} closed", self.conn_id());
+                            }
+
+                            // send close in case it is a local error
+                            self.conn_io.tx_notify.notify_waiters();
+
+                            return handle_connection_errors(
+                                self.conn_id(),
+                                qconn.local_error(),
+                                qconn.peer_error(),
+                            );
+                        }
+                        timeout = qconn.timeout();
                     }
-                    _ => {
-                        break 'poll Err(e).explain_err(H3Error, |_| {
-                            format!("failed to poll h3 connection {:?}", e)
-                        })
+
+                    tokio::select! {
+                        _data = self.conn_io.rx_notify.notified() => { /* continue */ }
+                        _timedout = async {
+                            if let Some(timeout) = timeout {
+                                debug!("connection {:?} timeout {:?}", self.conn_id(), timeout);
+                                tokio::time::sleep(timeout).await
+                            } else {
+                                debug!("connection {:?} timeout not present", self.conn_id());
+                                tokio::time::sleep(Duration::MAX).await
+                            }
+                        } => {
+                            self.sessions_housekeeping();
+                            if !self.sessions.is_empty() {
+                                warn!("connection {:?} timed out with {} open sessions",
+                                    self.conn_id(), self.sessions.len());
+                            }
+                            let mut qconn = self.conn_io.quic.lock();
+                            // closes connection
+                            qconn.on_timeout();
+                            if let Some(timeout) = timeout {
+                                debug!("connection {:?} timed out {:?}", self.conn_id(), timeout);
+                            }
+                        }
                     }
-                },
+                    continue 'poll;
+                }
+                Err(e) => {
+                    // If an error occurs while processing data, the connection is closed with
+                    // the appropriate error code, using the transport’s close() method.
+
+                    // send the close() event
+                    self.conn_io.tx_notify.notify_waiters();
+
+                    error!(
+                        "H3 connection {:?} closed with error {:?}.",
+                        self.conn_io.id, e
+                    );
+                    return Err(e)
+                        .explain_err(H3Error, |_| "failed to poll H3 connection for new events");
+                }
             };
 
             let session = if let Some(session) = self.sessions.get_mut(&stream_id) {
                 session
             } else {
-                self.add_sessions()?;
+                self.add_sessions();
                 let Some(session) = self.sessions.get_mut(&stream_id) else {
                     return Err(Error::explain(
                         InternalError,
@@ -477,45 +538,56 @@ impl Http3Poll {
         }
     }
 
-    fn sessions_housekeeping(&mut self) -> Result<()> {
-        self.drop_sessions()?;
+    fn sessions_housekeeping(&mut self) {
+        self.drop_sessions();
         self.add_sessions()
     }
 
-    fn add_sessions(&mut self) -> Result<()> {
+    fn add_sessions(&mut self) {
         let mut add_sessions = self.add_sessions.lock();
         while let Some((stream_id, sender)) = add_sessions.pop_front() {
-            if let Some(_sender) = self.sessions.insert(stream_id, sender) {
-                debug_assert!(false, "stream id {} existed", stream_id);
-                return Err(Error::explain(
-                    InternalError,
-                    format!("stream id {} was already present in sessions", stream_id),
-                ));
-            } else {
-                debug!(
-                    "connection {:?} added stream id {} to sessions",
-                    self.conn_io.id, stream_id
-                )
+            match self.sessions.insert(stream_id, sender) {
+                Some(_) => {
+                    warn!(
+                        "connection {:?} stream {} was already present in sessions",
+                        self.conn_id(),
+                        stream_id
+                    );
+                    debug_assert!(false)
+                }
+                None => {
+                    debug!(
+                        "connection {:?} added stream id {} to sessions",
+                        self.conn_io.id, stream_id
+                    )
+                }
             }
         }
-        Ok(())
     }
 
-    fn drop_sessions(&mut self) -> Result<()> {
+    fn drop_sessions(&mut self) {
         let mut drop_sessions = self.drop_sessions.lock();
         while let Some(stream_id) = drop_sessions.pop_front() {
-            if let Some(_sender) = self.sessions.remove(&stream_id) {
-                debug!(
-                    "connection {:?} removed stream id {} from sessions",
-                    self.conn_io.id, stream_id
-                )
-            } else {
-                return Err(Error::explain(
-                    InternalError,
-                    format!("failed to remove session with stream id {}", stream_id),
-                ));
+            match self.sessions.remove(&stream_id) {
+                None => {
+                    warn!(
+                        "connection {:?} failed to remove stream {} from sessions",
+                        self.conn_id(),
+                        stream_id
+                    );
+                    debug_assert!(false)
+                }
+                Some(_) => {
+                    debug!(
+                        "connection {:?} removed stream id {} from sessions",
+                        self.conn_io.id, stream_id
+                    )
+                }
             }
         }
-        Ok(())
+    }
+
+    fn conn_id(&self) -> &ConnectionId<'static> {
+        &self.conn_io.id
     }
 }

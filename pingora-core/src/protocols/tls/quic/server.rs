@@ -2,9 +2,10 @@ use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
 use crate::protocols::l4::quic::listener::{
     EstablishedHandle, HandshakeResponse, IncomingEstablishedState, IncomingHandshakeState,
 };
-use crate::protocols::l4::quic::{Connection, ConnectionTx, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE};
+use crate::protocols::l4::quic::{
+    handle_connection_errors, Connection, ConnectionTx, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE,
+};
 use crate::protocols::l4::stream::Stream as L4Stream;
-use crate::protocols::tls::quic::handle_connection_errors;
 use crate::protocols::ConnectionState;
 use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
@@ -274,21 +275,20 @@ async fn handshake_incoming(
             conn.local_error()
         );
 
-        handle_connection_errors(conn_id.clone(), conn.peer_error(), conn.local_error())?;
+        handle_connection_errors(&conn_id, conn.peer_error(), conn.local_error())?;
     }
 
-    let connection_id = conn_id;
     let connection = Arc::new(Mutex::new(conn));
     let tx_notify = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
 
     debug!(
         "connection {:?} handshake successful, udp_rx {}",
-        connection_id,
+        conn_id,
         udp_rx.len()
     );
     let handle = EstablishedHandle {
-        connection_id: connection_id.clone(),
+        connection_id: conn_id.clone(),
         connection: connection.clone(),
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
@@ -301,7 +301,7 @@ async fn handshake_incoming(
 
     let tx = ConnectionTx {
         socket_details: socket_details.clone(),
-        connection_id: connection_id.clone(),
+        connection_id: conn_id.clone(),
         connection: connection.clone(),
 
         tx_notify: tx_notify.clone(),
@@ -309,7 +309,7 @@ async fn handshake_incoming(
     };
 
     let e_state = IncomingEstablishedState {
-        connection_id: connection_id.clone(),
+        connection_id: conn_id.clone(),
         connection: connection.clone(),
 
         http3_config: configs.http3().clone(),

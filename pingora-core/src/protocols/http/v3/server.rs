@@ -24,7 +24,7 @@ use crate::protocols::http::v3::{
     H3_SESSION_EVENTS_CHANNEL_SIZE,
 };
 use crate::protocols::http::HttpTask;
-use crate::protocols::l4::quic::Connection;
+use crate::protocols::l4::quic::{handle_connection_errors, Connection};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::uri::PathAndQuery;
@@ -178,7 +178,7 @@ impl H3Connection {
         }
     }
 
-    async fn sessions_housekeeping(&mut self) {
+    fn sessions_housekeeping(&mut self) {
         let mut drop_sessions = self.drop_sessions.lock();
 
         // housekeeping finished sessions
@@ -376,51 +376,41 @@ impl H3Session {
                     debug!("H3 connection {:?} no events available", conn.conn_id());
                     // TODO: in case PriorityUpdate was triggered call take_priority_update() here
 
-                    conn.sessions_housekeeping().await;
+                    conn.sessions_housekeeping();
 
-                    let is_closed;
                     let timeout;
                     {
                         let qconn = conn.conn_io.quic.lock();
-                        is_closed = qconn.is_closed()
+                        let is_closed = qconn.is_closed()
                             || !(qconn.is_established() || qconn.is_in_early_data());
                         if is_closed {
-                            if let Some(e) = qconn.peer_error() {
-                                debug!(
-                                    "connection {:?} peer error reason: {}",
+                            if !conn.sessions.is_empty() {
+                                warn!(
+                                    "H3 connection {:?} closed with open {} sessions",
                                     conn.conn_id(),
-                                    String::from_utf8_lossy(e.reason.as_slice()).to_string()
+                                    conn.sessions.len()
                                 );
+                            } else {
+                                debug!("H3 connection {:?} closed", conn.conn_id());
                             }
-                            if let Some(e) = qconn.local_error() {
-                                debug!(
-                                    "connection {:?} local error reason: {}",
-                                    conn.conn_id(),
-                                    String::from_utf8_lossy(e.reason.as_slice()).to_string()
-                                );
-                            }
+                            // send close in case it is a local error
+                            conn.conn_io.tx_notify.notify_waiters();
+
+                            return match handle_connection_errors(
+                                conn.conn_id(),
+                                qconn.local_error(),
+                                qconn.peer_error(),
+                            ) {
+                                Ok(()) => Ok(None), // closes the connection
+                                Err(e) => Err(e),
+                            };
                         }
                         timeout = qconn.timeout();
                     }
 
-                    if is_closed {
-                        if !conn.sessions.is_empty() {
-                            warn!(
-                                "H3 connection {:?} closed with open {} sessions",
-                                conn.conn_id(),
-                                conn.sessions.len()
-                            );
-                        } else {
-                            debug!("H3 connection {:?} closed", conn.conn_id());
-                        }
-
-                        conn.conn_io.tx_notify.notify_waiters();
-                        return Ok(None);
-                    }
-
                     // race for new data on connection or timeout
                     tokio::select! {
-                        _data = conn.conn_io.rx_notify.notified() => {}
+                        _data = conn.conn_io.rx_notify.notified() => { /* continue */ }
                         _timedout = async {
                             if let Some(timeout) = timeout {
                                 debug!("connection {:?} timeout {:?}", conn.conn_id(), timeout);
@@ -430,7 +420,7 @@ impl H3Session {
                                 tokio::time::sleep(Duration::MAX).await
                             }
                         } => {
-                            conn.sessions_housekeeping().await;
+                            conn.sessions_housekeeping();
                             if !conn.sessions.is_empty() {
                                 warn!("connection {:?} timed out with {} open sessions",
                                     conn.conn_id(), conn.sessions.len());
@@ -443,6 +433,7 @@ impl H3Session {
                             }
                         }
                     }
+                    continue 'poll;
                 }
                 Err(e) => {
                     // If an error occurs while processing data, the connection is closed with
@@ -451,9 +442,13 @@ impl H3Session {
                     // send the close() event
                     conn.conn_io.tx_notify.notify_waiters();
 
-                    error!("H3 connection closed with error {:?}.", e);
+                    error!(
+                        "H3 connection {:?} closed with error {:?}.",
+                        conn.conn_id(),
+                        e
+                    );
                     return Err(e)
-                        .explain_err(H3Error, |_| "while accepting new downstream requests");
+                        .explain_err(H3Error, |_| "failed to poll H3 connection for new events");
                 }
             }
         }

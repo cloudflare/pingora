@@ -2,7 +2,7 @@ use crate::protocols::l4::quic::Connection;
 use crate::protocols::l4::quic::{
     detect_gso_pacing, Crypto, QuicHttp3Configs, SocketDetails, MAX_IPV6_BUF_SIZE,
 };
-use log::{debug, trace};
+use log::{debug, error, trace};
 use parking_lot::Mutex;
 use pingora_error::{ErrorType, OrErr, Result};
 use quiche::Connection as QuicheConnection;
@@ -82,18 +82,18 @@ impl ConnectionRx {
     pub async fn start(self) -> Result<()> {
         let socket = self.socket_details.io;
         let local_addr = self.socket_details.local_addr;
-        let id = self.connection_id;
+        let conn_id = self.connection_id;
 
         // TODO: support ip switching on local & peer address
         // would require socket re-binding
         let mut buf = [0u8; MAX_IPV6_BUF_SIZE];
-        debug!("connection {:?} rx read", id);
+        debug!("connection {:?} rx read", conn_id);
         'read: loop {
             let (size, recv_info) = match socket.try_recv_from(&mut buf) {
                 Ok((size, from)) => {
                     trace!(
                         "connection {:?} network received from={} length={}",
-                        id,
+                        conn_id,
                         from,
                         size
                     );
@@ -122,11 +122,18 @@ impl ConnectionRx {
                 let mut conn = self.connection.lock();
                 match conn.recv(&mut buf[..size], recv_info) {
                     Ok(_size) => {
-                        debug!("connection {:?} received {}", id, size);
+                        debug!("connection {:?} received {}", conn_id, size);
                         self.tx_notify.notify_waiters();
                         self.rx_notify.notify_waiters();
                     }
                     Err(e) => {
+                        // If an error occurs while processing data, the connection is closed with
+                        // the appropriate error code, using the transport’s close() method.
+
+                        // send the close() event
+                        self.tx_notify.notify_waiters();
+
+                        error!("H3 connection {:?} closed with error {:?}.", conn_id, e);
                         return Err(e).explain_err(ErrorType::ReadError, |_| {
                             "failed to receive data from socket on connection"
                         });
