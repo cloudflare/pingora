@@ -55,7 +55,7 @@ impl ConnectionRef {
 
 impl ConnectionRef {
     pub(crate) fn conn_id(&self) -> &ConnectionId<'_> {
-        &self.0.conn_io.id
+        &self.0.conn_io.conn_id()
     }
 
     pub(crate) fn conn_io(&self) -> &ConnectionIo {
@@ -131,7 +131,10 @@ impl Drop for ConnectionRefInner {
     fn drop(&mut self) {
         if !self.h3poll_task.is_finished() {
             self.h3poll_task.abort();
-            debug!("connection {:?} stopped Http3Poll task", self.conn_io.id)
+            debug!(
+                "connection {:?} stopped Http3Poll task",
+                self.conn_io.conn_id()
+            )
         }
     }
 }
@@ -310,11 +313,7 @@ impl ConnectionRef {
     }
 
     pub fn more_streams_allowed(&self) -> bool {
-        let qconn = self.0.conn_io.quic.lock();
-        qconn.is_established()
-            && !qconn.is_closed()
-            && !qconn.is_draining()
-            && qconn.peer_streams_left_bidi() > 0
+        self.conn_io().more_streams_available()
     }
 }
 
@@ -351,13 +350,7 @@ async fn handshake(mut stream: Stream, max_streams: usize) -> Result<ConnectionR
             }?;
             e_state.tx_notify.notify_waiters();
 
-            ConnectionIo {
-                id: e_state.connection_id.clone(),
-                quic: e_state.connection.clone(),
-                http3: Arc::new(Mutex::new(hconn)),
-                rx_notify: e_state.rx_notify.clone(),
-                tx_notify: e_state.tx_notify.clone(),
-            }
+            ConnectionIo::from((&*e_state, hconn))
         }
     };
     debug!("H3 handshake to server done.");

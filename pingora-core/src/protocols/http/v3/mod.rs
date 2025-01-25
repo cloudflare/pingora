@@ -14,23 +14,28 @@
 
 //! HTTP/3 implementation
 
-use crate::protocols::l4::quic::MAX_IPV6_QUIC_DATAGRAM_SIZE;
+use crate::protocols::http::v3::nohash::StreamIdHashMap;
+use crate::protocols::l4::quic::connector::OutgoingEstablishedState;
+use crate::protocols::l4::quic::listener::IncomingEstablishedState;
+use crate::protocols::l4::quic::{handle_connection_errors, MAX_IPV6_QUIC_DATAGRAM_SIZE};
 use bytes::{BufMut, Bytes, BytesMut};
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
-use log::{debug, trace, warn};
+use log::{debug, error, trace, warn};
 use parking_lot::Mutex;
 use pingora_error::ErrorType::{H3Error, InvalidHTTPHeader, ReadError, WriteError};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use quiche::h3::{Event, Header, NameValue};
-use quiche::{ConnectionId, Shutdown};
+use quiche::{h3, ConnectionId, Shutdown};
 use std::cmp;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc::Receiver;
+use std::time::Duration;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 
 pub const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
@@ -44,22 +49,58 @@ pub mod server;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionIo {
-    pub(crate) id: ConnectionId<'static>,
+    id: ConnectionId<'static>,
 
-    pub(crate) quic: Arc<Mutex<quiche::Connection>>,
-    pub(crate) http3: Arc<Mutex<quiche::h3::Connection>>,
+    quic: Arc<Mutex<quiche::Connection>>,
+    http3: Arc<Mutex<quiche::h3::Connection>>,
 
     // receive notification on Quic recv, used to check stream capacity
     // as it only increases after MaxData or MaxStreamData frame was received
-    pub(crate) rx_notify: Arc<Notify>,
+    rx_notify: Arc<Notify>,
     // trigger Quic send, continue ConnectionTx write loop
-    pub(crate) tx_notify: Arc<Notify>,
+    tx_notify: Arc<Notify>,
+}
+
+impl From<(&OutgoingEstablishedState, h3::Connection)> for ConnectionIo {
+    fn from((state, h3conn): (&OutgoingEstablishedState, h3::Connection)) -> Self {
+        Self {
+            id: state.connection_id.clone(),
+            quic: state.connection.clone(),
+            http3: Arc::new(Mutex::new(h3conn)),
+            rx_notify: state.rx_notify.clone(),
+            tx_notify: state.tx_notify.clone(),
+        }
+    }
+}
+
+impl From<(&IncomingEstablishedState, h3::Connection)> for ConnectionIo {
+    fn from((state, h3conn): (&IncomingEstablishedState, h3::Connection)) -> Self {
+        Self {
+            id: state.connection_id.clone(),
+            quic: state.connection.clone(),
+            http3: Arc::new(Mutex::new(h3conn)),
+            rx_notify: state.rx_notify.clone(),
+            tx_notify: state.tx_notify.clone(),
+        }
+    }
 }
 
 impl ConnectionIo {
+    pub(crate) fn conn_id(&self) -> &ConnectionId<'static> {
+        &self.id
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         let qconn = self.quic.lock();
         qconn.is_draining()
+    }
+
+    pub(crate) fn more_streams_available(&self) -> bool {
+        let qconn = self.quic.lock();
+        qconn.is_established()
+            && !qconn.is_closed()
+            && !qconn.is_draining()
+            && qconn.peer_streams_left_bidi() > 0
     }
 
     fn capacity(
@@ -213,6 +254,126 @@ impl ConnectionIo {
         }
 
         self.tx_notify.notify_waiters()
+    }
+
+    async fn error_or_timeout_data_race<D, A>(
+        &self,
+        error: h3::Error,
+        sessions: &mut StreamIdHashMap<Sender<Event>>,
+        mut drop_sessions: D,
+        mut add_sessions: A,
+    ) -> Result<bool>
+    where
+        D: FnMut(&mut StreamIdHashMap<Sender<Event>>),
+        A: FnMut(&mut StreamIdHashMap<Sender<Event>>),
+    {
+        match error {
+            h3::Error::Done => {
+                debug!("H3 connection {:?} no events available", self.conn_id());
+                // TODO: in case PriorityUpdate was triggered call take_priority_update() here
+
+                add_sessions(sessions);
+                drop_sessions(sessions);
+
+                let timeout;
+                {
+                    let qconn = self.quic.lock();
+                    let is_closed =
+                        qconn.is_closed() || !(qconn.is_established() || qconn.is_in_early_data());
+                    if is_closed {
+                        if !sessions.is_empty() {
+                            warn!(
+                                "H3 connection {:?} closed with open {} sessions",
+                                self.conn_id(),
+                                sessions.len()
+                            );
+                        } else {
+                            debug!("H3 connection {:?} closed", self.conn_id());
+                        }
+
+                        // send close in case it is a local error
+                        self.tx_notify.notify_waiters();
+
+                        return match handle_connection_errors(
+                            self.conn_id(),
+                            qconn.local_error(),
+                            qconn.peer_error(),
+                        ) {
+                            Ok(()) => Ok(false), // signal connection close
+                            Err(e) => Err(e),
+                        };
+                    }
+                    timeout = qconn.timeout();
+                }
+
+                // race for new data on connection or timeout
+                tokio::select! {
+                    _data = self.rx_notify.notified() => { /* continue */ }
+                    _timedout = async {
+                        if let Some(timeout) = timeout {
+                            debug!("connection {:?} timeout {:?}", self.conn_id(), timeout);
+                            tokio::time::sleep(timeout).await
+                        } else {
+                            debug!("connection {:?} timeout not present", self.conn_id());
+                            tokio::time::sleep(Duration::MAX).await
+                        }
+                    } => {
+                        drop_sessions(sessions);
+                        if !sessions.is_empty() {
+                            warn!("connection {:?} timed out with {} open sessions",
+                                self.conn_id(), sessions.len());
+                        }
+                        let mut qconn = self.quic.lock();
+                        // closes connection
+                        qconn.on_timeout();
+                        if let Some(timeout) = timeout {
+                            debug!("connection {:?} timed out {:?}", self.conn_id(), timeout);
+                        }
+                    }
+                }
+                Ok(true) // signal continue
+            }
+            _ => {
+                // If an error occurs while processing data, the connection is closed with
+                // the appropriate error code, using the transport’s close() method.
+
+                // send the close() event
+                self.tx_notify.notify_waiters();
+
+                error!(
+                    "H3 connection {:?} closed with error {:?}.",
+                    self.conn_id(),
+                    error
+                );
+                Err(error).explain_err(H3Error, |_| "failed to poll H3 connection for new events")
+            }
+        }
+    }
+}
+
+fn housekeeping_drop_sessions(
+    conn_id: &ConnectionId<'_>,
+    sessions: &mut StreamIdHashMap<Sender<Event>>,
+    drop_sessions: &Mutex<VecDeque<u64>>,
+) {
+    let mut drop_sessions = drop_sessions.lock();
+
+    // housekeeping finished sessions
+    while let Some(stream_id) = drop_sessions.pop_front() {
+        match sessions.remove(&stream_id) {
+            None => {
+                warn!(
+                    "connection {:?} failed to remove stream {} from sessions",
+                    conn_id, stream_id
+                )
+            }
+            Some(_) => {
+                debug!(
+                    "connection {:?} stream {} removed from sessions",
+                    conn_id, stream_id
+                );
+            }
+        };
     }
 }
 
