@@ -14,20 +14,19 @@
 
 //! Connecting to HTTP 2 servers
 
-use super::HttpSession;
+use super::{HttpSession, InUsePool};
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
-use crate::protocols::{Digest, Stream, UniqueIDType};
+use crate::protocols::{Digest, Stream, UniqueID, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
 use log::debug;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
-use std::collections::HashMap;
+use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -164,51 +163,9 @@ impl ConnectionRef {
     }
 }
 
-// FIXME: potentially lift to mod.rs
-pub(crate) struct InUsePool {
-    // TODO: use pingora hashmap to shard the lock contention
-    pools: RwLock<HashMap<u64, PoolNode<ConnectionRef>>>,
-}
-
-impl InUsePool {
-    pub(crate) fn new() -> Self {
-        InUsePool {
-            pools: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub(crate) fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
-        {
-            let pools = self.pools.read();
-            if let Some(pool) = pools.get(&reuse_hash) {
-                pool.insert(conn.id(), conn);
-                return;
-            }
-        } // drop read lock
-
-        let pool = PoolNode::new();
-        pool.insert(conn.id(), conn);
-        let mut pools = self.pools.write();
-        pools.insert(reuse_hash, pool);
-    }
-
-    // retrieve a h2 conn ref to create a new stream
-    // the caller should return the conn ref to this pool if there are still
-    // capacity left for more streams
-    pub(crate) fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
-    }
-
-    // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
-    // the caller should update the ref and then decide where to put it (in use pool or idle)
-    pub(crate) fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        if let Some(pool) = pools.get(&reuse_hash) {
-            pool.remove(id)
-        } else {
-            None
-        }
+impl UniqueID for ConnectionRef {
+    fn id(&self) -> UniqueIDType {
+        self.0.id
     }
 }
 
@@ -221,7 +178,7 @@ pub struct Connector {
     // the h2 connection idle pool
     idle_pool: Arc<ConnectionPool<ConnectionRef>>,
     // the pool of h2 connections that have ongoing streams
-    in_use_pool: InUsePool,
+    in_use_pool: InUsePool<ConnectionRef>,
 }
 
 impl Connector {

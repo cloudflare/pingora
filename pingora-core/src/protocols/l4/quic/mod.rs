@@ -46,6 +46,7 @@ use crate::listeners::ALPN;
 use crate::protocols::l4::quic::sendto::{detect_gso, send_to, set_txtime_sockopt};
 use crate::protocols::tls::{SslDigest, TlsRef};
 use crate::protocols::{ConnectionState, Ssl};
+use pingora_boringssl::ssl::SslContextBuilder;
 
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
@@ -58,7 +59,7 @@ pub const MAX_IPV6_BUF_SIZE: usize = 65487;
 pub const MAX_IPV6_UDP_PACKET_SIZE: usize = 1452;
 
 //pub const MAX_IPV4_QUIC_DATAGRAM_SIZE: usize = 1370;
-// TODO: validate size (possibly 1200 is the standard)
+// TODO: validate size (is 1200 the standard?)
 pub const MAX_IPV6_QUIC_DATAGRAM_SIZE: usize = 1350;
 
 /// initial size for the connection drop deque
@@ -317,31 +318,9 @@ impl QuicHttp3Configs {
                 })?;
         };
 
-        quic.set_application_protos(h3::APPLICATION_PROTOCOL)
-            .explain_err(ErrorType::InternalError, |_| {
-                "Failed to set application protocols."
-            })?;
-
-        quic.grease(false); // default true
-
-        quic.set_max_idle_timeout(60 * 1000); // default ulimited
-        quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
-        quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
-        quic.set_initial_max_data(10_000_000); // 10 Mb
-        quic.set_initial_max_stream_data_bidi_local(1_000_000); // 1 Mb
-        quic.set_initial_max_stream_data_bidi_remote(1_000_000); // 1 Mb
-        quic.set_initial_max_stream_data_uni(1_000_000); // 1 Mb
-        quic.set_initial_max_streams_bidi(100);
-        quic.set_initial_max_streams_uni(100);
-
-        quic.set_disable_active_migration(true); // default is false
-
-        // quic.set_active_connection_id_limit(2); // default 2
-        // quic.set_max_connection_window(conn_args.max_window); // default 24 Mb
-        // quic.set_max_stream_window(conn_args.max_stream_window); // default 16 Mb
-
-        Ok(quic)
+        QuicHttp3Configs::set_quic_defaults(quic)
     }
+
     pub fn new_quic_listener(cert_chain_pem_file: &str, priv_key_pem_file: &str) -> Result<Config> {
         let mut quic = Config::new(quiche::PROTOCOL_VERSION)
             .explain_err(ErrorType::InternalError, |_| {
@@ -358,25 +337,21 @@ impl QuicHttp3Configs {
                 "Could not load private key from pem file."
             })?;
 
-        // quic.load_verify_locations_from_file() for CA's
-        // quic.verify_peer(); default server = false; client = true
-        // quic.discover_pmtu(false); // default false
-        quic.grease(false); // default true
-                            // quic.log_keys() && config.set_keylog(); // logging SSL secrets
-                            // quic.set_ticket_key() // session ticket signer key material
+        QuicHttp3Configs::set_quic_defaults(quic)
+    }
 
-        //config.enable_early_data(); // can lead to ZeroRTT headers during handshake
-
+    fn set_quic_defaults(mut quic: Config) -> Result<Config> {
         quic.set_application_protos(h3::APPLICATION_PROTOCOL)
             .explain_err(ErrorType::InternalError, |_| {
                 "Failed to set application protocols."
             })?;
+        quic.grease(false); // default true
 
-        // quic.set_application_protos_wire_format();
-        // quic.set_max_amplification_factor(3); // anti-amplification limit factor; default 3
+        // TODO: usable for mTLS?
+        // quic.verify_peer(); default server = false; client = true
 
         quic.set_max_idle_timeout(60 * 1000); // default ulimited
-        quic.set_max_recv_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // recv default is 65527
+        quic.set_max_recv_udp_payload_size(MAX_IPV6_BUF_SIZE); // recv default is 65527
         quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
         quic.set_initial_max_data(10_000_000); // 10 Mb
         quic.set_initial_max_stream_data_bidi_local(1_000_000); // 1 Mb
@@ -384,29 +359,6 @@ impl QuicHttp3Configs {
         quic.set_initial_max_stream_data_uni(1_000_000); // 1 Mb
         quic.set_initial_max_streams_bidi(100);
         quic.set_initial_max_streams_uni(100);
-
-        // quic.set_ack_delay_exponent(3); // default 3
-        // quic.set_max_ack_delay(25); // default 25
-        // quic.set_active_connection_id_limit(2); // default 2
-        // quic.set_disable_active_migration(false); // default false
-
-        // quic.set_active_connection_id_limit(2); // default 2
-        // quic.set_disable_active_migration(false); // default false
-        // quic.set_cc_algorithm_name("cubic"); // default cubic
-        // quic.set_initial_congestion_window_packets(10); // default 10
-        // quic.set_cc_algorithm(CongestionControlAlgorithm::CUBIC); // default CongestionControlAlgorithm::CUBIC
-
-        // quic.enable_hystart(true); // default true
-        // quic.enable_pacing(true); // default true
-        // quic.set_max_pacing_rate(); // default ulimited
-
-        //config.enable_dgram(false); // default false
-
-        // quic.set_path_challenge_recv_max_queue_len(3); // default 3
-        // quic.set_max_connection_window(MAX_CONNECTION_WINDOW); // default 24 Mb
-        // quic.set_max_stream_window(MAX_STREAM_WINDOW); // default 16 Mb
-        // quic.set_stateless_reset_token(None) // default None
-        // quic.set_disable_dcid_reuse(false) // default false
 
         Ok(quic)
     }
@@ -446,6 +398,21 @@ impl QuicHttp3Configs {
             "failed to create new h3::Config"
         })?;
 
+        Ok(Self {
+            quic: Arc::new(Mutex::new(quic)),
+            http3: Arc::new(http3),
+        })
+    }
+
+    pub(crate) fn with_boring_ssl_ctx_builder(ctx_builder: SslContextBuilder) -> Result<Self> {
+        let quic = Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, ctx_builder)
+            .explain_err(ErrorType::InternalError, |_| {
+                "Failed to create quiche config."
+            })?;
+
+        let quic = QuicHttp3Configs::set_quic_defaults(quic)?;
+
+        let http3 = QuicHttp3Configs::new_http3()?;
         Ok(Self {
             quic: Arc::new(Mutex::new(quic)),
             http3: Arc::new(http3),
@@ -615,7 +582,7 @@ impl Ssl for Connection {
             Connection::IncomingEstablished(s) => {
                 let mut conn = s.connection.lock();
                 let conn = &mut *conn;
-                Some(Arc::from(SslDigest::from_ssl(conn.as_mut())))
+                Some(Arc::from(SslDigest::from_quic_ssl(conn.as_mut())))
             }
             _ => None,
         }
@@ -648,7 +615,9 @@ impl AsRawFd for Connection {
     }
 }
 
-#[allow(unused_variables)] // TODO: remove
+// TODO: remove, ideally requirement for AsyncRead & AsyncWrite on Stream
+// possibly switch to AsyncIO & IO and/or AsyncStream & Stream
+#[allow(unused_variables)]
 impl AsyncWrite for Connection {
     fn poll_write(
         self: Pin<&mut Self>,

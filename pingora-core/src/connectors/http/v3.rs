@@ -36,7 +36,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-// FIXME: ConnectorOptions contains CA file path from ServerConfig
 
 /// a ref to an established HTTP 3 connection
 #[derive(Clone)]
@@ -192,7 +191,7 @@ impl Connector {
             // lock the connection before adding a stream
             // ensures that moving between pools and e.g. idle() checks is guarded
             let _release_lock = conn.0.release_lock.lock_arc();
-            let h3_stream = conn.spawn_stream().await?;
+            let h3_stream = conn.spawn_stream();
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
             }
@@ -274,7 +273,6 @@ impl Connector {
 
         let h3_stream = conn
             .spawn_stream()
-            .await?
             .expect("newly created connections should have at least one free stream");
 
         if conn.more_streams_allowed() {
@@ -287,18 +285,18 @@ impl Connector {
 
 impl ConnectionRef {
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
-    pub async fn spawn_stream(&self) -> Result<Option<Http3Session>> {
+    fn spawn_stream(&self) -> Option<Http3Session> {
         // Atomically check if the current_stream is over the limit
         // load(), compare and then fetch_add() cannot guarantee the same
         let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
         if current_streams >= self.0.max_streams {
             // already over the limit, reset the counter to the previous value
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
-            return Ok(None);
+            return None;
         }
 
-        let h3_session = Http3Session::new(self.clone())?;
-        Ok(Some(h3_session))
+        let h3_session = Http3Session::new(self.clone());
+        Some(h3_session)
     }
 
     pub fn more_streams_allowed(&self) -> bool {

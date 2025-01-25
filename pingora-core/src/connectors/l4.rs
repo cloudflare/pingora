@@ -267,12 +267,7 @@ where
                 }
             }?;
 
-            let mut quic_http3_configs = None;
-            if let Some(peer_options) = peer.get_peer_options() {
-                quic_http3_configs.clone_from(&peer_options.quic_http3_configs)
-            };
-
-            Ok(Connection::initiate(socket, quic_http3_configs)?.into())
+            Ok(Connection::initiate(socket)?.into())
         }
         SocketAddr::Unix(_addr) => {
             // NOTE: tokio::net::UnixDatagram support could be an option
@@ -686,7 +681,8 @@ mod quic_tests {
         assert!(pre_handshake_stream.quic_connection_state().is_some());
 
         let tls_connector = tls::Connector::new(None);
-        let mut stream = do_connect(&peer, None, None, &tls_connector.ctx).await?;
+        let quic_connector = tls::quic::Connector::new(None);
+        let mut stream = do_connect(&peer, None, None, &tls_connector, &quic_connector).await?;
         assert!(stream.quic_connection_state().is_some());
 
         let connection = stream.quic_connection_state().unwrap();

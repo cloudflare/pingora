@@ -57,7 +57,15 @@ impl Connector {
         let h1_only = peer
             .get_peer_options()
             .map_or(true, |o| o.alpn.get_max_http_version() == 1);
-        if h1_only {
+
+        if peer.udp_http3() {
+            if let Some(h3) = self.h3.reused_http_session(peer).await? {
+                Ok((HttpSession::H3(h3), true))
+            } else {
+                let session = self.h3.new_http_session(peer).await?;
+                Ok((session, false))
+            }
+        } else if h1_only {
             let (h1, reused) = self.h1.get_http_session(peer).await?;
             Ok((HttpSession::H1(h1), reused))
         } else {
@@ -81,12 +89,6 @@ impl Connector {
             let session = self.h2.new_http_session(peer).await?;
             Ok((session, false))
         }
-        /*
-        // FIXME: correctly route HTTP3
-        let Some(h3) = self.h3.reused_http_session(peer).await?; {
-            Ok((HttpSession::H3(h3), true))
-        }
-         */
     }
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
@@ -108,7 +110,6 @@ impl Connector {
     }
 }
 
-// TODO: also use in v2, currently only used in v3
 pub(crate) struct InUsePool<T: UniqueID> {
     // TODO: use pingora hashmap to shard the lock contention
     pools: RwLock<HashMap<u64, PoolNode<T>>>,
@@ -135,15 +136,15 @@ impl<T: UniqueID> InUsePool<T> {
         pools.insert(reuse_hash, pool);
     }
 
-    // retrieve a h2 conn ref to create a new stream
-    // the caller should return the conn ref to this pool if there are still
+    // retrieve a `<T>` to create a new stream
+    // the caller should return the <T> to this pool if there is still
     // capacity left for more streams
     pub(crate) fn get(&self, reuse_hash: u64) -> Option<T> {
         let pools = self.pools.read();
         pools.get(&reuse_hash)?.get_any().map(|v| v.1)
     }
 
-    // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
+    // release a http stream, this functional will cause an `<T>` to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
     pub(crate) fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<T> {
         let pools = self.pools.read();

@@ -17,12 +17,13 @@
 use crate::listeners::ALPN;
 use crate::protocols::l4::quic::connector::{ConnectionRx, EstablishedState, HandshakeState};
 use crate::protocols::l4::quic::id_token::generate_outgoing_cid;
-use crate::protocols::l4::quic::{handle_connection_errors, Connection, ConnectionTx, TxStats};
+use crate::protocols::l4::quic::{
+    handle_connection_errors, Connection, ConnectionTx, QuicHttp3Configs, TxStats,
+};
 use crate::protocols::IO;
 use crate::upstreams::peer::Peer;
 use log::{info, trace};
 use parking_lot::Mutex;
-use pingora_boringssl::ssl::SslConnector;
 use pingora_error::ErrorType::HandshakeError;
 use pingora_error::{Error, ErrorType, OrErr};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub(crate) async fn handshake<T, P>(
     mut stream: T,
     peer: &P,
     alpn_override: Option<ALPN>,
-    tls_ctx: &SslConnector,
+    tls_ctx: &QuicHttp3Configs,
 ) -> pingora_error::Result<T>
 where
     T: IO,
@@ -74,7 +75,7 @@ pub(crate) async fn handshake_inner<P>(
     state: &mut HandshakeState,
     peer: &P,
     _alpn_override: Option<ALPN>, // potentially HTTP09 could be supported
-    _tls_ctx: &SslConnector, // currently the SslConnector cannot be used with quiche, might be feasible
+    quic_tls_ctx: &QuicHttp3Configs,
 ) -> pingora_error::Result<EstablishedState>
 where
     P: Peer + Send + Sync,
@@ -82,8 +83,19 @@ where
     let HandshakeState {
         crypto,
         socket_details,
-        configs,
     } = state;
+
+    let mut peer_quic_http3_config = None;
+    if let Some(peer_options) = peer.get_peer_options() {
+        peer_quic_http3_config.clone_from(&peer_options.quic_http3_configs)
+    };
+
+    // use peer config in case present or fallback to tls_ctx from TransportConnector
+    let configs = if let Some(peer_quic_http3_config) = peer_quic_http3_config {
+        peer_quic_http3_config
+    } else {
+        quic_tls_ctx.clone()
+    };
 
     let conn_id = generate_outgoing_cid(&crypto.rng);
 

@@ -15,9 +15,7 @@
 //! Quic Connector
 
 use crate::protocols::l4::quic::Connection;
-use crate::protocols::l4::quic::{
-    detect_gso_pacing, Crypto, QuicHttp3Configs, SocketDetails, MAX_IPV6_BUF_SIZE,
-};
+use crate::protocols::l4::quic::{detect_gso_pacing, Crypto, SocketDetails, MAX_IPV6_BUF_SIZE};
 use log::{debug, error, trace};
 use parking_lot::Mutex;
 use pingora_error::{ErrorType, OrErr, Result};
@@ -33,7 +31,6 @@ pub struct HandshakeState {
     //pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) socket_details: SocketDetails,
     pub(crate) crypto: Crypto,
-    pub(crate) configs: QuicHttp3Configs,
 }
 
 /// can be used to wait for network data or trigger network sending
@@ -57,7 +54,7 @@ pub struct EstablishedState {
 }
 
 impl Connection {
-    pub fn initiate(io: UdpSocket, configs: Option<QuicHttp3Configs>) -> Result<Self> {
+    pub fn initiate(io: UdpSocket) -> Result<Self> {
         let local_addr = io.local_addr().explain_err(ErrorType::SocketError, |e| {
             format!("failed to get local address from socket: {}", e)
         })?;
@@ -65,11 +62,9 @@ impl Connection {
             format!("failed to get peer address from socket: {}", e)
         })?;
 
-        let configs = configs.unwrap_or(QuicHttp3Configs::from_ca_file_path(None)?);
-
         let (gso_enabled, pacing_enabled) = detect_gso_pacing(&io);
         Ok(Self::OutgoingHandshake(HandshakeState {
-            crypto: Crypto::new()?,
+            crypto: Crypto::new()?, // TODO:: custom crypto or cid generation/validation
             socket_details: SocketDetails {
                 io: Arc::new(io),
                 local_addr,
@@ -77,7 +72,6 @@ impl Connection {
                 gso_enabled,
                 pacing_enabled,
             },
-            configs,
         }))
     }
 }
@@ -103,8 +97,7 @@ impl ConnectionRx {
         let local_addr = self.socket_details.local_addr;
         let conn_id = self.connection_id;
 
-        // TODO: support ip switching on local & peer address
-        // would require socket re-binding
+        // support ip switching on local & peer address would require socket re-binding
         let mut buf = [0u8; MAX_IPV6_BUF_SIZE];
         debug!("connection {:?} rx read", conn_id);
         'read: loop {

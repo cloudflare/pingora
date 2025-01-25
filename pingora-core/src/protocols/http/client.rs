@@ -151,8 +151,7 @@ impl HttpSession {
     /// Give up the http session abruptly.
     /// For H1 this will close the underlying connection
     /// For H2 this will send RST_STREAM frame to end this stream if the stream has not ended at all
-    /// TODO: fix h3 documentation
-    /// For H3 this will
+    /// For H3 this will send a `STOP_SENDING` and a `RESET_STREAM` for the Quic stream to the client.
     pub async fn shutdown(&mut self) {
         match self {
             Self::H1(s) => s.shutdown().await,
@@ -186,8 +185,7 @@ impl HttpSession {
 
     /// Return a mutable [Digest] reference for the connection.
     ///
-    /// Will return `None` if this is an H2 session and multiple streams are open.
-    /// TODO: fix h3 documentation
+    /// Will return `None` if this is an H2 or H3 session and multiple streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
         match self {
             Self::H1(s) => Some(s.digest_mut()),

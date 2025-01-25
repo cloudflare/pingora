@@ -32,8 +32,6 @@ use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVe
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
 
-pub type TlsConnector = SslConnector;
-
 const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
     :AES-256-GCM-SHA384\
     :CHACHA20-POLY1305-SHA256\

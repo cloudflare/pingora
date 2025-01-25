@@ -39,7 +39,6 @@ use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tls::TlsConnector;
 use tokio::sync::Mutex;
 
 /// The options to configure a [TransportConnector]
@@ -131,6 +130,7 @@ impl ConnectorOptions {
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
+    quic_tls_ctx: tls::quic::Connector,
     connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
@@ -156,7 +156,8 @@ impl TransportConnector {
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
         TransportConnector {
-            tls_ctx: tls::Connector::new(options),
+            tls_ctx: tls::Connector::new(options.clone()),
+            quic_tls_ctx: tls::quic::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
             offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
             bind_to_v4,
@@ -178,11 +179,21 @@ impl TransportConnector {
         let stream = if let Some(rt) = rt {
             let peer = peer.clone();
             let tls_ctx = self.tls_ctx.clone();
-            rt.spawn(async move { do_connect(&peer, bind_to, alpn_override, &tls_ctx.ctx).await })
-                .await
-                .or_err(InternalError, "offload runtime failure")??
+            let quic_tls_ctx = self.quic_tls_ctx.clone();
+            rt.spawn(async move {
+                do_connect(&peer, bind_to, alpn_override, &tls_ctx, &quic_tls_ctx).await
+            })
+            .await
+            .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
+            do_connect(
+                peer,
+                bind_to,
+                alpn_override,
+                &self.tls_ctx,
+                &self.quic_tls_ctx,
+            )
+            .await?
         };
 
         Ok(stream)
@@ -299,11 +310,12 @@ async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &TlsConnector,
+    tls_ctx: &tls::Connector,
+    quic_tls_ctx: &tls::quic::Connector,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
-    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
+    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx, quic_tls_ctx);
 
     match peer.total_connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {
@@ -322,7 +334,8 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &TlsConnector,
+    tls_ctx: &tls::Connector,
+    quic_tls_ctx: &tls::quic::Connector,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
@@ -333,14 +346,12 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
                     "usage of HTTP3 requires enabled TLS for the peer",
                 ));
             }
-            // TODO: use tls_ctx with boringssl & quiche
-            // tls_ctx is already built, but quiche only provides a Config::from_boring()
-            // accepting a SslContextBuilder, but internally calling only .build() on it,
-            // likely a SslContext it should be possible to adapt quiche to accept a SslConnector
-            let quic_stream = quic_handshake(stream, peer, alpn_override, tls_ctx).await?;
+
+            let quic_stream =
+                quic_handshake(stream, peer, alpn_override, &quic_tls_ctx.quic_http3).await?;
             Ok(Box::new(quic_stream))
         } else {
-            let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
+            let tls_stream = tls::connect(stream, peer, alpn_override, &tls_ctx.ctx).await?;
             Ok(Box::new(tls_stream))
         }
     } else {
@@ -373,7 +384,6 @@ impl PreferredHttpVersion {
         let v = self.versions.read();
         v.get(&key)
             .copied()
-            // FIXME: H3 support
             .map(|v| if v == 1 { ALPN::H1 } else { ALPN::H2H1 })
     }
 }
@@ -411,6 +421,7 @@ mod tests {
     use tls::Connector;
 
     use super::*;
+    use crate::connectors::tls::quic;
     use crate::upstreams::peer::BasicPeer;
     use tokio::io::AsyncWriteExt;
     #[cfg(unix)]
@@ -521,7 +532,8 @@ mod tests {
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
-        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
+        let quic_connector = quic::Connector::new(None);
+        let stream = do_connect(peer, None, None, &tls_connector, &quic_connector).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (

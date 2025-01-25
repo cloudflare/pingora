@@ -52,10 +52,9 @@ pub struct Http3Session {
     // HTTP3 event channel for this stream_id
     event_rx: Option<Receiver<Event>>,
 
-    /// The read timeout, which will be applied to both reading the header and the body.
-    /// The timeout is reset on every read. This is not a timeout on the overall duration of the
-    /// response.
-    // FIXME: race with timeout if present
+    /// The read timeout, which will be applied when reading the header, body and trailers.
+    /// The timeout is reset on every read attempt. This is not a timeout on the overall duration
+    /// of the response.
     pub read_timeout: Option<Duration>,
 
     // sent request
@@ -98,8 +97,8 @@ impl Drop for Http3Session {
 }
 
 impl Http3Session {
-    pub(crate) fn new(conn: ConnectionRef) -> Result<Self> {
-        Ok(Self {
+    pub(crate) fn new(conn: ConnectionRef) -> Self {
+        Self {
             conn,
             stream_id: None,
             event_rx: None,
@@ -112,7 +111,7 @@ impl Http3Session {
             body_read: 0,
             read_continue: false,
             read_ended: false,
-        })
+        }
     }
 
     /// Write the request header to the server
@@ -200,10 +199,18 @@ impl Http3Session {
             return Ok(());
         };
 
-        let (headers, _) = headers_event(self.stream_id()?, self.event_rx()?).await?;
-        let map = event_to_response_headers(&headers)?;
+        let read_timeout = self.read_timeout;
+        tokio::select! {
+            res = headers_event(self.stream_id()?, self.event_rx()?) => {
+                let (headers, _) = res?;
+                let map = event_to_response_headers(&headers)?;
+                self.response_header = Some(map);
+            },
+            _timedout = timeout(read_timeout) => {
+                return Err(Error::explain(ErrorType::ReadTimedout, "reading response headers timed out"))
+            }
+        }
 
-        self.response_header = Some(map);
         Ok(())
     }
 
@@ -245,14 +252,8 @@ impl Http3Session {
                     return Ok(None)
                 }
             },
-            _timedout = async {
-                if let Some(read_timeout) = read_timeout {
-                    tokio::time::sleep(read_timeout).await;
-                } else {
-                    tokio::time::sleep(Duration::MAX).await;
-                }
-            } => {
-                return Err(Error::explain(ErrorType::ReadTimedout, "reading body timed out"))
+            _timedout = timeout(read_timeout) => {
+                return Err(Error::explain(ErrorType::ReadTimedout, "reading response body timed out"))
             }
         }
 
@@ -291,8 +292,8 @@ impl Http3Session {
 
         // RFC9110 Section 6.5.1
         // The presence of the keyword "trailers" in the TE header field (Section 10.1.4) of
-        // a request indicates that the client is willing to accept trailer fields,
-        // on behalf of itself and any downstream clients.
+        // a request indicates that the client is willing to accept trailer fields, on behalf of
+        // itself and any downstream clients.
         let mut client_accepts = false;
         if let Some(headers) = &self.request_header_written {
             if let Some(te_header) = headers.headers.get(http::header::TE) {
@@ -316,8 +317,16 @@ impl Http3Session {
         // as per RFC9114/Section 4.1 it is an optional SINGLE header frame
         // only possible when supported by the version of HTTP in use and enabled by an explicit
         // framing mechanism
-        let (trailers, _) = headers_event(self.stream_id()?, self.event_rx()?).await?;
-        let trailer_map = headervec_to_headermap(&trailers)?;
+        let read_timeout = self.read_timeout;
+        let trailer_map = tokio::select! {
+            res = headers_event(self.stream_id()?, self.event_rx()?) => {
+                let (trailers, _) = res?;
+                headervec_to_headermap(&trailers)?
+            },
+            _timedout = timeout(read_timeout) => {
+                return Err(Error::explain(ErrorType::ReadTimedout, "reading response body timed out"))
+            }
+        };
 
         Ok(Some(trailer_map))
     }
@@ -540,5 +549,13 @@ fn housekeeping_add_sessions(
                 )
             }
         }
+    }
+}
+
+async fn timeout(timeout: Option<Duration>) {
+    if let Some(timeout) = timeout {
+        tokio::time::sleep(timeout).await;
+    } else {
+        tokio::time::sleep(Duration::MAX).await;
     }
 }

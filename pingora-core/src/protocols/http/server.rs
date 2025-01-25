@@ -490,7 +490,7 @@ impl Session {
 
     /// Return a mutable [Digest] reference for the connection.
     ///
-    /// Will return `None` if multiple H2 streams are open.
+    /// Will return `None` if this is an H2 or H3 session and multiple streams are open.
     pub fn digest_mut(&mut self) -> Option<&mut Digest> {
         match self {
             Self::H1(s) => Some(s.digest_mut()),
