@@ -79,7 +79,7 @@ impl Connector {
                 }
             }
             let session = self.h2.new_http_session(peer).await?;
-            return Ok((session, false));
+            Ok((session, false))
         }
         /*
         // FIXME: correctly route HTTP3

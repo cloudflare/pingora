@@ -1,7 +1,21 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Quic Client TLS Handshake
+
 use crate::listeners::ALPN;
-use crate::protocols::l4::quic::connector::{
-    ConnectionRx, OutgoingEstablishedState, OutgoingHandshakeState,
-};
+use crate::protocols::l4::quic::connector::{ConnectionRx, EstablishedState, HandshakeState};
 use crate::protocols::l4::quic::id_token::generate_outgoing_cid;
 use crate::protocols::l4::quic::{handle_connection_errors, Connection, ConnectionTx, TxStats};
 use crate::protocols::IO;
@@ -48,7 +62,7 @@ where
             ));
         }
         Connection::OutgoingHandshake(o) => {
-            handshake_outgoing(o, peer, alpn_override, tls_ctx).await?
+            handshake_inner(o, peer, alpn_override, tls_ctx).await?
         }
     };
 
@@ -56,16 +70,16 @@ where
     Ok(stream)
 }
 
-pub(crate) async fn handshake_outgoing<P>(
-    state: &mut OutgoingHandshakeState,
+pub(crate) async fn handshake_inner<P>(
+    state: &mut HandshakeState,
     peer: &P,
     _alpn_override: Option<ALPN>, // potentially HTTP09 could be supported
     _tls_ctx: &SslConnector, // currently the SslConnector cannot be used with quiche, might be feasible
-) -> pingora_error::Result<OutgoingEstablishedState>
+) -> pingora_error::Result<EstablishedState>
 where
     P: Peer + Send + Sync,
 {
-    let OutgoingHandshakeState {
+    let HandshakeState {
         crypto,
         socket_details,
         configs,
@@ -151,7 +165,7 @@ where
         tx_notify.notify_waiters();
     }
 
-    let e_state = OutgoingEstablishedState {
+    let e_state = EstablishedState {
         connection_id: conn_id.clone(),
         connection: connection.clone(),
 

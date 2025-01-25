@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Connecting to HTTP 2 servers
+
 use super::HttpSession;
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
@@ -212,7 +214,7 @@ impl InUsePool {
 
 const DEFAULT_POOL_SIZE: usize = 128;
 
-/// Http2 connector
+/// HTTP 2 connector
 pub struct Connector {
     // just for creating connections, the Stream of h2 should be reused
     transport: TransportConnector,

@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+//! generate connection ids and retry tokens
+
 use log::trace;
 use quiche::{ConnectionId, Header};
 use ring::hmac::Key;
@@ -38,7 +40,7 @@ use std::net;
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-pub(crate) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
+pub(crate) fn mint_token(hdr: &Header, src: &net::SocketAddr) -> Vec<u8> {
     // TODO: implement token generation/validation using crypto
     let mut token = Vec::new();
 
@@ -65,7 +67,7 @@ pub(crate) fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8>
 pub(crate) fn validate_token<'a>(
     src: &net::SocketAddr,
     token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
+) -> Option<ConnectionId<'a>> {
     // TODO: implement token generation/validation using crypto
     if token.len() < 6 {
         return None;
@@ -86,9 +88,10 @@ pub(crate) fn validate_token<'a>(
         return None;
     }
 
-    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+    Some(ConnectionId::from_ref(&token[addr.len()..]))
 }
 
+/// Generate an incoming [`ConnectionId`].
 pub(crate) fn generate_incoming_cid(key: &Key, hdr: &Header) -> ConnectionId<'static> {
     let conn_id = ring::hmac::sign(key, &hdr.dcid);
     let conn_id = conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN].to_vec();
@@ -98,6 +101,7 @@ pub(crate) fn generate_incoming_cid(key: &Key, hdr: &Header) -> ConnectionId<'st
     conn_id
 }
 
+/// Generate an outgoing [`ConnectionId`].
 pub(crate) fn generate_outgoing_cid(rng: &SystemRandom) -> ConnectionId<'static> {
     let mut conn_id = [0; quiche::MAX_CONN_ID_LEN];
     rng.fill(&mut conn_id[..]).unwrap();

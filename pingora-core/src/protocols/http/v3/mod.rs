@@ -15,9 +15,9 @@
 //! HTTP/3 implementation
 
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
-use crate::protocols::l4::quic::connector::OutgoingEstablishedState;
-use crate::protocols::l4::quic::listener::IncomingEstablishedState;
-use crate::protocols::l4::quic::{handle_connection_errors, MAX_IPV6_QUIC_DATAGRAM_SIZE};
+use crate::protocols::l4::quic::{
+    connector, handle_connection_errors, listener, MAX_IPV6_QUIC_DATAGRAM_SIZE,
+};
 use bytes::{BufMut, Bytes, BytesMut};
 use http::uri::{Authority, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri, Version};
@@ -38,31 +38,38 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 
-pub const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
-pub const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
+const H3_SESSION_EVENTS_CHANNEL_SIZE: usize = 256;
+const H3_SESSION_DROP_DEQUE_INITIAL_CAPACITY: usize = 2048;
 
 const MAX_PER_INVOCATION_READ_BODY_BYTES: usize = MAX_IPV6_QUIC_DATAGRAM_SIZE * 64;
 
 pub mod client;
-pub mod nohash;
+pub(crate) mod nohash;
 pub mod server;
 
+/// ConnectionIo useable for HTTP 3 interactions
+/// unifies actions that are used in server & client
 #[derive(Clone)]
 pub(crate) struct ConnectionIo {
+    /// the QUIC/HTTP 3 connection id
     id: ConnectionId<'static>,
 
+    /// the underlying Quic connection
     quic: Arc<Mutex<quiche::Connection>>,
+    /// the actual HTTP 3 connection
     http3: Arc<Mutex<quiche::h3::Connection>>,
 
-    // receive notification on Quic recv, used to check stream capacity
-    // as it only increases after MaxData or MaxStreamData frame was received
+    /// receive notification on Quic recv
+    ///
+    /// e.g. used to continue the Http3Poll loop and to check stream capacity
+    /// as it only increases after MaxData or MaxStreamData frame was received
     rx_notify: Arc<Notify>,
-    // trigger Quic send, continue ConnectionTx write loop
+    /// trigger Quic send, continues [`crate::protocols::l4::quic::ConnectionTx`] write loop
     tx_notify: Arc<Notify>,
 }
 
-impl From<(&OutgoingEstablishedState, h3::Connection)> for ConnectionIo {
-    fn from((state, h3conn): (&OutgoingEstablishedState, h3::Connection)) -> Self {
+impl From<(&connector::EstablishedState, h3::Connection)> for ConnectionIo {
+    fn from((state, h3conn): (&connector::EstablishedState, h3::Connection)) -> Self {
         Self {
             id: state.connection_id.clone(),
             quic: state.connection.clone(),
@@ -73,8 +80,8 @@ impl From<(&OutgoingEstablishedState, h3::Connection)> for ConnectionIo {
     }
 }
 
-impl From<(&IncomingEstablishedState, h3::Connection)> for ConnectionIo {
-    fn from((state, h3conn): (&IncomingEstablishedState, h3::Connection)) -> Self {
+impl From<(&listener::EstablishedState, h3::Connection)> for ConnectionIo {
+    fn from((state, h3conn): (&listener::EstablishedState, h3::Connection)) -> Self {
         Self {
             id: state.connection_id.clone(),
             quic: state.connection.clone(),
@@ -465,7 +472,7 @@ fn request_headers_to_event(req: &RequestHeader) -> Result<Vec<Header>> {
     Ok(qheaders)
 }
 
-fn event_to_response_headers(resp: &Vec<Header>) -> Result<ResponseHeader> {
+fn event_to_response_headers(resp: &[Header]) -> Result<ResponseHeader> {
     // pseudo-headers have to be first, response only has a single valid pseudo header ":status"
     // which MUST be included as per RFC9114 Section 4.3.2
     let mut response = ResponseHeader::build(resp[0].value(), Some(resp.len() - 1))?;
@@ -494,7 +501,7 @@ fn headermap_to_headervec(headers: &HeaderMap) -> Vec<Header> {
 fn headervec_to_headermap(headers: &Vec<Header>) -> Result<HeaderMap> {
     let mut map = HeaderMap::with_capacity(headers.len());
     for h in headers {
-        if h.name().len() > 0 && h.name()[0] == b":".as_slice()[0] {
+        if !h.name().is_empty() && h.name()[0] == b":".as_slice()[0] {
             let k = HeaderName::from_bytes(h.name()).explain_err(InvalidHTTPHeader, |_| {
                 format!("failed to parse header name {:?}", h.name())
             })?;

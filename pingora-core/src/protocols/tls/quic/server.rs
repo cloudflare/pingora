@@ -1,6 +1,22 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Quic Server TLS Handshake
+
 use crate::protocols::l4::quic::id_token::{mint_token, validate_token};
 use crate::protocols::l4::quic::listener::{
-    EstablishedHandle, HandshakeResponse, IncomingEstablishedState, IncomingHandshakeState,
+    EstablishedHandle, EstablishedState, HandshakeResponse, HandshakeState,
 };
 use crate::protocols::l4::quic::{
     handle_connection_errors, Connection, ConnectionTx, TxStats, MAX_IPV6_QUIC_DATAGRAM_SIZE,
@@ -34,7 +50,7 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
             ));
         }
         Connection::IncomingHandshake(i) => {
-            if let Some(e_state) = handshake_incoming(i).await? {
+            if let Some(e_state) = handshake_inner(i).await? {
                 // send HANDSHAKE_DONE Quic frame on established connection
                 e_state.tx_notify.notify_waiters();
                 Some(e_state)
@@ -66,10 +82,10 @@ pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4S
     }
 }
 
-async fn handshake_incoming(
-    state: &mut IncomingHandshakeState,
-) -> pingora_error::Result<Option<IncomingEstablishedState>> {
-    let IncomingHandshakeState {
+async fn handshake_inner(
+    state: &mut HandshakeState,
+) -> pingora_error::Result<Option<EstablishedState>> {
+    let HandshakeState {
         connection_id: conn_id,
         configs,
         drop_connection,
@@ -275,7 +291,7 @@ async fn handshake_incoming(
             conn.local_error()
         );
 
-        handle_connection_errors(&conn_id, conn.peer_error(), conn.local_error())?;
+        handle_connection_errors(conn_id, conn.peer_error(), conn.local_error())?;
     }
 
     let connection = Arc::new(Mutex::new(conn));
@@ -308,7 +324,7 @@ async fn handshake_incoming(
         tx_stats: TxStats::new(),
     };
 
-    let e_state = IncomingEstablishedState {
+    let e_state = EstablishedState {
         connection_id: conn_id.clone(),
         connection: connection.clone(),
 

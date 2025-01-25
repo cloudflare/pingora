@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! TCP and UDP/Quic connections
+
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
@@ -105,14 +107,11 @@ where
     let mut stream: Stream =
         if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
             custom_l4.connect(peer_addr).await?
+        } else if peer.udp_http3() {
+            inner_udp_connect(peer, &bind_to, peer_addr).await?
         } else {
-            if peer.udp_http3() {
-                // create UDP sockets
-                inner_udp_connect(peer, &bind_to, peer_addr).await?
-            } else {
-                // create TCP sockets
-                inner_tcp_connect(peer, bind_to, peer_addr).await?
-            }
+            // create TCP sockets
+            inner_tcp_connect(peer, bind_to, peer_addr).await?
         };
 
     let tracer = peer.get_tracer();
@@ -140,6 +139,7 @@ where
     Ok(stream)
 }
 
+/// create [`tokio::net::TcpSocket`] and a [`tokio::net::TcpStream`]
 async fn inner_tcp_connect<P>(
     peer: &P,
     bind_to: Option<BindTo>,
@@ -222,6 +222,7 @@ where
     }
 }
 
+/// create [`tokio::net::UdpSocket`] and a Quic [Connection](`crate::protocols::l4::quic::Connection::OutgoingHandshake`)
 async fn inner_udp_connect<P>(
     peer: &P,
     bind_to: &Option<BindTo>,
@@ -255,7 +256,7 @@ where
             let socket = match conn_res {
                 Ok(socket) => {
                     debug!("connected to new server: {}", peer.address());
-                    Ok(socket.into())
+                    Ok(socket)
                 }
                 Err(e) => {
                     let c = format!("Fail to connect to {peer}");
@@ -268,7 +269,7 @@ where
 
             let mut quic_http3_configs = None;
             if let Some(peer_options) = peer.get_peer_options() {
-                quic_http3_configs = peer_options.quic_http3_configs.clone()
+                quic_http3_configs.clone_from(&peer_options.quic_http3_configs)
             };
 
             Ok(Connection::initiate(socket, quic_http3_configs)?.into())

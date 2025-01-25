@@ -1,3 +1,19 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Quic Connector
+
 use crate::protocols::l4::quic::Connection;
 use crate::protocols::l4::quic::{
     detect_gso_pacing, Crypto, QuicHttp3Configs, SocketDetails, MAX_IPV6_BUF_SIZE,
@@ -13,7 +29,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// corresponds to a new outgoing (connector) connection before the handshake is completed
-pub struct OutgoingHandshakeState {
+pub struct HandshakeState {
     //pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) socket_details: SocketDetails,
     pub(crate) crypto: Crypto,
@@ -21,7 +37,7 @@ pub struct OutgoingHandshakeState {
 }
 
 /// can be used to wait for network data or trigger network sending
-pub struct OutgoingEstablishedState {
+pub struct EstablishedState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
 
@@ -52,7 +68,7 @@ impl Connection {
         let configs = configs.unwrap_or(QuicHttp3Configs::from_ca_file_path(None)?);
 
         let (gso_enabled, pacing_enabled) = detect_gso_pacing(&io);
-        Ok(Self::OutgoingHandshake(OutgoingHandshakeState {
+        Ok(Self::OutgoingHandshake(HandshakeState {
             crypto: Crypto::new()?,
             socket_details: SocketDetails {
                 io: Arc::new(io),
@@ -66,8 +82,8 @@ impl Connection {
     }
 }
 
-/// connections receive task receives data from the UDP socket to the [`quiche::Connection`]
-/// the task notifies the `rx_notify` when data was received from network for teh connection
+/// connections receive task receives data from the UDP socket into the [`quiche::Connection`]
+/// the task notifies the `rx_notify` when data was received from network for the connection
 pub struct ConnectionRx {
     pub(crate) socket_details: SocketDetails,
 
@@ -79,6 +95,9 @@ pub struct ConnectionRx {
 }
 
 impl ConnectionRx {
+    /// start the `rx` task, consumes the struct
+    ///
+    /// is stopped within the `Drop` implementation of the corresponding [`Connection`]
     pub async fn start(self) -> Result<()> {
         let socket = self.socket_details.io;
         let local_addr = self.socket_details.local_addr;
@@ -144,7 +163,7 @@ impl ConnectionRx {
     }
 }
 
-impl Drop for OutgoingEstablishedState {
+impl Drop for EstablishedState {
     fn drop(&mut self) {
         if !self.rx_handle.is_finished() {
             self.rx_handle.abort();

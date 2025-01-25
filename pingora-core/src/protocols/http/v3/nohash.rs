@@ -24,7 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A simple no-op hasher for Stream IDs.
 ///
@@ -56,5 +56,4 @@ impl std::hash::Hasher for StreamIdHasher {
 
 type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 
-pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
-pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
+pub(crate) type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;

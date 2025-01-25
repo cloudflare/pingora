@@ -205,6 +205,7 @@ pub trait Peer: Display + Clone {
         None
     }
 
+    /// Whether UDP/Quic should be used.
     fn udp_http3(&self) -> bool {
         let mut udp_http3 = false;
         if let Some(alpn) = self.get_alpn() {

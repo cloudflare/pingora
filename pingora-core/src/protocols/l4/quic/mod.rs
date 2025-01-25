@@ -1,3 +1,19 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Quic integration
+
 use log::{debug, error, trace};
 use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType, OrErr, Result};
@@ -31,9 +47,6 @@ use crate::protocols::l4::quic::sendto::{detect_gso, send_to, set_txtime_sockopt
 use crate::protocols::tls::{SslDigest, TlsRef};
 use crate::protocols::{ConnectionState, Ssl};
 
-use crate::protocols::l4::quic::connector::{OutgoingEstablishedState, OutgoingHandshakeState};
-use crate::protocols::l4::quic::listener::{IncomingEstablishedState, IncomingHandshakeState};
-
 // UDP header 8 bytes, IPv4 Header 20 bytes
 //pub const MAX_IPV4_BUF_SIZE: usize = 65507;
 /// UDP header 8 bytes, IPv6 Header 40 bytes
@@ -48,32 +61,32 @@ pub const MAX_IPV6_UDP_PACKET_SIZE: usize = 1452;
 // TODO: validate size (possibly 1200 is the standard)
 pub const MAX_IPV6_QUIC_DATAGRAM_SIZE: usize = 1350;
 
-/// max. amount of [`UdpRecv`] messages on the `tokio::sync::mpsc::channel`
-const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
 /// initial size for the connection drop deque
 const CONNECTION_DROP_DEQUE_INITIAL_SIZE: usize = 1024;
 
 /// Represents a Quic [`Connection`] in either `Incoming` or `Outgoing` direction.
 ///
-/// A [`Connection`] of variant `Incoming*` corresponds to a [`IncomingConnectionHandle`].
-/// They are created having e.g. the variants [`Connection::IncomingHandshake`] / [`IncomingConnectionHandle::Handshake`]
-/// and are transitioned to the [`Connection::IncomingEstablished`] / [`IncomingConnectionHandle::Established`]
-/// variants once the TLS handshake was successful.
+/// A [`Connection`] of variant `Incoming*` corresponds to a `IncomingConnectionHandle`.
 ///
-/// `Outgoing` connections do not have corresponding handles as they are bound to a distinguished
-/// socket/quad-tuple and having a distinguished ConnectionRx task.
+/// They are created having e.g. the variants [`Connection::IncomingHandshake`] / [`listener::IncomingConnectionHandle::Handshake`].
+/// Once the TLS handshake was successful they are transitioned to the
+/// [`Connection::IncomingEstablished`] / [`listener::IncomingConnectionHandle::Established`] variants.
+///
+/// `Outgoing` connections **do not have** corresponding handles as they are bound to
+/// a distinguished socket/4-tuple and having a distinguished [`connector::ConnectionRx`] task.
 pub enum Connection {
     /// new incoming connection while in the handshake phase
-    IncomingHandshake(IncomingHandshakeState),
+    IncomingHandshake(listener::HandshakeState),
     /// established incoming connection after successful handshake ([`quiche::Connection::is_established`])
-    IncomingEstablished(IncomingEstablishedState),
+    IncomingEstablished(listener::EstablishedState),
 
     /// new outgoing connection while in the handshake phase
-    OutgoingHandshake(OutgoingHandshakeState),
+    OutgoingHandshake(connector::HandshakeState),
     /// established outgoing connection after successful handshake ([`quiche::Connection::is_established`])
-    OutgoingEstablished(OutgoingEstablishedState),
+    OutgoingEstablished(connector::EstablishedState),
 }
 
+/// the [`UdpSocket`] and according details
 #[derive(Clone)]
 pub(crate) struct SocketDetails {
     pub(crate) io: Arc<UdpSocket>,
@@ -101,9 +114,9 @@ impl Crypto {
     }
 }
 
-/// connections transmit task sends data from the [`quiche::Connection`] to the UDP socket
-/// the actor is notified through the `tx_notify` and flushes all connection data to the network
-pub struct ConnectionTx {
+/// Connection transmit (`tx`) task sends data from the [`quiche::Connection`] to the UDP socket
+/// the task is notified through the `tx_notify` and flushes all connection data to the network
+pub(crate) struct ConnectionTx {
     pub(crate) socket_details: SocketDetails,
 
     pub(crate) connection_id: ConnectionId<'static>,
@@ -114,10 +127,16 @@ pub struct ConnectionTx {
 }
 
 /// During establishing a [`ConnectionTx`] task is started being responsible to write data from
-/// the [`quiche::Connection`] to the `[UdpSocket`].
-/// The connections `Rx` path is part of the [`Listener::accept`] which distributes the datagrams
+/// the [`quiche::Connection`] to the [`UdpSocket`].
+///
+/// The connections receive (`rx`) path is part of the [`listener::Listener::accept`] which distributes the datagrams
 /// to the according connections.
+///
+/// For outgoing [`Connection`]s a [`connector::ConnectionRx`] task is responsible to receive the data into the [`quiche::Connection`]
 impl ConnectionTx {
+    /// start the `tx` task, consumes the struct
+    ///
+    /// is stopped within the `Drop` implementation of the corresponding [`Connection`]
     pub(crate) async fn start(mut self) -> Result<()> {
         let id = self.connection_id;
         let mut out = [0u8; MAX_IPV6_BUF_SIZE];
@@ -230,7 +249,7 @@ impl ConnectionTx {
 }
 
 /// used within [`ConnectionTx`] to keep track of the maximum send burst
-pub struct TxStats {
+pub(crate) struct TxStats {
     loss_rate: f64,
     max_send_burst: usize,
     max_datagram_size: usize,
@@ -449,8 +468,8 @@ impl Debug for QuicHttp3Configs {
 }
 
 fn detect_gso_pacing(io: &UdpSocket) -> (bool, bool) {
-    let gso_enabled = detect_gso(&io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
-    let pacing_enabled = match set_txtime_sockopt(&io) {
+    let gso_enabled = detect_gso(io, MAX_IPV6_QUIC_DATAGRAM_SIZE);
+    let pacing_enabled = match set_txtime_sockopt(io) {
         Ok(_) => {
             debug!("successfully set SO_TXTIME socket option");
             true
@@ -464,7 +483,7 @@ fn detect_gso_pacing(io: &UdpSocket) -> (bool, bool) {
 }
 
 impl Connection {
-    pub(crate) fn establish_incoming(&mut self, state: IncomingEstablishedState) -> Result<()> {
+    pub(crate) fn establish_incoming(&mut self, state: listener::EstablishedState) -> Result<()> {
         if cfg!(test) {
             let conn = state.connection.lock();
             debug_assert!(
@@ -516,7 +535,7 @@ impl Connection {
         }
     }
 
-    pub(crate) fn establish_outgoing(&mut self, state: OutgoingEstablishedState) -> Result<()> {
+    pub(crate) fn establish_outgoing(&mut self, state: connector::EstablishedState) -> Result<()> {
         if cfg!(test) {
             let conn = state.connection.lock();
             debug_assert!(
@@ -565,15 +584,21 @@ impl ConnectionState for Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        match self {
-            Connection::IncomingEstablished(s) => {
-                if !s.tx_handle.is_finished() {
-                    s.tx_handle.abort();
-                    debug!("connection {:?} stopped tx task", s.connection_id);
-                }
+        if let Connection::IncomingEstablished(s) = self {
+            if !s.tx_handle.is_finished() {
+                s.tx_handle.abort();
+                debug!("connection {:?} stopped tx task", s.connection_id);
             }
-            // FIXME: handle outgoing (stopping rx loop)
-            _ => {}
+        }
+        if let Connection::OutgoingEstablished(s) = self {
+            if !s.rx_handle.is_finished() {
+                s.rx_handle.abort();
+                debug!("connection {:?} stopped rx task", s.connection_id);
+            }
+            if !s.tx_handle.is_finished() {
+                s.tx_handle.abort();
+                debug!("connection {:?} stopped tx task", s.connection_id);
+            }
         }
     }
 }
@@ -584,7 +609,7 @@ impl Ssl for Connection {
         None
     }
 
-    /// Return the [`tls::SslDigest`] for logging
+    /// Return the [`crate::protocols::tls::SslDigest`] for logging
     fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
         match self {
             Connection::IncomingEstablished(s) => {

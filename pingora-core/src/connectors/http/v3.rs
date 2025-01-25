@@ -1,10 +1,26 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Connecting to HTTP 3 servers
+
 use super::HttpSession;
 
 use crate::connectors::http::InUsePool;
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v3::client::{Http3Poll, Http3Session};
 use crate::protocols::http::v3::ConnectionIo;
-use crate::protocols::l4::quic::{Connection, Crypto};
+use crate::protocols::l4::quic::Connection;
 use crate::protocols::{Digest, Stream, UniqueID, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 use log::debug;
@@ -22,40 +38,44 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 // FIXME: ConnectorOptions contains CA file path from ServerConfig
 
+/// a ref to an established HTTP 3 connection
 #[derive(Clone)]
 pub(crate) struct ConnectionRef(Arc<ConnectionRefInner>);
 
-impl ConnectionRef {
-    pub fn new(
-        l4_stream: Stream,
-        conn_io: ConnectionIo,
-        digest: Digest,
-        add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
-        drop_sessions: Arc<Mutex<VecDeque<u64>>>,
-        idle_close: watch::Receiver<bool>,
-        max_streams: usize,
-        h3poll_task: JoinHandle<Result<()>>,
-    ) -> Self {
-        Self(Arc::new(ConnectionRefInner {
-            l4_stream,
-            conn_io,
+/// corresponds to an established HTTP 3 connection
+pub(crate) struct ConnectionRefInner {
+    /// avoid dropping the [`Stream`] & used for [`UniqueIDType`]
+    l4_stream: Stream,
 
-            digest,
-            max_streams,
-            current_streams: AtomicUsize::new(0),
-            release_lock: Arc::new(Default::default()),
+    /// resources required for Http3, Quic & network IO
+    conn_io: ConnectionIo,
 
-            add_sessions,
-            drop_sessions,
-            idle_close,
-            h3poll_task,
-        }))
-    }
+    /// connection [`Digest`]
+    digest: Digest,
+
+    /// max. concurrent streams this connection is allowed to create
+    max_streams: usize,
+
+    /// how many concurrent streams already active
+    current_streams: AtomicUsize,
+
+    /// lock is used during moving the connection across pools
+    release_lock: Arc<Mutex<()>>,
+
+    /// add session to active sessions in Http3Poll task
+    add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
+    /// remove session from active sessions in Http3Poll task
+    drop_sessions: Arc<Mutex<VecDeque<u64>>>,
+    /// watch for idle pool timeouts
+    idle_close: watch::Receiver<bool>,
+
+    /// the background task handle polling the HTTP3 3 connection
+    h3poll_task: JoinHandle<Result<()>>,
 }
 
 impl ConnectionRef {
     pub(crate) fn conn_id(&self) -> &ConnectionId<'_> {
-        &self.0.conn_io.conn_id()
+        self.0.conn_io.conn_id()
     }
 
     pub(crate) fn conn_io(&self) -> &ConnectionIo {
@@ -98,35 +118,6 @@ impl ConnectionRef {
     }
 }
 
-pub(crate) struct ConnectionRefInner {
-    // avoid dropping stream, & used for UniqueIDType
-    l4_stream: Stream,
-
-    // resources required for Http3, Quic & network IO
-    conn_io: ConnectionIo,
-
-    // connection digest
-    digest: Digest,
-
-    // max concurrent streams this connection is allowed to create
-    max_streams: usize,
-
-    // how many concurrent streams already active
-    current_streams: AtomicUsize,
-
-    // lock is used during moving the connection across pools
-    release_lock: Arc<Mutex<()>>,
-
-    // add session to active sessions in Http3Poll task
-    add_sessions: Arc<Mutex<VecDeque<(u64, mpsc::Sender<Event>)>>>,
-    // remove session from active sessions in Http3Poll task
-    drop_sessions: Arc<Mutex<VecDeque<u64>>>,
-    // watch for idle pool timeouts
-    idle_close: watch::Receiver<bool>,
-
-    h3poll_task: JoinHandle<Result<()>>,
-}
-
 impl Drop for ConnectionRefInner {
     fn drop(&mut self) {
         if !self.h3poll_task.is_finished() {
@@ -145,7 +136,7 @@ impl UniqueID for ConnectionRef {
     }
 }
 
-/// Http3 connector
+/// HTTP 3 connector
 pub struct Connector {
     // for creating connections, the Stream for h3 should be reused
     transport: TransportConnector,
@@ -153,7 +144,6 @@ pub struct Connector {
     idle_pool: Arc<ConnectionPool<ConnectionRef>>,
     // the pool of h3 connections that have ongoing streams
     in_use_pool: InUsePool<ConnectionRef>,
-    crypto: Option<Crypto>,
 }
 
 const DEFAULT_POOL_SIZE: usize = 128;
@@ -169,7 +159,6 @@ impl Connector {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
-            crypto: Crypto::new().ok(),
         }
     }
 
@@ -368,16 +357,20 @@ async fn handshake(mut stream: Stream, max_streams: usize) -> Result<ConnectionR
     };
     let h3poll_task = pingora_runtime::current_handle().spawn(h3poll.start());
 
-    Ok(ConnectionRef::new(
-        stream,
+    Ok(ConnectionRef(Arc::new(ConnectionRefInner {
+        l4_stream: stream,
         conn_io,
+
         digest,
+        max_streams,
+        current_streams: AtomicUsize::new(0),
+        release_lock: Arc::new(Default::default()),
+
         add_sessions,
         drop_sessions,
-        idle_close_rx,
-        max_streams,
+        idle_close: idle_close_rx,
         h3poll_task,
-    ))
+    })))
 }
 
 #[cfg(test)]
@@ -438,7 +431,7 @@ mod tests {
         let h3 = connector.new_http_session(&peer).await.unwrap();
         match h3 {
             HttpSession::H1(_) | HttpSession::H2(_) => panic!("expect h3"),
-            HttpSession::H3(_h3_session) => assert!(true),
+            HttpSession::H3(_h3_session) => { /* success */ }
         }
     }
 

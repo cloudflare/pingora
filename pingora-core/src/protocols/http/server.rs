@@ -16,7 +16,7 @@
 
 use super::v1::server::HttpSession as SessionV1;
 use super::v2::server::HttpSession as SessionV2;
-use super::v3::server::H3Session as SessionV3;
+use super::v3::server::Http3Session as SessionV3;
 use super::HttpTask;
 use super::{error_resp, HttpVersion};
 use crate::protocols::{Digest, SocketAddr, Stream};

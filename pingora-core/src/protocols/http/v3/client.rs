@@ -1,3 +1,19 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! HTTP/3 client session and connection
+
 use crate::connectors::http::v3::ConnectionRef;
 use crate::protocols::http::v3::nohash::StreamIdHashMap;
 use crate::protocols::http::v3::{
@@ -23,6 +39,10 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, watch};
 
+/// HTTP/3 client session
+///
+/// The [`Http3Session`] is built around [`pingora_http`] structs and converts to
+/// [`quiche::h3::Event`] where needed.
 pub struct Http3Session {
     conn: ConnectionRef,
 
@@ -209,7 +229,7 @@ impl Http3Session {
             return Ok(None);
         }
 
-        let read_timeout = self.read_timeout.clone();
+        let read_timeout = self.read_timeout;
         tokio::select! {
             res = async {
                 if !self.read_continue {
@@ -337,7 +357,7 @@ impl Http3Session {
     /// For reused connection, the timing in the digest will reflect its initial handshakes
     /// The caller should check if the connection is reused to avoid misuse the timing field.
     pub fn digest(&self) -> Option<&Digest> {
-        Some(&self.conn.digest())
+        Some(self.conn.digest())
     }
 
     /// Return a mutable [`Digest`] reference for the connection

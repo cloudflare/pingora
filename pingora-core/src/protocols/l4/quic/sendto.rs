@@ -24,6 +24,9 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+//! send UDP datagrams incl. GSO & pacing support
+
+use nix::sys::socket::{sendmsg, ControlMessage};
 use std::cmp;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -43,7 +46,9 @@ pub fn detect_gso(_socket: &mio::net::UdpSocket, _segment_size: usize) -> bool {
     false
 }
 
-/// Send packets using sendmsg() with GSO.
+/// Send packets using [`sendmsg`] with
+/// [Generic Segmentation Offloading](`ControlMessage::UdpGsoSegments`) and
+/// [pacing](`ControlMessage::TxTime`).
 #[cfg(target_os = "linux")]
 fn send_to_gso_pacing(
     socket: &tokio::net::UdpSocket,
@@ -51,8 +56,6 @@ fn send_to_gso_pacing(
     send_info: &quiche::SendInfo,
     segment_size: usize,
 ) -> io::Result<usize> {
-    use nix::sys::socket::sendmsg;
-    use nix::sys::socket::ControlMessage;
     use nix::sys::socket::MsgFlags;
     use nix::sys::socket::SockaddrStorage;
     use std::io::IoSlice;

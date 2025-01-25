@@ -34,7 +34,7 @@ use parking_lot::Mutex;
 use pingora_error::ErrorType::{ConnectError, H3Error, InternalError, ReadError, WriteError};
 use pingora_error::{Error, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-pub use quiche::h3::Config as H3Options;
+pub use quiche::h3::Config as Http3Options;
 use quiche::h3::{self, Connection as QuicheH3Connection, Event, NameValue};
 use quiche::ConnectionId;
 use std::collections::VecDeque;
@@ -46,11 +46,14 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 const BODY_BUF_LIMIT: usize = 1024 * 64;
 const SHUTDOWN_GOAWAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Perform HTTP/3 connection handshake with an established (QUIC) connection.
+/// Perform HTTP/3 connection handshake with an established Quic connection.
 ///
 /// The optional `options` allow to adjust certain HTTP/3 parameters and settings.
-/// See [`H3Options`] for more details.
-pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3Connection> {
+/// See [`Http3Options`] for more details.
+pub(crate) async fn handshake(
+    mut io: Stream,
+    options: Option<&Http3Options>,
+) -> Result<Http3Connection> {
     let Some(conn) = io.quic_connection_state() else {
         return Err(Error::explain(
             ConnectError,
@@ -86,7 +89,7 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
         }
     };
 
-    Ok(H3Connection {
+    Ok(Http3Connection {
         _l4stream: io,
 
         conn_io,
@@ -102,8 +105,8 @@ pub async fn handshake(mut io: Stream, options: Option<&H3Options>) -> Result<H3
     })
 }
 
-/// corresponds to a [`quiche::h3::Connection`] and links [`H3Session`]s to Quic IO
-pub struct H3Connection {
+/// corresponds to a [`quiche::h3::Connection`] and links [`Http3Session`]s to Quic IO
+pub(crate) struct Http3Connection {
     _l4stream: Stream, // ensure the stream will not be dropped until connection is closed
 
     conn_io: ConnectionIo,
@@ -116,7 +119,7 @@ pub struct H3Connection {
     received_goaway: Option<u64>,
 }
 
-impl Drop for H3Connection {
+impl Drop for Http3Connection {
     fn drop(&mut self) {
         let mut drop_connections = self.drop_connections.lock();
         drop_connections.push_back(self.conn_id().clone());
@@ -124,7 +127,7 @@ impl Drop for H3Connection {
     }
 }
 
-impl H3Connection {
+impl Http3Connection {
     fn conn_id(&self) -> &ConnectionId<'static> {
         &self.conn_io.id
     }
@@ -176,10 +179,11 @@ impl H3Connection {
 }
 
 /// HTTP/3 server session
-/// [`H3Session`]s contain the converted [`quiche::h3::Event::Headers`] as
-/// [`pingora_http::RequestHeader`]. The [`H3Session`] is built around [`pingora_http`] structs and
-/// converts to [`quiche::h3::Event`] where needed.
-pub struct H3Session {
+///
+/// [`Http3Session`]s contain the converted [`quiche::h3::Event::Headers`] as
+/// [`pingora_http::RequestHeader`]. The [`Http3Session`] is built around [`pingora_http`] structs
+/// and converts to [`quiche::h3::Event`] where needed.
+pub struct Http3Session {
     pub(crate) stream_id: u64,
     conn_io: ConnectionIo,
 
@@ -213,7 +217,7 @@ pub struct H3Session {
     digest: Arc<Digest>,
 }
 
-impl Drop for H3Session {
+impl Drop for Http3Session {
     fn drop(&mut self) {
         let mut drop_sessions = self.drop_session.lock();
         drop_sessions.push_back(self.stream_id);
@@ -225,8 +229,8 @@ impl Drop for H3Session {
     }
 }
 
-impl H3Session {
-    /// Create a new [`H3Session`] from the QUIC connection.
+impl Http3Session {
+    /// Create a new [`Http3Session`] from the QUIC connection.
     /// This function returns a new HTTP/3 session when the provided HTTP/3 connection, `conn`,
     /// establishes a new HTTP/3 stream to this server.
     ///
@@ -239,8 +243,8 @@ impl H3Session {
     ///
     /// `None` will be returned when the connection is closing so that the loop can exit.
     ///
-    pub async fn from_h3_conn(
-        conn: &mut H3Connection,
+    pub(crate) async fn from_h3_conn(
+        conn: &mut Http3Connection,
         digest: Arc<Digest>,
     ) -> Result<Option<Self>> {
         'poll: loop {
@@ -306,7 +310,7 @@ impl H3Session {
                                 let (event_tx, event_rx) =
                                     mpsc::channel(H3_SESSION_EVENTS_CHANNEL_SIZE);
 
-                                let session = H3Session {
+                                let session = Http3Session {
                                     stream_id,
                                     conn_io: conn.conn_io.clone(),
 

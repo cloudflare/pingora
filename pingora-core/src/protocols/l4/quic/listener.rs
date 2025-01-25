@@ -1,8 +1,24 @@
+// Copyright 2024 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Quic Listener
+
 use crate::protocols::l4::quic::id_token::generate_incoming_cid;
 use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::l4::quic::{
     detect_gso_pacing, Connection, Crypto, SocketDetails, CONNECTION_DROP_DEQUE_INITIAL_SIZE,
-    HANDSHAKE_PACKET_BUFFER_SIZE, MAX_IPV6_BUF_SIZE,
+    MAX_IPV6_BUF_SIZE,
 };
 use crate::protocols::l4::stream::Stream;
 use log::{debug, trace, warn};
@@ -21,8 +37,11 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+/// max. amount of [`UdpRecv`] messages on the `tokio::sync::mpsc::channel`
+const HANDSHAKE_PACKET_BUFFER_SIZE: usize = 64;
+
 /// corresponds to a new incoming (listener) connection before the handshake is completed
-pub struct IncomingHandshakeState {
+pub struct HandshakeState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) configs: QuicHttp3Configs,
     pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
@@ -37,7 +56,7 @@ pub struct IncomingHandshakeState {
 }
 
 /// can be used to wait for network data or trigger network sending
-pub struct IncomingEstablishedState {
+pub struct EstablishedState {
     pub(crate) connection_id: ConnectionId<'static>,
     pub(crate) connection: Arc<Mutex<QuicheConnection>>,
 
@@ -55,8 +74,8 @@ pub struct IncomingEstablishedState {
     pub(crate) drop_connection: Arc<Mutex<VecDeque<ConnectionId<'static>>>>,
 }
 
-/// A [`IncomingConnectionHandle`] corresponds to a [`IncomingConnection`].
-/// For further details please refer to [`IncomingConnection`].
+/// A [`IncomingConnectionHandle`] corresponds to an Incoming [`Connection`].
+/// For further details please refer to [`Connection`].
 pub enum IncomingConnectionHandle {
     /// new connection handle during handshake
     Handshake(HandshakeHandle),
@@ -103,8 +122,9 @@ pub struct UdpRecv {
 }
 
 /// The [`Listener`] contains a [`HashMap`] linking [`quiche::ConnectionId`] to [`IncomingConnectionHandle`]
-/// the `Listener::accept` method returns [`IncomingConnection`]s and is responsible to forward network
-/// UDP packets to the according `Connection` through the corresponding [`IncomingConnectionHandle`].
+/// the `Listener::accept` method returns Incoming [`Connection`]s and is responsible to forward
+/// network UDP packets to the according `Incoming [`Connection`] through the corresponding
+/// [`IncomingConnectionHandle`].
 ///
 /// In the [`IncomingConnectionHandle::Handshake`] state the UDP packets are forwarded through a
 /// [`tokio::sync::mpsc::channel`].
@@ -287,7 +307,7 @@ impl Listener {
             let response = Arc::new(Mutex::new(None));
 
             debug!("new incoming connection {:?}", conn_id);
-            let connection = Connection::IncomingHandshake(IncomingHandshakeState {
+            let connection = Connection::IncomingHandshake(HandshakeState {
                 connection_id: conn_id.clone(),
                 drop_connection: self.drop_connections.clone(),
 

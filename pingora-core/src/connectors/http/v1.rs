@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Connecting to HTTP 1.x servers
+
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession;
 use crate::upstreams::peer::Peer;
@@ -19,6 +21,7 @@ use crate::upstreams::peer::Peer;
 use pingora_error::Result;
 use std::time::Duration;
 
+/// HTTP 1.x connector
 pub struct Connector {
     transport: TransportConnector,
 }

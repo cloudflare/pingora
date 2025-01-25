@@ -59,6 +59,7 @@ impl HttpTask {
     }
 }
 
+/// HTTP Version
 #[derive(Debug, Default, Copy, Clone)]
 pub enum HttpVersion {
     #[default]

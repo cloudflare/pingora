@@ -27,8 +27,8 @@
 //! Pingora is a framework to build fast, reliable and programmable networked systems at Internet scale.
 //!
 //! # Features
-//! - Http 1.x and Http 2
-//! - Modern TLS with OpenSSL or BoringSSL (FIPS compatible)
+//! - Http 1.x, Http 2 and Http 3
+//! - Modern TLS with OpenSSL, BoringSSL (FIPS compatible) and Rustls
 //! - Zero downtime upgrade
 //!
 //! # Usage

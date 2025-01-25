@@ -93,7 +93,7 @@ pub trait HttpServerApp {
     /// every time a new HTTP/3 **connection** needs to be established.
     ///
     /// A `None` means to use the built-in default options. See [`server::H2Options`] for more details.
-    fn h3_options(&self) -> Option<&h3_server::H3Options> {
+    fn h3_options(&self) -> Option<&h3_server::Http3Options> {
         None
     }
 
@@ -245,7 +245,7 @@ where
                         };
                         return None;
                     }
-                    h3_stream = h3_server::H3Session::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream
+                    h3_stream = h3_server::Http3Session::from_h3_conn(&mut h3_conn, digest.clone()) => h3_stream
                 };
 
                 let h3_stream = match h3_stream {
