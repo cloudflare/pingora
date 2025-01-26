@@ -46,6 +46,7 @@ use crate::max_file_size::MaxFileSizeMissHandler;
 pub use key::CacheKey;
 use lock::{CacheKeyLock, LockStatus, Locked};
 pub use memory::MemCache;
+pub use meta::{set_compression_dict_content, set_compression_dict_path};
 pub use meta::{CacheMeta, CacheMetaDefaults};
 pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
 pub use variance::VarianceBuilder;
@@ -1236,13 +1237,4 @@ impl HttpCache {
             .cache_span
             .set_tag(|| Tag::new("is_subrequest", true))
     }
-}
-
-/// Set the header compression dictionary, which helps serialize http header.
-///
-/// Return false if it is already set.
-pub fn set_compression_dict_path(path: &str) -> bool {
-    crate::meta::COMPRESSION_DICT_PATH
-        .set(path.to_string())
-        .is_ok()
 }
