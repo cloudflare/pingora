@@ -87,69 +87,91 @@ pub struct Server {
 
 impl Server {
     #[cfg(unix)]
-    async fn main_loop(&self) -> ShutdownType {
+    async fn main_loop(&self) -> (ShutdownType, bool) {
         // waiting for exit signal
         // TODO: there should be a signal handling function
         let mut graceful_upgrade_signal = unix::signal(unix::SignalKind::quit()).unwrap();
         let mut graceful_terminate_signal = unix::signal(unix::SignalKind::terminate()).unwrap();
         let mut fast_shutdown_signal = unix::signal(unix::SignalKind::interrupt()).unwrap();
-        tokio::select! {
-            _ = fast_shutdown_signal.recv() => {
-                info!("SIGINT received, exiting");
-                ShutdownType::Quick
-            },
-            _ = graceful_terminate_signal.recv() => {
-                // we receive a graceful terminate, all instances are instructed to stop
-                info!("SIGTERM received, gracefully exiting");
-                // graceful shutdown if there are listening sockets
-                info!("Broadcasting graceful shutdown");
-                match self.shutdown_watch.send(true) {
-                    Ok(_) => { info!("Graceful shutdown started!"); }
-                    Err(e) => {
-                        error!("Graceful shutdown broadcast failed: {e}");
-                    }
-                }
-                info!("Broadcast graceful shutdown complete");
-                ShutdownType::Graceful
-            }
-            _ = graceful_upgrade_signal.recv() => {
-                // TODO: still need to select! on signals in case a fast shutdown is needed
-                // aka: move below to another task and only kick it off here
-                info!("SIGQUIT received, sending socks and gracefully exiting");
-                if let Some(fds) = &self.listen_fds {
-                    let fds = fds.lock().await;
-                    info!("Trying to send socks");
-                    // XXX: this is blocking IO
-                    match fds.send_to_sock(
-                        self.configuration.as_ref().upgrade_sock.as_str())
-                    {
-                        Ok(_) => {info!("listener sockets sent");},
-                        Err(e) => {
-                            error!("Unable to send listener sockets to new process: {e}");
-                            // sentry log error on fd send failure
-                            #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                            sentry::capture_error(&e);
-                        }
-                    }
-                    sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
+        let mut reload_signal = unix::signal(unix::SignalKind::hangup()).unwrap();
+
+        loop {
+            tokio::select! {
+                _ = fast_shutdown_signal.recv() => {
+                    info!("SIGINT received, exiting");
+                    return (ShutdownType::Quick, false)
+                },
+                _ = graceful_terminate_signal.recv() => {
+                    // we receive a graceful terminate, all instances are instructed to stop
+                    info!("SIGTERM received, gracefully exiting");
+                    // graceful shutdown if there are listening sockets
                     info!("Broadcasting graceful shutdown");
-                    // gracefully exiting
                     match self.shutdown_watch.send(true) {
                         Ok(_) => { info!("Graceful shutdown started!"); }
                         Err(e) => {
                             error!("Graceful shutdown broadcast failed: {e}");
-                            // switch to fast shutdown
-                            return ShutdownType::Graceful;
                         }
                     }
                     info!("Broadcast graceful shutdown complete");
-                    ShutdownType::Graceful
-                } else {
-                    info!("No socks to send, shutting down.");
-                    ShutdownType::Graceful
+                    return (ShutdownType::Graceful, false)
                 }
-            },
+                _ = graceful_upgrade_signal.recv() => {
+                    info!("SIGQUIT received, sending socks and gracefully exiting");
+                    self.handle_gracefull_upgrade_signal(false).await;
+                    return (ShutdownType::Graceful, false)
+                },
+                _ = reload_signal.recv() => {
+                    info!("SIGHUP received, sending socks and gracefully reloading");
+                    // ensure that sending socks is successful before exiting
+                    if !self.handle_gracefull_upgrade_signal(true).await {
+                        continue;
+                    }
+                    return (ShutdownType::Graceful, true)
+                }
+            }
         }
+    }
+
+    async fn handle_gracefull_upgrade_signal(&self, reload: bool) -> bool {
+        // TODO: still need to select! on signals in case a fast shutdown is needed
+        // aka: move below to another task and only kick it off here
+        if let Some(fds) = &self.listen_fds {
+            let fds = fds.lock().await;
+            info!("Trying to send socks");
+            // XXX: this is blocking IO
+            match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                Ok(_) => {
+                    info!("listener sockets sent");
+                }
+                Err(e) => {
+                    error!("Unable to send listener sockets to new process: {e}");
+                    // sentry log error on fd send failure
+                    #[cfg(all(not(debug_assertions), feature = "sentry"))]
+                    sentry::capture_error(&e);
+
+                    if reload {
+                        return false;
+                    }
+                }
+            }
+            sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
+            info!("Broadcasting graceful shutdown");
+            // gracefully exiting
+            match self.shutdown_watch.send(true) {
+                Ok(_) => {
+                    info!("Graceful shutdown started!");
+                }
+                Err(e) => {
+                    error!("Graceful shutdown broadcast failed: {e}");
+                    // switch to fast shutdown
+                    return true;
+                }
+            }
+            info!("Broadcast graceful shutdown complete");
+        } else {
+            info!("No socks to send, shutting down.");
+        }
+        true
     }
 
     fn run_service(
@@ -277,6 +299,22 @@ impl Server {
     /// When trying to zero downtime upgrade from an older version of the server which is already
     /// running, this function will try to get all its listening sockets in order to take them over.
     pub fn bootstrap(&mut self) {
+        match self.try_bootstrap() {
+            Ok(true) => {
+                std::process::exit(0);
+            }
+            Ok(false) => {}
+            Err(_) => {
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// Prepare the server to start
+    ///
+    /// When trying to zero downtime upgrade from an older version of the server which is already
+    /// running, this function will try to get all its listening sockets in order to take them over.
+    pub fn try_bootstrap(&mut self) -> Result<bool> {
         info!("Bootstrap starting");
         debug!("{:#?}", self.options);
 
@@ -286,7 +324,7 @@ impl Server {
 
         if self.options.as_ref().map_or(false, |o| o.test) {
             info!("Server Test passed, exiting");
-            std::process::exit(0);
+            return Ok(true);
         }
 
         // load fds
@@ -294,6 +332,7 @@ impl Server {
         match self.load_fds(self.options.as_ref().map_or(false, |o| o.upgrade)) {
             Ok(_) => {
                 info!("Bootstrap done");
+                Ok(false)
             }
             Err(e) => {
                 // sentry log error on fd load failure
@@ -301,7 +340,10 @@ impl Server {
                 sentry::capture_error(&e);
 
                 error!("Bootstrap failed on error: {:?}, exiting.", e);
-                std::process::exit(1);
+                Err(Error::explain(
+                    ErrorType::Custom("BootstrapFdLoadError"),
+                    e.desc(),
+                ))
             }
         }
     }
@@ -313,13 +355,26 @@ impl Server {
     ///
     /// Note: this function may fork the process for daemonization, so any additional threads created
     /// before this function will be lost to any service logic once this function is called.
-    pub fn run_forever(mut self) -> ! {
+    pub fn run_forever(self) -> ! {
+        let daemon = self.configuration.daemon;
+        self.run_server(daemon).unwrap();
+        std::process::exit(0)
+    }
+
+    /// Start the server
+    ///
+    /// This function will block forever until the server needs to quit or reload. So this would be the last
+    /// function to call for this object.
+    ///
+    /// Note: this function may fork the process for daemonization, so any additional threads created
+    /// before this function will be lost to any service logic once this function is called.
+    pub fn run_server(mut self, enable_daemon: bool) -> Result<bool> {
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
 
         #[cfg(unix)]
-        if conf.daemon {
+        if enable_daemon {
             info!("Daemonizing the server");
             fast_timeout::pause_for_fork();
             daemonize(&self.configuration);
@@ -354,9 +409,9 @@ impl Server {
         // Only work steal runtime can use block_on()
         let server_runtime = Server::create_runtime("Server", 1, true);
         #[cfg(unix)]
-        let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
+        let (shutdown_type, reload) = server_runtime.get_handle().block_on(self.main_loop());
         #[cfg(windows)]
-        let shutdown_type = ShutdownType::Graceful;
+        let (shutdown_type, reload) = (ShutdownType::Graceful, false);
 
         if matches!(shutdown_type, ShutdownType::Graceful) {
             let exit_timeout = self
@@ -395,7 +450,7 @@ impl Server {
             }
         }
         info!("All runtimes exited, exiting now");
-        std::process::exit(0)
+        Ok(reload)
     }
 
     fn create_runtime(name: &str, threads: usize, work_steal: bool) -> Runtime {
