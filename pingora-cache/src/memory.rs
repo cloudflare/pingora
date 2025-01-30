@@ -206,6 +206,23 @@ impl HandleHit for MemHitHandler {
         }
     }
 
+    fn should_count_access(&self) -> bool {
+        match self {
+            // avoid counting accesses for partial reads to keep things simple
+            Self::Complete(_) => true,
+            Self::Partial(_) => false,
+        }
+    }
+
+    fn get_eviction_weight(&self) -> usize {
+        match self {
+            // FIXME: just body size, also track meta size
+            Self::Complete(c) => c.body.len(),
+            // partial read cannot be estimated since body size is unknown
+            Self::Partial(_) => 0,
+        }
+    }
+
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
         self
     }

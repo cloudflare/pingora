@@ -568,8 +568,10 @@ impl HttpCache {
             if let Some(eviction) = inner.eviction {
                 // TODO: make access() accept CacheKey
                 let cache_key = key.to_compact();
-                // FIXME(PINGORA-1914): get size
-                eviction.access(&cache_key, 0, meta.0.internal.fresh_until);
+                if hit_handler.should_count_access() {
+                    let size = hit_handler.get_eviction_weight();
+                    eviction.access(&cache_key, size, meta.0.internal.fresh_until);
+                }
             }
             inner.meta = Some(meta);
             inner.body_reader = Some(hit_handler);
