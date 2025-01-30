@@ -592,13 +592,14 @@ pub(crate) mod quic_tests {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    pub(crate) fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
+    pub(crate) async fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
+        env_logger::builder()
+            .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
+            .init();
+
+        info!("Starting listener...");
         let port = 6147u16;
         fn inner(port: u16) {
-            env_logger::builder()
-                .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
-                .init();
-
             let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
             let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
 
@@ -627,7 +628,8 @@ pub(crate) mod quic_tests {
         );
         peer.options.set_http_version(3, 3);
 
-        info!("Startup completed..");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        info!("Startup completed.");
         Ok((server_handle, peer))
     }
 

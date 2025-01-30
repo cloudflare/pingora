@@ -377,17 +377,20 @@ mod tests {
     use crate::protocols::l4::quic::MAX_IPV6_QUIC_DATAGRAM_SIZE;
     use crate::upstreams::peer::HttpPeer;
     use bytes::{BufMut, BytesMut};
+    use histogram::{AtomicHistogram, Histogram};
     use http::Version;
-    use log::warn;
+    use log::info;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
+    use std::time::Instant;
+    use textplots::{Chart, Plot, Shape};
     use tokio::task::JoinSet;
 
-    const ITER_SIZE: usize = 128;
+    const ITER_SIZE: usize = 32;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
-        let (_server_handle, peer) = quic_listener_peer()?;
+        let (_server_handle, peer) = quic_listener_peer().await?;
 
         let connector = Connector::new(None);
         let mut session = connector.new_http_session(&peer).await?;
@@ -509,33 +512,122 @@ mod tests {
         assert_eq!(id, h3_5.conn().id());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_connector_sequential_quic_http3() -> Result<()> {
-        let (_server_handle, mut peer) = quic_listener_peer()?;
+        let (_server_handle, mut peer) = quic_listener_peer().await?;
         peer.options.max_h3_streams = 100;
 
+        let mut req_counter = 0usize;
+        let mut histogram =
+            Histogram::new(7, 32).explain_err(InternalError, |_| "failed to crate histogram")?;
+        let timing = Instant::now();
+
         let connector = Connector::new(None);
-        for s in 0..ITER_SIZE * ITER_SIZE {
+        for s in 0..ITER_SIZE.pow(3) {
+            let timer = Instant::now();
             let (mut session, r) = get_session(&connector, &peer).await?;
             debug!("session acquired: {}/{} reused: {}", 0, s, r);
             request(&mut session, &peer).await?;
+            let time_taken = timer.elapsed().as_micros() as u64;
+            histogram
+                .add(time_taken, 1)
+                .explain_err(InternalError, |_| "failed to add to histogram")?;
+            req_counter += 1;
         }
+        assert_eq!(req_counter, ITER_SIZE.pow(3));
+
+        let diff = timing.elapsed();
+        info!("successful requests {}", req_counter);
+        info!("total duration {} milli seconds", diff.as_millis());
+        print_histogram(histogram)?;
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_connector_parallel_quic_http3() -> Result<()> {
-        let (_server_handle, mut peer) = quic_listener_peer()?;
+        let (_server_handle, mut peer) = quic_listener_peer().await?;
         peer.options.max_h3_streams = 10;
+
+        let req_counter = Arc::new(AtomicUsize::new(0));
+        let histogram = Arc::new(
+            AtomicHistogram::new(7, 32)
+                .explain_err(InternalError, |_| "failed to crate histogram")?,
+        );
+        let timing = Instant::now();
+
+        let mut joinset = JoinSet::<Result<usize>>::new();
+        for c in 0..ITER_SIZE / 4 {
+            let peer = peer.clone();
+            let req_counter = req_counter.clone();
+            let histogram = histogram.clone();
+            joinset.spawn(async move {
+                let connector = Connector::new(None);
+                for _s in 0..ITER_SIZE * ITER_SIZE {
+                    let timer = Instant::now();
+                    // always use a new connection
+                    let mut session = connector.new_http_session(&peer).await?;
+                    request(&mut session, &peer).await?;
+
+                    let time_taken = timer.elapsed().as_micros() as u64;
+                    histogram
+                        .add(time_taken, 1)
+                        .explain_err(InternalError, |_| "failed to add to histogram")?;
+                    req_counter.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(c)
+            });
+        }
+
+        let mut seen = [false; ITER_SIZE / 4];
+        while let Some(res) = joinset.join_next().await {
+            let idx = res.unwrap().unwrap();
+            seen[idx] = true;
+        }
+        let diff = timing.elapsed();
+
+        for task in seen.iter() {
+            assert!(task);
+        }
+
+        let req_counter = req_counter.load(Ordering::SeqCst);
+        //assert_eq!(req_counter, ITER_SIZE * ITER_SIZE * 2);
+
+        info!("successful requests {}", req_counter);
+        info!("total duration {} milli seconds", diff.as_millis());
+
+        let histogram = histogram.load();
+        print_histogram(histogram)?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_connector_parallel_sequential_quic_http3() -> Result<()> {
+        let (_server_handle, mut peer) = quic_listener_peer().await?;
+        peer.options.max_h3_streams = 10;
+
+        let req_counter = Arc::new(AtomicUsize::new(0));
+        let histogram = Arc::new(
+            AtomicHistogram::new(7, 32)
+                .explain_err(InternalError, |_| "failed to crate histogram")?,
+        );
+        let timing = Instant::now();
 
         let mut joinset = JoinSet::<Result<usize>>::new();
         for c in 0..ITER_SIZE {
             let peer = peer.clone();
+            let req_counter = req_counter.clone();
+            let histogram = histogram.clone();
             joinset.spawn(async move {
                 let connector = Connector::new(None);
-                for _s in 0..ITER_SIZE {
+                for _s in 0..ITER_SIZE.pow(2) {
+                    let timer = Instant::now();
                     let (mut session, _r) = get_session(&connector, &peer).await?;
                     request(&mut session, &peer).await?;
+                    let time_taken = timer.elapsed().as_micros() as u64;
+                    histogram
+                        .add(time_taken, 1)
+                        .explain_err(InternalError, |_| "failed to add to histogram")?;
+                    req_counter.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(c)
             });
@@ -546,16 +638,66 @@ mod tests {
             let idx = res.unwrap().unwrap();
             seen[idx] = true;
         }
+        let diff = timing.elapsed();
 
         for task in seen.iter() {
             assert!(task);
         }
+
+        let req_counter = req_counter.load(Ordering::SeqCst);
+        assert_eq!(req_counter, ITER_SIZE.pow(3));
+
+        info!("successful requests {}", req_counter);
+        info!("total duration {} milli seconds", diff.as_millis());
+
+        let histogram = histogram.load();
+        print_histogram(histogram)?;
+        Ok(())
+    }
+
+    // requires cargo --nocapture
+    fn print_histogram(histogram: Histogram) -> Result<()> {
+        let log_percentiles = [50f64, 75f64, 80f64, 90f64, 95f64, 99f64];
+        let mut percentile_values = vec![];
+        for i in 1..100 {
+            percentile_values.push(f64::from(i))
+        }
+
+        let percentiles = histogram
+            .percentiles(percentile_values.as_slice())
+            .explain_err(InternalError, |_| "failed to generate percentiles")?
+            .unwrap();
+
+        let mut points_duration = vec![];
+        let mut points_amount = vec![];
+        info!("percentiles:");
+        for (percentile, bucket) in percentiles {
+            let range_start = *bucket.range().start() as f32 / 1000f32;
+            let range_end = *bucket.range().end() as f32 / 1000f32;
+
+            if log_percentiles.contains(&percentile) {
+                info!("{}th = {}ms - {}ms", percentile, range_start, range_end)
+            }
+
+            points_duration.push((percentile as f32, (range_start + range_end) / 2f32));
+            points_amount.push((percentile as f32, bucket.count() as f32));
+        }
+
+        println!("x = percentiles, y = milliseconds");
+        Chart::new(200, 100, 0.0, 100.0)
+            .lineplot(&Shape::Lines(&points_duration))
+            .nice();
+
+        println!("x = percentiles, y = requests");
+        Chart::new(200, 100, 0.0, 100.0)
+            .lineplot(&Shape::Lines(&points_amount))
+            .nice();
+
         Ok(())
     }
 
     async fn get_session(connector: &Connector, peer: &HttpPeer) -> Result<(HttpSession, bool)> {
         if let Some(h3) = connector.reused_http_session(peer).await? {
-            warn!("reused session is some");
             Ok((HttpSession::H3(h3), true))
         } else {
             let session = connector.new_http_session(peer).await?;

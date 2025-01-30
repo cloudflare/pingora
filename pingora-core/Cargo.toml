@@ -88,6 +88,8 @@ h3i = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca" }
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 jemallocator = "0.5"
+histogram = "0.11"
+textplots = "0.8"
 
 [features]
 default = ["boringssl"]

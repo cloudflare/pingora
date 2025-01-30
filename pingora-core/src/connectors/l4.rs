@@ -675,7 +675,7 @@ mod quic_tests {
 
     #[tokio::test]
     async fn test_connector_quic_handshake() -> Result<()> {
-        let (_server_handle, peer) = quic_listener_peer()?;
+        let (_server_handle, peer) = quic_listener_peer().await?;
 
         let mut pre_handshake_stream = connect(&peer, None).await?;
         assert!(pre_handshake_stream.quic_connection_state().is_some());
