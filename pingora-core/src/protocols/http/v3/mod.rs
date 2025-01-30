@@ -349,7 +349,7 @@ impl ConnectionIo {
                                 self.conn_id(), sessions.len());
                         }
                         let mut qconn = self.quic.lock();
-                        // closes connection
+                        // potentially closes connection
                         qconn.on_timeout();
                         if let Some(timeout) = timeout {
                             debug!("connection {:?} timed out {:?}", self.conn_id(), timeout);
@@ -359,7 +359,7 @@ impl ConnectionIo {
                 Ok(true) // signal continue
             }
             _ => {
-                // If an error occurs while processing data, the connection is closed with
+                // if an error occurs while processing data, the connection is closed with
                 // the appropriate error code, using the transport’s close() method.
 
                 // send the close() event

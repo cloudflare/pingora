@@ -591,7 +591,6 @@ mod tests {
                     histogram
                         .add(time_taken, 1)
                         .explain_err(InternalError, |_| "failed to add to histogram")?;
-                    req_counter.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(c)
             });

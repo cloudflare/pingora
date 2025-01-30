@@ -101,6 +101,7 @@ impl ConnectionRx {
         let mut buf = [0u8; MAX_IPV6_BUF_SIZE];
         debug!("connection {:?} rx read", conn_id);
         'read: loop {
+            // TODO: replace with recv.await()
             let (size, recv_info) = match socket.try_recv_from(&mut buf) {
                 Ok((size, from)) => {
                     trace!(

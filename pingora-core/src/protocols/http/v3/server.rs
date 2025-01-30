@@ -89,6 +89,7 @@ pub(crate) async fn handshake(
         }
     };
 
+    debug!("connection {:?} http3 handshake finished", conn_io.id);
     Ok(Http3Connection {
         _l4stream: io,
 

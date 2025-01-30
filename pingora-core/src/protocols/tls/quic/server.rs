@@ -309,7 +309,8 @@ async fn handshake_inner(
     };
 
     {
-        // hold the lock while draining the channel to avoid pkt receiving issues during establishing the handle
+        // hold the lock while draining the channel
+        // avoid pkt receiving issues during establishing
         let mut resp = response.lock();
         'drain: loop {
             if !udp_rx.is_empty() {

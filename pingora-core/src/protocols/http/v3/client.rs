@@ -460,23 +460,15 @@ pub(crate) struct Http3Poll {
 
 impl Http3Poll {
     pub(crate) async fn start(mut self) -> Result<()> {
-        let conn_id = self.conn_io.id.clone();
         'poll: loop {
-            let res = {
+            let poll = {
                 let mut qconn = self.conn_io.quic.lock();
-                if qconn.is_closed() {
-                    self.idle_close.send_replace(true);
-                    break 'poll Err(Error::explain(
-                        H3Error,
-                        format!("quic connection {:?} is closed stopping", conn_id),
-                    ));
-                }
-
                 let mut hconn = self.conn_io.http3.lock();
+                // NOTE: poll() drives the entire Quic/HTTP3 connection
                 hconn.poll(&mut qconn)
             };
 
-            let (stream_id, ev) = match res {
+            let (stream_id, ev) = match poll {
                 Ok((stream, ev)) => (stream, ev),
                 Err(e) => {
                     let conn_id = self.conn_id().clone();
@@ -503,6 +495,7 @@ impl Http3Poll {
                     if conn_alive {
                         continue 'poll;
                     } else {
+                        self.idle_close.send_replace(true);
                         break 'poll Ok(());
                     }
                 }
@@ -516,7 +509,11 @@ impl Http3Poll {
                 let Some(session) = self.sessions.get_mut(&stream_id) else {
                     return Err(Error::explain(
                         InternalError,
-                        format!("missing session channel for stream id {}", stream_id),
+                        format!(
+                            "connection {:?} missing session channel for stream {}",
+                            self.conn_io.conn_id(),
+                            stream_id
+                        ),
                     ));
                 };
                 session

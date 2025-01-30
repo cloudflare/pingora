@@ -634,21 +634,23 @@ pub(crate) fn handle_connection_errors(
     peer_error: Option<&quiche::ConnectionError>,
 ) -> Result<()> {
     if let Some(e) = local_error {
-        error!(
+        let error_msg = format!(
             "connection {:?} local error {}",
             conn_id,
-            String::from_utf8_lossy(e.reason.as_slice()).to_string()
+            String::from_utf8_lossy(e.reason.as_slice())
         );
-        return Err(e).explain_err(ConnectionClosed, |_| "local connection error");
+        debug!("{}", error_msg);
+        return Err(e).explain_err(ConnectionClosed, |_| error_msg);
     }
 
     if let Some(e) = peer_error {
-        error!(
+        let error_msg = format!(
             "connection {:?} peer error {}",
             conn_id,
-            String::from_utf8_lossy(e.reason.as_slice()).to_string()
+            String::from_utf8_lossy(e.reason.as_slice())
         );
-        return Err(e).explain_err(ConnectionClosed, |_| "peer connection error");
+        debug!("{}", error_msg);
+        return Err(e).explain_err(ConnectionClosed, |_| error_msg);
     }
 
     Ok(())
