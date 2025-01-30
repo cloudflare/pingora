@@ -350,7 +350,7 @@ impl QuicHttp3Configs {
         // TODO: usable for mTLS?
         // quic.verify_peer(); default server = false; client = true
 
-        quic.set_max_idle_timeout(60 * 1000); // default ulimited
+        quic.set_max_idle_timeout(5 * 1000); // default ulimited
         quic.set_max_recv_udp_payload_size(MAX_IPV6_BUF_SIZE); // recv default is 65527
         quic.set_max_send_udp_payload_size(MAX_IPV6_QUIC_DATAGRAM_SIZE); // send default is 1200
         quic.set_initial_max_data(10_000_000); // 10 Mb

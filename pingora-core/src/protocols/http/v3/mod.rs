@@ -169,6 +169,11 @@ impl ConnectionIo {
         debug_assert_eq!(sent_len, data.len());
 
         if end {
+            trace!(
+                "connection {:?} sent FIN flag for stream id {}",
+                self.conn_id(),
+                stream_id
+            );
             self.tx_notify.notify_waiters();
         }
 
@@ -193,7 +198,11 @@ impl ConnectionIo {
             |e| format! {"Writing h3 request body finished to downstream failed. {e}"},
         )?;
         self.tx_notify.notify_waiters();
-        trace!("sent FIN flag for stream id {}", stream_id);
+        trace!(
+            "connection {:?} sent FIN flag for stream id {}",
+            self.conn_id(),
+            stream_id
+        );
         Ok(())
     }
 
@@ -211,11 +220,15 @@ impl ConnectionIo {
                         break true;
                     }
                 }
-                Err(quiche::h3::Error::Done) => {
+                Err(h3::Error::Done) => {
                     // poll for next Http3 event
                     // Event::Finished is only emitted after recv_body is Done
                     self.rx_notify.notify_waiters();
-                    trace!("read_body done");
+                    trace!(
+                        "connection {:?} reading body for stream {} done",
+                        self.conn_id(),
+                        stream_id
+                    );
                     break false;
                 }
                 Err(e) => {
@@ -274,6 +287,9 @@ impl ConnectionIo {
         D: FnMut(&mut StreamIdHashMap<Sender<Event>>),
         A: FnMut(&mut StreamIdHashMap<Sender<Event>>),
     {
+        // register before housekeeping to avoid notify misses in high-load scenarios
+        let data_future = self.rx_notify.notified();
+
         match error {
             h3::Error::Done => {
                 debug!("H3 connection {:?} no events available", self.conn_id());
@@ -314,8 +330,10 @@ impl ConnectionIo {
                 }
 
                 // race for new data on connection or timeout
-                tokio::select! {
-                    _data = self.rx_notify.notified() => { /* continue */ }
+                tokio::select! { /* biased, poll data first */
+                    // to avoid timeout race wins in high load scenarios when data could be available
+                    biased;
+                    _data = data_future => { /* continue */ }
                     _timedout = async {
                         if let Some(timeout) = timeout {
                             debug!("connection {:?} timeout {:?}", self.conn_id(), timeout);
@@ -567,7 +585,10 @@ async fn data_finished_event(stream_id: u64, event_rx: &mut Receiver<Event>) -> 
             None => {
                 return Err(Error::explain(
                     ReadError,
-                    "H3 session event channel disconnected",
+                    format!(
+                        "H3 session event channel disconnected fn {} stream {}",
+                        "data_finished_event", stream_id
+                    ),
                 ))
             }
         }

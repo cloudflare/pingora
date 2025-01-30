@@ -381,6 +381,9 @@ mod tests {
     use log::warn;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
+    use tokio::task::JoinSet;
+
+    const ITER_SIZE: usize = 128;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
@@ -512,11 +515,40 @@ mod tests {
         peer.options.max_h3_streams = 100;
 
         let connector = Connector::new(None);
-        let sample_size = 1000;
-        for s in 0..sample_size {
+        for s in 0..ITER_SIZE * ITER_SIZE {
             let (mut session, r) = get_session(&connector, &peer).await?;
-            warn!("session acquired: {}/{} reused: {}", 0, s, r);
+            debug!("session acquired: {}/{} reused: {}", 0, s, r);
             request(&mut session, &peer).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connector_parallel_quic_http3() -> Result<()> {
+        let (_server_handle, mut peer) = quic_listener_peer()?;
+        peer.options.max_h3_streams = 10;
+
+        let mut joinset = JoinSet::<Result<usize>>::new();
+        for c in 0..ITER_SIZE {
+            let peer = peer.clone();
+            joinset.spawn(async move {
+                let connector = Connector::new(None);
+                for _s in 0..ITER_SIZE {
+                    let (mut session, _r) = get_session(&connector, &peer).await?;
+                    request(&mut session, &peer).await?;
+                }
+                Ok(c)
+            });
+        }
+
+        let mut seen = [false; ITER_SIZE];
+        while let Some(res) = joinset.join_next().await {
+            let idx = res.unwrap().unwrap();
+            seen[idx] = true;
+        }
+
+        for task in seen.iter() {
+            assert!(task);
         }
         Ok(())
     }
@@ -540,16 +572,25 @@ mod tests {
         let mut body_send = BytesMut::new();
         body_send.put(body_string.as_bytes());
 
-        warn!("write_request_header");
+        debug!("write_request_header");
         session.write_request_header(Box::new(req)).await?;
-        warn!("write_request_body");
+        let h3_session = session.as_http3().unwrap();
+        let conn = h3_session.conn();
+        let stream_id = session.as_http3().unwrap().stream_id()?;
+
+        debug!(
+            "connection={:?} stream={}",
+            conn.conn_id(),
+            h3_session.stream_id()?
+        );
         session
             .write_request_body(body_send.freeze(), false)
             .await?;
-        warn!("finish_request_body");
+        debug!("write_request_body");
         session.finish_request_body().await?;
-        warn!("read_response_header");
+        debug!("finish_request_body {}", stream_id);
         session.read_response_header().await?;
+        debug!("read_response_header");
 
         let resp = session.response_header();
         assert!(resp.is_some());

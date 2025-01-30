@@ -198,7 +198,9 @@ impl Http3Session {
         };
 
         let read_timeout = self.read_timeout;
-        tokio::select! {
+        tokio::select! { /* biased, poll data first */
+            // to avoid timeout race wins in high load scenarios when data could be available
+            biased;
             res = headers_event(self.stream_id()?, self.event_rx()?) => {
                 let (headers, _) = res?;
                 let map = event_to_response_headers(&headers)?;
@@ -212,7 +214,7 @@ impl Http3Session {
         Ok(())
     }
 
-    fn stream_id(&self) -> Result<u64> {
+    pub(crate) fn stream_id(&self) -> Result<u64> {
         let Some(stream_id) = self.stream_id else {
             return Err(Error::explain(H3Error, "stream id not present"));
         };
@@ -235,7 +237,9 @@ impl Http3Session {
         }
 
         let read_timeout = self.read_timeout;
-        tokio::select! {
+        tokio::select! { /* biased, poll data first */
+            // to avoid timeout race wins in high load scenarios when data could be available
+            biased;
             res = async {
                 if !self.read_continue {
                     data_finished_event(self.stream_id()?, self.event_rx()?).await
@@ -316,7 +320,9 @@ impl Http3Session {
         // only possible when supported by the version of HTTP in use and enabled by an explicit
         // framing mechanism
         let read_timeout = self.read_timeout;
-        let trailer_map = tokio::select! {
+        let trailer_map = tokio::select! { /* biased, poll data first */
+            // to avoid timeout race wins in high load scenarios when data could be available
+            biased;
             res = headers_event(self.stream_id()?, self.event_rx()?) => {
                 let (trailers, _) = res?;
                 headervec_to_headermap(&trailers)?

@@ -80,9 +80,10 @@ async fn test_listener_quic_http3() -> Result<()> {
     utils::init();
     info!("Startup completed..");
 
+    let host = "openrusty.org";
     let config = Config::new()
         .with_connect_to("127.0.0.1:6147".to_string())
-        .with_host_port("openrusty.org:6147".to_string())
+        .with_host_port(format!("{}:6147", host))
         .with_idle_timeout(2000)
         .verify_peer(false)
         .build()
@@ -92,7 +93,7 @@ async fn test_listener_quic_http3() -> Result<()> {
     let headers = vec![
         Header::new(b":method", b"POST"),
         Header::new(b":scheme", b"https"),
-        Header::new(b":authority", b"openrusty.org"),
+        Header::new(b":authority", host.as_bytes()),
         Header::new(b":path", b"/"),
         Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];
@@ -162,9 +163,10 @@ async fn test_listener_quic_http3_timeout() -> Result<()> {
     utils::init();
     info!("Startup completed..");
 
+    let host = "openrusty.org";
     let config = Config::new()
         .with_connect_to("127.0.0.1:6147".to_string())
-        .with_host_port("openrusty.org:6147".to_string())
+        .with_host_port(format!("{}:6147", host))
         .with_idle_timeout(3000)
         .verify_peer(false)
         .build()
@@ -174,7 +176,7 @@ async fn test_listener_quic_http3_timeout() -> Result<()> {
     let headers = vec![
         Header::new(b":method", b"POST"),
         Header::new(b":scheme", b"https"),
-        Header::new(b":authority", b"openrusty.org"),
+        Header::new(b":authority", host.as_bytes()),
         Header::new(b":path", b"/"),
         Header::new(b"content-length", body.len().to_string().as_bytes()),
     ];

@@ -342,7 +342,9 @@ impl Http3Session {
                                     )
                                 };
 
-                                conn.max_accepted_stream_id = session.stream_id;
+                                if session.stream_id > conn.max_accepted_stream_id {
+                                    conn.max_accepted_stream_id = session.stream_id;
+                                }
                                 return Ok(Some(session));
                             }
                         }
@@ -592,7 +594,10 @@ impl Http3Session {
                 None => {
                     return Err(Error::explain(
                         ReadError,
-                        "H3 session event channel disconnected",
+                        format!(
+                            "H3 session event channel disconnected fn {} stream {}",
+                            "reset_event", self.stream_id
+                        ),
                     ))
                 }
             }

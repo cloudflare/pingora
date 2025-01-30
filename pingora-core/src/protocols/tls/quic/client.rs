@@ -22,7 +22,7 @@ use crate::protocols::l4::quic::{
 };
 use crate::protocols::IO;
 use crate::upstreams::peer::Peer;
-use log::{info, trace};
+use log::{debug, trace};
 use parking_lot::Mutex;
 use pingora_error::ErrorType::HandshakeError;
 use pingora_error::{Error, ErrorType, OrErr};
@@ -121,7 +121,7 @@ where
             format!("failed to generate initial handshake packet {:?}", e)
         })?
     };
-    info!(
+    debug!(
         "connection {:?} outgoing from {:} to {:}",
         conn_id, local_addr, peer_addr
     );
