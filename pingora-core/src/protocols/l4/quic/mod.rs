@@ -357,6 +357,8 @@ impl QuicHttp3Configs {
         quic.set_initial_max_stream_data_bidi_local(1_000_000); // 1 Mb
         quic.set_initial_max_stream_data_bidi_remote(1_000_000); // 1 Mb
         quic.set_initial_max_stream_data_uni(1_000_000); // 1 Mb
+
+        // TODO: config through peer.options.max_h3_streams
         quic.set_initial_max_streams_bidi(100);
         quic.set_initial_max_streams_uni(100);
 

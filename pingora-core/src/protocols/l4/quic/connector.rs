@@ -135,8 +135,8 @@ impl ConnectionRx {
                 match conn.recv(&mut buf[..size], recv_info) {
                     Ok(_size) => {
                         debug!("connection {:?} received {}", conn_id, size);
-                        self.tx_notify.notify_waiters();
                         self.rx_notify.notify_waiters();
+                        self.tx_notify.notify_waiters();
                     }
                     Err(e) => {
                         // If an error occurs while processing data, the connection is closed with

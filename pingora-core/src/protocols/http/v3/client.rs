@@ -84,6 +84,7 @@ impl Http3Session {
 impl Drop for Http3Session {
     fn drop(&mut self) {
         // TODO: clarify if a RESET_STREAM should be sent
+        // drop session in case initialized
         if let Some(stream_id) = self.stream_id {
             self.conn.drop_session(stream_id);
             debug!(
@@ -92,6 +93,7 @@ impl Drop for Http3Session {
                 stream_id
             )
         }
+        // always decrease counter
         self.conn.release_stream();
     }
 }
@@ -115,7 +117,7 @@ impl Http3Session {
     }
 
     /// Write the request header to the server
-    pub async fn write_request_header(&mut self, req: Box<RequestHeader>) -> Result<()> {
+    pub fn write_request_header(&mut self, req: Box<RequestHeader>) -> Result<()> {
         if self.request_header_written.is_some() {
             // cannot send again
             warn!("request not sent as session already sent a request");
@@ -123,17 +125,13 @@ impl Http3Session {
         }
 
         let headers = request_headers_to_event(&req)?;
-        self.send_request(&headers, false).await?;
+        self.send_request(&headers, false)?;
 
         self.request_header_written = Some(req);
         Ok(())
     }
 
-    async fn send_request<T: NameValue + Debug>(
-        &mut self,
-        headers: &[T],
-        fin: bool,
-    ) -> Result<u64> {
+    fn send_request<T: NameValue + Debug>(&mut self, headers: &[T], fin: bool) -> Result<u64> {
         // sending the request creates the underlying quic stream & according stream id
         // it is not possible to check the stream capacity before sending the request
         let stream_id = {

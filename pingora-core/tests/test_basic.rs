@@ -153,7 +153,7 @@ async fn test_listener_quic_http3() -> Result<()> {
     assert_eq!(content_type, &b"text/html".to_vec());
     assert_eq!(content_length, &body.len().to_string().as_bytes().to_vec());
     assert_eq!(resp_body[0], body.as_slice().to_vec());
-
+    tokio::time::sleep(Duration::MAX).await;
     Ok(())
 }
 

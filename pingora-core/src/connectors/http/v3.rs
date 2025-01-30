@@ -91,7 +91,6 @@ impl ConnectionRef {
     }
 
     pub(crate) fn drop_session(&self, stream_id: u64) {
-        self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
         let mut drop_sessions = self.0.drop_sessions.lock();
         drop_sessions.push_back(stream_id);
     }
@@ -379,6 +378,7 @@ mod tests {
     use crate::upstreams::peer::HttpPeer;
     use bytes::{BufMut, BytesMut};
     use http::Version;
+    use log::warn;
     use pingora_error::Result;
     use pingora_http::RequestHeader;
 
@@ -504,5 +504,66 @@ mod tests {
         // all streams are released, now the connection is idle
         let h3_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h3_5.conn().id());
+    }
+
+    #[tokio::test]
+    async fn test_connector_sequential_quic_http3() -> Result<()> {
+        let (_server_handle, mut peer) = quic_listener_peer()?;
+        peer.options.max_h3_streams = 100;
+
+        let connector = Connector::new(None);
+        let sample_size = 1000;
+        for s in 0..sample_size {
+            let (mut session, r) = get_session(&connector, &peer).await?;
+            warn!("session acquired: {}/{} reused: {}", 0, s, r);
+            request(&mut session, &peer).await?;
+        }
+        Ok(())
+    }
+
+    async fn get_session(connector: &Connector, peer: &HttpPeer) -> Result<(HttpSession, bool)> {
+        if let Some(h3) = connector.reused_http_session(peer).await? {
+            warn!("reused session is some");
+            Ok((HttpSession::H3(h3), true))
+        } else {
+            let session = connector.new_http_session(peer).await?;
+            Ok((session, false))
+        }
+    }
+
+    async fn request(session: &mut HttpSession, peer: &HttpPeer) -> Result<()> {
+        let mut req = RequestHeader::build("GET", b"/", Some(3))?;
+        req.insert_header(http::header::HOST, peer.sni())?;
+
+        let body_base = "hello world\n";
+        let body_string = body_base.to_string();
+        let mut body_send = BytesMut::new();
+        body_send.put(body_string.as_bytes());
+
+        warn!("write_request_header");
+        session.write_request_header(Box::new(req)).await?;
+        warn!("write_request_body");
+        session
+            .write_request_body(body_send.freeze(), false)
+            .await?;
+        warn!("finish_request_body");
+        session.finish_request_body().await?;
+        warn!("read_response_header");
+        session.read_response_header().await?;
+
+        let resp = session.response_header();
+        assert!(resp.is_some());
+        if let Some(resp) = resp {
+            assert_eq!(resp.status.as_str(), "200");
+            assert_eq!(resp.version, Version::HTTP_3);
+        }
+
+        let mut resp_body = BytesMut::new();
+        while let Some(body) = session.read_response_body().await? {
+            assert!(body.len() < MAX_IPV6_QUIC_DATAGRAM_SIZE * 64);
+            resp_body.put(body)
+        }
+        assert_eq!(resp_body.as_ref(), body_string.as_bytes());
+        Ok(())
     }
 }
