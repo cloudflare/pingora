@@ -1194,8 +1194,14 @@ impl HttpCache {
                     .storage
                     .purge(&key, PurgeType::Invalidation, &span.handle())
                     .await;
-                // FIXME: also need to remove from eviction manager
-                span.set_tag(|| trace::Tag::new("purged", matches!(result, Ok(true))));
+                let purged = matches!(result, Ok(true));
+                // need to inform eviction manager if asset was removed
+                if let Some(eviction) = inner.eviction.as_ref() {
+                    if purged {
+                        eviction.remove(&key);
+                    }
+                }
+                span.set_tag(|| trace::Tag::new("purged", purged));
                 result
             }
             _ => panic!("wrong phase {:?}", self.phase),
