@@ -170,7 +170,7 @@ impl ConnectionIo {
 
         if end {
             trace!(
-                "connection {:?} sent FIN flag for stream id {}",
+                "connection {:?} sent FIN flag for stream {} body",
                 self.conn_id(),
                 stream_id
             );
@@ -199,7 +199,7 @@ impl ConnectionIo {
         )?;
         self.tx_notify.notify_waiters();
         trace!(
-            "connection {:?} sent FIN flag for stream id {}",
+            "connection {:?} sent FIN flag for stream {} finish",
             self.conn_id(),
             stream_id
         );

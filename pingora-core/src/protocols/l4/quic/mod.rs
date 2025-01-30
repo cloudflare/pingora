@@ -34,7 +34,6 @@ use std::task::{Context, Poll};
 use std::{io, mem};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
 
 pub(crate) mod connector;
@@ -462,38 +461,15 @@ impl Connection {
         }
         match self {
             Connection::IncomingHandshake(s) => {
-                'drain: loop {
-                    match s.udp_rx.try_recv() {
-                        Ok(mut dgram) => {
-                            let mut conn = state.connection.lock();
-                            conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
-                                .explain_err(ErrorType::HandshakeError, |_| {
-                                    "receiving dgram failed"
-                                })?;
-                            debug!(
-                                "connection {:?} dgram received while establishing",
-                                s.connection_id
-                            )
-                        }
-                        Err(e) => {
-                            match e {
-                                TryRecvError::Empty => {
-                                    // stop accepting packets
-                                    s.udp_rx.close();
-                                }
-                                TryRecvError::Disconnected => {
-                                    // remote already closed channel
-                                }
-                            }
-                            break 'drain;
-                        }
-                    }
+                if !s.udp_rx.is_empty() {
+                    error!(
+                        "connection {:?} established udp_rx={}",
+                        state.connection_id,
+                        s.udp_rx.len()
+                    );
+                } else {
+                    debug!("connection {:?} established", state.connection_id);
                 }
-                debug_assert!(
-                    s.udp_rx.is_empty(),
-                    "udp rx channel must be empty when establishing the connection"
-                );
-                debug!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::IncomingEstablished(state));
                 Ok(())
             }

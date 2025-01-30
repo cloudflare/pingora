@@ -30,6 +30,7 @@ use quiche::ConnectionId;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::Notify;
 
 pub(crate) async fn handshake(mut stream: L4Stream) -> pingora_error::Result<L4Stream> {
@@ -298,11 +299,8 @@ async fn handshake_inner(
     let tx_notify = Arc::new(Notify::new());
     let rx_notify = Arc::new(Notify::new());
 
-    debug!(
-        "connection {:?} handshake successful, udp_rx {}",
-        conn_id,
-        udp_rx.len()
-    );
+    debug!("connection {:?} handshake successful", conn_id);
+
     let handle = EstablishedHandle {
         connection_id: conn_id.clone(),
         connection: connection.clone(),
@@ -311,9 +309,45 @@ async fn handshake_inner(
     };
 
     {
+        // hold the lock while draining the channel to avoid pkt receiving issues during establishing the handle
         let mut resp = response.lock();
+        'drain: loop {
+            if !udp_rx.is_empty() {
+                error!(
+                    "connection {:?} established udp_rx {}",
+                    conn_id,
+                    udp_rx.len()
+                );
+            }
+            match udp_rx.try_recv() {
+                Ok(mut dgram) => {
+                    let mut conn = connection.lock();
+                    conn.recv(dgram.pkt.as_mut_slice(), dgram.recv_info)
+                        .explain_err(ErrorType::HandshakeError, |_| "receiving dgram failed")?;
+                    debug!("connection {:?} dgram received while establishing", conn_id)
+                }
+                Err(e) => {
+                    match e {
+                        TryRecvError::Empty => break 'drain,
+                        TryRecvError::Disconnected => {
+                            // remote already closed channel
+                            // not an issue, HandshakeResponse already processed
+                            error!("connection {:?} channel disconnected", conn_id)
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            udp_rx.len(),
+            0,
+            "udp rx channel must be empty when establishing the connection"
+        );
         *resp = Some(HandshakeResponse::Established(handle));
     }
+    // release the lock, next packet will be received on the connection
+    // the Listener::accept() needs to hold the lock while writing to the udp_tx channel
 
     let tx = ConnectionTx {
         socket_details: socket_details.clone(),
@@ -333,13 +367,11 @@ async fn handshake_inner(
         rx_notify: rx_notify.clone(),
         tx_notify: tx_notify.clone(),
 
-        tx_handle: tokio::spawn(tx.start()),
+        tx_handle: tokio::spawn(tx.start()), // sends HANDSHAKE_DONE Quic frame on established connection
         drop_connection: drop_connection.clone(),
         socket: socket.clone(),
     };
 
-    // send HANDSHAKE_DONE Quic frame on established connection
-    e_state.tx_notify.notify_waiters();
     Ok(Some(e_state))
 }
 

@@ -440,7 +440,10 @@ async fn headers_event(
             None => {
                 return Err(Error::explain(
                     ReadError,
-                    "H3 session event channel disconnected",
+                    format!(
+                        "H3 session event channel disconnected fn {} stream {}",
+                        "headers_event", stream_id
+                    ),
                 ))
             }
         }
@@ -544,11 +547,11 @@ fn housekeeping_add_sessions(
                     "connection {:?} stream {} was already present in sessions",
                     conn_id, stream_id
                 );
-                debug_assert!(false)
+                debug_assert!(false, "session already present")
             }
             None => {
                 debug!(
-                    "connection {:?} added stream id {} to sessions",
+                    "connection {:?} added stream {} to sessions",
                     conn_id, stream_id
                 )
             }

@@ -147,18 +147,7 @@ impl Listener {
         debug!("endpoint rx loop");
         'read: loop {
             // receive from network and parse Quic header
-            let (size, from) = match self.socket_details.io.try_recv_from(&mut rx_buf) {
-                Ok((size, from)) => (size, from),
-                Err(e) => {
-                    if e.kind() == ErrorKind::WouldBlock {
-                        // no more UDP packets to read for now, wait  for new packets
-                        self.socket_details.io.readable().await?;
-                        continue 'read;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+            let (size, from) = self.socket_details.io.recv_from(&mut rx_buf).await?;
 
             // cleanup connections
             {
@@ -196,7 +185,6 @@ impl Listener {
             };
 
             let mut conn_id = header.dcid.clone();
-            let mut udp_tx = None;
             let mut established_handle = None;
             // send to corresponding connection
             let mut handle;
@@ -221,28 +209,47 @@ impl Listener {
                 let mut needs_establish = None;
                 match handle {
                     IncomingConnectionHandle::Handshake(i) => {
-                        let resp;
                         {
-                            resp = i.response.lock().take();
-                        }
-                        if let Some(resp) = resp {
-                            match resp {
-                                HandshakeResponse::Established(e) => {
-                                    debug!(
-                                        "connection {:?} received HandshakeResponse::Established",
-                                        conn_id
-                                    );
-                                    established_handle = Some(e.clone());
-                                    needs_establish = Some(e);
+                            // hold on to the lock while writing to udp_tx to avoid dropping packets
+                            // during establishing the connection
+                            let mut resp = i.response.lock();
+                            if let Some(resp) = resp.take() {
+                                match resp {
+                                    HandshakeResponse::Established(e) => {
+                                        debug!(
+                                            "connection {:?} received HandshakeResponse::Established",
+                                            conn_id
+                                        );
+                                        // receive data into existing connection
+                                        established_handle = Some(e.clone());
+                                        needs_establish = Some(e);
+                                    }
+                                    HandshakeResponse::Ignored => {
+                                        // drop connection
+                                        //self.connections.remove(&header.dcid);
+                                        let mut drop_connections = self.drop_connections.lock();
+                                        drop_connections.push_back(header.dcid);
+                                        continue 'read;
+                                    }
                                 }
-                                HandshakeResponse::Ignored => {
-                                    // drop connection
-                                    self.connections.remove(&header.dcid);
-                                    continue 'read;
+                            } else {
+                                // receive data on UDP channel
+                                // use try_send as sync method to avoid await point while holding lock
+                                match i.udp_tx
+                                    .try_send(UdpRecv {
+                                        pkt: rx_buf[..size].to_vec(),
+                                        header,
+                                        recv_info,
+                                    })
+                                {
+                                    Ok(()) => {}
+                                    Err(e) => warn!(
+                                        "sending dgram to connection {:?} failed with error: {}, dropping dgram",
+                                        conn_id, e
+                                    ),
                                 }
+                                continue 'read;
                             }
-                        } else {
-                            udp_tx = Some(i.udp_tx.clone());
                         }
                     }
                     IncomingConnectionHandle::Established(e) => {
@@ -273,25 +280,6 @@ impl Listener {
                         break 'read Err(e);
                     }
                 }
-            }
-
-            // receive data on UDP channel
-            if let Some(udp_tx) = udp_tx {
-                match udp_tx
-                    .send(UdpRecv {
-                        pkt: rx_buf[..size].to_vec(),
-                        header,
-                        recv_info,
-                    })
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => warn!(
-                        "sending dgram to connection {:?} failed with error: {}",
-                        conn_id, e
-                    ),
-                }
-                continue 'read;
             }
 
             if header.ty != Type::Initial {

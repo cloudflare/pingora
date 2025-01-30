@@ -379,14 +379,15 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use histogram::{AtomicHistogram, Histogram};
     use http::Version;
-    use log::info;
-    use pingora_error::Result;
+    use log::{error, info};
+    use pingora_error::{ErrorType, Result};
     use pingora_http::RequestHeader;
+    use std::net::SocketAddr;
     use std::time::Instant;
     use textplots::{Chart, Plot, Shape};
     use tokio::task::JoinSet;
 
-    const ITER_SIZE: usize = 32;
+    const ITER_SIZE: usize = 42;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
@@ -549,6 +550,7 @@ mod tests {
         peer.options.max_h3_streams = 10;
 
         let req_counter = Arc::new(AtomicUsize::new(0));
+        let failed_req_counter = Arc::new(AtomicUsize::new(0));
         let histogram = Arc::new(
             AtomicHistogram::new(7, 32)
                 .explain_err(InternalError, |_| "failed to crate histogram")?,
@@ -556,17 +558,34 @@ mod tests {
         let timing = Instant::now();
 
         let mut joinset = JoinSet::<Result<usize>>::new();
-        for c in 0..ITER_SIZE / 4 {
+        for c in 0..ITER_SIZE {
             let peer = peer.clone();
             let req_counter = req_counter.clone();
+            let failed_req_counter = failed_req_counter.clone();
             let histogram = histogram.clone();
             joinset.spawn(async move {
-                let connector = Connector::new(None);
+                let mut options = ConnectorOptions::new(128);
+                let socket_addr: SocketAddr = format!("127.0.0.{}:0", c)
+                    .parse()
+                    .explain_err(ErrorType::BindError, |_| "failed to parse socket addr")?;
+                options.bind_to_v4 = vec![socket_addr];
+                let connector = Connector::new(Some(options));
+
                 for _s in 0..ITER_SIZE * ITER_SIZE {
                     let timer = Instant::now();
                     // always use a new connection
-                    let mut session = connector.new_http_session(&peer).await?;
-                    request(&mut session, &peer).await?;
+                    let mut session = match connector.new_http_session(&peer).await {
+                        Ok(session) => session,
+                        Err(e) => {
+                            failed_req_counter.fetch_add(1, Ordering::SeqCst);
+                            error!("{}", e);
+                            continue;
+                        }
+                    };
+                    match request(&mut session, &peer).await {
+                        Ok(_) => req_counter.fetch_add(1, Ordering::SeqCst),
+                        Err(_) => failed_req_counter.fetch_add(1, Ordering::SeqCst),
+                    };
 
                     let time_taken = timer.elapsed().as_micros() as u64;
                     histogram
@@ -578,7 +597,7 @@ mod tests {
             });
         }
 
-        let mut seen = [false; ITER_SIZE / 4];
+        let mut seen = [false; ITER_SIZE];
         while let Some(res) = joinset.join_next().await {
             let idx = res.unwrap().unwrap();
             seen[idx] = true;
@@ -590,9 +609,11 @@ mod tests {
         }
 
         let req_counter = req_counter.load(Ordering::SeqCst);
+        let failed_req_counter = failed_req_counter.load(Ordering::SeqCst);
         //assert_eq!(req_counter, ITER_SIZE * ITER_SIZE * 2);
 
         info!("successful requests {}", req_counter);
+        info!("failed requests {}", failed_req_counter);
         info!("total duration {} milli seconds", diff.as_millis());
 
         let histogram = histogram.load();
@@ -714,26 +735,42 @@ mod tests {
         let mut body_send = BytesMut::new();
         body_send.put(body_string.as_bytes());
 
-        debug!("write_request_header");
-        session.write_request_header(Box::new(req)).await?;
         let h3_session = session.as_http3().unwrap();
         let conn = h3_session.conn();
+        debug!("connection={:?} write_request_header", conn.conn_id());
+        session.write_request_header(Box::new(req)).await?;
         let stream_id = session.as_http3().unwrap().stream_id()?;
-
         debug!(
-            "connection={:?} stream={}",
+            "connection={:?} stream={} write_request_body",
             conn.conn_id(),
-            h3_session.stream_id()?
+            stream_id
         );
         session
             .write_request_body(body_send.freeze(), false)
             .await?;
-        debug!("write_request_body");
+        debug!(
+            "connection={:?} stream={} finish_request_body",
+            conn.conn_id(),
+            stream_id
+        );
         session.finish_request_body().await?;
-        debug!("finish_request_body {}", stream_id);
-        session.read_response_header().await?;
-        debug!("read_response_header");
-
+        debug!(
+            "connection={:?} stream={} read_response_header",
+            conn.conn_id(),
+            stream_id
+        );
+        match session.read_response_header().await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("{}", e);
+                return Err(e);
+            }
+        };
+        debug!(
+            "connection={:?} stream={} response_header",
+            conn.conn_id(),
+            stream_id
+        );
         let resp = session.response_header();
         assert!(resp.is_some());
         if let Some(resp) = resp {

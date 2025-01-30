@@ -138,7 +138,7 @@ pub struct TransportConnector {
     preferred_http_version: PreferredHttpVersion,
 }
 
-const DEFAULT_POOL_SIZE: usize = 128;
+const DEFAULT_POOL_SIZE: usize = 16;
 
 impl TransportConnector {
     /// Create a new [TransportConnector] with the given [ConnectorOptions]
@@ -611,7 +611,7 @@ pub(crate) mod quic_tests {
 
             let mut echo_service_http =
                 Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
-            echo_service_http.threads = Some(4);
+            echo_service_http.threads = Some(1);
 
             my_server.add_service(echo_service_http);
             my_server.run_forever();
