@@ -18,7 +18,7 @@ path = "src/lib.rs"
 ahash = { workspace = true }
 
 [dev-dependencies]
-rand = "0"
+rand = "0.8"
 dashmap = "5"
 dhat = "0"
 float-cmp = "0.9.0"
