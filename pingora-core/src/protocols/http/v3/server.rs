@@ -124,7 +124,7 @@ impl Drop for Http3Connection {
     fn drop(&mut self) {
         let mut drop_connections = self.drop_connections.lock();
         drop_connections.push_back(self.conn_id().clone());
-        debug!("drop connection {:?}", self.conn_id());
+        debug!("Http3Connection drop {:?}", self.conn_id());
     }
 }
 
@@ -352,16 +352,9 @@ impl Http3Session {
                     }
                 }
                 Err(e) => {
-                    let conn_id = conn.conn_id().clone();
-                    let drop_sessions = &conn.drop_sessions.clone();
-
-                    let fn_drop_sessions = |sessions: &mut StreamIdHashMap<Sender<Event>>| {
-                        housekeeping_drop_sessions(&conn_id, sessions, drop_sessions)
-                    };
-
                     let conn_active = conn
                         .conn_io
-                        .error_or_timeout_data_race(e, &mut conn.sessions, fn_drop_sessions, |_| {})
+                        .error_or_timeout_data_race(e, &conn.sessions)
                         .await?;
                     match conn_active {
                         true => continue 'poll,
@@ -369,6 +362,12 @@ impl Http3Session {
                     }
                 }
             }
+
+            housekeeping_drop_sessions(
+                &conn.conn_id().clone(),
+                &mut conn.sessions,
+                &conn.drop_sessions,
+            );
         }
     }
 

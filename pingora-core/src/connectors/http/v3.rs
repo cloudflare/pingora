@@ -609,11 +609,12 @@ mod tests {
 
         let req_counter = req_counter.load(Ordering::SeqCst);
         let failed_req_counter = failed_req_counter.load(Ordering::SeqCst);
-        //assert_eq!(req_counter, ITER_SIZE * ITER_SIZE * 2);
 
         info!("successful requests {}", req_counter);
         info!("failed requests {}", failed_req_counter);
         info!("total duration {} milli seconds", diff.as_millis());
+
+        assert_eq!(req_counter, ITER_SIZE * ITER_SIZE * 2);
 
         let histogram = histogram.load();
         print_histogram(histogram)?;
@@ -665,10 +666,11 @@ mod tests {
         }
 
         let req_counter = req_counter.load(Ordering::SeqCst);
-        assert_eq!(req_counter, ITER_SIZE.pow(3));
 
         info!("successful requests {}", req_counter);
         info!("total duration {} milli seconds", diff.as_millis());
+
+        assert_eq!(req_counter, ITER_SIZE.pow(3));
 
         let histogram = histogram.load();
         print_histogram(histogram)?;

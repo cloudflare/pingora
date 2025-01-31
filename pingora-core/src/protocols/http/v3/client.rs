@@ -471,26 +471,9 @@ impl Http3Poll {
             let (stream_id, ev) = match poll {
                 Ok((stream, ev)) => (stream, ev),
                 Err(e) => {
-                    let conn_id = self.conn_id().clone();
-
-                    let drop_sessions = &self.drop_sessions.clone();
-                    let fn_drop_sessions = |sessions: &mut StreamIdHashMap<Sender<Event>>| {
-                        housekeeping_drop_sessions(&conn_id, sessions, drop_sessions)
-                    };
-
-                    let add_sessions = &self.add_sessions.clone();
-                    let fn_add_sessions = |sessions: &mut StreamIdHashMap<Sender<Event>>| {
-                        housekeeping_add_sessions(&conn_id, sessions, add_sessions)
-                    };
-
                     let conn_alive = self
                         .conn_io
-                        .error_or_timeout_data_race(
-                            e,
-                            &mut self.sessions,
-                            fn_drop_sessions,
-                            fn_add_sessions,
-                        )
+                        .error_or_timeout_data_race(e, &self.sessions)
                         .await?;
                     match conn_alive {
                         true => continue 'poll,
@@ -523,7 +506,13 @@ impl Http3Poll {
             session
                 .send(ev)
                 .await
-                .explain_err(H3Error, |_| "failed to forward h3 event to session")?
+                .explain_err(H3Error, |_| "failed to forward h3 event to session")?;
+
+            housekeeping_drop_sessions(
+                &self.conn_id().clone(),
+                &mut self.sessions,
+                &self.drop_sessions,
+            );
         }
     }
 

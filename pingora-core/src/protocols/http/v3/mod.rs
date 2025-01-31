@@ -57,7 +57,7 @@ pub(crate) struct ConnectionIo {
     /// the underlying Quic connection
     quic: Arc<Mutex<quiche::Connection>>,
     /// the actual HTTP 3 connection
-    http3: Arc<Mutex<quiche::h3::Connection>>,
+    http3: Arc<Mutex<h3::Connection>>,
 
     /// receive notification on Quic recv
     ///
@@ -99,15 +99,12 @@ impl ConnectionIo {
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         let qconn = self.quic.lock();
-        qconn.is_draining()
+        qconn.is_draining() && !qconn.is_closed()
     }
 
     pub(crate) fn more_streams_available(&self) -> bool {
         let qconn = self.quic.lock();
-        qconn.is_established()
-            && !qconn.is_closed()
-            && !qconn.is_draining()
-            && qconn.peer_streams_left_bidi() > 0
+        qconn.is_established() && qconn.peer_streams_left_bidi() > 0
     }
 
     fn capacity(
@@ -276,17 +273,11 @@ impl ConnectionIo {
         self.tx_notify.notify_waiters()
     }
 
-    async fn error_or_timeout_data_race<D, A>(
+    async fn error_or_timeout_data_race(
         &self,
         error: h3::Error,
-        sessions: &mut StreamIdHashMap<Sender<Event>>,
-        mut drop_sessions: D,
-        mut add_sessions: A,
-    ) -> Result<bool>
-    where
-        D: FnMut(&mut StreamIdHashMap<Sender<Event>>),
-        A: FnMut(&mut StreamIdHashMap<Sender<Event>>),
-    {
+        sessions: &StreamIdHashMap<Sender<Event>>,
+    ) -> Result<bool> {
         // register before housekeeping to avoid notify misses in high-load scenarios
         let data_future = self.rx_notify.notified();
 
@@ -295,9 +286,6 @@ impl ConnectionIo {
                 debug!("H3 connection {:?} no events available", self.conn_id());
                 // TODO: in case PriorityUpdate was triggered call take_priority_update() here
 
-                add_sessions(sessions);
-                drop_sessions(sessions);
-
                 let timeout;
                 {
                     let qconn = self.quic.lock();
@@ -305,7 +293,7 @@ impl ConnectionIo {
                         qconn.is_closed() || !(qconn.is_established() || qconn.is_in_early_data());
                     if is_closed {
                         if !sessions.is_empty() {
-                            warn!(
+                            debug!(
                                 "H3 connection {:?} closed with open {} sessions",
                                 self.conn_id(),
                                 sessions.len()
@@ -343,7 +331,6 @@ impl ConnectionIo {
                             tokio::time::sleep(Duration::MAX).await
                         }
                     } => {
-                        drop_sessions(sessions);
                         if !sessions.is_empty() {
                             debug!("connection {:?} timed out with {} open sessions",
                                 self.conn_id(), sessions.len());

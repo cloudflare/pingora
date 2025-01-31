@@ -156,16 +156,3 @@ impl ConnectionRx {
         }
     }
 }
-
-impl Drop for EstablishedState {
-    fn drop(&mut self) {
-        if !self.rx_handle.is_finished() {
-            self.rx_handle.abort();
-            debug!("connection {:?} stopped rx task", self.connection_id)
-        }
-        if !self.tx_handle.is_finished() {
-            self.tx_handle.abort();
-            debug!("connection {:?} stopped rx task", self.connection_id)
-        }
-    }
-}
