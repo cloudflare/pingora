@@ -1,0 +1,6 @@
+---
+version: 1
+threads: 2
+pid_file: /tmp/load_balancer.pid
+error_log: /tmp/load_balancer_err.log
+upgrade_sock: /tmp/load_balancer.sock
