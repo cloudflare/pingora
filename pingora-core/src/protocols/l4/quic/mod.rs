@@ -141,7 +141,7 @@ impl ConnectionTx {
         let id = self.connection_id;
         let mut out = [0u8; MAX_IPV6_BUF_SIZE];
 
-        let mut finished_sending = false;
+        let mut finished_sending = None;
         debug!("connection {:?} tx write", id);
         'write: loop {
             let mut continue_write = false;
@@ -173,7 +173,8 @@ impl ConnectionTx {
                     Err(e) => {
                         if e == quiche::Error::Done {
                             trace!("connection {:?} send finished", id);
-                            finished_sending = true;
+                            // register notify before socket send to avoid misses under high load
+                            finished_sending = Some(self.tx_notify.notified());
                             break 'fill;
                         }
                         error!("connection {:?} send error: {:?}", id, e);
@@ -239,9 +240,10 @@ impl ConnectionTx {
                 continue 'write;
             }
 
-            if finished_sending {
+            if let Some(tx_notified) = finished_sending {
                 trace!("connection {:?} finished sending", id);
-                self.tx_notify.notified().await;
+                tx_notified.await;
+                finished_sending = None;
                 continue 'write;
             }
         }

@@ -169,12 +169,12 @@ impl ConnectionIo {
         debug_assert_eq!(sent_len, data.len());
 
         if end {
+            self.tx_notify.notify_waiters();
             trace!(
                 "connection {:?} sent FIN flag for stream {} body",
                 self.conn_id(),
                 stream_id
             );
-            self.tx_notify.notify_waiters();
         }
 
         Ok(sent_len)

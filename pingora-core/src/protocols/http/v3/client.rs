@@ -492,11 +492,12 @@ impl Http3Poll {
                             fn_add_sessions,
                         )
                         .await?;
-                    if conn_alive {
-                        continue 'poll;
-                    } else {
-                        self.idle_close.send_replace(true);
-                        break 'poll Ok(());
+                    match conn_alive {
+                        true => continue 'poll,
+                        false => {
+                            self.idle_close.send_replace(true);
+                            break 'poll Ok(());
+                        }
                     }
                 }
             };

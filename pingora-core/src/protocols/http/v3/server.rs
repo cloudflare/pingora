@@ -359,10 +359,13 @@ impl Http3Session {
                         housekeeping_drop_sessions(&conn_id, sessions, drop_sessions)
                     };
 
-                    conn.conn_io
+                    let conn_active = conn.conn_io
                         .error_or_timeout_data_race(e, &mut conn.sessions, fn_drop_sessions, |_| {})
                         .await?;
-                    continue 'poll;
+                    match conn_active {
+                        true => continue 'poll,
+                        false => return Ok(None),
+                    }
                 }
             }
         }
