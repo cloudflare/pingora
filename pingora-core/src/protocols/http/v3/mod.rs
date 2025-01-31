@@ -345,14 +345,16 @@ impl ConnectionIo {
                     } => {
                         drop_sessions(sessions);
                         if !sessions.is_empty() {
-                            warn!("connection {:?} timed out with {} open sessions",
+                            debug!("connection {:?} timed out with {} open sessions",
                                 self.conn_id(), sessions.len());
                         }
                         let mut qconn = self.quic.lock();
                         // potentially closes connection
                         qconn.on_timeout();
+                        self.tx_notify.notify_waiters();
+
                         if let Some(timeout) = timeout {
-                            debug!("connection {:?} timed out {:?}", self.conn_id(), timeout);
+                            trace!("connection {:?} timed out {:?}", self.conn_id(), timeout);
                         }
                     }
                 }

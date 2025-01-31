@@ -162,6 +162,11 @@ impl ConnectionTx {
             'fill: while total_write < max_send_burst {
                 let send = {
                     let mut conn = self.connection.lock();
+                    if conn.is_draining() {
+                        // Once is_draining() returns true, it is no longer necessary
+                        // to call send() and all calls will return Done.
+                        break 'write Ok(());
+                    }
                     conn.send(&mut out[total_write..max_send_burst])
                 };
 
@@ -178,10 +183,7 @@ impl ConnectionTx {
                             break 'fill;
                         }
                         error!("connection {:?} send error: {:?}", id, e);
-                        /* TODO: close connection
-                           let mut conn = self.connection.lock();
-                           conn.close(false, 0x1, b"fail").ok();
-                        */
+                        // TODO: close connection needed
                         break 'write Err(Error::explain(
                             ErrorType::WriteError,
                             format!(
