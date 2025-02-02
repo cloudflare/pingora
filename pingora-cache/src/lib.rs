@@ -698,7 +698,10 @@ impl HttpCache {
                     // to let readers start reading the body.
                     let lock = inner.lock.take();
                     if let Some(Locked::Write(permit)) = lock {
-                        inner.cache_lock.expect("must have cache lock to have write permit").release(key, permit, LockStatus::Done);
+                        inner
+                            .cache_lock
+                            .expect("must have cache lock to have write permit")
+                            .release(key, permit, LockStatus::Done);
                     }
                     // Downstream read and upstream write can be decoupled
                     let body_reader = inner
@@ -758,7 +761,10 @@ impl HttpCache {
                 if let Some(Locked::Write(permit)) = lock {
                     // no need to call r.unlock() because release() will call it
                     // r is a guard to make sure the lock is unlocked when this request is dropped
-                    inner.cache_lock.unwrap().release(key, permit, LockStatus::Done);
+                    inner
+                        .cache_lock
+                        .unwrap()
+                        .release(key, permit, LockStatus::Done);
                 }
                 if let Some(eviction) = inner.eviction {
                     let cache_key = key.to_compact();
@@ -827,10 +833,11 @@ impl HttpCache {
 
                 let lock = inner.lock.take();
                 if let Some(Locked::Write(permit)) = lock {
-                    inner
-                        .cache_lock
-                        .unwrap()
-                        .release(inner.key.as_ref().unwrap(), permit, LockStatus::Done);
+                    inner.cache_lock.unwrap().release(
+                        inner.key.as_ref().unwrap(),
+                        permit,
+                        LockStatus::Done,
+                    );
                 }
 
                 let mut span = inner.traces.child("update_meta");
@@ -965,7 +972,10 @@ impl HttpCache {
                 // lock instead? we will not be modifying this secondary slot so it's not actually
                 // ready for readers
                 if let Some(Locked::Write(permit)) = inner.lock.take() {
-                    inner.cache_lock.unwrap().release(key, permit, LockStatus::Done);
+                    inner
+                        .cache_lock
+                        .unwrap()
+                        .release(key, permit, LockStatus::Done);
                 }
                 // Remove the `variance` from the `key`, so that we admit this asset into the
                 // primary slot. (`key` is used to tell storage where to write the data.)
@@ -1120,10 +1130,15 @@ impl HttpCache {
     /// Take the write lock from this request to transfer it to another one.
     /// # Panic
     ///  Call is_cache_lock_writer() to check first, will panic otherwise.
-    pub fn take_write_lock(&mut self) -> WritePermit {
+    pub fn take_write_lock(&mut self) -> (WritePermit, &'static CacheKeyLockImpl) {
         let lock = self.inner_mut().lock.take().unwrap();
         match lock {
-            Locked::Write(w) => w,
+            Locked::Write(w) => (
+                w,
+                self.inner()
+                    .cache_lock
+                    .expect("cache lock must be set if write permit exists"),
+            ),
             Locked::Read(_) => panic!("take_write_lock() called on read lock"),
         }
     }

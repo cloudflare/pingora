@@ -288,6 +288,12 @@ impl<SV> HttpProxy<SV> {
             None
         }
     }
+
+    fn cleanup_sub_req(&self, session: &mut Session) {
+        if let Some(ctx) = session.subrequest_ctx.as_mut() {
+            ctx.release_write_lock();
+        }
+    }
 }
 
 use pingora_cache::HttpCache;
@@ -307,7 +313,7 @@ pub struct Session {
     /// ignore downstream range (skip downstream range filters)
     pub ignore_downstream_range: bool,
     // the context from parent request
-    subrequest_ctx: Option<Box<SubReqCtx>>,
+    pub subrequest_ctx: Option<Box<SubReqCtx>>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
 }
@@ -489,6 +495,7 @@ impl<SV> HttpProxy<SV> {
         {
             self.handle_error(&mut session, &mut ctx, e, "Fail to early filter request:")
                 .await;
+            self.cleanup_sub_req(&mut session);
             return None;
         }
 
@@ -507,6 +514,7 @@ impl<SV> HttpProxy<SV> {
                 "Failed in downstream modules request filter:",
             )
             .await;
+            self.cleanup_sub_req(&mut session);
             return None;
         }
 
@@ -515,6 +523,7 @@ impl<SV> HttpProxy<SV> {
                 if response_sent {
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
+                    self.cleanup_sub_req(&mut session);
                     return session.downstream_session.finish().await.ok().flatten();
                 }
                 /* else continue */
@@ -522,6 +531,7 @@ impl<SV> HttpProxy<SV> {
             Err(e) => {
                 self.handle_error(&mut session, &mut ctx, e, "Fail to filter request:")
                     .await;
+                self.cleanup_sub_req(&mut session);
                 return None;
             }
         }
@@ -531,6 +541,9 @@ impl<SV> HttpProxy<SV> {
             return self.finish(session, &mut ctx, reuse, err.as_deref()).await;
         }
         // either uncacheable, or cache miss
+
+        // there should not be a write lock in the sub req ctx after this point
+        self.cleanup_sub_req(&mut session);
 
         // decide if the request is allowed to go to upstream
         match self
