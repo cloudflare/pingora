@@ -15,7 +15,8 @@
 use async_trait::async_trait;
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use pingora_cache::lock::WritePermit;
+use pingora_cache::lock::{CacheKeyLockImpl, LockStatus, WritePermit};
+use pingora_cache::CacheKey;
 use pingora_core::protocols::raw_connect::ProxyDigest;
 use pingora_core::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl, TimingDigest,
@@ -117,9 +118,46 @@ async fn test_dummy_io() {
     assert!(res.is_ok());
 }
 
-// To share state across the parent req and the sub req
-pub(crate) struct Ctx {
-    pub(crate) write_lock: Option<WritePermit>,
+struct LockCtx {
+    write_permit: WritePermit,
+    cache_lock: &'static CacheKeyLockImpl,
+    key: CacheKey,
+}
+
+/// Ctx to share state across the parent req and the sub req
+pub struct Ctx {
+    lock: Option<LockCtx>,
+}
+
+impl Ctx {
+    pub fn with_write_lock(
+        cache_lock: &'static CacheKeyLockImpl,
+        key: CacheKey,
+        write_permit: WritePermit,
+    ) -> Ctx {
+        Ctx {
+            lock: Some(LockCtx {
+                cache_lock,
+                key,
+                write_permit,
+            }),
+        }
+    }
+
+    pub fn release_write_lock(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            // If we are releasing the write lock in the subrequest,
+            // it means that the cache did not take it for whatever reason.
+            // TransientError will cause the election of a new writer
+            lock.cache_lock
+                .release(&lock.key, lock.write_permit, LockStatus::TransientError);
+        }
+    }
+
+    pub fn take_write_lock(&mut self) -> Option<WritePermit> {
+        // also clear out lock ctx
+        self.lock.take().map(|lock| lock.write_permit)
+    }
 }
 
 use crate::HttpSession;

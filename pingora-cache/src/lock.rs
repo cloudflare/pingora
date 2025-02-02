@@ -268,7 +268,13 @@ impl WritePermit {
     pub fn new(timeout: Duration) -> (WritePermit, LockStub) {
         let lock = LockCore::new_arc(timeout);
         let stub = LockStub(lock.clone());
-        (WritePermit { lock, finished: false }, stub)
+        (
+            WritePermit {
+                lock,
+                finished: false,
+            },
+            stub,
+        )
     }
 
     pub fn unlock(&mut self, reason: LockStatus) {
