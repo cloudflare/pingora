@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -128,24 +128,7 @@ impl RequestHeader {
         req.base.method = method
             .try_into()
             .explain_err(InvalidHTTPHeader, |_| "invalid method")?;
-        if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            req.base.uri = uri;
-            // keep raw_path empty, no need to store twice
-        } else {
-            // put a valid utf-8 path into base for read only access
-            let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            req.base.uri = uri;
-            req.raw_path_fallback = path.to_vec();
-        }
-
+        req.set_raw_path(path)?;
         Ok(req)
     }
 
@@ -212,6 +195,34 @@ impl RequestHeader {
     /// Set the request URI
     pub fn set_uri(&mut self, uri: http::Uri) {
         self.base.uri = uri;
+        // Clear out raw_path_fallback, or it will be used when serializing
+        self.raw_path_fallback = vec![];
+    }
+
+    /// Set the request URI directly via raw bytes.
+    ///
+    /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
+    ///
+    /// This API is to allow supporting non UTF-8 cases.
+    pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
+        if let Ok(p) = std::str::from_utf8(path) {
+            let uri = Uri::builder()
+                .path_and_query(p)
+                .build()
+                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
+            self.base.uri = uri;
+            // keep raw_path empty, no need to store twice
+        } else {
+            // put a valid utf-8 path into base for read only access
+            let lossy_str = String::from_utf8_lossy(path);
+            let uri = Uri::builder()
+                .path_and_query(lossy_str.as_ref())
+                .build()
+                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
+            self.base.uri = uri;
+            self.raw_path_fallback = path.to_vec();
+        }
+        Ok(())
     }
 
     /// Set whether we send an END_STREAM on H2 request HEADERS if body is empty.
@@ -656,7 +667,7 @@ mod tests {
         assert_eq!(buf, b"FoO: Bar\r\n");
 
         let mut resp = ResponseHeader::new(None);
-        req.insert_header("foo", "bar").unwrap();
+        resp.insert_header("foo", "bar").unwrap();
         resp.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
@@ -673,7 +684,7 @@ mod tests {
         assert_eq!(buf, b"foo: Bar\r\n");
 
         let mut resp = ResponseHeader::new_no_case(None);
-        req.insert_header("foo", "bar").unwrap();
+        resp.insert_header("foo", "bar").unwrap();
         resp.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
@@ -720,6 +731,20 @@ mod tests {
         let req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
         assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
         assert_eq!(raw_path, req.raw_path());
+    }
+
+    #[cfg(feature = "patched_http1")]
+    #[test]
+    fn test_override_invalid_path() {
+        let raw_path = b"Hello\xF0\x90\x80World";
+        let mut req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
+        assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
+        assert_eq!(raw_path, req.raw_path());
+
+        let new_path = "/HelloWorld";
+        req.set_uri(Uri::builder().path_and_query(new_path).build().unwrap());
+        assert_eq!(new_path, req.uri.path_and_query().unwrap());
+        assert_eq!(new_path.as_bytes(), req.raw_path());
     }
 
     #[test]

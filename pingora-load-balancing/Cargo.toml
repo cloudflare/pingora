@@ -25,12 +25,12 @@ pingora-ketama = { version = "0.4.0", path = "../pingora-ketama" }
 pingora-runtime = { version = "0.4.0", path = "../pingora-runtime" }
 arc-swap = "1"
 fnv = "1"
-rand = "0"
+rand = "0.8"
 tokio = { workspace = true }
 futures = "0"
 log = { workspace = true }
 http = { workspace = true }
-derivative = "2.2.0"
+derivative.workspace = true
 
 [dev-dependencies]
 

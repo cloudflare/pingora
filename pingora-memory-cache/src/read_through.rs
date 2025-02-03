@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -282,6 +282,58 @@ where
 
             ret
         }
+    }
+
+    /// Similar to [get], query the cache for a given value, but also returns the value even if the
+    /// value is expired up to `stale_ttl`. If it is a cache miss or the value is stale more than
+    /// the `stale_ttl`, a lookup will be performed to populate the cache.
+    pub async fn get_stale(
+        &self,
+        key: &K,
+        ttl: Option<Duration>,
+        extra: Option<&S>,
+        stale_ttl: Duration,
+    ) -> (Result<T, Box<Error>>, CacheStatus) {
+        let (result, cache_status) = self.inner.get_stale(key);
+        if let Some(result) = result {
+            let stale_duration = cache_status.stale();
+            if stale_duration.unwrap_or(Duration::ZERO) <= stale_ttl {
+                return (Ok(result), cache_status);
+            }
+        }
+        let (res, status) = self.get(key, ttl, extra).await;
+        (res, status)
+    }
+}
+
+impl<K, T, CB, S> RTCache<K, T, CB, S>
+where
+    K: Hash + Clone + Send + Sync,
+    T: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync,
+    CB: Lookup<K, T, S> + Sync + Send,
+{
+    /// Similar to [get_stale], but when it returns the stale value, it also initiates a lookup
+    /// in the background in order to refresh the value.
+    ///
+    /// Note that this function requires the [RTCache] to be static, which can be done by wrapping
+    /// it with something like [once_cell::sync::Lazy].
+    pub async fn get_stale_while_update(
+        &'static self,
+        key: &K,
+        ttl: Option<Duration>,
+        extra: Option<&S>,
+        stale_ttl: Duration,
+    ) -> (Result<T, Box<Error>>, CacheStatus) {
+        let (result, cache_status) = self.get_stale(key, ttl, extra, stale_ttl).await;
+        let key = key.clone();
+        let extra = extra.cloned();
+        if cache_status.stale().is_some() {
+            tokio::spawn(async move {
+                let _ = self.get(&key, ttl, extra.as_ref()).await;
+            });
+        }
+        (result, cache_status)
     }
 }
 
@@ -685,5 +737,68 @@ mod tests {
             .multi_get([4, 5, 6].iter(), None, opt1.as_ref())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_stale() {
+        let ttl = Some(Duration::from_millis(100));
+        let cache: RTCache<i32, i32, TestCB, ExtraOpt> = RTCache::new(10, None, None);
+        let opt = Some(ExtraOpt {
+            error: false,
+            empty: false,
+            delay_for: None,
+            used: Arc::new(AtomicI32::new(0)),
+        });
+        let (res, hit) = cache.get(&1, ttl, opt.as_ref()).await;
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(hit, CacheStatus::Miss);
+        let (res, hit) = cache.get(&1, ttl, opt.as_ref()).await;
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(hit, CacheStatus::Hit);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (res, hit) = cache
+            .get_stale(&1, ttl, opt.as_ref(), Duration::from_millis(1000))
+            .await;
+        assert_eq!(res.unwrap(), 1);
+        assert!(hit.stale().is_some());
+
+        let (res, hit) = cache
+            .get_stale(&1, ttl, opt.as_ref(), Duration::from_millis(30))
+            .await;
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(hit, CacheStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn test_get_stale_while_update() {
+        use once_cell::sync::Lazy;
+        let ttl = Some(Duration::from_millis(100));
+        static CACHE: Lazy<RTCache<i32, i32, TestCB, ExtraOpt>> =
+            Lazy::new(|| RTCache::new(10, None, None));
+        let opt = Some(ExtraOpt {
+            error: false,
+            empty: false,
+            delay_for: None,
+            used: Arc::new(AtomicI32::new(0)),
+        });
+        let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(hit, CacheStatus::Miss);
+        let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(hit, CacheStatus::Hit);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (res, hit) = CACHE
+            .get_stale_while_update(&1, ttl, opt.as_ref(), Duration::from_millis(1000))
+            .await;
+        assert_eq!(res.unwrap(), 1);
+        assert!(hit.stale().is_some());
+
+        // allow the background lookup to finish
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(hit, CacheStatus::Hit);
     }
 }

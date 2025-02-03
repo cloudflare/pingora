@@ -35,6 +35,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
+derivative.workspace = true
 clap = { version = "3.2.25", features = ["derive"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -61,7 +62,7 @@ rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "3"
-openssl-probe = "0.1"
+openssl-probe = "0.1.6"
 tokio-test = "0.4"
 zstd = "0"
 httpdate = "1"
@@ -83,6 +84,7 @@ reqwest = { version = "0.11", features = [
     "rustls-tls",
 ], default-features = false }
 hyper = "0.14"
+rstest = "0.23.0"
 h3i = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca" }
 
 [target.'cfg(unix)'.dev-dependencies]

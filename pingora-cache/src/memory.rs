@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -405,8 +405,8 @@ impl Storage for MemCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use cf_rustracing::span::Span;
     use once_cell::sync::Lazy;
-    use rustracing::span::Span;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -198,11 +198,11 @@ mod test {
         count.insert(b2.clone(), 0);
         count.insert(b3.clone(), 0);
 
-        for _ in 0..100 {
+        for _ in 0..10000 {
             let mut iter = hash.iter(b"test");
             *count.get_mut(iter.next().unwrap()).unwrap() += 1;
         }
         let b2_count = *count.get(&b2).unwrap();
-        assert!((70..=90).contains(&b2_count));
+        assert!((7000..=9000).contains(&b2_count));
     }
 }

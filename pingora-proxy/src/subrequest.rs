@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -126,7 +126,7 @@ pub(crate) struct Ctx {
 
 use crate::HttpSession;
 
-pub fn create_dummy_session(parsed_session: &HttpSession) -> HttpSession {
+pub(crate) fn create_dummy_session(parsed_session: &HttpSession) -> HttpSession {
     // TODO: check if there is req body, we don't capture the body for now
     HttpSession::new_http1(Box::new(DummyIO::new(&parsed_session.to_h1_raw())))
 }

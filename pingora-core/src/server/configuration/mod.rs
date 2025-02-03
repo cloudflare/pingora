@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,9 @@ use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+
+// default maximum upstream retries for retry-able proxy errors
+const DEFAULT_MAX_RETRIES: usize = 16;
 
 /// The configuration file
 ///
@@ -92,6 +95,11 @@ pub struct ServerConf {
     /// for debugging purposes.
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_debug_ssl_keylog: bool,
+    /// The maximum number of retries that will be attempted when an error is
+    /// retry-able (`e.retry() == true`) when proxying to upstream.
+    ///
+    /// This setting is a fail-safe and defaults to 16.
+    pub max_retries: usize,
 }
 
 impl Default for ServerConf {
@@ -115,6 +123,7 @@ impl Default for ServerConf {
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
+            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 }
@@ -269,6 +278,7 @@ mod tests {
             upstream_connect_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
+            max_retries: 1,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
@@ -304,6 +314,7 @@ version: 1
         assert_eq!(0, conf.client_bind_to_ipv4.len());
         assert_eq!(0, conf.client_bind_to_ipv6.len());
         assert_eq!(1, conf.version);
+        assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
     }
 }

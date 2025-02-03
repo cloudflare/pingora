@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -73,7 +73,7 @@ impl HttpSession {
                 h1.write_body(&data).await?;
                 Ok(())
             }
-            HttpSession::H2(h2) => h2.write_request_body(data, end),
+            HttpSession::H2(h2) => h2.write_request_body(data, end).await,
             HttpSession::H3(h3) => h3.write_request_body(data, end).await,
         }
     }

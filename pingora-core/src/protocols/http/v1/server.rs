@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
+use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, warn};
@@ -222,9 +223,22 @@ impl HttpSession {
                             let header_value = unsafe {
                                 http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
                             };
+
                             request_header
                                 .append_header(header_name, header_value)
                                 .or_err(InvalidHTTPHeader, "while parsing request header")?;
+                        }
+
+                        let contains_transfer_encoding =
+                            request_header.headers.contains_key(TRANSFER_ENCODING);
+                        let contains_content_length =
+                            request_header.headers.contains_key(CONTENT_LENGTH);
+
+                        // Transfer encoding overrides content length, so when
+                        // both are present, we can remove content length. This
+                        // is per https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
+                        if contains_content_length && contains_transfer_encoding {
+                            request_header.remove_header(&CONTENT_LENGTH);
                         }
 
                         self.buf = buf;
@@ -823,8 +837,14 @@ impl HttpSession {
         }
     }
 
+    /// Sets the downstream read timeout. This will trigger if we're unable
+    /// to read from the stream after `timeout`.
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = Some(timeout);
+    }
+
     /// Sets the downstream write timeout. This will trigger if we're unable
-    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     pub fn set_write_timeout(&mut self, timeout: Duration) {
         self.write_timeout = Some(timeout);
@@ -932,7 +952,7 @@ impl HttpSession {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
         }
-        Ok(end_stream)
+        Ok(end_stream || self.body_writer.finished())
     }
 
     // TODO: use vectored write to avoid copying
@@ -978,7 +998,7 @@ impl HttpSession {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
         }
-        Ok(end_stream)
+        Ok(end_stream || self.body_writer.finished())
     }
 
     /// Get the reference of the [Stream] that this HTTP session is operating upon.
@@ -1099,6 +1119,7 @@ mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
     use http::StatusCode;
+    use rstest::rstest;
     use std::str;
     use tokio_test::io::Builder;
 
@@ -1315,6 +1336,55 @@ mod tests_stream {
         assert!(res.is_none());
         assert_eq!(http_stream.body_bytes_read(), 1);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
+    }
+
+    #[rstest]
+    #[case(None, None)]
+    #[case(Some("transfer-encoding"), None)]
+    #[case(Some("transfer-encoding"), Some("CONTENT-LENGTH"))]
+    #[case(Some("TRANSFER-ENCODING"), Some("CONTENT-LENGTH"))]
+    #[case(Some("TRANSFER-ENCODING"), None)]
+    #[case(None, Some("CONTENT-LENGTH"))]
+    #[case(Some("TRANSFER-ENCODING"), Some("content-length"))]
+    #[case(None, Some("content-length"))]
+    #[tokio::test]
+    async fn transfer_encoding_and_content_length_disallowed(
+        #[case] transfer_encoding_header: Option<&str>,
+        #[case] content_length_header: Option<&str>,
+    ) {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let mut input2 = "Host: pingora.org\r\n".to_owned();
+
+        if let Some(transfer_encoding) = transfer_encoding_header {
+            input2 += &format!("{transfer_encoding}: chunked\r\n");
+        }
+        if let Some(content_length) = content_length_header {
+            input2 += &format!("{content_length}: 4\r\n")
+        }
+
+        input2 += "\r\n3e\r\na\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(input2.as_bytes())
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let _ = http_stream.read_request().await.unwrap();
+
+        match (content_length_header, transfer_encoding_header) {
+            (Some(_) | None, Some(_)) => {
+                assert!(http_stream.get_header(TRANSFER_ENCODING).is_some());
+                assert!(http_stream.get_header(CONTENT_LENGTH).is_none());
+            }
+            (Some(_), None) => {
+                assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
+                assert!(http_stream.get_header(CONTENT_LENGTH).is_some());
+            }
+            _ => {
+                assert!(http_stream.get_header(CONTENT_LENGTH).is_none());
+                assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
+            }
+        }
     }
 
     #[tokio::test]

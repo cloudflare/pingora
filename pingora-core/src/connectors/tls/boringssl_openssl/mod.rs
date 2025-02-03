@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -81,7 +81,9 @@ static INIT_CA_ENV: Once = Once::new();
 fn init_ssl_cert_env_vars() {
     // this sets env vars to pick up the root certs
     // it is universal across openssl and boringssl
-    INIT_CA_ENV.call_once(openssl_probe::init_ssl_cert_env_vars);
+    // safety: although impossible to prove safe we assume it's safe since the call is
+    // wrapped in a call_once and it's unlikely other threads are reading these vars
+    INIT_CA_ENV.call_once(|| unsafe { openssl_probe::init_openssl_env_vars() });
 }
 
 #[derive(Clone)]

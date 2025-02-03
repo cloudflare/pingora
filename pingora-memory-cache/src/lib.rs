@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use ahash::RandomState;
+use std::borrow::Borrow;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -33,6 +34,9 @@ pub enum CacheStatus {
     Expired,
     /// The key was not initially found but was found after awaiting a lock.
     LockHit,
+    /// The returned value was expired but still returned. The [Duration] is
+    /// how long it has been since its expiration time.
+    Stale(Duration),
 }
 
 impl CacheStatus {
@@ -43,14 +47,23 @@ impl CacheStatus {
             Self::Miss => "miss",
             Self::Expired => "expired",
             Self::LockHit => "lock_hit",
+            Self::Stale(_) => "stale",
         }
     }
 
     /// Returns whether this status represents a cache hit.
     pub fn is_hit(&self) -> bool {
         match self {
-            CacheStatus::Hit | CacheStatus::LockHit => true,
+            CacheStatus::Hit | CacheStatus::LockHit | CacheStatus::Stale(_) => true,
             CacheStatus::Miss | CacheStatus::Expired => false,
+        }
+    }
+
+    /// Returns the stale duration if any
+    pub fn stale(&self) -> Option<Duration> {
+        match self {
+            CacheStatus::Stale(time) => Some(*time),
+            _ => None,
         }
     }
 }
@@ -71,14 +84,20 @@ impl<T: Clone> Node<T> {
     }
 
     fn will_expire_at(&self, time: &Instant) -> bool {
-        match self.expire_on.as_ref() {
-            Some(t) => t <= time,
-            None => false,
-        }
+        self.stale_duration(time).is_some()
     }
 
     fn is_expired(&self) -> bool {
         self.will_expire_at(&Instant::now())
+    }
+
+    fn stale_duration(&self, time: &Instant) -> Option<Duration> {
+        let expire_time = self.expire_on?;
+        if &expire_time <= time {
+            Some(time.duration_since(expire_time))
+        } else {
+            None
+        }
     }
 }
 
@@ -100,15 +119,41 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Fetch the key and return its value in addition to a [CacheStatus].
-    pub fn get(&self, key: &K) -> (Option<T>, CacheStatus) {
+    pub fn get<Q>(&self, key: &Q) -> (Option<T>, CacheStatus)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         let hashed_key = self.hasher.hash_one(key);
 
         if let Some(n) = self.store.get(&hashed_key) {
             if !n.is_expired() {
                 (Some(n.value), CacheStatus::Hit)
             } else {
-                // TODO: consider returning the staled value
                 (None, CacheStatus::Expired)
+            }
+        } else {
+            (None, CacheStatus::Miss)
+        }
+    }
+
+    /// Similar to [get], fetch the key and return its value in addition to a
+    /// [CacheStatus] but also return the value even if it is expired. When the
+    /// value is expired, the [Duration] of how long it has been stale will
+    /// also be returned.
+    pub fn get_stale<Q>(&self, key: &Q) -> (Option<T>, CacheStatus)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
+        let hashed_key = self.hasher.hash_one(key);
+
+        if let Some(n) = self.store.get(&hashed_key) {
+            let stale_duration = n.stale_duration(&Instant::now());
+            if let Some(stale_duration) = stale_duration {
+                (Some(n.value), CacheStatus::Stale(stale_duration))
+            } else {
+                (Some(n.value), CacheStatus::Hit)
             }
         } else {
             (None, CacheStatus::Miss)
@@ -118,7 +163,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     /// Insert a key and value pair with an optional TTL into the cache.
     ///
     /// An item with zero TTL of zero will not be inserted.
-    pub fn put(&self, key: &K, value: T, ttl: Option<Duration>) {
+    pub fn put<Q>(&self, key: &Q, value: T, ttl: Option<Duration>)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         if let Some(t) = ttl {
             if t.is_zero() {
                 return;
@@ -131,7 +180,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Remove a key from the cache if it exists.
-    pub fn remove(&self, key: &K) {
+    pub fn remove<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
         let hashed_key = self.hasher.hash_one(key);
         self.store.remove(&hashed_key);
     }
@@ -149,10 +202,11 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// This is equivalent to [MemoryCache::get] but for an arbitrary amount of keys.
-    pub fn multi_get<'a, I>(&self, keys: I) -> Vec<(Option<T>, CacheStatus)>
+    pub fn multi_get<'a, I, Q>(&self, keys: I) -> Vec<(Option<T>, CacheStatus)>
     where
-        I: Iterator<Item = &'a K>,
-        K: 'a,
+        I: Iterator<Item = &'a Q>,
+        Q: Hash + ?Sized + 'a,
+        K: Borrow<Q> + 'a,
     {
         let mut resp = Vec::with_capacity(keys.size_hint().0);
         for key in keys {
@@ -162,10 +216,14 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
     }
 
     /// Same as [MemoryCache::multi_get] but returns the keys that are missing from the cache.
-    pub fn multi_get_with_miss<'a, I>(&self, keys: I) -> (Vec<(Option<T>, CacheStatus)>, Vec<&'a K>)
+    pub fn multi_get_with_miss<'a, I, Q>(
+        &self,
+        keys: I,
+    ) -> (Vec<(Option<T>, CacheStatus)>, Vec<&'a Q>)
     where
-        I: Iterator<Item = &'a K>,
-        K: 'a,
+        I: Iterator<Item = &'a Q>,
+        Q: Hash + ?Sized + 'a,
+        K: Borrow<Q> + 'a,
     {
         let mut resp = Vec::with_capacity(keys.size_hint().0);
         let mut missed = Vec::with_capacity(keys.size_hint().0 / 2);
@@ -246,6 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn test_get_stale() {
+        let cache: MemoryCache<i32, i32> = MemoryCache::new(10);
+        let (res, hit) = cache.get(&1);
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+        cache.put(&1, 2, Some(Duration::from_secs(1)));
+        sleep(Duration::from_millis(1100));
+        let (res, hit) = cache.get_stale(&1);
+        assert_eq!(res.unwrap(), 2);
+        // we slept 1100ms and the ttl is 1000ms
+        assert!(hit.stale().unwrap() >= Duration::from_millis(100));
+    }
+
+    #[test]
     fn test_eviction() {
         let cache: MemoryCache<i32, i32> = MemoryCache::new(2);
         cache.put(&1, 2, None);
@@ -284,5 +356,25 @@ mod tests {
         assert_eq!(resp[2].1, CacheStatus::Miss);
         assert_eq!(missed[0], &1);
         assert_eq!(missed[1], &3);
+    }
+
+    #[test]
+    fn test_get_with_mismatched_key() {
+        let cache: MemoryCache<String, ()> = MemoryCache::new(10);
+        let (res, hit) = cache.get("Hello");
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+    }
+
+    #[test]
+    fn test_put_get_with_mismatched_key() {
+        let cache: MemoryCache<String, i32> = MemoryCache::new(10);
+        let (res, hit) = cache.get("1");
+        assert_eq!(res, None);
+        assert_eq!(hit, CacheStatus::Miss);
+        cache.put("1", 2, None);
+        let (res, hit) = cache.get("1");
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(hit, CacheStatus::Hit);
     }
 }

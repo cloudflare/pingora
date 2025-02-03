@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,16 @@
 
 //! Defines where to connect to and how to connect to a remote server
 
+use crate::connectors::{l4::BindTo, L4Connect};
+use crate::protocols::l4::quic::QuicHttp3Configs;
+use crate::protocols::l4::socket::SocketAddr;
+use crate::protocols::tls::CaType;
+#[cfg(unix)]
+use crate::protocols::ConnFdReusable;
+use crate::protocols::TcpKeepalive;
+use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
+use derivative::Derivative;
 use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
@@ -30,15 +39,7 @@ use std::os::windows::io::AsRawSocket;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-
-use crate::connectors::{l4::BindTo, L4Connect};
-use crate::protocols::l4::quic::QuicHttp3Configs;
-use crate::protocols::l4::socket::SocketAddr;
-use crate::protocols::tls::CaType;
-#[cfg(unix)]
-use crate::protocols::ConnFdReusable;
-use crate::protocols::TcpKeepalive;
-use crate::utils::tls::{get_organization_unit, CertKey};
+use tokio::net::TcpSocket;
 
 pub use crate::protocols::tls::ALPN;
 
@@ -205,6 +206,17 @@ pub trait Peer: Display + Clone {
         None
     }
 
+    /// Returns a hook that should be run before an upstream TCP connection is connected.
+    ///
+    /// This hook can be used to set additional socket options.
+    fn upstream_tcp_sock_tweak_hook(
+        &self,
+    ) -> Option<&Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>> {
+        self.get_peer_options()?
+            .upstream_tcp_sock_tweak_hook
+            .as_ref()
+    }
+
     /// Whether UDP/Quic should be used.
     fn udp_http3(&self) -> bool {
         let mut udp_http3 = false;
@@ -313,7 +325,9 @@ impl Scheme {
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
-#[derive(Clone, Debug)]
+#[non_exhaustive]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
@@ -350,6 +364,9 @@ pub struct PeerOptions {
     pub tracer: Option<Tracer>,
     // A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
+    #[derivative(Debug = "ignore")]
+    pub upstream_tcp_sock_tweak_hook:
+        Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
 }
 
 impl PeerOptions {
@@ -380,6 +397,7 @@ impl PeerOptions {
             tcp_fast_open: false,
             tracer: None,
             custom_l4: None,
+            upstream_tcp_sock_tweak_hook: None,
         }
     }
 

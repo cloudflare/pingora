@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -232,7 +232,7 @@ impl HttpSession {
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
-    pub fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+    pub async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             // NOTE: in h1, we also track to see if content-length matches the data
             // We have not tracked that in h2
@@ -246,11 +246,9 @@ impl HttpSession {
             ));
         };
         let data_len = data.len();
-        writer.reserve_capacity(data_len);
-        writer.send_data(data, end).or_err(
-            ErrorType::WriteError,
-            "while writing h2 response body to downstream",
-        )?;
+        super::write_body(writer, data, end)
+            .await
+            .map_err(|e| e.into_down())?;
         self.body_sent += data_len;
         self.ended = self.ended || end;
         Ok(())
@@ -308,7 +306,7 @@ impl HttpSession {
         Ok(())
     }
 
-    pub fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
+    pub async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         let mut end_stream = false;
         for task in tasks.into_iter() {
             end_stream = match task {
@@ -320,7 +318,7 @@ impl HttpSession {
                 HttpTask::Body(data, end) => match data {
                     Some(d) => {
                         if !d.is_empty() {
-                            self.write_body(d, end).map_err(|e| e.into_down())?;
+                            self.write_body(d, end).await.map_err(|e| e.into_down())?;
                         }
                         end
                     }
@@ -567,7 +565,7 @@ mod test {
                 }
 
                 // end: false here to verify finish() closes the stream nicely
-                http.write_body(server_body.into(), false).unwrap();
+                http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
                 http.write_trailers(trailers).unwrap();
@@ -639,7 +637,7 @@ mod test {
                     .write_response_header(response_header.clone(), false)
                     .is_ok());
 
-                http.write_body(server_body.into(), false).unwrap();
+                http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
                 // 3. Waiting for the reset from the client
@@ -711,7 +709,7 @@ mod test {
                     .write_response_header(response_header.clone(), false)
                     .is_ok());
 
-                http.write_body(server_body.into(), false).unwrap();
+                http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
                 // 3. Waiting for the client to close stream.

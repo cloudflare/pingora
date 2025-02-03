@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
-use pingora_core::protocols::http::v2::client::{write_body, Http2Session};
+use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
 // add scheme and authority as required by h2 lib
 fn update_h2_scheme_authority(
@@ -67,7 +67,7 @@ fn update_h2_scheme_authority(
 }
 
 impl<SV> HttpProxy<SV> {
-    pub(crate) async fn proxy_1to2(
+    pub(crate) async fn proxy_down_to_up(
         &self,
         session: &mut Session,
         client_session: &mut Http2Session,
@@ -150,7 +150,7 @@ impl<SV> HttpProxy<SV> {
 
         if !send_end_stream && body_empty {
             // send END_STREAM on empty DATA frame
-            match client_session.write_request_body(Bytes::new(), true) {
+            match client_session.write_request_body(Bytes::new(), true).await {
                 Ok(()) => debug!("sent empty DATA frame to h2"),
                 Err(e) => {
                     return (false, Some(e.into_up()));
@@ -172,8 +172,8 @@ impl<SV> HttpProxy<SV> {
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
-            self.bidirection_1to2(session, &mut client_body, rx, ctx),
-            pipe_2to1_response(client_session, tx)
+            self.bidirection_down_to_up(session, &mut client_body, rx, ctx),
+            pipe_up_to_down_response(client_session, tx)
         );
 
         match ret {
@@ -207,14 +207,15 @@ impl<SV> HttpProxy<SV> {
             return (false, Some(e));
         }
 
-        let (server_session_reuse, error) =
-            self.proxy_1to2(session, client_session, peer, ctx).await;
+        let (server_session_reuse, error) = self
+            .proxy_down_to_up(session, client_session, peer, ctx)
+            .await;
 
         (server_session_reuse, error)
     }
 
     // returns whether server (downstream) session can be reused
-    async fn bidirection_1to2(
+    async fn bidirection_down_to_up(
         &self,
         session: &mut Session,
         client_body: &mut h2::SendStream<bytes::Bytes>,
@@ -337,7 +338,7 @@ impl<SV> HttpProxy<SV> {
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
@@ -547,11 +548,15 @@ impl<SV> HttpProxy<SV> {
 
         if let Some(data) = data {
             debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body).map_err(|e| e.into_up())?;
+            write_body(client_body, data, end_of_body)
+                .await
+                .map_err(|e| e.into_up())?;
         } else {
             debug!("Read downstream body done");
             /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true).map_err(|e| e.into_up())?;
+            write_body(client_body, Bytes::new(), true)
+                .await
+                .map_err(|e| e.into_up())?;
         }
 
         Ok(end_of_body)
@@ -559,7 +564,7 @@ impl<SV> HttpProxy<SV> {
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
-pub(crate) async fn pipe_2to1_response(
+pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
 ) -> Result<()> {
@@ -628,15 +633,26 @@ pub(crate) async fn pipe_2to1_response(
         };
         match client.check_response_end_or_error() {
             Ok(eos) => {
-                if data.is_empty() && !eos {
+                let empty = data.is_empty();
+                if empty && !eos {
                     /* it is normal to get 0 bytes because of multi-chunk
                      * don't write 0 bytes to downstream since it will be
                      * misread as the terminating chunk */
                     continue;
                 }
-                tx.send(HttpTask::Body(Some(data), eos))
+                let sent = tx
+                    .send(HttpTask::Body(Some(data), eos))
                     .await
-                    .or_err(InternalError, "sending h2 body to pipe")?;
+                    .or_err(InternalError, "sending h2 body to pipe");
+                // If the if the response with content-length is sent to an HTTP1 downstream,
+                // bidirection_down_to_up() could decide that the body has finished and exit without
+                // waiting for this function to signal the eos. In this case tx being closed is not
+                // an sign of error. It should happen if the only thing left for the h2 to send is
+                // an empty data frame with eos set.
+                if sent.is_err() && eos && empty {
+                    return Ok(());
+                }
+                sent?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit

@@ -1,4 +1,4 @@
-// Copyright 2024 Cloudflare, Inc.
+// Copyright 2025 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -170,7 +170,7 @@ impl Session {
                 s.write_body(&data).await?;
                 Ok(())
             }
-            Self::H2(s) => s.write_body(data, end),
+            Self::H2(s) => s.write_body(data, end).await,
             Self::H3(s) => s.write_body(data, end).await,
         }
     }
@@ -209,7 +209,7 @@ impl Session {
     pub async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         match self {
             Self::H1(s) => s.response_duplex_vec(tasks).await,
-            Self::H2(s) => s.response_duplex_vec(tasks),
+            Self::H2(s) => s.response_duplex_vec(tasks).await,
             Self::H3(s) => s.response_duplex_vec(tasks).await,
         }
     }
@@ -224,8 +224,19 @@ impl Session {
         }
     }
 
+    /// Sets the downstream read timeout. This will trigger if we're unable
+    /// to read from the stream after `timeout`.
+    ///
+    /// This is a noop for h2.
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_read_timeout(timeout),
+            Self::H2(_) => {}
+        }
+    }
+
     /// Sets the downstream write timeout. This will trigger if we're unable
-    /// to write to the stream after `duration`. If a `min_send_rate` is
+    /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     ///
     /// This is a noop for h2/h3.
