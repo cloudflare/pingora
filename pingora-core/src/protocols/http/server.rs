@@ -232,6 +232,7 @@ impl Session {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
             Self::H2(_) => {}
+            Self::H3(_) => {}
         }
     }
 
