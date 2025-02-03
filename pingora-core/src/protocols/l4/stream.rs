@@ -432,11 +432,7 @@ impl Stream {
 impl From<Connection> for Stream {
     fn from(s: Connection) -> Self {
         Stream {
-            stream: BufStream::with_capacity(
-                BUF_READ_SIZE,
-                BUF_WRITE_SIZE,
-                RawStreamWrapper::new(RawStream::Quic(s)),
-            ),
+            stream: BufStream::with_capacity(0, 0, RawStreamWrapper::new(RawStream::Quic(s))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),

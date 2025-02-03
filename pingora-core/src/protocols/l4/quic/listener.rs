@@ -31,6 +31,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{io, mem};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -147,23 +148,17 @@ impl Listener {
         debug!("endpoint rx loop");
         'read: loop {
             // receive from network and parse Quic header
-            let (size, from) = self.socket_details.io.recv_from(&mut rx_buf).await?;
-
-            // cleanup connections
-            {
-                let mut drop_conn = self.drop_connections.lock();
-                while let Some(drop_id) = drop_conn.pop_front() {
-                    match self.connections.remove(&drop_id) {
-                        None => warn!(
-                            "failed to remove connection handle {:?} from connections",
-                            drop_id
-                        ),
-                        Some(_) => {
-                            debug!("removed connection handle {:?} from connections", drop_id)
-                        }
-                    }
+            let (size, from) = tokio::select! {
+                biased;
+                res = self.socket_details.io.recv_from(&mut rx_buf) => { res? },
+                _housekeeping_tick = tokio::time::sleep(Duration::from_millis(100)) => {
+                    // avoid stuck connections when traffic stops
+                    self.housekeeping_connections_drop();
+                    continue;
                 }
-            }
+            };
+
+            self.housekeeping_connections_drop();
 
             // parse the Quic packet's header
             let header = match Header::from_slice(rx_buf[..size].as_mut(), quiche::MAX_CONN_ID_LEN)
@@ -317,6 +312,22 @@ impl Listener {
 
             self.connections.insert(conn_id, handle);
             return Ok((connection.into(), from));
+        }
+    }
+
+    fn housekeeping_connections_drop(&mut self) {
+        // cleanup connections
+        let mut drop_conn = self.drop_connections.lock();
+        while let Some(drop_id) = drop_conn.pop_front() {
+            match self.connections.remove(&drop_id) {
+                None => warn!(
+                    "failed to remove connection handle {:?} from connections",
+                    drop_id
+                ),
+                Some(_) => {
+                    debug!("removed connection handle {:?} from connections", drop_id)
+                }
+            }
         }
     }
 

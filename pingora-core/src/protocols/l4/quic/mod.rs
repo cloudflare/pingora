@@ -464,16 +464,8 @@ impl Connection {
             )
         }
         match self {
-            Connection::IncomingHandshake(s) => {
-                if !s.udp_rx.is_empty() {
-                    error!(
-                        "connection {:?} established udp_rx={}",
-                        state.connection_id,
-                        s.udp_rx.len()
-                    );
-                } else {
-                    debug!("connection {:?} established", state.connection_id);
-                }
+            Connection::IncomingHandshake(_) => {
+                debug!("connection {:?} established", state.connection_id);
                 let _ = mem::replace(self, Connection::IncomingEstablished(state));
                 Ok(())
             }
