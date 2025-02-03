@@ -314,7 +314,7 @@ async fn handshake_inner(
         let mut resp = response.lock();
         'drain: loop {
             if !udp_rx.is_empty() {
-                error!(
+                debug!(
                     "connection {:?} established udp_rx {}",
                     conn_id,
                     udp_rx.len()

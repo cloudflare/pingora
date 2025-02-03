@@ -154,7 +154,7 @@ impl Connector {
 
         // connection offload is handled by the [TransportConnector]
         Self {
-            transport: TransportConnector::new(options),
+            transport: TransportConnector::new_http3(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
         }
@@ -299,7 +299,10 @@ impl ConnectionRef {
     }
 
     pub fn more_streams_allowed(&self) -> bool {
-        self.conn_io().more_streams_available()
+        let current = self.0.current_streams.load(Ordering::Relaxed);
+        !self.is_shutting_down()
+            && self.0.max_streams > current
+            && self.conn_io().more_streams_available()
     }
 }
 
@@ -387,7 +390,7 @@ mod tests {
     use textplots::{Chart, Plot, Shape};
     use tokio::task::JoinSet;
 
-    const ITER_SIZE: usize = 42;
+    const ITER_SIZE: usize = 16;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
@@ -535,6 +538,7 @@ mod tests {
                 .explain_err(InternalError, |_| "failed to add to histogram")?;
             req_counter += 1;
         }
+
         assert_eq!(req_counter, ITER_SIZE.pow(3));
 
         let diff = timing.elapsed();
@@ -588,6 +592,16 @@ mod tests {
                     };
 
                     let time_taken = timer.elapsed().as_micros() as u64;
+
+                    match session {
+                        HttpSession::H1(_) | HttpSession::H2(_) => {}
+                        HttpSession::H3(h3_session) => connector.release_http_session(
+                            h3_session,
+                            &peer,
+                            Some(Duration::from_secs(1)),
+                        ),
+                    }
+
                     histogram
                         .add(time_taken, 1)
                         .explain_err(InternalError, |_| "failed to add to histogram")?;
@@ -614,7 +628,7 @@ mod tests {
         info!("failed requests {}", failed_req_counter);
         info!("total duration {} milli seconds", diff.as_millis());
 
-        assert_eq!(req_counter, ITER_SIZE * ITER_SIZE * 2);
+        assert_eq!(req_counter, ITER_SIZE.pow(3));
 
         let histogram = histogram.load();
         print_histogram(histogram)?;

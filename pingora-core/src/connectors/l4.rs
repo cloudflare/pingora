@@ -680,9 +680,8 @@ mod quic_tests {
         let mut pre_handshake_stream = connect(&peer, None).await?;
         assert!(pre_handshake_stream.quic_connection_state().is_some());
 
-        let tls_connector = tls::Connector::new(None);
-        let quic_connector = tls::quic::Connector::new(None);
-        let mut stream = do_connect(&peer, None, None, &tls_connector, &quic_connector).await?;
+        let tls_connector = tls::quic::Connector::new(None);
+        let mut stream = do_connect(&peer, None, None, None, Some(&tls_connector)).await?;
         assert!(stream.quic_connection_state().is_some());
 
         let connection = stream.quic_connection_state().unwrap();

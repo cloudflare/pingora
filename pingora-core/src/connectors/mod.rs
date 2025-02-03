@@ -129,8 +129,8 @@ impl ConnectorOptions {
 
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
-    tls_ctx: tls::Connector,
-    quic_tls_ctx: tls::quic::Connector,
+    tls_ctx: Option<tls::Connector>,
+    quic_tls_ctx: Option<tls::quic::Connector>,
     connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
@@ -156,8 +156,32 @@ impl TransportConnector {
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
         TransportConnector {
-            tls_ctx: tls::Connector::new(options.clone()),
-            quic_tls_ctx: tls::quic::Connector::new(options),
+            tls_ctx: Some(tls::Connector::new(options.clone())),
+            quic_tls_ctx: None,
+            connection_pool: Arc::new(ConnectionPool::new(pool_size)),
+            offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
+            bind_to_v4,
+            bind_to_v6,
+            preferred_http_version: PreferredHttpVersion::new(),
+        }
+    }
+
+    pub fn new_http3(mut options: Option<ConnectorOptions>) -> Self {
+        let pool_size = options
+            .as_ref()
+            .map_or(DEFAULT_POOL_SIZE, |c| c.keepalive_pool_size);
+        // Take the offloading setting there because this layer has implement offloading,
+        // so no need for stacks at lower layer to offload again.
+        let offload = options.as_mut().and_then(|o| o.offload_threadpool.take());
+        let bind_to_v4 = options
+            .as_ref()
+            .map_or_else(Vec::new, |o| o.bind_to_v4.clone());
+        let bind_to_v6 = options
+            .as_ref()
+            .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
+        TransportConnector {
+            tls_ctx: None,
+            quic_tls_ctx: Some(tls::quic::Connector::new(options.clone())),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
             offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
             bind_to_v4,
@@ -181,7 +205,14 @@ impl TransportConnector {
             let tls_ctx = self.tls_ctx.clone();
             let quic_tls_ctx = self.quic_tls_ctx.clone();
             rt.spawn(async move {
-                do_connect(&peer, bind_to, alpn_override, &tls_ctx, &quic_tls_ctx).await
+                do_connect(
+                    &peer,
+                    bind_to,
+                    alpn_override,
+                    tls_ctx.as_ref(),
+                    quic_tls_ctx.as_ref(),
+                )
+                .await
             })
             .await
             .or_err(InternalError, "offload runtime failure")??
@@ -190,8 +221,8 @@ impl TransportConnector {
                 peer,
                 bind_to,
                 alpn_override,
-                &self.tls_ctx,
-                &self.quic_tls_ctx,
+                self.tls_ctx.as_ref(),
+                self.quic_tls_ctx.as_ref(),
             )
             .await?
         };
@@ -310,8 +341,8 @@ async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &tls::Connector,
-    quic_tls_ctx: &tls::quic::Connector,
+    tls_ctx: Option<&tls::Connector>,
+    quic_tls_ctx: Option<&tls::quic::Connector>,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
@@ -334,8 +365,8 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &tls::Connector,
-    quic_tls_ctx: &tls::quic::Connector,
+    tls_ctx: Option<&tls::Connector>,
+    quic_tls_ctx: Option<&tls::quic::Connector>,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
@@ -347,10 +378,24 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
                 ));
             }
 
+            let Some(quic_tls_ctx) = quic_tls_ctx else {
+                return Err(Error::explain(
+                    HandshakeError,
+                    "usage of HTTP3 requires a Quic TLS context",
+                ));
+            };
+
             let quic_stream =
                 quic_handshake(stream, peer, alpn_override, &quic_tls_ctx.quic_http3).await?;
             Ok(Box::new(quic_stream))
         } else {
+            let Some(tls_ctx) = tls_ctx else {
+                return Err(Error::explain(
+                    HandshakeError,
+                    "usage of HTTP1/2 with TLS enabled requires a TLS context",
+                ));
+            };
+
             let tls_stream = tls::connect(stream, peer, alpn_override, &tls_ctx.ctx).await?;
             Ok(Box::new(tls_stream))
         }
@@ -421,7 +466,6 @@ mod tests {
     use tls::Connector;
 
     use super::*;
-    use crate::connectors::tls::quic;
     use crate::upstreams::peer::BasicPeer;
     use tokio::io::AsyncWriteExt;
     #[cfg(unix)]
@@ -532,8 +576,7 @@ mod tests {
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
-        let quic_connector = quic::Connector::new(None);
-        let stream = do_connect(peer, None, None, &tls_connector, &quic_connector).await;
+        let stream = do_connect(peer, None, None, Some(&tls_connector), None).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (
@@ -593,9 +636,10 @@ pub(crate) mod quic_tests {
     use std::time::Duration;
 
     pub(crate) async fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
-        env_logger::builder()
+        let _ = env_logger::builder()
+            .is_test(true)
             .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
-            .init();
+            .try_init();
 
         info!("Starting listener...");
         let port = 6147u16;
@@ -611,7 +655,7 @@ pub(crate) mod quic_tests {
 
             let mut echo_service_http =
                 Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
-            echo_service_http.threads = Some(1);
+            echo_service_http.threads = Some(4);
 
             my_server.add_service(echo_service_http);
             my_server.run_forever();
