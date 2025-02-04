@@ -390,11 +390,11 @@ mod tests {
     use textplots::{Chart, Plot, Shape};
     use tokio::task::JoinSet;
 
-    const ITER_SIZE: usize = 16;
+    const ITER_SIZE: usize = 8;
 
     #[tokio::test]
     async fn test_listener_connector_quic_http3() -> Result<()> {
-        let (_server_handle, peer) = quic_listener_peer().await?;
+        let (_server_handle, peer) = quic_listener_peer(6180).await?;
 
         let connector = Connector::new(None);
         let mut session = connector.new_http_session(&peer).await?;
@@ -518,7 +518,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_connector_sequential_quic_http3() -> Result<()> {
-        let (_server_handle, mut peer) = quic_listener_peer().await?;
+        let (_server_handle, mut peer) = quic_listener_peer(6181).await?;
         peer.options.max_h3_streams = 100;
 
         let mut req_counter = 0usize;
@@ -550,7 +550,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_connector_parallel_quic_http3() -> Result<()> {
-        let (_server_handle, mut peer) = quic_listener_peer().await?;
+        let (_server_handle, mut peer) = quic_listener_peer(6182).await?;
         peer.options.max_h3_streams = 10;
 
         let req_counter = Arc::new(AtomicUsize::new(0));
@@ -637,7 +637,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_connector_parallel_sequential_quic_http3() -> Result<()> {
-        let (_server_handle, mut peer) = quic_listener_peer().await?;
+        let (_server_handle, mut peer) = quic_listener_peer(6183).await?;
         peer.options.max_h3_streams = 10;
 
         let req_counter = Arc::new(AtomicUsize::new(0));

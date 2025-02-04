@@ -135,7 +135,7 @@ impl ConnectionRx {
                 let mut conn = self.connection.lock();
                 match conn.recv(&mut buf[..size], recv_info) {
                     Ok(_size) => {
-                        debug!("connection {:?} received {}", conn_id, size);
+                        debug!("connection {:?} received data length={}", conn_id, size);
                         self.rx_notify.notify_waiters();
                         self.tx_notify.notify_waiters();
                     }

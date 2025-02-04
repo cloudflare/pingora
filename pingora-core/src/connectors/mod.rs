@@ -628,21 +628,20 @@ pub(crate) mod quic_tests {
     use async_trait::async_trait;
     use bytes::{BufMut, BytesMut};
     use http::{Response, StatusCode};
-    use log::info;
+    use log::{error, info};
     use pingora_error::Result;
     use pingora_timeout::timeout;
     use std::thread;
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    pub(crate) async fn quic_listener_peer() -> Result<(JoinHandle<()>, HttpPeer)> {
+    pub(crate) async fn quic_listener_peer(port: u16) -> Result<(JoinHandle<()>, HttpPeer)> {
         let _ = env_logger::builder()
             .is_test(true)
             .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
             .try_init();
 
         info!("Starting listener...");
-        let port = 6147u16;
         fn inner(port: u16) {
             let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
             let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
