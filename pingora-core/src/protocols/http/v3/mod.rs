@@ -35,6 +35,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::futures::Notified;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 
@@ -276,11 +277,9 @@ impl ConnectionIo {
     async fn error_or_timeout_data_race(
         &self,
         error: h3::Error,
+        data_race: Notified<'_>,
         sessions: &StreamIdHashMap<Sender<Event>>,
-    ) -> Result<bool> {
-        // register before housekeeping to avoid notify misses in high-load scenarios
-        let data_future = self.rx_notify.notified();
-
+    ) -> Result<Option<Notified>> {
         match error {
             h3::Error::Done => {
                 debug!("H3 connection {:?} no events available", self.conn_id());
@@ -310,7 +309,7 @@ impl ConnectionIo {
                             qconn.local_error(),
                             qconn.peer_error(),
                         ) {
-                            Ok(()) => Ok(false), // signal connection close
+                            Ok(()) => Ok(None), // signal connection close
                             Err(e) => Err(e),
                         };
                     }
@@ -318,10 +317,14 @@ impl ConnectionIo {
                 }
 
                 // race for new data on connection or timeout
-                tokio::select! { /* biased, poll data first */
+                let notified = tokio::select! { /* biased, poll data first */
                     // to avoid timeout race wins in high load scenarios when data could be available
                     biased;
-                    _data = data_future => { /* continue */ }
+                    _data = data_race => {
+                        /* continue */
+                        // register notify right away to cover all notify signals
+                        self.rx_notify.notified()
+                    }
                     _timedout = async {
                         if let Some(timeout) = timeout {
                             debug!("connection {:?} timeout {:?}", self.conn_id(), timeout);
@@ -331,6 +334,9 @@ impl ConnectionIo {
                             tokio::time::sleep(Duration::MAX).await
                         }
                     } => {
+                        // register notify right away to cover all notify signals
+                        let notified = self.rx_notify.notified();
+
                         if !sessions.is_empty() {
                             debug!("connection {:?} timed out with {} open sessions",
                                 self.conn_id(), sessions.len());
@@ -342,10 +348,11 @@ impl ConnectionIo {
 
                         if let Some(timeout) = timeout {
                             trace!("connection {:?} timed out {:?}", self.conn_id(), timeout);
-                        }
+                        };
+                        notified
                     }
-                }
-                Ok(true) // signal continue
+                };
+                Ok(Some(notified)) // signal continue
             }
             _ => {
                 // if an error occurs while processing data, the connection is closed with

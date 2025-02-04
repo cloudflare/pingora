@@ -628,7 +628,7 @@ pub(crate) mod quic_tests {
     use async_trait::async_trait;
     use bytes::{BufMut, BytesMut};
     use http::{Response, StatusCode};
-    use log::{error, info};
+    use log::info;
     use pingora_error::Result;
     use pingora_timeout::timeout;
     use std::thread;

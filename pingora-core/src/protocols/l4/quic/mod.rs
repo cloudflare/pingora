@@ -141,10 +141,11 @@ impl ConnectionTx {
         let id = self.connection_id;
         let mut out = [0u8; MAX_IPV6_BUF_SIZE];
 
-        let mut finished_sending = None;
+        let mut notified = self.tx_notify.notified();
         debug!("connection {:?} tx write", id);
         'write: loop {
             let mut continue_write = false;
+            let mut finished_sending = false;
 
             // update tx stats & get current details
             let (max_dgram_size, max_send_burst) = self.tx_stats.max_send_burst(&self.connection);
@@ -178,8 +179,7 @@ impl ConnectionTx {
                     Err(e) => {
                         if e == quiche::Error::Done {
                             trace!("connection {:?} send finished", id);
-                            // register notify before socket send to avoid misses under high load
-                            finished_sending = Some(self.tx_notify.notified());
+                            finished_sending = true;
                             break 'fill;
                         }
                         error!("connection {:?} send error: {:?}", id, e);
@@ -206,7 +206,9 @@ impl ConnectionTx {
 
             if total_write == 0 || dst_info.is_none() {
                 trace!("connection {:?} nothing to send", id);
-                self.tx_notify.notified().await;
+                notified.await;
+                // register notify right away to cover all notify signals
+                notified = self.tx_notify.notified();
                 continue 'write;
             }
             let dst_info = dst_info.unwrap();
@@ -242,10 +244,11 @@ impl ConnectionTx {
                 continue 'write;
             }
 
-            if let Some(tx_notified) = finished_sending {
+            if finished_sending {
                 trace!("connection {:?} finished sending", id);
-                tx_notified.await;
-                finished_sending = None;
+                notified.await;
+                // register notify right away to cover all notify signals
+                notified = self.tx_notify.notified();
                 continue 'write;
             }
         }

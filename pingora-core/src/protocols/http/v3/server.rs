@@ -248,6 +248,8 @@ impl Http3Session {
         conn: &mut Http3Connection,
         digest: Arc<Digest>,
     ) -> Result<Option<Self>> {
+        let mut notified = conn.conn_io.rx_notify.notified();
+
         'poll: loop {
             let poll = {
                 let mut qconn = conn.conn_io.quic.lock();
@@ -352,22 +354,25 @@ impl Http3Session {
                     }
                 }
                 Err(e) => {
+                    housekeeping_drop_sessions(
+                        &conn.conn_id().clone(),
+                        &mut conn.sessions,
+                        &conn.drop_sessions,
+                    );
+
                     let conn_active = conn
                         .conn_io
-                        .error_or_timeout_data_race(e, &conn.sessions)
+                        .error_or_timeout_data_race(e, notified, &conn.sessions)
                         .await?;
                     match conn_active {
-                        true => continue 'poll,
-                        false => return Ok(None),
+                        Some(updated_notified) => {
+                            notified = updated_notified;
+                            continue 'poll;
+                        }
+                        None => return Ok(None),
                     }
                 }
             }
-
-            housekeeping_drop_sessions(
-                &conn.conn_id().clone(),
-                &mut conn.sessions,
-                &conn.drop_sessions,
-            );
         }
     }
 

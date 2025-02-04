@@ -460,6 +460,8 @@ pub(crate) struct Http3Poll {
 
 impl Http3Poll {
     pub(crate) async fn start(mut self) -> Result<()> {
+        let mut notified = self.conn_io.rx_notify.notified();
+
         'poll: loop {
             let poll = {
                 let mut qconn = self.conn_io.quic.lock();
@@ -471,13 +473,22 @@ impl Http3Poll {
             let (stream_id, ev) = match poll {
                 Ok((stream, ev)) => (stream, ev),
                 Err(e) => {
+                    housekeeping_drop_sessions(
+                        &self.conn_id().clone(),
+                        &mut self.sessions,
+                        &self.drop_sessions,
+                    );
+
                     let conn_alive = self
                         .conn_io
-                        .error_or_timeout_data_race(e, &self.sessions)
+                        .error_or_timeout_data_race(e, notified, &self.sessions)
                         .await?;
                     match conn_alive {
-                        true => continue 'poll,
-                        false => {
+                        Some(updated_notified) => {
+                            notified = updated_notified;
+                            continue 'poll;
+                        }
+                        None => {
                             self.idle_close.send_replace(true);
                             break 'poll Ok(());
                         }
@@ -507,12 +518,6 @@ impl Http3Poll {
                 .send(ev)
                 .await
                 .explain_err(H3Error, |_| "failed to forward h3 event to session")?;
-
-            housekeeping_drop_sessions(
-                &self.conn_id().clone(),
-                &mut self.sessions,
-                &self.drop_sessions,
-            );
         }
     }
 
