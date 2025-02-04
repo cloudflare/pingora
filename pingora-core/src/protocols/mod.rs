@@ -52,6 +52,17 @@ pub trait UniqueID {
     fn id(&self) -> UniqueIDType;
 }
 
+/// Interface to get the connection state for e.g. for UDP/QUIC
+pub trait ConnectionState {
+    fn quic_connection_state(&mut self) -> Option<&mut Connection> {
+        None
+    }
+
+    fn is_quic_connection(&self) -> bool {
+        false
+    }
+}
+
 /// Interface to get TLS info
 pub trait Ssl {
     /// Return the TLS info if the connection is over TLS
@@ -90,6 +101,7 @@ pub trait IO:
     + AsyncWrite
     + Shutdown
     + UniqueID
+    + ConnectionState
     + Ssl
     + GetTimingDigest
     + GetProxyDigest
@@ -111,6 +123,7 @@ impl<
             + AsyncWrite
             + Shutdown
             + UniqueID
+            + ConnectionState
             + Ssl
             + GetTimingDigest
             + GetProxyDigest
@@ -149,6 +162,7 @@ mod ext_io_impl {
             0
         }
     }
+    impl ConnectionState for Mock {}
     impl Ssl for Mock {}
     impl GetTimingDigest for Mock {
         fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
@@ -208,6 +222,7 @@ mod ext_io_impl {
             0
         }
     }
+    impl ConnectionState for DuplexStream {}
     impl Ssl for DuplexStream {}
     impl GetTimingDigest for DuplexStream {
         fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
@@ -238,6 +253,8 @@ pub(crate) trait ConnSockReusable {
     fn check_sock_match<V: AsRawSocket>(&self, sock: V) -> bool;
 }
 
+use crate::protocols::l4::quic::Connection;
+use crate::protocols::tls::TlsRef;
 use l4::socket::SocketAddr;
 use log::{debug, error};
 #[cfg(unix)]
@@ -247,8 +264,6 @@ use std::os::unix::prelude::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 use std::{net::SocketAddr as InetSocketAddr, path::Path};
-
-use crate::protocols::tls::TlsRef;
 
 #[cfg(unix)]
 impl ConnFdReusable for SocketAddr {

@@ -225,6 +225,9 @@ impl<SV> HttpProxy<SV> {
 
                         (server_reused, error)
                     }
+                    ClientSession::H3(mut _h3) => {
+                        todo!()
+                    }
                 };
                 (
                     server_reused,

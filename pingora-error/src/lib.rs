@@ -119,6 +119,7 @@ pub enum ErrorType {
     InvalidHTTPHeader,
     H1Error,     // catch all
     H2Error,     // catch all
+    H3Error,     // catch all
     H2Downgrade, // Peer over h2 requests to downgrade to h1
     InvalidH2,   // Peer sends invalid h2 frames to us
     // IO error on established connections
@@ -177,6 +178,7 @@ impl ErrorType {
             ErrorType::InvalidHTTPHeader => "InvalidHTTPHeader",
             ErrorType::H1Error => "H1Error",
             ErrorType::H2Error => "H2Error",
+            ErrorType::H3Error => "H3Error",
             ErrorType::InvalidH2 => "InvalidH2",
             ErrorType::H2Downgrade => "H2Downgrade",
             ErrorType::ReadError => "ReadError",

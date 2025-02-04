@@ -16,23 +16,30 @@
 
 use crate::connectors::ConnectorOptions;
 use crate::protocols::http::client::HttpSession;
+use crate::protocols::{UniqueID, UniqueIDType};
 use crate::upstreams::peer::Peer;
+use parking_lot::RwLock;
 use pingora_error::Result;
+use pingora_pool::PoolNode;
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub mod v1;
 pub mod v2;
+pub mod v3;
 
 pub struct Connector {
     h1: v1::Connector,
     h2: v2::Connector,
+    h3: v3::Connector,
 }
 
 impl Connector {
     pub fn new(options: Option<ConnectorOptions>) -> Self {
         Connector {
             h1: v1::Connector::new(options.clone()),
-            h2: v2::Connector::new(options),
+            h2: v2::Connector::new(options.clone()),
+            h3: v3::Connector::new(options),
         }
     }
 
@@ -50,7 +57,15 @@ impl Connector {
         let h1_only = peer
             .get_peer_options()
             .map_or(true, |o| o.alpn.get_max_http_version() == 1);
-        if h1_only {
+
+        if peer.udp_http3() {
+            if let Some(h3) = self.h3.reused_http_session(peer).await? {
+                Ok((HttpSession::H3(h3), true))
+            } else {
+                let session = self.h3.new_http_session(peer).await?;
+                Ok((session, false))
+            }
+        } else if h1_only {
             let (h1, reused) = self.h1.get_http_session(peer).await?;
             Ok((HttpSession::H1(h1), reused))
         } else {
@@ -85,12 +100,59 @@ impl Connector {
         match session {
             HttpSession::H1(h1) => self.h1.release_http_session(h1, peer, idle_timeout).await,
             HttpSession::H2(h2) => self.h2.release_http_session(h2, peer, idle_timeout),
+            HttpSession::H3(h3) => self.h3.release_http_session(h3, peer, idle_timeout),
         }
     }
 
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.h2.prefer_h1(peer);
+    }
+}
+
+pub(crate) struct InUsePool<T: UniqueID> {
+    // TODO: use pingora hashmap to shard the lock contention
+    pools: RwLock<HashMap<u64, PoolNode<T>>>,
+}
+
+impl<T: UniqueID> InUsePool<T> {
+    pub(crate) fn new() -> Self {
+        InUsePool {
+            pools: RwLock::new(HashMap::new()),
+        }
+    }
+    pub(crate) fn insert(&self, reuse_hash: u64, conn: T) {
+        {
+            let pools = self.pools.read();
+            if let Some(pool) = pools.get(&reuse_hash) {
+                pool.insert(conn.id(), conn);
+                return;
+            }
+        } // drop read lock
+
+        let pool = PoolNode::new();
+        pool.insert(conn.id(), conn);
+        let mut pools = self.pools.write();
+        pools.insert(reuse_hash, pool);
+    }
+
+    // retrieve a `<T>` to create a new stream
+    // the caller should return the <T> to this pool if there is still
+    // capacity left for more streams
+    pub(crate) fn get(&self, reuse_hash: u64) -> Option<T> {
+        let pools = self.pools.read();
+        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
+    }
+
+    // release a http stream, this functional will cause an `<T>` to be returned (if exist)
+    // the caller should update the ref and then decide where to put it (in use pool or idle)
+    pub(crate) fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<T> {
+        let pools = self.pools.read();
+        if let Some(pool) = pools.get(&reuse_hash) {
+            pool.remove(id)
+        } else {
+            None
+        }
     }
 }
 
@@ -121,8 +183,8 @@ mod tests {
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         match &h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
+            _ => panic!("expect h2"),
         }
 
         connector.release_http_session(h2, &peer, None).await;
@@ -131,8 +193,8 @@ mod tests {
         // reused this time
         assert!(reused);
         match &h2 {
-            HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
+            _ => panic!("expect h2"),
         }
     }
 
@@ -147,7 +209,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -156,7 +218,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -177,7 +239,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -189,7 +251,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 
@@ -206,7 +268,7 @@ mod tests {
             HttpSession::H1(http) => {
                 get_http(http, 200).await;
             }
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
         connector.release_http_session(h1, &peer, None).await;
 
@@ -216,7 +278,7 @@ mod tests {
         assert!(reused);
         match &mut h1 {
             HttpSession::H1(_) => {}
-            HttpSession::H2(_) => panic!("expect h1"),
+            _ => panic!("expect h1"),
         }
     }
 }

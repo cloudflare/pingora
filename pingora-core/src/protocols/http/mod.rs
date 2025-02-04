@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTP/1.x and HTTP/2 implementation APIs
+//! HTTP/1.x, HTTP/2 and HTTP/3 implementation APIs
 
 mod body_buffer;
 pub mod bridge;
@@ -24,6 +24,7 @@ pub mod error_resp;
 pub mod server;
 pub mod v1;
 pub mod v2;
+pub mod v3;
 
 pub use server::Session as ServerSession;
 
@@ -56,4 +57,13 @@ impl HttpTask {
             HttpTask::Failed(_) => true,
         }
     }
+}
+
+/// HTTP Version
+#[derive(Debug, Default, Copy, Clone)]
+pub enum HttpVersion {
+    #[default]
+    V1,
+    V2,
+    V3,
 }

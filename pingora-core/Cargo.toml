@@ -68,6 +68,8 @@ zstd = "0"
 httpdate = "1"
 x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
+quiche = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca", default-features = false, optional = true }
+ring = { version = "0.17.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
@@ -83,17 +85,21 @@ reqwest = { version = "0.11", features = [
 ], default-features = false }
 hyper = "0.14"
 rstest = "0.23.0"
+h3i = { git = 'https://github.com/cloudflare/quiche.git', rev = "5d2031ca" }
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 jemallocator = "0.5"
+histogram = "0.11"
+textplots = "0.8"
 
 [features]
-default = []
+default = ["boringssl"]
 openssl = ["pingora-openssl", "openssl_derived"]
-boringssl = ["pingora-boringssl", "openssl_derived"]
+boringssl = ["pingora-boringssl", "openssl_derived", "quic-boringssl"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
 patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["dep:sentry"]
+quic-boringssl = ["dep:quiche", "dep:ring", "pingora-boringssl", "quiche/boringssl-boring-crate"]

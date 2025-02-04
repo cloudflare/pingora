@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
-use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
+use crate::protocols::{tls::SslDigest, ConnectionState, Peek, TimingDigest, UniqueIDType};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
 };
@@ -220,6 +220,8 @@ where
         self.tls.stream.as_ref().unwrap().get_ref().0.id()
     }
 }
+
+impl<T> ConnectionState for TlsStream<T> {}
 
 impl<T> Ssl for TlsStream<T> {
     fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {

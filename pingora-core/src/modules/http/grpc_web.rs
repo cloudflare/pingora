@@ -75,6 +75,6 @@ pub struct GrpcWeb;
 
 impl HttpModuleBuilder for GrpcWeb {
     fn init(&self) -> Module {
-        Box::new(GrpcWebBridge::default())
+        Box::<GrpcWebBridge>::default()
     }
 }

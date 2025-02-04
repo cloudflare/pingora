@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transport layer protocol implementation
+//! Quic TLS handshakes
 
-pub mod ext;
-pub mod listener;
-pub mod quic;
-pub mod socket;
-pub mod stream;
+pub mod client;
+pub mod server;
+mod stream;

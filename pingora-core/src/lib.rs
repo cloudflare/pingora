@@ -40,6 +40,7 @@
 // This enables the feature that labels modules that are only available with
 // certain pingora features
 #![cfg_attr(docsrs, feature(doc_cfg))]
+extern crate core;
 
 pub mod apps;
 pub mod connectors;

@@ -18,6 +18,8 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
+pub(crate) mod quic;
+
 #[cfg(feature = "rustls")]
 mod rustls;
 

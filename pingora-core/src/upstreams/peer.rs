@@ -15,6 +15,7 @@
 //! Defines where to connect to and how to connect to a remote server
 
 use crate::connectors::{l4::BindTo, L4Connect};
+use crate::protocols::l4::quic::QuicHttp3Configs;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
 #[cfg(unix)]
@@ -215,6 +216,15 @@ pub trait Peer: Display + Clone {
             .upstream_tcp_sock_tweak_hook
             .as_ref()
     }
+
+    /// Whether UDP/Quic should be used.
+    fn udp_http3(&self) -> bool {
+        let mut udp_http3 = false;
+        if let Some(alpn) = self.get_alpn() {
+            udp_http3 = matches!(alpn, &ALPN::H3)
+        }
+        udp_http3
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -329,6 +339,7 @@ pub struct PeerOptions {
     pub verify_hostname: bool,
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
+    /// to enable HTTP3 the ALPN needs to be ALPN::H3
     pub alpn: ALPN,
     pub ca: Option<Arc<CaType>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
@@ -337,6 +348,10 @@ pub struct PeerOptions {
     pub h2_ping_interval: Option<Duration>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
+    // how many concurrent h3 stream are allowed in the same connection
+    pub max_h3_streams: usize,
+    // quic and http3 configs (quiche)
+    pub quic_http3_configs: Option<QuicHttp3Configs>,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise
     // if `None`, the default curves will be used
@@ -374,6 +389,8 @@ impl PeerOptions {
             dscp: None,
             h2_ping_interval: None,
             max_h2_streams: 1,
+            max_h3_streams: 1,
+            quic_http3_configs: None,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -385,6 +402,7 @@ impl PeerOptions {
     }
 
     /// Set the ALPN according to the `max` and `min` constrains.
+    /// HTTP3 is only supported when setting min & max to 3 which corresponds to an `ALPN::H3`
     pub fn set_http_version(&mut self, max: u8, min: u8) {
         self.alpn = ALPN::new(max, min);
     }

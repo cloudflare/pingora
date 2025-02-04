@@ -24,6 +24,7 @@ mod tls;
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
+use crate::protocols::tls::quic::client::handshake as quic_handshake;
 use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -38,7 +39,6 @@ use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tls::TlsConnector;
 use tokio::sync::Mutex;
 
 /// The options to configure a [TransportConnector]
@@ -129,7 +129,8 @@ impl ConnectorOptions {
 
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
-    tls_ctx: tls::Connector,
+    tls_ctx: Option<tls::Connector>,
+    quic_tls_ctx: Option<tls::quic::Connector>,
     connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
@@ -137,7 +138,7 @@ pub struct TransportConnector {
     preferred_http_version: PreferredHttpVersion,
 }
 
-const DEFAULT_POOL_SIZE: usize = 128;
+const DEFAULT_POOL_SIZE: usize = 16;
 
 impl TransportConnector {
     /// Create a new [TransportConnector] with the given [ConnectorOptions]
@@ -155,7 +156,32 @@ impl TransportConnector {
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
         TransportConnector {
-            tls_ctx: tls::Connector::new(options),
+            tls_ctx: Some(tls::Connector::new(options.clone())),
+            quic_tls_ctx: None,
+            connection_pool: Arc::new(ConnectionPool::new(pool_size)),
+            offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
+            bind_to_v4,
+            bind_to_v6,
+            preferred_http_version: PreferredHttpVersion::new(),
+        }
+    }
+
+    pub fn new_http3(mut options: Option<ConnectorOptions>) -> Self {
+        let pool_size = options
+            .as_ref()
+            .map_or(DEFAULT_POOL_SIZE, |c| c.keepalive_pool_size);
+        // Take the offloading setting there because this layer has implement offloading,
+        // so no need for stacks at lower layer to offload again.
+        let offload = options.as_mut().and_then(|o| o.offload_threadpool.take());
+        let bind_to_v4 = options
+            .as_ref()
+            .map_or_else(Vec::new, |o| o.bind_to_v4.clone());
+        let bind_to_v6 = options
+            .as_ref()
+            .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
+        TransportConnector {
+            tls_ctx: None,
+            quic_tls_ctx: Some(tls::quic::Connector::new(options.clone())),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
             offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
             bind_to_v4,
@@ -177,11 +203,28 @@ impl TransportConnector {
         let stream = if let Some(rt) = rt {
             let peer = peer.clone();
             let tls_ctx = self.tls_ctx.clone();
-            rt.spawn(async move { do_connect(&peer, bind_to, alpn_override, &tls_ctx.ctx).await })
+            let quic_tls_ctx = self.quic_tls_ctx.clone();
+            rt.spawn(async move {
+                do_connect(
+                    &peer,
+                    bind_to,
+                    alpn_override,
+                    tls_ctx.as_ref(),
+                    quic_tls_ctx.as_ref(),
+                )
                 .await
-                .or_err(InternalError, "offload runtime failure")??
+            })
+            .await
+            .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
+            do_connect(
+                peer,
+                bind_to,
+                alpn_override,
+                self.tls_ctx.as_ref(),
+                self.quic_tls_ctx.as_ref(),
+            )
+            .await?
         };
 
         Ok(stream)
@@ -298,11 +341,12 @@ async fn do_connect<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &TlsConnector,
+    tls_ctx: Option<&tls::Connector>,
+    quic_tls_ctx: Option<&tls::quic::Connector>,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
-    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
+    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx, quic_tls_ctx);
 
     match peer.total_connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {
@@ -321,12 +365,40 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     peer: &P,
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
-    tls_ctx: &TlsConnector,
+    tls_ctx: Option<&tls::Connector>,
+    quic_tls_ctx: Option<&tls::quic::Connector>,
 ) -> Result<Stream> {
     let stream = l4_connect(peer, bind_to).await?;
     if peer.tls() {
-        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
-        Ok(Box::new(tls_stream))
+        if peer.udp_http3() {
+            if !peer.tls() {
+                return Err(Error::explain(
+                    HandshakeError,
+                    "usage of HTTP3 requires enabled TLS for the peer",
+                ));
+            }
+
+            let Some(quic_tls_ctx) = quic_tls_ctx else {
+                return Err(Error::explain(
+                    HandshakeError,
+                    "usage of HTTP3 requires a Quic TLS context",
+                ));
+            };
+
+            let quic_stream =
+                quic_handshake(stream, peer, alpn_override, &quic_tls_ctx.quic_http3).await?;
+            Ok(Box::new(quic_stream))
+        } else {
+            let Some(tls_ctx) = tls_ctx else {
+                return Err(Error::explain(
+                    HandshakeError,
+                    "usage of HTTP1/2 with TLS enabled requires a TLS context",
+                ));
+            };
+
+            let tls_stream = tls::connect(stream, peer, alpn_override, &tls_ctx.ctx).await?;
+            Ok(Box::new(tls_stream))
+        }
     } else {
         Ok(Box::new(stream))
     }
@@ -504,7 +576,7 @@ mod tests {
     /// the decomposed error type and message
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
-        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
+        let stream = do_connect(peer, None, None, Some(&tls_connector), None).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (
@@ -541,5 +613,103 @@ mod tests {
         let peer = BasicPeer::new(BLACK_HOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod quic_tests {
+    use crate::apps::http_app::ServeHttp;
+    use crate::listeners::Listeners;
+    use crate::prelude::HttpPeer;
+    use crate::protocols::http::ServerSession;
+    use crate::protocols::l4::quic::{QuicHttp3Configs, MAX_IPV6_BUF_SIZE};
+    use crate::server::Server;
+    use crate::services::listening::Service;
+    use async_trait::async_trait;
+    use bytes::{BufMut, BytesMut};
+    use http::{Response, StatusCode};
+    use log::info;
+    use pingora_error::Result;
+    use pingora_timeout::timeout;
+    use std::thread;
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    pub(crate) async fn quic_listener_peer(port: u16) -> Result<(JoinHandle<()>, HttpPeer)> {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .format_timestamp(Some(env_logger::TimestampPrecision::Nanos))
+            .try_init();
+
+        info!("Starting listener...");
+        fn inner(port: u16) {
+            let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+            let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+            let mut my_server = Server::new(None).unwrap();
+            my_server.bootstrap();
+
+            let configs = QuicHttp3Configs::from_cert_key_paths(&cert_path, &key_path).unwrap();
+            let listeners = Listeners::quic(format!("0.0.0.0:{port}").as_str(), configs).unwrap();
+
+            let mut echo_service_http =
+                Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
+            echo_service_http.threads = Some(4);
+
+            my_server.add_service(echo_service_http);
+            my_server.run_forever();
+        }
+
+        let server_handle = thread::spawn(move || {
+            inner(port);
+        });
+
+        let mut peer = HttpPeer::new(
+            format!("127.0.0.1:{port}"),
+            true,
+            "openrusty.org".to_string(),
+        );
+        peer.options.set_http_version(3, 3);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        info!("Startup completed.");
+        Ok((server_handle, peer))
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct EchoApp;
+    #[async_trait]
+    impl ServeHttp for EchoApp {
+        async fn response(&self, http_stream: &mut ServerSession) -> Response<Vec<u8>> {
+            let body_future = async {
+                let mut body = BytesMut::with_capacity(MAX_IPV6_BUF_SIZE);
+                while let Ok(b) = http_stream.read_request_body().await {
+                    match b {
+                        None => break, // finished reading request
+                        Some(b) => body.put(b),
+                    }
+                }
+                if body.is_empty() {
+                    body.put("no body!".as_bytes());
+                }
+                body.freeze()
+            };
+
+            // read timeout of 2s
+            let read_timeout = 2000;
+            let body = match timeout(Duration::from_millis(read_timeout), body_future).await {
+                Ok(res) => res,
+                Err(_) => {
+                    panic!("Timed out after {:?}ms", read_timeout);
+                }
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(http::header::CONTENT_TYPE, "text/html")
+                .header(http::header::CONTENT_LENGTH, body.len())
+                .body(body.to_vec())
+                .unwrap()
+        }
     }
 }

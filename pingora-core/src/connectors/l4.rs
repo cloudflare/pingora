@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! TCP and UDP/Quic connections
+
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
-    connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
+    connect_udp_with as udp_connect, connect_with as tcp_connect, set_dscp, set_recv_buf,
+    set_tcp_fastopen_connect,
 };
+use crate::protocols::l4::quic::Connection;
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 use crate::protocols::{GetSocketDigest, SocketDigest};
@@ -99,90 +103,16 @@ where
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
     let peer_addr = peer.address();
+
     let mut stream: Stream =
         if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
             custom_l4.connect(peer_addr).await?
+        } else if peer.udp_http3() {
+            // create UDP sockets
+            inner_udp_connect(peer, &bind_to, peer_addr).await?
         } else {
-            match peer_addr {
-                SocketAddr::Inet(addr) => {
-                    let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
-                        #[cfg(unix)]
-                        let raw = socket.as_raw_fd();
-                        #[cfg(windows)]
-                        let raw = socket.as_raw_socket();
-
-                        if peer.tcp_fast_open() {
-                            set_tcp_fastopen_connect(raw)?;
-                        }
-                        if let Some(recv_buf) = peer.tcp_recv_buf() {
-                            debug!("Setting recv buf size");
-                            set_recv_buf(raw, recv_buf)?;
-                        }
-                        if let Some(dscp) = peer.dscp() {
-                            debug!("Setting dscp");
-                            set_dscp(raw, dscp)?;
-                        }
-
-                        if let Some(tweak_hook) = peer
-                            .get_peer_options()
-                            .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
-                        {
-                            tweak_hook(socket)?;
-                        }
-
-                        Ok(())
-                    });
-                    let conn_res = match peer.connection_timeout() {
-                        Some(t) => pingora_timeout::timeout(t, connect_future)
-                            .await
-                            .explain_err(ConnectTimedout, |_| {
-                                format!("timeout {t:?} connecting to server {peer}")
-                            })?,
-                        None => connect_future.await,
-                    };
-                    match conn_res {
-                        Ok(socket) => {
-                            debug!("connected to new server: {}", peer.address());
-                            Ok(socket.into())
-                        }
-                        Err(e) => {
-                            let c = format!("Fail to connect to {peer}");
-                            match e.etype() {
-                                SocketError | BindError => Error::e_because(InternalError, c, e),
-                                _ => Err(e.more_context(c)),
-                            }
-                        }
-                    }
-                }
-                #[cfg(unix)]
-                SocketAddr::Unix(addr) => {
-                    let connect_future = connect_uds(
-                        addr.as_pathname()
-                            .expect("non-pathname unix sockets not supported as peer"),
-                    );
-                    let conn_res = match peer.connection_timeout() {
-                        Some(t) => pingora_timeout::timeout(t, connect_future)
-                            .await
-                            .explain_err(ConnectTimedout, |_| {
-                                format!("timeout {t:?} connecting to server {peer}")
-                            })?,
-                        None => connect_future.await,
-                    };
-                    match conn_res {
-                        Ok(socket) => {
-                            debug!("connected to new server: {}", peer.address());
-                            Ok(socket.into())
-                        }
-                        Err(e) => {
-                            let c = format!("Fail to connect to {peer}");
-                            match e.etype() {
-                                SocketError | BindError => Error::e_because(InternalError, c, e),
-                                _ => Err(e.more_context(c)),
-                            }
-                        }
-                    }
-                }
-            }?
+            // create TCP sockets
+            inner_tcp_connect(peer, bind_to, peer_addr).await?
         };
 
     let tracer = peer.get_tracer();
@@ -208,6 +138,157 @@ where
     stream.set_socket_digest(digest);
 
     Ok(stream)
+}
+
+/// create [`tokio::net::TcpSocket`] and a [`tokio::net::TcpStream`]
+async fn inner_tcp_connect<P>(
+    peer: &P,
+    bind_to: Option<BindTo>,
+    peer_addr: &SocketAddr,
+) -> Result<Stream>
+where
+    P: Peer + Send + Sync,
+{
+    match peer_addr {
+        SocketAddr::Inet(addr) => {
+            let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
+                #[cfg(unix)]
+                let raw = socket.as_raw_fd();
+                #[cfg(windows)]
+                let raw = socket.as_raw_socket();
+
+                if peer.tcp_fast_open() {
+                    set_tcp_fastopen_connect(raw)?;
+                }
+                if let Some(recv_buf) = peer.tcp_recv_buf() {
+                    debug!("Setting recv buf size");
+                    set_recv_buf(raw, recv_buf)?;
+                }
+                if let Some(dscp) = peer.dscp() {
+                    debug!("Setting dscp");
+                    set_dscp(raw, dscp)?;
+                }
+
+                if let Some(tweak_hook) = peer
+                    .get_peer_options()
+                    .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
+                {
+                    tweak_hook(socket)?;
+                }
+
+                Ok(())
+            });
+            let conn_res = match peer.connection_timeout() {
+                Some(t) => pingora_timeout::timeout(t, connect_future)
+                    .await
+                    .explain_err(ConnectTimedout, |_| {
+                        format!("timeout {t:?} connecting to server {peer}")
+                    })?,
+                None => connect_future.await,
+            };
+            match conn_res {
+                Ok(socket) => {
+                    debug!("connected to new server: {}", peer.address());
+                    Ok(socket.into())
+                }
+                Err(e) => {
+                    let c = format!("Fail to connect to {peer}");
+                    match e.etype() {
+                        SocketError | BindError => Error::e_because(InternalError, c, e),
+                        _ => Err(e.more_context(c)),
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        SocketAddr::Unix(addr) => {
+            let connect_future = connect_uds(
+                addr.as_pathname()
+                    .expect("non-pathname unix sockets not supported as peer"),
+            );
+            let conn_res = match peer.connection_timeout() {
+                Some(t) => pingora_timeout::timeout(t, connect_future)
+                    .await
+                    .explain_err(ConnectTimedout, |_| {
+                        format!("timeout {t:?} connecting to server {peer}")
+                    })?,
+                None => connect_future.await,
+            };
+            match conn_res {
+                Ok(socket) => {
+                    debug!("connected to new server: {}", peer.address());
+                    Ok(socket.into())
+                }
+                Err(e) => {
+                    let c = format!("Fail to connect to {peer}");
+                    match e.etype() {
+                        SocketError | BindError => Error::e_because(InternalError, c, e),
+                        _ => Err(e.more_context(c)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// create [`tokio::net::UdpSocket`] and a Quic [Connection](`crate::protocols::l4::quic::Connection::OutgoingHandshake`)
+async fn inner_udp_connect<P>(
+    peer: &P,
+    bind_to: &Option<BindTo>,
+    peer_addr: &SocketAddr,
+) -> Result<Stream>
+where
+    P: Peer + Send + Sync,
+{
+    match peer_addr {
+        SocketAddr::Inet(addr) => {
+            let connect_future = udp_connect(addr, bind_to.as_ref(), |socket| {
+                #[cfg(unix)]
+                let raw = socket.as_raw_fd();
+                #[cfg(windows)]
+                let raw = socket.as_raw_socket();
+
+                if let Some(dscp) = peer.dscp() {
+                    debug!("Setting dscp");
+                    set_dscp(raw, dscp)?;
+                }
+                Ok(())
+            });
+            let conn_res = match peer.connection_timeout() {
+                Some(t) => pingora_timeout::timeout(t, connect_future)
+                    .await
+                    .explain_err(ConnectTimedout, |_| {
+                        format!("timeout {t:?} connecting to server {peer}")
+                    })?,
+                None => connect_future.await,
+            };
+            let socket = match conn_res {
+                Ok(socket) => {
+                    debug!("connected to new server: {}", peer.address());
+                    Ok(socket)
+                }
+                Err(e) => {
+                    let c = format!("Fail to connect to {peer}");
+                    match e.etype() {
+                        SocketError | BindError => Error::e_because(InternalError, c, e),
+                        _ => Err(e.more_context(c)),
+                    }
+                }
+            }?;
+
+            Ok(Connection::initiate(socket)?.into())
+        }
+        SocketAddr::Unix(_addr) => {
+            // NOTE: tokio::net::UnixDatagram support could be an option
+            // send_to(), recv_from() are using a file path with UnixDatagram
+            // needs verification if Quic/quiche can handle paths as SocketAddr
+            // in send() & recv()
+            Err(Error::explain(
+                BindError,
+                "Unix Sockets for HTTP3 are not implemented",
+            ))
+        }
+    }
 }
 
 pub(crate) fn bind_to_random<P: Peer>(
@@ -659,5 +740,31 @@ mod tests {
         // low < high success
         bind_to.set_port_range(Some((1000, 2000))).unwrap();
         assert_eq!(bind_to.port_range, Some((1000, 2000)));
+    }
+}
+
+#[cfg(test)]
+mod quic_tests {
+    use crate::connectors::l4::connect;
+    use crate::connectors::quic_tests::quic_listener_peer;
+    use crate::connectors::{do_connect, tls};
+    use crate::protocols::l4::quic::Connection;
+    use crate::protocols::ConnectionState;
+    use pingora_error::Result;
+
+    #[tokio::test]
+    async fn test_connector_quic_handshake() -> Result<()> {
+        let (_server_handle, peer) = quic_listener_peer(6184).await?;
+
+        let mut pre_handshake_stream = connect(&peer, None).await?;
+        assert!(pre_handshake_stream.quic_connection_state().is_some());
+
+        let tls_connector = tls::quic::Connector::new(None);
+        let mut stream = do_connect(&peer, None, None, None, Some(&tls_connector)).await?;
+        assert!(stream.quic_connection_state().is_some());
+
+        let connection = stream.quic_connection_state().unwrap();
+        assert!(matches!(connection, Connection::OutgoingEstablished(_)));
+        Ok(())
     }
 }

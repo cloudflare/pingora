@@ -31,6 +31,7 @@ pub use rustls::*;
 
 #[cfg(not(feature = "any_tls"))]
 pub mod noop_tls;
+pub mod quic;
 
 #[cfg(not(feature = "any_tls"))]
 pub use noop_tls::*;
@@ -44,6 +45,8 @@ pub enum ALPN {
     H2,
     /// Prefer HTTP/2 over HTTP/1.1
     H2H1,
+    /// Prefer HTTP/3 only
+    H3,
 }
 
 impl std::fmt::Display for ALPN {
@@ -52,6 +55,7 @@ impl std::fmt::Display for ALPN {
             ALPN::H1 => write!(f, "H1"),
             ALPN::H2 => write!(f, "H2"),
             ALPN::H2H1 => write!(f, "H2H1"),
+            ALPN::H3 => write!(f, "H3"),
         }
     }
 }
@@ -63,6 +67,8 @@ impl ALPN {
             ALPN::H1
         } else if min == 2 {
             ALPN::H2
+        } else if min == 3 {
+            ALPN::H3
         } else {
             ALPN::H2H1
         }
@@ -72,15 +78,17 @@ impl ALPN {
     pub fn get_max_http_version(&self) -> u8 {
         match self {
             ALPN::H1 => 1,
-            _ => 2,
+            ALPN::H2 | ALPN::H2H1 => 2,
+            ALPN::H3 => 3,
         }
     }
 
     /// Return the min http version this [`ALPN`] allows
     pub fn get_min_http_version(&self) -> u8 {
         match self {
+            ALPN::H3 => 3,
             ALPN::H2 => 2,
-            _ => 1,
+            ALPN::H2H1 | ALPN::H1 => 1,
         }
     }
 
@@ -92,6 +100,7 @@ impl ALPN {
             Self::H1 => b"\x08http/1.1",
             Self::H2 => b"\x02h2",
             Self::H2H1 => b"\x02h2\x08http/1.1",
+            Self::H3 => b"\x02h3",
         }
     }
 
@@ -100,6 +109,7 @@ impl ALPN {
         match raw {
             b"http/1.1" => Some(Self::H1),
             b"h2" => Some(Self::H2),
+            b"h3" => Some(Self::H3),
             _ => None,
         }
     }
@@ -110,6 +120,7 @@ impl ALPN {
             ALPN::H1 => vec![b"http/1.1".to_vec()],
             ALPN::H2 => vec![b"h2".to_vec()],
             ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ALPN::H3 => vec![b"h3".to_vec()],
         }
     }
 }
