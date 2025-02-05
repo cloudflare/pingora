@@ -97,7 +97,7 @@ pub struct HttpProxy<SV> {
     max_retries: usize,
 }
 
-impl<SV> HttpProxy<SV> {
+impl<SV: Sync> HttpProxy<SV> {
     fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
         HttpProxy {
             inner,
@@ -242,7 +242,7 @@ impl<SV> HttpProxy<SV> {
         }
     }
 
-    fn upstream_filter(
+    async fn upstream_filter(
         &self,
         session: &mut Session,
         task: &mut HttpTask,
@@ -255,9 +255,11 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Header(header, _eos) => {
                 self.inner.upstream_response_filter(session, header, ctx)
             }
-            HttpTask::Body(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => self
                 .inner
                 .upstream_response_trailer_filter(session, trailers, ctx)?,
@@ -783,7 +785,7 @@ use pingora_core::services::listening::Service;
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
+pub fn http_proxy_service<SV: Sync>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
 where
     SV: ProxyHttp,
 {
@@ -793,7 +795,7 @@ where
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service_with_name<SV>(
+pub fn http_proxy_service_with_name<SV: Sync>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
