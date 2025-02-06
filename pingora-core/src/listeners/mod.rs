@@ -79,6 +79,7 @@ impl TransportStackBuilder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
