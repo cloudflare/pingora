@@ -341,7 +341,7 @@ impl ListenerEndpoint {
         Ok(())
     }
 
-    pub async fn accept(&mut self) -> Result<Stream> {
+    pub async fn accept(&self) -> Result<Stream> {
         let mut stream = self
             .listener
             .accept()
@@ -365,10 +365,10 @@ mod test {
         builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
 
         #[cfg(unix)]
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
-        let mut listener = builder.listen().await.unwrap();
+        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -391,10 +391,10 @@ mod test {
         builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
 
         #[cfg(unix)]
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
-        let mut listener = builder.listen().await.unwrap();
+        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept twice
@@ -418,7 +418,7 @@ mod test {
 
         builder.listen_addr(ServerAddress::Uds(addr.into(), None));
 
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept once

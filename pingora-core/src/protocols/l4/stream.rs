@@ -351,7 +351,8 @@ const BUF_WRITE_SIZE: usize = 1460;
 /// A concrete type for transport layer connection + extra fields for logging
 #[derive(Debug)]
 pub struct Stream {
-    stream: BufStream<RawStreamWrapper>,
+    // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
+    stream: Option<BufStream<RawStreamWrapper>>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<u8>,
     buffer_write: bool,
@@ -368,9 +369,17 @@ pub struct Stream {
 }
 
 impl Stream {
+    fn stream(&self) -> &BufStream<RawStreamWrapper> {
+        self.stream.as_ref().expect("stream should always be set")
+    }
+
+    fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
+        self.stream.as_mut().expect("stream should always be set")
+    }
+
     /// set TCP nodelay for this connection if `self` is TCP
     pub fn set_nodelay(&mut self) -> Result<()> {
-        if let RawStream::Tcp(s) = &self.stream.get_mut().stream {
+        if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             s.set_nodelay(true)
                 .or_err(ConnectError, "failed to set_nodelay")?;
         }
@@ -379,7 +388,7 @@ impl Stream {
 
     /// set TCP keepalive settings for this connection if `self` is TCP
     pub fn set_keepalive(&mut self, ka: &TcpKeepalive) -> Result<()> {
-        if let RawStream::Tcp(s) = &self.stream.get_mut().stream {
+        if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             debug!("Setting tcp keepalive");
             set_tcp_keepalive(s, ka)?;
         }
@@ -390,12 +399,12 @@ impl Stream {
     pub fn set_rx_timestamp(&mut self) -> Result<()> {
         use nix::sys::socket::{setsockopt, sockopt, TimestampingFlag};
 
-        if let RawStream::Tcp(s) = &self.stream.get_mut().stream {
+        if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             let timestamp_options = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
                 | TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE;
             setsockopt(s.as_raw_fd(), sockopt::Timestamping, &timestamp_options)
                 .or_err(InternalError, "failed to set SOF_TIMESTAMPING_RX_SOFTWARE")?;
-            self.stream.get_mut().enable_rx_ts(true);
+            self.stream_mut().get_mut().enable_rx_ts(true);
         }
 
         Ok(())
@@ -412,16 +421,28 @@ impl Stream {
             self.rewind_read_buf.extend_from_slice(data);
         }
     }
+
+    /// Set the buffer of BufStream
+    /// It is only set later because of the malloc overhead in critical accept() path
+    pub(crate) fn set_buffer(&mut self) {
+        use std::mem;
+        // Since BufStream doesn't provide an API to adjust the buf directly,
+        // we take the raw stream out of it and put it in a new BufStream with the size we want
+        let stream = mem::take(&mut self.stream);
+        let stream =
+            stream.map(|s| BufStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
+        let _ = mem::replace(&mut self.stream, stream);
+    }
 }
 
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: BufStream::with_capacity(
-                BUF_READ_SIZE,
-                BUF_WRITE_SIZE,
+            stream: Some(BufStream::with_capacity(
+                0,
+                0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
-            ),
+            )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -439,11 +460,11 @@ impl From<TcpStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: BufStream::with_capacity(
-                BUF_READ_SIZE,
-                BUF_WRITE_SIZE,
+            stream: Some(BufStream::with_capacity(
+                0,
+                0,
                 RawStreamWrapper::new(RawStream::Unix(s)),
-            ),
+            )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -460,14 +481,14 @@ impl From<UnixStream> for Stream {
 #[cfg(unix)]
 impl AsRawFd for Stream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.stream.get_ref().as_raw_fd()
+        self.stream().get_ref().as_raw_fd()
     }
 }
 
 #[cfg(windows)]
 impl AsRawSocket for Stream {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
-        self.stream.get_ref().as_raw_socket()
+        self.stream().get_ref().as_raw_socket()
     }
 }
 
@@ -551,7 +572,7 @@ impl Drop for Stream {
             t.0.on_disconnected();
         }
         /* use nodelay/local_addr function to detect socket status */
-        let ret = match &self.stream.get_ref().stream {
+        let ret = match &self.stream().get_ref().stream {
             RawStream::Tcp(s) => s.nodelay().err(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.local_addr().err(),
@@ -594,10 +615,10 @@ impl AsyncRead for Stream {
             let _ = std::mem::replace(&mut self.rewind_read_buf, remaining_buf);
             result
         } else {
-            Pin::new(&mut self.stream).poll_read(cx, buf)
+            Pin::new(&mut self.stream_mut()).poll_read(cx, buf)
         };
         self.read_pending_time.poll_time(&result);
-        self.rx_ts = self.stream.get_ref().rx_ts;
+        self.rx_ts = self.stream().get_ref().rx_ts;
         result
     }
 }
@@ -609,22 +630,22 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let result = if self.buffer_write {
-            Pin::new(&mut self.stream).poll_write(cx, buf)
+            Pin::new(&mut self.stream_mut()).poll_write(cx, buf)
         } else {
-            Pin::new(&mut self.stream.get_mut()).poll_write(cx, buf)
+            Pin::new(&mut self.stream_mut().get_mut()).poll_write(cx, buf)
         };
         self.write_pending_time.poll_write_time(&result, buf.len());
         result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.stream).poll_flush(cx);
+        let result = Pin::new(&mut self.stream_mut()).poll_flush(cx);
         self.write_pending_time.poll_time(&result);
         result
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        Pin::new(&mut self.stream_mut()).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -635,9 +656,9 @@ impl AsyncWrite for Stream {
         let total_size = bufs.iter().fold(0, |acc, s| acc + s.len());
 
         let result = if self.buffer_write {
-            Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+            Pin::new(&mut self.stream_mut()).poll_write_vectored(cx, bufs)
         } else {
-            Pin::new(&mut self.stream.get_mut()).poll_write_vectored(cx, bufs)
+            Pin::new(&mut self.stream_mut().get_mut()).poll_write_vectored(cx, bufs)
         };
 
         self.write_pending_time.poll_write_time(&result, total_size);
@@ -646,9 +667,9 @@ impl AsyncWrite for Stream {
 
     fn is_write_vectored(&self) -> bool {
         if self.buffer_write {
-            self.stream.is_write_vectored() // it is true
+            self.stream().is_write_vectored() // it is true
         } else {
-            self.stream.get_ref().is_write_vectored()
+            self.stream().get_ref().is_write_vectored()
         }
     }
 }
