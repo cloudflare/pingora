@@ -391,8 +391,16 @@ pub trait ProxyHttp {
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
-    /// The response status code of the error response maybe returned for logging purpose.
-    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> u16
+    /// The response status code of the error response may be returned for logging purposes.
+    /// Additionally, the user can return whether this session may be reused in spite of the error.
+    /// Today this reuse status is only respected for errors that occur prior to upstream peer
+    /// selection, and the keepalive configured on the `Session` itself still takes precedent.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
@@ -419,7 +427,12 @@ pub trait ProxyHttp {
                 error!("failed to send error response to downstream: {e}");
             });
         }
-        code
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     /// Decide whether should serve stale when encountering an error or during revalidation
@@ -492,4 +505,10 @@ pub trait ProxyHttp {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Context struct returned by `fail_to_proxy`.
+pub struct FailToProxy {
+    pub error_code: u16,
+    pub can_reuse_downstream: bool,
 }
