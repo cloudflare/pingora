@@ -231,6 +231,7 @@ impl Server {
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
+        listeners_per_fd: usize,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
@@ -242,6 +243,7 @@ impl Server {
                     #[cfg(unix)]
                     fds,
                     shutdown,
+                    listeners_per_fd,
                 )
                 .await;
             info!("service exited.")
@@ -429,6 +431,7 @@ impl Server {
                 self.shutdown_recv.clone(),
                 threads,
                 conf.work_stealing,
+                self.configuration.listener_tasks_per_fd,
             );
             runtimes.push(runtime);
         }
