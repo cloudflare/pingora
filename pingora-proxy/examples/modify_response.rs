@@ -85,7 +85,7 @@ impl ProxyHttp for Json2Yaml {
         Ok(())
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,

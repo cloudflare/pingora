@@ -785,9 +785,9 @@ use pingora_core::services::listening::Service;
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV: Sync>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
+pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
 where
-    SV: ProxyHttp,
+    SV: ProxyHttp + Sync,
 {
     http_proxy_service_with_name(conf, inner, "Pingora HTTP Proxy Service")
 }
@@ -795,13 +795,13 @@ where
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service_with_name<SV: Sync>(
+pub fn http_proxy_service_with_name<SV>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
 ) -> Service<HttpProxy<SV>>
 where
-    SV: ProxyHttp,
+    SV: ProxyHttp + Sync,
 {
     let mut proxy = HttpProxy::new(inner, conf.clone());
     proxy.handle_init_modules();
