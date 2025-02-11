@@ -513,6 +513,8 @@ impl<SV> HttpProxy<SV> {
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
                     && !end
                 {
+                    // Upgrade the http version to 1.1 because 1.0/0.9 doesn't support chunked
+                    header.set_version(Version::HTTP_11);
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
 
