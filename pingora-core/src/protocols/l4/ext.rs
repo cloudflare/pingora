@@ -447,7 +447,7 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
     bind_to: Option<&BindTo>,
     set_socket: F,
 ) -> Result<TcpStream> {
-    if bind_to.as_ref().map_or(false, |b| b.will_fallback()) {
+    if bind_to.as_ref().is_some_and(|b| b.will_fallback()) {
         // if we see an EADDRNOTAVAIL error clear the port range and try again
         let connect_result = inner_connect_with(addr, bind_to, set_socket.clone()).await;
         if let Err(e) = connect_result.as_ref() {

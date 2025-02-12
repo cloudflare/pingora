@@ -93,7 +93,7 @@ struct InsertToManager<'a, const N: usize> {
     lru: &'a Manager<N>,
 }
 
-impl<'de, 'a, const N: usize> serde::de::Visitor<'de> for InsertToManager<'a, N> {
+impl<'de, const N: usize> serde::de::Visitor<'de> for InsertToManager<'_, N> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

@@ -61,7 +61,7 @@ impl Connector {
             }
             let h2_only = peer
                 .get_peer_options()
-                .map_or(false, |o| o.alpn.get_min_http_version() == 2)
+                .is_some_and(|o| o.alpn.get_min_http_version() == 2)
                 && !self.h2.h1_is_preferred(peer);
             if !h2_only {
                 // We next check the reuse pool for h1 before creating a new h2 connection.

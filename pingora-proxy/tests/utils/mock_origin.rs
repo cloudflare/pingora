@@ -46,7 +46,8 @@ fn init() -> bool {
     process::Command::new("pkill")
         .args(["-F", "/tmp/pingora_mock_origin.pid"])
         .spawn()
-        .unwrap();
+        .unwrap()
+        .wait();
     let _origin = thread::spawn(|| {
         process::Command::new("openresty")
             .args(["-p", &format!("{}/origin", super::conf_dir())])

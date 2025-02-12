@@ -574,7 +574,7 @@ impl<SV> HttpProxy<SV> {
          * output anything yet.
          * Don't write 0 bytes to the network since it will be
          * treated as the terminating chunk */
-        if !upstream_end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+        if !upstream_end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
             return Ok(false);
         }
 

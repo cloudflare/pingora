@@ -322,7 +322,7 @@ pub struct LoadBalancer<S> {
     pub parallel_health_check: bool,
 }
 
-impl<'a, S: BackendSelection> LoadBalancer<S>
+impl<S: BackendSelection> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
     S::Iter: BackendIter,

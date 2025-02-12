@@ -359,14 +359,14 @@ impl Server {
         #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
-        if self.options.as_ref().map_or(false, |o| o.test) {
+        if self.options.as_ref().is_some_and(|o| o.test) {
             info!("Server Test passed, exiting");
             std::process::exit(0);
         }
 
         // load fds
         #[cfg(unix)]
-        match self.load_fds(self.options.as_ref().map_or(false, |o| o.upgrade)) {
+        match self.load_fds(self.options.as_ref().is_some_and(|o| o.upgrade)) {
             Ok(_) => {
                 info!("Bootstrap done");
             }
