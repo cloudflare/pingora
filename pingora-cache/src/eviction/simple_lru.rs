@@ -142,7 +142,7 @@ struct InsertToManager<'a> {
     lru: &'a Manager,
 }
 
-impl<'de, 'a> serde::de::Visitor<'de> for InsertToManager<'a> {
+impl<'de> serde::de::Visitor<'de> for InsertToManager<'_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

@@ -156,7 +156,7 @@ pub(super) fn is_upgrade_req(req: &RequestHeader) -> bool {
 pub(super) fn is_expect_continue_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11
         // https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1
-        && req.headers.get(header::EXPECT).map_or(false, |v| {
+        && req.headers.get(header::EXPECT).is_some_and(|v| {
             v.as_bytes().eq_ignore_ascii_case(b"100-continue")
         })
 }
@@ -234,7 +234,7 @@ pub(super) fn populate_headers(
         if !header.name.is_empty() {
             header_ref.push(KVRef::new(
                 header.name.as_ptr() as usize - base,
-                header.name.as_bytes().len(),
+                header.name.len(),
                 header.value.as_ptr() as usize - base,
                 header.value.len(),
             ));

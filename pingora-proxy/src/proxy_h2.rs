@@ -542,7 +542,7 @@ impl<SV> HttpProxy<SV> {
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
          * for consistency */
-        if !end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+        if !end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
             return Ok(false);
         }
 

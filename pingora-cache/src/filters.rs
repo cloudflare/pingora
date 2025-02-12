@@ -96,7 +96,7 @@ pub fn calculate_fresh_until(
 
     let uncacheable = cache_control
         .as_ref()
-        .map_or(false, |cc| cc.is_cacheable() == Cacheable::No);
+        .is_some_and(|cc| cc.is_cacheable() == Cacheable::No);
     if uncacheable {
         return None;
     }

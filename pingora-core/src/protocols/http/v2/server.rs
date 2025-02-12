@@ -67,7 +67,7 @@ use std::pin::Pin;
 /// Calling `.await` in this object will not return until the client decides to close this stream.
 pub struct Idle<'a>(&'a mut HttpSession);
 
-impl<'a> Future for Idle<'a> {
+impl Future for Idle<'_> {
     type Output = Result<h2::Reason>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -398,7 +398,7 @@ impl HttpSession {
                     .request_header
                     .headers
                     .get(header::CONTENT_LENGTH)
-                    .map_or(false, |cl| cl.as_bytes() == b"0"))
+                    .is_some_and(|cl| cl.as_bytes() == b"0"))
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {

@@ -366,7 +366,7 @@ impl<'a, T> Iterator for LruUnitIter<'a, T> {
     }
 }
 
-impl<'a, T> DoubleEndedIterator for LruUnitIter<'a, T> {
+impl<T> DoubleEndedIterator for LruUnitIter<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.iter.next_back().map(|key| {
             // safe because we always items in table and list are always 1:1
