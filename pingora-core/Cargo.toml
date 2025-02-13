@@ -46,7 +46,7 @@ libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
 thread_local = "1.0"
 prometheus = "0.13"
-sentry = { version = "0.26", features = [
+sentry = { version = "0.36", features = [
     "backtrace",
     "contexts",
     "panic",
