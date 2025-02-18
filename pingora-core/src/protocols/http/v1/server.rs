@@ -247,6 +247,7 @@ impl HttpSession {
                         self.body_reader.reinit();
                         self.response_written = None;
                         self.respect_keepalive();
+                        self.validate_request()?;
 
                         return Ok(Some(s));
                     }
@@ -285,6 +286,17 @@ impl HttpSession {
                 }
             }
         }
+    }
+
+    // Validate the request header read. This function must be called after the request header
+    // read.
+    fn validate_request(&self) -> Result<()> {
+        let req_header = self.req_header();
+
+        // ad-hoc checks
+        super::common::check_dup_content_length(&req_header.headers)?;
+
+        Ok(())
     }
 
     /// Return a reference of the `RequestHeader` this session read

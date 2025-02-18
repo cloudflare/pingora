@@ -166,6 +166,20 @@ impl HttpSession {
         Ok(res)
     }
 
+    // Validate the response header read. This function must be called after the response header
+    // read.
+    fn validate_response(&self) -> Result<()> {
+        let resp_header = self
+            .response_header
+            .as_ref()
+            .expect("response header must be read");
+
+        // ad-hoc checks
+        super::common::check_dup_content_length(&resp_header.headers)?;
+
+        Ok(())
+    }
+
     /// Read the response header from the server
     /// This function can be called multiple times, if the headers received are just informational
     /// headers.
@@ -287,6 +301,7 @@ impl HttpSession {
                     self.buf = buf;
                     self.upgraded = self.is_upgrade(&response_header).unwrap_or(false);
                     self.response_header = Some(response_header);
+                    self.validate_response()?;
                     return Ok(s);
                 }
                 HeaderParseState::Partial => { /* continue the loop */ }
