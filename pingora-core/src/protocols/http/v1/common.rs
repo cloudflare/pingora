@@ -16,6 +16,7 @@
 
 use http::{header, HeaderValue};
 use log::warn;
+use pingora_error::Result;
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
 use std::time::Duration;
@@ -242,4 +243,52 @@ pub(super) fn populate_headers(
         }
     }
     used_header_index
+}
+
+// RFC 7230:
+// If a message is received without Transfer-Encoding and with
+// either multiple Content-Length header fields having differing
+// field-values or a single Content-Length header field having an
+// invalid value, then the message framing is invalid and the
+// recipient MUST treat it as an unrecoverable error.
+pub(super) fn check_dup_content_length(headers: &HMap) -> Result<()> {
+    if headers.get(header::TRANSFER_ENCODING).is_some() {
+        // If TE header, ignore CL
+        return Ok(());
+    }
+    let mut cls = headers.get_all(header::CONTENT_LENGTH).into_iter();
+    if cls.next().is_none() {
+        // no CL header is fine.
+        return Ok(());
+    }
+    if cls.next().is_some() {
+        // duplicated CL is bad
+        return crate::Error::e_explain(
+            crate::ErrorType::InvalidHTTPHeader,
+            "duplicated Content-Length header",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+
+    #[test]
+    fn test_check_dup_content_length() {
+        let mut headers = HMap::new();
+
+        assert!(check_dup_content_length(&headers).is_ok());
+
+        headers.append(CONTENT_LENGTH, "1".try_into().unwrap());
+        assert!(check_dup_content_length(&headers).is_ok());
+
+        headers.append(CONTENT_LENGTH, "2".try_into().unwrap());
+        assert!(check_dup_content_length(&headers).is_err());
+
+        headers.append(TRANSFER_ENCODING, "chunkeds".try_into().unwrap());
+        assert!(check_dup_content_length(&headers).is_ok());
+    }
 }
