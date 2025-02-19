@@ -343,11 +343,23 @@ impl Session {
         // rather than a misleading the client with 'keep-alive'
         self.set_keepalive(None);
 
+        // If a response was already written and it's not informational 1xx, return.
+        // The only exception is an informational 101 Switching Protocols, which is treated
+        // as final response https://www.rfc-editor.org/rfc/rfc9110#section-15.2.2.
+        if let Some(resp_written) = self.response_written().as_ref() {
+            if !resp_written.status.is_informational() || resp_written.status == 101 {
+                return Ok(());
+            }
+        }
+
         self.write_response_header(Box::new(resp)).await?;
+
         if !body.is_empty() {
             self.write_response_body(body, true).await?;
+        } else {
             self.finish_body().await?;
         }
+
         Ok(())
     }
 
