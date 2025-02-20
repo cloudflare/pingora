@@ -165,7 +165,10 @@ where
         const POINT_MULTIPLE: u32 = 160;
 
         if buckets.is_empty() {
-            return Continuum { ring: Box::new([]), addrs: Box::new([]) };
+            return Continuum {
+                ring: Box::new([]),
+                addrs: Box::new([]),
+            };
         }
 
         // The total weight is multiplied by the factor of points to create many points per node.
@@ -198,7 +201,10 @@ where
         ring.sort_unstable();
         ring.dedup_by(|a, b| a.hash == b.hash);
 
-        Continuum { ring: ring.into_boxed_slice(), addrs: addrs.into_boxed_slice() }
+        Continuum {
+            ring: ring.into_boxed_slice(),
+            addrs: addrs.into_boxed_slice(),
+        }
     }
 
     /// Find the associated index for the given input.
@@ -216,7 +222,7 @@ where
                 } else {
                     i
                 }
-            },
+            }
         }
     }
 
@@ -232,7 +238,10 @@ where
     /// This function is useful to find failover servers if the original ones are offline, which is
     /// cheaper than rebuilding the entire hash ring.
     pub fn node_iter(&self, hash_key: &[u8]) -> NodeIterator<Node> {
-        NodeIterator { idx: self.node_idx(hash_key), continuum: self }
+        NodeIterator {
+            idx: self.node_idx(hash_key),
+            continuum: self,
+        }
     }
 
     pub fn get_addr(&self, idx: &mut usize) -> Option<&Node> {
