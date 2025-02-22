@@ -160,6 +160,9 @@ pub trait ProxyHttp {
     ///
     /// This filter can be used for deferring checks like rate limiting or access control to when they
     /// actually needed after cache miss.
+    ///
+    /// By default the session will attempt to be reused after returning Ok(false). It is the
+    /// caller's responsibility to disable keepalive or drain the request body if needed.
     async fn proxy_upstream_filter(
         &self,
         _session: &mut Session,
