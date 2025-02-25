@@ -1,0 +1,24 @@
+# layer cache - update alpine base
+FROM alpine:latest AS alpine-base
+RUN apk upgrade --no-cache --available \
+    && apk add -f --no-cache --virtual .base-alpine ca-certificates gnupg
+
+# layer cache - builder base (compilers, libraries)
+FROM alpine-base AS builder-base
+RUN apk add -f --no-cache --virtual .base-builder g++ make cmake clang-dev
+
+ # layer cache - builder base (tooling, packaging)
+FROM builder-base AS tooling-base
+RUN apk add -f --no-cache --virtual .base-cargo-builder cargo perl pcre2 \
+    perl-error
+
+# layer cache - builder repository fetching base (security concerns)
+FROM tooling-base AS net-base
+RUN apk add -f --no-cache --virtual .base-fetchers-builder git
+
+# layer cache - build app
+FROM net-base AS builder
+ENV PATH="/root/.cargo/bin:${PATH}"
+WORKDIR /var/opt/pingora
+COPY . .
+RUN cargo build -r
