@@ -60,6 +60,8 @@ Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months
 
 Our current MSRV is 1.72.
 
+Building with the optional feature `boringssl` with Boring >= 4.14 requires Rust 1.80.
+
 ## Build Requirements
 
 Some of the crates in this repository have dependencies on additional tools and
