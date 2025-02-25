@@ -307,9 +307,14 @@ impl ListenerEndpointBuilder {
 
     #[cfg(windows)]
     pub async fn listen(self) -> Result<ListenerEndpoint> {
+        let listen_addr = self
+            .listen_addr
+            .expect("Tried to listen with no addr specified");
+        let listener = bind(&listen_addr).await?;
+
         Ok(ListenerEndpoint {
             listen_addr,
-            listener: bind(&listen_addr).await?,
+            listener: Arc::new(listener),
         })
     }
 }
