@@ -35,6 +35,7 @@ use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
 pub use crate::protocols::tls::ALPN;
+use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
@@ -116,6 +117,18 @@ impl UninitializedStream {
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))
+        }
+    }
+
+    /// Get the peer address of the connection if available
+    pub fn peer_addr(&self) -> Option<String> {
+        match &self.l4 {
+            stream => {
+                if let Some(socket_digest) = stream.get_socket_digest() {
+                    return socket_digest.peer_addr().map(|addr| addr.to_string());
+                }
+                None
+            }
         }
     }
 }
