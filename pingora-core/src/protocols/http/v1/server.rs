@@ -106,7 +106,7 @@ impl HttpSession {
             update_resp_headers: true,
             response_written: None,
             request_header: None,
-            read_timeout: None,
+            read_timeout: Some(Duration::from_secs(60)),
             write_timeout: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
@@ -149,7 +149,16 @@ impl HttpSession {
                             return Ok(None);
                         }
                     },
-                    _ => read_event.await,
+                    _ => match self.read_timeout {
+                        Some(t) => match timeout(t, read_event).await {
+                            Ok(res) => res,
+                            Err(e) => {
+                                debug!("read timeout {t:?} reached, {e}");
+                                return Error::e_explain(ReadTimedout, format!("timeout: {t:?}"));
+                            }
+                        },
+                        None => read_event.await,
+                    },
                 }
             };
             let n = match read_result {
@@ -1965,5 +1974,88 @@ mod test_sync {
         // FIXME: the order is not guaranteed
         assert_eq!(b"Foo", headers[0].name.as_bytes());
         assert_eq!(b"Bar", headers[0].value);
+    }
+}
+
+#[cfg(test)]
+mod test_timeouts {
+    use super::*;
+    use std::future::IntoFuture;
+    use tokio_test::io::{Builder, Mock};
+
+    /// An upper limit for any read within any test to prevent tests from hanging forever if
+    /// an internal read call never returns, etc.
+    const TEST_MAX_WAIT_FOR_READ: Duration = Duration::from_secs(3);
+
+    /// The duration of 600 seconds is chosen to be "effectively forever" for the purpose of testing
+    const TEST_FOREVER_DURATION: Duration = Duration::from_secs(600);
+
+    /// The read_timeout to use, when we want to test that a read operation times out
+    const TEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[derive(Debug)]
+    struct ReadBlockedForeverError;
+
+    /// Returns a client stream that will "never" send any bytes / return from a read operation
+    fn mocked_blocking_headers_forever_stream() -> Box<Mock> {
+        Box::new(Builder::new().wait(TEST_FOREVER_DURATION).build())
+    }
+
+    fn mocked_blocking_body_forever_stream() -> Box<Mock> {
+        let http1 = b"GET / HTTP/1.1\r\n";
+        let http2 = b"Host: pingora.example\r\nContent-Length: 3\r\n\r\n";
+        Box::new(
+            Builder::new()
+                .read(&http1[..])
+                .read(&http2[..])
+                .wait(TEST_FOREVER_DURATION)
+                .build(),
+        )
+    }
+
+    /// Helper function to test a read operation with a tokio timeout
+    /// to prevent tests from hanging forever in case of a bug
+    async fn test_read_with_tokio_timeout<F, T>(
+        read_future: F,
+    ) -> Result<Result<T, Box<Error>>, ReadBlockedForeverError>
+    where
+        F: IntoFuture<Output = Result<T, Box<Error>>>,
+    {
+        let read_result = tokio::time::timeout(TEST_MAX_WAIT_FOR_READ, read_future).await;
+        read_result.map_err(|_| ReadBlockedForeverError)
+    }
+
+    #[tokio::test]
+    async fn test_read_http_request_headers_timeout_for_read_request() {
+        // confirm that a `read_timeout` of `None` would've waited "indefinitely"
+        let mut http_stream = HttpSession::new(mocked_blocking_headers_forever_stream());
+        http_stream.read_timeout = None;
+        let res = test_read_with_tokio_timeout(http_stream.read_request()).await;
+        assert!(res.is_err()); // test timeout occurred, and not any internal Pingora timeout
+
+        // confirm that the `read_timeout` is respected
+        let mut http_stream = HttpSession::new(mocked_blocking_headers_forever_stream());
+        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
+        let res = test_read_with_tokio_timeout(http_stream.read_request()).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+    }
+
+    #[tokio::test]
+    async fn test_read_http_body_timeout_for_read_body_bytes() {
+        // confirm that a `read_timeout` of `None` would've waited "indefinitely"
+        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
+        http_stream.read_timeout = None;
+        http_stream.read_request().await.unwrap();
+        let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
+        assert!(res.is_err()); // test timeout occurred, and not any internal Pingora timeout
+
+        // confirm that the `read_timeout` is respected
+        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
+        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
+        http_stream.read_request().await.unwrap();
+        let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
     }
 }
