@@ -122,13 +122,12 @@ impl UninitializedStream {
 
     /// Get the peer address of the connection if available
     pub fn peer_addr(&self) -> Option<String> {
-        match &self.l4 {
-            stream => {
-                if let Some(socket_digest) = stream.get_socket_digest() {
-                    return socket_digest.peer_addr().map(|addr| addr.to_string());
-                }
-                None
+        let stream = &self.l4;
+        {
+            if let Some(socket_digest) = stream.get_socket_digest() {
+                return socket_digest.peer_addr().map(|addr| addr.to_string());
             }
+            None
         }
     }
 }
