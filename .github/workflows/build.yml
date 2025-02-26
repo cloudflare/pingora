@@ -5,6 +5,7 @@ name: build
 jobs:
   pingora:
     strategy:
+      fail-fast: false
       matrix:
         # nightly, MSRV, and latest stable
         toolchain: [nightly, 1.72.0, 1.82.0]
