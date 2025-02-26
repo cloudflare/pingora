@@ -59,4 +59,4 @@ jobs:
 
       - name: Run cargo machete
         run: |
-          [[ ${{ matrix.toolchain }} != 1.82.0 ]] || (cargo install cargo-machete && cargo machete)
+          [[ ${{ matrix.toolchain }} != 1.82.0 ]] || (cargo install cargo-machete --version 0.7.0 && cargo machete)
