@@ -430,7 +430,7 @@ fn main() {
         (ITERATIONS as f32 * THREADS as f32 / elapsed.as_secs_f32()) as u32
     );
 
-    let tinyufo_compact = tinyufo::TinyUfo::new(CACHE_SIZE, CACHE_SIZE);
+    let tinyufo_compact = tinyufo::TinyUfo::new_compact(CACHE_SIZE, CACHE_SIZE);
     let wg = Barrier::new(THREADS);
     let before = Instant::now();
     thread::scope(|s| {

@@ -17,7 +17,7 @@
 use super::{Bucket, Key};
 use ahash::RandomState;
 use crossbeam_skiplist::{map::Entry, SkipMap};
-use flurry::HashMap;
+use scc::HashIndex;
 
 /// N-shard skip list. Memory efficient, constant time lookup on average, but a bit slower
 /// than hash map
@@ -60,30 +60,30 @@ impl<T: Send + 'static> Compact<T> {
 }
 
 // Concurrent hash map, fast but use more memory
-pub struct Fast<T>(HashMap<Key, Bucket<T>, RandomState>);
+pub struct Fast<T>(HashIndex<Key, Bucket<T>, RandomState>);
 
-impl<T: Send + Sync> Fast<T> {
+impl<T: Send + Sync + 'static + Clone> Fast<T> {
     pub fn new(total_items: usize) -> Self {
-        Self(HashMap::with_capacity_and_hasher(
+        Self(HashIndex::with_capacity_and_hasher(
             total_items,
             RandomState::new(),
         ))
     }
 
     pub fn get_map<V, F: FnOnce(&Bucket<T>) -> V>(&self, key: &Key, f: F) -> Option<V> {
-        let pinned = self.0.pin();
-        let v = pinned.get(key);
-        v.map(f)
+        let guard = scc::ebr::Guard::new();
+        self.0.peek(&key.clone(), &guard).map(|v| f(v))
     }
 
     fn insert(&self, key: Key, value: Bucket<T>) -> Option<()> {
-        let pinned = self.0.pin();
-        pinned.insert(key, value).map(|_| ())
+        match self.0.insert(key, value) {
+            Ok(_) => Some(()),
+            Err(_) => None,
+        }
     }
 
     fn remove(&self, key: &Key) {
-        let pinned = self.0.pin();
-        pinned.remove(key);
+        self.0.remove(key);
     }
 }
 
@@ -92,7 +92,7 @@ pub enum Buckets<T> {
     Compact(Compact<T>),
 }
 
-impl<T: Send + Sync + 'static> Buckets<T> {
+impl<T: Send + Sync + 'static + Clone> Buckets<T> {
     pub fn new_fast(items: usize) -> Self {
         Self::Fast(Box::new(Fast::new(items)))
     }

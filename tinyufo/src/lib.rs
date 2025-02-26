@@ -21,11 +21,11 @@
 use ahash::RandomState;
 use crossbeam_queue::SegQueue;
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{
-    AtomicBool, AtomicU8,
+    AtomicBool, AtomicU8, AtomicUsize,
     Ordering::{Acquire, Relaxed, SeqCst},
 };
+use std::sync::Arc;
 mod buckets;
 mod estimation;
 
@@ -37,12 +37,12 @@ const SMALL: bool = false;
 const MAIN: bool = true;
 
 // Indicate which queue an item is located
-#[derive(Debug, Default)]
-struct Location(AtomicBool);
+#[derive(Debug, Default, Clone)]
+struct Location(Arc<AtomicBool>);
 
 impl Location {
     fn new_small() -> Self {
-        Self(AtomicBool::new(SMALL))
+        Self(Arc::new(AtomicBool::new(SMALL)))
     }
 
     fn value(&self) -> bool {
@@ -62,8 +62,8 @@ impl Location {
 // in the worst case can find something to evict quickly
 const USES_CAP: u8 = 3;
 
-#[derive(Debug, Default)]
-struct Uses(AtomicU8);
+#[derive(Debug, Default, Clone)]
+struct Uses(Arc<AtomicU8>);
 
 impl Uses {
     pub fn inc_uses(&self) -> u8 {
@@ -121,6 +121,7 @@ pub struct KV<T> {
 }
 
 // the data and its metadata
+#[derive(Clone)]
 pub struct Bucket<T> {
     uses: Uses,
     queue: Location,
@@ -225,9 +226,9 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                 return evicted;
             };
             Bucket {
-                queue: Location(queue.into()),
+                queue: Location(Arc::new(queue.into())),
                 weight,
-                uses: Uses(uses.into()),
+                uses: Uses(Arc::new(uses.into())),
                 data,
             }
         };
