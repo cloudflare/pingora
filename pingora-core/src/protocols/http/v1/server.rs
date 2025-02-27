@@ -531,6 +531,14 @@ impl HttpSession {
         }
     }
 
+    pub fn get_keepalive_timeout(&self) -> Option<u64> {
+        match self.keepalive_timeout {
+            KeepaliveStatus::Timeout(d) => Some(d.as_secs()),
+            KeepaliveStatus::Infinite => Some(0),
+            KeepaliveStatus::Off => None,
+        }
+    }
+
     /// Return whether the session will be keepalived for connection reuse.
     pub fn will_keepalive(&self) -> bool {
         // TODO: check self.body_writer. If it is http1.0 type then keepalive
