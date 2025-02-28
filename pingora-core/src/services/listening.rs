@@ -31,8 +31,10 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use pingora_error::Result;
 use pingora_runtime::current_handle;
+use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -167,15 +169,22 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
-                        match io.handshake().await {
-                            Ok(io) => Self::handle_event(io, app, shutdown).await,
-                            Err(e) => {
-                                // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
-                                if let Some(addr) = peer_addr {
-                                    error!("Downstream handshake error from {}: {e}", addr);
-                                } else {
-                                    error!("Downstream handshake error: {e}");
+                        match timeout(Duration::from_secs(60), io.handshake()).await {
+                            Ok(handshake) => {
+                                match handshake {
+                                    Ok(io) => Self::handle_event(io, app, shutdown).await,
+                                    Err(e) => {
+                                        // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
+                                        if let Some(addr) = peer_addr {
+                                            error!("Downstream handshake error from {}: {e}", addr);
+                                        } else {
+                                            error!("Downstream handshake error: {e}");
+                                        }
+                                    }
                                 }
+                            }
+                            Err(_) => {
+                                error!("Downstream handshake timeout");
                             }
                         }
                     });
