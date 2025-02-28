@@ -872,9 +872,16 @@ impl HttpCache {
                  */
                 let mut old_header = self.inner().meta.as_ref().unwrap().0.header.clone();
                 let mut clone_header = |header_name: &'static str| {
-                    // TODO: multiple headers
-                    if let Some(value) = resp.headers.get(header_name) {
-                        old_header.insert_header(header_name, value).unwrap();
+                    for (i, value) in resp.headers.get_all(header_name).iter().enumerate() {
+                        if i == 0 {
+                            old_header
+                                .insert_header(header_name, value)
+                                .expect("can add valid header");
+                        } else {
+                            old_header
+                                .append_header(header_name, value)
+                                .expect("can add valid header");
+                        }
                     }
                 };
                 clone_header("cache-control");
