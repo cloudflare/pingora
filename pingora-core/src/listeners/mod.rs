@@ -22,7 +22,7 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{tls::TlsRef, Stream};
+use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -121,10 +121,10 @@ impl UninitializedStream {
     }
 
     /// Get the peer address of the connection if available
-    pub fn peer_addr(&self) -> Option<String> {
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.l4
             .get_socket_digest()
-            .and_then(|d| d.peer_addr().map(|addr| addr.to_string()))
+            .and_then(|d| d.peer_addr().cloned())
     }
 }
 

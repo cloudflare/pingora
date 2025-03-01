@@ -163,10 +163,10 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
             };
             match new_io {
                 Ok(io) => {
-                    let peer_addr = io.peer_addr();
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
+                        let peer_addr = io.peer_addr();
                         match io.handshake().await {
                             Ok(io) => Self::handle_event(io, app, shutdown).await,
                             Err(e) => {
