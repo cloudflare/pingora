@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 ahash = { workspace = true }
 scc = "2"
+quick_cache = "0.6"
 crossbeam-queue = "0"
 crossbeam-skiplist = "0"
 
@@ -27,7 +28,6 @@ lru = "0"
 rand_distr = "0.5"
 moka = { version = "0", features = ["sync"] }
 dhat = "0"
-quick_cache = "0.6"
 triomphe = "<=0.1.11" # 0.1.12 requires Rust 1.76
 
 [[bench]]
