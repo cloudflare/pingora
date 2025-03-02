@@ -433,17 +433,14 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
 
         // Get data and update weights
         let result = self.buckets.get_map(&key, |bucket| {
-            let data = bucket.data.clone();
-            let weight = bucket.weight;
-
             // Update weight based on queue location
             if bucket.queue.is_main() {
-                self.queues.main_weight.fetch_sub(weight as usize, SeqCst);
+                self.queues.main_weight.fetch_sub(bucket.weight as usize, SeqCst);
             } else {
-                self.queues.small_weight.fetch_sub(weight as usize, SeqCst);
+                self.queues.small_weight.fetch_sub(bucket.weight as usize, SeqCst);
             }
 
-            data
+            bucket.data.clone()
         });
 
         // If we found and processed the item, remove it from buckets

@@ -14,8 +14,6 @@
 
 //! Concurrent storage backend
 
-use std::sync::Arc;
-
 use super::{Bucket, Key};
 use ahash::RandomState;
 use quick_cache::sync::Cache;
@@ -23,7 +21,7 @@ use scc::HashIndex;
 
 /// N-shard skip list. Memory efficient, constant time lookup on average, but a bit slower
 /// than hash map
-pub struct Compact<T>(Cache<Arc<Key>, Bucket<T>>);
+pub struct Compact<T>(Cache<Key, Bucket<T>>);
 
 impl<T: Send + 'static + Clone> Compact<T> {
     /// Create a new [Compact]
@@ -44,7 +42,7 @@ impl<T: Send + 'static + Clone> Compact<T> {
     }
 
     fn insert(&self, key: Key, value: Bucket<T>) {
-        self.0.insert(Arc::new(key), value);
+        self.0.insert(key, value);
     }
 
     fn remove(&self, key: &Key) {
