@@ -228,6 +228,8 @@ pub trait ProxyHttp {
     /// It also allow users to modify the response header accordingly.
     ///
     /// The default implementation can handle a single-range as per [RFC7232].
+    ///
+    /// [RFC7232]: https://www.rfc-editor.org/rfc/rfc7232
     fn range_header_filter(
         &self,
         req: &RequestHeader,

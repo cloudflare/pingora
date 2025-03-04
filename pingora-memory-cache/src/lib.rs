@@ -137,7 +137,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         }
     }
 
-    /// Similar to [get], fetch the key and return its value in addition to a
+    /// Similar to [Self::get], fetch the key and return its value in addition to a
     /// [CacheStatus] but also return the value even if it is expired. When the
     /// value is expired, the [Duration] of how long it has been stale will
     /// also be returned.

@@ -284,7 +284,7 @@ where
         }
     }
 
-    /// Similar to [get], query the cache for a given value, but also returns the value even if the
+    /// Similar to [Self::get], query the cache for a given value, but also returns the value even if the
     /// value is expired up to `stale_ttl`. If it is a cache miss or the value is stale more than
     /// the `stale_ttl`, a lookup will be performed to populate the cache.
     pub async fn get_stale(
@@ -313,11 +313,13 @@ where
     S: Clone + Send + Sync,
     CB: Lookup<K, T, S> + Sync + Send,
 {
-    /// Similar to [get_stale], but when it returns the stale value, it also initiates a lookup
+    /// Similar to [Self::get_stale], but when it returns the stale value, it also initiates a lookup
     /// in the background in order to refresh the value.
     ///
     /// Note that this function requires the [RTCache] to be static, which can be done by wrapping
     /// it with something like [once_cell::sync::Lazy].
+    ///
+    /// [once_cell::sync::Lazy]: https://docs.rs/once_cell/latest/once_cell/sync/struct.Lazy.html
     pub async fn get_stale_while_update(
         &'static self,
         key: &K,
