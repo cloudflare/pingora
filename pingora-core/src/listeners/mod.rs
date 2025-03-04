@@ -22,7 +22,7 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{tls::TlsRef, Stream};
+use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -35,6 +35,7 @@ use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
 pub use crate::protocols::tls::ALPN;
+use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
@@ -117,6 +118,13 @@ impl UninitializedStream {
         } else {
             Ok(Box::new(self.l4))
         }
+    }
+
+    /// Get the peer address of the connection if available
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.l4
+            .get_socket_digest()
+            .and_then(|d| d.peer_addr().cloned())
     }
 }
 

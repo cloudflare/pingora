@@ -166,11 +166,16 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
+                        let peer_addr = io.peer_addr();
                         match io.handshake().await {
                             Ok(io) => Self::handle_event(io, app, shutdown).await,
                             Err(e) => {
-                                // TODO: Maybe IOApp trait needs a fn to handle/filter our this error
-                                error!("Downstream handshake error {e}");
+                                // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
+                                if let Some(addr) = peer_addr {
+                                    error!("Downstream handshake error from {}: {e}", addr);
+                                } else {
+                                    error!("Downstream handshake error: {e}");
+                                }
                             }
                         }
                     });
