@@ -274,7 +274,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut SV::CTX,
         reuse: bool,
         error: Option<&Error>,
-    ) -> Option<Stream>
+    ) -> ProcessResult
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -283,9 +283,9 @@ impl<SV> HttpProxy<SV> {
 
         if reuse {
             // TODO: log error
-            session.downstream_session.finish().await.ok().flatten()
+            ProcessResult::for_stream(session.downstream_session.finish().await.ok().flatten())
         } else {
-            None
+            ProcessResult::none()
         }
     }
 
@@ -478,12 +478,64 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     resp
 });
 
+#[derive(Debug, Clone)]
+struct PersistentSettings {
+    keepalive_timeout: Option<u64>,
+}
+
+impl PersistentSettings {
+    fn for_session(session: &Session) -> Self {
+        PersistentSettings {
+            keepalive_timeout: session.get_keepalive(),
+        }
+    }
+
+    fn apply_to_session(&self, session: &mut pingora_core::protocols::http::ServerSession) {
+        session.set_keepalive(self.keepalive_timeout);
+    }
+}
+
+struct ProcessResult {
+    stream: Option<Stream>,
+    persistent_settings: Option<PersistentSettings>,
+}
+
+impl ProcessResult {
+    fn none() -> Self {
+        ProcessResult {
+            stream: None,
+            persistent_settings: None,
+        }
+    }
+
+    fn for_stream(stream: Option<Stream>) -> Self {
+        ProcessResult {
+            stream,
+            persistent_settings: None,
+        }
+    }
+
+    fn for_stream_with_persistent_settings(
+        stream: Option<Stream>,
+        persistent_settings: PersistentSettings,
+    ) -> Self {
+        ProcessResult {
+            stream,
+            persistent_settings: Some(persistent_settings),
+        }
+    }
+
+    fn consume(self) -> (Option<Stream>, Option<PersistentSettings>) {
+        (self.stream, self.persistent_settings)
+    }
+}
+
 impl<SV> HttpProxy<SV> {
     async fn process_request(
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
-    ) -> Option<Stream>
+    ) -> ProcessResult
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -522,7 +574,11 @@ impl<SV> HttpProxy<SV> {
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    return session.downstream_session.finish().await.ok().flatten();
+                    let persistent_settings = PersistentSettings::for_session(&session);
+                    return ProcessResult::for_stream_with_persistent_settings(
+                        session.downstream_session.finish().await.ok().flatten(),
+                        persistent_settings,
+                    );
                 }
                 /* else continue */
             }
@@ -679,7 +735,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
-    ) -> Option<Stream>
+    ) -> ProcessResult
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -697,9 +753,9 @@ impl<SV> HttpProxy<SV> {
         self.cleanup_sub_req(&mut session);
 
         if res.can_reuse_downstream {
-            session.downstream_session.finish().await.ok().flatten()
+            ProcessResult::for_stream(session.downstream_session.finish().await.ok().flatten())
         } else {
-            None
+            ProcessResult::none()
         }
     }
 }
@@ -779,7 +835,34 @@ where
         }
 
         let ctx = self.inner.new_ctx();
-        self.process_request(session, ctx).await
+        let is_http2 = session.is_http2();
+        let mut result = self.process_request(session, ctx).await;
+
+        if !is_http2 {
+            while let (Some(stream), persistent_settings) = result.consume() {
+                let mut session = Box::new(HttpSession::new_http1(stream));
+                if let Some(persistent_settings) = persistent_settings {
+                    persistent_settings.apply_to_session(&mut session);
+                }
+                if *shutdown.borrow() {
+                    // stop downstream from reusing if this service is shutting down soon
+                    session.set_keepalive(None);
+                }
+                let session = match self.handle_new_request(session).await {
+                    Some(downstream_session) => {
+                        Session::new(downstream_session, &self.downstream_modules)
+                    }
+                    None => {
+                        return None; // bad request
+                    }
+                };
+
+                let ctx = self.inner.new_ctx();
+                result = self.process_request(session, ctx).await;
+            }
+        }
+
+        None
     }
 
     async fn http_cleanup(&self) {
