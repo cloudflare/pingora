@@ -435,9 +435,13 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
         let result = self.buckets.get_map(&key, |bucket| {
             // Update weight based on queue location
             if bucket.queue.is_main() {
-                self.queues.main_weight.fetch_sub(bucket.weight as usize, SeqCst);
+                self.queues
+                    .main_weight
+                    .fetch_sub(bucket.weight as usize, SeqCst);
             } else {
-                self.queues.small_weight.fetch_sub(bucket.weight as usize, SeqCst);
+                self.queues
+                    .small_weight
+                    .fetch_sub(bucket.weight as usize, SeqCst);
             }
 
             bucket.data.clone()
