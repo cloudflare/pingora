@@ -16,37 +16,46 @@
 
 use super::{Bucket, Key};
 use ahash::RandomState;
-use quick_cache::sync::Cache;
+use crossbeam_skiplist::{map::Entry, SkipMap};
 use scc::HashIndex;
 
 /// N-shard skip list. Memory efficient, constant time lookup on average, but a bit slower
 /// than hash map
-pub struct Compact<T>(Cache<Key, Bucket<T>>);
+pub struct Compact<T>(Box<[SkipMap<Key, Bucket<T>>]>);
 
-impl<T: Send + 'static + Clone> Compact<T> {
+impl<T: Send + 'static> Compact<T> {
     /// Create a new [Compact]
     pub fn new(total_items: usize, items_per_shard: usize) -> Self {
         assert!(items_per_shard > 0);
 
         let shards = std::cmp::max(total_items / items_per_shard, 1);
-        Self(Cache::new(shards))
+        let mut shard_array = vec![];
+        for _ in 0..shards {
+            shard_array.push(SkipMap::new());
+        }
+        Self(shard_array.into_boxed_slice())
     }
 
-    pub fn get(&self, key: &Key) -> Option<Bucket<T>> {
-        self.0.get(key)
+    pub fn get(&self, key: &Key) -> Option<Entry<Key, Bucket<T>>> {
+        let shard = *key as usize % self.0.len();
+        self.0[shard].get(key)
     }
 
-    pub fn get_map<V, F: FnOnce(Bucket<T>) -> V>(&self, key: &Key, f: F) -> Option<V> {
+    pub fn get_map<V, F: FnOnce(Entry<Key, Bucket<T>>) -> V>(&self, key: &Key, f: F) -> Option<V> {
         let v = self.get(key);
         v.map(f)
     }
 
-    fn insert(&self, key: Key, value: Bucket<T>) {
-        self.0.insert(key, value);
+    fn insert(&self, key: Key, value: Bucket<T>) -> Option<()> {
+        let shard = key as usize % self.0.len();
+        let removed = self.0[shard].remove(&key);
+        self.0[shard].insert(key, value);
+        removed.map(|_| ())
     }
 
     fn remove(&self, key: &Key) {
-        self.0.remove(key);
+        let shard = *key as usize % self.0.len();
+        (&self.0)[shard].remove(key);
     }
 }
 
@@ -94,7 +103,7 @@ impl<T: Send + Sync + 'static + Clone> Buckets<T> {
 
     pub fn insert(&self, key: Key, value: Bucket<T>) -> Option<()> {
         match self {
-            Self::Compact(c) => Some(c.insert(key, value)),
+            Self::Compact(c) => c.insert(key, value),
             Self::Fast(f) => f.insert(key, value),
         }
     }
@@ -108,7 +117,7 @@ impl<T: Send + Sync + 'static + Clone> Buckets<T> {
 
     pub fn get_map<V, F: FnOnce(&Bucket<T>) -> V>(&self, key: &Key, f: F) -> Option<V> {
         match self {
-            Self::Compact(c) => c.get_map(key, |v| f(&v)),
+            Self::Compact(c) => c.get_map(key, |v| f(v.value())),
             Self::Fast(c) => c.get_map(key, f),
         }
     }
