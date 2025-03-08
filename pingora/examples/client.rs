@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use pingora::{connectors::http::Connector, prelude::*};
-use pingora_http::RequestHeader;
 use regex::Regex;
 
 #[tokio::main]
