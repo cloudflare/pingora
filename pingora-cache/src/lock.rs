@@ -19,6 +19,8 @@ use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
 use pingora_timeout::timeout;
 use std::sync::Arc;
 
+pub type CacheKeyLockImpl = (dyn CacheKeyLock + Send + Sync);
+
 pub trait CacheKeyLock {
     /// Try to lock a cache fetch
     ///
@@ -30,7 +32,7 @@ pub trait CacheKeyLock {
     ///
     /// When the write lock is dropped without being released, the read lock holders will consider
     /// it to be failed so that they will compete for the write lock again.
-    fn release(&self, key: &CacheKey, reason: LockStatus);
+    fn release(&self, key: &CacheKey, permit: WritePermit, reason: LockStatus);
 }
 
 const N_SHARDS: usize = 16;
@@ -93,7 +95,6 @@ impl CacheKeyLock for CacheLock {
             // compete for the write lock again.
         }
 
-        let (permit, stub) = WritePermit::new(self.timeout);
         let mut table = table.write();
         // check again in case another request already added it
         if let Some(lock) = table.get(&key) {
@@ -101,18 +102,17 @@ impl CacheKeyLock for CacheLock {
                 return Locked::Read(lock.read_lock());
             }
         }
+        let (permit, stub) = WritePermit::new(self.timeout);
         table.insert(key, stub);
         Locked::Write(permit)
     }
 
-    fn release(&self, key: &CacheKey, reason: LockStatus) {
+    fn release(&self, key: &CacheKey, mut permit: WritePermit, reason: LockStatus) {
         let hash = key.combined_bin();
         let key = u128::from_be_bytes(hash); // endianness doesn't matter
-        if let Some(lock) = self.lock_table.write(key).remove(&key) {
+        if let Some(_lock) = self.lock_table.write(key).remove(&key) {
             // make sure that the caller didn't forget to unlock it
-            if lock.0.locked() {
-                lock.0.unlock(reason);
-            }
+            permit.unlock(reason);
         }
     }
 }
@@ -259,24 +259,35 @@ impl ReadLock {
 
 /// WritePermit: requires who get it need to populate the cache and then release it
 #[derive(Debug)]
-pub struct WritePermit(Arc<LockCore>);
+pub struct WritePermit {
+    lock: Arc<LockCore>,
+    finished: bool,
+}
 
 impl WritePermit {
     pub fn new(timeout: Duration) -> (WritePermit, LockStub) {
         let lock = LockCore::new_arc(timeout);
         let stub = LockStub(lock.clone());
-        (WritePermit(lock), stub)
+        (
+            WritePermit {
+                lock,
+                finished: false,
+            },
+            stub,
+        )
     }
 
-    pub fn unlock(&self, reason: LockStatus) {
-        self.0.unlock(reason)
+    pub fn unlock(&mut self, reason: LockStatus) {
+        self.finished = true;
+        self.lock.unlock(reason);
     }
 }
 
 impl Drop for WritePermit {
     fn drop(&mut self) {
         // Writer exited without properly unlocking. We let others to compete for the write lock again
-        if self.0.locked() {
+        if !self.finished {
+            debug_assert!(false, "Dangling cache lock started!");
             self.unlock(LockStatus::Dangling);
         }
     }
@@ -302,16 +313,21 @@ mod test {
         assert!(locked1.is_write()); // write permit
         let locked2 = cache_lock.lock(&key1);
         assert!(!locked2.is_write()); // read lock
-        cache_lock.release(&key1, LockStatus::Done);
+        if let Locked::Write(permit) = locked1 {
+            cache_lock.release(&key1, permit, LockStatus::Done);
+        }
         let locked3 = cache_lock.lock(&key1);
         assert!(locked3.is_write()); // write permit again
+        if let Locked::Write(permit) = locked3 {
+            cache_lock.release(&key1, permit, LockStatus::Done);
+        }
     }
 
     #[tokio::test]
     async fn test_lock() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
         let key1 = CacheKey::new("", "a", "1");
-        let permit = match cache_lock.lock(&key1) {
+        let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
             _ => panic!(),
         };
@@ -332,7 +348,7 @@ mod test {
     async fn test_lock_timeout() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
         let key1 = CacheKey::new("", "a", "1");
-        let permit = match cache_lock.lock(&key1) {
+        let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
             _ => panic!(),
         };
@@ -362,5 +378,41 @@ mod test {
 
         permit.unlock(LockStatus::Done);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lock_concurrent() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Test that concurrent attempts to compete for a lock run without issues
+        let cache_lock = Arc::new(CacheLock::new_boxed(Duration::from_secs(1)));
+        let key1 = CacheKey::new("", "a", "1");
+
+        let mut handles = vec![];
+
+        const READERS: usize = 30;
+        for _ in 0..READERS {
+            let key1 = key1.clone();
+            let cache_lock = cache_lock.clone();
+            // simulate a cache lookup / lock attempt loop
+            handles.push(tokio::spawn(async move {
+                // timed out
+                loop {
+                    match cache_lock.lock(&key1) {
+                        Locked::Write(permit) => {
+                            let _ = tokio::time::sleep(Duration::from_millis(5)).await;
+                            cache_lock.release(&key1, permit, LockStatus::Done);
+                            break;
+                        }
+                        Locked::Read(r) => {
+                            r.wait().await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
     }
 }

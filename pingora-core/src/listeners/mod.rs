@@ -79,6 +79,7 @@ impl TransportStackBuilder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
@@ -89,7 +90,7 @@ impl TransportStack {
         self.l4.as_str()
     }
 
-    pub async fn accept(&mut self) -> Result<UninitializedStream> {
+    pub async fn accept(&self) -> Result<UninitializedStream> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
             l4: stream,
@@ -108,7 +109,8 @@ pub(crate) struct UninitializedStream {
 }
 
 impl UninitializedStream {
-    pub async fn handshake(self) -> Result<Stream> {
+    pub async fn handshake(mut self) -> Result<Stream> {
+        self.l4.set_buffer();
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
@@ -247,7 +249,7 @@ mod test {
             .unwrap();
 
         assert_eq!(listeners.len(), 2);
-        for mut listener in listeners {
+        for listener in listeners {
             tokio::spawn(async move {
                 // just try to accept once
                 let stream = listener.accept().await.unwrap();
@@ -271,7 +273,7 @@ mod test {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
-        let mut listener = listeners
+        let listener = listeners
             .build(
                 #[cfg(unix)]
                 None,

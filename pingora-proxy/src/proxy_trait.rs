@@ -160,6 +160,9 @@ pub trait ProxyHttp {
     ///
     /// This filter can be used for deferring checks like rate limiting or access control to when they
     /// actually needed after cache miss.
+    ///
+    /// By default the session will attempt to be reused after returning Ok(false). It is the
+    /// caller's responsibility to disable keepalive or drain the request body if needed.
     async fn proxy_upstream_filter(
         &self,
         _session: &mut Session,
@@ -391,8 +394,16 @@ pub trait ProxyHttp {
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
-    /// The response status code of the error response maybe returned for logging purpose.
-    async fn fail_to_proxy(&self, session: &mut Session, e: &Error, _ctx: &mut Self::CTX) -> u16
+    /// The response status code of the error response may be returned for logging purposes.
+    /// Additionally, the user can return whether this session may be reused in spite of the error.
+    /// Today this reuse status is only respected for errors that occur prior to upstream peer
+    /// selection, and the keepalive configured on the `Session` itself still takes precedent.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
     where
         Self::CTX: Send + Sync,
     {
@@ -419,7 +430,12 @@ pub trait ProxyHttp {
                 error!("failed to send error response to downstream: {e}");
             });
         }
-        code
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     /// Decide whether should serve stale when encountering an error or during revalidation
@@ -440,7 +456,7 @@ pub trait ProxyHttp {
         // it is disconnected
         // or doing so is explicitly permitted by the client or origin server
         // (e.g. headers or an out-of-band contract)
-        error.map_or(false, |e| e.esource() == &ErrorSource::Upstream)
+        error.is_some_and(|e| e.esource() == &ErrorSource::Upstream)
     }
 
     /// This filter is called when the request just established or reused a connection to the upstream
@@ -492,4 +508,10 @@ pub trait ProxyHttp {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+/// Context struct returned by `fail_to_proxy`.
+pub struct FailToProxy {
+    pub error_code: u16,
+    pub can_reuse_downstream: bool,
 }

@@ -339,7 +339,7 @@ impl<'a> Iterator for LinkedListIter<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for LinkedListIter<'a> {
+impl DoubleEndedIterator for LinkedListIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let prev_index = self.list.prev(self.tail);
         if prev_index == HEAD || prev_index == NULL {

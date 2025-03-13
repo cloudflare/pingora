@@ -124,7 +124,7 @@ where
                 return None;
             }
             // Skip certain NoCacheReason::Custom according to user
-            Custom(reason) if self.skip_custom_reasons_fn.map_or(false, |f| f(reason)) => {
+            Custom(reason) if self.skip_custom_reasons_fn.is_some_and(|f| f(reason)) => {
                 return None;
             }
             Custom(_) | OriginNotCache | ResponseTooLarge => { /* mark uncacheable for these only */

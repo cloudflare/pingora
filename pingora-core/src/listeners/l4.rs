@@ -17,7 +17,6 @@ use pingora_error::{
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
 };
-use std::fs::Permissions;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
@@ -27,6 +26,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::time::Duration;
+use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
 
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
@@ -253,9 +253,10 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
     }
 }
 
+#[derive(Clone)]
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
-    listener: Listener,
+    listener: Arc<Listener>,
 }
 
 #[derive(Default)]
@@ -300,7 +301,7 @@ impl ListenerEndpointBuilder {
 
         Ok(ListenerEndpoint {
             listen_addr,
-            listener,
+            listener: Arc::new(listener),
         })
     }
 
@@ -340,7 +341,7 @@ impl ListenerEndpoint {
         Ok(())
     }
 
-    pub async fn accept(&mut self) -> Result<Stream> {
+    pub async fn accept(&self) -> Result<Stream> {
         let mut stream = self
             .listener
             .accept()
@@ -364,10 +365,10 @@ mod test {
         builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
 
         #[cfg(unix)]
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
-        let mut listener = builder.listen().await.unwrap();
+        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -390,10 +391,10 @@ mod test {
         builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
 
         #[cfg(unix)]
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
-        let mut listener = builder.listen().await.unwrap();
+        let listener = builder.listen().await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept twice
@@ -417,7 +418,7 @@ mod test {
 
         builder.listen_addr(ServerAddress::Uds(addr.into(), None));
 
-        let mut listener = builder.listen(None).await.unwrap();
+        let listener = builder.listen(None).await.unwrap();
 
         tokio::spawn(async move {
             // just try to accept once

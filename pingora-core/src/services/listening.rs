@@ -204,6 +204,7 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         &mut self,
         #[cfg(unix)] fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
+        listeners_per_fd: usize,
     ) {
         let runtime = current_handle();
         let endpoints = self
@@ -221,12 +222,20 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             .expect("can only start_service() once");
         let app_logic = Arc::new(app_logic);
 
-        let handlers = endpoints.into_iter().map(|endpoint| {
-            let shutdown = shutdown.clone();
-            let my_app_logic = app_logic.clone();
-            runtime.spawn(async move {
-                Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
-            })
+        let mut handlers = Vec::new();
+
+        endpoints.into_iter().for_each(|endpoint| {
+            for _ in 0..listeners_per_fd {
+                let shutdown = shutdown.clone();
+                let my_app_logic = app_logic.clone();
+                let endpoint = endpoint.clone();
+
+                let jh = runtime.spawn(async move {
+                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                });
+
+                handlers.push(jh);
+            }
         });
 
         futures::future::join_all(handlers).await;

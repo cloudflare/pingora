@@ -106,6 +106,20 @@ impl Session {
         }
     }
 
+    /// Discard the request body by reading it until completion.
+    ///
+    /// This is useful for making streams reusable (in particular for HTTP/1.1) after returning an
+    /// error before the whole body has been read.
+    pub async fn drain_request_body(&mut self) -> Result<()> {
+        loop {
+            match self.read_request_body().await {
+                Ok(Some(_)) => { /* continue to drain */ }
+                Ok(None) => return Ok(()), // done
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Write the response header to client
     /// Informational headers (status code 100-199, excluding 101) can be written multiple times the final
     /// response header (status code 200+ or 101) is written.

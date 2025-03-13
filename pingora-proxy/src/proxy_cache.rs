@@ -171,7 +171,7 @@ impl<SV> HttpProxy<SV> {
                             if let Some(write_lock) = session
                                 .subrequest_ctx
                                 .as_mut()
-                                .and_then(|ctx| ctx.write_lock.take())
+                                .and_then(|ctx| ctx.take_write_lock())
                             {
                                 // Put the write lock in the request
                                 session.cache.set_write_lock(write_lock);
@@ -200,9 +200,12 @@ impl<SV> HttpProxy<SV> {
                                 let subrequest =
                                     Box::new(crate::subrequest::create_dummy_session(session));
                                 let new_app = self.clone(); // Clone the Arc
-                                let sub_req_ctx = Box::new(SubReqCtx {
-                                    write_lock: Some(session.cache.take_write_lock()),
-                                });
+                                let (permit, cache_lock) = session.cache.take_write_lock();
+                                let sub_req_ctx = Box::new(SubReqCtx::with_write_lock(
+                                    cache_lock,
+                                    session.cache.cache_key().clone(),
+                                    permit,
+                                ));
                                 tokio::spawn(async move {
                                     new_app.process_subrequest(subrequest, sub_req_ctx).await;
                                 });

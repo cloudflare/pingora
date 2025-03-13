@@ -44,7 +44,7 @@ mod variance;
 
 use crate::max_file_size::MaxFileSizeMissHandler;
 pub use key::CacheKey;
-use lock::{CacheKeyLock, LockStatus, Locked};
+use lock::{CacheKeyLockImpl, LockStatus, Locked};
 pub use memory::MemCache;
 pub use meta::{CacheMeta, CacheMetaDefaults};
 pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
@@ -281,7 +281,7 @@ struct HttpCacheInner {
     pub eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
     pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
-    pub cache_lock: Option<&'static (dyn CacheKeyLock + Send + Sync)>,
+    pub cache_lock: Option<&'static CacheKeyLockImpl>,
     pub traces: trace::CacheTraceCTX,
 }
 
@@ -341,7 +341,7 @@ impl HttpCache {
         use NoCacheReason::*;
         if let Some(inner) = self.inner.as_mut() {
             let lock = inner.lock.take();
-            if let Some(Locked::Write(_r)) = lock {
+            if let Some(Locked::Write(permit)) = lock {
                 let lock_status = match reason {
                     // let the next request try to fetch it
                     InternalError | StorageError | Deferred | UpstreamError => {
@@ -363,7 +363,7 @@ impl HttpCache {
                 inner
                     .cache_lock
                     .unwrap()
-                    .release(inner.key.as_ref().unwrap(), lock_status);
+                    .release(inner.key.as_ref().unwrap(), permit, lock_status);
             }
         }
     }
@@ -426,7 +426,7 @@ impl HttpCache {
         storage: &'static (dyn storage::Storage + Sync),
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
         predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
-        cache_lock: Option<&'static (dyn CacheKeyLock + Send + Sync)>,
+        cache_lock: Option<&'static CacheKeyLockImpl>,
     ) {
         match self.phase {
             CachePhase::Disabled(_) => {
@@ -568,8 +568,10 @@ impl HttpCache {
             if let Some(eviction) = inner.eviction {
                 // TODO: make access() accept CacheKey
                 let cache_key = key.to_compact();
-                // FIXME(PINGORA-1914): get size
-                eviction.access(&cache_key, 0, meta.0.internal.fresh_until);
+                if hit_handler.should_count_access() {
+                    let size = hit_handler.get_eviction_weight();
+                    eviction.access(&cache_key, size, meta.0.internal.fresh_until);
+                }
             }
             inner.meta = Some(meta);
             inner.body_reader = Some(hit_handler);
@@ -695,8 +697,11 @@ impl HttpCache {
                     // If a reader can access partial write, the cache lock can be released here
                     // to let readers start reading the body.
                     let lock = inner.lock.take();
-                    if let Some(Locked::Write(_r)) = lock {
-                        inner.cache_lock.unwrap().release(key, LockStatus::Done);
+                    if let Some(Locked::Write(permit)) = lock {
+                        inner
+                            .cache_lock
+                            .expect("must have cache lock to have write permit")
+                            .release(key, permit, LockStatus::Done);
                     }
                     // Downstream read and upstream write can be decoupled
                     let body_reader = inner
@@ -753,10 +758,13 @@ impl HttpCache {
                 let size = miss_handler.finish().await?;
                 let lock = inner.lock.take();
                 let key = inner.key.as_ref().unwrap();
-                if let Some(Locked::Write(_r)) = lock {
+                if let Some(Locked::Write(permit)) = lock {
                     // no need to call r.unlock() because release() will call it
                     // r is a guard to make sure the lock is unlocked when this request is dropped
-                    inner.cache_lock.unwrap().release(key, LockStatus::Done);
+                    inner
+                        .cache_lock
+                        .unwrap()
+                        .release(key, permit, LockStatus::Done);
                 }
                 if let Some(eviction) = inner.eviction {
                     let cache_key = key.to_compact();
@@ -824,11 +832,12 @@ impl HttpCache {
                 inner.meta.replace(meta);
 
                 let lock = inner.lock.take();
-                if let Some(Locked::Write(_r)) = lock {
-                    inner
-                        .cache_lock
-                        .unwrap()
-                        .release(inner.key.as_ref().unwrap(), LockStatus::Done);
+                if let Some(Locked::Write(permit)) = lock {
+                    inner.cache_lock.unwrap().release(
+                        inner.key.as_ref().unwrap(),
+                        permit,
+                        LockStatus::Done,
+                    );
                 }
 
                 let mut span = inner.traces.child("update_meta");
@@ -962,8 +971,11 @@ impl HttpCache {
                 // TODO: maybe we should try to signal waiting readers to compete for the primary key
                 // lock instead? we will not be modifying this secondary slot so it's not actually
                 // ready for readers
-                if let Some(lock) = inner.cache_lock.as_ref() {
-                    lock.release(key, LockStatus::Done);
+                if let Some(Locked::Write(permit)) = inner.lock.take() {
+                    inner
+                        .cache_lock
+                        .unwrap()
+                        .release(key, permit, LockStatus::Done);
                 }
                 // Remove the `variance` from the `key`, so that we admit this asset into the
                 // primary slot. (`key` is used to tell storage where to write the data.)
@@ -1118,10 +1130,15 @@ impl HttpCache {
     /// Take the write lock from this request to transfer it to another one.
     /// # Panic
     ///  Call is_cache_lock_writer() to check first, will panic otherwise.
-    pub fn take_write_lock(&mut self) -> WritePermit {
+    pub fn take_write_lock(&mut self) -> (WritePermit, &'static CacheKeyLockImpl) {
         let lock = self.inner_mut().lock.take().unwrap();
         match lock {
-            Locked::Write(w) => w,
+            Locked::Write(w) => (
+                w,
+                self.inner()
+                    .cache_lock
+                    .expect("cache lock must be set if write permit exists"),
+            ),
             Locked::Read(_) => panic!("take_write_lock() called on read lock"),
         }
     }
@@ -1194,8 +1211,14 @@ impl HttpCache {
                     .storage
                     .purge(&key, PurgeType::Invalidation, &span.handle())
                     .await;
-                // FIXME: also need to remove from eviction manager
-                span.set_tag(|| trace::Tag::new("purged", matches!(result, Ok(true))));
+                let purged = matches!(result, Ok(true));
+                // need to inform eviction manager if asset was removed
+                if let Some(eviction) = inner.eviction.as_ref() {
+                    if purged {
+                        eviction.remove(&key);
+                    }
+                }
+                span.set_tag(|| trace::Tag::new("purged", purged));
                 result
             }
             _ => panic!("wrong phase {:?}", self.phase),

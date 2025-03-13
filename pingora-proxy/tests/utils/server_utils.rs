@@ -21,7 +21,7 @@ use http::HeaderValue;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
-use pingora_cache::lock::CacheKeyLock;
+use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
@@ -328,7 +328,7 @@ static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<Box<(dyn CacheKeyLock + std::marker::Send + Sync + 'static)>> =
+static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
     Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =

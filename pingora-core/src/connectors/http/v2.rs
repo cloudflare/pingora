@@ -376,7 +376,7 @@ impl Connector {
         self.transport
             .preferred_http_version
             .get(peer)
-            .map_or(false, |v| matches!(v, ALPN::H1))
+            .is_some_and(|v| matches!(v, ALPN::H1))
     }
 }
 

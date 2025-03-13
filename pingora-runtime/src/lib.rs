@@ -111,7 +111,7 @@ pub struct NoStealRuntime {
     name: String,
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
-    pools: Arc<OnceCell<Box<[Handle]>>>,
+    pools: Pools,
     controls: OnceCell<Vec<Control>>,
 }
 
@@ -209,8 +209,8 @@ impl NoStealRuntime {
 #[test]
 fn test_steal_runtime() {
     use tokio::time::{sleep, Duration};
-
-    let rt = Runtime::new_steal(2, "test");
+    let threads = 2;
+    let rt = Runtime::new_steal(threads, "test");
     let handle = rt.get_handle();
     let ret = handle.block_on(async {
         sleep(Duration::from_secs(1)).await;
@@ -222,6 +222,7 @@ fn test_steal_runtime() {
         1
     });
 
+    assert_eq!(handle.metrics().num_workers(), threads);
     assert_eq!(ret, 1);
 }
 
