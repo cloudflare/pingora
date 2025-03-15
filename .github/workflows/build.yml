@@ -37,7 +37,7 @@ jobs:
 
       - name: Pin crates to versions for MSRV
         run: |
-          [[ ${{ matrix.toolchain }} != 1.72.0 ]] || (cargo update -p boring --precise 4.13.0 && cargo update -p litemap --precise 0.7.4 && cargo update -p zerofrom --precise 0.1.5)
+          [[ ${{ matrix.toolchain }} != 1.72.0 ]] || (cargo update -p boring --precise 4.13.0 && cargo update -p litemap --precise 0.7.4 && cargo update -p zerofrom --precise 0.1.5 && cargo update -p half --precise 2.4.1)
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
