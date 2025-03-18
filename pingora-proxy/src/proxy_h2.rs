@@ -291,7 +291,8 @@ impl<SV> HttpProxy<SV> {
                         // pull as many tasks as we can
                         let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         tasks.push(t);
-                        while let Some(maybe_task) = rx.recv().now_or_never() {
+                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
                             if let Some(t) = maybe_task {
                                 tasks.push(t);
                             } else {
