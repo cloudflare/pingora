@@ -29,5 +29,4 @@ pub struct SslDigest {
     pub cert_digest: Vec<u8>,
     /// the SNI used in the negotiation
     pub sni: Option<String>,
-
 }

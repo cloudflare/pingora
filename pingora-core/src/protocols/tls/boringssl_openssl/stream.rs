@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::protocols::digest::TimingDigest;
-use crate::protocols::tls::{SslDigest, ALPN};
 use crate::protocols::tls::boringssl_openssl::stream::ssl::NameType;
+use crate::protocols::tls::{SslDigest, ALPN};
 use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use crate::utils::tls::{get_organization, get_serial};
