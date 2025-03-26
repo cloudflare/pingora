@@ -388,6 +388,59 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_upstream_revalidation_appends_headers() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_upstream_revalidation_appends_headers/cache_control";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(headers["cache-control"], "public, max-age=1");
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .header("set-cache-control", "stale-while-revalidate=86400")
+            .header("set-revalidated", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(headers["x-upstream-status"], "304");
+        let mut cc = headers.get_all("cache-control").into_iter();
+        assert_eq!(cc.next().unwrap(), "public, max-age=1");
+        assert_eq!(cc.next().unwrap(), "stale-while-revalidate=86400");
+        assert!(cc.next().is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_force_miss() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_froce_miss/revalidate_now";
