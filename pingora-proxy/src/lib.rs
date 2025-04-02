@@ -572,7 +572,7 @@ impl<SV> HttpProxy<SV> {
                         }
                     }
 
-                    return self.finish(session, &mut ctx, false, None).await;
+                    return self.finish(session, &mut ctx, true, None).await;
                 }
                 /* else continue */
             }

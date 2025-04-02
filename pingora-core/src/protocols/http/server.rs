@@ -106,6 +106,20 @@ impl Session {
         }
     }
 
+    /// Discard the request body by reading it until completion.
+    ///
+    /// This is useful for making streams reusable (in particular for HTTP/1.1) after returning an
+    /// error before the whole body has been read.
+    pub async fn drain_request_body(&mut self) -> Result<()> {
+        loop {
+            match self.read_request_body().await {
+                Ok(Some(_)) => { /* continue to drain */ }
+                Ok(None) => return Ok(()), // done
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Write the response header to client
     /// Informational headers (status code 100-199, excluding 101) can be written multiple times the final
     /// response header (status code 200+ or 101) is written.
@@ -329,11 +343,23 @@ impl Session {
         // rather than a misleading the client with 'keep-alive'
         self.set_keepalive(None);
 
+        // If a response was already written and it's not informational 1xx, return.
+        // The only exception is an informational 101 Switching Protocols, which is treated
+        // as final response https://www.rfc-editor.org/rfc/rfc9110#section-15.2.2.
+        if let Some(resp_written) = self.response_written().as_ref() {
+            if !resp_written.status.is_informational() || resp_written.status == 101 {
+                return Ok(());
+            }
+        }
+
         self.write_response_header(Box::new(resp)).await?;
+
         if !body.is_empty() {
             self.write_response_body(body, true).await?;
+        } else {
             self.finish_body().await?;
         }
+
         Ok(())
     }
 
