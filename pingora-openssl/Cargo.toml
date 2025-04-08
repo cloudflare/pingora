@@ -18,7 +18,7 @@ path = "src/lib.rs"
 
 [dependencies]
 openssl-sys = "0.9"
-openssl = { version = "0.10.70", features = ["vendored"] }
+openssl = { version = "0.10.72", features = ["vendored"] }
 tokio-openssl = { version = "0.6" }
 libc = "0.2.70"
 foreign-types = { version = "0.3"}
