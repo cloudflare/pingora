@@ -62,6 +62,8 @@ pub struct HttpSession {
     keepalive_timeout: KeepaliveStatus,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
+    /// How long to wait to make downstream session reusable, if body needs to be drained.
+    total_drain_timeout: Option<Duration>,
     /// A copy of the response that is already written to the client
     response_written: Option<Box<ResponseHeader>>,
     /// The parsed request header
@@ -106,6 +108,7 @@ impl HttpSession {
             request_header: None,
             read_timeout: None,
             write_timeout: None,
+            total_drain_timeout: None,
             body_bytes_sent: 0,
             body_bytes_read: 0,
             retry_buffer: None,
@@ -396,6 +399,30 @@ impl HttpSession {
                 Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
             },
             None => self.do_read_body().await,
+        }
+    }
+
+    async fn do_drain_request_body(&mut self) -> Result<()> {
+        loop {
+            match self.read_body_bytes().await {
+                Ok(Some(_)) => { /* continue to drain */ }
+                Ok(None) => return Ok(()), // done
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Drain the request body. `Ok(())` when there is no (more) body to read.
+    pub async fn drain_request_body(&mut self) -> Result<()> {
+        if self.is_body_done() {
+            return Ok(());
+        }
+        match self.total_drain_timeout {
+            Some(t) => match timeout(t, self.do_drain_request_body()).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(ReadTimedout, format!("draining body, timeout: {t:?}")),
+            },
+            None => self.do_drain_request_body().await,
         }
     }
 
@@ -862,6 +889,18 @@ impl HttpSession {
         self.write_timeout = Some(timeout);
     }
 
+    /// Sets the total drain timeout. For HTTP/1.1, reusing a session requires
+    /// ensuring that the request body is consumed. This `timeout` will be used
+    /// to determine how long to wait for the entirety of the downstream request
+    /// body to finish after the upstream response is completed to return the
+    /// session to the reuse pool. If the timeout is exceeded, we will give up
+    /// on trying to reuse the session.
+    ///
+    /// Note that the downstream read timeout still applies between body byte reads.
+    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
+        self.total_drain_timeout = Some(timeout);
+    }
+
     /// Sets the minimum downstream send rate in bytes per second. This
     /// is used to calculate a write timeout in seconds based on the size
     /// of the buffer being written. If a `min_send_rate` is configured it
@@ -911,19 +950,25 @@ impl HttpSession {
     }
 
     /// Consume `self`, if the connection can be reused, the underlying stream will be returned
-    /// to be fed to the next [`Self::new()`]. The next session can just call [`Self::read_request()`].
+    /// to be fed to the next [`Self::new()`]. This drains any remaining request body if it hasn't
+    /// yet been read and the stream is reusable.
+    ///
+    /// The next session can just call [`Self::read_request()`].
+    ///
     /// If the connection cannot be reused, the underlying stream will be closed and `None` will be
-    /// returned.
-    pub async fn reuse(mut self) -> Option<Stream> {
-        // TODO: this function is unnecessarily slow for keepalive case
-        // because that case does not need async
+    /// returned. If there was an error while draining any remaining request body that error will
+    /// be returned.
+    pub async fn reuse(mut self) -> Result<Option<Stream>> {
         match self.keepalive_timeout {
             KeepaliveStatus::Off => {
                 debug!("HTTP shutdown connection");
                 self.shutdown().await;
-                None
+                Ok(None)
             }
-            _ => Some(self.underlying_stream),
+            _ => {
+                self.drain_request_body().await?;
+                Ok(Some(self.underlying_stream))
+            }
         }
     }
 
