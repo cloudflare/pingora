@@ -111,12 +111,9 @@ impl Session {
     /// This is useful for making streams reusable (in particular for HTTP/1.1) after returning an
     /// error before the whole body has been read.
     pub async fn drain_request_body(&mut self) -> Result<()> {
-        loop {
-            match self.read_request_body().await {
-                Ok(Some(_)) => { /* continue to drain */ }
-                Ok(None) => return Ok(()), // done
-                Err(e) => return Err(e),
-            }
+        match self {
+            Self::H1(s) => s.drain_request_body().await,
+            Self::H2(s) => s.drain_request_body().await,
         }
     }
 
@@ -177,7 +174,7 @@ impl Session {
             Self::H1(mut s) => {
                 // need to flush body due to buffering
                 s.finish_body().await?;
-                Ok(s.reuse().await)
+                s.reuse().await
             }
             Self::H2(mut s) => {
                 s.finish()?;
@@ -222,6 +219,19 @@ impl Session {
         match self {
             Self::H1(s) => s.set_write_timeout(timeout),
             Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the total drain timeout, which will be applied while discarding the
+    /// request body using `drain_request_body`.
+    ///
+    /// For HTTP/1.1, reusing a session requires ensuring that the request body
+    /// is consumed. If the timeout is exceeded, the caller should give up on
+    /// trying to reuse the session.
+    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
+        match self {
+            Self::H1(s) => s.set_total_drain_timeout(timeout),
+            Self::H2(s) => s.set_total_drain_timeout(timeout),
         }
     }
 
