@@ -415,12 +415,19 @@ impl ProxyHttp for ExampleProxyCache {
         &self,
         session: &Session,
         _meta: &CacheMeta,
+        is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>> {
         // allow test header to control force expiry/miss
         if session.get_header_bytes("x-force-miss") != b"" {
             return Ok(Some(ForcedInvalidationKind::ForceMiss));
         }
+
+        if !is_fresh {
+            // already expired
+            return Ok(None);
+        }
+
         if session.get_header_bytes("x-force-expire") != b"" {
             return Ok(Some(ForcedInvalidationKind::ForceExpired));
         }
