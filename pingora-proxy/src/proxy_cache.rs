@@ -22,6 +22,7 @@ use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
+use std::time::SystemTime;
 
 impl<SV> HttpProxy<SV> {
     // return bool: server_session can be reused, and error if any
@@ -113,29 +114,35 @@ impl<SV> HttpProxy<SV> {
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let hit_status = if meta.is_fresh(std::time::SystemTime::now()) {
-                            // check if we should force expire or miss
-                            // vs. hard purge which forces miss)
-                            match self.inner.cache_hit_filter(session, &meta, ctx).await {
-                                Err(e) => {
-                                    error!(
-                                        "Failed to filter cache hit: {e}, {}",
-                                        self.inner.request_summary(session, ctx)
-                                    );
-                                    // this return value will cause us to fetch from upstream
-                                    HitStatus::FailedHitFilter
-                                }
-                                Ok(None) => HitStatus::Fresh,
-                                Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
-                                    // force expired asset should not be serve as stale
-                                    // because force expire is usually to remove data
-                                    meta.disable_serve_stale();
-                                    HitStatus::ForceExpired
-                                }
-                                Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
+                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        // check if we should force expire or force miss
+                        let hit_status = match self
+                            .inner
+                            .cache_hit_filter(session, &meta, is_fresh, ctx)
+                            .await
+                        {
+                            Err(e) => {
+                                error!(
+                                    "Failed to filter cache hit: {e}, {}",
+                                    self.inner.request_summary(session, ctx)
+                                );
+                                // this return value will cause us to fetch from upstream
+                                HitStatus::FailedHitFilter
                             }
-                        } else {
-                            HitStatus::Expired
+                            Ok(None) => {
+                                if is_fresh {
+                                    HitStatus::Fresh
+                                } else {
+                                    HitStatus::Expired
+                                }
+                            }
+                            Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
+                                // force expired asset should not be serve as stale
+                                // because force expire is usually to remove data
+                                meta.disable_serve_stale();
+                                HitStatus::ForceExpired
+                            }
+                            Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
                         };
 
                         hit_status_opt = Some(hit_status);
