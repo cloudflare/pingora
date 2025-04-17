@@ -229,6 +229,16 @@ fn set_so_keepalive_idle(fd: RawFd, val: Duration) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn set_so_keepalive_user_timeout(fd: RawFd, val: Duration) -> io::Result<()> {
+    set_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_USER_TIMEOUT,
+        val.as_millis() as c_int, // only the ms part of val is used
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn set_so_keepalive_interval(fd: RawFd, val: Duration) -> io::Result<()> {
     set_opt(
         fd,
@@ -248,7 +258,8 @@ fn set_keepalive(fd: RawFd, ka: &TcpKeepalive) -> io::Result<()> {
     set_so_keepalive(fd, true)?;
     set_so_keepalive_idle(fd, ka.idle)?;
     set_so_keepalive_interval(fd, ka.interval)?;
-    set_so_keepalive_count(fd, ka.count)
+    set_so_keepalive_count(fd, ka.count)?;
+    set_so_keepalive_user_timeout(fd, ka.user_timeout)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -559,9 +570,25 @@ pub struct TcpKeepalive {
     pub interval: Duration,
     /// The maximum number of TCP keep-alive probes to send before giving up and killing the connection
     pub count: usize,
+    /// the maximum amount of time in milliseconds that transmitted data may
+    /// remain unacknowledged, or buffered data may remain untransmitted (due to
+    /// zero window size) before TCP will forcibly close the corresponding
+    /// connection and return ETIMEDOUT. If the value is specified as 0 (the
+    /// default), TCP will use the system default.
+    #[cfg(target_os = "linux")]
+    pub user_timeout: Duration,
 }
 
 impl std::fmt::Display for TcpKeepalive {
+    #[cfg(target_os = "linux")]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?}/{:?}/{}/{:?}",
+            self.idle, self.interval, self.count, self.user_timeout
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}/{:?}/{}", self.idle, self.interval, self.count)
     }
