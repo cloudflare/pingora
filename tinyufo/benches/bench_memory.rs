@@ -142,7 +142,9 @@ dhat: At t-gmax: 766,024 bytes in 10,421 blocks
 
 fn main() {
     for items in [1000, 10_000, 100_000] {
-        println!("\ntotal items {items}, cache size 10%");
+        println!("\n-----------------------------------");
+        println!("total items {items}, cache size 10%");
+        println!("-----------------------------------");
         {
             let _profiler = dhat::Profiler::new_heap();
             bench_lru(1.05, items, 0.1);
