@@ -83,9 +83,11 @@ impl ProxyApp {
 
 #[async_trait]
 impl ServerApp for ProxyApp {
+    type StreamMeta = ();
     async fn process_new(
         self: &Arc<Self>,
         io: Stream,
+        _meta: &mut Option<Self::StreamMeta>,
         _shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let client_session = self.client_connector.new_stream(&self.proxy_to).await;

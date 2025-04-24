@@ -74,7 +74,12 @@ mod boringssl_openssl {
 
     #[async_trait]
     impl pingora::listeners::TlsAccept for DynamicCert {
-        async fn certificate_callback(&self, ssl: &mut pingora::tls::ssl::SslRef) {
+        type StreamMeta = ();
+        async fn certificate_callback(
+            &self,
+            ssl: &mut pingora::tls::ssl::SslRef,
+            _stream_meta: &mut Option<Self::StreamMeta>,
+        ) {
             use pingora::tls::ext;
             ext::ssl_use_certificate(ssl, &self.cert).unwrap();
             ext::ssl_use_private_key(ssl, &self.key).unwrap();
@@ -160,7 +165,7 @@ pub fn main() {
     }
     #[cfg(not(feature = "any_tls"))]
     {
-        tls_settings = TlsSettings;
+        tls_settings = TlsSettings::default();
     }
 
     tls_settings.enable_h2();

@@ -22,7 +22,7 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
+use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream, IO};
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -41,28 +41,42 @@ pub use l4::{ServerAddress, TcpSocketOptions};
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
 pub trait TlsAccept {
+    /// Custom defined associate type to represent meta info of the stream
+    type StreamMeta: Send + Sync + 'static;
+
+    /// This function is called before of a TLS handshake to get the custom stream info.
+    /// The StreamMeta is later passed to `certificate_callback`
+    fn stream_meta(&self, _io: &dyn IO) -> Option<Self::StreamMeta> {
+        // return None by default
+        None
+    }
+
     // TODO: return error?
     /// This function is called in the middle of a TLS handshake. Structs who
     /// implement this function should provide tls certificate and key to the
     /// [TlsRef] via `ssl_use_certificate` and `ssl_use_private_key`.
     /// Note. This is only supported for openssl and boringssl
-    async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
+    async fn certificate_callback(
+        &self,
+        _ssl: &mut TlsRef,
+        _stream_meta: &mut Option<Self::StreamMeta>,
+    ) -> () {
         // does nothing by default
     }
 }
 
-pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
+pub type TlsAcceptCallbacks<T = ()> = Box<dyn TlsAccept<StreamMeta = T> + Send + Sync>;
 
-struct TransportStackBuilder {
+struct TransportStackBuilder<T> {
     l4: ServerAddress,
-    tls: Option<TlsSettings>,
+    tls: Option<TlsSettings<T>>,
 }
 
-impl TransportStackBuilder {
-    pub async fn build(
+impl<T> TransportStackBuilder<T> {
+    async fn build(
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
-    ) -> Result<TransportStack> {
+    ) -> Result<TransportStack<T>> {
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
@@ -81,17 +95,17 @@ impl TransportStackBuilder {
 }
 
 #[derive(Clone)]
-pub(crate) struct TransportStack {
+pub(crate) struct TransportStack<T> {
     l4: ListenerEndpoint,
-    tls: Option<Arc<Acceptor>>,
+    tls: Option<Arc<Acceptor<T>>>,
 }
 
-impl TransportStack {
+impl<T> TransportStack<T> {
     pub fn as_str(&self) -> &str {
         self.l4.as_str()
     }
 
-    pub async fn accept(&self) -> Result<UninitializedStream> {
+    pub async fn accept(&self) -> Result<UninitializedStream<T>> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
             l4: stream,
@@ -104,19 +118,19 @@ impl TransportStack {
     }
 }
 
-pub(crate) struct UninitializedStream {
+pub(crate) struct UninitializedStream<T = ()> {
     l4: L4Stream,
-    tls: Option<Arc<Acceptor>>,
+    tls: Option<Arc<Acceptor<T>>>,
 }
 
-impl UninitializedStream {
-    pub async fn handshake(mut self) -> Result<Stream> {
+impl<T: Send + Sync + 'static> UninitializedStream<T> {
+    pub async fn handshake(mut self) -> Result<(Stream, Option<T>)> {
         self.l4.set_buffer();
         if let Some(tls) = self.tls {
-            let tls_stream = tls.tls_handshake(self.l4).await?;
-            Ok(Box::new(tls_stream))
+            let (tls_stream, meta) = tls.tls_handshake(self.l4).await?;
+            Ok((Box::new(tls_stream), meta))
         } else {
-            Ok(Box::new(self.l4))
+            Ok((Box::new(self.l4), None))
         }
     }
 
@@ -129,11 +143,11 @@ impl UninitializedStream {
 }
 
 /// The struct to hold one more multiple listening endpoints
-pub struct Listeners {
-    stacks: Vec<TransportStackBuilder>,
+pub struct Listeners<T = ()> {
+    stacks: Vec<TransportStackBuilder<T>>,
 }
 
-impl Listeners {
+impl<T> Listeners<T> {
     /// Create a new [`Listeners`] with no listening endpoints.
     pub fn new() -> Self {
         Listeners { stacks: vec![] }
@@ -193,7 +207,7 @@ impl Listeners {
         &mut self,
         addr: &str,
         sock_opt: Option<TcpSocketOptions>,
-        settings: TlsSettings,
+        settings: TlsSettings<T>,
     ) {
         self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings));
     }
@@ -204,14 +218,14 @@ impl Listeners {
     }
 
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
-    pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
+    pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings<T>>) {
         self.stacks.push(TransportStackBuilder { l4, tls })
     }
 
     pub(crate) async fn build(
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
-    ) -> Result<Vec<TransportStack>> {
+    ) -> Result<Vec<TransportStack<T>>> {
         let mut stacks = Vec::with_capacity(self.stacks.len());
 
         for b in self.stacks.iter_mut() {
@@ -245,7 +259,7 @@ mod test {
     async fn test_listen_tcp() {
         let addr1 = "127.0.0.1:7101";
         let addr2 = "127.0.0.1:7102";
-        let mut listeners = Listeners::tcp(addr1);
+        let mut listeners: Listeners = Listeners::tcp(addr1);
         listeners.add_tcp(addr2);
 
         let listeners = listeners
@@ -293,8 +307,8 @@ mod test {
 
         tokio::spawn(async move {
             // just try to accept once
-            let stream = listener.accept().await.unwrap();
-            let mut stream = stream.handshake().await.unwrap();
+            let stream: UninitializedStream = listener.accept().await.unwrap();
+            let (mut stream, _stream_meta) = stream.handshake().await.unwrap();
             let mut buf = [0; 1024];
             let _ = stream.read(&mut buf).await.unwrap();
             stream

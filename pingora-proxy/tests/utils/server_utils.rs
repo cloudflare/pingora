@@ -111,6 +111,7 @@ fn response_filter_common(
 #[cfg(feature = "any_tls")]
 impl ProxyHttp for ExampleProxyHttps {
     type CTX = CTX;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         CTX::default()
     }
@@ -209,6 +210,7 @@ pub struct ExampleProxyHttp {}
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         CTX::default()
     }
@@ -344,6 +346,7 @@ pub struct ExampleProxyCache {}
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
     type CTX = CacheCTX;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         CacheCTX {
             upstream_status: None,

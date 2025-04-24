@@ -34,6 +34,7 @@ pub struct GrpcWebBridgeProxy;
 #[async_trait]
 impl ProxyHttp for GrpcWebBridgeProxy {
     type CTX = ();
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {}
 
     fn init_downstream_modules(&self, modules: &mut HttpModules) {

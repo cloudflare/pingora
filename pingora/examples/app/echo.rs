@@ -37,9 +37,11 @@ pub struct EchoApp;
 
 #[async_trait]
 impl ServerApp for EchoApp {
+    type StreamMeta = ();
     async fn process_new(
         self: &Arc<Self>,
         mut io: Stream,
+        _meta: &mut Option<Self::StreamMeta>,
         _shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let mut buf = [0; 1024];

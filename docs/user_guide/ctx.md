@@ -22,6 +22,7 @@ fn check_beta_user(req: &pingora_http::RequestHeader) -> bool {
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = MyCtx;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         MyCtx { beta_user: false }
     }
@@ -77,6 +78,7 @@ fn check_beta_user(req: &pingora_http::RequestHeader) -> bool {
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = MyCtx;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         MyCtx { beta_user: false }
     }

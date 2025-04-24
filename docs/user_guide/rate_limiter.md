@@ -75,6 +75,7 @@ static MAX_REQ_PER_SEC: isize = 1;
 #[async_trait]
 impl ProxyHttp for LB {
     type CTX = ();
+    type StreamMeta = ();
 
     fn new_ctx(&self) {}
 
