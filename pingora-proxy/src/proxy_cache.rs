@@ -609,7 +609,15 @@ impl<SV> HttpProxy<SV> {
                 if resp.status == StatusCode::NOT_MODIFIED {
                     if session.cache.maybe_cache_meta().is_some() {
                         // run upstream response filters on upstream 304 first
-                        self.inner.upstream_response_filter(session, resp, ctx);
+                        if let Err(err) = self.inner.upstream_response_filter(session, resp, ctx) {
+                            error!("upstream response filter error on 304: {err:?}");
+                            session.cache.revalidate_uncacheable(
+                                *resp.clone(),
+                                NoCacheReason::InternalError,
+                            );
+                            // always serve from cache after receiving the 304
+                            return true;
+                        }
                         // 304 doesn't contain all the headers, merge 304 into cached 200 header
                         // in order for response_cache_filter to run correctly
                         let merged_header = session.cache.revalidate_merge_header(resp);
