@@ -253,7 +253,7 @@ impl<SV> HttpProxy<SV> {
     {
         match task {
             HttpTask::Header(header, _eos) => {
-                self.inner.upstream_response_filter(session, header, ctx)
+                self.inner.upstream_response_filter(session, header, ctx)?
             }
             HttpTask::Body(data, eos) => self
                 .inner

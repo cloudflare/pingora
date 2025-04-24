@@ -269,7 +269,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Modify the response header before it is send to the downstream

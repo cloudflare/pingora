@@ -494,10 +494,12 @@ impl ProxyHttp for ExampleProxyCache {
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
-    ) where
+    ) -> Result<()>
+    where
         Self::CTX: Send + Sync,
     {
         ctx.upstream_status = Some(upstream_response.status.into());
+        Ok(())
     }
 
     async fn response_filter(
