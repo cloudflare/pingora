@@ -65,6 +65,36 @@ async fn test_connection_die() {
 }
 
 #[tokio::test]
+async fn test_upload_connection_die() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+
+    // try h2
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .header("x-h2", "true")
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+}
+
+#[tokio::test]
 async fn test_upload() {
     init();
     let client = reqwest::Client::new();

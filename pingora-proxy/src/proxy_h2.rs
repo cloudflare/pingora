@@ -275,10 +275,18 @@ impl<SV> HttpProxy<SV> {
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    let request_done =
-                        self.send_body_to2(session, body, is_body_done, client_body, ctx)
-                        .await?;
-                    downstream_state.maybe_finished(request_done);
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx).await {
+                        Ok(request_done) =>  {
+                            downstream_state.maybe_finished(request_done);
+                        },
+                        Err(e) => {
+                            // mark request done, attempt to drain receive
+                            warn!("Upstream h2 body send error: {e}");
+                            // upstream is what actually errored but we don't want to continue
+                            // polling the downstream body
+                            downstream_state.to_errored();
+                        }
+                    };
                 },
 
                 task = rx.recv(), if !response_state.upstream_done() => {
