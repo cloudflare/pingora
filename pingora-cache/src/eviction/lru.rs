@@ -157,6 +157,16 @@ impl<const N: usize> EvictionManager for Manager<N> {
             .collect()
     }
 
+    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey> {
+        let key = u64key(&item);
+        self.0.increment_weight(key, delta);
+        self.0
+            .evict_to_limit()
+            .into_iter()
+            .map(|(key, _weight)| key)
+            .collect()
+    }
+
     fn remove(&self, item: &CompactCacheKey) {
         let key = u64key(item);
         self.0.remove(key);

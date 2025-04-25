@@ -14,7 +14,7 @@
 
 //! Set limit on the largest size to cache
 
-use crate::storage::HandleMiss;
+use crate::storage::{HandleMiss, MissFinishType};
 use crate::MissHandler;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -69,7 +69,7 @@ impl HandleMiss for MaxFileSizeMissHandler {
         self.inner.write_body(data, eof).await
     }
 
-    async fn finish(self: Box<Self>) -> pingora_error::Result<usize> {
+    async fn finish(self: Box<Self>) -> pingora_error::Result<MissFinishType> {
         self.inner.finish().await
     }
 

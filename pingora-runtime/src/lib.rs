@@ -222,6 +222,7 @@ fn test_steal_runtime() {
         1
     });
 
+    #[cfg(target_os = "linux")]
     assert_eq!(handle.metrics().num_workers(), threads);
     assert_eq!(ret, 1);
 }

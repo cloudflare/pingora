@@ -323,6 +323,7 @@ mod tests {
     /// not indicative of real errors. This function will retry the peer/server
     /// in increasing intervals until it either succeeds in connecting or a long
     /// timeout expires (max 10sec)
+    #[cfg(unix)]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
