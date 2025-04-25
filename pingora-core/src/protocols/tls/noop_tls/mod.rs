@@ -83,11 +83,11 @@ pub mod listeners {
 
     impl<T> TlsSettings<T> {
         pub fn build(&self) -> Acceptor<T> {
-            Acceptor(PhantomData::default())
+            Acceptor(PhantomData)
         }
 
         pub fn intermediate(_: &str, _: &str) -> Result<Self> {
-            Ok(Self(PhantomData::default()))
+            Ok(Self(PhantomData))
         }
 
         pub fn enable_h2(&mut self) {}
