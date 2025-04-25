@@ -258,7 +258,7 @@ impl HandleMiss for MemMissHandler {
         Ok(())
     }
 
-    async fn finish(self: Box<Self>) -> Result<usize> {
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
         // safe, the temp object is inserted when the miss handler is created
         let cache_object = self
             .temp
@@ -274,7 +274,7 @@ impl HandleMiss for MemMissHandler {
             .write()
             .get_mut(&self.key)
             .and_then(|map| map.remove(&self.temp_id.into()));
-        Ok(size)
+        Ok(MissFinishType::Created(size))
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {

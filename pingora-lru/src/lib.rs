@@ -83,6 +83,19 @@ impl<T, const N: usize> Lru<T, N> {
         shard
     }
 
+    /// Increment the weight associated with a given key.
+    ///
+    /// Return the total new weight. 0 indicates the key did not exist.
+    pub fn increment_weight(&self, key: u64, delta: usize) -> usize {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+        let new_weight = unit.increment_weight(key, delta);
+        if new_weight > 0 {
+            self.weight.fetch_add(delta, Ordering::Relaxed);
+        }
+        new_weight
+    }
+
     /// Promote the key to the head of the LRU
     ///
     /// Return `true` if the key exists.
@@ -272,6 +285,17 @@ impl<T> LruUnit<T> {
             weight,
         });
         self.lookup_table.insert(key, node);
+        0
+    }
+
+    /// Increase the weight of an existing key. Returns the new weight or the key.
+    pub fn increment_weight(&mut self, key: u64, delta: usize) -> usize {
+        if let Some(node) = self.lookup_table.get_mut(&key) {
+            node.weight += delta;
+            self.used_weight += delta;
+            self.order.promote(node.list_index);
+            return node.weight;
+        }
         0
     }
 
@@ -506,6 +530,21 @@ mod test_lru {
     }
 
     #[test]
+    fn test_increment_weight() {
+        let lru = Lru::<_, 2>::with_capacity(6, 10);
+        lru.admit(1, 1, 1);
+        lru.increment_weight(1, 1);
+        assert_eq!(lru.weight(), 1 + 1);
+
+        lru.increment_weight(0, 1000);
+        assert_eq!(lru.weight(), 1 + 1);
+
+        lru.admit(2, 2, 2);
+        lru.increment_weight(2, 2);
+        assert_eq!(lru.weight(), 1 + 1 + 2 + 2);
+    }
+
+    #[test]
     fn test_remove() {
         let lru = Lru::<_, 2>::with_capacity(30, 10);
         lru.admit(2, 2, 2);
@@ -659,6 +698,21 @@ mod test_lru_unit {
         assert_eq!(lru.evict(), None);
         assert_eq!(lru.used_weight(), 0);
         assert_lru(&lru, &[]);
+    }
+
+    #[test]
+    fn test_increment_weight() {
+        let mut lru = LruUnit::with_capacity(10);
+        lru.admit(1, 1, 1);
+        lru.increment_weight(1, 1);
+        assert_eq!(lru.used_weight(), 1 + 1);
+
+        lru.increment_weight(0, 1000);
+        assert_eq!(lru.used_weight(), 1 + 1);
+
+        lru.admit(2, 2, 2);
+        lru.increment_weight(2, 2);
+        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2);
     }
 
     #[test]

@@ -156,6 +156,12 @@ pub trait HandleHit {
 /// Hit Handler
 pub type HitHandler = Box<(dyn HandleHit + Sync + Send)>;
 
+/// MissFinishType
+pub enum MissFinishType {
+    Created(usize),
+    Appended(usize),
+}
+
 /// Cache miss handling trait
 #[async_trait]
 pub trait HandleMiss {
@@ -168,7 +174,7 @@ pub trait HandleMiss {
     /// failed.
     async fn finish(
         self: Box<Self>, // because self is always used as a trait object
-    ) -> Result<usize>;
+    ) -> Result<MissFinishType>;
 
     /// Return a streaming write tag recognized by the underlying [`Storage`].
     ///
