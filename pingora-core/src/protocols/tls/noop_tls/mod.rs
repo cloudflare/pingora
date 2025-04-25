@@ -70,8 +70,8 @@ pub mod connectors {
 }
 
 pub mod listeners {
-    use std::marker::PhantomData;
     use pingora_error::Result;
+    use std::marker::PhantomData;
     use tokio::io::{AsyncRead, AsyncWrite};
 
     use super::stream::SslStream;
