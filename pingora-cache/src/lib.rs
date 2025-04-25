@@ -775,7 +775,7 @@ impl HttpCache {
                             eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                         }
                         MissFinishType::Appended(size) => {
-                            eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                            eviction.increment_weight(cache_key, size)
                         }
                     };
                     // actual eviction can be done async
