@@ -420,7 +420,6 @@ fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut
                         if let Some(s) = i.bare_item.as_token() {
                             // TODO: support q value
                             let algorithm = Algorithm::from(s.as_str());
-
                             // ignore algorithms that we don't understand ignore
                             if algorithm != Algorithm::Other {
                                 list.push(Algorithm::from(s.as_str()));
