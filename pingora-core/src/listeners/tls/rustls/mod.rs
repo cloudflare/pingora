@@ -76,7 +76,6 @@ impl TlsSettings {
 
     fn build_bundled(bundle: &[BundleCert]) -> ServerConfig {
         let crypto_provider = crypto_provider();
-        // let crypto_provider = install_crypto_provider();
 
         let mut resolver = ResolvesServerCertUsingSni::new();
         for cert_key in bundle {

@@ -40,6 +40,7 @@ pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 ///
 /// If the CryptoProvider has not been installed yet.
 pub fn crypto_provider() -> &'static Arc<CryptoProvider> {
+    // the crypto provider is already installed at this point
     CryptoProvider::get_default().unwrap()
 }
 
