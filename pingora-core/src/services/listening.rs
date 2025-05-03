@@ -35,15 +35,15 @@ use std::fs::Permissions;
 use std::sync::Arc;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
-pub struct Service<A> {
+pub struct Service<A, T = ()> {
     name: String,
-    listeners: Listeners,
+    listeners: Listeners<T>,
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
 }
 
-impl<A> Service<A> {
+impl<A, T> Service<A, T> {
     /// Create a new [`Service`] with the given application (see [`crate::apps`]).
     pub fn new(name: String, app_logic: A) -> Self {
         Service {
@@ -56,7 +56,7 @@ impl<A> Service<A> {
 
     /// Create a new [`Service`] with the given application (see [`crate::apps`]) and the given
     /// [`Listeners`].
-    pub fn with_listeners(name: String, listeners: Listeners, app_logic: A) -> Self {
+    pub fn with_listeners(name: String, listeners: Listeners<T>, app_logic: A) -> Self {
         Service {
             name,
             listeners,
@@ -66,7 +66,7 @@ impl<A> Service<A> {
     }
 
     /// Get the [`Listeners`], mostly to add more endpoints.
-    pub fn endpoints(&mut self) -> &mut Listeners {
+    pub fn endpoints(&mut self) -> &mut Listeners<T> {
         &mut self.listeners
     }
 
@@ -101,7 +101,7 @@ impl<A> Service<A> {
         &mut self,
         addr: &str,
         sock_opt: Option<TcpSocketOptions>,
-        settings: TlsSettings,
+        settings: TlsSettings<T>,
     ) {
         self.listeners
             .add_tls_with_settings(addr, sock_opt, settings)
@@ -123,21 +123,29 @@ impl<A> Service<A> {
     }
 }
 
-impl<A: ServerApp + Send + Sync + 'static> Service<A> {
-    pub async fn handle_event(event: Stream, app_logic: Arc<A>, shutdown: ShutdownWatch) {
+impl<A: ServerApp + Send + Sync + 'static> Service<A, A::StreamMeta>
+where
+    A::StreamMeta: Send + Sync + 'static,
+{
+    pub async fn handle_event(
+        event: Stream,
+        app_logic: Arc<A>,
+        mut meta: Option<A::StreamMeta>,
+        shutdown: ShutdownWatch,
+    ) {
         debug!("new event!");
-        let mut reuse_event = app_logic.process_new(event, &shutdown).await;
+        let mut reuse_event = app_logic.process_new(event, &mut meta, &shutdown).await;
         while let Some(event) = reuse_event {
             // TODO: with no steal runtime, consider spawn() the next event on
             // another thread for more evenly load balancing
             debug!("new reusable event!");
-            reuse_event = app_logic.process_new(event, &shutdown).await;
+            reuse_event = app_logic.process_new(event, &mut meta, &shutdown).await;
         }
     }
 
     async fn run_endpoint(
         app_logic: Arc<A>,
-        mut stack: TransportStack,
+        mut stack: TransportStack<A::StreamMeta>,
         mut shutdown: ShutdownWatch,
     ) {
         // the accept loop, until the system is shutting down
@@ -168,7 +176,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
                         match io.handshake().await {
-                            Ok(io) => Self::handle_event(io, app, shutdown).await,
+                            Ok((io, meta)) => Self::handle_event(io, app, meta, shutdown).await,
                             Err(e) => {
                                 // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
                                 if let Some(addr) = peer_addr {
@@ -204,7 +212,10 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
 }
 
 #[async_trait]
-impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
+impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A, A::StreamMeta>
+where
+    A::StreamMeta: Clone,
+{
     async fn start_service(
         &mut self,
         #[cfg(unix)] fds: Option<ListenFds>,

@@ -31,9 +31,31 @@ use std::time::Duration;
 pub trait ProxyHttp {
     /// The per request object to share state across the different filters
     type CTX;
+    /// Custom defined associate type to represent meta info of the stream.
+    /// StreamMeta could either be created at the handshake of stream or
+    /// be created and reused by this app.
+    /// The StreamMeta is reused between all sessions on one stream.
+    type StreamMeta: Send + Sync + 'static + Clone;
 
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
+
+    /// This function is called at the begining of the each downstream session and only called if
+    /// the reused StreamMeta of the current downstream is None.
+    /// The first none empty StreamMeta is created either by this funtion or
+    /// the callback of tls handshake in [TlsAccept] or.
+    fn stream_meta(_stream: &Stream) -> Option<Self::StreamMeta> {
+        None
+    }
+
+    /// This function is called at the begining of the session to store and reuse the StreamMeta
+    fn reuse_stream_meta(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _meta: &mut Option<Self::StreamMeta>,
+    ) {
+    }
 
     /// Define where the proxy should send the request to.
     ///

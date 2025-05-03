@@ -13,6 +13,7 @@ pub struct MyGateway;
 #[async_trait]
 impl ProxyHttp for MyGateway {
     type CTX = ();
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn upstream_peer(

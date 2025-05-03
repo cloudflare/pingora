@@ -26,18 +26,19 @@ use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 use crate::protocols::{ALPN, IO};
 
 /// The TLS settings of a listening endpoint
-pub struct TlsSettings {
+pub struct TlsSettings<T = ()> {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
     key_path: String,
+    _stream_meta: std::marker::PhantomData<T>,
 }
 
-pub struct Acceptor {
+pub struct Acceptor<T = ()> {
     pub acceptor: RusTlsAcceptor,
-    callbacks: Option<TlsAcceptCallbacks>,
+    callbacks: Option<TlsAcceptCallbacks<T>>,
 }
 
-impl TlsSettings {
+impl<T> TlsSettings<T> {
     /// Create a Rustls acceptor based on the current setting for certificates,
     /// keys, and protocols.
     ///
@@ -45,7 +46,7 @@ impl TlsSettings {
     /// certificate files or constructing the builder
     ///
     /// Todo: Return a result instead of panicking XD
-    pub fn build(self) -> Acceptor {
+    pub fn build(self) -> Acceptor<T> {
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
             panic!(
@@ -92,6 +93,7 @@ impl TlsSettings {
             alpn_protocols: None,
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
+            _stream_meta: Default::default(),
         })
     }
 
@@ -107,14 +109,14 @@ impl TlsSettings {
     }
 }
 
-impl Acceptor {
-    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
+impl<T> Acceptor<T> {
+    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<(TlsStream<S>, Option<T>)> {
         debug!("new tls session");
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {
             handshake_with_callback(self, stream, cb).await
         } else {
-            handshake(self, stream).await
+            handshake(self, stream).await.map(|stream| (stream, None))
         }
     }
 }

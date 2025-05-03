@@ -71,28 +71,33 @@ pub mod connectors {
 
 pub mod listeners {
     use pingora_error::Result;
+    use std::marker::PhantomData;
     use tokio::io::{AsyncRead, AsyncWrite};
 
     use super::stream::SslStream;
 
-    pub struct Acceptor;
+    pub struct Acceptor<T = ()>(PhantomData<T>);
 
-    pub struct TlsSettings;
+    #[derive(Default)]
+    pub struct TlsSettings<T = ()>(PhantomData<T>);
 
-    impl TlsSettings {
-        pub fn build(&self) -> Acceptor {
-            Acceptor
+    impl<T> TlsSettings<T> {
+        pub fn build(&self) -> Acceptor<T> {
+            Acceptor(PhantomData)
         }
 
         pub fn intermediate(_: &str, _: &str) -> Result<Self> {
-            Ok(Self)
+            Ok(Self(PhantomData))
         }
 
         pub fn enable_h2(&mut self) {}
     }
 
-    impl Acceptor {
-        pub async fn tls_handshake<S: AsyncRead + AsyncWrite>(&self, _: S) -> Result<SslStream<S>> {
+    impl<T> Acceptor<T> {
+        pub async fn tls_handshake<S: AsyncRead + AsyncWrite>(
+            &self,
+            _: S,
+        ) -> Result<(SslStream<S>, Option<T>)> {
             unimplemented!("No tls feature was specified")
         }
     }

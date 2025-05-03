@@ -47,14 +47,14 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> TlsStream<S> {
     }
 }
 
-async fn prepare_tls_stream<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
+async fn prepare_tls_stream<S: IO, T>(acceptor: &Acceptor<T>, io: S) -> Result<TlsStream<S>> {
     TlsStream::from_acceptor(acceptor, io)
         .await
         .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))
 }
 
 /// Perform TLS handshake for the given connection with the given configuration
-pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>> {
+pub async fn handshake<S: IO, T>(acceptor: &Acceptor<T>, io: S) -> Result<TlsStream<S>> {
     let mut stream = prepare_tls_stream(acceptor, io).await?;
     stream
         .accept()
@@ -65,11 +65,11 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
 
 /// Perform TLS handshake for the given connection with the given configuration and callbacks
 /// callbacks are currently not supported within pingora Rustls and are ignored
-pub async fn handshake_with_callback<S: IO>(
-    acceptor: &Acceptor,
+pub async fn handshake_with_callback<S: IO, T>(
+    acceptor: &Acceptor<T>,
     io: S,
-    _callbacks: &TlsAcceptCallbacks,
-) -> Result<TlsStream<S>> {
+    _callbacks: &TlsAcceptCallbacks<T>,
+) -> Result<(TlsStream<S>, Option<T>)> {
     let mut tls_stream = prepare_tls_stream(acceptor, io).await?;
     let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
@@ -82,7 +82,7 @@ pub async fn handshake_with_callback<S: IO>(
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     }
 
-    Ok(tls_stream)
+    Ok((tls_stream, None))
 }
 
 #[async_trait]

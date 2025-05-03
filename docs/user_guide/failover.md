@@ -29,6 +29,7 @@ pub struct MyCtx {
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = MyCtx;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         MyCtx { tries: 0 }
     }

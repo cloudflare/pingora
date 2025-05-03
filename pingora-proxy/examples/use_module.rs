@@ -83,6 +83,7 @@ pub struct MyProxy;
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = ();
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {}
 
     // This function is only called once when the server starts

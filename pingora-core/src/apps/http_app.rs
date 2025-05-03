@@ -47,10 +47,12 @@ impl<SV> HttpServerApp for SV
 where
     SV: ServeHttp + Send + Sync,
 {
+    type StreamMeta = ();
     async fn process_new_http(
         self: &Arc<Self>,
         mut http: ServerSession,
         shutdown: &ShutdownWatch,
+        _meta: &mut Option<Self::StreamMeta>,
     ) -> Option<Stream> {
         match http.read_request().await {
             Ok(res) => match res {
@@ -133,10 +135,12 @@ impl<SV> HttpServerApp for HttpServer<SV>
 where
     SV: ServeHttp + Send + Sync,
 {
+    type StreamMeta = ();
     async fn process_new_http(
         self: &Arc<Self>,
         mut http: ServerSession,
         shutdown: &ShutdownWatch,
+        _meta: &mut Option<Self::StreamMeta>,
     ) -> Option<Stream> {
         match http.read_request().await {
             Ok(res) => match res {

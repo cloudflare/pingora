@@ -36,6 +36,7 @@ struct BackoffRetryProxy;
 #[async_trait]
 impl ProxyHttp for BackoffRetryProxy {
     type CTX = RetryCtx;
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {
         Self::CTX::default()
     }

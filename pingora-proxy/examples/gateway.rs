@@ -37,6 +37,7 @@ pub struct MyGateway {
 #[async_trait]
 impl ProxyHttp for MyGateway {
     type CTX = ();
+    type StreamMeta = ();
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {

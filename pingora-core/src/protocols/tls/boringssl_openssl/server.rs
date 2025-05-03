@@ -46,11 +46,12 @@ pub async fn handshake<S: IO>(ssl_acceptor: &SslAcceptor, io: S) -> Result<SslSt
 }
 
 /// Perform TLS handshake for the given connection with the given configuration and callbacks
-pub async fn handshake_with_callback<S: IO>(
+pub async fn handshake_with_callback<S: IO, T: Send + Sync + 'static>(
     ssl_acceptor: &SslAcceptor,
     io: S,
-    callbacks: &TlsAcceptCallbacks,
-) -> Result<SslStream<S>> {
+    callbacks: &TlsAcceptCallbacks<T>,
+) -> Result<(SslStream<S>, Option<T>)> {
+    let mut stream_meta = callbacks.stream_meta(&io);
     let mut tls_stream = prepare_tls_stream(ssl_acceptor, io)?;
     let done = Pin::new(&mut tls_stream)
         .start_accept()
@@ -59,14 +60,16 @@ pub async fn handshake_with_callback<S: IO>(
     if !done {
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
-        callbacks.certificate_callback(ssl_mut).await;
+        callbacks
+            .certificate_callback(ssl_mut, &mut stream_meta)
+            .await;
         Pin::new(&mut tls_stream)
             .resume_accept()
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
-        Ok(tls_stream)
+        Ok((tls_stream, stream_meta))
     } else {
-        Ok(tls_stream)
+        Ok((tls_stream, None))
     }
 }
 
@@ -144,7 +147,12 @@ async fn test_async_cert() {
     struct Callback;
     #[async_trait]
     impl TlsAccept for Callback {
-        async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
+        type StreamMeta = ();
+        async fn certificate_callback(
+            &self,
+            ssl: &mut TlsRef,
+            _stream_meta: &mut Option<Self::StreamMeta>,
+        ) -> () {
             assert_eq!(
                 ssl.servername(ssl::NameType::HOST_NAME).unwrap(),
                 "pingora.org"

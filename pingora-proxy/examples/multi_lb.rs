@@ -31,6 +31,7 @@ struct Router {
 #[async_trait]
 impl ProxyHttp for Router {
     type CTX = ();
+    type StreamMeta = ();
     fn new_ctx(&self) {}
 
     async fn upstream_peer(&self, session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {

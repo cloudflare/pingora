@@ -483,11 +483,13 @@ impl<SV> HttpProxy<SV> {
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
+        meta: &mut Option<SV::StreamMeta>,
     ) -> Option<Stream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        self.inner.reuse_stream_meta(&mut session, &mut ctx, meta);
         if let Err(e) = self
             .inner
             .early_request_filter(&mut session, &mut ctx)
@@ -746,7 +748,7 @@ where
         session.subrequest_ctx.replace(sub_req_ctx);
         trace!("processing subrequest");
         let ctx = self.inner.new_ctx();
-        self.process_request(session, ctx).await;
+        self.process_request(session, ctx, &mut None).await;
         trace!("subrequest done");
     }
 }
@@ -757,10 +759,12 @@ where
     SV: ProxyHttp + Send + Sync + 'static,
     <SV as ProxyHttp>::CTX: Send + Sync,
 {
+    type StreamMeta = SV::StreamMeta;
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
         shutdown: &ShutdownWatch,
+        meta: &mut Option<Self::StreamMeta>,
     ) -> Option<Stream> {
         let session = Box::new(session);
 
@@ -779,7 +783,7 @@ where
         }
 
         let ctx = self.inner.new_ctx();
-        self.process_request(session, ctx).await
+        self.process_request(session, ctx, meta).await
     }
 
     async fn http_cleanup(&self) {
@@ -793,6 +797,9 @@ where
         self.server_options.as_ref()
     }
 
+    fn stream_meta(stream: &Stream) -> Option<<SV as ProxyHttp>::StreamMeta> {
+        <SV as ProxyHttp>::stream_meta(stream)
+    }
     // TODO implement h2_options
 }
 
@@ -801,7 +808,10 @@ use pingora_core::services::listening::Service;
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
+pub fn http_proxy_service<SV>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+) -> Service<HttpProxy<SV>, SV::StreamMeta>
 where
     SV: ProxyHttp,
 {
@@ -815,7 +825,7 @@ pub fn http_proxy_service_with_name<SV>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
-) -> Service<HttpProxy<SV>>
+) -> Service<HttpProxy<SV>, SV::StreamMeta>
 where
     SV: ProxyHttp,
 {

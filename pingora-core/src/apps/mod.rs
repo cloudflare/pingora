@@ -35,6 +35,11 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
 pub trait ServerApp {
+    /// Custom defined associate type to represent meta info of the stream.
+    /// StreamMeta could either be created at the handshake of stream or
+    /// be created and reused by this app.
+    type StreamMeta: Send + Sync + 'static;
+
     /// Whenever a new connection is established, this function will be called with the established
     /// [`Stream`] object provided.
     ///
@@ -50,6 +55,7 @@ pub trait ServerApp {
     async fn process_new(
         self: &Arc<Self>,
         mut session: Stream,
+        meta: &mut Option<Self::StreamMeta>,
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
     ) -> Option<Stream>;
@@ -68,6 +74,12 @@ pub struct HttpServerOptions {
 /// This trait defines the interface of an HTTP application.
 #[async_trait]
 pub trait HttpServerApp {
+    /// Custom defined associate type to represent meta info of the stream.
+    /// StreamMeta could either be created at the handshake of stream or
+    /// be created and reused by this app.
+    /// The StreamMeta is reused between all sessions on one stream.
+    type StreamMeta: Send + Sync + 'static + Clone;
+
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
     /// After successful processing, [`ServerSession::finish()`] can be called to return an optionally reusable
@@ -78,6 +90,7 @@ pub trait HttpServerApp {
         mut session: ServerSession,
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
+        meta: &mut Option<Self::StreamMeta>,
     ) -> Option<Stream>;
 
     /// Provide options on how HTTP/2 connection should be established. This function will be called
@@ -97,6 +110,10 @@ pub trait HttpServerApp {
     }
 
     async fn http_cleanup(&self) {}
+
+    fn stream_meta(_stream: &Stream) -> Option<Self::StreamMeta> {
+        None
+    }
 }
 
 #[async_trait]
@@ -104,11 +121,17 @@ impl<T> ServerApp for T
 where
     T: HttpServerApp + Send + Sync + 'static,
 {
+    type StreamMeta = T::StreamMeta;
+
     async fn process_new(
         self: &Arc<Self>,
         mut stream: Stream,
+        meta: &mut Option<Self::StreamMeta>,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
+        if meta.is_none() {
+            *meta = T::stream_meta(&stream);
+        }
         let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
 
         // try to read h2 preface
@@ -173,14 +196,19 @@ where
                 };
                 let app = self.clone();
                 let shutdown = shutdown.clone();
+                let mut meta_cl = meta.clone();
                 pingora_runtime::current_handle().spawn(async move {
-                    app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
-                        .await;
+                    app.process_new_http(
+                        ServerSession::new_http2(h2_stream),
+                        &shutdown,
+                        &mut meta_cl,
+                    )
+                    .await;
                 });
             }
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
-            self.process_new_http(ServerSession::new_http1(stream), shutdown)
+            self.process_new_http(ServerSession::new_http1(stream), shutdown, meta)
                 .await
         }
     }

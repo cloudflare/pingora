@@ -77,7 +77,7 @@ where
     ///
     /// Using RustTLS the stream is only returned after the handshake.
     /// The caller does therefor not need to perform [`Self::accept()`].
-    pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
+    pub(crate) async fn from_acceptor<S>(acceptor: &Acceptor<S>, stream: T) -> Result<Self> {
         let tls = InnerStream::from_acceptor(acceptor, stream)
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("tls stream error: {e}"))?;
@@ -258,7 +258,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> InnerStream<T> {
         })
     }
 
-    pub(crate) async fn from_acceptor(acceptor: &Acceptor, stream: T) -> Result<Self> {
+    pub(crate) async fn from_acceptor<S>(acceptor: &Acceptor<S>, stream: T) -> Result<Self> {
         let accept = acceptor.acceptor.accept(stream);
 
         Ok(InnerStream {

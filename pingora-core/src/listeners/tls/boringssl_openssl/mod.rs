@@ -29,15 +29,15 @@ use crate::{
 
 pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
-pub(crate) struct Acceptor {
+pub(crate) struct Acceptor<T> {
     ssl_acceptor: SslAcceptor,
-    callbacks: Option<TlsAcceptCallbacks>,
+    callbacks: Option<TlsAcceptCallbacks<T>>,
 }
 
 /// The TLS settings of a listening endpoint
-pub struct TlsSettings {
+pub struct TlsSettings<T = ()> {
     accept_builder: SslAcceptorBuilder,
-    callbacks: Option<TlsAcceptCallbacks>,
+    callbacks: Option<TlsAcceptCallbacks<T>>,
 }
 
 impl From<SslAcceptorBuilder> for TlsSettings {
@@ -63,7 +63,7 @@ impl DerefMut for TlsSettings {
     }
 }
 
-impl TlsSettings {
+impl<T> TlsSettings<T> {
     /// Create a new [`TlsSettings`] with the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29)
     /// server side TLS settings. Users can adjust the TLS settings after this object is created.
     /// Return error if the provided certificate and private key are invalid or not found.
@@ -88,7 +88,7 @@ impl TlsSettings {
 
     /// Create a new [`TlsSettings`] similar to [TlsSettings::intermediate()]. A struct that implements [TlsAcceptCallbacks]
     /// is needed to provide the certificate during the TLS handshake.
-    pub fn with_callbacks(callbacks: TlsAcceptCallbacks) -> Result<Self> {
+    pub fn with_callbacks(callbacks: TlsAcceptCallbacks<T>) -> Result<Self> {
         let accept_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).or_err(
             TLS_CONF_ERR,
             "fail to create mozilla_intermediate_v5 Acceptor",
@@ -116,7 +116,7 @@ impl TlsSettings {
         }
     }
 
-    pub(crate) fn build(self) -> Acceptor {
+    pub(crate) fn build(self) -> Acceptor<T> {
         Acceptor {
             ssl_acceptor: self.accept_builder.build(),
             callbacks: self.callbacks,
@@ -124,14 +124,16 @@ impl TlsSettings {
     }
 }
 
-impl Acceptor {
-    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<SslStream<S>> {
+impl<T: Send + Sync + 'static> Acceptor<T> {
+    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<(SslStream<S>, Option<T>)> {
         debug!("new ssl session");
         // TODO: be able to offload this handshake in a thread pool
         if let Some(cb) = self.callbacks.as_ref() {
             handshake_with_callback(&self.ssl_acceptor, stream, cb).await
         } else {
-            handshake(&self.ssl_acceptor, stream).await
+            handshake(&self.ssl_acceptor, stream)
+                .await
+                .map(|stream| (stream, None))
         }
     }
 }
