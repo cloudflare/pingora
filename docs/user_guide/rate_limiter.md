@@ -85,7 +85,7 @@ impl ProxyHttp for LB {
     ) -> Result<Box<HttpPeer>> {
         let upstream = self.0.select(b"", 256).unwrap();
         // Set SNI
-        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string())?);
         Ok(peer)
     }
 
@@ -135,11 +135,11 @@ impl ProxyHttp for LB {
 ```
 
 ## Testing
-To use the example above, 
+To use the example above,
 
-1. Run your program with `cargo run`. 
+1. Run your program with `cargo run`.
 2. Verify the program is working with a few executions of ` curl localhost:6188 -H "appid:1" -v`
-   - The first request should work and any later requests that arrive within 1s of a previous request should fail with: 
+   - The first request should work and any later requests that arrive within 1s of a previous request should fail with:
      ```
      *   Trying 127.0.0.1:6188...
      * Connected to localhost (127.0.0.1) port 6188 (#0)
@@ -148,19 +148,19 @@ To use the example above,
      > User-Agent: curl/7.88.1
      > Accept: */*
      > appid:1
-     > 
+     >
      < HTTP/1.1 429 Too Many Requests
      < X-Rate-Limit-Limit: 1
      < X-Rate-Limit-Remaining: 0
      < X-Rate-Limit-Reset: 1
      < Date: Sun, 14 Jul 2024 20:29:02 GMT
      < Connection: close
-     < 
+     <
      * Closing connection 0
      ```
 
 ## Complete Example
-You can run the pre-made example code in the [`pingora-proxy` examples folder](https://github.com/cloudflare/pingora/tree/main/pingora-proxy/examples/rate_limiter.rs) with 
+You can run the pre-made example code in the [`pingora-proxy` examples folder](https://github.com/cloudflare/pingora/tree/main/pingora-proxy/examples/rate_limiter.rs) with
 
 ```
 cargo run --example rate_limiter

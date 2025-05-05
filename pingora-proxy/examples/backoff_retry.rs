@@ -67,7 +67,7 @@ impl ProxyHttp for BackoffRetryProxy {
             info!("sleeping for ms: {sleep_ms:?}");
             tokio::time::sleep(sleep_ms).await;
         }
-        let mut peer = HttpPeer::new(("10.0.0.1", 80), false, "".into());
+        let mut peer = HttpPeer::new(("10.0.0.1", 80), false, "".into())?;
         peer.options.connection_timeout = Some(Duration::from_millis(100));
         Ok(Box::new(peer))
     }

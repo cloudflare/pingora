@@ -116,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(1, 1);
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -166,7 +166,7 @@ mod tests {
         // h1 session instead.
 
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // As it is hard to find a server that support only h1, we use the following hack to trick
         // the connector to think the server supports only h1. We force ALPN to use h1 and then
         // return the connection to the Connector. And then we use a Peer that allows h2
@@ -181,7 +181,7 @@ mod tests {
         }
         connector.release_http_session(h1, &peer, None).await;
 
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
 
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
@@ -196,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_prefer_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
         connector.prefer_h1(&peer);
 

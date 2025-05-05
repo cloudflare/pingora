@@ -70,7 +70,7 @@ impl ProxyHttp for MyProxy {
             ("1.1.1.1", 443)
         };
 
-        let peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string())?);
         Ok(peer)
     }
 }

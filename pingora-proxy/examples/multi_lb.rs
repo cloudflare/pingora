@@ -48,7 +48,7 @@ impl ProxyHttp for Router {
         println!("upstream peer is: {upstream:?}");
 
         // Set SNI to one.one.one.one
-        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string())?);
         Ok(peer)
     }
 }

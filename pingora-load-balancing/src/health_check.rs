@@ -187,7 +187,7 @@ impl HttpHealthCheck {
         let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.append_header("Host", host).unwrap();
         let sni = if tls { host.into() } else { String::new() };
-        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni);
+        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni).unwrap();
         peer_template.options.connection_timeout = Some(Duration::from_secs(1));
         peer_template.options.read_timeout = Some(Duration::from_secs(1));
         HttpHealthCheck {
