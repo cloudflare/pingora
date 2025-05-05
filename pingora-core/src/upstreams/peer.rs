@@ -468,7 +468,9 @@ impl HttpPeer {
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
     pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
-        let mut addrs_iter = address.to_socket_addrs().or_err(SocketError, "invalid address")?;
+        let mut addrs_iter = address
+            .to_socket_addrs()
+            .or_err(SocketError, "invalid address")?;
         let addr = addrs_iter.next().unwrap();
         Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
