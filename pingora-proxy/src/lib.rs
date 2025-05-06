@@ -431,7 +431,20 @@ impl Session {
                         *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Done or Failed */ }
+                HttpTask::Done => {
+                    // `Done` can be sent in certain response paths to mark end
+                    // of response if not already done via trailers or body with
+                    // end flag set.
+                    // If the filter returns body bytes on Done,
+                    // write them into the response.
+                    //
+                    // Note, this will not work if end of stream has already
+                    // been seen or we've written content-length bytes.
+                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                        *task = HttpTask::Body(Some(buf), true);
+                    }
+                }
+                _ => { /* Failed */ }
             }
         }
         self.downstream_session.response_duplex_vec(tasks).await

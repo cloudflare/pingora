@@ -72,6 +72,10 @@ pub trait HttpModule {
         Ok(None)
     }
 
+    fn response_done_filter(&mut self) -> Result<Option<Bytes>> {
+        Ok(None)
+    }
+
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -253,6 +257,24 @@ impl HttpModuleCtx {
         let mut encoded = None;
         for filter in self.module_ctx.iter_mut() {
             if let Some(buf) = filter.response_trailer_filter(trailers)? {
+                encoded = Some(buf);
+            }
+        }
+        Ok(encoded)
+    }
+
+    /// Run the `response_done_filter` for all the modules according to their orders.
+    ///
+    /// This filter may be invoked in certain response paths to signal end of response
+    /// if not already done so via trailers or body (with end flag set).
+    ///
+    /// Returns an `Option<Bytes>` which can be used to write additional response body
+    /// bytes. Note, if multiple modules attempt to write body bytes, only the last one
+    /// will be used.
+    pub fn response_done_filter(&mut self) -> Result<Option<Bytes>> {
+        let mut encoded = None;
+        for filter in self.module_ctx.iter_mut() {
+            if let Some(buf) = filter.response_done_filter()? {
                 encoded = Some(buf);
             }
         }

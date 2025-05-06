@@ -72,6 +72,15 @@ impl HttpModule for ResponseCompression {
         }
         Ok(())
     }
+
+    fn response_done_filter(&mut self) -> Result<Option<Bytes>> {
+        if !self.0.is_enabled() {
+            return Ok(None);
+        }
+        // Flush or finish any remaining encoded bytes upon HTTP response completion
+        // (if it was not already ended in the body filter).
+        Ok(self.0.response_body_filter(None, true))
+    }
 }
 
 /// The builder for HTTP response compression module
