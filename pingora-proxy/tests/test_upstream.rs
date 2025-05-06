@@ -343,6 +343,53 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_downstream_compression() {
+        init();
+
+        // disable reqwest gzip support to check compression headers and body
+        // otherwise reqwest will decompress and strip the headers
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_compression/no_compression")
+            .header("x-downstream-compression", "1")
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["Content-Encoding"], "gzip");
+        assert_eq!(headers["x-cache-status"], "miss");
+        let body = res.bytes().await.unwrap();
+        assert!(body.len() < 32);
+    }
+
+    #[tokio::test]
+    async fn test_cache_downstream_decompression() {
+        init();
+
+        // disable reqwest gzip support to check compression headers and body
+        // otherwise reqwest will decompress and strip the headers
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_decompression/gzip/index.html")
+            .header("x-downstream-decompression", "1")
+            .header("x-upstream-accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // upstream should have received gzip, should decompress for downstream
+        assert_eq!(headers["received-accept-encoding"], "gzip");
+        assert!(headers.get("Content-Encoding").is_none());
+        assert_eq!(headers["x-cache-status"], "miss");
+        let body = res.bytes().await.unwrap();
+        assert_eq!(body, "Hello World!\n");
+    }
+
+    #[tokio::test]
     async fn test_network_error_mid_response() {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_network_error_mid_response.txt";
