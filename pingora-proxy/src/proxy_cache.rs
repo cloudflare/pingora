@@ -302,6 +302,26 @@ impl<SV> HttpProxy<SV> {
         match self.inner.response_filter(session, &mut header, ctx).await {
             Ok(_) => {
                 if let Err(e) = session
+                    .downstream_modules_ctx
+                    .response_header_filter(&mut header, header_only)
+                    .await
+                {
+                    error!(
+                        "Failed to run downstream modules response header filter in hit: {e}, {}",
+                        self.inner.request_summary(session, ctx)
+                    );
+                    session
+                        .as_mut()
+                        .respond_error(500)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("failed to send error response to downstream: {e}");
+                        });
+                    // we have not write anything dirty to downstream, it is still reusable
+                    return (true, Some(e));
+                }
+
+                if let Err(e) = session
                     .as_mut()
                     .write_response_header(header)
                     .await
@@ -312,7 +332,10 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             Err(e) => {
-                // TODO: more logging and error handling
+                error!(
+                    "Failed to run response filter in hit: {e}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
                 session
                     .as_mut()
                     .respond_error(500)
@@ -351,17 +374,31 @@ impl<SV> HttpProxy<SV> {
                             }
                         }
 
-                        if let Some(b) = body {
-                            // write to downstream
-                            if let Err(e) = session
-                                .as_mut()
-                                .write_response_body(b, false)
-                                .await
-                                .map_err(|e| e.into_down())
-                            {
-                                return (false, Some(e));
-                            }
-                        } else {
+                        if let Err(e) = session
+                            .downstream_modules_ctx
+                            .response_body_filter(&mut body, end)
+                        {
+                            // body is being sent, don't treat downstream as reusable
+                            return (false, Some(e));
+                        }
+
+                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                            // Don't write empty body which will end session,
+                            // still more hit handler bytes to read
+                            continue;
+                        }
+
+                        // write to downstream
+                        let b = body.unwrap_or_default();
+                        if let Err(e) = session
+                            .as_mut()
+                            .write_response_body(b, end)
+                            .await
+                            .map_err(|e| e.into_down())
+                        {
+                            return (false, Some(e));
+                        }
+                        if end {
                             break;
                         }
                     }

@@ -352,6 +352,8 @@ impl<SV> HttpProxy<SV> {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
+                    debug!("serve_from_cache task {task:?}");
+
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
                         Err(e) => if serve_from_cache.is_miss() {
