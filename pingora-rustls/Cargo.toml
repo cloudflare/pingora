@@ -1,6 +1,6 @@
 [package]
 name = "pingora-rustls"
-version = "0.4.0"
+version = "0.5.0"
 license = "Apache-2.0"
 edition = "2021"
 repository = "https://github.com/cloudflare/pingora"
@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 log = "0.4.21"
-pingora-error = {version = "0.4.0", path = "../pingora-error"}
+pingora-error = {version = "0.5.0", path = "../pingora-error"}
 ring = "0.17.12"
 rustls = "0.23.12"
 rustls-native-certs = "0.7.1"
