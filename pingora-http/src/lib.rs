@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -84,6 +84,12 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
+    }
+}
+
+impl DerefMut for RequestHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
     }
 }
 
