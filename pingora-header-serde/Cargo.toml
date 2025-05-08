@@ -1,6 +1,6 @@
 [package]
 name = "pingora-header-serde"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -27,6 +27,6 @@ zstd-safe = { version = "7.1.0", features = ["std"] }
 http = { workspace = true }
 bytes = { workspace = true }
 httparse = { workspace = true }
-pingora-error = { version = "0.4.0", path = "../pingora-error" }
-pingora-http = { version = "0.4.0", path = "../pingora-http" }
+pingora-error = { version = "0.5.0", path = "../pingora-error" }
+pingora-http = { version = "0.5.0", path = "../pingora-http" }
 thread_local = "1.0"
