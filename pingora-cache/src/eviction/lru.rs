@@ -18,6 +18,7 @@ use super::EvictionManager;
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
+use log::{info, warn};
 use pingora_error::{BError, ErrorType::*, OrErr, Result};
 use pingora_lru::Lru;
 use serde::de::SeqAccess;
@@ -217,6 +218,7 @@ impl<const N: usize> EvictionManager for Manager<N> {
 
     async fn load(&self, dir_path: &str) -> Result<()> {
         // TODO: check the saved shards so that we load all the save files
+        let mut loaded_shards = 0;
         for i in 0..N {
             let dir_path = dir_path.to_owned();
 
@@ -233,7 +235,22 @@ impl<const N: usize> EvictionManager for Manager<N> {
             })
             .await
             .or_err(InternalError, "async blocking IO failure")??;
-            self.deserialize_shard(&data)?;
+
+            if let Err(e) = self.deserialize_shard(&data) {
+                warn!("Failed to deserialize shard {}: {}. Skipping shard.", i, e);
+                continue; // Skip shard and move onto the next one
+            }
+            loaded_shards += 1;
+        }
+
+        // Log how many shards were successfully loaded
+        if loaded_shards < N {
+            warn!(
+                "Only loaded {}/{} shards. Cache may be incomplete.",
+                loaded_shards, N
+            )
+        } else {
+            info!("Successfully loaded {}/{} shards.", loaded_shards, N)
         }
 
         Ok(())
