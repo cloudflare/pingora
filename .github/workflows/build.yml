@@ -7,8 +7,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # nightly, MSRV, and latest stable
-        toolchain: [nightly, 1.72.0, 1.82.0]
+        # nightly, and latest stable
+        toolchain: [nightly, 1.82.0]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
