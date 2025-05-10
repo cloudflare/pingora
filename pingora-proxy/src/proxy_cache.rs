@@ -22,6 +22,7 @@ use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
+use std::time::SystemTime;
 
 impl<SV> HttpProxy<SV> {
     // return bool: server_session can be reused, and error if any
@@ -113,29 +114,35 @@ impl<SV> HttpProxy<SV> {
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let hit_status = if meta.is_fresh(std::time::SystemTime::now()) {
-                            // check if we should force expire or miss
-                            // vs. hard purge which forces miss)
-                            match self.inner.cache_hit_filter(session, &meta, ctx).await {
-                                Err(e) => {
-                                    error!(
-                                        "Failed to filter cache hit: {e}, {}",
-                                        self.inner.request_summary(session, ctx)
-                                    );
-                                    // this return value will cause us to fetch from upstream
-                                    HitStatus::FailedHitFilter
-                                }
-                                Ok(None) => HitStatus::Fresh,
-                                Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
-                                    // force expired asset should not be serve as stale
-                                    // because force expire is usually to remove data
-                                    meta.disable_serve_stale();
-                                    HitStatus::ForceExpired
-                                }
-                                Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
+                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        // check if we should force expire or force miss
+                        let hit_status = match self
+                            .inner
+                            .cache_hit_filter(session, &meta, is_fresh, ctx)
+                            .await
+                        {
+                            Err(e) => {
+                                error!(
+                                    "Failed to filter cache hit: {e}, {}",
+                                    self.inner.request_summary(session, ctx)
+                                );
+                                // this return value will cause us to fetch from upstream
+                                HitStatus::FailedHitFilter
                             }
-                        } else {
-                            HitStatus::Expired
+                            Ok(None) => {
+                                if is_fresh {
+                                    HitStatus::Fresh
+                                } else {
+                                    HitStatus::Expired
+                                }
+                            }
+                            Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
+                                // force expired asset should not be serve as stale
+                                // because force expire is usually to remove data
+                                meta.disable_serve_stale();
+                                HitStatus::ForceExpired
+                            }
+                            Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -295,6 +302,26 @@ impl<SV> HttpProxy<SV> {
         match self.inner.response_filter(session, &mut header, ctx).await {
             Ok(_) => {
                 if let Err(e) = session
+                    .downstream_modules_ctx
+                    .response_header_filter(&mut header, header_only)
+                    .await
+                {
+                    error!(
+                        "Failed to run downstream modules response header filter in hit: {e}, {}",
+                        self.inner.request_summary(session, ctx)
+                    );
+                    session
+                        .as_mut()
+                        .respond_error(500)
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("failed to send error response to downstream: {e}");
+                        });
+                    // we have not write anything dirty to downstream, it is still reusable
+                    return (true, Some(e));
+                }
+
+                if let Err(e) = session
                     .as_mut()
                     .write_response_header(header)
                     .await
@@ -305,7 +332,10 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             Err(e) => {
-                // TODO: more logging and error handling
+                error!(
+                    "Failed to run response filter in hit: {e}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
                 session
                     .as_mut()
                     .respond_error(500)
@@ -344,17 +374,31 @@ impl<SV> HttpProxy<SV> {
                             }
                         }
 
-                        if let Some(b) = body {
-                            // write to downstream
-                            if let Err(e) = session
-                                .as_mut()
-                                .write_response_body(b, false)
-                                .await
-                                .map_err(|e| e.into_down())
-                            {
-                                return (false, Some(e));
-                            }
-                        } else {
+                        if let Err(e) = session
+                            .downstream_modules_ctx
+                            .response_body_filter(&mut body, end)
+                        {
+                            // body is being sent, don't treat downstream as reusable
+                            return (false, Some(e));
+                        }
+
+                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                            // Don't write empty body which will end session,
+                            // still more hit handler bytes to read
+                            continue;
+                        }
+
+                        // write to downstream
+                        let b = body.unwrap_or_default();
+                        if let Err(e) = session
+                            .as_mut()
+                            .write_response_body(b, end)
+                            .await
+                            .map_err(|e| e.into_down())
+                        {
+                            return (false, Some(e));
+                        }
+                        if end {
                             break;
                         }
                     }
@@ -602,7 +646,15 @@ impl<SV> HttpProxy<SV> {
                 if resp.status == StatusCode::NOT_MODIFIED {
                     if session.cache.maybe_cache_meta().is_some() {
                         // run upstream response filters on upstream 304 first
-                        self.inner.upstream_response_filter(session, resp, ctx);
+                        if let Err(err) = self.inner.upstream_response_filter(session, resp, ctx) {
+                            error!("upstream response filter error on 304: {err:?}");
+                            session.cache.revalidate_uncacheable(
+                                *resp.clone(),
+                                NoCacheReason::InternalError,
+                            );
+                            // always serve from cache after receiving the 304
+                            return true;
+                        }
                         // 304 doesn't contain all the headers, merge 304 into cached 200 header
                         // in order for response_cache_filter to run correctly
                         let merged_header = session.cache.revalidate_merge_header(resp);

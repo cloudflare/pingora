@@ -19,7 +19,7 @@
 use super::HttpTask;
 
 use bytes::Bytes;
-use log::warn;
+use log::{debug, warn};
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
@@ -248,6 +248,7 @@ impl ResponseCompressionCtx {
                 }
 
                 let action = decide_action(resp, accept_encoding);
+                debug!("compression action: {action:?}");
                 let (encoder, preserve_etag) = match action {
                     Action::Noop => (None, false),
                     Action::Compress(algorithm) => {
@@ -271,9 +272,10 @@ impl ResponseCompressionCtx {
         }
     }
 
-    /// Stream the response body chunks into this ctx. The return value will be the compressed data
+    /// Stream the response body chunks into this ctx. The return value will be the compressed
+    /// data.
     ///
-    /// Return None if the compressed is not enabled
+    /// Return None if compression is not enabled.
     pub fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
         match &mut self.0 {
             CtxInner::HeaderPhase { .. } => panic!("Wrong phase: HeaderPhase"),

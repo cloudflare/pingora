@@ -138,6 +138,7 @@ pub trait ProxyHttp {
     /// cache asset is ready to be used.
     ///
     /// This filter allows the user to log or force invalidate the asset.
+    /// This also runs on stale hit assets (for which `is_fresh` is false).
     ///
     /// The value returned indicates if the force invalidation should be used,
     /// and which kind. Returning `None` indicates no forced invalidation
@@ -145,6 +146,7 @@ pub trait ProxyHttp {
         &self,
         _session: &Session,
         _meta: &CacheMeta,
+        _is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>>
     where
@@ -267,7 +269,8 @@ pub trait ProxyHttp {
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) {
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Modify the response header before it is send to the downstream

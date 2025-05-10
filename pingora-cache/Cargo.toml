@@ -1,6 +1,6 @@
 [package]
 name = "pingora-cache"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -17,12 +17,12 @@ name = "pingora_cache"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.4.0", path = "../pingora-core", default-features = false }
-pingora-error = { version = "0.4.0", path = "../pingora-error" }
-pingora-header-serde = { version = "0.4.0", path = "../pingora-header-serde" }
-pingora-http = { version = "0.4.0", path = "../pingora-http" }
-pingora-lru = { version = "0.4.0", path = "../pingora-lru" }
-pingora-timeout = { version = "0.4.0", path = "../pingora-timeout" }
+pingora-core = { version = "0.5.0", path = "../pingora-core", default-features = false }
+pingora-error = { version = "0.5.0", path = "../pingora-error" }
+pingora-header-serde = { version = "0.5.0", path = "../pingora-header-serde" }
+pingora-http = { version = "0.5.0", path = "../pingora-http" }
+pingora-lru = { version = "0.5.0", path = "../pingora-lru" }
+pingora-timeout = { version = "0.5.0", path = "../pingora-timeout" }
 http = { workspace = true }
 indexmap = "1"
 once_cell = { workspace = true }

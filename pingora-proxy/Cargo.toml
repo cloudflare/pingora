@@ -1,6 +1,6 @@
 [package]
 name = "pingora-proxy"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,11 +18,11 @@ name = "pingora_proxy"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-error = { version = "0.4.0", path = "../pingora-error" }
-pingora-core = { version = "0.4.0", path = "../pingora-core", default-features = false }
-pingora-cache = { version = "0.4.0", path = "../pingora-cache", default-features = false }
+pingora-error = { version = "0.5.0", path = "../pingora-error" }
+pingora-core = { version = "0.5.0", path = "../pingora-core", default-features = false }
+pingora-cache = { version = "0.5.0", path = "../pingora-cache", default-features = false }
 tokio = { workspace = true, features = ["macros", "net"] }
-pingora-http = { version = "0.4.0", path = "../pingora-http" }
+pingora-http = { version = "0.5.0", path = "../pingora-http" }
 http = { workspace = true }
 futures = "0.3"
 bytes = { workspace = true }
@@ -42,8 +42,8 @@ tokio-test = "0.4"
 env_logger = "0.9"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
-pingora-limits = { version = "0.4.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.4.0", path = "../pingora-load-balancing", default-features=false }
+pingora-limits = { version = "0.5.0", path = "../pingora-limits" }
+pingora-load-balancing = { version = "0.5.0", path = "../pingora-load-balancing", default-features=false }
 prometheus = "0.13"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }

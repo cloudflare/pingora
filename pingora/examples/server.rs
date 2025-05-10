@@ -132,6 +132,8 @@ pub fn main() {
         idle: Duration::from_secs(60),
         interval: Duration::from_secs(5),
         count: 5,
+        #[cfg(target_os = "linux")]
+        user_timeout: Duration::from_secs(85),
     });
 
     echo_service_http.add_tcp_with_settings("0.0.0.0:6145", options);

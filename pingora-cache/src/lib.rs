@@ -24,6 +24,7 @@ use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use std::time::{Duration, Instant, SystemTime};
+use storage::MissFinishType;
 use strum::IntoStaticStr;
 use trace::CacheTraceCTX;
 
@@ -755,7 +756,7 @@ impl HttpCache {
                     return Ok(());
                 }
                 let miss_handler = inner.miss_handler.take().unwrap();
-                let size = miss_handler.finish().await?;
+                let finish = miss_handler.finish().await?;
                 let lock = inner.lock.take();
                 let key = inner.key.as_ref().unwrap();
                 if let Some(Locked::Write(permit)) = lock {
@@ -769,7 +770,14 @@ impl HttpCache {
                 if let Some(eviction) = inner.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner.meta.as_ref().unwrap();
-                    let evicted = eviction.admit(cache_key, size, meta.0.internal.fresh_until);
+                    let evicted = match finish {
+                        MissFinishType::Created(size) => {
+                            eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                        }
+                        MissFinishType::Appended(size) => {
+                            eviction.increment_weight(cache_key, size)
+                        }
+                    };
                     // actual eviction can be done async
                     let span = inner.traces.child("eviction");
                     let handle = span.handle();
