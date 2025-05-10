@@ -52,7 +52,7 @@ impl ProxyHttp for Json2Yaml {
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let peer = Box::new(HttpPeer::new(self.addr, false, HOST.to_owned()));
+        let peer = Box::new(HttpPeer::new(self.addr, false, HOST.to_owned())?);
         Ok(peer)
     }
 
