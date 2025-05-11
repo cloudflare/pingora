@@ -20,7 +20,6 @@ Pingora provides a crate `pingora-limits` which provides a simple and easy to us
 ```rust
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
-use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora_limits::rate::Rate;
 use std::sync::Arc;
