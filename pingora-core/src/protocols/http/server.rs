@@ -199,6 +199,14 @@ impl Session {
         }
     }
 
+    /// Get the keepalive timeout. None if keepalive is disabled. Not applicable for h2
+    pub fn get_keepalive(&self) -> Option<u64> {
+        match self {
+            Self::H1(s) => s.get_keepalive_timeout(),
+            Self::H2(_) => None,
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
