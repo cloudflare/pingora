@@ -146,3 +146,4 @@ document-features = [
     "sentry",
     "connection_filter"
 ]
+prometheus = ["pingora-core/prometheus"]
