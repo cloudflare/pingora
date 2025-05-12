@@ -14,47 +14,53 @@
 
 //! An HTTP application that reports Prometheus metrics.
 
-use async_trait::async_trait;
-use http::Response;
-use prometheus::{Encoder, TextEncoder};
+#[cfg(feature = "prometheus")]
+mod prometheus_impl {
+    use async_trait::async_trait;
+    use http::Response;
+    use prometheus::{Encoder, TextEncoder};
 
-use super::http_app::HttpServer;
-use crate::apps::http_app::ServeHttp;
-use crate::modules::http::compression::ResponseCompressionBuilder;
-use crate::protocols::http::ServerSession;
+    use super::super::http_app::HttpServer;
+    use crate::apps::http_app::ServeHttp;
+    use crate::modules::http::compression::ResponseCompressionBuilder;
+    use crate::protocols::http::ServerSession;
 
-/// An HTTP application that reports Prometheus metrics.
-///
-/// This application will report all the [static metrics](https://docs.rs/prometheus/latest/prometheus/index.html#static-metrics)
-/// collected via the [Prometheus](https://docs.rs/prometheus/) crate;
-pub struct PrometheusHttpApp;
+    /// An HTTP application that reports Prometheus metrics.
+    ///
+    /// This application will report all the [static metrics](https://docs.rs/prometheus/latest/prometheus/index.html#static-metrics)
+    /// collected via the [Prometheus](https://docs.rs/prometheus/) crate;
+    pub struct PrometheusHttpApp;
 
-#[async_trait]
-impl ServeHttp for PrometheusHttpApp {
-    async fn response(&self, _http_session: &mut ServerSession) -> Response<Vec<u8>> {
-        let encoder = TextEncoder::new();
-        let metric_families = prometheus::gather();
-        let mut buffer = vec![];
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        Response::builder()
-            .status(200)
-            .header(http::header::CONTENT_TYPE, encoder.format_type())
-            .header(http::header::CONTENT_LENGTH, buffer.len())
-            .body(buffer)
-            .unwrap()
+    #[async_trait]
+    impl ServeHttp for PrometheusHttpApp {
+        async fn response(&self, _http_session: &mut ServerSession) -> Response<Vec<u8>> {
+            let encoder = TextEncoder::new();
+            let metric_families = prometheus::gather();
+            let mut buffer = vec![];
+            encoder.encode(&metric_families, &mut buffer).unwrap();
+            Response::builder()
+                .status(200)
+                .header(http::header::CONTENT_TYPE, encoder.format_type())
+                .header(http::header::CONTENT_LENGTH, buffer.len())
+                .body(buffer)
+                .unwrap()
+        }
+    }
+
+    /// The [HttpServer] for [PrometheusHttpApp]
+    ///
+    /// This type provides the functionality of [PrometheusHttpApp] with compression enabled
+    pub type PrometheusServer = HttpServer<PrometheusHttpApp>;
+
+    impl PrometheusServer {
+        pub fn new() -> Self {
+            let mut server = Self::new_app(PrometheusHttpApp);
+            // enable gzip level 7 compression
+            server.add_module(ResponseCompressionBuilder::enable(7));
+            server
+        }
     }
 }
 
-/// The [HttpServer] for [PrometheusHttpApp]
-///
-/// This type provides the functionality of [PrometheusHttpApp] with compression enabled
-pub type PrometheusServer = HttpServer<PrometheusHttpApp>;
-
-impl PrometheusServer {
-    pub fn new() -> Self {
-        let mut server = Self::new_app(PrometheusHttpApp);
-        // enable gzip level 7 compression
-        server.add_module(ResponseCompressionBuilder::enable(7));
-        server
-    }
-}
+#[cfg(feature = "prometheus")]
+pub use prometheus_impl::*;

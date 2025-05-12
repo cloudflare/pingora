@@ -44,7 +44,7 @@ strum = "0.26.2"
 strum_macros = "0.26.2"
 libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
-prometheus = "0.13"
+prometheus = { version = "0.13", optional = true }
 sentry = { version = "0.36", features = [
     "backtrace",
     "contexts",
@@ -97,3 +97,4 @@ patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["dep:sentry"]
+prometheus = ["dep:prometheus"]
