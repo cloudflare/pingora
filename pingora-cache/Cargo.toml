@@ -44,6 +44,7 @@ ahash = { workspace = true }
 hex = "0.4"
 httparse = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
+rand = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
