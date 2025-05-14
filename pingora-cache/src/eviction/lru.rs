@@ -21,9 +21,10 @@ use async_trait::async_trait;
 use log::{info, warn};
 use pingora_error::{BError, ErrorType::*, OrErr, Result};
 use pingora_lru::Lru;
+use rand::Rng;
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{rename, File};
 use std::hash::{Hash, Hasher};
 use std::io::prelude::*;
 use std::path::Path;
@@ -203,11 +204,26 @@ impl<const N: usize> EvictionManager for Manager<N> {
             let data = self.serialize_shard(i)?;
             let dir_path = dir_path.to_owned();
             tokio::task::spawn_blocking(move || {
-                let file_path = Path::new(&dir_path).join(format!("{}.{i}", FILE_NAME));
-                let mut file = File::create(&file_path)
-                    .or_err_with(InternalError, || err_str_path("fail to create", &file_path))?;
+                let dir_path = Path::new(&dir_path);
+                let final_path = dir_path.join(format!("{}.{i}", FILE_NAME));
+                // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
+                let random_suffix: u32 = rand::thread_rng().gen();
+                let temp_path =
+                    dir_path.join(format!("{}.{i}.{:08x}.tmp", FILE_NAME, random_suffix));
+                let mut file = File::create(&temp_path)
+                    .or_err_with(InternalError, || err_str_path("fail to create", &temp_path))?;
                 file.write_all(&data).or_err_with(InternalError, || {
-                    err_str_path("fail to write to", &file_path)
+                    err_str_path("fail to write to", &temp_path)
+                })?;
+                file.flush().or_err_with(InternalError, || {
+                    err_str_path("fail to flush temp file", &temp_path)
+                })?;
+                rename(&temp_path, &final_path).or_err_with(InternalError, || {
+                    format!(
+                        "Failed to rename file from {} to {}",
+                        temp_path.display(),
+                        final_path.display(),
+                    )
                 })
             })
             .await
