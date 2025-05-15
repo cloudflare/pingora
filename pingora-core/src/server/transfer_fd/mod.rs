@@ -66,7 +66,7 @@ impl Fds {
         P: ?Sized + NixPath + std::fmt::Display,
     {
         let (vec_key, vec_fds) = self.serialize();
-        let mut ser_buf: [u8; 2048] = [0; 2048];
+        let mut ser_buf: Vec<u8> = Vec::new();
         let ser_key_size = serialize_vec_string(&vec_key, &mut ser_buf);
         send_fds_to(vec_fds, &ser_buf[..ser_key_size], path)
     }
@@ -83,11 +83,12 @@ impl Fds {
     }
 }
 
-fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
+fn serialize_vec_string(vec_string: &[String], buf: &mut Vec<u8>) -> usize {
     // There are many ways to do this. Serde is probably the way to go
     // But let's start with something simple: space separated strings
     let joined = vec_string.join(" ");
-    // TODO: check the buf is large enough
+    // Avoid excessive expansion
+    buf.reserve_exact(joined.len());
     buf.write(joined.as_bytes()).unwrap()
 }
 
@@ -116,11 +117,15 @@ where
         Ok(()) => {
             debug!("unlink {} done", path);
         }
-        Err(e) => {
+        Err(e) => match e {
             // Normal if file does not exist
-            debug!("unlink {} failed: {}", path, e);
-            // TODO: warn if exist but not able to unlink
-        }
+            Errno::ENOENT => {
+                debug!("unlink {} done", path);
+            }
+            _ => {
+                warn!("unlink {} failed: {}", path, e);
+            }
+        },
     };
     socket::bind(listen_fd, &unix_addr).unwrap();
 
@@ -364,9 +369,11 @@ mod tests {
     fn test_vec_string_serde() {
         init_log();
         let vec_str: Vec<String> = vec!["aaaa".to_string(), "bbb".to_string()];
-        let mut ser_buf: [u8; 1024] = [0; 1024];
+        let mut ser_buf: Vec<u8> = Vec::new();
         let size = serialize_vec_string(&vec_str, &mut ser_buf);
         let de_vec_string = deserialize_vec_string(&ser_buf[..size]).unwrap();
+
+        assert_eq!(vec_str.join(" ").as_bytes().len(), ser_buf.capacity());
         assert_eq!(de_vec_string.len(), 2);
         assert_eq!(de_vec_string[0], "aaaa");
         assert_eq!(de_vec_string[1], "bbb");
