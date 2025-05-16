@@ -1001,7 +1001,7 @@ mod tests_stream {
     }
 
     #[tokio::test]
-    async fn read_informational_with_compress() {
+    async fn read_informational_sticky() {
         init_log();
         let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 OK\r\nServer: example\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
