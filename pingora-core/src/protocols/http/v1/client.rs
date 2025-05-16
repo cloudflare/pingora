@@ -184,9 +184,29 @@ impl HttpSession {
     /// This function can be called multiple times, if the headers received are just informational
     /// headers.
     pub async fn read_response(&mut self) -> Result<usize> {
-        self.buf.clear();
         let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
         let mut already_read: usize = 0;
+
+        // For informational headers, packet sticking may occur at the transport layer,
+        // where the request header may be misread as the request body.
+        let mut has_sticky_header = false;
+        if let (Some(potential_header), Some(code)) = (
+            self.preread_body.as_ref(),
+            self.get_status().map(|s| s.as_u16()),
+        ) {
+            if (100..199).contains(&code)
+                && potential_header.0 < potential_header.1
+                && !self.buf.is_empty()
+            {
+                let potential_header = potential_header.get(&self.buf[..]);
+                buf.put_slice(potential_header);
+                already_read += potential_header.len();
+                has_sticky_header = true;
+                self.preread_body = None;
+            }
+        }
+        self.buf.clear();
+
         loop {
             if already_read > MAX_HEADER_SIZE {
                 /* NOTE: this check only blocks second read. The first large read is allowed
@@ -198,46 +218,52 @@ impl HttpSession {
                 );
             }
 
-            let read_fut = self.underlying_stream.read_buf(&mut buf);
-            let read_result = match self.read_timeout {
-                Some(t) => timeout(t, read_fut)
-                    .await
-                    .map_err(|_| Error::explain(ReadTimedout, "while reading response headers"))?,
-                None => read_fut.await,
-            };
-            let n = match read_result {
-                Ok(n) => match n {
-                    0 => {
-                        let mut e = Error::explain(
-                            ConnectionClosed,
+            if !has_sticky_header {
+                let read_fut = self.underlying_stream.read_buf(&mut buf);
+                let read_result = match self.read_timeout {
+                    Some(t) => timeout(t, read_fut).await.map_err(|_| {
+                        Error::explain(ReadTimedout, "while reading response headers")
+                    })?,
+                    None => read_fut.await,
+                };
+                let n = match read_result {
+                    Ok(n) => match n {
+                        0 => {
+                            let mut e = Error::explain(
+                                ConnectionClosed,
+                                format!(
+                                    "while reading response headers, bytes already read: {already_read}",
+                                ),
+                            );
+                            e.retry = RetryType::ReusedOnly;
+                            return Err(e);
+                        }
+                        _ => {
+                            n /* read n bytes, continue */
+                        }
+                    },
+                    Err(e) => {
+                        let true_io_error = e.raw_os_error().is_some();
+                        let mut e = Error::because(
+                            ReadError,
                             format!(
                                 "while reading response headers, bytes already read: {already_read}",
                             ),
+                            e,
                         );
-                        e.retry = RetryType::ReusedOnly;
+                        // Likely OSError, typical if a previously reused connection drops it
+                        if true_io_error {
+                            e.retry = RetryType::ReusedOnly;
+                        } // else: not safe to retry TLS error
                         return Err(e);
                     }
-                    _ => {
-                        n /* read n bytes, continue */
-                    }
-                },
-                Err(e) => {
-                    let true_io_error = e.raw_os_error().is_some();
-                    let mut e = Error::because(
-                        ReadError,
-                        format!(
-                            "while reading response headers, bytes already read: {already_read}",
-                        ),
-                        e,
-                    );
-                    // Likely OSError, typical if a previously reused connection drops it
-                    if true_io_error {
-                        e.retry = RetryType::ReusedOnly;
-                    } // else: not safe to retry TLS error
-                    return Err(e);
-                }
-            };
-            already_read += n;
+                };
+                already_read += n;
+            } else {
+                // sticky header should only read once.
+                has_sticky_header = false;
+            }
+
             let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let mut resp = httparse::Response::new(&mut headers);
             let parsed = parse_resp_buffer(&mut resp, &buf);
@@ -948,6 +974,37 @@ mod tests_stream {
         let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
         let input2 = b"HTTP/1.1 204 OK\r\nServer: pingora\r\n\r\n";
         let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // read 100 header first
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // read 200 header next
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 204);
+                assert!(eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_informational_with_compress() {
+        init_log();
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 OK\r\nServer: example\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
 
         // read 100 header first
