@@ -18,7 +18,7 @@
 
 use cf_rustracing::tag::Tag;
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
-use key::{CacheHashKey, HashBinary};
+use key::{CacheHashKey, CompactCacheKey, HashBinary};
 use lock::WritePermit;
 use log::warn;
 use pingora_error::Result;
@@ -26,7 +26,7 @@ use pingora_http::ResponseHeader;
 use std::time::{Duration, Instant, SystemTime};
 use storage::MissFinishType;
 use strum::IntoStaticStr;
-use trace::CacheTraceCTX;
+use trace::{CacheTraceCTX, Span};
 
 pub mod cache_control;
 pub mod eviction;
@@ -1216,28 +1216,63 @@ impl HttpCache {
     /// Delete the asset from the cache storage
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
-    pub async fn purge(&mut self) -> Result<bool> {
+    pub async fn purge(&self) -> Result<bool> {
         match self.phase {
             CachePhase::CacheKey => {
-                let inner = self.inner_mut();
-                let mut span = inner.traces.child("purge");
+                let inner = self.inner();
+                let span = inner.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                let result = inner
-                    .storage
-                    .purge(&key, PurgeType::Invalidation, &span.handle())
-                    .await;
-                let purged = matches!(result, Ok(true));
-                // need to inform eviction manager if asset was removed
-                if let Some(eviction) = inner.eviction.as_ref() {
-                    if purged {
-                        eviction.remove(&key);
-                    }
-                }
-                span.set_tag(|| trace::Tag::new("purged", purged));
-                result
+                Self::purge_impl(inner.storage, inner.eviction, &key, span).await
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
+    }
+
+    /// Delete the asset from the cache storage via a spawned task.
+    /// Returns corresponding `JoinHandle` of that task.
+    /// # Panic
+    /// Need to be called after the cache key is set. Panic otherwise.
+    pub fn spawn_async_purge(
+        &self,
+        context: &'static str,
+    ) -> tokio::task::JoinHandle<Result<bool>> {
+        if matches!(self.phase, CachePhase::Disabled(_) | CachePhase::Uninit) {
+            panic!("wrong phase {:?}", self.phase);
+        }
+
+        let inner = self.inner();
+        let span = inner.traces.child("purge");
+        let key = inner.key.as_ref().unwrap().to_compact();
+        let storage = inner.storage;
+        let eviction = inner.eviction;
+        tokio::task::spawn(async move {
+            Self::purge_impl(storage, eviction, &key, span)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to purge {key} (context: {context}): {e}");
+                    e
+                })
+        })
+    }
+
+    async fn purge_impl(
+        storage: &'static (dyn storage::Storage + Sync),
+        eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
+        key: &CompactCacheKey,
+        mut span: Span,
+    ) -> Result<bool> {
+        let result = storage
+            .purge(key, PurgeType::Invalidation, &span.handle())
+            .await;
+        let purged = matches!(result, Ok(true));
+        // need to inform eviction manager if asset was removed
+        if let Some(eviction) = eviction.as_ref() {
+            if purged {
+                eviction.remove(key);
+            }
+        }
+        span.set_tag(|| trace::Tag::new("purged", purged));
+        result
     }
 
     /// Check the cacheable prediction
