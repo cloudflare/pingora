@@ -194,11 +194,27 @@ impl BodyReader {
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
+            let mut has_read = false;
+            // should not discard remaining data if peer send more.
+            if let PS::Partial(_, to_read) = self.body_state {
+                if to_read < body_buf.len() {
+                    let mut buffer = Vec::with_capacity(to_read);
+                    buffer.resize(to_read, 0);
+                    n = stream
+                        .read(&mut buffer)
+                        .await
+                        .or_err(ReadError, "when reading body")?;
+                    body_buf[..n].copy_from_slice(&buffer[..n]);
+                    has_read = true;
+                }
+            }
             /* Need to actually read */
-            n = stream
-                .read(body_buf)
-                .await
-                .or_err(ReadError, "when reading body")?;
+            if !has_read {
+                n = stream
+                    .read(body_buf)
+                    .await
+                    .or_err(ReadError, "when reading body")?;
+            }
         }
         match self.body_state {
             PS::Partial(read, to_read) => {
@@ -704,6 +720,11 @@ mod tests {
         assert_eq!(res, BufRef::new(0, 2));
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(&input2[0..2], body_reader.get_body(&res));
+        // read remaining data
+        body_reader.init_content_length(1, b"");
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.body_state, ParseState::Complete(1));
+        assert_eq!(&input2[2..], body_reader.get_body(&res));
     }
 
     #[tokio::test]
