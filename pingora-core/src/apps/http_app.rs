@@ -20,11 +20,10 @@ use log::{debug, error, trace};
 use pingora_http::ResponseHeader;
 use std::sync::Arc;
 
-use crate::apps::HttpServerApp;
+use crate::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
 use crate::modules::http::{HttpModules, ModuleBuilder};
 use crate::protocols::http::HttpTask;
 use crate::protocols::http::ServerSession;
-use crate::protocols::Stream;
 use crate::server::ShutdownWatch;
 
 /// This trait defines how to map a request to a response
@@ -51,7 +50,7 @@ where
         self: &Arc<Self>,
         mut http: ServerSession,
         shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+    ) -> Option<ReusedHttpStream> {
         match http.read_request().await {
             Ok(res) => match res {
                 false => {
@@ -97,8 +96,9 @@ where
                 ),
             }
         }
+        let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c,
+            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None
@@ -137,7 +137,7 @@ where
         self: &Arc<Self>,
         mut http: ServerSession,
         shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+    ) -> Option<ReusedHttpStream> {
         match http.read_request().await {
             Ok(res) => match res {
                 false => {
@@ -200,8 +200,9 @@ where
                 http.request_summary()
             ),
         }
+        let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c,
+            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None

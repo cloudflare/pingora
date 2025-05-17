@@ -65,6 +65,42 @@ pub struct HttpServerOptions {
     pub h2c: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct HttpPersistentSettings {
+    keepalive_timeout: Option<u64>,
+}
+
+impl HttpPersistentSettings {
+    pub fn for_session(session: &ServerSession) -> Self {
+        HttpPersistentSettings {
+            keepalive_timeout: session.get_keepalive(),
+        }
+    }
+
+    pub fn apply_to_session(&self, session: &mut ServerSession) {
+        session.set_keepalive(self.keepalive_timeout);
+    }
+}
+
+#[derive(Debug)]
+pub struct ReusedHttpStream {
+    stream: Stream,
+    persistent_settings: Option<HttpPersistentSettings>,
+}
+
+impl ReusedHttpStream {
+    pub fn new(stream: Stream, persistent_settings: Option<HttpPersistentSettings>) -> Self {
+        ReusedHttpStream {
+            stream,
+            persistent_settings,
+        }
+    }
+
+    pub fn consume(self) -> (Stream, Option<HttpPersistentSettings>) {
+        (self.stream, self.persistent_settings)
+    }
+}
+
 /// This trait defines the interface of an HTTP application.
 #[async_trait]
 pub trait HttpServerApp {
@@ -78,7 +114,7 @@ pub trait HttpServerApp {
         mut session: ServerSession,
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
-    ) -> Option<Stream>;
+    ) -> Option<ReusedHttpStream>;
 
     /// Provide options on how HTTP/2 connection should be established. This function will be called
     /// every time a new HTTP/2 **connection** needs to be established.
@@ -174,15 +210,37 @@ where
                 let app = self.clone();
                 let shutdown = shutdown.clone();
                 pingora_runtime::current_handle().spawn(async move {
+                    // Note, `PersistentSettings` not currently relevant for h2
                     app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
                         .await;
                 });
             }
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
-            self.process_new_http(ServerSession::new_http1(stream), shutdown)
-                .await
+            let mut session = ServerSession::new_http1(stream);
+            if *shutdown.borrow() {
+                // stop downstream from reusing if this service is shutting down soon
+                session.set_keepalive(None);
+            } else {
+                // default 60s
+                session.set_keepalive(Some(60));
+            }
+
+            let mut result = self.process_new_http(session, shutdown).await;
+            while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+                let mut session = ServerSession::new_http1(stream);
+                if let Some(persistent_settings) = persistent_settings {
+                    persistent_settings.apply_to_session(&mut session);
+                }
+                if *shutdown.borrow() {
+                    // stop downstream from reusing if this service is shutting down soon
+                    session.set_keepalive(None);
+                }
+
+                result = self.process_new_http(session, shutdown).await;
+            }
         }
+        None
     }
 
     async fn cleanup(&self) {
