@@ -737,9 +737,10 @@ impl HttpCache {
 
         // The cache lock might not be set for stale hit or hits treated as
         // misses, so we need to initialize it here
-        if phase == CachePhase::Stale || hit_status.is_treated_as_miss() {
+        let stale = phase == CachePhase::Stale;
+        if stale || hit_status.is_treated_as_miss() {
             if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
+                lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, stale));
             }
         }
 
@@ -1284,7 +1285,7 @@ impl HttpCache {
                 });
                 if result.is_none() {
                     if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
+                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
                     }
                 }
                 span.set_tag(|| trace::Tag::new("found", result.is_some()));
