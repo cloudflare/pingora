@@ -22,6 +22,7 @@ use pingora_core::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl, TimingDigest,
     UniqueID, UniqueIDType,
 };
+use std::any::Any;
 use std::io::Cursor;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, Error, ReadBuf};
@@ -124,26 +125,75 @@ struct LockCtx {
     key: CacheKey,
 }
 
-/// Ctx to share state across the parent req and the sub req
-pub struct Ctx {
+/// Optional user-defined subrequest context.
+pub type UserCtx = Box<(dyn Any + Sync + Send)>;
+
+#[derive(Default)]
+pub struct CtxBuilder {
     lock: Option<LockCtx>,
+    user_ctx: Option<UserCtx>,
 }
 
-impl Ctx {
-    pub fn with_write_lock(
-        cache_lock: &'static CacheKeyLockImpl,
-        key: CacheKey,
-        write_permit: WritePermit,
-    ) -> Ctx {
-        Ctx {
-            lock: Some(LockCtx {
-                cache_lock,
-                key,
-                write_permit,
-            }),
+impl CtxBuilder {
+    pub fn new() -> Self {
+        Self {
+            lock: None,
+            user_ctx: None,
         }
     }
 
+    pub fn cache_write_lock(
+        mut self,
+        cache_lock: &'static CacheKeyLockImpl,
+        key: CacheKey,
+        write_permit: WritePermit,
+    ) -> Self {
+        self.lock = Some(LockCtx {
+            cache_lock,
+            key,
+            write_permit,
+        });
+        self
+    }
+
+    pub fn user_ctx(mut self, user_ctx: UserCtx) -> Self {
+        self.user_ctx = Some(user_ctx);
+        self
+    }
+
+    pub fn build(self) -> Ctx {
+        Ctx {
+            lock: self.lock,
+            user_ctx: self.user_ctx,
+        }
+    }
+}
+
+/// Context struct to share state across the parent and sub-request.
+pub struct Ctx {
+    lock: Option<LockCtx>,
+    // User-defined custom context.
+    user_ctx: Option<UserCtx>,
+}
+
+impl Ctx {
+    /// Create a [`CtxBuilder`] in order to make a new subrequest `Ctx`.
+    pub fn builder() -> CtxBuilder {
+        CtxBuilder::new()
+    }
+
+    /// Get a reference to the extensions inside this subrequest.
+    pub fn user_ctx(&self) -> Option<&UserCtx> {
+        self.user_ctx.as_ref()
+    }
+
+    /// Get a mutable reference to the extensions inside this subrequest.
+    pub fn user_ctx_mut(&mut self) -> Option<&mut UserCtx> {
+        self.user_ctx.as_mut()
+    }
+
+    /// Release the write lock from the subrequest (to clean up a write permit
+    /// that will not be used in the cache key lock).
     pub fn release_write_lock(&mut self) {
         if let Some(lock) = self.lock.take() {
             // If we are releasing the write lock in the subrequest,
@@ -154,6 +204,7 @@ impl Ctx {
         }
     }
 
+    /// Take the write lock from the subrequest, for use in a cache key lock.
     pub fn take_write_lock(&mut self) -> Option<WritePermit> {
         // also clear out lock ctx
         self.lock.take().map(|lock| lock.write_permit)

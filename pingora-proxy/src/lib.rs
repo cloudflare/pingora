@@ -76,9 +76,9 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
-mod subrequest;
+pub mod subrequest;
 
-use subrequest::Ctx as SubReqCtx;
+use subrequest::Ctx as SubrequestCtx;
 
 pub use proxy_cache::range_filter::{range_header_filter, RangeType};
 pub use proxy_purge::PurgeStatus;
@@ -326,8 +326,10 @@ pub struct Session {
     pub ignore_downstream_range: bool,
     /// Were the upstream request headers modified?
     pub upstream_headers_mutated_for_cache: bool,
-    // the context from parent request
-    pub subrequest_ctx: Option<Box<SubReqCtx>>,
+    /// The context from parent request, if this is a subrequest.
+    pub subrequest_ctx: Option<Box<SubrequestCtx>>,
+    /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
+    pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
 }
@@ -345,6 +347,7 @@ impl Session {
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
             subrequest_ctx: None,
+            subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
         }
     }
@@ -535,6 +538,10 @@ impl<SV> HttpProxy<SV> {
             return self
                 .handle_error(session, &mut ctx, e, "Fail to early filter request:")
                 .await;
+        }
+
+        if self.inner.allow_spawning_subrequest(&session, &ctx) {
+            session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
 
         let req = session.downstream_session.req_header_mut();
@@ -767,11 +774,11 @@ error[E0391]: cycle detected when computing type of `proxy_cache::<impl at pingo
 
 */
 #[async_trait]
-trait Subrequest {
+pub trait Subrequest {
     async fn process_subrequest(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         session: Box<HttpSession>,
-        sub_req_ctx: Box<SubReqCtx>,
+        sub_req_ctx: Box<SubrequestCtx>,
     );
 }
 
@@ -782,11 +789,12 @@ where
     <SV as ProxyHttp>::CTX: Send + Sync,
 {
     async fn process_subrequest(
-        self: &Arc<Self>,
+        self: Arc<Self>,
         session: Box<HttpSession>,
-        sub_req_ctx: Box<SubReqCtx>,
+        sub_req_ctx: Box<SubrequestCtx>,
     ) {
         debug!("starting subrequest");
+
         let mut session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return, // bad request
@@ -801,6 +809,35 @@ where
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await;
         trace!("subrequest done");
+    }
+}
+
+/// A handle to the underlying HTTP proxy app that allows spawning subrequests.
+pub struct SubrequestSpawner {
+    app: Arc<dyn Subrequest + Send + Sync>,
+}
+
+impl SubrequestSpawner {
+    /// Create a new [`SubrequestSpawner`].
+    pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
+        SubrequestSpawner { app }
+    }
+
+    /// Spawn a background subrequest and return a join handle.
+    // TODO: allow configuring the subrequest session before use
+    pub fn spawn_background_subrequest(
+        &self,
+        session: &HttpSession,
+        ctx: SubrequestCtx,
+    ) -> tokio::task::JoinHandle<()> {
+        let new_app = self.app.clone(); // Clone the Arc
+        let subrequest = subrequest::create_dummy_session(session);
+        let sub_req_ctx = Box::new(ctx);
+        tokio::spawn(async move {
+            new_app
+                .process_subrequest(Box::new(subrequest), sub_req_ctx)
+                .await;
+        })
     }
 }
 

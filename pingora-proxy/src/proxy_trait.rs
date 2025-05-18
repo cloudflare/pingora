@@ -88,6 +88,21 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Returns whether this session is allowed to spawn subrequests.
+    ///
+    /// This function is checked after [`early_request_filter`] to allow that filter to configure
+    /// this if required. This will also run for subrequests themselves, which may allowed to spawn
+    /// their own subrequests.
+    ///
+    /// Note that this doesn't prevent subrequests from being spawned based on the session by proxy
+    /// core functionality, e.g. background cache revalidation requires spawning subrequests.
+    fn allow_spawning_subrequest(&self, _session: &Session, _ctx: &Self::CTX) -> bool
+    where
+        Self::CTX: Send + Sync,
+    {
+        false
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is
