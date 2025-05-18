@@ -205,18 +205,19 @@ impl<SV> HttpProxy<SV> {
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if will_serve_stale {
                                 // create a background thread to do the actual update
-                                let subrequest =
-                                    Box::new(crate::subrequest::create_dummy_session(session));
-                                let new_app = self.clone(); // Clone the Arc
+                                // the subrequest handle is only None by this phase in unit tests
+                                // that don't go through process_new_http
                                 let (permit, cache_lock) = session.cache.take_write_lock();
-                                let sub_req_ctx = Box::new(SubReqCtx::with_write_lock(
-                                    cache_lock,
-                                    session.cache.cache_key().clone(),
-                                    permit,
-                                ));
-                                tokio::spawn(async move {
-                                    new_app.process_subrequest(subrequest, sub_req_ctx).await;
-                                });
+                                SubrequestSpawner::new(self.clone()).spawn_background_subrequest(
+                                    session.as_ref(),
+                                    subrequest::Ctx::builder()
+                                        .cache_write_lock(
+                                            cache_lock,
+                                            session.cache.cache_key().clone(),
+                                            permit,
+                                        )
+                                        .build(),
+                                );
                                 // continue to serve stale for this request
                                 session.cache.set_stale_updating();
                             } else {
