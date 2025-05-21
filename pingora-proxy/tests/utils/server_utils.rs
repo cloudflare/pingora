@@ -447,6 +447,7 @@ impl ProxyHttp for ExampleProxyCache {
         &self,
         session: &Session,
         _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
         is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>> {

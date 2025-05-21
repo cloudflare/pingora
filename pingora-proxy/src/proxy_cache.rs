@@ -82,7 +82,7 @@ impl<SV> HttpProxy<SV> {
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
-                    if let Some((mut meta, handler)) = res {
+                    if let Some((mut meta, mut handler)) = res {
                         // Vary logic
                         // Because this branch can be called multiple times in a loop, and we only
                         // need to update the vary once, check if variance is already set to
@@ -118,7 +118,7 @@ impl<SV> HttpProxy<SV> {
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
-                            .cache_hit_filter(session, &meta, is_fresh, ctx)
+                            .cache_hit_filter(session, &meta, &mut handler, is_fresh, ctx)
                             .await
                         {
                             Err(e) => {

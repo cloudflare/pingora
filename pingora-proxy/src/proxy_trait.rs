@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedInvalidationKind,
+    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -146,6 +146,7 @@ pub trait ProxyHttp {
         &self,
         _session: &Session,
         _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
         _is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>>
