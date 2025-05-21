@@ -190,31 +190,21 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let body_buf = self.body_buf.as_deref_mut().unwrap();
+        let mut body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
-            let mut has_read = false;
             // should not discard remaining data if peer send more.
             if let PS::Partial(_, to_read) = self.body_state {
                 if to_read < body_buf.len() {
-                    let mut buffer = Vec::with_capacity(to_read);
-                    buffer.resize(to_read, 0);
-                    n = stream
-                        .read(&mut buffer)
-                        .await
-                        .or_err(ReadError, "when reading body")?;
-                    body_buf[..n].copy_from_slice(&buffer[..n]);
-                    has_read = true;
+                    body_buf = &mut body_buf[..to_read];
                 }
             }
             /* Need to actually read */
-            if !has_read {
-                n = stream
-                    .read(body_buf)
-                    .await
-                    .or_err(ReadError, "when reading body")?;
-            }
+            n = stream
+                .read(body_buf)
+                .await
+                .or_err(ReadError, "when reading body")?;
         }
         match self.body_state {
             PS::Partial(read, to_read) => {
