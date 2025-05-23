@@ -137,14 +137,15 @@ pub trait ProxyHttp {
     /// This filter is called after a successful cache lookup and before the
     /// cache asset is ready to be used.
     ///
-    /// This filter allows the user to log or force invalidate the asset.
+    /// This filter allows the user to log or force invalidate the asset, or
+    /// to adjust the body reader associated with the cache hit.
     /// This also runs on stale hit assets (for which `is_fresh` is false).
     ///
     /// The value returned indicates if the force invalidation should be used,
     /// and which kind. Returning `None` indicates no forced invalidation
     async fn cache_hit_filter(
         &self,
-        _session: &Session,
+        _session: &mut Session,
         _meta: &CacheMeta,
         _hit_handler: &mut HitHandler,
         _is_fresh: bool,

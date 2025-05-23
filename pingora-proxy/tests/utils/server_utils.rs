@@ -27,7 +27,7 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
-use pingora_cache::{ForcedInvalidationKind, PurgeType, VarianceBuilder};
+use pingora_cache::{ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
@@ -445,7 +445,7 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn cache_hit_filter(
         &self,
-        session: &Session,
+        session: &mut Session,
         _meta: &CacheMeta,
         _hit_handler: &mut HitHandler,
         is_fresh: bool,

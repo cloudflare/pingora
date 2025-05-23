@@ -451,6 +451,27 @@ impl HttpCache {
         }
     }
 
+    /// Set the cache lock implementation.
+    /// # Panic
+    /// Must be called before a cache lock is attempted to be acquired,
+    /// i.e. in the `cache_key_callback` or `cache_hit_filter` phases.
+    pub fn set_cache_lock(&mut self, cache_lock: Option<&'static CacheKeyLockImpl>) {
+        match self.phase {
+            CachePhase::Disabled(_)
+            | CachePhase::CacheKey
+            | CachePhase::Stale
+            | CachePhase::Hit => {
+                let inner = self.inner_mut();
+                if inner.lock.is_some() {
+                    panic!("lock already set when resetting cache lock")
+                } else {
+                    inner.cache_lock = cache_lock;
+                }
+            }
+            _ => panic!("wrong phase: {:?}", self.phase),
+        }
+    }
+
     // Enable distributed tracing
     pub fn enable_tracing(&mut self, parent_span: trace::Span) {
         if let Some(inner) = self.inner.as_mut() {
