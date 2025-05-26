@@ -180,6 +180,7 @@ pub struct Opt {
 
 impl ServerConf {
     // Does not has to be async until we want runtime reload
+    #[cfg(feature = "yaml")]
     pub fn load_from_yaml<P>(path: P) -> Result<Self>
     where
         P: AsRef<std::path::Path> + std::fmt::Display,
@@ -190,7 +191,19 @@ impl ServerConf {
         debug!("Conf file read from {path}");
         Self::from_yaml(&conf_str)
     }
+    #[cfg(feature = "toml")]
+    pub fn load_from_toml<P>(path: P) -> Result<Self>
+    where
+        P: AsRef<std::path::Path> + std::fmt::Display,
+    {
+        let conf_str = fs::read_to_string(&path).or_err_with(ReadError, || {
+            format!("Unable to read conf file from {path}")
+        })?;
+        debug!("Conf file read from {path}");
+        Self::from_toml(&conf_str)
+    }
 
+    #[cfg(feature = "yaml")]
     pub fn load_yaml_with_opt_override(opt: &Opt) -> Result<Self> {
         if let Some(path) = &opt.conf {
             let mut conf = Self::load_from_yaml(path)?;
@@ -200,22 +213,31 @@ impl ServerConf {
             Error::e_explain(ReadError, "No path specified")
         }
     }
-
-    pub fn new() -> Option<Self> {
-        Self::from_yaml("---\nversion: 1").ok()
-    }
-
-    pub fn new_with_opt_override(opt: &Opt) -> Option<Self> {
-        let conf = Self::new();
-        match conf {
-            Some(mut c) => {
-                c.merge_with_opt(opt);
-                Some(c)
-            }
-            None => None,
+    #[cfg(feature = "toml")]
+    pub fn load_toml_with_opt_override(opt: &Opt) -> Result<Self> {
+        if let Some(path) = &opt.conf {
+            let mut conf = Self::load_from_toml(path)?;
+            conf.merge_with_opt(opt);
+            Ok(conf)
+        } else {
+            Error::e_explain(ReadError, "No path specified")
         }
     }
 
+    pub fn new() -> Self {
+        Self {
+            version: 1,
+            ..Default::default()
+        }
+    }
+
+    pub fn new_with_opt_override(opt: &Opt) -> Self {
+        let mut conf = Self::new();
+        conf.merge_with_opt(opt);
+        conf
+    }
+
+    #[cfg(feature = "yaml")]
     pub fn from_yaml(conf_str: &str) -> Result<Self> {
         trace!("Read conf file: {conf_str}");
         let conf: ServerConf = serde_yaml::from_str(conf_str).or_err_with(ReadError, || {
@@ -225,9 +247,24 @@ impl ServerConf {
         trace!("Loaded conf: {conf:?}");
         conf.validate()
     }
+    #[cfg(feature = "toml")]
+    pub fn from_toml(conf_str: &str) -> Result<Self> {
+        trace!("Read conf file: {conf_str}");
+        let conf: ServerConf = toml_edit::de::from_str(conf_str).or_err_with(ReadError, || {
+            format!("Unable to parse toml conf {conf_str}")
+        })?;
 
+        trace!("Loaded conf: {conf:?}");
+        conf.validate()
+    }
+
+    #[cfg(feature = "yaml")]
     pub fn to_yaml(&self) -> String {
         serde_yaml::to_string(self).unwrap()
+    }
+    #[cfg(feature = "toml")]
+    pub fn to_toml(&self) -> String {
+        toml_edit::ser::to_string(self).unwrap()
     }
 
     pub fn validate(self) -> Result<Self> {
@@ -259,6 +296,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
     fn not_a_test_i_cannot_write_yaml_by_hand() {
         init_log();
@@ -288,8 +326,9 @@ mod tests {
         println!("{}", conf.to_yaml());
     }
 
+    #[cfg(feature = "yaml")]
     #[test]
-    fn test_load_file() {
+    fn test_load_file_yaml() {
         init_log();
         let conf_str = r#"
 ---
@@ -305,9 +344,28 @@ client_bind_to_ipv6: []
         assert_eq!(0, conf.client_bind_to_ipv6.len());
         assert_eq!(1, conf.version);
     }
-
+    #[cfg(feature = "toml")]
     #[test]
-    fn test_default() {
+    fn test_load_file_toml() {
+        init_log();
+        let conf_str = r#"
+version = 1
+client_bind_to_ipv4 = [
+    "1.2.3.4",
+    "5.6.7.8"
+]
+client_bind_to_ipv6 = []
+        "#
+        .to_string();
+        let conf = ServerConf::from_toml(&conf_str).unwrap();
+        assert_eq!(2, conf.client_bind_to_ipv4.len());
+        assert_eq!(0, conf.client_bind_to_ipv6.len());
+        assert_eq!(1, conf.version);
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn test_default_yaml() {
         init_log();
         let conf_str = r#"
 ---
@@ -321,4 +379,20 @@ version: 1
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
     }
+    #[cfg(feature = "toml")]
+    #[test]
+    fn test_default_toml() {
+        init_log();
+        let conf_str = r#"
+version = 1
+        "#
+        .to_string();
+        let conf = ServerConf::from_toml(&conf_str).unwrap();
+        assert_eq!(0, conf.client_bind_to_ipv4.len());
+        assert_eq!(0, conf.client_bind_to_ipv6.len());
+        assert_eq!(1, conf.version);
+        assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
+        assert_eq!("/tmp/pingora.pid", conf.pid_file);
+    }
+
 }
