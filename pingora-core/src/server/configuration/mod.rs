@@ -394,5 +394,4 @@ version = 1
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
     }
-
 }
