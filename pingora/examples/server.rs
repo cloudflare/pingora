@@ -156,7 +156,7 @@ pub fn main() {
             .set_max_proto_version(Some(pingora::tls::ssl::SslVersion::TLS1_2))
             .unwrap();
     }
-    #[cfg(feature = "rustls")]
+    #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
     {
         tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     }
