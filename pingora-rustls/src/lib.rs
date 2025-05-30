@@ -32,6 +32,12 @@ pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 
+pub mod cert_resolvers {
+    pub use rustls::server::ResolvesServerCert;
+    pub use rustls::server::{AlwaysResolvesServerRawPublicKeys, ResolvesServerCertUsingSni};
+    pub use rustls::sign::{CertifiedKey, SingleCertAndKey};
+}
+
 /// Load the given file from disk as a buffered reader and use the pingora Error
 /// type instead of the std::io version
 fn load_file<P>(path: P) -> Result<BufReader<File>>
