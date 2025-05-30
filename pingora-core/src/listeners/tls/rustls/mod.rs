@@ -87,7 +87,7 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub fn set_alpn(&mut self, alpn: ALPN) {
         self.alpn_protocols = Some(alpn.to_wire_protocols());
     }
 
@@ -106,10 +106,9 @@ impl TlsSettings {
     where
         Self: Sized,
     {
-        // TODO: verify if/how callback in handshake can be done using Rustls
         Error::e_explain(
             InternalError,
-            "Certificate callbacks are not supported with feature \"rustls\".",
+            "Certificate callbacks are not supported when using rustls.",
         )
     }
 }
