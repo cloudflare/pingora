@@ -136,8 +136,8 @@ fn main() {
 
 ### Run it
 
-Now that we have added the load balancer to the service, we can run our new
-project with
+Now that we have added the load balancer to the service, we can run our new 
+project with 
 
 ```cargo run```
 
@@ -158,24 +158,24 @@ upstream peer is: Backend { addr: Inet(1.0.0.1:443), weight: 1 }
 ...
 ```
 
-Well done! At this point you have a functional load balancer. It is a _very_
+Well done! At this point you have a functional load balancer. It is a _very_ 
 basic load balancer though, so the next section will walk you through how to
 make it more robust with some built-in pingora tooling.
 
 ## Add functionality
 
-Pingora provides several helpful features that can be enabled and configured
-with just a few lines of code. These range from simple peer health checks to
+Pingora provides several helpful features that can be enabled and configured 
+with just a few lines of code. These range from simple peer health checks to 
 the ability to seamlessly update running binary with zero service interruptions.
 
 ### Peer health checks
 
-To make our load balancer more reliable, we would like to add some health checks
-to our upstream peers. That way if there is a peer that has gone down, we can
+To make our load balancer more reliable, we would like to add some health checks 
+to our upstream peers. That way if there is a peer that has gone down, we can 
 quickly stop routing our traffic to that peer.
 
 First let's see how our simple load balancer behaves when one of the peers is
-down. To do this, we'll update the list of peers to include a peer that is
+down. To do this, we'll update the list of peers to include a peer that is 
 guaranteed to be broken.
 
 ```rust
@@ -187,16 +187,16 @@ fn main() {
 }
 ```
 
-Now if we run our load balancer again with `cargo run`, and test it with
+Now if we run our load balancer again with `cargo run`, and test it with 
 
 ```
 curl 127.0.0.1:6188 -svo /dev/null
 ```
 
-We can see that one in every 3 request fails with `502: Bad Gateway`. This is
-because our peer selection is strictly following the `RoundRobin` selection
+We can see that one in every 3 request fails with `502: Bad Gateway`. This is 
+because our peer selection is strictly following the `RoundRobin` selection 
 pattern we gave it with no consideration to whether that peer is healthy. We can
-fix this by adding a basic health check service.
+fix this by adding a basic health check service. 
 
 ```rust
 fn main() {
@@ -225,15 +225,15 @@ fn main() {
 }
 ```
 
-Now if we again run and test our load balancer, we see that all requests
-succeed and the broken peer is never used. Based on the configuration we used,
+Now if we again run and test our load balancer, we see that all requests 
+succeed and the broken peer is never used. Based on the configuration we used, 
 if that peer were to become healthy again, it would be re-included in the round
 robin again in within 1 second.
 
 ### Command line options
 
 The pingora `Server` type provides a lot of built-in functionality that we can
-take advantage of with single-line change.
+take advantage of with single-line change. 
 
 ```rust
 fn main() {
@@ -242,15 +242,15 @@ fn main() {
 }
 ```
 
-With this change, the command-line arguments passed to our load balancer will be
+With this change, the command-line arguments passed to our load balancer will be 
 consumed by Pingora. We can test this by running:
 
 ```
 cargo run -- -h
 ```
 
-We should see a help menu with the list of arguments now available to us. We
-will take advantage of those in the next sections to do more with our load
+We should see a help menu with the list of arguments now available to us. We 
+will take advantage of those in the next sections to do more with our load 
 balancer for free
 
 ### Running in the background
@@ -268,9 +268,9 @@ pkill -SIGTERM load_balancer
  (`SIGTERM` is the default signal for `pkill`.)
 
 ### Configurations
-Pingora configuration files help define how to run the service. Here is an
-example config file that defines how many threads the service can have, the
-location of the pid file, the error log file, and the upgrade coordination
+Pingora configuration files help define how to run the service. Here is an 
+example config file that defines how many threads the service can have, the 
+location of the pid file, the error log file, and the upgrade coordination 
 socket (which we will explain later). Copy the contents below and put them into
 a file called `conf.yaml` in your `load_balancer` project directory.
 
