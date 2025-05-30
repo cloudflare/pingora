@@ -116,11 +116,11 @@ impl TlsSettings {
         }
     }
 
-    pub(crate) fn build(self) -> Acceptor {
-        Acceptor {
+    pub(crate) fn build(self) -> Result<Acceptor> {
+        Ok(Acceptor {
             ssl_acceptor: self.accept_builder.build(),
             callbacks: self.callbacks,
-        }
+        })
     }
 }
 
