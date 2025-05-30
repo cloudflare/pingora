@@ -146,7 +146,7 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
         _session: &mut Session<DS>,
         _ctx: &mut (),
     ) -> Result<Box<HttpPeer>> {
-        let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new())?;
         peer.options.alpn = ALPN::Custom(CustomALPN::new(b"test/1".to_vec()));
         Ok(Box::new(peer))
     }

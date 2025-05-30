@@ -42,7 +42,7 @@ impl ProxyHttp for PipelinedGateway {
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into());
+        let peer = HttpPeer::new(("httpbin.org", 80), false, "httpbin.org".into())?;
         Ok(Box::new(peer))
     }
 }
