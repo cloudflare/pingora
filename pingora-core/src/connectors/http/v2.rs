@@ -689,7 +689,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -706,7 +706,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // a hack to force h1, new_http_session() in the future might validate this setting
         peer.options.set_http_version(1, 1);
         let h2 = connector
@@ -723,7 +723,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -757,7 +757,7 @@ mod tests {
             .with_spaces_after_header_name_in_responses(true)
             .with_obsolete_multiline_headers_in_responses(true);
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(address, false, "".into());
+        let mut peer = HttpPeer::new(address, false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
 
         let session = connector
@@ -782,7 +782,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
         let h2 = connector
@@ -818,7 +818,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 3;
         let h2 = connector
@@ -987,7 +987,7 @@ mod tests {
         }
 
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
 

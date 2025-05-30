@@ -1839,7 +1839,7 @@ mod tests {
             script.build()
         };
         let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
         let (downstream_reusable, upstream_reusable, error) = proxy
             .proxy_1to1(&mut session, &mut upstream, &peer, &mut ())
@@ -1993,7 +1993,7 @@ mod tests {
                 .wait(Duration::from_secs(30))
                 .build();
             let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
             let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
             let mut ctx = ();
             let mut run = tokio_test::task::spawn(proxy.proxy_1to1(
@@ -2269,7 +2269,7 @@ mod tests {
             script.build()
         };
         let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
         let mut ctx = ();
         let ((_, _, error), ()) = tokio::join!(
@@ -2382,7 +2382,7 @@ mod tests {
                 .read_error(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
                 .build();
             let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
             let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
             let mut ctx = ();
             let ((_, _, h1_error), ()) = tokio::join!(
@@ -2869,7 +2869,7 @@ mod tests {
             .read_request()
             .await
             .expect("test request should parse");
-        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned());
+        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned()).unwrap();
         let mut request_write_attempted = false;
         let (reuse, error) = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2974,7 +2974,7 @@ mod tests {
             None,
         );
         let mut upstream = AbandonRecordingCustom::new();
-        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned());
+        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned()).unwrap();
         let mut ctx = ();
         let mut request_write_attempted = false;
 

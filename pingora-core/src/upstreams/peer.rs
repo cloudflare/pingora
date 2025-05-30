@@ -764,10 +764,12 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
-    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        let mut addrs_iter = address.to_socket_addrs().unwrap(); //TODO: handle error
+    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
+        let mut addrs_iter = address
+            .to_socket_addrs()
+            .or_err(SocketError, "invalid address")?;
         let addr = addrs_iter.next().unwrap();
-        Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni)
+        Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
@@ -810,10 +812,10 @@ impl HttpPeer {
         address: A,
         sni: String,
         client_cert_key: Arc<CertKey>,
-    ) -> Self {
-        let mut peer = Self::new(address, true, sni);
+    ) -> Result<Self> {
+        let mut peer = Self::new(address, true, sni)?;
         peer.client_cert_key = Some(client_cert_key);
-        peer
+        Ok(peer)
     }
 
     fn peer_hash(&self) -> u64 {
@@ -973,7 +975,7 @@ mod tests {
     /// setting must not reuse it.
     #[test]
     fn peers_differing_in_tls_write_coalescing_do_not_share_connections() {
-        let peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into());
+        let peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into()).unwrap();
         let mut coalescing = peer.clone();
         coalescing.options.tls_write_coalescing = true;
         assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());

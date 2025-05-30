@@ -2601,7 +2601,7 @@ mod tests {
 
         DefaultRetryProxy
             .error_while_proxy(
-                &HttpPeer::new("127.0.0.1:80", false, "".to_string()),
+                &HttpPeer::new("127.0.0.1:80", false, "".to_string()).unwrap(),
                 session,
                 error,
                 &mut (),
