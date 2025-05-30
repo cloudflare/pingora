@@ -24,6 +24,7 @@ use std::path::Path;
 use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
+use rustls::crypto::CryptoProvider;
 pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
@@ -163,7 +164,22 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
         .unwrap_or_default())
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
-    let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
+    #[cfg(feature = "aws-lc-rs")]
+    use aws_lc_rs::digest;
+    #[cfg(feature = "ring")]
+    use ring::digest;
+
+    let hash = digest::digest(&digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
+}
+
+pub fn setup_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        #[cfg(feature = "aws-lc-rs")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(feature = "ring")]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 }
