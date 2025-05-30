@@ -19,6 +19,7 @@ use crate::protocols::tls::{server::handshake, server::handshake_with_callback, 
 use log::debug;
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
+use pingora_rustls::cert_resolvers::ResolvesServerCert;
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
@@ -28,8 +29,8 @@ use crate::protocols::{ALPN, IO};
 /// The TLS settings of a listening endpoint
 pub struct TlsSettings {
     alpn_protocols: Option<Vec<Vec<u8>>>,
-    cert_path: String,
-    key_path: String,
+    cert_key_path: Option<(String, String)>,
+    cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
 }
 
 pub struct Acceptor {
@@ -41,35 +42,16 @@ impl TlsSettings {
     /// Create a Rustls acceptor based on the current setting for certificates,
     /// keys, and protocols.
     pub(crate) fn build(self) -> Result<Acceptor> {
-        let cert_key = load_certs_and_key_files(&self.cert_path, &self.key_path).explain_err(
-            InternalError,
-            |e| {
-                format!(
-                    "Failed to load provided certificates \"{}\" or key \"{}\" error {}.",
-                    self.cert_path, self.key_path, e
-                )
-            },
-        )?;
-
-        let Some((certs, key)) = cert_key else {
+        let mut config = if let Some((cert_path, key_path)) = self.cert_key_path {
+            Self::build_with_cert_key_files(&cert_path, &key_path)?
+        } else if let Some(cert_resolver) = self.cert_resolver {
+            Self::build_with_cert_resolver(cert_resolver)
+        } else {
             return Err(Error::explain(
                 InternalError,
-                format!(
-                    "Certificate \"{}\" or key \"{}\" did not contain expected data.",
-                    self.cert_path, self.key_path
-                ),
+                "Neither cert/key path pair nor certificate resolver available.",
             ));
         };
-
-        // TODO - Add support for client auth & custom CA support
-        let mut config =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {e}")
-                })
-                .unwrap();
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -79,6 +61,41 @@ impl TlsSettings {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
             callbacks: None,
         })
+    }
+
+    fn build_with_cert_key_files(cert_path: &str, key_path: &str) -> Result<ServerConfig> {
+        let cert_key =
+            load_certs_and_key_files(cert_path, key_path).explain_err(InternalError, |e| {
+                format!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\" error {}.",
+                    cert_path, key_path, e
+                )
+            })?;
+
+        let Some((certs, key)) = cert_key else {
+            return Err(Error::explain(
+                InternalError,
+                format!(
+                    "Certificate \"{}\" or key \"{}\" did not contain expected data.",
+                    cert_path, key_path
+                ),
+            ));
+        };
+
+        // TODO - Add support for client auth & custom CA support
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .explain_err(InternalError, |e| {
+                format!("Failed to create server listener config: {e}")
+            })
+    }
+
+    fn build_with_cert_resolver(cert_resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
+        // TODO - Add support for client auth & custom CA support
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_cert_resolver(cert_resolver)
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.
@@ -97,8 +114,19 @@ impl TlsSettings {
     {
         Ok(TlsSettings {
             alpn_protocols: None,
-            cert_path: cert_path.to_string(),
-            key_path: key_path.to_string(),
+            cert_key_path: Some((cert_path.to_string(), key_path.to_string())),
+            cert_resolver: None,
+        })
+    }
+
+    pub fn resolver(cert_resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_key_path: None,
+            cert_resolver: Some(cert_resolver),
         })
     }
 
