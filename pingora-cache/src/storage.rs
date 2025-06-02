@@ -151,10 +151,19 @@ pub trait HandleHit {
 
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);
+
+    /// Helper function to cast the trait object to concrete types
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);
 }
 
 /// Hit Handler
 pub type HitHandler = Box<(dyn HandleHit + Sync + Send)>;
+
+/// MissFinishType
+pub enum MissFinishType {
+    Created(usize),
+    Appended(usize),
+}
 
 /// Cache miss handling trait
 #[async_trait]
@@ -168,7 +177,7 @@ pub trait HandleMiss {
     /// failed.
     async fn finish(
         self: Box<Self>, // because self is always used as a trait object
-    ) -> Result<usize>;
+    ) -> Result<MissFinishType>;
 
     /// Return a streaming write tag recognized by the underlying [`Storage`].
     ///

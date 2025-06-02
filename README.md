@@ -43,6 +43,8 @@ API docs are also available for all the crates.
 * Pingora-timeout: A more efficient async timer system
 * TinyUfo: The caching algorithm behind pingora-memory-cache
 
+Note that Pingora proxy integration with caching should be considered experimental, and as such APIs related to caching are currently highly volatile.
+
 # System requirements
 
 ## Systems
@@ -58,7 +60,9 @@ Both x86_64 and aarch64 architectures will be supported.
 
 Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old.
 
-Our current MSRV is 1.72.
+Our current MSRV is effectively 1.82.
+
+Previously Pingora advertised an MSRV of 1.72. Older Rust versions may still be able to compile via `cargo update` pinning dependencies such as `backtrace@0.3.74`. The advertised MSRV in config files will be officially bumped to 1.82 in an upcoming release.
 
 Building with the optional feature `boringssl` with Boring >= 4.14 requires Rust 1.80.
 

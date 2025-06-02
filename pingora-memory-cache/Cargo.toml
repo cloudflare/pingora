@@ -1,6 +1,6 @@
 [package]
 name = "pingora-memory-cache"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -17,14 +17,14 @@ name = "pingora_memory_cache"
 path = "src/lib.rs"
 
 [dependencies]
-TinyUFO = { version = "0.4.0", path = "../tinyufo" }
+TinyUFO = { version = "0.5.0", path = "../tinyufo" }
 ahash = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
-pingora-error = { version = "0.4.0", path = "../pingora-error" }
+pingora-error = { version = "0.5.0", path = "../pingora-error" }
 log = { workspace = true }
 parking_lot = "0"
-pingora-timeout = { version = "0.4.0", path = "../pingora-timeout" }
+pingora-timeout = { version = "0.5.0", path = "../pingora-timeout" }
 
 [dev-dependencies]
 once_cell = { workspace = true }

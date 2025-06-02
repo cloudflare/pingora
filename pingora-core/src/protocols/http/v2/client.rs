@@ -257,7 +257,9 @@ impl Http2Session {
         // https://docs.rs/h2/latest/h2/struct.RecvStream.html#method.is_end_stream
         // So poll the data once to check this condition. If an error is returned, that indicates
         // that the stream closed due to an error e.g. h2 protocol error.
-        match reader.data().now_or_never() {
+        //
+        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+        match tokio::task::unconstrained(reader.data()).now_or_never() {
             Some(None) => Ok(true),
             Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
             Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),

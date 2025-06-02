@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use lru::LruCache;
 use parking_lot::RwLock;
 use pingora_error::{BError, ErrorType::*, OrErr, Result};
+use rand::Rng;
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -84,6 +85,15 @@ impl Manager {
             self.used.fetch_add(size, Ordering::Relaxed);
             self.items.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn increase_weight(&self, key: u64, delta: usize) {
+        let mut lru = self.lru.write();
+        let Some(node) = lru.get_key_value_mut(&key) else {
+            return;
+        };
+        node.1.size += delta;
+        self.used.fetch_add(delta, Ordering::Relaxed);
     }
 
     // evict items until the used capacity is below the limit
@@ -196,6 +206,12 @@ impl EvictionManager for Manager {
         self.evict()
     }
 
+    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey> {
+        let key = u64key(&item);
+        self.increase_weight(key, delta);
+        self.evict()
+    }
+
     fn remove(&self, item: &CompactCacheKey) {
         let key = u64key(item);
         let node = self.lru.write().pop(&key);
@@ -227,12 +243,26 @@ impl EvictionManager for Manager {
             let dir_path = Path::new(&dir_str);
             std::fs::create_dir_all(dir_path)
                 .or_err_with(InternalError, || format!("fail to create {dir_str}"))?;
-            let file_path = dir_path.join(FILE_NAME);
-            let mut file = File::create(&file_path).or_err_with(InternalError, || {
-                format!("fail to create {}", file_path.display())
+
+            let final_file_path = dir_path.join(FILE_NAME);
+            // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
+            let random_suffix: u32 = rand::thread_rng().gen();
+            let temp_file_path = dir_path.join(format!("{}.{:08x}.tmp", FILE_NAME, random_suffix));
+            let mut file = File::create(&temp_file_path).or_err_with(InternalError, || {
+                format!("fail to create temporary file {}", temp_file_path.display())
             })?;
             file.write_all(&data).or_err_with(InternalError, || {
-                format!("fail to write to {}", file_path.display())
+                format!("fail to write to {}", temp_file_path.display())
+            })?;
+            file.flush().or_err_with(InternalError, || {
+                format!("fail to flush temp file {}", temp_file_path.display())
+            })?;
+            std::fs::rename(&temp_file_path, &final_file_path).or_err_with(InternalError, || {
+                format!(
+                    "fail to rename temporary file {} to {}",
+                    temp_file_path.display(),
+                    final_file_path.display()
+                )
             })
         })
         .await
