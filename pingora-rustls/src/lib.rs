@@ -24,6 +24,7 @@ use std::path::Path;
 use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
+pub use rustls::crypto::aws_lc_rs::default_provider;
 pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
@@ -33,9 +34,10 @@ pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 
 pub mod cert_resolvers {
-    pub use rustls::server::ResolvesServerCert;
     pub use rustls::server::{AlwaysResolvesServerRawPublicKeys, ResolvesServerCertUsingSni};
+    pub use rustls::server::{ClientHello, ResolvesServerCert};
     pub use rustls::sign::{CertifiedKey, SingleCertAndKey};
+    pub use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 }
 
 /// Load the given file from disk as a buffered reader and use the pingora Error
