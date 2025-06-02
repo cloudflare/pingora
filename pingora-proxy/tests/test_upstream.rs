@@ -1518,13 +1518,14 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
+            // cache lock timeout, disable cache
             assert_eq!(headers["x-cache-status"], "no-cache");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         // send the 3rd request after the 2 second cache lock timeout where the
         // first request still holds the lock (3s delay in origin)
-        sleep(Duration::from_millis(2000)).await;
+        sleep(Duration::from_millis(2200)).await;
         let task3 = tokio::spawn(async move {
             let res = reqwest::Client::new()
                 .get(url)
@@ -1535,7 +1536,9 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // this is now a miss because we will not timeout on cache lock
+            // and will fetch from origin successfully
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1553,6 +1556,46 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
         assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_wait_timeout() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_wait_timeout.txt";
+
+        let mut handles = vec![];
+        const N_REQUESTS: u64 = 8;
+        for _ in 0..N_REQUESTS {
+            handles.push(tokio::spawn(async move {
+                // Each task will attempt to wait for the origin's 1s sleep upon acquiring the
+                // cache lock, before the origin disconnects.
+                let res = reqwest::Client::new()
+                    .get(url)
+                    .header("x-lock", "true")
+                    .header("x-set-sleep", "1") // we have a 2 second cache lock timeout
+                    .header("x-abort", "1")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), 502);
+                let headers = res.headers();
+                headers
+                    .get("x-cache-lock-time-ms")
+                    .and_then(|ms| ms.to_str().ok().and_then(|s| s.parse::<u64>().ok()))
+            }));
+        }
+        let mut waited_count = 0;
+        for handle in handles {
+            let lock_time_ms = handle.await.unwrap();
+            if let Some(lock_time_ms) = lock_time_ms {
+                // should not have waited more than 2s for each response
+                waited_count += 1;
+                assert!(lock_time_ms <= 2200);
+            }
+        }
+        assert!(waited_count > 0, "at least one reader waited");
+        // This whole process /should/ have taken no longer than 4s, as each reader has an
+        // independently enforced 2s timeout
     }
 
     #[tokio::test]

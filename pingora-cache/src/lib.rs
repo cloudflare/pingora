@@ -23,6 +23,7 @@ use lock::WritePermit;
 use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
+use pingora_timeout::timeout;
 use std::time::{Duration, Instant, SystemTime};
 use storage::MissFinishType;
 use strum::IntoStaticStr;
@@ -269,6 +270,12 @@ impl HitStatus {
     }
 }
 
+pub struct LockCtx {
+    pub lock: Option<Locked>,
+    pub cache_lock: &'static CacheKeyLockImpl,
+    pub wait_timeout: Option<Duration>,
+}
+
 struct HttpCacheInner {
     pub key: Option<CacheKey>,
     pub meta: Option<CacheMeta>,
@@ -281,8 +288,7 @@ struct HttpCacheInner {
     pub storage: &'static (dyn storage::Storage + Sync), // static for now
     pub eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
-    pub lock: Option<Locked>, // TODO: these 3 fields should come in 1 sub struct
-    pub cache_lock: Option<&'static CacheKeyLockImpl>,
+    pub lock_ctx: Option<LockCtx>,
     pub traces: trace::CacheTraceCTX,
 }
 
@@ -341,30 +347,31 @@ impl HttpCache {
     pub fn release_write_lock(&mut self, reason: NoCacheReason) {
         use NoCacheReason::*;
         if let Some(inner) = self.inner.as_mut() {
-            let lock = inner.lock.take();
-            if let Some(Locked::Write(permit)) = lock {
-                let lock_status = match reason {
-                    // let the next request try to fetch it
-                    InternalError | StorageError | Deferred | UpstreamError => {
-                        LockStatus::TransientError
-                    }
-                    // depends on why the proxy upstream filter declined the request,
-                    // for now still allow next request try to acquire to avoid thundering herd
-                    DeclinedToUpstream => LockStatus::TransientError,
-                    // no need for the lock anymore
-                    OriginNotCache | ResponseTooLarge => LockStatus::GiveUp,
-                    // not sure which LockStatus make sense, we treat it as GiveUp for now
-                    Custom(_) => LockStatus::GiveUp,
-                    // should never happen, NeverEnabled shouldn't hold a lock
-                    NeverEnabled => panic!("NeverEnabled holds a write lock"),
-                    CacheLockGiveUp | CacheLockTimeout => {
-                        panic!("CacheLock* are for cache lock readers only")
-                    }
-                };
-                inner
-                    .cache_lock
-                    .unwrap()
-                    .release(inner.key.as_ref().unwrap(), permit, lock_status);
+            if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                let lock = lock_ctx.lock.take();
+                if let Some(Locked::Write(permit)) = lock {
+                    let lock_status = match reason {
+                        // let the next request try to fetch it
+                        InternalError | StorageError | Deferred | UpstreamError => {
+                            LockStatus::TransientError
+                        }
+                        // depends on why the proxy upstream filter declined the request,
+                        // for now still allow next request try to acquire to avoid thundering herd
+                        DeclinedToUpstream => LockStatus::TransientError,
+                        // no need for the lock anymore
+                        OriginNotCache | ResponseTooLarge => LockStatus::GiveUp,
+                        // not sure which LockStatus make sense, we treat it as GiveUp for now
+                        Custom(_) => LockStatus::GiveUp,
+                        // should never happen, NeverEnabled shouldn't hold a lock
+                        NeverEnabled => panic!("NeverEnabled holds a write lock"),
+                        CacheLockGiveUp | CacheLockTimeout => {
+                            panic!("CacheLock* are for cache lock readers only")
+                        }
+                    };
+                    lock_ctx
+                        .cache_lock
+                        .release(inner.key.as_ref().unwrap(), permit, lock_status);
+                }
             }
         }
     }
@@ -432,6 +439,13 @@ impl HttpCache {
         match self.phase {
             CachePhase::Disabled(_) => {
                 self.phase = CachePhase::Uninit;
+
+                let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
+                    cache_lock,
+                    lock: None,
+                    wait_timeout: None,
+                });
+
                 self.inner = Some(Box::new(HttpCacheInner {
                     key: None,
                     meta: None,
@@ -442,8 +456,7 @@ impl HttpCache {
                     storage,
                     eviction,
                     predictor,
-                    lock: None,
-                    cache_lock,
+                    lock_ctx,
                     traces: CacheTraceCTX::new(),
                 }));
             }
@@ -462,10 +475,24 @@ impl HttpCache {
             | CachePhase::Stale
             | CachePhase::Hit => {
                 let inner = self.inner_mut();
-                if inner.lock.is_some() {
+                if inner
+                    .lock_ctx
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.lock.is_some())
+                {
                     panic!("lock already set when resetting cache lock")
                 } else {
-                    inner.cache_lock = cache_lock;
+                    let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
+                        cache_lock,
+                        lock: None,
+                        wait_timeout: None,
+                    });
+                    inner.lock_ctx = lock_ctx;
+
+                    // if key already set, initialize lock settings
+                    if inner.key.as_ref().is_some() {
+                        self.init_cache_key_lock_settings();
+                    }
                 }
             }
             _ => panic!("wrong phase: {:?}", self.phase),
@@ -512,9 +539,23 @@ impl HttpCache {
         match self.phase {
             CachePhase::Uninit | CachePhase::CacheKey => {
                 self.phase = CachePhase::CacheKey;
+
                 self.inner_mut().key = Some(key);
+                self.init_cache_key_lock_settings();
             }
             _ => panic!("wrong phase {:?}", self.phase),
+        }
+    }
+
+    // Initialize any cache key specific settings
+    // Panics: if key is unset
+    fn init_cache_key_lock_settings(&mut self) {
+        // Allow key-specific wait timeout
+        let inner = self.inner_mut();
+        if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+            lock_ctx.wait_timeout = lock_ctx
+                .cache_lock
+                .wait_timeout(inner.key.as_ref().expect("key must be set"));
         }
     }
 
@@ -574,8 +615,8 @@ impl HttpCache {
         // The cache lock might not be set for stale hit or hits treated as
         // misses, so we need to initialize it here
         if phase == CachePhase::Stale || hit_status.is_treated_as_miss() {
-            if let Some(lock) = inner.cache_lock.as_ref() {
-                inner.lock = Some(lock.lock(key));
+            if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
             }
         }
 
@@ -718,12 +759,11 @@ impl HttpCache {
                 if inner.storage.support_streaming_partial_write() {
                     // If a reader can access partial write, the cache lock can be released here
                     // to let readers start reading the body.
-                    let lock = inner.lock.take();
-                    if let Some(Locked::Write(permit)) = lock {
-                        inner
-                            .cache_lock
-                            .expect("must have cache lock to have write permit")
-                            .release(key, permit, LockStatus::Done);
+                    if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                        let lock = lock_ctx.lock.take();
+                        if let Some(Locked::Write(permit)) = lock {
+                            lock_ctx.cache_lock.release(key, permit, LockStatus::Done);
+                        }
                     }
                     // Downstream read and upstream write can be decoupled
                     let body_reader = inner
@@ -777,21 +817,23 @@ impl HttpCache {
                     return Ok(());
                 }
                 let miss_handler = inner.miss_handler.take().unwrap();
-                let finish = miss_handler.finish().await?;
-                let lock = inner.lock.take();
-                let key = inner.key.as_ref().unwrap();
-                if let Some(Locked::Write(permit)) = lock {
-                    // no need to call r.unlock() because release() will call it
-                    // r is a guard to make sure the lock is unlocked when this request is dropped
-                    inner
-                        .cache_lock
-                        .unwrap()
-                        .release(key, permit, LockStatus::Done);
+                let size = miss_handler.finish().await?;
+                let key = inner
+                    .key
+                    .as_ref()
+                    .expect("key set by miss or expired phase");
+                if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                    let lock = lock_ctx.lock.take();
+                    if let Some(Locked::Write(permit)) = lock {
+                        // no need to call r.unlock() because release() will call it
+                        // r is a guard to make sure the lock is unlocked when this request is dropped
+                        lock_ctx.cache_lock.release(key, permit, LockStatus::Done);
+                    }
                 }
                 if let Some(eviction) = inner.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner.meta.as_ref().unwrap();
-                    let evicted = match finish {
+                    let evicted = match size {
                         MissFinishType::Created(size) => {
                             eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                         }
@@ -860,13 +902,15 @@ impl HttpCache {
 
                 inner.meta.replace(meta);
 
-                let lock = inner.lock.take();
-                if let Some(Locked::Write(permit)) = lock {
-                    inner.cache_lock.unwrap().release(
-                        inner.key.as_ref().unwrap(),
-                        permit,
-                        LockStatus::Done,
-                    );
+                if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                    let lock = lock_ctx.lock.take();
+                    if let Some(Locked::Write(permit)) = lock {
+                        lock_ctx.cache_lock.release(
+                            inner.key.as_ref().expect("key set by stale phase"),
+                            permit,
+                            LockStatus::Done,
+                        );
+                    }
                 }
 
                 let mut span = inner.traces.child("update_meta");
@@ -1007,11 +1051,10 @@ impl HttpCache {
                 // TODO: maybe we should try to signal waiting readers to compete for the primary key
                 // lock instead? we will not be modifying this secondary slot so it's not actually
                 // ready for readers
-                if let Some(Locked::Write(permit)) = inner.lock.take() {
-                    inner
-                        .cache_lock
-                        .unwrap()
-                        .release(key, permit, LockStatus::Done);
+                if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                    if let Some(Locked::Write(permit)) = lock_ctx.lock.take() {
+                        lock_ctx.cache_lock.release(key, permit, LockStatus::Done);
+                    }
                 }
                 // Remove the `variance` from the `key`, so that we admit this asset into the
                 // primary slot. (`key` is used to tell storage where to write the data.)
@@ -1096,8 +1139,8 @@ impl HttpCache {
                     Some((meta, header))
                 });
                 if result.is_none() {
-                    if let Some(lock) = inner.cache_lock.as_ref() {
-                        inner.lock = Some(lock.lock(key));
+                    if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
                     }
                 }
                 span.set_tag(|| trace::Tag::new("found", result.is_some()));
@@ -1154,34 +1197,52 @@ impl HttpCache {
     /// Whether this request is behind a cache lock in order to wait for another request to read the
     /// asset.
     pub fn is_cache_locked(&self) -> bool {
-        matches!(self.inner().lock, Some(Locked::Read(_)))
+        matches!(
+            self.inner().lock_ctx.as_ref().and_then(|l| l.lock.as_ref()),
+            Some(Locked::Read(_))
+        )
     }
 
     /// Whether this request is the leader request to fetch the assets for itself and other requests
     /// behind the cache lock.
     pub fn is_cache_lock_writer(&self) -> bool {
-        matches!(self.inner().lock, Some(Locked::Write(_)))
+        matches!(
+            self.inner().lock_ctx.as_ref().and_then(|l| l.lock.as_ref()),
+            Some(Locked::Write(_))
+        )
     }
 
     /// Take the write lock from this request to transfer it to another one.
     /// # Panic
     ///  Call is_cache_lock_writer() to check first, will panic otherwise.
     pub fn take_write_lock(&mut self) -> (WritePermit, &'static CacheKeyLockImpl) {
-        let lock = self.inner_mut().lock.take().unwrap();
+        let lock_ctx = self
+            .inner_mut()
+            .lock_ctx
+            .as_mut()
+            .expect("take_write_lock() called without cache lock");
+        let lock = lock_ctx
+            .lock
+            .take()
+            .expect("take_write_lock() called without lock");
         match lock {
-            Locked::Write(w) => (
-                w,
-                self.inner()
-                    .cache_lock
-                    .expect("cache lock must be set if write permit exists"),
-            ),
+            Locked::Write(w) => (w, lock_ctx.cache_lock),
             Locked::Read(_) => panic!("take_write_lock() called on read lock"),
         }
     }
 
     /// Set the write lock, which is usually transferred from [Self::take_write_lock()]
+    ///
+    /// # Panic
+    /// Panics if cache lock was not originally configured for this request.
+    // TODO: it may make sense to allow configuring the CacheKeyLock here too that the write permit
+    // is associated with
+    // (The WritePermit comes from the CacheKeyLock and should be used when releasing from the CacheKeyLock,
+    // shouldn't be possible to give a WritePermit to a request using a different CacheKeyLock)
     pub fn set_write_lock(&mut self, write_lock: WritePermit) {
-        self.inner_mut().lock.replace(Locked::Write(write_lock));
+        if let Some(lock_ctx) = self.inner_mut().lock_ctx.as_mut() {
+            lock_ctx.lock.replace(Locked::Write(write_lock));
+        }
     }
 
     /// Whether this request's cache hit is staled
@@ -1208,19 +1269,35 @@ impl HttpCache {
     pub async fn cache_lock_wait(&mut self) -> LockStatus {
         let inner = self.inner_mut();
         let mut span = inner.traces.child("cache_lock");
-        let lock = inner.lock.take(); // remove the lock from self
-        if let Some(Locked::Read(r)) = lock {
-            let now = Instant::now();
-            r.wait().await;
-            // it's possible for a request to be locked more than once
-            self.digest.add_lock_duration(now.elapsed());
-            let status = r.lock_status();
-            let tag_value: &'static str = status.into();
-            span.set_tag(|| Tag::new("status", tag_value));
-            status
+        // should always call is_cache_locked() before this function, which should guarantee that
+        // the inner cache has a read lock and lock ctx
+        if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
+            let lock = lock_ctx.lock.take(); // remove the lock from self
+            if let Some(Locked::Read(r)) = lock {
+                let now = Instant::now();
+                // it's possible for a request to be locked more than once,
+                // so wait the remainder of our configured timeout
+                let status = if let Some(wait_timeout) = lock_ctx.wait_timeout {
+                    let wait_timeout =
+                        wait_timeout.saturating_sub(self.lock_duration().unwrap_or(Duration::ZERO));
+                    match timeout(wait_timeout, r.wait()).await {
+                        Ok(()) => r.lock_status(),
+                        // TODO: need to differentiate WaitTimeout vs. Lock(Age)Timeout (expired)?
+                        Err(_) => LockStatus::Timeout,
+                    }
+                } else {
+                    r.wait().await;
+                    r.lock_status()
+                };
+                self.digest.add_lock_duration(now.elapsed());
+                let tag_value: &'static str = status.into();
+                span.set_tag(|| Tag::new("status", tag_value));
+                status
+            } else {
+                panic!("cache_lock_wait on wrong type of lock")
+            }
         } else {
-            // should always call is_cache_locked() before this function
-            panic!("cache_lock_wait on wrong type of lock")
+            panic!("cache_lock_wait without cache lock")
         }
     }
 

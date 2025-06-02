@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use http::header::{ACCEPT_ENCODING, VARY};
 use http::HeaderValue;
+use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
@@ -30,14 +31,16 @@ use pingora_cache::{
 use pingora_cache::{ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
-use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
+use pingora_core::protocols::{
+    http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
+};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
-use pingora_error::{Error, ErrorSource, Result};
+use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
@@ -328,8 +331,12 @@ static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
-    Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> = Lazy::new(|| {
+    CacheLock::new_boxed(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+    )
+});
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
@@ -591,6 +598,56 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // default OSS fail_to_proxy with added headers
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            _ => {
+                match e.esource() {
+                    ErrorSource::Upstream => 502,
+                    ErrorSource::Downstream => {
+                        match e.etype() {
+                            WriteError | ReadError | ConnectionClosed => {
+                                /* conn already dead */
+                                0
+                            }
+                            _ => 400,
+                        }
+                    }
+                    ErrorSource::Internal | ErrorSource::Unset => 500,
+                }
+            }
+        };
+        if code > 0 {
+            let mut resp = gen_error_response(code);
+            // any relevant metadata headers to add
+            if let Some(d) = session.cache.lock_duration() {
+                resp.insert_header("x-cache-lock-time-ms", format!("{}", d.as_millis()))
+                    .unwrap();
+            }
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("failed to send error response to downstream: {e}");
+                });
+        }
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     fn should_serve_stale(
