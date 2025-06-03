@@ -62,6 +62,7 @@ impl<SV> HttpProxy<SV> {
                 session.cache.disable(NoCacheReason::InternalError);
                 warn!("cache upstream filter error {}, disabling cache", e);
             }
+            session.mark_upstream_headers_mutated_for_cache();
         }
 
         match self
@@ -493,10 +494,9 @@ impl<SV> HttpProxy<SV> {
 
         match task {
             HttpTask::Header(mut header, end) => {
-                /* Downstream revalidation/range, only needed when cache is on because otherwise origin
+                /* Downstream revalidation/range, only needed when cache modified headers because otherwise origin
                  * will handle it */
-                // TODO: if cache is disabled during response phase, we should still do the filter
-                if session.cache.enabled() {
+                if session.upstream_headers_mutated_for_cache() {
                     self.downstream_response_conditional_filter(
                         serve_from_cache,
                         session,
@@ -504,9 +504,7 @@ impl<SV> HttpProxy<SV> {
                         ctx,
                     );
                     if !session.ignore_downstream_range {
-                        let range_type =
-                            self.inner
-                                .range_header_filter(session.req_header(), &mut header, ctx);
+                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
                         range_body_filter.set(range_type);
                     }
                 }
