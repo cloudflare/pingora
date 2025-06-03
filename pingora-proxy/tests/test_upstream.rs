@@ -2424,4 +2424,41 @@ mod test_cache {
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
+
+    #[tokio::test]
+    async fn test_cache_bypass_downstream_range() {
+        init();
+        let test_url =
+            "http://127.0.0.1:6148/unique/test_cache_bypass_downstream_range/cache_control/";
+
+        let res = reqwest::Client::new()
+            .get(test_url)
+            .header("Range", "bytes=6-10")
+            // We start this request as cacheable, and then this disables it.
+            // We would expect the range body filter to run since we have
+            // started to cache, and then disabled.
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "world");
+
+        // We're starting as uncacheable, so proxy origin to downstream
+        // unchanged.
+        let res = reqwest::Client::new()
+            .get(test_url)
+            // We pass this up to the upstream, but it ignores it.
+            .header("Range", "bytes=0-4")
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
 }
