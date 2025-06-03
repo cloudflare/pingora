@@ -142,7 +142,9 @@ impl CacheKeyLock for CacheLock {
             // if lock age timed out, then readers are capable of
             // replacing the lock associated with this permit from the lock table
             // (see lock() implementation)
-            permit.unlock(reason);
+            // keep the lock status as Timeout accordingly when unlocking
+            // (because we aren't removing it from the lock_table)
+            permit.unlock(LockStatus::Timeout);
         } else if let Some(_lock) = self.lock_table.write(key).remove(&key) {
             permit.unlock(reason);
         }
@@ -250,7 +252,7 @@ pub struct ReadLock(Arc<LockCore>);
 impl ReadLock {
     /// Wait for the writer to release the lock
     pub async fn wait(&self) {
-        if !self.locked() || self.expired() {
+        if !self.locked() {
             return;
         }
 
@@ -272,6 +274,11 @@ impl ReadLock {
                         .store(LockStatus::Timeout.into(), Ordering::SeqCst);
                 }
             }
+        } else {
+            // expiration has already occurred, store timeout status
+            self.0
+                .lock_status
+                .store(LockStatus::Timeout.into(), Ordering::SeqCst);
         }
     }
 
@@ -428,6 +435,78 @@ mod test {
         permit.unlock(LockStatus::Done);
         permit2.unlock(LockStatus::Done);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lock_expired_release() {
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let key1 = CacheKey::new("", "a", "1");
+        let permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+
+        let lock = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        assert!(lock.locked());
+        let handle = tokio::spawn(async move {
+            // timed out
+            lock.wait().await;
+            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+        });
+
+        tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
+        handle.await.unwrap(); // check lock is timed out
+
+        // writer finally finishes
+        cache_lock.release(&key1, permit, LockStatus::Done);
+
+        // can reacquire after release
+        let mut permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+        assert_eq!(permit.lock.lock_status(), LockStatus::Waiting);
+
+        let lock2 = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        assert!(lock2.locked());
+        let handle = tokio::spawn(async move {
+            // timed out
+            lock2.wait().await;
+            assert_eq!(lock2.lock_status(), LockStatus::Done);
+        });
+
+        permit.unlock(LockStatus::Done);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lock_expired_no_reader() {
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let key1 = CacheKey::new("", "a", "1");
+        let mut permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+        tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
+
+        // lock expired without reader, but status is not yet set
+        assert_eq!(permit.lock.lock_status(), LockStatus::Waiting);
+
+        let lock = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        // reader expires write permit
+        lock.wait().await;
+        assert_eq!(lock.lock_status(), LockStatus::Timeout);
+        assert_eq!(permit.lock.lock_status(), LockStatus::Timeout);
+        permit.unlock(LockStatus::Timeout);
     }
 
     #[tokio::test]
