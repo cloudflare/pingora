@@ -895,15 +895,15 @@ impl HttpSession {
 
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
-        self.read_timeout = Some(timeout);
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
     /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
-    pub fn set_write_timeout(&mut self, timeout: Duration) {
-        self.write_timeout = Some(timeout);
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
     }
 
     /// Sets the total drain timeout. For HTTP/1.1, reusing a session requires
@@ -914,8 +914,8 @@ impl HttpSession {
     /// on trying to reuse the session.
     ///
     /// Note that the downstream read timeout still applies between body byte reads.
-    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
-        self.total_drain_timeout = Some(timeout);
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        self.total_drain_timeout = timeout;
     }
 
     /// Sets the minimum downstream send rate in bytes per second. This
@@ -925,10 +925,12 @@ impl HttpSession {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.
-    pub fn set_min_send_rate(&mut self, min_send_rate: usize) {
-        if min_send_rate > 0 {
-            self.min_send_rate = Some(min_send_rate);
+    /// is greater than zero, a send rate of zero is equivalent to disabling.
+    pub fn set_min_send_rate(&mut self, min_send_rate: Option<usize>) {
+        if let Some(rate) = min_send_rate.filter(|r| *r > 0) {
+            self.min_send_rate = Some(rate);
+        } else {
+            self.min_send_rate = None;
         }
     }
 
@@ -1914,7 +1916,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_secs(5);
 
-        http_stream.set_write_timeout(expected);
+        http_stream.set_write_timeout(Some(expected));
         assert_eq!(Some(expected), http_stream.write_timeout(50));
     }
 
@@ -1925,9 +1927,13 @@ mod tests_stream {
     }
 
     #[test]
-    fn test_get_write_timeout_min_send_rate_zero_noop() {
+    fn test_get_write_timeout_min_send_rate_zero() {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        http_stream.set_min_send_rate(0);
+        http_stream.set_min_send_rate(Some(0));
+        assert!(http_stream.write_timeout(50).is_none());
+
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        http_stream.set_min_send_rate(None);
         assert!(http_stream.write_timeout(50).is_none());
     }
 
@@ -1936,8 +1942,8 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_millis(29800);
 
-        http_stream.set_write_timeout(Duration::from_secs(60));
-        http_stream.set_min_send_rate(5000);
+        http_stream.set_write_timeout(Some(Duration::from_secs(60)));
+        http_stream.set_min_send_rate(Some(5000));
 
         assert_eq!(Some(expected), http_stream.write_timeout(149000));
     }
@@ -1947,7 +1953,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_secs(1);
 
-        http_stream.set_min_send_rate(1);
+        http_stream.set_min_send_rate(Some(1));
         assert_eq!(Some(expected), http_stream.write_timeout(0));
     }
 }

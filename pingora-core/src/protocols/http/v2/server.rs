@@ -213,8 +213,8 @@ impl HttpSession {
 
     /// Sets the total drain timeout. This `timeout` will be used while draining
     /// the request body.
-    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
-        self.total_drain_timeout = Some(timeout);
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        self.total_drain_timeout = timeout;
     }
 
     // the write_* don't have timeouts because the actual writing happens on the connection

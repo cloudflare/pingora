@@ -261,12 +261,8 @@ impl ProxyHttp for ExampleProxyHttp {
                 .adjust_level(0);
         }
 
-        if let Some(min_rate) = min_rate {
-            session.set_min_send_rate(min_rate);
-        }
-        if let Some(write_timeout) = write_timeout {
-            session.set_write_timeout(Duration::from_secs(write_timeout));
-        }
+        session.set_min_send_rate(min_rate);
+        session.set_write_timeout(write_timeout.map(Duration::from_secs));
 
         Ok(false)
     }

@@ -211,7 +211,7 @@ impl Session {
     /// to read from the stream after `timeout`.
     ///
     /// This is a noop for h2.
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
             Self::H2(_) => {}
@@ -223,7 +223,7 @@ impl Session {
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     ///
     /// This is a noop for h2.
-    pub fn set_write_timeout(&mut self, timeout: Duration) {
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_write_timeout(timeout),
             Self::H2(_) => {}
@@ -236,7 +236,7 @@ impl Session {
     /// For HTTP/1.1, reusing a session requires ensuring that the request body
     /// is consumed. If the timeout is exceeded, the caller should give up on
     /// trying to reuse the session.
-    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_total_drain_timeout(timeout),
             Self::H2(s) => s.set_total_drain_timeout(timeout),
@@ -250,10 +250,10 @@ impl Session {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.
+    /// is greater than zero, a send rate of zero is equivalent to disabling.
     ///
     /// This is a noop for h2.
-    pub fn set_min_send_rate(&mut self, rate: usize) {
+    pub fn set_min_send_rate(&mut self, rate: Option<usize>) {
         match self {
             Self::H1(s) => s.set_min_send_rate(rate),
             Self::H2(_) => {}
