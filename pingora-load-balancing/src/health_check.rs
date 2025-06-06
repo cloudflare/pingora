@@ -233,7 +233,7 @@ impl HealthCheck for HttpHealthCheck {
         session.finish_request_body().await?;
 
         if let Some(read_timeout) = peer.options.read_timeout {
-            session.set_read_timeout(read_timeout);
+            session.set_read_timeout(Some(read_timeout));
         }
 
         session.read_response_header().await?;
