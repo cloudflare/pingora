@@ -294,6 +294,17 @@ impl BodyReader {
                             .read(&mut body_buf[expecting_from_io..])
                             .await
                             .or_err(ReadError, "when reading body")?;
+                        if new_bytes == 0 {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                ConnectionClosed,
+                                format!(
+                                    "Connection prematurely closed without the termination chunk \
+                                    (partial chunk head), read {total_read} bytes"
+                                ),
+                            );
+                        }
+
                         /* more data is read, extend the buffer */
                         existing_buf_end = expecting_from_io + new_bytes;
                         expecting_from_io = 0;
@@ -830,6 +841,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_with_body_1_chunk_incomplete() {
+        init_log();
+        let input1 = b"1\r\na\r\n";
+        let mut mock_io = Builder::new().read(&input1[..]).build();
+        let mut body_reader = BodyReader::new();
+        body_reader.init_chunked(b"");
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(res, BufRef::new(3, 1));
+        assert_eq!(&input1[3..4], body_reader.get_body(&res));
+        assert_eq!(body_reader.body_state, ParseState::Chunked(1, 0, 0, 0));
+        let res = body_reader.read_body(&mut mock_io).await;
+        assert!(res.is_err());
+        assert_eq!(body_reader.body_state, ParseState::Done(1));
+    }
+
+    #[tokio::test]
     async fn read_with_body_1_chunk_rewind() {
         init_log();
         let rewind = b"1\r\nx\r\n";
@@ -911,6 +938,21 @@ mod tests {
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(1));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_partial_head_chunk_incomplete() {
+        init_log();
+        let input1 = b"1\r";
+        let mut mock_io = Builder::new().read(&input1[..]).build();
+        let mut body_reader = BodyReader::new();
+        body_reader.init_chunked(b"");
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(res, BufRef::new(0, 0));
+        assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
+        let res = body_reader.read_body(&mut mock_io).await;
+        assert!(res.is_err());
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
