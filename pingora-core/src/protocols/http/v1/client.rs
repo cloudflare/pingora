@@ -72,7 +72,7 @@ impl HttpSession {
             buf: Bytes::new(), // zero size, will be replaced by parsed header later
             raw_header: None,
             preread_body: None,
-            body_reader: BodyReader::new(),
+            body_reader: BodyReader::new(true),
             body_writer: BodyWriter::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             response_header: None,
@@ -413,6 +413,12 @@ impl HttpSession {
     pub fn respect_keepalive(&mut self) {
         if self.get_status() == Some(StatusCode::SWITCHING_PROTOCOLS) {
             // make sure the connection is closed at the end when 101/upgrade is used
+            self.set_keepalive(None);
+            return;
+        }
+        if self.body_reader.has_bytes_overread() {
+            // if more bytes sent than expected, there are likely more bytes coming
+            // so don't reuse this connection
             self.set_keepalive(None);
             return;
         }
@@ -800,6 +806,30 @@ mod tests_stream {
         let res = http_stream.read_body_ref().await.unwrap();
         assert_eq!(res, None);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+    }
+
+    #[tokio::test]
+    async fn read_response_overread() {
+        init_log();
+        let input_header = b"HTTP/1.1 200 OK\r\n";
+        let input_header2 = b"Content-Length: 2\r\n\r\n";
+        let input_body = b"abc";
+        let mock_io = Builder::new()
+            .read(&input_header[..])
+            .read(&input_header2[..])
+            .read(&input_body[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert_eq!(input_header.len() + input_header2.len(), res.unwrap());
+        let res = http_stream.read_body_ref().await.unwrap();
+        assert_eq!(res.unwrap(), &input_body[..2]);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(2));
+        let res = http_stream.read_body_ref().await.unwrap();
+        assert_eq!(res, None);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(2));
+        http_stream.respect_keepalive();
+        assert!(!http_stream.will_keepalive());
     }
 
     #[tokio::test]

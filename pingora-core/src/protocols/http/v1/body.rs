@@ -103,15 +103,19 @@ pub struct BodyReader {
     pub body_buf: Option<BytesMut>,
     pub body_buf_size: usize,
     rewind_buf_len: usize,
+    upstream: bool,
+    body_buf_overread: Option<BytesMut>,
 }
 
 impl BodyReader {
-    pub fn new() -> Self {
+    pub fn new(upstream: bool) -> Self {
         BodyReader {
             body_state: PS::ToStart,
             body_buf: None,
             body_buf_size: BODY_BUFFER_SIZE,
             rewind_buf_len: 0,
+            upstream,
+            body_buf_overread: None,
         }
     }
 
@@ -164,12 +168,28 @@ impl BodyReader {
         buf_ref.get(self.body_buf.as_ref().unwrap())
     }
 
+    fn get_body_overread(&self) -> Option<&[u8]> {
+        self.body_buf_overread.as_deref()
+    }
+
+    pub fn has_bytes_overread(&self) -> bool {
+        self.get_body_overread().is_some_and(|b| !b.is_empty())
+    }
+
     pub fn body_done(&self) -> bool {
         matches!(self.body_state, PS::Complete(_) | PS::Done(_))
     }
 
     pub fn body_empty(&self) -> bool {
         self.body_state == PS::Complete(0)
+    }
+
+    fn finish_body_buf(&mut self, end_of_body: usize, total_read: usize) {
+        let body_buf_mut = self.body_buf.as_mut().expect("must have read body buf");
+        // remove unused buffer
+        body_buf_mut.truncate(total_read);
+        let overread_bytes = body_buf_mut.split_off(end_of_body);
+        self.body_buf_overread = (!overread_bytes.is_empty()).then_some(overread_bytes);
     }
 
     pub async fn read_body<S>(&mut self, stream: &mut S) -> Result<Option<BufRef>>
@@ -194,10 +214,12 @@ impl BodyReader {
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
-            // should not discard remaining data if peer send more.
-            if let PS::Partial(_, to_read) = self.body_state {
-                if to_read < body_buf.len() {
-                    body_buf = &mut body_buf[..to_read];
+            // downstream should not discard remaining data if peer sent more.
+            if !self.upstream {
+                if let PS::Partial(_, to_read) = self.body_state {
+                    if to_read < body_buf.len() {
+                        body_buf = &mut body_buf[..to_read];
+                    }
                 }
             }
             /* Need to actually read */
@@ -227,6 +249,7 @@ impl BodyReader {
                         )
                     }
                     self.body_state = PS::Complete(read + to_read);
+                    self.finish_body_buf(to_read, n);
                     Ok(Some(BufRef::new(0, to_read)))
                 } else {
                     self.body_state = PS::Partial(read + n, to_read - n);
@@ -658,7 +681,7 @@ mod tests {
         init_log();
         let input = b"abc";
         let mut mock_io = Builder::new().read(&input[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_content_length(3, b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 3));
@@ -672,7 +695,7 @@ mod tests {
         let input1 = b"a";
         let input2 = b"bc";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_content_length(3, b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
@@ -690,7 +713,7 @@ mod tests {
         let input1 = b"a";
         let input2 = b""; // simulating close
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_content_length(3, b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
@@ -707,7 +730,7 @@ mod tests {
         let input1 = b"a";
         let input2 = b"bcd";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_content_length(3, b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
@@ -725,12 +748,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_with_body_content_length_overread() {
+        init_log();
+        let input1 = b"a";
+        let input2 = b"bcd";
+        let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut body_reader = BodyReader::new(true);
+        body_reader.init_content_length(3, b"");
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(res, BufRef::new(0, 1));
+        assert_eq!(body_reader.body_state, ParseState::Partial(1, 2));
+        assert_eq!(input1, body_reader.get_body(&res));
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(res, BufRef::new(0, 2));
+        assert_eq!(body_reader.body_state, ParseState::Complete(3));
+        assert_eq!(&input2[0..2], body_reader.get_body(&res));
+        assert_eq!(body_reader.get_body_overread(), Some(&b"d"[..]));
+    }
+
+    #[tokio::test]
     async fn read_with_body_content_length_rewind() {
         init_log();
         let rewind = b"ab";
         let input = b"c";
         let mut mock_io = Builder::new().read(&input[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_content_length(3, rewind);
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 2));
@@ -748,7 +790,7 @@ mod tests {
         let input1 = b"a";
         let input2 = b""; // simulating close
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_http10(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
@@ -766,7 +808,7 @@ mod tests {
         let input1 = b"c";
         let input2 = b""; // simulating close
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_http10(rewind);
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 2));
@@ -786,7 +828,7 @@ mod tests {
         init_log();
         let input = b"0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
         assert_eq!(res, None);
@@ -798,7 +840,7 @@ mod tests {
         init_log();
         let input = b"0;aaaa\r\n\r\n";
         let mut mock_io = Builder::new().read(&input[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
         assert_eq!(res, None);
@@ -816,7 +858,7 @@ mod tests {
             .read(&ext1[..])
             .read(&ext2[..])
             .build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         // read chunk-size, chunk incomplete
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
@@ -836,7 +878,7 @@ mod tests {
         let input1 = b"1\r\na\r\n";
         let input2 = b"0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(3, 1));
@@ -852,7 +894,7 @@ mod tests {
         init_log();
         let input1 = b"1\r\na\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(3, 1));
@@ -870,7 +912,7 @@ mod tests {
         let input1 = b"1\r\na\r\n";
         let input2 = b"0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(rewind);
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(3, 1));
@@ -891,7 +933,7 @@ mod tests {
         let input1 = b"1\r\na\r\n2\r\nbc\r\n";
         let input2 = b"0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(3, 1));
@@ -912,7 +954,7 @@ mod tests {
         let input1 = b"3\r\na";
         let input2 = b"bc\r\n0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(3, 1));
@@ -933,7 +975,7 @@ mod tests {
         let input1 = b"1\r";
         let input2 = b"\na\r\n0\r\n\r\n";
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 0));
@@ -952,7 +994,7 @@ mod tests {
         init_log();
         let input1 = b"1\r";
         let mut mock_io = Builder::new().read(&input1[..]).build();
-        let mut body_reader = BodyReader::new();
+        let mut body_reader = BodyReader::new(false);
         body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 0));

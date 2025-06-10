@@ -101,7 +101,7 @@ impl HttpSession {
             buf: Bytes::new(), // zero size, with be replaced by parsed header later
             raw_header: None,
             preread_body: None,
-            body_reader: BodyReader::new(),
+            body_reader: BodyReader::new(false),
             body_writer: BodyWriter::new(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
