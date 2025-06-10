@@ -540,6 +540,8 @@ impl<SV> HttpProxy<SV> {
                                             NoCacheReason::ResponseTooLarge,
                                         );
                                         session.cache.disable(NoCacheReason::ResponseTooLarge);
+                                        // too large to cache, disable ranging
+                                        session.ignore_downstream_range = true;
                                     }
                                 }
                                 // if the content-length header is not specified, the miss handler
