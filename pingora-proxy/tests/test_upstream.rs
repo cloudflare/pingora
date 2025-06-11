@@ -47,6 +47,8 @@ async fn test_duplex() {
         .send()
         .await
         .unwrap();
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "keep-alive");
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
@@ -108,6 +110,25 @@ async fn test_upload() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
+}
+
+#[tokio::test]
+async fn test_close_on_response_before_downstream_finish() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/test2")
+        .header("x-close-on-response-before-downstream-finish", "1")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "close");
+    let body = res.text().await.unwrap();
+    assert_eq!(body.len(), 11);
 }
 
 #[tokio::test]

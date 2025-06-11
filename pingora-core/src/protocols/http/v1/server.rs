@@ -79,6 +79,8 @@ pub struct HttpSession {
     min_send_rate: Option<usize>,
     /// When this is enabled informational response headers will not be proxied downstream
     ignore_info_resp: bool,
+    /// Disable keepalive if response is sent before downstream body is finished
+    close_on_response_before_downstream_finish: bool,
 }
 
 impl HttpSession {
@@ -116,6 +118,7 @@ impl HttpSession {
             digest,
             min_send_rate: None,
             ignore_info_resp: false,
+            close_on_response_before_downstream_finish: false,
         }
     }
 
@@ -467,6 +470,11 @@ impl HttpSession {
                 warn!("Respond header is already sent, cannot send again");
                 return Ok(());
             }
+        }
+
+        if self.close_on_response_before_downstream_finish && !self.is_body_done() {
+            debug!("set connection close before downstream finish");
+            self.set_keepalive(None);
         }
 
         // no need to add these headers to 1xx responses
@@ -944,6 +952,14 @@ impl HttpSession {
     /// Expect: 100-continue was set on the request.
     pub fn set_ignore_info_resp(&mut self, ignore: bool) {
         self.ignore_info_resp = ignore;
+    }
+
+    /// Sets whether keepalive should be disabled if response is written prior to
+    /// downstream body finishing.
+    ///
+    /// This may be set to avoid draining downstream if the body is no longer necessary.
+    pub fn set_close_on_response_before_downstream_finish(&mut self, close: bool) {
+        self.close_on_response_before_downstream_finish = close;
     }
 
     /// Return the [Digest] of the connection.
