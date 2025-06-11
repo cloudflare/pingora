@@ -27,12 +27,25 @@ use std::slice;
 use std::str;
 
 /// The max delta-second per [RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-1.2.2)
-// "If a cache receives a delta-seconds
-// value greater than the greatest integer it can represent, or if any
-// of its subsequent calculations overflows, the cache MUST consider the
-// value to be either 2147483648 (2^31) or the greatest positive integer
-// it can conveniently represent."
-pub const DELTA_SECONDS_OVERFLOW_VALUE: u32 = 2147483648;
+// "If a cache receives a delta-seconds value
+// greater than the greatest integer it can represent, or if any of its
+// subsequent calculations overflows, the cache MUST consider the value
+// to be 2147483648 (2^31) or the greatest positive integer it can
+// conveniently represent.
+//
+//    |  *Note:* The value 2147483648 is here for historical reasons,
+//    |  represents infinity (over 68 years), and does not need to be
+//    |  stored in binary form; an implementation could produce it as a
+//    |  string if any overflow occurs, even if the calculations are
+//    |  performed with an arithmetic type incapable of directly
+//    |  representing that number.  What matters here is that an
+//    |  overflow be detected and not treated as a negative value in
+//    |  later calculations."
+//
+// We choose to use i32::MAX for our overflow value to stick to the letter of the RFC.
+pub const DELTA_SECONDS_OVERFLOW_VALUE: u32 = i32::MAX as u32;
+pub const DELTA_SECONDS_OVERFLOW_DURATION: Duration =
+    Duration::from_secs(DELTA_SECONDS_OVERFLOW_VALUE as u64);
 
 /// Cache control directive key type
 pub type DirectiveKey = String;
@@ -332,36 +345,40 @@ impl InterpretCacheControl for CacheControl {
         self.must_revalidate() || self.public() || self.has_key("s-maxage")
     }
 
-    fn fresh_sec(&self) -> Option<u32> {
+    fn fresh_duration(&self) -> Option<Duration> {
         if self.no_cache() {
             // always treated as stale
-            return Some(0);
+            return Some(Duration::ZERO);
         }
         match self.s_maxage() {
-            Ok(Some(seconds)) => Some(seconds),
+            Ok(Some(duration)) => Some(Duration::from_secs(duration as u64)),
             // s-maxage not present
             Ok(None) => match self.max_age() {
-                Ok(Some(seconds)) => Some(seconds),
+                Ok(Some(duration)) => Some(Duration::from_secs(duration as u64)),
                 _ => None,
             },
             _ => None,
         }
     }
 
-    fn serve_stale_while_revalidate_sec(&self) -> Option<u32> {
+    fn serve_stale_while_revalidate_duration(&self) -> Option<Duration> {
         // RFC 7234: these directives forbid serving stale.
         // https://datatracker.ietf.org/doc/html/rfc7234#section-4.2.4
         if self.must_revalidate() || self.proxy_revalidate() || self.has_key("s-maxage") {
-            return Some(0);
+            return Some(Duration::ZERO);
         }
-        self.stale_while_revalidate().unwrap_or(None)
+        self.stale_while_revalidate()
+            .unwrap_or(None)
+            .map(|secs| Duration::from_secs(secs as u64))
     }
 
-    fn serve_stale_if_error_sec(&self) -> Option<u32> {
+    fn serve_stale_if_error_duration(&self) -> Option<Duration> {
         if self.must_revalidate() || self.proxy_revalidate() || self.has_key("s-maxage") {
-            return Some(0);
+            return Some(Duration::ZERO);
         }
-        self.stale_if_error().unwrap_or(None)
+        self.stale_if_error()
+            .unwrap_or(None)
+            .map(|secs| Duration::from_secs(secs as u64))
     }
 
     // Strip header names listed in `private` or `no-cache` directives from a response.
@@ -408,9 +425,9 @@ pub trait InterpretCacheControl {
 
     /// Returns freshness ttl specified in cache-control
     ///
-    /// - `Some(_)` indicates cache-control specifies a valid ttl. Some(0) = always stale.
+    /// - `Some(_)` indicates cache-control specifies a valid ttl. Some(Duration::ZERO) = always stale.
     /// - `None` means cache-control did not specify a valid ttl.
-    fn fresh_sec(&self) -> Option<u32>;
+    fn fresh_duration(&self) -> Option<Duration>;
 
     /// Returns stale-while-revalidate ttl,
     ///
@@ -420,7 +437,7 @@ pub trait InterpretCacheControl {
     /// or `stale-while-revalidater=0`.
     ///
     /// `None` indicates no SWR ttl was specified.
-    fn serve_stale_while_revalidate_sec(&self) -> Option<u32>;
+    fn serve_stale_while_revalidate_duration(&self) -> Option<Duration>;
 
     /// Returns stale-if-error ttl,
     ///
@@ -430,7 +447,7 @@ pub trait InterpretCacheControl {
     /// or `stale-if-error=0`.
     ///
     /// `None` indicates no SIE ttl was specified.
-    fn serve_stale_if_error_sec(&self) -> Option<u32>;
+    fn serve_stale_if_error_duration(&self) -> Option<Duration>;
 
     /// Strip header names listed in `private` or `no-cache` directives from a response,
     /// usually prior to storing that response in cache.
@@ -644,16 +661,16 @@ mod tests {
     fn test_fresh_sec() {
         let resp = build_response(CACHE_CONTROL, "");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
-        assert!(cc.fresh_sec().is_none());
+        assert!(cc.fresh_duration().is_none());
 
         let resp = build_response(CACHE_CONTROL, "max-age=12345");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
-        assert_eq!(cc.fresh_sec().unwrap(), 12345);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(12345));
 
         let resp = build_response(CACHE_CONTROL, "max-age=99999,s-maxage=123");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         // prefer s-maxage over max-age
-        assert_eq!(cc.fresh_sec().unwrap(), 123);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(123));
     }
 
     #[test]
@@ -686,7 +703,7 @@ mod tests {
         let resp = build_response(CACHE_CONTROL, "no-cache, max-age=12345");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         assert_eq!(cc.is_cacheable(), Cacheable::Yes);
-        assert_eq!(cc.fresh_sec().unwrap(), 0);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::ZERO);
     }
 
     #[test]
@@ -695,7 +712,7 @@ mod tests {
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         assert!(!cc.private());
         assert_eq!(cc.is_cacheable(), Cacheable::Yes);
-        assert_eq!(cc.fresh_sec().unwrap(), 12345);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(12345));
         let mut field_names = cc.no_cache_field_names().unwrap();
         assert_eq!(
             str::from_utf8(field_names.next().unwrap()).unwrap(),
@@ -750,8 +767,11 @@ mod tests {
         let resp = build_response(CACHE_CONTROL, "max-age=12345, stale-while-revalidate=5");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         assert_eq!(cc.stale_while_revalidate().unwrap().unwrap(), 5);
-        assert_eq!(cc.serve_stale_while_revalidate_sec().unwrap(), 5);
-        assert!(cc.serve_stale_if_error_sec().is_none());
+        assert_eq!(
+            cc.serve_stale_while_revalidate_duration().unwrap(),
+            Duration::from_secs(5)
+        );
+        assert!(cc.serve_stale_if_error_duration().is_none());
     }
 
     #[test]
@@ -759,8 +779,11 @@ mod tests {
         let resp = build_response(CACHE_CONTROL, "max-age=12345, stale-if-error=3600");
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         assert_eq!(cc.stale_if_error().unwrap().unwrap(), 3600);
-        assert_eq!(cc.serve_stale_if_error_sec().unwrap(), 3600);
-        assert!(cc.serve_stale_while_revalidate_sec().is_none());
+        assert_eq!(
+            cc.serve_stale_if_error_duration().unwrap(),
+            Duration::from_secs(3600)
+        );
+        assert!(cc.serve_stale_while_revalidate_duration().is_none());
     }
 
     #[test]
@@ -773,8 +796,11 @@ mod tests {
         assert!(cc.must_revalidate());
         assert_eq!(cc.stale_while_revalidate().unwrap().unwrap(), 60);
         assert_eq!(cc.stale_if_error().unwrap().unwrap(), 30);
-        assert_eq!(cc.serve_stale_while_revalidate_sec().unwrap(), 0);
-        assert_eq!(cc.serve_stale_if_error_sec().unwrap(), 0);
+        assert_eq!(
+            cc.serve_stale_while_revalidate_duration().unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(cc.serve_stale_if_error_duration().unwrap(), Duration::ZERO);
     }
 
     #[test]
@@ -787,8 +813,11 @@ mod tests {
         assert!(cc.proxy_revalidate());
         assert_eq!(cc.stale_while_revalidate().unwrap().unwrap(), 60);
         assert_eq!(cc.stale_if_error().unwrap().unwrap(), 30);
-        assert_eq!(cc.serve_stale_while_revalidate_sec().unwrap(), 0);
-        assert_eq!(cc.serve_stale_if_error_sec().unwrap(), 0);
+        assert_eq!(
+            cc.serve_stale_while_revalidate_duration().unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(cc.serve_stale_if_error_duration().unwrap(), Duration::ZERO);
     }
 
     #[test]
@@ -800,8 +829,11 @@ mod tests {
         let cc = CacheControl::from_resp_headers(&resp).unwrap();
         assert_eq!(cc.stale_while_revalidate().unwrap().unwrap(), 60);
         assert_eq!(cc.stale_if_error().unwrap().unwrap(), 30);
-        assert_eq!(cc.serve_stale_while_revalidate_sec().unwrap(), 0);
-        assert_eq!(cc.serve_stale_if_error_sec().unwrap(), 0);
+        assert_eq!(
+            cc.serve_stale_while_revalidate_duration().unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(cc.serve_stale_if_error_duration().unwrap(), Duration::ZERO);
     }
 
     #[test]
