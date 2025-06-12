@@ -149,7 +149,11 @@ impl HttpSession {
                             return Ok(None);
                         }
                     },
-                    _ => match self.read_timeout {
+                    KeepaliveStatus::Infinite => {
+                        // FIXME: this should only apply to reads between requests
+                        read_event.await
+                    }
+                    KeepaliveStatus::Off => match self.read_timeout {
                         Some(t) => match timeout(t, read_event).await {
                             Ok(res) => res,
                             Err(e) => {
