@@ -94,7 +94,7 @@ pub fn ssl_set_verify_cert_store(
 /// See [SSL_use_certificate](https://www.openssl.org/docs/man1.1.1/man3/SSL_use_certificate.html).
 pub fn ssl_use_certificate(ssl: &mut SslRef, cert: &X509Ref) -> Result<(), ErrorStack> {
     unsafe {
-        cvt(SSL_use_certificate(ssl.as_ptr() as *mut SSL, cert.as_ptr() as *mut X509) as c_long)?;
+        cvt(SSL_use_certificate(ssl.as_ptr(), cert.as_ptr()) as c_long)?;
     }
     Ok(())
 }
@@ -107,7 +107,7 @@ where
     T: HasPrivate,
 {
     unsafe {
-        cvt(SSL_use_PrivateKey(ssl.as_ptr() as *mut SSL, key.as_ptr() as *mut EVP_PKEY) as c_long)?;
+        cvt(SSL_use_PrivateKey(ssl.as_ptr(), key.as_ptr()) as c_long)?;
     }
     Ok(())
 }
