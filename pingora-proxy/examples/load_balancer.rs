@@ -40,7 +40,11 @@ impl ProxyHttp for LB {
 
         info!("upstream peer is: {:?}", upstream);
 
-        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(
+            upstream,
+            true,
+            "one.one.one.one".to_string(),
+        )?);
         Ok(peer)
     }
 
