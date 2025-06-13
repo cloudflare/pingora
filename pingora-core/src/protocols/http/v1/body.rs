@@ -341,11 +341,7 @@ impl BodyReader {
                             return Ok(Some(BufRef::new(0, existing_buf_end)));
                         }
                         /* could be expecting DATA + CRLF or just CRLF */
-                        let payload_size = if expecting_from_io > 2 {
-                            expecting_from_io - 2
-                        } else {
-                            0
-                        };
+                        let payload_size = expecting_from_io.saturating_sub(2);
                         /* expecting_from_io < existing_buf_end + 2 */
                         if expecting_from_io >= existing_buf_end {
                             self.body_state = self
