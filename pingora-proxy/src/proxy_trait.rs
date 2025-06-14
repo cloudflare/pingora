@@ -64,6 +64,11 @@ pub trait ProxyHttp {
     /// If the user already sent a response to this request, an `Ok(true)` should be returned so that
     /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
     ///
+    /// When sending a response (such as a redirect) and returning `Ok(true)`, ensure the response
+    /// is properly terminated by:
+    /// 1. Setting the `Content-Length` header to `0` (e.g., for redirect or error responses with no body)
+    /// 2. Setting `end: true` in the write_response_body call
+    ///
     /// By default this filter does nothing and returns `Ok(false)`.
     async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
     where
