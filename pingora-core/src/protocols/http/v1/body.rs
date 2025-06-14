@@ -190,10 +190,16 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let body_buf = self.body_buf.as_deref_mut().unwrap();
+        let mut body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
+            // should not discard remaining data if peer send more.
+            if let PS::Partial(_, to_read) = self.body_state {
+                if to_read < body_buf.len() {
+                    body_buf = &mut body_buf[..to_read];
+                }
+            }
             /* Need to actually read */
             n = stream
                 .read(body_buf)
@@ -711,6 +717,11 @@ mod tests {
         assert_eq!(res, BufRef::new(0, 2));
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(&input2[0..2], body_reader.get_body(&res));
+        // read remaining data
+        body_reader.init_content_length(1, b"");
+        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.body_state, ParseState::Complete(1));
+        assert_eq!(&input2[2..], body_reader.get_body(&res));
     }
 
     #[tokio::test]
