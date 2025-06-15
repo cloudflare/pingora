@@ -86,6 +86,10 @@ pub struct TcpSocketOptions {
     /// Specifies the server should set the following DSCP value on outgoing connections.
     /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
     pub dscp: Option<u8>,
+    /// Enable SO_REUSEPORT to allow multiple sockets to bind to the same address and port.
+    /// This is useful for load balancing across multiple worker processes.
+    /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
+    pub so_reuseport: Option<bool>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -151,12 +155,21 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
     let Some(opt) = opt else {
         return Ok(());
     };
+
+    let socket_ref = socket2::SockRef::from(sock);
+
     if let Some(ipv6_only) = opt.ipv6_only {
-        let socket_ref = socket2::SockRef::from(sock);
         socket_ref
             .set_only_v6(ipv6_only)
             .or_err(BindError, "failed to set IPV6_V6ONLY")?;
     }
+
+    if let Some(reuseport) = opt.so_reuseport {
+        socket_ref
+            .set_reuse_port(reuseport)
+            .or_err(BindError, "failed to set SO_REUSEPORT")?;
+    }
+
     #[cfg(unix)]
     let raw = sock.as_raw_fd();
     #[cfg(windows)]
@@ -253,7 +266,7 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
     listener: Arc<Listener>,
@@ -432,5 +445,64 @@ mod test {
         tokio::net::UnixStream::connect(addr)
             .await
             .expect("can connect to UDS listener");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_so_reuseport() {
+        let addr = "127.0.0.1:7201";
+        let sock_opt = TcpSocketOptions {
+            so_reuseport: Some(true),
+            ..Default::default()
+        };
+
+        // Create first listener with SO_REUSEPORT
+        let mut builder1 = ListenerEndpoint::builder();
+        builder1.listen_addr(ServerAddress::Tcp(addr.into(), Some(sock_opt.clone())));
+        let listener1 = builder1.listen(None).await.unwrap();
+
+        // Create second listener with the same address and SO_REUSEPORT
+        // This should succeed because SO_REUSEPORT is enabled
+        let mut builder2 = ListenerEndpoint::builder();
+        builder2.listen_addr(ServerAddress::Tcp(addr.into(), Some(sock_opt)));
+        let listener2 = builder2.listen(None).await.unwrap();
+
+        // Both listeners should be able to bind to the same address
+        assert_eq!(listener1.as_str(), addr);
+        assert_eq!(listener2.as_str(), addr);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_so_reuseport_false() {
+        let addr = "127.0.0.1:7202";
+        let sock_opt_no_reuseport = TcpSocketOptions {
+            so_reuseport: Some(false), // Explicitly disable SO_REUSEPORT
+            ..Default::default()
+        };
+
+        // Create first listener without SO_REUSEPORT
+        let mut builder1 = ListenerEndpoint::builder();
+        builder1.listen_addr(ServerAddress::Tcp(
+            addr.into(),
+            Some(sock_opt_no_reuseport.clone()),
+        ));
+        let listener1 = builder1.listen(None).await.unwrap();
+
+        // Try to create second listener with the same address and no SO_REUSEPORT
+        // This should fail with "address already in use"
+        let mut builder2 = ListenerEndpoint::builder();
+        builder2.listen_addr(ServerAddress::Tcp(addr.into(), Some(sock_opt_no_reuseport)));
+        let result = builder2.listen(None).await;
+
+        // The second bind should fail
+        assert!(result.is_err());
+        let error_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            error_msg.contains("address")
+                || error_msg.contains("in use")
+                || error_msg.contains("bind")
+        );
+
+        // Verify the first listener still works
+        assert_eq!(listener1.as_str(), addr);
     }
 }
