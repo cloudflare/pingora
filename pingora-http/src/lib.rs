@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -55,6 +55,11 @@ same order of the map of header values.
 This idea is inspaired by hyper @nox
 */
 type CaseMap = HMap<CaseHeaderName>;
+
+pub enum HeaderNameVariant<'a> {
+    Case(&'a CaseHeaderName),
+    Titled(&'a str),
+}
 
 /// The HTTP request header type.
 ///
@@ -84,6 +89,12 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
+    }
+}
+
+impl DerefMut for RequestHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
     }
 }
 
@@ -198,6 +209,33 @@ impl RequestHeader {
     /// Returns true if the request has case-sensitive headers.
     pub fn has_case(&self) -> bool {
         self.header_name_map.is_some()
+    }
+
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Set the request method
@@ -349,6 +387,12 @@ impl Deref for ResponseHeader {
     }
 }
 
+impl DerefMut for ResponseHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
 impl Clone for ResponseHeader {
     fn clone(&self) -> Self {
         Self {
@@ -491,6 +535,33 @@ impl ResponseHeader {
         self.header_name_map.is_some()
     }
 
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set the status code
     pub fn set_status(&mut self, status: impl TryInto<StatusCode>) -> Result<()> {
         self.base.status = status
@@ -546,6 +617,7 @@ fn clone_req_parts(me: &ReqParts) -> ReqParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 
@@ -558,6 +630,7 @@ fn clone_resp_parts(me: &RespParts) -> RespParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 

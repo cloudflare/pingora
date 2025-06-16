@@ -42,7 +42,7 @@ pub mod noop_tls;
 pub use noop_tls::*;
 
 /// The protocol for Application-Layer Protocol Negotiation
-#[derive(Hash, Clone, Debug)]
+#[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum ALPN {
     /// Prefer HTTP/1.1 only
     H1,
@@ -50,6 +50,54 @@ pub enum ALPN {
     H2,
     /// Prefer HTTP/2 over HTTP/1.1
     H2H1,
+    /// Custom Protocol is stored in wire format (length-prefixed)
+    /// Wire format is precomputed at creation to avoid dangling references
+    Custom(CustomALPN),
+}
+
+/// Represents a Custom ALPN Protocol with a precomputed wire format and header offset.
+#[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
+pub struct CustomALPN {
+    wire: Vec<u8>,
+    header: usize,
+}
+
+impl CustomALPN {
+    /// Create a new CustomALPN from a protocol byte vector
+    pub fn new(proto: Vec<u8>) -> Self {
+        // Validate before setting
+        assert!(!proto.is_empty(), "Custom ALPN protocol must not be empty");
+        // RFC-7301
+        assert!(
+            proto.len() <= 255,
+            "ALPN protocol name must be 255 bytes or fewer"
+        );
+
+        match proto.as_slice() {
+            b"http/1.1" | b"h2" => {
+                panic!("Custom ALPN cannot be a reserved protocol (http/1.1 or h2)")
+            }
+            _ => {}
+        }
+        let mut wire = Vec::with_capacity(1 + proto.len());
+        wire.push(proto.len() as u8);
+        wire.extend_from_slice(&proto);
+
+        Self {
+            wire,
+            header: 1, // Header is always at index 1 since we prefix one length byte
+        }
+    }
+
+    /// Get the custom protocol name as a slice
+    pub fn protocol(&self) -> &[u8] {
+        &self.wire[self.header..]
+    }
+
+    /// Get the wire format used for ALPN negotiation
+    pub fn as_wire(&self) -> &[u8] {
+        &self.wire
+    }
 }
 
 impl std::fmt::Display for ALPN {
@@ -58,6 +106,13 @@ impl std::fmt::Display for ALPN {
             ALPN::H1 => write!(f, "H1"),
             ALPN::H2 => write!(f, "H2"),
             ALPN::H2H1 => write!(f, "H2H1"),
+            ALPN::Custom(custom) => {
+                // extract protocol name, print as UTF-8 if possible, else judt itd raw bytes
+                match std::str::from_utf8(custom.protocol()) {
+                    Ok(s) => write!(f, "Custom({})", s),
+                    Err(_) => write!(f, "Custom({:?})", custom.protocol()),
+                }
+            }
         }
     }
 }
@@ -78,15 +133,17 @@ impl ALPN {
     pub fn get_max_http_version(&self) -> u8 {
         match self {
             ALPN::H1 => 1,
-            _ => 2,
+            ALPN::H2 | ALPN::H2H1 => 2,
+            ALPN::Custom(_) => 0,
         }
     }
 
     /// Return the min http version this [`ALPN`] allows
     pub fn get_min_http_version(&self) -> u8 {
         match self {
+            ALPN::H1 | ALPN::H2H1 => 1,
             ALPN::H2 => 2,
-            _ => 1,
+            ALPN::Custom(_) => 0,
         }
     }
 
@@ -98,6 +155,7 @@ impl ALPN {
             Self::H1 => b"\x08http/1.1",
             Self::H2 => b"\x02h2",
             Self::H2H1 => b"\x02h2\x08http/1.1",
+            Self::Custom(custom) => custom.as_wire(),
         }
     }
 
@@ -106,7 +164,7 @@ impl ALPN {
         match raw {
             b"http/1.1" => Some(Self::H1),
             b"h2" => Some(Self::H2),
-            _ => None,
+            _ => Some(Self::Custom(CustomALPN::new(raw.to_vec()))),
         }
     }
 
@@ -116,6 +174,7 @@ impl ALPN {
             ALPN::H1 => vec![b"http/1.1".to_vec()],
             ALPN::H2 => vec![b"h2".to_vec()],
             ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ALPN::Custom(custom) => vec![custom.protocol().to_vec()],
         }
     }
 
@@ -126,5 +185,49 @@ impl ALPN {
             ALPN::H2 => vec![b"h2".to_vec()],
             ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_alpn_construction_and_versions() {
+        // Standard Protocols
+        assert_eq!(ALPN::H1.get_min_http_version(), 1);
+        assert_eq!(ALPN::H1.get_max_http_version(), 1);
+
+        assert_eq!(ALPN::H2.get_min_http_version(), 2);
+        assert_eq!(ALPN::H2.get_max_http_version(), 2);
+
+        assert_eq!(ALPN::H2H1.get_min_http_version(), 1);
+        assert_eq!(ALPN::H2H1.get_max_http_version(), 2);
+
+        // Custom Protocol
+        let custom_protocol = ALPN::Custom(CustomALPN::new("custom/1.0".into()));
+        assert_eq!(custom_protocol.get_min_http_version(), 0);
+        assert_eq!(custom_protocol.get_max_http_version(), 0);
+    }
+    #[test]
+    #[should_panic(expected = "Custom ALPN protocol must not be empty")]
+    fn test_empty_custom_alpn() {
+        let _ = ALPN::Custom(CustomALPN::new("".into()));
+    }
+    #[test]
+    #[should_panic(expected = "ALPN protocol name must be 255 bytes or fewer")]
+    fn test_large_custom_alpn() {
+        let large_alpn = vec![b'a'; 256];
+        let _ = ALPN::Custom(CustomALPN::new(large_alpn));
+    }
+    #[test]
+    #[should_panic(expected = "Custom ALPN cannot be a reserved protocol (http/1.1 or h2)")]
+    fn test_custom_h1_alpn() {
+        let _ = ALPN::Custom(CustomALPN::new("http/1.1".into()));
+    }
+    #[test]
+    #[should_panic(expected = "Custom ALPN cannot be a reserved protocol (http/1.1 or h2)")]
+    fn test_custom_h2_alpn() {
+        let _ = ALPN::Custom(CustomALPN::new("h2".into()));
     }
 }

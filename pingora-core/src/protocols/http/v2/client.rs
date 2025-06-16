@@ -27,6 +27,7 @@ use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
@@ -51,7 +52,7 @@ pub struct Http2Session {
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// request.
     pub write_timeout: Option<Duration>,
-    pub(crate) conn: ConnectionRef,
+    pub conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
 }
@@ -176,7 +177,7 @@ impl Http2Session {
         }
 
         let Some(resp_fut) = self.resp_fut.take() else {
-            panic!("Try to  response header is already read")
+            panic!("Try to take response header, but it is already taken")
         };
 
         let res = match self.read_timeout {
@@ -191,6 +192,35 @@ impl Http2Session {
         self.response_body_reader = Some(body_reader);
 
         Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_response_header(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), h2::Error>> {
+        if self.response_header.is_some() {
+            panic!("H2 response header is already read")
+        }
+
+        let Some(mut resp_fut) = self.resp_fut.take() else {
+            panic!("Try to take response header, but it is already taken")
+        };
+
+        let res = match resp_fut.poll_unpin(cx) {
+            Poll::Ready(Ok(res)) => res,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {
+                self.resp_fut = Some(resp_fut);
+                return Poll::Pending;
+            }
+        };
+
+        let (resp, body_reader) = res.into_parts();
+        self.response_header = Some(resp.into());
+        self.response_body_reader = Some(body_reader);
+
+        Poll::Ready(Ok(()))
     }
 
     /// Read the response body
@@ -229,6 +259,30 @@ impl Http2Session {
         }
 
         Ok(body)
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_response_body(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let Some(body_reader) = self.response_body_reader.as_mut() else {
+            // req is not sent or response is already read
+            // TODO: warn
+            return Poll::Ready(None);
+        };
+
+        let data = match ready!(body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            body_reader.flow_control().release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
     }
 
     /// Whether the response has ended

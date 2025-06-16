@@ -26,6 +26,7 @@ use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
@@ -48,6 +49,7 @@ pub use h2::server::Builder as H2Options;
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
     let options = options.unwrap_or_default();
     let res = options.handshake(io).await;
+
     match res {
         Ok(connection) => {
             debug!("H2 handshake done.");
@@ -186,6 +188,27 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_body_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            self.body_read += data.len();
+            self.request_body_reader
+                .flow_control()
+                .release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
     }
 
     async fn do_drain_request_body(&mut self) -> Result<()> {
@@ -447,6 +470,11 @@ impl HttpSession {
         if !self.ended {
             self.send_response.send_reset(h2::Reason::INTERNAL_ERROR);
         }
+    }
+
+    #[doc(hidden)]
+    pub fn take_response_body_writer(&mut self) -> Option<SendStream<Bytes>> {
+        self.send_response_body.take()
     }
 
     // This is a hack for pingora-proxy to create subrequests from h2 server session

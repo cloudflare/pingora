@@ -29,6 +29,7 @@ pingora-http = { version = "0.6.0", path = "../pingora-http" }
 pingora-rustls = { version = "0.6.0", path = "../pingora-rustls", optional = true }
 pingora-s2n = { version = "0.6.0", path = "../pingora-s2n", optional = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
+tokio-stream = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
 httparse = { workspace = true }
@@ -87,6 +88,7 @@ reqwest = { version = "0.11", features = [
 ], default-features = false }
 hyper = "0.14"
 rstest = "0.23.0"
+rustls = "0.23"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"

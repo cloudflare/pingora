@@ -177,6 +177,19 @@ where
     // TODO: curve setup from peer
     // - second key share from peer, currently only used in boringssl with PQ features
 
+    // Patch config for dangerous verifier if needed, but only in test builds.
+    #[cfg(test)]
+    if !peer.verify_cert() || !peer.verify_hostname() {
+        use crate::connectors::http::rustls_no_verify::apply_no_verify;
+        if let Some(cfg) = updated_config_opt.as_mut() {
+            apply_no_verify(cfg);
+        } else {
+            let mut tmp = RusTlsClientConfig::clone(config);
+            apply_no_verify(&mut tmp);
+            updated_config_opt = Some(tmp);
+        }
+    }
+
     let tls_conn = if let Some(cfg) = updated_config_opt {
         RusTlsConnector::from(Arc::new(cfg))
     } else {
