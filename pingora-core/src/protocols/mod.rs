@@ -229,6 +229,46 @@ mod ext_io_impl {
 }
 
 #[cfg(unix)]
+pub mod ext_test {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::{
+        raw_connect, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
+        SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
+    };
+
+    #[async_trait]
+    impl Shutdown for tokio::net::UnixStream {
+        async fn shutdown(&mut self) -> () {}
+    }
+    impl UniqueID for tokio::net::UnixStream {
+        fn id(&self) -> UniqueIDType {
+            0
+        }
+    }
+    impl Ssl for tokio::net::UnixStream {}
+    impl GetTimingDigest for tokio::net::UnixStream {
+        fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
+            vec![]
+        }
+    }
+    impl GetProxyDigest for tokio::net::UnixStream {
+        fn get_proxy_digest(&self) -> Option<Arc<raw_connect::ProxyDigest>> {
+            None
+        }
+    }
+    impl GetSocketDigest for tokio::net::UnixStream {
+        fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+
+    impl Peek for tokio::net::UnixStream {}
+}
+
+#[cfg(unix)]
 pub(crate) trait ConnFdReusable {
     fn check_fd_match<V: AsRawFd>(&self, fd: V) -> bool;
 }

@@ -309,6 +309,51 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    // custom_forwarding is called when downstream and upstream connections are successfully established.
+    #[doc(hidden)]
+    async fn custom_forwarding(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: mpsc::Sender<Bytes>,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    // received a custom message from the downstream before sending it to the upstream.
+    #[doc(hidden)]
+    async fn downstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
+    }
+
+    // received a custom message from the upstream before sending it to the downstream.
+    #[doc(hidden)]
+    async fn upstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
+    }
+
     /// Similar to [Self::upstream_response_filter()] but for response body
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
