@@ -43,7 +43,7 @@ impl ProxyHttp for GrpcWebTextProxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
 
-        if content_type != GRPC_WEB_TEXT {
+        if !content_type.to_ascii_lowercase().starts_with(GRPC_WEB_TEXT) {
             let _ = session
                 .respond_error_with_body(400, "Not a grpc-web-text request".into())
                 .await?;
