@@ -33,6 +33,7 @@ once_cell = { workspace = true }
 clap = { version = "3.2.25", features = ["derive"] }
 regex = "1"
 
+
 [dev-dependencies]
 reqwest = { version = "0.11", features = [
     "gzip",
@@ -43,20 +44,25 @@ env_logger = "0.9"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
 pingora-limits = { version = "0.4.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.4.0", path = "../pingora-load-balancing", default-features=false }
+pingora-load-balancing = { version = "0.4.0", path = "../pingora-load-balancing", default-features = false }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.8"
+boring = "4.17.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 
 [features]
-default = []
+default = ["boringssl"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
-boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl", "openssl_derived"]
+boringssl = [
+    "pingora-core/boringssl",
+    "pingora-cache/boringssl",
+    "openssl_derived",
+]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
@@ -68,3 +74,7 @@ rustdoc-args = ["--cfg", "doc_async_trait"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }
+
+[[example]]
+name = "mtls"
+required_features = ["boringssl"]
