@@ -57,6 +57,14 @@ pub trait EvictionManager {
         fresh_until: SystemTime,
     ) -> Vec<CompactCacheKey>;
 
+    /// Adjust an item's weight upwards by a delta. If the item is not already admitted,
+    /// nothing will happen.
+    ///
+    /// Return one or more items to evict. The sizes of these items are deducted
+    /// from the total size already. The caller needs to make sure that these assets are actually
+    /// removed from the storage.
+    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey>;
+
     /// Remove an item from the eviction manager.
     ///
     /// The size of the item will be deducted.

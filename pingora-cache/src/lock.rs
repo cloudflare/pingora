@@ -18,6 +18,9 @@ use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
 
 use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::time::Duration;
+
+pub type CacheKeyLockImpl = (dyn CacheKeyLock + Send + Sync);
 
 pub trait CacheKeyLock {
     /// Try to lock a cache fetch
@@ -30,7 +33,14 @@ pub trait CacheKeyLock {
     ///
     /// When the write lock is dropped without being released, the read lock holders will consider
     /// it to be failed so that they will compete for the write lock again.
-    fn release(&self, key: &CacheKey, reason: LockStatus);
+    fn release(&self, key: &CacheKey, permit: WritePermit, reason: LockStatus);
+
+    /// Configured reader wait timeout for this cache lock
+    ///
+    /// This controls how long any given reader is allowed to wait on cache locks, before giving up
+    /// with a timeout. This is separate from the writer's lock age timeout, because readers can
+    /// wait behind multiple cache locks.
+    fn wait_timeout(&self, key: &CacheKey) -> Option<Duration>;
 }
 
 const N_SHARDS: usize = 16;
@@ -38,7 +48,9 @@ const N_SHARDS: usize = 16;
 /// The global cache locking manager
 pub struct CacheLock {
     lock_table: ConcurrentHashTable<LockStub, N_SHARDS>,
-    timeout: Duration, // fixed timeout value for now
+    // fixed lock timeout values for now
+    age_timeout: Duration,
+    wait_timeout: Duration,
 }
 
 /// A struct representing locked cache access
@@ -60,21 +72,27 @@ impl Locked {
 impl CacheLock {
     /// Create a new [CacheLock] with the given lock timeout
     ///
-    /// When the timeout is reached, the read locks are automatically unlocked
-    pub fn new_boxed(timeout: Duration) -> Box<Self> {
+    /// Age timeout refers to how long a writer has been holding onto a particular lock, and wait
+    /// timeout refers to how long a reader may hold onto any number of locks before giving up.
+    /// When either timeout is reached, the read locks are automatically unlocked.
+    pub fn new_boxed(age_timeout: Duration, wait_timeout: Duration) -> Box<Self> {
         Box::new(CacheLock {
             lock_table: ConcurrentHashTable::new(),
-            timeout,
+            age_timeout,
+            wait_timeout,
         })
     }
 
     /// Create a new [CacheLock] with the given lock timeout
     ///
-    /// When the timeout is reached, the read locks are automatically unlocked
-    pub fn new(timeout: Duration) -> Self {
+    /// Age timeout refers to how long a writer has been holding onto a particular lock, and wait
+    /// timeout refers to how long a reader may hold onto any number of locks before giving up.
+    /// When either timeout is reached, the read locks are automatically unlocked.
+    pub fn new(age_timeout: Duration, wait_timeout: Duration) -> Self {
         CacheLock {
             lock_table: ConcurrentHashTable::new(),
-            timeout,
+            age_timeout,
+            wait_timeout,
         }
     }
 }
@@ -86,40 +104,62 @@ impl CacheKeyLock for CacheLock {
         let table = self.lock_table.get(key);
         if let Some(lock) = table.read().get(&key) {
             // already has an ongoing request
-            if lock.0.lock_status() != LockStatus::Dangling {
+            // If the lock status is dangling or timeout, the lock will _remain_ in the table
+            // and readers should attempt to replace it.
+            // In the case of writer timeout, any remaining readers that were waiting on THIS
+            // LockCore should have (or are about to) timed out on their own.
+            // Finding a Timeout status means that THIS writer's lock already expired, so future
+            // requests ought to recreate the lock.
+            if !matches!(
+                lock.0.lock_status(),
+                LockStatus::Dangling | LockStatus::Timeout
+            ) {
                 return Locked::Read(lock.read_lock());
             }
             // Dangling: the previous writer quit without unlocking the lock. Requests should
             // compete for the write lock again.
         }
 
-        let (permit, stub) = WritePermit::new(self.timeout);
         let mut table = table.write();
         // check again in case another request already added it
         if let Some(lock) = table.get(&key) {
-            if lock.0.lock_status() != LockStatus::Dangling {
+            if !matches!(
+                lock.0.lock_status(),
+                LockStatus::Dangling | LockStatus::Timeout
+            ) {
                 return Locked::Read(lock.read_lock());
             }
         }
+        let (permit, stub) = WritePermit::new(self.age_timeout);
         table.insert(key, stub);
         Locked::Write(permit)
     }
 
-    fn release(&self, key: &CacheKey, reason: LockStatus) {
+    fn release(&self, key: &CacheKey, mut permit: WritePermit, reason: LockStatus) {
         let hash = key.combined_bin();
         let key = u128::from_be_bytes(hash); // endianness doesn't matter
-        if let Some(lock) = self.lock_table.write(key).remove(&key) {
-            // make sure that the caller didn't forget to unlock it
-            if lock.0.locked() {
-                lock.0.unlock(reason);
-            }
+        if permit.lock.lock_status() == LockStatus::Timeout {
+            // if lock age timed out, then readers are capable of
+            // replacing the lock associated with this permit from the lock table
+            // (see lock() implementation)
+            // keep the lock status as Timeout accordingly when unlocking
+            // (because we aren't removing it from the lock_table)
+            permit.unlock(LockStatus::Timeout);
+        } else if let Some(_lock) = self.lock_table.write(key).remove(&key) {
+            permit.unlock(reason);
         }
+        // these situations above should capture all possible options,
+        // else dangling cache lock may start
+    }
+
+    fn wait_timeout(&self, _key: &CacheKey) -> Option<Duration> {
+        Some(self.wait_timeout)
     }
 }
 
 use log::warn;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use strum::IntoStaticStr;
 use tokio::sync::Semaphore;
 
@@ -171,7 +211,7 @@ impl From<u8> for LockStatus {
 #[derive(Debug)]
 pub struct LockCore {
     pub lock_start: Instant,
-    pub timeout: Duration,
+    pub age_timeout: Duration,
     pub(super) lock: Semaphore,
     // use u8 for Atomic enum
     lock_status: AtomicU8,
@@ -181,7 +221,7 @@ impl LockCore {
     pub fn new_arc(timeout: Duration) -> Arc<Self> {
         Arc::new(LockCore {
             lock: Semaphore::new(0),
-            timeout,
+            age_timeout: timeout,
             lock_start: Instant::now(),
             lock_status: AtomicU8::new(LockStatus::Waiting.into()),
         })
@@ -212,13 +252,16 @@ pub struct ReadLock(Arc<LockCore>);
 impl ReadLock {
     /// Wait for the writer to release the lock
     pub async fn wait(&self) {
-        if !self.locked() || self.expired() {
+        if !self.locked() {
             return;
         }
 
+        // FIXME: for now it is the awkward responsibility of the ReadLock to set the
+        // timeout status on the lock itself because the write permit cannot lock age
+        // timeout on its own
         // TODO: need to be careful not to wake everyone up at the same time
         // (maybe not an issue because regular cache lock release behaves that way)
-        if let Some(duration) = self.0.timeout.checked_sub(self.0.lock_start.elapsed()) {
+        if let Some(duration) = self.0.age_timeout.checked_sub(self.0.lock_start.elapsed()) {
             match timeout(duration, self.0.lock.acquire()).await {
                 Ok(Ok(_)) => { // permit is returned to Semaphore right away
                 }
@@ -231,6 +274,11 @@ impl ReadLock {
                         .store(LockStatus::Timeout.into(), Ordering::SeqCst);
                 }
             }
+        } else {
+            // expiration has already occurred, store timeout status
+            self.0
+                .lock_status
+                .store(LockStatus::Timeout.into(), Ordering::SeqCst);
         }
     }
 
@@ -243,7 +291,7 @@ impl ReadLock {
     pub fn expired(&self) -> bool {
         // NOTE: this is whether the lock is currently expired
         // not whether it was timed out during wait()
-        self.0.lock_start.elapsed() >= self.0.timeout
+        self.0.lock_start.elapsed() >= self.0.age_timeout
     }
 
     /// The current status of the lock
@@ -259,24 +307,35 @@ impl ReadLock {
 
 /// WritePermit: requires who get it need to populate the cache and then release it
 #[derive(Debug)]
-pub struct WritePermit(Arc<LockCore>);
+pub struct WritePermit {
+    lock: Arc<LockCore>,
+    finished: bool,
+}
 
 impl WritePermit {
     pub fn new(timeout: Duration) -> (WritePermit, LockStub) {
         let lock = LockCore::new_arc(timeout);
         let stub = LockStub(lock.clone());
-        (WritePermit(lock), stub)
+        (
+            WritePermit {
+                lock,
+                finished: false,
+            },
+            stub,
+        )
     }
 
-    pub fn unlock(&self, reason: LockStatus) {
-        self.0.unlock(reason)
+    pub fn unlock(&mut self, reason: LockStatus) {
+        self.finished = true;
+        self.lock.unlock(reason);
     }
 }
 
 impl Drop for WritePermit {
     fn drop(&mut self) {
         // Writer exited without properly unlocking. We let others to compete for the write lock again
-        if self.0.locked() {
+        if !self.finished {
+            debug_assert!(false, "Dangling cache lock started!");
             self.unlock(LockStatus::Dangling);
         }
     }
@@ -296,22 +355,27 @@ mod test {
 
     #[test]
     fn test_get_release() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000), Duration::from_secs(1000));
         let key1 = CacheKey::new("", "a", "1");
         let locked1 = cache_lock.lock(&key1);
         assert!(locked1.is_write()); // write permit
         let locked2 = cache_lock.lock(&key1);
         assert!(!locked2.is_write()); // read lock
-        cache_lock.release(&key1, LockStatus::Done);
+        if let Locked::Write(permit) = locked1 {
+            cache_lock.release(&key1, permit, LockStatus::Done);
+        }
         let locked3 = cache_lock.lock(&key1);
         assert!(locked3.is_write()); // write permit again
+        if let Locked::Write(permit) = locked3 {
+            cache_lock.release(&key1, permit, LockStatus::Done);
+        }
     }
 
     #[tokio::test]
     async fn test_lock() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000), Duration::from_secs(1000));
         let key1 = CacheKey::new("", "a", "1");
-        let permit = match cache_lock.lock(&key1) {
+        let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
             _ => panic!(),
         };
@@ -330,9 +394,9 @@ mod test {
 
     #[tokio::test]
     async fn test_lock_timeout() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
         let key1 = CacheKey::new("", "a", "1");
-        let permit = match cache_lock.lock(&key1) {
+        let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
             _ => panic!(),
         };
@@ -348,19 +412,139 @@ mod test {
             assert_eq!(lock.lock_status(), LockStatus::Timeout);
         });
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
 
-        // expired lock
+        handle.await.unwrap(); // check lock is timed out
+
+        // expired lock - we will be able to install a new lock instead
+        let mut permit2 = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
         let lock2 = match cache_lock.lock(&key1) {
             Locked::Read(r) => r,
             _ => panic!(),
         };
         assert!(lock2.locked());
-        assert_eq!(lock2.lock_status(), LockStatus::Timeout);
-        lock2.wait().await;
-        assert_eq!(lock2.lock_status(), LockStatus::Timeout);
+        let handle = tokio::spawn(async move {
+            // timed out
+            lock2.wait().await;
+            assert_eq!(lock2.lock_status(), LockStatus::Done);
+        });
+
+        permit.unlock(LockStatus::Done);
+        permit2.unlock(LockStatus::Done);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lock_expired_release() {
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let key1 = CacheKey::new("", "a", "1");
+        let permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+
+        let lock = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        assert!(lock.locked());
+        let handle = tokio::spawn(async move {
+            // timed out
+            lock.wait().await;
+            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+        });
+
+        tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
+        handle.await.unwrap(); // check lock is timed out
+
+        // writer finally finishes
+        cache_lock.release(&key1, permit, LockStatus::Done);
+
+        // can reacquire after release
+        let mut permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+        assert_eq!(permit.lock.lock_status(), LockStatus::Waiting);
+
+        let lock2 = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        assert!(lock2.locked());
+        let handle = tokio::spawn(async move {
+            // timed out
+            lock2.wait().await;
+            assert_eq!(lock2.lock_status(), LockStatus::Done);
+        });
 
         permit.unlock(LockStatus::Done);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lock_expired_no_reader() {
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let key1 = CacheKey::new("", "a", "1");
+        let mut permit = match cache_lock.lock(&key1) {
+            Locked::Write(w) => w,
+            _ => panic!(),
+        };
+        tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
+
+        // lock expired without reader, but status is not yet set
+        assert_eq!(permit.lock.lock_status(), LockStatus::Waiting);
+
+        let lock = match cache_lock.lock(&key1) {
+            Locked::Read(r) => r,
+            _ => panic!(),
+        };
+        // reader expires write permit
+        lock.wait().await;
+        assert_eq!(lock.lock_status(), LockStatus::Timeout);
+        assert_eq!(permit.lock.lock_status(), LockStatus::Timeout);
+        permit.unlock(LockStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_lock_concurrent() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // Test that concurrent attempts to compete for a lock run without issues
+        let cache_lock = Arc::new(CacheLock::new_boxed(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let key1 = CacheKey::new("", "a", "1");
+
+        let mut handles = vec![];
+
+        const READERS: usize = 30;
+        for _ in 0..READERS {
+            let key1 = key1.clone();
+            let cache_lock = cache_lock.clone();
+            // simulate a cache lookup / lock attempt loop
+            handles.push(tokio::spawn(async move {
+                // timed out
+                loop {
+                    match cache_lock.lock(&key1) {
+                        Locked::Write(permit) => {
+                            let _ = tokio::time::sleep(Duration::from_millis(5)).await;
+                            cache_lock.release(&key1, permit, LockStatus::Done);
+                            break;
+                        }
+                        Locked::Read(r) => {
+                            r.wait().await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
     }
 }

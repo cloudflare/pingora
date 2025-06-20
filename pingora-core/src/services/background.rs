@@ -71,6 +71,7 @@ where
         &mut self,
         #[cfg(unix)] _fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
+        _listeners_per_fd: usize,
     ) {
         self.task.start(shutdown).await;
     }

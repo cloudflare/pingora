@@ -26,8 +26,8 @@ fn bench_one(zip_exp: f64, cache_size_percent: f32) {
     let quick_cache = quick_cache::sync::Cache::new(cache_size);
     let tinyufo = tinyufo::TinyUfo::new(cache_size, cache_size);
 
-    let mut rng = thread_rng();
-    let zipf = zipf::ZipfDistribution::new(ITEMS, zip_exp).unwrap();
+    let mut rng = rand::rng();
+    let zipf = rand_distr::Zipf::new(ITEMS as f64, zip_exp).unwrap();
 
     let mut lru_hit = 0;
     let mut moka_hit = 0;

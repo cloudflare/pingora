@@ -1,6 +1,6 @@
 [package]
 name = "pingora-load-balancing"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,11 +18,11 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = { workspace = true }
-pingora-http = { version = "0.4.0", path = "../pingora-http" }
-pingora-error = { version = "0.4.0", path = "../pingora-error" }
-pingora-core = { version = "0.4.0", path = "../pingora-core", default-features = false }
-pingora-ketama = { version = "0.4.0", path = "../pingora-ketama" }
-pingora-runtime = { version = "0.4.0", path = "../pingora-runtime" }
+pingora-http = { version = "0.5.0", path = "../pingora-http" }
+pingora-error = { version = "0.5.0", path = "../pingora-error" }
+pingora-core = { version = "0.5.0", path = "../pingora-core", default-features = false }
+pingora-ketama = { version = "0.5.0", path = "../pingora-ketama" }
+pingora-runtime = { version = "0.5.0", path = "../pingora-runtime" }
 arc-swap = "1"
 fnv = "1"
 rand = "0.8"

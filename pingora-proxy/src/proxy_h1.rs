@@ -154,6 +154,7 @@ impl<SV> HttpProxy<SV> {
     {
         let mut request_done = false;
         let mut response_done = false;
+        let mut send_error = None;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
@@ -178,7 +179,7 @@ impl<SV> HttpProxy<SV> {
                         Err(e) => {
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
-                            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                            let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
                             // Downstream should consume all remaining data and handle the error
                             return Ok(())
                         }
@@ -186,10 +187,20 @@ impl<SV> HttpProxy<SV> {
                 },
 
                 body = rx.recv(), if !request_done => {
-                    request_done = send_body_to1(client_session, body).await?;
-                    // An upgraded request is terminated when either side is done
-                    if request_done && client_session.is_upgrade_req() {
-                        response_done = true;
+                    match send_body_to1(client_session, body).await {
+                        Ok(send_done) => {
+                            request_done = send_done;
+                            // An upgraded request is terminated when either side is done
+                            if request_done && client_session.is_upgrade_req() {
+                                response_done = true;
+                            }
+                        },
+                        Err(e) => {
+                           debug!("send error, draining read buf: {e}");
+                           request_done = true;
+                           send_error = Some(e);
+                           continue
+                        }
                     }
                 },
 
@@ -331,7 +342,8 @@ impl<SV> HttpProxy<SV> {
                         // pull as many tasks as we can
                         let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         tasks.push(t);
-                        while let Some(maybe_task) = rx.recv().now_or_never() {
+                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
                             debug!("upstream event now: {:?}", maybe_task);
                             if let Some(t) = maybe_task {
                                 tasks.push(t);
@@ -513,6 +525,8 @@ impl<SV> HttpProxy<SV> {
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
                     && !end
                 {
+                    // Upgrade the http version to 1.1 because 1.0/0.9 doesn't support chunked
+                    header.set_version(Version::HTTP_11);
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
 
@@ -572,7 +586,7 @@ impl<SV> HttpProxy<SV> {
          * output anything yet.
          * Don't write 0 bytes to the network since it will be
          * treated as the terminating chunk */
-        if !upstream_end_of_body && data.as_ref().map_or(false, |d| d.is_empty()) {
+        if !upstream_end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
             return Ok(false);
         }
 

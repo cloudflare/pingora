@@ -24,7 +24,9 @@ use http::uri::PathAndQuery;
 use http::{header, HeaderMap, Response};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
@@ -67,7 +69,7 @@ use std::pin::Pin;
 /// Calling `.await` in this object will not return until the client decides to close this stream.
 pub struct Idle<'a>(&'a mut HttpSession);
 
-impl<'a> Future for Idle<'a> {
+impl Future for Idle<'_> {
     type Output = Result<h2::Reason>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -99,6 +101,8 @@ pub struct HttpSession {
     retry_buffer: Option<FixedBuffer>,
     // digest to record underlying connection info
     digest: Arc<Digest>,
+    // How long to wait when draining (discarding) request body
+    total_drain_timeout: Option<Duration>,
 }
 
 impl HttpSession {
@@ -138,6 +142,7 @@ impl HttpSession {
                 body_sent: 0,
                 retry_buffer: None,
                 digest,
+                total_drain_timeout: None,
             }
         }))
     }
@@ -176,6 +181,40 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
+    }
+
+    async fn do_drain_request_body(&mut self) -> Result<()> {
+        loop {
+            match self.read_body_bytes().await {
+                Ok(Some(_)) => { /* continue to drain */ }
+                Ok(None) => return Ok(()), // done
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Drain the request body. `Ok(())` when there is no (more) body to read.
+    // NOTE for h2 it may be worth allowing cancellation of the stream via reset.
+    pub async fn drain_request_body(&mut self) -> Result<()> {
+        if self.is_body_done() {
+            return Ok(());
+        }
+        match self.total_drain_timeout {
+            Some(t) => match timeout(t, self.do_drain_request_body()).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(
+                    ErrorType::ReadTimedout,
+                    format!("draining body, timeout: {t:?}"),
+                ),
+            },
+            None => self.do_drain_request_body().await,
+        }
+    }
+
+    /// Sets the total drain timeout. This `timeout` will be used while draining
+    /// the request body.
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        self.total_drain_timeout = timeout;
     }
 
     // the write_* don't have timeouts because the actual writing happens on the connection
@@ -398,7 +437,7 @@ impl HttpSession {
                     .request_header
                     .headers
                     .get(header::CONTENT_LENGTH)
-                    .map_or(false, |cl| cl.as_bytes() == b"0"))
+                    .is_some_and(|cl| cl.as_bytes() == b"0"))
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {

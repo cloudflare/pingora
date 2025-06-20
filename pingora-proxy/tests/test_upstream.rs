@@ -65,6 +65,36 @@ async fn test_connection_die() {
 }
 
 #[tokio::test]
+async fn test_upload_connection_die() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+
+    // try h2
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .header("x-h2", "true")
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+}
+
+#[tokio::test]
 async fn test_upload() {
     init();
     let client = reqwest::Client::new();
@@ -313,6 +343,105 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_downstream_compression() {
+        init();
+
+        // disable reqwest gzip support to check compression headers and body
+        // otherwise reqwest will decompress and strip the headers
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_compression/no_compression")
+            .header("x-downstream-compression", "1")
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["Content-Encoding"], "gzip");
+        assert_eq!(headers["x-cache-status"], "miss");
+        let body = res.bytes().await.unwrap();
+        assert!(body.len() < 32);
+
+        // should also apply on hit
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_compression/no_compression")
+            .header("x-downstream-compression", "1")
+            .header("accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["Content-Encoding"], "gzip");
+        assert_eq!(headers["x-cache-status"], "hit");
+        let body = res.bytes().await.unwrap();
+        assert!(body.len() < 32);
+    }
+
+    #[tokio::test]
+    async fn test_cache_downstream_decompression() {
+        init();
+
+        // disable reqwest gzip support to check compression headers and body
+        // otherwise reqwest will decompress and strip the headers
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_decompression/gzip/index.html")
+            .header("x-downstream-decompression", "1")
+            .header("x-upstream-accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // upstream should have received gzip, should decompress for downstream
+        assert_eq!(headers["received-accept-encoding"], "gzip");
+        assert!(headers.get("Content-Encoding").is_none());
+        assert_eq!(headers["x-cache-status"], "miss");
+        let body = res.bytes().await.unwrap();
+        assert_eq!(body, "Hello World!\n");
+
+        // should also apply on hit
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_decompression/gzip/index.html")
+            .header("x-downstream-decompression", "1")
+            .header("x-upstream-accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert!(headers.get("Content-Encoding").is_none());
+        assert_eq!(headers["x-cache-status"], "hit");
+        let body = res.bytes().await.unwrap();
+        assert_eq!(body, "Hello World!\n");
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // should also apply on revalidated
+        let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+        let res = client
+            .get("http://127.0.0.1:6148/unique/test_cache_downstream_decompression/gzip/index.html")
+            .header("x-downstream-decompression", "1")
+            .header("x-upstream-accept-encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert!(headers.get("Content-Encoding").is_none());
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        let body = res.bytes().await.unwrap();
+        assert_eq!(body, "Hello World!\n");
+    }
+
+    #[tokio::test]
     async fn test_network_error_mid_response() {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_network_error_mid_response.txt";
@@ -388,6 +517,59 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_upstream_revalidation_appends_headers() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_upstream_revalidation_appends_headers/cache_control";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(headers["cache-control"], "public, max-age=1");
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .header("set-cache-control", "stale-while-revalidate=86400")
+            .header("set-revalidated", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(headers["x-upstream-status"], "304");
+        let mut cc = headers.get_all("cache-control").into_iter();
+        assert_eq!(cc.next().unwrap(), "public, max-age=1");
+        assert_eq!(cc.next().unwrap(), "stale-while-revalidate=86400");
+        assert!(cc.next().is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_force_miss() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_froce_miss/revalidate_now";
@@ -421,6 +603,48 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_force_miss_stale() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_froce_miss_stale/revalidate_now";
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // stale, but can be forced miss
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-force-miss", "1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        let cache_miss_epoch2 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert!(cache_miss_epoch != cache_miss_epoch2);
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
@@ -1294,13 +1518,14 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
+            // cache lock timeout, disable cache
             assert_eq!(headers["x-cache-status"], "no-cache");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         // send the 3rd request after the 2 second cache lock timeout where the
         // first request still holds the lock (3s delay in origin)
-        sleep(Duration::from_millis(2000)).await;
+        sleep(Duration::from_millis(2200)).await;
         let task3 = tokio::spawn(async move {
             let res = reqwest::Client::new()
                 .get(url)
@@ -1311,7 +1536,9 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // this is now a miss because we will not timeout on cache lock
+            // and will fetch from origin successfully
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1329,6 +1556,46 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
         assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_wait_timeout() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_wait_timeout.txt";
+
+        let mut handles = vec![];
+        const N_REQUESTS: u64 = 8;
+        for _ in 0..N_REQUESTS {
+            handles.push(tokio::spawn(async move {
+                // Each task will attempt to wait for the origin's 1s sleep upon acquiring the
+                // cache lock, before the origin disconnects.
+                let res = reqwest::Client::new()
+                    .get(url)
+                    .header("x-lock", "true")
+                    .header("x-set-sleep", "1") // we have a 2 second cache lock timeout
+                    .header("x-abort", "1")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), 502);
+                let headers = res.headers();
+                headers
+                    .get("x-cache-lock-time-ms")
+                    .and_then(|ms| ms.to_str().ok().and_then(|s| s.parse::<u64>().ok()))
+            }));
+        }
+        let mut waited_count = 0;
+        for handle in handles {
+            let lock_time_ms = handle.await.unwrap();
+            if let Some(lock_time_ms) = lock_time_ms {
+                // should not have waited more than 2s for each response
+                waited_count += 1;
+                assert!(lock_time_ms <= 2200);
+            }
+        }
+        assert!(waited_count > 0, "at least one reader waited");
+        // This whole process /should/ have taken no longer than 4s, as each reader has an
+        // independently enforced 2s timeout
     }
 
     #[tokio::test]

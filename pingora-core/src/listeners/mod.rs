@@ -22,7 +22,7 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{tls::TlsRef, Stream};
+use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -35,6 +35,7 @@ use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
 pub use crate::protocols::tls::ALPN;
+use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
@@ -79,6 +80,7 @@ impl TransportStackBuilder {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
@@ -89,7 +91,7 @@ impl TransportStack {
         self.l4.as_str()
     }
 
-    pub async fn accept(&mut self) -> Result<UninitializedStream> {
+    pub async fn accept(&self) -> Result<UninitializedStream> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
             l4: stream,
@@ -108,13 +110,21 @@ pub(crate) struct UninitializedStream {
 }
 
 impl UninitializedStream {
-    pub async fn handshake(self) -> Result<Stream> {
+    pub async fn handshake(mut self) -> Result<Stream> {
+        self.l4.set_buffer();
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))
         }
+    }
+
+    /// Get the peer address of the connection if available
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.l4
+            .get_socket_digest()
+            .and_then(|d| d.peer_addr().cloned())
     }
 }
 
@@ -247,7 +257,7 @@ mod test {
             .unwrap();
 
         assert_eq!(listeners.len(), 2);
-        for mut listener in listeners {
+        for listener in listeners {
             tokio::spawn(async move {
                 // just try to accept once
                 let stream = listener.accept().await.unwrap();
@@ -271,7 +281,7 @@ mod test {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::tls(addr, &cert_path, &key_path).unwrap();
-        let mut listener = listeners
+        let listener = listeners
             .build(
                 #[cfg(unix)]
                 None,

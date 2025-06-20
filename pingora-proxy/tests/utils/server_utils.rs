@@ -16,28 +16,31 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::VARY;
+use http::header::{ACCEPT_ENCODING, VARY};
 use http::HeaderValue;
+use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::key::HashBinary;
-use pingora_cache::lock::CacheKeyLock;
+use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
-use pingora_cache::{ForcedInvalidationKind, PurgeType, VarianceBuilder};
+use pingora_cache::{ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
-use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
+use pingora_core::protocols::{
+    http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
+};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
-use pingora_error::{Error, ErrorSource, Result};
+use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
@@ -258,12 +261,8 @@ impl ProxyHttp for ExampleProxyHttp {
                 .adjust_level(0);
         }
 
-        if let Some(min_rate) = min_rate {
-            session.set_min_send_rate(min_rate);
-        }
-        if let Some(write_timeout) = write_timeout {
-            session.set_write_timeout(Duration::from_secs(write_timeout));
-        }
+        session.set_min_send_rate(min_rate);
+        session.set_write_timeout(write_timeout.map(Duration::from_secs));
 
         Ok(false)
     }
@@ -328,8 +327,12 @@ static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<Box<(dyn CacheKeyLock + std::marker::Send + Sync + 'static)>> =
-    Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> = Lazy::new(|| {
+    CacheLock::new_boxed(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(2),
+    )
+});
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
@@ -348,6 +351,38 @@ impl ProxyHttp for ExampleProxyCache {
         CacheCTX {
             upstream_status: None,
         }
+    }
+
+    async fn early_request_filter(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .get("x-downstream-compression")
+            .is_some()
+        {
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_level(6);
+        }
+        if session
+            .req_header()
+            .headers
+            .get("x-downstream-decompression")
+            .is_some()
+        {
+            session
+                .downstream_modules_ctx
+                .get_mut::<ResponseCompression>()
+                .unwrap()
+                .adjust_decompression(true);
+        }
+        Ok(())
     }
 
     async fn upstream_peer(
@@ -413,14 +448,22 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn cache_hit_filter(
         &self,
-        session: &Session,
+        session: &mut Session,
         _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
+        is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>> {
         // allow test header to control force expiry/miss
         if session.get_header_bytes("x-force-miss") != b"" {
             return Ok(Some(ForcedInvalidationKind::ForceMiss));
         }
+
+        if !is_fresh {
+            // already expired
+            return Ok(None);
+        }
+
         if session.get_header_bytes("x-force-expire") != b"" {
             return Ok(Some(ForcedInvalidationKind::ForceExpired));
         }
@@ -467,6 +510,22 @@ impl ProxyHttp for ExampleProxyCache {
         key.finalize()
     }
 
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(up_accept_encoding) = session
+            .req_header()
+            .headers
+            .get("x-upstream-accept-encoding")
+        {
+            upstream_request.insert_header(&ACCEPT_ENCODING, up_accept_encoding)?;
+        }
+        Ok(())
+    }
+
     fn response_cache_filter(
         &self,
         _session: &Session,
@@ -487,10 +546,12 @@ impl ProxyHttp for ExampleProxyCache {
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
-    ) where
+    ) -> Result<()>
+    where
         Self::CTX: Send + Sync,
     {
         ctx.upstream_status = Some(upstream_response.status.into());
+        Ok(())
     }
 
     async fn response_filter(
@@ -533,6 +594,56 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // default OSS fail_to_proxy with added headers
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            _ => {
+                match e.esource() {
+                    ErrorSource::Upstream => 502,
+                    ErrorSource::Downstream => {
+                        match e.etype() {
+                            WriteError | ReadError | ConnectionClosed => {
+                                /* conn already dead */
+                                0
+                            }
+                            _ => 400,
+                        }
+                    }
+                    ErrorSource::Internal | ErrorSource::Unset => 500,
+                }
+            }
+        };
+        if code > 0 {
+            let mut resp = gen_error_response(code);
+            // any relevant metadata headers to add
+            if let Some(d) = session.cache.lock_duration() {
+                resp.insert_header("x-cache-lock-time-ms", format!("{}", d.as_millis()))
+                    .unwrap();
+            }
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("failed to send error response to downstream: {e}");
+                });
+        }
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     fn should_serve_stale(

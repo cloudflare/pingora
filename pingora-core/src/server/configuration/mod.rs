@@ -60,6 +60,8 @@ pub struct ServerConf {
     pub group: Option<String>,
     /// How many threads **each** service should get. The threads are not shared across services.
     pub threads: usize,
+    /// Number of listener tasks to use per fd. This allows for parallel accepts.
+    pub listener_tasks_per_fd: usize,
     /// Allow work stealing between threads of the same service. Default `true`.
     pub work_stealing: bool,
     /// The path to CA file the SSL library should use. If empty, the default trust store location
@@ -117,6 +119,7 @@ impl Default for ServerConf {
             user: None,
             group: None,
             threads: 1,
+            listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
@@ -272,6 +275,7 @@ mod tests {
             user: None,
             group: None,
             threads: 1,
+            listener_tasks_per_fd: 1,
             work_stealing: true,
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,

@@ -27,7 +27,7 @@ use pingora_core::{
 };
 use pingora_proxy::{ProxyHttp, Session};
 
-/// This example shows how to use the gRPC-web bridge module
+// This example shows how to use the gRPC-web bridge module
 
 pub struct GrpcWebBridgeProxy;
 

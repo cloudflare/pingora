@@ -206,7 +206,28 @@ impl HandleHit for MemHitHandler {
         }
     }
 
+    fn should_count_access(&self) -> bool {
+        match self {
+            // avoid counting accesses for partial reads to keep things simple
+            Self::Complete(_) => true,
+            Self::Partial(_) => false,
+        }
+    }
+
+    fn get_eviction_weight(&self) -> usize {
+        match self {
+            // FIXME: just body size, also track meta size
+            Self::Complete(c) => c.body.len(),
+            // partial read cannot be estimated since body size is unknown
+            Self::Partial(_) => 0,
+        }
+    }
+
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
         self
     }
 }
@@ -241,7 +262,7 @@ impl HandleMiss for MemMissHandler {
         Ok(())
     }
 
-    async fn finish(self: Box<Self>) -> Result<usize> {
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
         // safe, the temp object is inserted when the miss handler is created
         let cache_object = self
             .temp
@@ -257,7 +278,7 @@ impl HandleMiss for MemMissHandler {
             .write()
             .get_mut(&self.key)
             .and_then(|map| map.remove(&self.temp_id.into()));
-        Ok(size)
+        Ok(MissFinishType::Created(size))
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {

@@ -1,6 +1,6 @@
 [package]
 name = "pingora-openssl"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,7 +18,7 @@ path = "src/lib.rs"
 
 [dependencies]
 openssl-sys = "0.9"
-openssl = { version = "0.10", features = ["vendored"] }
+openssl = { version = "0.10.72", features = ["vendored"] }
 tokio-openssl = { version = "0.6" }
 libc = "0.2.70"
 foreign-types = { version = "0.3"}

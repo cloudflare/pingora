@@ -106,6 +106,17 @@ impl Session {
         }
     }
 
+    /// Discard the request body by reading it until completion.
+    ///
+    /// This is useful for making streams reusable (in particular for HTTP/1.1) after returning an
+    /// error before the whole body has been read.
+    pub async fn drain_request_body(&mut self) -> Result<()> {
+        match self {
+            Self::H1(s) => s.drain_request_body().await,
+            Self::H2(s) => s.drain_request_body().await,
+        }
+    }
+
     /// Write the response header to client
     /// Informational headers (status code 100-199, excluding 101) can be written multiple times the final
     /// response header (status code 200+ or 101) is written.
@@ -163,7 +174,7 @@ impl Session {
             Self::H1(mut s) => {
                 // need to flush body due to buffering
                 s.finish_body().await?;
-                Ok(s.reuse().await)
+                s.reuse().await
             }
             Self::H2(mut s) => {
                 s.finish()?;
@@ -188,11 +199,19 @@ impl Session {
         }
     }
 
+    /// Get the keepalive timeout. None if keepalive is disabled. Not applicable for h2
+    pub fn get_keepalive(&self) -> Option<u64> {
+        match self {
+            Self::H1(s) => s.get_keepalive_timeout(),
+            Self::H2(_) => None,
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
     /// This is a noop for h2.
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
             Self::H2(_) => {}
@@ -204,10 +223,23 @@ impl Session {
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     ///
     /// This is a noop for h2.
-    pub fn set_write_timeout(&mut self, timeout: Duration) {
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_write_timeout(timeout),
             Self::H2(_) => {}
+        }
+    }
+
+    /// Sets the total drain timeout, which will be applied while discarding the
+    /// request body using `drain_request_body`.
+    ///
+    /// For HTTP/1.1, reusing a session requires ensuring that the request body
+    /// is consumed. If the timeout is exceeded, the caller should give up on
+    /// trying to reuse the session.
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        match self {
+            Self::H1(s) => s.set_total_drain_timeout(timeout),
+            Self::H2(s) => s.set_total_drain_timeout(timeout),
         }
     }
 
@@ -218,10 +250,10 @@ impl Session {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.
+    /// is greater than zero, a send rate of zero is equivalent to disabling.
     ///
     /// This is a noop for h2.
-    pub fn set_min_send_rate(&mut self, rate: usize) {
+    pub fn set_min_send_rate(&mut self, rate: Option<usize>) {
         match self {
             Self::H1(s) => s.set_min_send_rate(rate),
             Self::H2(_) => {}
@@ -329,11 +361,23 @@ impl Session {
         // rather than a misleading the client with 'keep-alive'
         self.set_keepalive(None);
 
+        // If a response was already written and it's not informational 1xx, return.
+        // The only exception is an informational 101 Switching Protocols, which is treated
+        // as final response https://www.rfc-editor.org/rfc/rfc9110#section-15.2.2.
+        if let Some(resp_written) = self.response_written().as_ref() {
+            if !resp_written.status.is_informational() || resp_written.status == 101 {
+                return Ok(());
+            }
+        }
+
         self.write_response_header(Box::new(resp)).await?;
+
         if !body.is_empty() {
             self.write_response_body(body, true).await?;
+        } else {
             self.finish_body().await?;
         }
+
         Ok(())
     }
 

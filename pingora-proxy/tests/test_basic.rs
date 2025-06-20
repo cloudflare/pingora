@@ -14,10 +14,14 @@
 
 mod utils;
 
+use bytes::Bytes;
+use h2::client;
+use http::Request;
 use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
+use tokio::net::TcpStream;
 
 use utils::server_utils::init;
 
@@ -930,4 +934,77 @@ async fn test_tls_diff_alt_cnt_no_reuse() {
     assert_eq!(res.status(), StatusCode::OK);
     let headers = res.headers();
     assert!(headers.get("x-conn-reuse").is_none());
+}
+
+#[tokio::test]
+async fn test_error_before_headers_sent() {
+    init();
+    let url = "http://127.0.0.1:6146/sleep/test_error_before_headers_sent.txt";
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, h2) = client::handshake(tcp).await.unwrap();
+
+    tokio::spawn(async move {
+        h2.await.unwrap();
+    });
+
+    let request = Request::builder()
+        .uri(url)
+        .header("x-set-sleep", "0")
+        .header("x-abort", "true")
+        .body(())
+        .unwrap();
+
+    let (response, mut _stream) = client.send_request(request, true).unwrap();
+
+    let response = response.await.unwrap();
+    let mut body = response.into_body();
+
+    while let Some(chunk) = body.data().await {
+        assert_eq!(chunk.unwrap(), Bytes::new());
+    }
+}
+
+#[tokio::test]
+async fn test_error_after_headers_sent_rst_received() {
+    init();
+    let url = "http://127.0.0.1:6146/connection_die/test_error_after_headers_sent_rst_received.txt";
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, h2) = client::handshake(tcp).await.unwrap();
+
+    tokio::spawn(async move {
+        h2.await.unwrap();
+    });
+
+    let request = Request::builder().uri(url).body(()).unwrap();
+
+    let (response, mut _stream) = client.send_request(request, true).unwrap();
+
+    let response = response.await.unwrap();
+    let mut body = response.into_body();
+
+    let chunk = body.data().await.unwrap();
+    assert_eq!(chunk.unwrap(), Bytes::from_static(b"AAAAA"));
+
+    let err = body.data().await.unwrap().err().unwrap();
+    assert_eq!(err.reason().unwrap(), h2::Reason::CANCEL);
+}
+
+#[tokio::test]
+async fn test_103() {
+    init();
+    let res = reqwest::get("http://127.0.0.1:6147/103").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let headers = res.headers();
+    assert_eq!(headers[header::CONTENT_LENGTH], "6");
+    let body = res.text().await.unwrap();
+    assert_eq!(body, "123456");
+}
+
+#[tokio::test]
+async fn test_103_die() {
+    init();
+    let res = reqwest::get("http://127.0.0.1:6147/103-die").await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
