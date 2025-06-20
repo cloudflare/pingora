@@ -1,3 +1,3 @@
 ---
 version: 1
-ca_file: "./ca.pem"
+ca_file: "examples/mtls_assets/ca.pem"

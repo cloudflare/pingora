@@ -19,7 +19,9 @@ use boring::{
     ssl::{SslAlert, SslVerifyError, SslVerifyMode},
     x509::X509,
 };
+use env_logger::{Env, Target};
 use log::{debug, info};
+
 use pingora_core::{
     listeners::{tls::TlsSettings, TlsAccept},
     prelude::{HttpPeer, Opt},
@@ -29,6 +31,7 @@ use pingora_core::{
     utils::tls::CertKey,
     Result,
 };
+use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
 // This is the client that will connect to the server using mTLS. It forwards all requests to the server
@@ -96,6 +99,28 @@ impl ProxyHttp for Server {
             "globeandcitizen.com".to_string(),
         )))
     }
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let data = b"Hello, this is the server responding to the client after mTLS handshake!";
+
+        let mut resp_header = ResponseHeader::build(200, None).unwrap();
+        resp_header
+            .insert_header("Content-Length", data.len())
+            .unwrap();
+
+        session
+            .write_response_header(Box::new(resp_header), true)
+            .await?;
+
+        session
+            .write_response_body(Some(data.to_vec().into()), true)
+            .await?;
+
+        Ok(true)
+    }
 }
 
 // This will provide the server-side TLS configuration and handle the mTLS handshake.
@@ -119,7 +144,10 @@ impl ServerTls {
         debug!("Client certificate: {:?}", client_cert.subject_name());
 
         let ca_cert = X509::from_pem(cert::CA_CERT)
-            .map_err(|e| SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?
+            .map_err(|e| {
+                log::error!("Failed to load CA certificate: {}", e);
+                SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR)
+            })?
             .public_key()
             .unwrap();
 
@@ -152,8 +180,9 @@ impl TlsAccept for ServerTls {
     }
 }
 
-#[tokio::main]
-async fn main() {
+// cargo run --example mtls -- --conf examples/mtls_assets/conf.yml
+// curl https://localhost:8080 --cacert /absolute/path/to/examples/mtls_assets/ca.pem -v
+fn main() {
     // mTLS Steps:
     // 1. Client connects to server
     // 2. Server presents its TLS certificate
@@ -163,40 +192,32 @@ async fn main() {
     // 6. Server grants access
     // 7. Client and server exchange information over encrypted TLS connection
 
+    env_logger::Builder::from_env(Env::default().write_style_or("RUST_LOG_STYLE", "always"))
+        .target(Target::Stdout)
+        .init();
+
+    let opt = Opt::parse_args();
+    let mut server = PingoraServer::new(Some(opt)).unwrap();
+    server.bootstrap();
+
     // setting up the client; localhost:8080 is the server address
-
-    let client = {
-        let mut client = PingoraServer::new(Some(Opt {
-            conf: Some(format!("./mtls_assets/conf.yml")),
-            ..Default::default()
-        }))
-        .unwrap();
-
-        client.bootstrap();
+    {
         let mut client_proxy =
-            pingora_proxy::http_proxy_service_with_name(&client.configuration, Client, "client");
+            pingora_proxy::http_proxy_service_with_name(&server.configuration, Client, "client");
 
         client_proxy
             .add_tls(
                 "localhost:8080",
-                "./mtls_assets/client.pem",
-                "./mtls_assets/client.key",
+                "examples/mtls_assets/client.pem",
+                "examples/mtls_assets/client-key.pem",
             )
             .unwrap();
 
-        client.add_service(client_proxy);
-        client
-    };
+        server.add_service(client_proxy);
+    }
 
     // set up the server: localhost:8081 is the upstream server address
-    let server = {
-        let mut server = PingoraServer::new(Some(Opt {
-            conf: Some(format!("./mtls_assets/conf.yml")),
-            ..Default::default()
-        }))
-        .unwrap();
-
-        server.bootstrap();
+    {
         let mut server_proxy =
             pingora_proxy::http_proxy_service_with_name(&server.configuration, Server, "server");
 
@@ -207,25 +228,15 @@ async fn main() {
         );
 
         server.add_service(server_proxy);
-        server
-    };
+    }
 
-    // let (client_tx, client)
+    server.run_forever();
 }
 
 mod cert {
-    // This is the ca cert that has been used to sign the client and server certs.
-    pub const CA_CERT: &[u8] = include_bytes!("./mtls_assets/ca.pem");
-
-    // This is the client cert that has been signed by the CA cert.
-    pub const CLIENT_CERT: &[u8] = include_bytes!("./mtls_assets/client.pem");
-
-    // This is the private key for the client cert. Would normally be kept secret.
-    pub const CLIENT_KEY: &[u8] = include_bytes!("./mtls_assets/client.key");
-
-    // This is the server cert that has been signed by the CA cert.
-    pub const SERVER_CERT: &[u8] = include_bytes!("./mtls_assets/server.pem");
-
-    // This is the private key for the server cert. Would normally be kept secret.
-    pub const SERVER_KEY: &[u8] = include_bytes!("./mtls_assets/server.key");
+    pub const CA_CERT: &[u8] = include_bytes!("mtls_assets/ca.pem");
+    pub const CLIENT_CERT: &[u8] = include_bytes!("mtls_assets/client.pem");
+    pub const CLIENT_KEY: &[u8] = include_bytes!("mtls_assets/client-key.pem");
+    pub const SERVER_CERT: &[u8] = include_bytes!("mtls_assets/server.pem");
+    pub const SERVER_KEY: &[u8] = include_bytes!("mtls_assets/server-key.pem");
 }
