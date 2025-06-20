@@ -97,9 +97,11 @@ pub trait CacheHashKey {
 /// General purpose cache key
 #[derive(Debug, Clone)]
 pub struct CacheKey {
-    // All strings for now. It can be more structural as long as it can hash
-    namespace: String,
-    primary: String,
+    // Namespace and primary fields are essentially strings,
+    // except they allow invalid UTF-8 sequences.
+    // These fields should be able to be hashed.
+    namespace: Vec<u8>,
+    primary: Vec<u8>,
     primary_bin_override: Option<HashBinary>,
     variance: Option<HashBinary>,
     /// An extra tag for identifying users
@@ -130,6 +132,16 @@ impl CacheKey {
     /// Override the primary key hash
     pub fn set_primary_bin_override(&mut self, key: HashBinary) {
         self.primary_bin_override = Some(key)
+    }
+
+    /// Try to get primary key as UTF-8 str, if valid
+    pub fn primary_key_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.primary).ok()
+    }
+
+    /// Try to get namespace key as UTF-8 str, if valid
+    pub fn namespace_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.namespace).ok()
     }
 }
 
@@ -186,10 +198,10 @@ pub fn hash_u8(key: &str) -> u8 {
     raw[0]
 }
 
-/// helper function: hash str to [HashBinary]
-pub fn hash_key(key: &str) -> HashBinary {
+/// helper function: hash key (String or Bytes) to [HashBinary]
+pub fn hash_key<K: AsRef<[u8]>>(key: K) -> HashBinary {
     let mut hasher = Blake2b128::new();
-    hasher.update(key);
+    hasher.update(key.as_ref());
     let raw = hasher.finalize();
     raw.into()
 }
@@ -202,11 +214,11 @@ impl CacheKey {
         hasher
     }
 
-    /// Create a default [CacheKey] from a request, which just takes it URI as the primary key.
+    /// Create a default [CacheKey] from a request, which just takes its URI as the primary key.
     pub fn default(req_header: &ReqHeader) -> Self {
         CacheKey {
-            namespace: "".into(),
-            primary: format!("{}", req_header.uri),
+            namespace: Vec::new(),
+            primary: format!("{}", req_header.uri).into_bytes(),
             primary_bin_override: None,
             variance: None,
             user_tag: "".into(),
@@ -214,14 +226,14 @@ impl CacheKey {
         }
     }
 
-    /// Create a new [CacheKey] from the given namespace, primary, and user_tag string.
+    /// Create a new [CacheKey] from the given namespace, primary, and user_tag input.
     ///
     /// Both `namespace` and `primary` will be used for the primary hash
-    pub fn new<S1, S2, S3>(namespace: S1, primary: S2, user_tag: S3) -> Self
+    pub fn new<B1, B2, S>(namespace: B1, primary: B2, user_tag: S) -> Self
     where
-        S1: Into<String>,
-        S2: Into<String>,
-        S3: Into<String>,
+        B1: Into<Vec<u8>>,
+        B2: Into<Vec<u8>>,
+        S: Into<String>,
     {
         CacheKey {
             namespace: namespace.into(),
@@ -234,13 +246,13 @@ impl CacheKey {
     }
 
     /// Return the namespace of this key
-    pub fn namespace(&self) -> &str {
-        &self.namespace
+    pub fn namespace(&self) -> &[u8] {
+        &self.namespace[..]
     }
 
     /// Return the primary key of this key
-    pub fn primary_key(&self) -> &str {
-        &self.primary
+    pub fn primary_key(&self) -> &[u8] {
+        &self.primary[..]
     }
 
     /// Convert this key to [CompactCacheKey].
@@ -279,8 +291,8 @@ mod tests {
     #[test]
     fn test_cache_key_hash() {
         let key = CacheKey {
-            namespace: "".into(),
-            primary: "aa".into(),
+            namespace: Vec::new(),
+            primary: b"aa".to_vec(),
             primary_bin_override: None,
             variance: None,
             user_tag: "1".into(),
@@ -299,8 +311,8 @@ mod tests {
     #[test]
     fn test_cache_key_hash_override() {
         let mut key = CacheKey {
-            namespace: "".into(),
-            primary: "aa".into(),
+            namespace: Vec::new(),
+            primary: b"aa".to_vec(),
             primary_bin_override: str2hex("27c35e6e9373877f29e562464e46497e"),
             variance: None,
             user_tag: "1".into(),
@@ -330,8 +342,8 @@ mod tests {
     #[test]
     fn test_cache_key_vary_hash() {
         let key = CacheKey {
-            namespace: "".into(),
-            primary: "aa".into(),
+            namespace: Vec::new(),
+            primary: b"aa".to_vec(),
             primary_bin_override: None,
             variance: Some([0u8; 16]),
             user_tag: "1".into(),
@@ -353,8 +365,8 @@ mod tests {
     #[test]
     fn test_cache_key_vary_hash_override() {
         let key = CacheKey {
-            namespace: "".into(),
-            primary: "saaaad".into(),
+            namespace: Vec::new(),
+            primary: b"saaaad".to_vec(),
             primary_bin_override: str2hex("ac10f2aef117729f8dad056b3059eb7e"),
             variance: Some([0u8; 16]),
             user_tag: "1".into(),
@@ -385,5 +397,35 @@ mod tests {
         for i in 0..KEY_SIZE {
             assert_eq!(key[i], key2[i]);
         }
+    }
+    #[test]
+    fn test_primary_key_str_valid_utf8() {
+        let valid_utf8_key = CacheKey {
+            namespace: Vec::new(),
+            primary: b"/valid/path?query=1".to_vec(),
+            primary_bin_override: None,
+            variance: None,
+            user_tag: "1".into(),
+            extensions: Extensions::new(),
+        };
+
+        assert_eq!(
+            valid_utf8_key.primary_key_str(),
+            Some("/valid/path?query=1")
+        )
+    }
+
+    #[test]
+    fn test_primary_key_str_invalid_utf8() {
+        let invalid_utf8_key = CacheKey {
+            namespace: Vec::new(),
+            primary: vec![0x66, 0x6f, 0x6f, 0xff],
+            primary_bin_override: None,
+            variance: None,
+            user_tag: "1".into(),
+            extensions: Extensions::new(),
+        };
+
+        assert!(invalid_utf8_key.primary_key_str().is_none())
     }
 }
