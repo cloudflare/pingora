@@ -236,11 +236,11 @@ pub trait ProxyHttp {
     /// [RFC7232]: https://www.rfc-editor.org/rfc/rfc7232
     fn range_header_filter(
         &self,
-        req: &RequestHeader,
+        session: &mut Session,
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> range_filter::RangeType {
-        proxy_cache::range_filter::range_header_filter(req, resp)
+        proxy_cache::range_filter::range_header_filter(session.req_header(), resp)
     }
 
     /// Modify the request before it is sent to the upstream

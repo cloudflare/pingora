@@ -47,6 +47,8 @@ async fn test_duplex() {
         .send()
         .await
         .unwrap();
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "keep-alive");
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
@@ -108,6 +110,25 @@ async fn test_upload() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
+}
+
+#[tokio::test]
+async fn test_close_on_response_before_downstream_finish() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/test2")
+        .header("x-close-on-response-before-downstream-finish", "1")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "close");
+    let body = res.text().await.unwrap();
+    assert_eq!(body.len(), 11);
 }
 
 #[tokio::test]
@@ -2352,16 +2373,19 @@ mod test_cache {
         assert_eq!(headers["x-cache-status"], "miss");
     }
 
-    async fn send_max_file_size_req(url: &str, max_file_size_bytes: usize) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(url)
-            .header(
-                "x-cache-max-file-size-bytes",
-                max_file_size_bytes.to_string(),
-            )
-            .send()
-            .await
-            .unwrap()
+    async fn send_max_file_size_req(
+        url: &str,
+        max_file_size_bytes: usize,
+        range: Option<(usize, usize)>,
+    ) -> reqwest::Response {
+        let mut req = reqwest::Client::new().get(url).header(
+            "x-cache-max-file-size-bytes",
+            max_file_size_bytes.to_string(),
+        );
+        if let Some(r) = range {
+            req = req.header("Range", format!("bytes={}-{}", r.0, r.1));
+        }
+        req.send().await.unwrap()
     }
 
     #[tokio::test]
@@ -2369,30 +2393,69 @@ mod test_cache {
         init();
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_100/now";
 
-        let res = send_max_file_size_req(url, 100).await;
+        let res = send_max_file_size_req(url, 100, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_max_file_size_req(url, 100).await;
+        let res = send_max_file_size_req(url, 100, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_1/now";
-        let res = send_max_file_size_req(url, 1).await;
+        let res = send_max_file_size_req(url, 1, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_max_file_size_req(url, 1).await;
+        let res = send_max_file_size_req(url, 1, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_max_file_size_range() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_100/now";
+
+        let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let epoch1 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "ello");
+
+        let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let epoch2 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "ello");
+        assert_eq!(epoch1, epoch2);
+
+        // disable downstream ranging on max file size exceeded
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_1/now";
+        let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let epoch1 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // predicted uncacheable (note upstream endpoint doesn't support range)
+        let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let epoch2 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+        assert!(epoch1 != epoch2);
     }
 
     #[tokio::test]
@@ -2422,6 +2485,43 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_bypass_downstream_range() {
+        init();
+        let test_url =
+            "http://127.0.0.1:6148/unique/test_cache_bypass_downstream_range/cache_control/";
+
+        let res = reqwest::Client::new()
+            .get(test_url)
+            .header("Range", "bytes=6-10")
+            // We start this request as cacheable, and then this disables it.
+            // We would expect the range body filter to run since we have
+            // started to cache, and then disabled.
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "world");
+
+        // We're starting as uncacheable, so proxy origin to downstream
+        // unchanged.
+        let res = reqwest::Client::new()
+            .get(test_url)
+            // We pass this up to the upstream, but it ignores it.
+            .header("Range", "bytes=0-4")
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 }

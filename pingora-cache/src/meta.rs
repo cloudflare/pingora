@@ -513,12 +513,12 @@ impl CacheMeta {
 use http::StatusCode;
 
 /// The function to generate TTL from the given [StatusCode].
-pub type FreshSecByStatusFn = fn(StatusCode) -> Option<u32>;
+pub type FreshDurationByStatusFn = fn(StatusCode) -> Option<Duration>;
 
 /// The default settings to generate [CacheMeta]
 pub struct CacheMetaDefaults {
     // if a status code is not included in fresh_sec, it's not considered cacheable by default.
-    fresh_sec_fn: FreshSecByStatusFn,
+    fresh_sec_fn: FreshDurationByStatusFn,
     stale_while_revalidate_sec: u32,
     // TODO: allow "error" condition to be configurable?
     stale_if_error_sec: u32,
@@ -527,7 +527,7 @@ pub struct CacheMetaDefaults {
 impl CacheMetaDefaults {
     /// Create a new [CacheMetaDefaults]
     pub const fn new(
-        fresh_sec_fn: FreshSecByStatusFn,
+        fresh_sec_fn: FreshDurationByStatusFn,
         stale_while_revalidate_sec: u32,
         stale_if_error_sec: u32,
     ) -> Self {
@@ -541,7 +541,7 @@ impl CacheMetaDefaults {
     /// Return the default TTL for the given [StatusCode]
     ///
     /// `None`: do no cache this code.
-    pub fn fresh_sec(&self, resp_status: StatusCode) -> Option<u32> {
+    pub fn fresh_sec(&self, resp_status: StatusCode) -> Option<Duration> {
         // safe guard to make sure 304 response to share the same default ttl of 200
         if resp_status == StatusCode::NOT_MODIFIED {
             (self.fresh_sec_fn)(StatusCode::OK)

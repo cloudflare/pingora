@@ -290,7 +290,7 @@ impl<SV> HttpProxy<SV> {
 
         // process range header if the cache storage supports seek
         let range_type = if seekable && !session.ignore_downstream_range {
-            self.inner.range_header_filter(req, &mut header, ctx)
+            self.inner.range_header_filter(session, &mut header, ctx)
         } else {
             RangeType::None
         };
@@ -540,6 +540,8 @@ impl<SV> HttpProxy<SV> {
                                             NoCacheReason::ResponseTooLarge,
                                         );
                                         session.cache.disable(NoCacheReason::ResponseTooLarge);
+                                        // too large to cache, disable ranging
+                                        session.ignore_downstream_range = true;
                                     }
                                 }
                                 // if the content-length header is not specified, the miss handler

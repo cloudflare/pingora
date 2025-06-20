@@ -273,6 +273,17 @@ impl Session {
         }
     }
 
+    /// Sets whether keepalive should be disabled if response is written prior to
+    /// downstream body finishing.
+    ///
+    /// This is a noop for h2.
+    pub fn set_close_on_response_before_downstream_finish(&mut self, close: bool) {
+        match self {
+            Self::H1(s) => s.set_close_on_response_before_downstream_finish(close),
+            Self::H2(_) => {} // always ignored
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {

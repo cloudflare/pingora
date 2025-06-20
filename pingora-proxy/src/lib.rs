@@ -321,6 +321,8 @@ pub struct Session {
     pub upstream_compression: ResponseCompressionCtx,
     /// ignore downstream range (skip downstream range filters)
     pub ignore_downstream_range: bool,
+    /// Were the upstream request headers modified?
+    pub upstream_headers_mutated_for_cache: bool,
     // the context from parent request
     pub subrequest_ctx: Option<Box<SubReqCtx>>,
     // Downstream filter modules
@@ -338,6 +340,7 @@ impl Session {
             // disable both upstream and downstream compression
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
+            upstream_headers_mutated_for_cache: false,
             subrequest_ctx: None,
             downstream_modules_ctx: downstream_modules.build_ctx(),
         }
@@ -457,6 +460,17 @@ impl Session {
             }
         }
         self.downstream_session.response_duplex_vec(tasks).await
+    }
+
+    /// Mark the upstream headers as modified by caching. This should lead to range filters being
+    /// skipped when responding to the downstream.
+    pub fn mark_upstream_headers_mutated_for_cache(&mut self) {
+        self.upstream_headers_mutated_for_cache = true;
+    }
+
+    /// Check whether the upstream headers were marked as mutated during the request.
+    pub fn upstream_headers_mutated_for_cache(&self) -> bool {
+        self.upstream_headers_mutated_for_cache
     }
 }
 

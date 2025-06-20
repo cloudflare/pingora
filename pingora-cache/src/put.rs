@@ -206,7 +206,8 @@ mod test {
     struct TestCachePut();
     impl CachePut for TestCachePut {
         fn cache_defaults() -> &'static CacheMetaDefaults {
-            const DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
+            const DEFAULT: CacheMetaDefaults =
+                CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
             &DEFAULT
         }
     }

@@ -249,6 +249,11 @@ impl ProxyHttp for ExampleProxyHttp {
             .get("x-min-rate")
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
 
+        let close_on_response_before_downstream_finish = req
+            .headers
+            .get("x-close-on-response-before-downstream-finish")
+            .is_some();
+
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if !downstream_compression {
             // enable upstream compression for all requests by default
@@ -263,6 +268,9 @@ impl ProxyHttp for ExampleProxyHttp {
 
         session.set_min_send_rate(min_rate);
         session.set_write_timeout(write_timeout.map(Duration::from_secs));
+        session.set_close_on_response_before_downstream_finish(
+            close_on_response_before_downstream_finish,
+        );
 
         Ok(false)
     }
@@ -324,7 +332,8 @@ impl ProxyHttp for ExampleProxyHttp {
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
-const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
+const CACHE_DEFAULT: CacheMetaDefaults =
+    CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> = Lazy::new(|| {
