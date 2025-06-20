@@ -56,7 +56,7 @@ boring = "4.17.0"
 hyperlocal = "0.8"
 
 [features]
-default = ["boringssl"]
+default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
 boringssl = [
     "pingora-core/boringssl",

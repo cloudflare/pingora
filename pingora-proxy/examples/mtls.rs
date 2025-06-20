@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "boringssl")]
+
 use std::sync::Arc;
 
 use boring::{
@@ -180,7 +182,7 @@ impl TlsAccept for ServerTls {
     }
 }
 
-// cargo run --example mtls -- --conf examples/mtls_assets/conf.yml
+// cargo run --features boringssl --example mtls -- --conf examples/mtls_assets/conf.yml
 // curl https://localhost:8080 --cacert /absolute/path/to/examples/mtls_assets/ca.pem -v
 fn main() {
     // mTLS Steps:
