@@ -337,15 +337,11 @@ impl InterpretCacheControl for CacheControl {
             // always treated as stale
             return Some(0);
         }
-        match self.s_maxage() {
-            Ok(Some(seconds)) => Some(seconds),
-            // s-maxage not present
-            Ok(None) => match self.max_age() {
-                Ok(Some(seconds)) => Some(seconds),
-                _ => None,
-            },
-            _ => None,
-        }
+        let seconds = self
+            .s_maxage()
+            .ok()?
+            .or_else(|| self.max_age().unwrap_or(None))?;
+        Some(seconds)
     }
 
     fn serve_stale_while_revalidate_sec(&self) -> Option<u32> {
