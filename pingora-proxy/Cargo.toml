@@ -44,7 +44,7 @@ env_logger = "0.9"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
 pingora-limits = { version = "0.5.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.5.0", path = "../pingora-load-balancing", default-features=false }
+pingora-load-balancing = { version = "0.5.0", path = "../pingora-load-balancing", default-features = false }
 prometheus = "0.13"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -77,4 +77,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(doc_async_trait)'] }
 
 [[example]]
 name = "mtls"
-required_features = ["boringssl"]
+required-features = ["boringssl"]
