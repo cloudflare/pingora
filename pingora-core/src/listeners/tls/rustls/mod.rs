@@ -16,14 +16,14 @@ use std::sync::Arc;
 
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
+use crate::protocols::{ALPN, IO};
+
 use log::debug;
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
 use pingora_rustls::{crypto_provider, load_certs_and_key_files, CertifiedKey};
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
-use pingora_rustls::{ResolvesServerCertUsingSni, ServerConfig};
-
-use crate::protocols::{ALPN, IO};
+use pingora_rustls::{ResolvesServerCert, ResolvesServerCertUsingSni, ServerConfig};
 
 /// The TLS settings of a listening endpoint
 pub struct TlsSettings {
@@ -34,6 +34,7 @@ pub struct TlsSettings {
 pub enum CertAndKey {
     Single { cert_path: String, key_path: String },
     Bundle(Vec<BundleCert>),
+    Custom(Arc<dyn ResolvesServerCert>),
 }
 
 pub struct BundleCert {
@@ -62,6 +63,7 @@ impl TlsSettings {
                 key_path,
             } => Self::build_single(cert_path, key_path),
             CertAndKey::Bundle(bundle) => Self::build_bundled(bundle),
+            CertAndKey::Custom(resolver) => Self::build_custom(resolver.clone()),
         };
 
         if let Some(alpn_protocols) = self.alpn_protocols {
@@ -126,6 +128,13 @@ impl TlsSettings {
             .unwrap()
     }
 
+    fn build_custom(resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
+        // TODO - Add support for client auth & custom CA support
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_cert_resolver(resolver)
+    }
+
     /// Enable HTTP/2 support for this endpoint, which is default off.
     /// This effectively sets the ALPN to prefer HTTP/2 with HTTP/1.1 allowed
     pub fn enable_h2(&mut self) {
@@ -156,6 +165,16 @@ impl TlsSettings {
         Ok(TlsSettings {
             alpn_protocols: None,
             cert_and_key: CertAndKey::Bundle(bundle),
+        })
+    }
+
+    pub fn intermediate_custom(resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_and_key: CertAndKey::Custom(resolver),
         })
     }
 

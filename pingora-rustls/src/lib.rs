@@ -21,7 +21,7 @@ use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use rustls::crypto::CryptoProvider;
-pub use rustls::server::ResolvesServerCertUsingSni;
+pub use rustls::server::{ResolvesServerCert, ResolvesServerCertUsingSni};
 pub use rustls::{sign::CertifiedKey, version, ClientConfig, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
