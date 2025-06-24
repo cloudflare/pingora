@@ -243,11 +243,8 @@ impl CacheControl {
     }
 
     fn get_field_names(&self, key: &str) -> Option<ListValueIter> {
-        if let Some(Some(value)) = self.directives.get(key) {
-            Some(ListValueIter::from(value))
-        } else {
-            None
-        }
+        let value = self.directives.get(key)?.as_ref()?;
+        Some(ListValueIter::from(value))
     }
 
     /// Get the values of `private=`
