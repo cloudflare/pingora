@@ -69,4 +69,5 @@ harness = false
 default = []
 openssl = ["pingora-core/openssl"]
 boringssl = ["pingora-core/boringssl"]
-rustls = ["pingora-core/rustls"]
+rustls-aws-lc-rs = ["pingora-core/rustls-aws-lc-rs"]
+rustls-ring = ["pingora-core/rustls-ring"]

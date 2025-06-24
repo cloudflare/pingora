@@ -84,11 +84,18 @@ boringssl = [
 ## Use  [rustls](https://crates.io/crates/rustls) for tls
 ##
 ## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
-rustls = [
-    "pingora-core/rustls",
-    "pingora-proxy?/rustls",
-    "pingora-cache?/rustls",
-    "pingora-load-balancing?/rustls",
+rustls-aws-lc-rs = [
+    "pingora-core/rustls-aws-lc-rs",
+    "pingora-proxy?/rustls-aws-lc-rs",
+    "pingora-cache?/rustls-aws-lc-rs",
+    "pingora-load-balancing?/rustls-aws-lc-rs",
+    "any_tls",
+]
+rustls-ring = [
+    "pingora-core/rustls-ring",
+    "pingora-proxy?/rustls-ring",
+    "pingora-cache?/rustls-ring",
+    "pingora-load-balancing?/rustls-ring",
     "any_tls",
 ]
 

@@ -22,8 +22,8 @@ use pingora_error::{
 };
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
-    version, CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
-    TlsConnector as RusTlsConnector,
+    setup_crypto_provider, version, CertificateDer, ClientConfig as RusTlsClientConfig,
+    PrivateKeyDer, RootCertStore, TlsConnector as RusTlsConnector,
 };
 
 use crate::protocols::tls::{client::handshake, TlsStream};
@@ -82,6 +82,8 @@ impl TlsConnector {
 
             (ca_certs, certs_key)
         };
+
+        setup_crypto_provider();
 
         // TODO: WebPkiServerVerifier for CRL/OCSP validation
         let builder =
