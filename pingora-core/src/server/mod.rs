@@ -40,7 +40,7 @@ use configuration::{Opt, ServerConf};
 #[cfg(unix)]
 pub use transfer_fd::Fds;
 
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::Result;
 
 /* Time to wait before exiting the program.
 This is the graceful period for all existing sessions to finish */
@@ -308,18 +308,23 @@ impl Server {
             opt.conf.as_ref().map_or_else(
                 || {
                     // options, no conf, generated
-                    ServerConf::new_with_opt_override(opt).ok_or_else(|| {
-                        Error::explain(ErrorType::ReadError, "Conf generation failed")
-                    })
+                    Ok(ServerConf::new_with_opt_override(opt))
                 },
                 |_| {
                     // options and conf loaded
-                    ServerConf::load_yaml_with_opt_override(opt)
+                    #[cfg(feature = "yaml")]
+                    {
+                        ServerConf::load_yaml_with_opt_override(opt)
+                    }
+                    #[cfg(not(feature = "yaml"))]
+                    {
+                        #[allow(dead_code)]
+                        ServerConf::load_toml_with_opt_override(opt)
+                    }
                 },
             )
         } else {
-            ServerConf::new()
-                .ok_or_else(|| Error::explain(ErrorType::ReadError, "Conf generation failed"))
+            Ok(ServerConf::new())
         }?;
 
         Ok(Server {
