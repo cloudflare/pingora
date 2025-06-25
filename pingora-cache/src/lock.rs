@@ -34,23 +34,16 @@ pub trait CacheKeyLock {
     /// When the write lock is dropped without being released, the read lock holders will consider
     /// it to be failed so that they will compete for the write lock again.
     fn release(&self, key: &CacheKey, permit: WritePermit, reason: LockStatus);
-
-    /// Configured reader wait timeout for this cache lock
-    ///
-    /// This controls how long any given reader is allowed to wait on cache locks, before giving up
-    /// with a timeout. This is separate from the writer's lock age timeout, because readers can
-    /// wait behind multiple cache locks.
-    fn wait_timeout(&self, key: &CacheKey) -> Option<Duration>;
 }
 
 const N_SHARDS: usize = 16;
 
 /// The global cache locking manager
+#[derive(Debug)]
 pub struct CacheLock {
     lock_table: ConcurrentHashTable<LockStub, N_SHARDS>,
     // fixed lock timeout values for now
-    age_timeout: Duration,
-    wait_timeout: Duration,
+    age_timeout_default: Duration,
 }
 
 /// A struct representing locked cache access
@@ -75,11 +68,10 @@ impl CacheLock {
     /// Age timeout refers to how long a writer has been holding onto a particular lock, and wait
     /// timeout refers to how long a reader may hold onto any number of locks before giving up.
     /// When either timeout is reached, the read locks are automatically unlocked.
-    pub fn new_boxed(age_timeout: Duration, wait_timeout: Duration) -> Box<Self> {
+    pub fn new_boxed(age_timeout: Duration) -> Box<Self> {
         Box::new(CacheLock {
             lock_table: ConcurrentHashTable::new(),
-            age_timeout,
-            wait_timeout,
+            age_timeout_default: age_timeout,
         })
     }
 
@@ -88,11 +80,10 @@ impl CacheLock {
     /// Age timeout refers to how long a writer has been holding onto a particular lock, and wait
     /// timeout refers to how long a reader may hold onto any number of locks before giving up.
     /// When either timeout is reached, the read locks are automatically unlocked.
-    pub fn new(age_timeout: Duration, wait_timeout: Duration) -> Self {
+    pub fn new(age_timeout_default: Duration) -> Self {
         CacheLock {
             lock_table: ConcurrentHashTable::new(),
-            age_timeout,
-            wait_timeout,
+            age_timeout_default,
         }
     }
 }
@@ -130,7 +121,7 @@ impl CacheKeyLock for CacheLock {
                 return Locked::Read(lock.read_lock());
             }
         }
-        let (permit, stub) = WritePermit::new(self.age_timeout);
+        let (permit, stub) = WritePermit::new(self.age_timeout_default);
         table.insert(key, stub);
         Locked::Write(permit)
     }
@@ -150,10 +141,6 @@ impl CacheKeyLock for CacheLock {
         }
         // these situations above should capture all possible options,
         // else dangling cache lock may start
-    }
-
-    fn wait_timeout(&self, _key: &CacheKey) -> Option<Duration> {
-        Some(self.wait_timeout)
     }
 }
 
@@ -341,6 +328,7 @@ impl Drop for WritePermit {
     }
 }
 
+#[derive(Debug)]
 pub struct LockStub(pub Arc<LockCore>);
 impl LockStub {
     pub fn read_lock(&self) -> ReadLock {
@@ -355,7 +343,7 @@ mod test {
 
     #[test]
     fn test_get_release() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000), Duration::from_secs(1000));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
         let key1 = CacheKey::new("", "a", "1");
         let locked1 = cache_lock.lock(&key1);
         assert!(locked1.is_write()); // write permit
@@ -373,7 +361,7 @@ mod test {
 
     #[tokio::test]
     async fn test_lock() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000), Duration::from_secs(1000));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
         let key1 = CacheKey::new("", "a", "1");
         let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
@@ -394,7 +382,7 @@ mod test {
 
     #[tokio::test]
     async fn test_lock_timeout() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
         let key1 = CacheKey::new("", "a", "1");
         let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
@@ -439,7 +427,7 @@ mod test {
 
     #[tokio::test]
     async fn test_lock_expired_release() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
         let key1 = CacheKey::new("", "a", "1");
         let permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
@@ -487,7 +475,7 @@ mod test {
 
     #[tokio::test]
     async fn test_lock_expired_no_reader() {
-        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1), Duration::from_secs(1));
+        let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
         let key1 = CacheKey::new("", "a", "1");
         let mut permit = match cache_lock.lock(&key1) {
             Locked::Write(w) => w,
@@ -513,10 +501,7 @@ mod test {
     async fn test_lock_concurrent() {
         let _ = env_logger::builder().is_test(true).try_init();
         // Test that concurrent attempts to compete for a lock run without issues
-        let cache_lock = Arc::new(CacheLock::new_boxed(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        ));
+        let cache_lock = Arc::new(CacheLock::new_boxed(Duration::from_secs(1)));
         let key1 = CacheKey::new("", "a", "1");
 
         let mut handles = vec![];

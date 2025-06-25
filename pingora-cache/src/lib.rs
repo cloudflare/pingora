@@ -292,6 +292,12 @@ struct HttpCacheInner {
     pub traces: trace::CacheTraceCTX,
 }
 
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct CacheOptionOverrides {
+    pub wait_timeout: Option<Duration>,
+}
+
 impl HttpCache {
     /// Create a new [HttpCache].
     ///
@@ -435,6 +441,7 @@ impl HttpCache {
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
         predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
         cache_lock: Option<&'static CacheKeyLockImpl>,
+        option_overrides: Option<CacheOptionOverrides>,
     ) {
         match self.phase {
             CachePhase::Disabled(_) => {
@@ -443,7 +450,9 @@ impl HttpCache {
                 let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                     cache_lock,
                     lock: None,
-                    wait_timeout: None,
+                    wait_timeout: option_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.wait_timeout),
                 });
 
                 self.inner = Some(Box::new(HttpCacheInner {
@@ -468,7 +477,11 @@ impl HttpCache {
     /// # Panic
     /// Must be called before a cache lock is attempted to be acquired,
     /// i.e. in the `cache_key_callback` or `cache_hit_filter` phases.
-    pub fn set_cache_lock(&mut self, cache_lock: Option<&'static CacheKeyLockImpl>) {
+    pub fn set_cache_lock(
+        &mut self,
+        cache_lock: Option<&'static CacheKeyLockImpl>,
+        option_overrides: Option<CacheOptionOverrides>,
+    ) {
         match self.phase {
             CachePhase::Disabled(_)
             | CachePhase::CacheKey
@@ -485,14 +498,9 @@ impl HttpCache {
                     let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                         cache_lock,
                         lock: None,
-                        wait_timeout: None,
+                        wait_timeout: option_overrides.and_then(|overrides| overrides.wait_timeout),
                     });
                     inner.lock_ctx = lock_ctx;
-
-                    // if key already set, initialize lock settings
-                    if inner.key.as_ref().is_some() {
-                        self.init_cache_key_lock_settings();
-                    }
                 }
             }
             _ => panic!("wrong phase: {:?}", self.phase),
@@ -539,23 +547,9 @@ impl HttpCache {
         match self.phase {
             CachePhase::Uninit | CachePhase::CacheKey => {
                 self.phase = CachePhase::CacheKey;
-
                 self.inner_mut().key = Some(key);
-                self.init_cache_key_lock_settings();
             }
             _ => panic!("wrong phase {:?}", self.phase),
-        }
-    }
-
-    // Initialize any cache key specific settings
-    // Panics: if key is unset
-    fn init_cache_key_lock_settings(&mut self) {
-        // Allow key-specific wait timeout
-        let inner = self.inner_mut();
-        if let Some(lock_ctx) = inner.lock_ctx.as_mut() {
-            lock_ctx.wait_timeout = lock_ctx
-                .cache_lock
-                .wait_timeout(inner.key.as_ref().expect("key must be set"));
         }
     }
 
