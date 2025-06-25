@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 // There are probably off-the-shelf crates of this, DashMap?
 /// A hash table that shards to a constant number of tables to reduce lock contention
+#[derive(Debug)]
 pub struct ConcurrentHashTable<V, const N: usize> {
     tables: [RwLock<HashMap<u128, V>>; N],
 }
