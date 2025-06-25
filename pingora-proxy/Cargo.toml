@@ -53,6 +53,8 @@ serde_yaml = "0.8"
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
 
+base64 = "0.20"
+
 [features]
 default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
