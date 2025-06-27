@@ -47,6 +47,10 @@ pub struct Http2Session {
     /// The timeout is reset on every read. This is not a timeout on the overall duration of the
     /// response.
     pub read_timeout: Option<Duration>,
+    /// The write timeout which will be applied to writing request body.
+    /// The timeout is reset on every write. This is not a timeout on the overall duration of the
+    /// request.
+    pub write_timeout: Option<Duration>,
     pub(crate) conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
@@ -68,6 +72,7 @@ impl Http2Session {
             response_header: None,
             response_body_reader: None,
             read_timeout: None,
+            write_timeout: None,
             conn,
             ended: false,
         }
@@ -124,6 +129,16 @@ impl Http2Session {
 
     /// Write a request body chunk
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+        match self.write_timeout {
+            Some(t) => match timeout(t, self.do_write_request_body(data, end)).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
+            },
+            None => self.do_write_request_body(data, end).await,
+        }
+    }
+
+    pub async fn do_write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
