@@ -101,6 +101,10 @@ pub struct HttpSession {
     retry_buffer: Option<FixedBuffer>,
     // digest to record underlying connection info
     digest: Arc<Digest>,
+    /// The write timeout which will be applied to writing response body.
+    /// The timeout is reset on every write. This is not a timeout on the overall duration of the
+    /// response.
+    pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
 }
@@ -142,6 +146,7 @@ impl HttpSession {
                 body_sent: 0,
                 retry_buffer: None,
                 digest,
+                write_timeout: None,
                 total_drain_timeout: None,
             }
         }))
@@ -211,6 +216,12 @@ impl HttpSession {
         }
     }
 
+    /// Sets the downstream write timeout. This will trigger if we're unable
+    /// to write to the stream after `timeout`.
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
+    }
+
     /// Sets the total drain timeout. This `timeout` will be used while draining
     /// the request body.
     pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
@@ -272,6 +283,19 @@ impl HttpSession {
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
     pub async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
+        match self.write_timeout {
+            Some(t) => match timeout(t, self.do_write_body(data, end)).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(
+                    ErrorType::WriteTimedout,
+                    format!("writing body, timeout: {t:?}"),
+                ),
+            },
+            None => self.do_write_body(data, end).await,
+        }
+    }
+
+    async fn do_write_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             // NOTE: in h1, we also track to see if content-length matches the data
             // We have not tracked that in h2

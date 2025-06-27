@@ -159,6 +159,7 @@ impl<SV> HttpProxy<SV> {
         }
 
         client_session.read_timeout = peer.options.read_timeout;
+        client_session.write_timeout = peer.options.write_timeout;
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
