@@ -89,7 +89,7 @@ pub mod prelude {
 ///
 /// Users don't need to interact with this object directly.
 pub struct HttpProxy<SV> {
-    inner: SV, // TODO: name it better than inner
+    pub inner: SV, // TODO: name it better than inner
     client_upstream: Connector,
     shutdown: Notify,
     pub server_options: Option<HttpServerOptions>,
@@ -98,7 +98,7 @@ pub struct HttpProxy<SV> {
 }
 
 impl<SV> HttpProxy<SV> {
-    fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+    pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
@@ -319,7 +319,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(
+    pub fn new(
         downstream_session: impl Into<Box<HttpSession>>,
         downstream_modules: &HttpModules,
     ) -> Self {
@@ -492,7 +492,7 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
 });
 
 impl<SV> HttpProxy<SV> {
-    async fn process_request(
+    pub async fn process_request(
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
