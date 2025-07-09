@@ -2397,6 +2397,7 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["content-length"], "11");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         let res = send_max_file_size_req(url, 100, None).await;
@@ -2416,6 +2417,76 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // became cacheable
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_max_file_size_chunked() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_chunked_100/test3";
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_chunked_1/test3";
+        let res = send_max_file_size_req(url, 1, None).await;
+        // TODO: this can currently break with 500 when body arrives alongside header
+        assert!(matches!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::OK
+        ));
+        let headers = res.headers();
+        assert!(headers
+            .get("x-cache-status")
+            .is_none_or(|s| s == "no-cache"));
+
+        let res = send_max_file_size_req(url, 1, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // became cacheable
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // will get marked on the next request
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 

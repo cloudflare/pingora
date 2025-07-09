@@ -505,7 +505,9 @@ impl<SV> HttpProxy<SV> {
                             if session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
-                                session.cache.disable(NoCacheReason::ResponseTooLarge);
+                                session
+                                    .cache
+                                    .disable(NoCacheReason::PredictedResponseTooLarge);
                                 return Ok(());
                             }
 
@@ -586,21 +588,31 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Body(data, end_stream) => match data {
                 Some(d) => {
                     if session.cache.enabled() {
+                        // TODO: do this async
+                        // fail if writing the body would exceed the max_file_size_bytes
+                        let body_size_allowed =
+                            session.cache.track_body_bytes_for_max_file_size(d.len());
+                        if !body_size_allowed {
+                            debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
+                            session
+                                .cache
+                                .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
+
+                            return Error::e_explain(
+                                ERR_RESPONSE_TOO_LARGE,
+                                format!(
+                                    "writing data of size {} bytes would exceed max file size of {} bytes",
+                                    d.len(),
+                                    session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
+                                ),
+                            );
+                        }
+
                         // this will panic if more data is sent after we see end_stream
                         // but should be impossible in real world
                         let miss_handler = session.cache.miss_handler().unwrap();
-                        // TODO: do this async
-                        let res = miss_handler.write_body(d.clone(), *end_stream).await;
-                        if let Err(err) = res {
-                            if err.etype == ERR_RESPONSE_TOO_LARGE {
-                                debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
-                                session
-                                    .cache
-                                    .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
-                            }
 
-                            return Err(err);
-                        }
+                        miss_handler.write_body(d.clone(), *end_stream).await?;
                         if *end_stream {
                             session.cache.finish_miss_handler().await?;
                         }

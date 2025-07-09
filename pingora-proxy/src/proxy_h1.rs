@@ -15,6 +15,7 @@
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
+use pingora_cache::CachePhase;
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_1to1(
@@ -492,7 +493,15 @@ impl<SV> HttpProxy<SV> {
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        match task {
+        // normally max file size is tracked in cache_http_task filters (when cache enabled),
+        // we will track it in these filters before sending to downstream on specific conditions
+        // when cache is disabled
+        let track_max_cache_size = matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+
+        let res = match task {
             HttpTask::Header(mut header, end) => {
                 /* Downstream revalidation/range, only needed when cache modified headers because otherwise origin
                  * will handle it */
@@ -534,6 +543,13 @@ impl<SV> HttpProxy<SV> {
                 }
             }
             HttpTask::Body(data, end) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
+                // before it can mark it as cacheable again.
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
@@ -542,12 +558,24 @@ impl<SV> HttpProxy<SV> {
                     trace!("delaying response for {:?}", duration);
                     time::sleep(duration).await;
                 }
+
                 Ok(HttpTask::Body(data, end))
             }
             HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
+        };
+        // On end, check if the response (based on file size) can be considered cacheable again
+        if let Ok(task) = res.as_ref() {
+            if track_max_cache_size
+                && task.is_end()
+                && !matches!(task, HttpTask::Failed(_))
+                && !session.cache.exceeded_max_file_size()
+            {
+                session.cache.response_became_cacheable();
+            }
         }
+        res
     }
 
     // TODO:: use this function to replace send_body_to2

@@ -14,6 +14,7 @@
 
 //! Cache Put module
 
+use crate::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use crate::*;
 use bytes::Bytes;
 use http::header;
@@ -21,6 +22,7 @@ use log::warn;
 use pingora_core::protocols::http::{
     v1::common::header_value_content_length, HttpTask, ServerSession,
 };
+use pingora_error::Error;
 
 /// The interface to define cache put behavior
 pub trait CachePut {
@@ -43,7 +45,7 @@ pub struct CachePutCtx<C: CachePut> {
     storage: &'static (dyn storage::Storage + Sync), // static for now
     eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
     miss_handler: Option<MissHandler>,
-    max_file_size_bytes: Option<usize>,
+    max_file_size_tracker: Option<MaxFileSizeTracker>,
     meta: Option<CacheMeta>,
     parser: ResponseParse,
     // FIXME: cache put doesn't have cache lock but some storage cannot handle concurrent put
@@ -66,7 +68,7 @@ impl<C: CachePut> CachePutCtx<C> {
             storage,
             eviction,
             miss_handler: None,
-            max_file_size_bytes: None,
+            max_file_size_tracker: None,
             meta: None,
             parser: ResponseParse::new(),
             trace,
@@ -75,7 +77,7 @@ impl<C: CachePut> CachePutCtx<C> {
 
     /// Set the max cacheable size limit
     pub fn set_max_file_size_bytes(&mut self, max_file_size_bytes: usize) {
-        self.max_file_size_bytes = Some(max_file_size_bytes);
+        self.max_file_size_tracker = Some(MaxFileSizeTracker::new(max_file_size_bytes));
     }
 
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
@@ -84,21 +86,27 @@ impl<C: CachePut> CachePutCtx<C> {
             .storage
             .get_miss_handler(&self.key, &meta, &trace)
             .await?;
-        self.miss_handler = Some(
-            if let Some(max_file_size_bytes) = self.max_file_size_bytes {
-                Box::new(MaxFileSizeMissHandler::new(
-                    miss_handler,
-                    max_file_size_bytes,
-                ))
-            } else {
-                miss_handler
-            },
-        );
+        self.miss_handler = Some(miss_handler);
         self.meta = Some(meta);
         Ok(())
     }
 
     async fn put_body(&mut self, data: Bytes, eof: bool) -> Result<()> {
+        // fail if writing the body would exceed the max_file_size_bytes
+        if let Some(size_tracker) = self.max_file_size_tracker.as_mut() {
+            let body_size_allowed = size_tracker.add_body_bytes(data.len());
+            if !body_size_allowed {
+                return Error::e_explain(
+                    ERR_RESPONSE_TOO_LARGE,
+                    format!(
+                        "writing data of size {} bytes would exceed max file size of {} bytes",
+                        data.len(),
+                        size_tracker.max_file_size_bytes(),
+                    ),
+                );
+            }
+        }
+
         let miss_handler = self.miss_handler.as_mut().unwrap();
         miss_handler.write_body(data, eof).await
     }
@@ -142,12 +150,12 @@ impl<C: CachePut> CachePutCtx<C> {
             match task {
                 HttpTask::Header(header, _eos) => match self.cache_put.cacheable(*header) {
                     RespCacheable::Cacheable(meta) => {
-                        if let Some(max_file_size_bytes) = self.max_file_size_bytes {
+                        if let Some(max_file_size_tracker) = &self.max_file_size_tracker {
                             let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
                             if let Some(content_length) =
                                 header_value_content_length(content_length_hdr)
                             {
-                                if content_length > max_file_size_bytes {
+                                if content_length > max_file_size_tracker.max_file_size_bytes() {
                                     return Ok(Some(NoCacheReason::ResponseTooLarge));
                                 }
                             }
