@@ -120,9 +120,7 @@ impl Connector {
                 builder.set_default_verify_paths().unwrap();
             }
             if let Some((cert, key)) = conf.cert_key_file.as_ref() {
-                builder
-                    .set_certificate_file(cert, SslFiletype::PEM)
-                    .unwrap();
+                builder.set_certificate_chain_file(cert).unwrap();
 
                 builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
             }
