@@ -16,6 +16,7 @@ use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
+use pingora_cache::CachePhase;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
 // add scheme and authority as required by h2 lib
@@ -443,7 +444,15 @@ impl<SV> HttpProxy<SV> {
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        match task {
+        // normally max file size is tracked in cache_http_task filters (when cache enabled),
+        // we will track it in these filters before sending to downstream on specific conditions
+        // when cache is disabled
+        let track_max_cache_size = matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+
+        let res = match task {
             HttpTask::Header(mut header, eos) => {
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
@@ -481,6 +490,12 @@ impl<SV> HttpProxy<SV> {
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
@@ -524,7 +539,18 @@ impl<SV> HttpProxy<SV> {
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
+        };
+        // On end, check if the response (based on file size) can be considered cacheable again
+        if let Ok(task) = res.as_ref() {
+            if track_max_cache_size
+                && task.is_end()
+                && !matches!(task, HttpTask::Failed(_))
+                && !session.cache.exceeded_max_file_size()
+            {
+                session.cache.response_became_cacheable();
+            }
         }
+        res
     }
 
     async fn send_body_to2(

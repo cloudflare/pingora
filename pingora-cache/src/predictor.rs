@@ -119,8 +119,15 @@ where
         match reason {
             // CacheLockGiveUp: the writer will set OriginNotCache (if applicable)
             // readers don't need to do it
-            NeverEnabled | StorageError | InternalError | Deferred | CacheLockGiveUp
-            | CacheLockTimeout | DeclinedToUpstream | UpstreamError => {
+            NeverEnabled
+            | StorageError
+            | InternalError
+            | Deferred
+            | CacheLockGiveUp
+            | CacheLockTimeout
+            | DeclinedToUpstream
+            | UpstreamError
+            | PredictedResponseTooLarge => {
                 return None;
             }
             // Skip certain NoCacheReason::Custom according to user
