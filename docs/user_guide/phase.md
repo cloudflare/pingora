@@ -63,7 +63,7 @@ This function is similar to `request_filter()` but executes before any other log
 This phase is usually for validating request inputs, rate limiting, and initializing context.
 
 ### `request_body_filter()`
-This phase is triggered after a response body is ready to send to upstream. It will be called every time a piece of request body is received.
+This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received.
 
 ### `proxy_upstream_filter()`
 This phase determines if we should continue to the upstream to serve a response. If we short-circuit, a 502 is returned by default, but a different response can be implemented.
