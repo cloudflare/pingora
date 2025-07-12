@@ -1,0 +1,3 @@
+---
+version: 1
+ca_file: "examples/mtls_assets/ca.pem"
