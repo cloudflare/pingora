@@ -92,7 +92,7 @@ pub struct ServerConf {
     /// See [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_connect_offload_thread_per_pool: Option<usize>,
-    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOGFILE
     /// env variable. This can be used by tools like Wireshark to decrypt upstream traffic
     /// for debugging purposes.
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
