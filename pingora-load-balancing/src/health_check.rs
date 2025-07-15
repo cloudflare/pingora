@@ -34,6 +34,9 @@ pub trait HealthObserve {
 /// Provided to a [HealthCheck] to observe changes to [Backend] health.
 pub type HealthObserveCallback = Box<dyn HealthObserve + Send + Sync>;
 
+/// Provided to a [HealthCheck] to fetch [Backend] summary for detailed logging.
+pub type BackendSummary = Box<dyn Fn(&Backend) -> String + Send + Sync>;
+
 /// [HealthCheck] is the interface to implement health check for backends
 #[async_trait]
 pub trait HealthCheck {
@@ -44,6 +47,11 @@ pub trait HealthCheck {
 
     /// Called when the health changes for a [Backend].
     async fn health_status_change(&self, _target: &Backend, _healthy: bool) {}
+
+    /// Called when a detailed [Backend] summary is needed.
+    fn backend_summary(&self, target: &Backend) -> String {
+        format!("{target:?}")
+    }
 
     /// This function defines how many *consecutive* checks should flip the health of a backend.
     ///
@@ -172,6 +180,8 @@ pub struct HttpHealthCheck {
     pub port_override: Option<u16>,
     /// A callback that is invoked when the `healthy` status changes for a [Backend].
     pub health_changed_callback: Option<HealthObserveCallback>,
+    /// An optional callback for backend summary reporting.
+    pub backend_summary_callback: Option<BackendSummary>,
 }
 
 impl HttpHealthCheck {
@@ -200,12 +210,20 @@ impl HttpHealthCheck {
             validator: None,
             port_override: None,
             health_changed_callback: None,
+            backend_summary_callback: None,
         }
     }
 
     /// Replace the internal http connector with the given [HttpConnector]
     pub fn set_connector(&mut self, connector: HttpConnector) {
         self.connector = connector;
+    }
+
+    pub fn set_backend_summary<F>(&mut self, callback: F)
+    where
+        F: Fn(&Backend) -> String + Send + Sync + 'static,
+    {
+        self.backend_summary_callback = Some(Box::new(callback));
     }
 }
 
@@ -265,6 +283,13 @@ impl HealthCheck for HttpHealthCheck {
     async fn health_status_change(&self, target: &Backend, healthy: bool) {
         if let Some(callback) = &self.health_changed_callback {
             callback.observe(target, healthy).await;
+        }
+    }
+    fn backend_summary(&self, target: &Backend) -> String {
+        if let Some(callback) = &self.backend_summary_callback {
+            callback(target)
+        } else {
+            format!("{target:?}")
         }
     }
 }
