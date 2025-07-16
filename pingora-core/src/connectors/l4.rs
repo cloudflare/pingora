@@ -23,7 +23,7 @@ use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
 use async_trait::async_trait;
 use log::debug;
-use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
+use pingora_error::{Context, Error, ErrorType::*, OrErr, Result,};
 use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
 #[cfg(unix)]
@@ -98,8 +98,13 @@ where
             .await
             .err_context(|| format!("Fail to establish CONNECT proxy: {}", peer));
     }
+
+    let tracer = peer.get_tracer();
     let peer_addr = peer.address();
-    let mut stream: Stream =
+    let mut stream: Stream = {
+        if let Some(t) = tracer.as_ref() {
+            t.0.check_allowed()?;
+        }
         if let Some(custom_l4) = peer.get_peer_options().and_then(|o| o.custom_l4.as_ref()) {
             custom_l4.connect(peer_addr).await?
         } else {
@@ -183,9 +188,9 @@ where
                     }
                 }
             }?
-        };
+        }
 
-    let tracer = peer.get_tracer();
+    };
     if let Some(t) = tracer {
         t.0.on_connected();
         stream.tracer = Some(t);

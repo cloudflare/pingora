@@ -44,6 +44,10 @@ pub use crate::protocols::tls::ALPN;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
+    /// Checks if the connection is allowed
+    fn check_allowed(&self) -> Result<()> {
+        Ok(())
+    }
     /// This method is called when successfully connected to a remote server
     fn on_connected(&self);
     /// This method is called when the connection is disconnected.
