@@ -23,7 +23,7 @@ use crate::protocols::{GetSocketDigest, SocketDigest};
 use crate::upstreams::peer::Peer;
 use async_trait::async_trait;
 use log::debug;
-use pingora_error::{Context, Error, ErrorType::*, OrErr, Result,};
+use pingora_error::{Context, Error, ErrorType::*, OrErr, Result};
 use rand::seq::SliceRandom;
 use std::net::SocketAddr as InetSocketAddr;
 #[cfg(unix)]
