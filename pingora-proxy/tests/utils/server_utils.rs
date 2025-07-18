@@ -142,7 +142,7 @@ impl ProxyHttp for ExampleProxyHttps {
             format!("127.0.0.1:{port}"),
             true,
             sni.to_string(),
-        ));
+        )?);
         peer.options.alternative_cn = Some(alt.to_string());
 
         let verify = session.get_header_bytes("verify") == b"1";
@@ -310,7 +310,7 @@ impl ProxyHttp for ExampleProxyHttp {
             format!("127.0.0.1:{port}"),
             false,
             "".to_string(),
-        ));
+        )?);
 
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
@@ -408,7 +408,7 @@ impl ProxyHttp for ExampleProxyCache {
             format!("127.0.0.1:{}", port),
             false,
             "".to_string(),
-        ));
+        )?);
 
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
