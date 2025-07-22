@@ -61,6 +61,7 @@ rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+prometheus = ["pingora-core/prometheus"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
