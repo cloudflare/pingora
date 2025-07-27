@@ -21,6 +21,7 @@ members = [
     "pingora-boringssl",
     "pingora-runtime",
     "pingora-rustls",
+    "pingora-s2n",
     "pingora-ketama",
     "pingora-load-balancing",
     "pingora-memory-cache",

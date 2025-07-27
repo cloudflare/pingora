@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use once_cell::sync::Lazy;
+#[cfg(feature = "s2n")]
+use pingora_core::tls::load_pem_file;
 #[cfg(feature = "rustls")]
 use pingora_core::tls::{load_pem_file_ca, load_pem_file_private_key};
 #[cfg(feature = "openssl_derived")]
@@ -30,6 +32,13 @@ mod key_types {
 }
 
 #[cfg(feature = "rustls")]
+mod key_types {
+    use super::*;
+    pub type PrivateKeyType = Vec<u8>;
+    pub type CertType = Vec<u8>;
+}
+
+#[cfg(feature = "s2n")]
 mod key_types {
     use super::*;
     pub type PrivateKeyType = Vec<u8>;
@@ -73,4 +82,16 @@ fn load_cert(path: &str) -> Vec<u8> {
 fn load_key(path: &str) -> Vec<u8> {
     let path = format!("{}/{path}", super::conf_dir());
     load_pem_file_private_key(&path).unwrap()
+}
+
+#[cfg(feature = "s2n")]
+fn load_cert(path: &str) -> Vec<u8> {
+    let path = format!("{}/{path}", super::conf_dir());
+    load_pem_file(&path).unwrap()
+}
+
+#[cfg(feature = "s2n")]
+fn load_key(path: &str) -> Vec<u8> {
+    let path = format!("{}/{path}", super::conf_dir());
+    load_pem_file(&path).unwrap()
 }
