@@ -59,7 +59,7 @@ default = []
 #! is added, only unencrypted http. Only one tls-providing feature can be
 #! selected at a time
 
-## Use [OpenSSL](https://crates.io/crates/openssl) for tls 
+## Use [OpenSSL](https://crates.io/crates/openssl) for tls
 ##
 ## Requires native openssl libraries and build tooling
 openssl = [
@@ -81,7 +81,18 @@ boringssl = [
     "openssl_derived",
 ]
 
-## Use  [rustls](https://crates.io/crates/rustls) for tls
+## Use  [s2n-tls](https://crates.io/crates/s2n-tls) for tls
+##
+## Requires native s2n-tls libraries and build tooling
+s2n = [
+    "pingora-core/s2n",
+    "pingora-proxy?/s2n",
+    "pingora-cache?/s2n",
+    "pingora-load-balancing?/s2n",
+    "any_tls",
+]
+
+## Use  [rustls](https://crates.io/crates/rustls) for tls 
 ##
 ## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
 rustls = [

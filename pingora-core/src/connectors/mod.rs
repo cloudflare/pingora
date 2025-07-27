@@ -49,6 +49,13 @@ pub struct ConnectorOptions {
     /// If `None`, the CA in the [default](https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_default_verify_paths.html)
     /// locations will be loaded
     pub ca_file: Option<String>,
+    /// The maximum number of unique s2n configs to cache. Creating a new s2n config is an
+    /// expensive operation, so we cache and re-use config objects with identical configurations.
+    /// Defaults to a cache size of 10. A value of 0 disables the cache.
+    ///
+    /// WARNING: Disabling the s2n config cache can result in poor performance
+    #[cfg(feature = "s2n")]
+    pub s2n_config_cache_size: Option<usize>,
     /// The default client cert and key to use for mTLS
     ///
     /// Each individual connection can use their own cert key to override this.
@@ -105,6 +112,8 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: server_conf.ca_file.clone(),
             cert_key_file: None, // TODO: use it
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: server_conf.s2n_config_cache_size,
             debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
             keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
             offload_threadpool,
@@ -117,6 +126,8 @@ impl ConnectorOptions {
     pub fn new(keepalive_pool_size: usize) -> Self {
         ConnectorOptions {
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             cert_key_file: None,
             debug_ssl_keylog: false,
             keepalive_pool_size,

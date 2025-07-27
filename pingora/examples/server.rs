@@ -160,6 +160,10 @@ pub fn main() {
     {
         tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
     }
+    #[cfg(feature = "s2n")]
+    {
+        tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+    }
     #[cfg(not(feature = "any_tls"))]
     {
         tls_settings = TlsSettings;
