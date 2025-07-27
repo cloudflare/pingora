@@ -67,6 +67,13 @@ pub struct ServerConf {
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
+    /// The maximum number of unique s2n configs to cache. Creating a new s2n config is an
+    /// expensive operation, so we cache and re-use config objects with identical configurations.
+    /// A value of 0 disables the cache.
+    ///
+    /// WARNING: Disabling the s2n config cache can result in poor performance
+    #[cfg(feature = "s2n")]
+    pub s2n_config_cache_size: Option<usize>,
     /// Grace period in seconds before starting the final step of the graceful shutdown after signaling shutdown.
     pub grace_period_seconds: Option<u64>,
     /// Timeout in seconds of the final step for the graceful shutdown.
@@ -111,6 +118,8 @@ impl Default for ServerConf {
             client_bind_to_ipv4: vec![],
             client_bind_to_ipv6: vec![],
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             daemon: false,
             error_log: None,
             upstream_debug_ssl_keylog: false,
@@ -267,6 +276,8 @@ mod tests {
             client_bind_to_ipv4: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
             client_bind_to_ipv6: vec![],
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             daemon: false,
             error_log: None,
             upstream_debug_ssl_keylog: false,

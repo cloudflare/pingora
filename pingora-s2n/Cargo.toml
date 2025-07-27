@@ -1,0 +1,21 @@
+[package]
+name = "pingora-s2n"
+version = "0.6.0"
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "tls", "ssl", "pingora"]
+description = """
+S2N async APIs for Pingora.
+"""
+
+[lib]
+name = "pingora_s2n"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-error = {version = "0.6.0", path = "../pingora-error"}
+ring = "0.17.12"
+s2n-tls = "0.3"
+s2n-tls-tokio = "0.3"
