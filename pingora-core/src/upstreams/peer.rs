@@ -17,6 +17,8 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
+#[cfg(feature = "s2n")]
+use crate::protocols::tls::PskType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -27,6 +29,8 @@ use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
 };
+#[cfg(feature = "s2n")]
+use pingora_s2n::S2NPolicy;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -104,6 +108,14 @@ pub trait Peer: Display + Clone {
             None => false,
         }
     }
+    /// Whether the system trust store should be loaded and used when verifying certificates
+    #[cfg(feature = "s2n")]
+    fn use_system_certs(&self) -> bool {
+        match self.get_peer_options() {
+            Some(opt) => opt.use_system_certs,
+            None => false,
+        }
+    }
     /// The alternative common name to use to verify the server cert.
     ///
     /// If the server cert doesn't match the SNI, this name will be used to
@@ -159,6 +171,40 @@ pub trait Peer: Display + Clone {
     /// Get the client cert and key for mutual TLS if any
     fn get_client_cert_key(&self) -> Option<&Arc<CertKey>> {
         None
+    }
+
+    /// Get the PSK (pre-shared key) to use to validate the connection
+    ///
+    /// If not set, PSK validation will not be used
+    #[cfg(feature = "s2n")]
+    fn get_psk(&self) -> Option<&Arc<PskType>> {
+        match self.get_peer_options() {
+            Some(opt) => opt.psk.as_ref(),
+            None => None,
+        }
+    }
+
+    /// Get the Security Policy to use for this connection (S2N only)
+    ///
+    /// If not set, the default policy "default_tls13" will be used
+    /// https://aws.github.io/s2n-tls/usage-guide/ch06-security-policies.html
+    #[cfg(feature = "s2n")]
+    fn get_s2n_security_policy(&self) -> Option<&S2NPolicy> {
+        match self.get_peer_options() {
+            Some(opt) => opt.s2n_security_policy.as_ref(),
+            None => None,
+        }
+    }
+
+    /// S2N-TLS will delay a response up to the max blinding delay (default 30)
+    /// seconds whenever an error triggered by a peer occurs to mitigate against
+    /// timing side channels.
+    #[cfg(feature = "s2n")]
+    fn get_max_blinding_delay(&self) -> Option<u32> {
+        match self.get_peer_options() {
+            Some(opt) => opt.max_blinding_delay,
+            None => None,
+        }
     }
 
     /// The TCP keepalive setting that should be applied to this connection
@@ -327,6 +373,8 @@ pub struct PeerOptions {
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
     pub verify_hostname: bool,
+    #[cfg(feature = "s2n")]
+    pub use_system_certs: bool,
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
     pub alpn: ALPN,
@@ -335,6 +383,12 @@ pub struct PeerOptions {
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
     pub h2_ping_interval: Option<Duration>,
+    #[cfg(feature = "s2n")]
+    pub psk: Option<Arc<PskType>>,
+    #[cfg(feature = "s2n")]
+    pub s2n_security_policy: Option<S2NPolicy>,
+    #[cfg(feature = "s2n")]
+    pub max_blinding_delay: Option<u32>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
@@ -366,6 +420,8 @@ impl PeerOptions {
             write_timeout: None,
             verify_cert: true,
             verify_hostname: true,
+            #[cfg(feature = "s2n")]
+            use_system_certs: true,
             alternative_cn: None,
             alpn: ALPN::H1,
             ca: None,
@@ -373,6 +429,12 @@ impl PeerOptions {
             tcp_recv_buf: None,
             dscp: None,
             h2_ping_interval: None,
+            #[cfg(feature = "s2n")]
+            psk: None,
+            #[cfg(feature = "s2n")]
+            s2n_security_policy: None,
+            #[cfg(feature = "s2n")]
+            max_blinding_delay: None,
             max_h2_streams: 1,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
@@ -407,6 +469,10 @@ impl Display for PeerOptions {
         if self.verify_hostname {
             write!(f, "verify_hostname: true,")?;
         }
+        #[cfg(feature = "s2n")]
+        if self.use_system_certs {
+            write!(f, "use_system_certs: true,")?;
+        }
         if let Some(cn) = &self.alternative_cn {
             write!(f, "alt_cn: {},", cn)?;
         }
@@ -418,6 +484,20 @@ impl Display for PeerOptions {
                     "CA: {}, expire: {},",
                     get_organization_unit(ca).unwrap_or_default(),
                     ca.not_after()
+                )?;
+            }
+        }
+        #[cfg(feature = "s2n")]
+        if let Some(policy) = &self.s2n_security_policy {
+            write!(f, "s2n_security_policy: {:?}, ", policy)?;
+        }
+        #[cfg(feature = "s2n")]
+        if let Some(psk_config) = &self.psk {
+            for psk in &psk_config.keys {
+                write!(
+                    f,
+                    "psk_identity: {}",
+                    String::from_utf8_lossy(psk.identity.as_slice())
                 )?;
             }
         }
@@ -527,6 +607,8 @@ impl Hash for HttpPeer {
         self.verify_cert().hash(state);
         self.verify_hostname().hash(state);
         self.alternative_cn().hash(state);
+        #[cfg(feature = "s2n")]
+        self.get_psk().hash(state);
         self.group_key.hash(state);
     }
 }

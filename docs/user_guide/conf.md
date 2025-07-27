@@ -26,6 +26,7 @@ group: webusers
 | client_bind_to_ipv4 | source IPv4 addresses to bind to when connecting to server | list of string |
 | client_bind_to_ipv6 | source IPv6 addresses to bind to when connecting to server| list of string |
 | ca_file | The path to the root CA file | string |
+| s2n_config_cache_size | The maximum number of unique s2n configs to cache. A value of 0 disables the cache. Default: 10 (s2n-tls only) | number |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
 | upstream_keepalive_pool_size | The number of total connections to keep in the connection pool | number |
 

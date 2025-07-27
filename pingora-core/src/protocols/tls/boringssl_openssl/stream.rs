@@ -203,13 +203,7 @@ impl SslDigest {
             None => (Vec::new(), None, None),
         };
 
-        SslDigest {
-            cipher,
-            version: ssl.version_str(),
-            organization: org,
-            serial_number: sn,
-            cert_digest,
-        }
+        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest)
     }
 }
 

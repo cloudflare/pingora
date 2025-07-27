@@ -14,17 +14,41 @@
 
 //! TLS information from the TLS connection
 
+use std::borrow::Cow;
+
 /// The TLS connection information
 #[derive(Clone, Debug)]
 pub struct SslDigest {
     /// The cipher used
-    pub cipher: &'static str,
+    pub cipher: Cow<'static, str>,
     /// The TLS version of this connection
-    pub version: &'static str,
+    pub version: Cow<'static, str>,
     /// The organization of the peer's certificate
     pub organization: Option<String>,
     /// The serial number of the peer's certificate
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+}
+
+impl SslDigest {
+    /// Create a new SslDigest
+    pub fn new<S>(
+        cipher: S,
+        version: S,
+        organization: Option<String>,
+        serial_number: Option<String>,
+        cert_digest: Vec<u8>,
+    ) -> Self
+    where
+        S: Into<Cow<'static, str>>,
+    {
+        SslDigest {
+            cipher: cipher.into(),
+            version: version.into(),
+            organization,
+            serial_number,
+            cert_digest,
+        }
+    }
 }
