@@ -52,6 +52,18 @@ where
         self.get(key).write()
     }
 
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&u128, &V),
+    {
+        for shard in &self.tables {
+            let guard = shard.read();
+            for (key, value) in guard.iter() {
+                f(key, value);
+            }
+        }
+    }
+
     // TODO: work out the lifetimes to provide get/set directly
 }
 
