@@ -351,24 +351,31 @@ impl<SV> HttpProxy<SV> {
         debug!("finished sending cached header to downstream");
 
         if !header_only {
-            if let RangeType::Single(r) = range_type.clone() {
-                if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
-                    return (false, Some(e));
+            let mut maybe_range_filter = match &range_type {
+                RangeType::Single(r) => {
+                    if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
+                        return (false, Some(e));
+                    }
+                    None
                 }
-            }
+                RangeType::Multi(_) => {
+                    // TODO: seek hit handler for multipart
+                    let mut range_filter = RangeBodyFilter::new();
+                    range_filter.set(range_type.clone());
+                    Some(range_filter)
+                }
+                RangeType::Invalid => unreachable!(),
+                RangeType::None => None,
+            };
             loop {
                 match session.cache.hit_handler().read_body().await {
                     Ok(raw_body) => {
                         let end = raw_body.is_none();
 
-                        let mut body = match range_type {
-                            // Call filter_body again for multipart range requests, using a new RangeBodyFilter
-                            RangeType::Multi(_) => {
-                                let mut range_filter = RangeBodyFilter::new();
-                                range_filter.set(range_type.clone());
-                                range_filter.filter_body(raw_body)
-                            }
-                            _ => raw_body,
+                        let mut body = if let Some(range_filter) = maybe_range_filter.as_mut() {
+                            range_filter.filter_body(raw_body)
+                        } else {
+                            raw_body
                         };
 
                         match self
@@ -1203,7 +1210,7 @@ pub mod range_filter {
             let content_type = self.content_type.as_ref();
             for range in self.ranges.clone() {
                 // Each part should have
-                // \r\n--boundary\r\n                             --> 4 + boundary.len() (16) + 2 = 20
+                // \r\n--boundary\r\n                         --> 4 + boundary.len() (16) + 2 = 20
                 // Content-Type: original-content-type\r\n    --> 14 + content_type.len() + 2
                 // Content-Range: bytes start-end/total\r\n   --> Variable +2
                 // \r\n                                       --> 2
@@ -1259,8 +1266,6 @@ pub mod range_filter {
             }
         }
     }
-
-    // TODO: if-range
 
     // Handles both single-range and multipart-range requests
     pub fn range_header_filter(req: &RequestHeader, resp: &mut ResponseHeader) -> RangeType {
@@ -1567,6 +1572,7 @@ pub mod range_filter {
     pub struct RangeBodyFilter {
         pub range: RangeType,
         current: usize,
+        multipart_idx: Option<usize>,
     }
 
     impl Default for RangeBodyFilter {
@@ -1580,11 +1586,15 @@ pub mod range_filter {
             RangeBodyFilter {
                 range: RangeType::None,
                 current: 0,
+                multipart_idx: None,
             }
         }
 
         pub fn set(&mut self, range: RangeType) {
             self.range = range.clone();
+            if let RangeType::Multi(_) = self.range {
+                self.multipart_idx = Some(0);
+            }
         }
 
         // Emit final boundary footer for multipart requests
@@ -1656,13 +1666,23 @@ pub mod range_filter {
         }
 
         // Return true if chunk includes the start of the given range
-        fn should_emit_header(
+        fn current_chunk_includes_range_start(
             &self,
             range: &Range<usize>,
             current: usize,
             data_len: usize,
         ) -> bool {
             range.start >= current && range.start < current + data_len
+        }
+
+        // Return true if chunk includes the end of the given range
+        fn current_chunk_includes_range_end(
+            &self,
+            range: &Range<usize>,
+            current: usize,
+            data_len: usize,
+        ) -> bool {
+            range.end > current && range.end <= current + data_len
         }
 
         fn filter_multi_range_body(
@@ -1673,31 +1693,45 @@ pub mod range_filter {
         ) -> Option<Bytes> {
             let mut result = BytesMut::new();
 
-            if let RangeType::Multi(multi_part_info) = &self.range {
-                if let Some(final_range) = multi_part_info.ranges.last() {
-                    for range in &multi_part_info.ranges {
-                        if let Some(sliced) =
-                            Self::filter_range_data(range.start, range.end, current, data.clone())
-                        {
-                            if self.should_emit_header(range, current, data_len) {
-                                result.extend_from_slice(&self.build_multipart_header(
-                                    range,
-                                    multi_part_info.boundary.as_ref(),
-                                    &multi_part_info.total_length,
-                                    multi_part_info.content_type.as_deref(),
-                                ));
-                            }
-                            // Emit the actual data bytes
-                            result.extend_from_slice(&sliced);
-                            // If this was the last range, we should emit the boundary footer too
-                            if range == final_range {
-                                if let Some(final_chunk) = self.finalize(&multi_part_info.boundary)
-                                {
-                                    result.extend_from_slice(&final_chunk);
-                                }
+            let RangeType::Multi(multi_part_info) = &self.range else {
+                return None;
+            };
+
+            let multipart_idx = self.multipart_idx.expect("must be set on multirange");
+            let final_range = multi_part_info.ranges.last()?;
+
+            let (_, remaining_ranges) = multi_part_info.ranges.as_slice().split_at(multipart_idx);
+            // NOTE: current invariant is that the multipart info ranges are disjoint ascending
+            // this code is invalid if this invariant is not upheld
+            for range in remaining_ranges {
+                if let Some(sliced) =
+                    Self::filter_range_data(range.start, range.end, current, data.clone())
+                {
+                    if self.current_chunk_includes_range_start(range, current, data_len) {
+                        result.extend_from_slice(&self.build_multipart_header(
+                            range,
+                            multi_part_info.boundary.as_ref(),
+                            &multi_part_info.total_length,
+                            multi_part_info.content_type.as_deref(),
+                        ));
+                    }
+                    // Emit the actual data bytes
+                    result.extend_from_slice(&sliced);
+                    if self.current_chunk_includes_range_end(range, current, data_len) {
+                        // If this was the last range, we should emit the final footer too
+                        if range == final_range {
+                            if let Some(final_chunk) = self.finalize(&multi_part_info.boundary) {
+                                result.extend_from_slice(&final_chunk);
                             }
                         }
+                        // done with this range
+                        self.multipart_idx = Some(self.multipart_idx.expect("must be set") + 1);
                     }
+                } else {
+                    // no part of the data was within this range,
+                    // so lower bound of this range (and remaining ranges) must be
+                    // > current + data_len
+                    break;
                 }
             }
             if result.is_empty() {
