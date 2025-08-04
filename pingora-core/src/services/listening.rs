@@ -20,6 +20,7 @@
 
 use crate::apps::ServerApp;
 use crate::listeners::tls::TlsSettings;
+use crate::listeners::{AcceptAllFilter, ConnectionFilter};
 use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TransportStack};
 use crate::protocols::Stream;
 #[cfg(unix)]
@@ -43,6 +44,7 @@ pub struct Service<A> {
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
+    connection_filter: Arc<dyn ConnectionFilter>,
 }
 
 impl<A> Service<A> {
@@ -53,6 +55,7 @@ impl<A> Service<A> {
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
             threads: None,
+            connection_filter: Arc::new(AcceptAllFilter),
         }
     }
 
@@ -64,7 +67,13 @@ impl<A> Service<A> {
             listeners,
             app_logic: Some(app_logic),
             threads: None,
+            connection_filter: Arc::new(AcceptAllFilter),
         }
+    }
+
+    /// Set a custom connection filter for this service
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        self.connection_filter = filter;
     }
 
     /// Get the [`Listeners`], mostly to add more endpoints.

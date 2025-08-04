@@ -16,6 +16,10 @@
 
 mod l4;
 
+pub mod connection_filter;
+
+pub use connection_filter::{AcceptAllFilter, ConnectionFilter};
+
 #[cfg(feature = "any_tls")]
 pub mod tls;
 
@@ -56,6 +60,7 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl TransportStackBuilder {
@@ -66,6 +71,10 @@ impl TransportStackBuilder {
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
+
+        if let Some(filter) = &self.connection_filter {
+            builder.connection_filter(filter.clone());
+        }
 
         #[cfg(unix)]
         let l4 = builder.listen(upgrade_listeners).await?;
@@ -203,9 +212,20 @@ impl Listeners {
         self.add_endpoint(addr, None);
     }
 
+    /// Set a connection filter for all endpoints in this listener collection
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        for stack in &mut self.stacks {
+            stack.connection_filter = Some(filter.clone());
+        }
+    }
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
-        self.stacks.push(TransportStackBuilder { l4, tls })
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            connection_filter: None,
+        })
     }
 
     pub(crate) async fn build(
