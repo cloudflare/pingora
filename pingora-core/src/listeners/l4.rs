@@ -659,11 +659,8 @@ mod test {
         let mut handles = vec![];
         for _ in 0..3 {
             let handle = tokio::spawn(async move {
-                match tokio::net::TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        drop(stream);
-                    }
-                    Err(_) => {}
+                if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                    drop(stream);
                 }
             });
             handles.push(handle);
