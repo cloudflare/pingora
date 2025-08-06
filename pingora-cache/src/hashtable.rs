@@ -44,6 +44,11 @@ where
     }
 
     #[allow(dead_code)]
+    pub fn get_shard_at_idx(&self, idx: usize) -> Option<&RwLock<HashMap<u128, V>>> {
+        self.tables.get(idx)
+    }
+
+    #[allow(dead_code)]
     pub fn read(&self, key: u128) -> RwLockReadGuard<HashMap<u128, V>> {
         self.get(key).read()
     }
@@ -52,6 +57,7 @@ where
         self.get(key).write()
     }
 
+    #[allow(dead_code)]
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(&u128, &V),
