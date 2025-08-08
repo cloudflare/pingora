@@ -140,12 +140,16 @@ impl UninitializedStream {
 /// The struct to hold one more multiple listening endpoints
 pub struct Listeners {
     stacks: Vec<TransportStackBuilder>,
+    connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl Listeners {
     /// Create a new [`Listeners`] with no listening endpoints.
     pub fn new() -> Self {
-        Listeners { stacks: vec![] }
+        Listeners {
+            stacks: vec![],
+            connection_filter: None,
+        }
     }
 
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
@@ -214,6 +218,12 @@ impl Listeners {
 
     /// Set a connection filter for all endpoints in this listener collection
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        log::debug!("Setting connection filter on Listeners");
+
+        // Store the filter for future endpoints
+        self.connection_filter = Some(filter.clone());
+
+        // Apply to existing stacks
         for stack in &mut self.stacks {
             stack.connection_filter = Some(filter.clone());
         }
@@ -221,10 +231,13 @@ impl Listeners {
 
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
+        let has_filter = self.connection_filter.is_some();
+        log::debug!("Adding endpoint, has filter: {}", has_filter);
+
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
-            connection_filter: None,
+            connection_filter: self.connection_filter.clone(),
         })
     }
 
@@ -256,6 +269,7 @@ impl Listeners {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -332,5 +346,53 @@ mod test {
 
         let res = client.get(format!("https://{addr}")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    #[test]
+    fn test_connection_filter_inheritance() {
+        #[derive(Debug, Clone)]
+        struct TestFilter {
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for TestFilter {
+            async fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let mut listeners = Listeners::new();
+
+        // Add an endpoint before setting filter
+        listeners.add_tcp("127.0.0.1:7104");
+
+        // Set the connection filter
+        let filter = Arc::new(TestFilter {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        listeners.set_connection_filter(filter.clone());
+
+        // Add endpoints after setting filter
+        listeners.add_tcp("127.0.0.1:7105");
+        #[cfg(feature = "any_tls")]
+        {
+            // Only test TLS if the feature is enabled
+            if let Ok(tls_settings) = TlsSettings::intermediate(
+                &format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR")),
+                &format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR")),
+            ) {
+                listeners.add_tls_with_settings("127.0.0.1:7106", None, tls_settings);
+            }
+        }
+
+        // Verify all stacks have the filter
+        for stack in &listeners.stacks {
+            assert!(
+                stack.connection_filter.is_some(),
+                "All stacks should have the connection filter set"
+            );
+        }
     }
 }

@@ -73,7 +73,8 @@ impl<A> Service<A> {
 
     /// Set a custom connection filter for this service
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
-        self.connection_filter = filter;
+        self.connection_filter = filter.clone();
+        self.listeners.set_connection_filter(filter);
     }
 
     /// Get the [`Listeners`], mostly to add more endpoints.
