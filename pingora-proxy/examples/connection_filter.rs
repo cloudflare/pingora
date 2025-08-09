@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(feature = "connection_filter"))]
+compile_error!("This example requires the 'connection_filter' feature to be enabled. Run with: cargo run --example connection_filter --features connection_filter");
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

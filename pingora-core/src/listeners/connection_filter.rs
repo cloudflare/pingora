@@ -13,28 +13,104 @@
 // limitations under the License.
 
 //! Connection filtering trait for early connection filtering
+//!
+//! This module provides the [`ConnectionFilter`] trait which allows filtering
+//! incoming connections at the TCP level, before the TLS handshake occurs.
+//!
+//! # Feature Flag
+//!
+//! This functionality requires the `connection_filter` feature to be enabled:
+//! ```toml
+//! [dependencies]
+//! pingora-core = { version = "0.5", features = ["connection_filter"] }
+//! ```
+//!
+//! When the feature is disabled, a no-op implementation is provided for API compatibility.
 
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 
-/// The trait for filtering connections at the TCP level before TLS handshake
+/// A trait for filtering incoming connections at the TCP level.
+///
+/// Implementations of this trait can inspect the peer address of incoming
+/// connections and decide whether to accept or reject them before any
+/// further processing (including TLS handshake) occurs.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use async_trait::async_trait;
+/// use pingora_core::listeners::ConnectionFilter;
+/// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+///
+/// #[derive(Debug)]
+/// struct BlocklistFilter {
+///     blocked_ips: Vec<IpAddr>,
+/// }
+///
+/// #[async_trait]
+/// impl ConnectionFilter for BlocklistFilter {
+///     async fn should_accept(&self, addr: &SocketAddr) -> bool {
+///         !self.blocked_ips.contains(&addr.ip())
+///     }
+/// }
+/// ```
+///
+/// # Performance Considerations
+///
+/// This filter is called for every incoming connection, so implementations
+/// should be efficient. Consider caching or pre-computing data structures
+/// for IP filtering rather than doing expensive operations per connection.
 #[async_trait]
 pub trait ConnectionFilter: Debug + Send + Sync {
-    /// Called when a new TCP connection is accepted, before TLS handshake
-    /// Return true to accept the connection, false to drop it
+    /// Determines whether an incoming connection should be accepted.
+    ///
+    /// This method is called after a TCP connection is accepted but before
+    /// any further processing (including TLS handshake).
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` - The socket address of the incoming connection
+    ///
+    /// # Returns
+    ///
+    /// * `true` - Accept the connection and continue processing
+    /// * `false` - Drop the connection immediately
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// async fn should_accept(&self, addr: &SocketAddr) -> bool {
+    ///     // Accept only connections from private IP ranges
+    ///     match addr.ip() {
+    ///         IpAddr::V4(ip) => ip.is_private(),
+    ///         IpAddr::V6(_) => true,
+    ///     }
+    /// }
+    ///
     async fn should_accept(&self, _addr: &SocketAddr) -> bool {
         true
     }
 }
 
-/// Default implementation that accepts all connections
+/// Default implementation that accepts all connections.
+///
+/// This filter accepts all incoming connections without any filtering.
+/// It's used as the default when no custom filter is specified.
 #[derive(Debug, Clone)]
 pub struct AcceptAllFilter;
 
 #[async_trait]
 impl ConnectionFilter for AcceptAllFilter {
     // Uses default implementation
+}
+
+#[cfg(not(feature = "connection_filter"))]
+impl AcceptAllFilter {
+    pub fn should_accept_sync(&self, _addr: &SocketAddr) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

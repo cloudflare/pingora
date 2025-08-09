@@ -43,7 +43,7 @@ env_logger = "0.9"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
 pingora-limits = { version = "0.5.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.5.0", path = "../pingora-load-balancing", default-features=false }
+pingora-load-balancing = { version = "0.5.0", path = "../pingora-load-balancing", default-features = false }
 prometheus = "0.13"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -56,11 +56,16 @@ hyperlocal = "0.8"
 [features]
 default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
-boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl", "openssl_derived"]
+boringssl = [
+    "pingora-core/boringssl",
+    "pingora-cache/boringssl",
+    "openssl_derived",
+]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+connection_filter = ["pingora-core/connection_filter"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

@@ -13,12 +13,61 @@
 // limitations under the License.
 
 //! The listening endpoints (TCP and TLS) and their configurations.
+//!
+//! This module provides the infrastructure for setting up network listeners
+//! that accept incoming connections. It supports TCP, Unix domain sockets,
+//! and TLS endpoints.
+//!
+//! # Connection Filtering
+//!
+//! With the `connection_filter` feature enabled, this module also provides
+//! early connection filtering capabilities through the [`ConnectionFilter`] trait.
+//! This allows dropping unwanted connections at the TCP level before any
+//! expensive operations like TLS handshakes.
+//!
+//! ## Example with Connection Filtering
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "connection_filter")]
+//! # {
+//! use pingora_core::listeners::{Listeners, ConnectionFilter};
+//! use std::sync::Arc;
+//!
+//! // Create a custom filter
+//! let filter = Arc::new(MyCustomFilter::new());
+//!
+//! // Apply to listeners
+//! let mut listeners = Listeners::new();
+//! listeners.set_connection_filter(filter);
+//! listeners.add_tcp("0.0.0.0:8080");
+//! # }
+//! ```
 
 mod l4;
 
+#[cfg(feature = "connection_filter")]
 pub mod connection_filter;
 
+#[cfg(feature = "connection_filter")]
 pub use connection_filter::{AcceptAllFilter, ConnectionFilter};
+
+#[cfg(not(feature = "connection_filter"))]
+#[derive(Debug, Clone)]
+pub struct AcceptAllFilter;
+
+#[cfg(not(feature = "connection_filter"))]
+pub trait ConnectionFilter: std::fmt::Debug + Send + Sync {
+    fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+        true
+    }
+}
+
+#[cfg(not(feature = "connection_filter"))]
+impl ConnectionFilter for AcceptAllFilter {
+    fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+        true
+    }
+}
 
 #[cfg(feature = "any_tls")]
 pub mod tls;
@@ -60,6 +109,7 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
@@ -72,6 +122,7 @@ impl TransportStackBuilder {
 
         builder.listen_addr(self.l4.clone());
 
+        #[cfg(feature = "connection_filter")]
         if let Some(filter) = &self.connection_filter {
             builder.connection_filter(filter.clone());
         }
@@ -140,6 +191,7 @@ impl UninitializedStream {
 /// The struct to hold one more multiple listening endpoints
 pub struct Listeners {
     stacks: Vec<TransportStackBuilder>,
+    #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
@@ -148,10 +200,10 @@ impl Listeners {
     pub fn new() -> Self {
         Listeners {
             stacks: vec![],
+            #[cfg(feature = "connection_filter")]
             connection_filter: None,
         }
     }
-
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
     pub fn tcp(addr: &str) -> Self {
         let mut listeners = Self::new();
@@ -217,6 +269,7 @@ impl Listeners {
     }
 
     /// Set a connection filter for all endpoints in this listener collection
+    #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
         log::debug!("Setting connection filter on Listeners");
 
@@ -229,14 +282,22 @@ impl Listeners {
         }
     }
 
+    #[cfg(not(feature = "connection_filter"))]
+    pub fn set_connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) {}
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
+        #[cfg(feature = "connection_filter")]
         let has_filter = self.connection_filter.is_some();
+        #[cfg(not(feature = "connection_filter"))]
+        let has_filter = false;
+
         log::debug!("Adding endpoint, has filter: {}", has_filter);
 
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
+            #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
         })
     }

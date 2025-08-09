@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use log::{debug, warn};
+#[cfg(feature = "connection_filter")]
+use log::debug;
+use log::warn;
 use pingora_error::{
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
@@ -29,11 +31,18 @@ use std::time::Duration;
 use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
 
+#[cfg(feature = "connection_filter")]
 use super::connection_filter::ConnectionFilter;
+#[cfg(not(feature = "connection_filter"))]
+use crate::listeners::ConnectionFilter;
+
+#[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
+
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
+#[cfg(feature = "connection_filter")]
 use crate::protocols::GetSocketDigest;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
@@ -273,12 +282,14 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
     listener: Arc<Listener>,
+    #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
 
 #[derive(Default)]
 pub struct ListenerEndpointBuilder {
     listen_addr: Option<ServerAddress>,
+    #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
@@ -286,6 +297,7 @@ impl ListenerEndpointBuilder {
     pub fn new() -> ListenerEndpointBuilder {
         Self {
             listen_addr: None,
+            #[cfg(feature = "connection_filter")]
             connection_filter: None,
         }
     }
@@ -295,8 +307,15 @@ impl ListenerEndpointBuilder {
         self
     }
 
+    #[cfg(feature = "connection_filter")]
     pub fn connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) -> &mut Self {
         self.connection_filter = Some(filter);
+        self
+    }
+
+    #[cfg(not(feature = "connection_filter"))]
+    #[allow(unused)]
+    pub fn connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) -> &mut Self {
         self
     }
 
@@ -325,6 +344,7 @@ impl ListenerEndpointBuilder {
             bind(&listen_addr).await?
         };
 
+        #[cfg(feature = "connection_filter")]
         let connection_filter = self
             .connection_filter
             .unwrap_or_else(|| Arc::new(AcceptAllFilter));
@@ -332,6 +352,7 @@ impl ListenerEndpointBuilder {
         Ok(ListenerEndpoint {
             listen_addr,
             listener: Arc::new(listener),
+            #[cfg(feature = "connection_filter")]
             connection_filter,
         })
     }
@@ -340,12 +361,20 @@ impl ListenerEndpointBuilder {
     pub async fn listen(self) -> Result<ListenerEndpoint> {
         let listen_addr = self
             .listen_addr
-            .expect("Tried to listen with no addr specified");
+            .ok_or_else(|| Error::explain(ErrorType::InternalError, "listen_addr is required"))?;
+
         let listener = bind(&listen_addr).await?;
+
+        #[cfg(feature = "connection_filter")]
+        let connection_filter = self
+            .connection_filter
+            .unwrap_or_else(|| Arc::new(AcceptAllFilter));
 
         Ok(ListenerEndpoint {
             listen_addr,
             listener: Arc::new(listener),
+            #[cfg(feature = "connection_filter")]
+            connection_filter,
         })
     }
 }
@@ -378,40 +407,53 @@ impl ListenerEndpoint {
     }
 
     pub async fn accept(&self) -> Result<Stream> {
-        loop {
+        #[cfg(feature = "connection_filter")]
+        {
+            loop {
+                let mut stream = self
+                    .listener
+                    .accept()
+                    .await
+                    .or_err(AcceptError, "Fail to accept()")?;
+
+                // Extract peer address for filtering using GetSocketDigest
+                let should_accept = if let Some(digest) = stream.get_socket_digest() {
+                    if let Some(peer_addr) = digest.peer_addr() {
+                        if let Some(inet_addr) = peer_addr.as_inet() {
+                            self.connection_filter.should_accept(inet_addr).await
+                        } else {
+                            // Unix domain socket or other non-inet address - accept by default
+                            true
+                        }
+                    } else {
+                        // No peer address available - accept by default
+                        true
+                    }
+                } else {
+                    // No socket digest available - accept by default
+                    true
+                };
+
+                if !should_accept {
+                    debug!("Connection rejected by filter");
+                    // Drop the stream and continue accepting
+                    drop(stream);
+                    continue;
+                }
+
+                self.apply_stream_settings(&mut stream)?;
+                return Ok(stream);
+            }
+        }
+        #[cfg(not(feature = "connection_filter"))]
+        {
             let mut stream = self
                 .listener
                 .accept()
                 .await
                 .or_err(AcceptError, "Fail to accept()")?;
-
-            // Extract peer address for filtering using GetSocketDigest
-            let should_accept = if let Some(digest) = stream.get_socket_digest() {
-                if let Some(peer_addr) = digest.peer_addr() {
-                    if let Some(inet_addr) = peer_addr.as_inet() {
-                        self.connection_filter.should_accept(inet_addr).await
-                    } else {
-                        // Unix domain socket or other non-inet address - accept by default
-                        true
-                    }
-                } else {
-                    // No peer address available - accept by default
-                    true
-                }
-            } else {
-                // No socket digest available - accept by default
-                true
-            };
-
-            if !should_accept {
-                debug!("Connection rejected by filter");
-                // Drop the stream and continue accepting
-                drop(stream);
-                continue;
-            }
-
             self.apply_stream_settings(&mut stream)?;
-            return Ok(stream);
+            Ok(stream)
         }
     }
 }
@@ -552,6 +594,7 @@ mod test {
         assert_eq!(listener1.as_str(), addr);
     }
 
+    #[cfg(feature = "connection_filter")]
     #[tokio::test]
     async fn test_connection_filter_accept() {
         use crate::listeners::ConnectionFilter;
@@ -614,6 +657,7 @@ mod test {
         assert_eq!(reject_count.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "connection_filter")]
     #[tokio::test]
     async fn test_connection_filter_blocks_all() {
         use crate::listeners::ConnectionFilter;
