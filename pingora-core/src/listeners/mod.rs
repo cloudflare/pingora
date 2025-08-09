@@ -322,6 +322,7 @@ impl Listeners {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "connection_filter")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
