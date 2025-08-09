@@ -67,6 +67,10 @@ any_tls = []
 sentry = ["pingora-core/sentry"]
 connection_filter = ["pingora-core/connection_filter"]
 
+[[example]]
+name = "connection_filter"
+required-features = ["connection_filter"]
+
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_async_trait"]

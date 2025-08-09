@@ -12,14 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(feature = "connection_filter"))]
-compile_error!("This example requires the 'connection_filter' feature to be enabled. Run with: cargo run --example connection_filter --features connection_filter");
-
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use clap::Parser;
-
 use log::info;
 use pingora_core::listeners::ConnectionFilter;
 use pingora_core::prelude::Opt;
@@ -27,6 +21,7 @@ use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{ProxyHttp, Session};
+use std::sync::Arc;
 
 /// This example demonstrates how to implement a connection filter
 pub struct MyProxy;

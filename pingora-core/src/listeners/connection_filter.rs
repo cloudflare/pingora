@@ -106,13 +106,6 @@ impl ConnectionFilter for AcceptAllFilter {
     // Uses default implementation
 }
 
-#[cfg(not(feature = "connection_filter"))]
-impl AcceptAllFilter {
-    pub fn should_accept_sync(&self, _addr: &SocketAddr) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

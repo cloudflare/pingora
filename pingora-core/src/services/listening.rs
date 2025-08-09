@@ -18,8 +18,6 @@
 //! Each [Service] can be configured with custom application logic (e.g. an `HTTPProxy`) and one or
 //! more endpoints to listen to.
 
-// pingora-core/src/services/listening.rs
-
 use crate::apps::ServerApp;
 use crate::listeners::tls::TlsSettings;
 #[cfg(feature = "connection_filter")]

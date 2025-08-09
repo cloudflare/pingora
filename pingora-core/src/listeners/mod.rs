@@ -68,7 +68,6 @@ impl ConnectionFilter for AcceptAllFilter {
         true
     }
 }
-
 #[cfg(feature = "any_tls")]
 pub mod tls;
 
@@ -287,13 +286,6 @@ impl Listeners {
 
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
-        #[cfg(feature = "connection_filter")]
-        let has_filter = self.connection_filter.is_some();
-        #[cfg(not(feature = "connection_filter"))]
-        let has_filter = false;
-
-        log::debug!("Adding endpoint, has filter: {}", has_filter);
-
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
@@ -409,6 +401,7 @@ mod test {
         assert_eq!(res.status(), reqwest::StatusCode::OK);
     }
 
+    #[cfg(feature = "connection_filter")]
     #[test]
     fn test_connection_filter_inheritance() {
         #[derive(Debug, Clone)]
@@ -448,7 +441,7 @@ mod test {
             }
         }
 
-        // Verify all stacks have the filter
+        // Verify all stacks have the filter (only when feature is enabled)
         for stack in &listeners.stacks {
             assert!(
                 stack.connection_filter.is_some(),
