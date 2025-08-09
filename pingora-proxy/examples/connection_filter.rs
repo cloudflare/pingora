@@ -52,10 +52,7 @@ struct BlockAllFilter;
 #[async_trait]
 impl ConnectionFilter for BlockAllFilter {
     async fn should_accept(&self, addr: &std::net::SocketAddr) -> bool {
-        info!(
-            "❌ BLOCKING connection from {} (BlockAllFilter active)",
-            addr
-        );
+        info!("BLOCKING connection from {} (BlockAllFilter active)", addr);
         false
     }
 }
@@ -92,7 +89,7 @@ fn main() {
     info!("  curl http://localhost:6196/get");
     info!("");
     info!("ALL requests should be blocked!");
-    info!("You should see '❌ BLOCKING connection' in the logs");
+    info!("You should see 'BLOCKING connection' in the logs");
     info!("and curl should fail with 'Connection refused' or hang");
     info!("");
 
