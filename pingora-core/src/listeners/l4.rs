@@ -361,7 +361,7 @@ impl ListenerEndpointBuilder {
     pub async fn listen(self) -> Result<ListenerEndpoint> {
         let listen_addr = self
             .listen_addr
-            .ok_or_else(|| Error::explain(ErrorType::InternalError, "listen_addr is required"))?;
+            .expect("Tried to listen with no addr specified");
 
         let listener = bind(&listen_addr).await?;
 
@@ -416,7 +416,7 @@ impl ListenerEndpoint {
                     .await
                     .or_err(AcceptError, "Fail to accept()")?;
 
-                // Extract peer address for filtering using GetSocketDigest
+                // Performance: nested if-let avoids cloning/allocations on each connection accept
                 let should_accept = if let Some(digest) = stream.get_socket_digest() {
                     if let Some(peer_addr) = digest.peer_addr() {
                         if let Some(inet_addr) = peer_addr.as_inet() {
@@ -436,7 +436,6 @@ impl ListenerEndpoint {
 
                 if !should_accept {
                     debug!("Connection rejected by filter");
-                    // Drop the stream and continue accepting
                     drop(stream);
                     continue;
                 }
