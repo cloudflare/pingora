@@ -13,12 +13,14 @@
 // limitations under the License.
 
 use crate::app::echo::{EchoApp, HttpEchoApp};
+use pingora::apps::http_app::HttpServer;
 use pingora::services::listening::Service;
 
 pub fn echo_service() -> Service<EchoApp> {
     Service::new("Echo Service".to_string(), EchoApp)
 }
 
-pub fn echo_service_http() -> Service<HttpEchoApp> {
-    Service::new("Echo Service HTTP".to_string(), HttpEchoApp)
+pub fn echo_service_http() -> Service<HttpServer<HttpEchoApp>> {
+    let server = HttpServer::new_app(HttpEchoApp);
+    Service::new("Echo Service HTTP".to_string(), server)
 }
