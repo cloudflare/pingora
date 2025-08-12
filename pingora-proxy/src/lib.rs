@@ -57,6 +57,7 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
+use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
 use pingora_core::protocols::http::SERVER_NAME;
@@ -95,6 +96,7 @@ pub struct HttpProxy<SV> {
     client_upstream: Connector,
     shutdown: Notify,
     pub server_options: Option<HttpServerOptions>,
+    pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
     max_retries: usize,
 }
@@ -106,6 +108,7 @@ impl<SV> HttpProxy<SV> {
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
             server_options: None,
+            h2_options: None,
             downstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
         }
@@ -835,7 +838,9 @@ where
         self.server_options.as_ref()
     }
 
-    // TODO implement h2_options
+    fn h2_options(&self) -> Option<H2Options> {
+        self.h2_options.clone()
+    }
 }
 
 use pingora_core::services::listening::Service;

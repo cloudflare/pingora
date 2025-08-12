@@ -20,8 +20,9 @@ use log::{debug, error, trace};
 use pingora_http::ResponseHeader;
 use std::sync::Arc;
 
-use crate::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
+use crate::apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use crate::modules::http::{HttpModules, ModuleBuilder};
+use crate::protocols::http::v2::server::H2Options;
 use crate::protocols::http::HttpTask;
 use crate::protocols::http::ServerSession;
 use crate::server::ShutdownWatch;
@@ -111,6 +112,8 @@ where
 pub struct HttpServer<SV> {
     app: SV,
     modules: HttpModules,
+    pub server_options: Option<HttpServerOptions>,
+    pub h2_options: Option<H2Options>,
 }
 
 impl<SV> HttpServer<SV> {
@@ -119,6 +122,8 @@ impl<SV> HttpServer<SV> {
         HttpServer {
             app,
             modules: HttpModules::new(),
+            server_options: None,
+            h2_options: None,
         }
     }
 
@@ -208,5 +213,13 @@ where
                 None
             }
         }
+    }
+
+    fn h2_options(&self) -> Option<H2Options> {
+        self.h2_options.clone()
+    }
+
+    fn server_options(&self) -> Option<&HttpServerOptions> {
+        self.server_options.as_ref()
     }
 }
