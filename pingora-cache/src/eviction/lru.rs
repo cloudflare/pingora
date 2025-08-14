@@ -50,6 +50,18 @@ impl<const N: usize> Manager<N> {
         Manager(Lru::with_capacity(limit, capacity))
     }
 
+    /// Create a [Manager] with an optional watermark in addition to weight limit.
+    ///
+    /// When `watermark` is set, the underlying LRU will also evict to keep total item count
+    /// under or equal to that watermark.
+    pub fn with_capacity_and_watermark(
+        limit: usize,
+        capacity: usize,
+        watermark: Option<usize>,
+    ) -> Self {
+        Manager(Lru::with_capacity_and_watermark(limit, capacity, watermark))
+    }
+
     /// Serialize the given shard
     pub fn serialize_shard(&self, shard: usize) -> Result<Vec<u8>> {
         use rmp_serde::encode::Serializer;

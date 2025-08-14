@@ -44,6 +44,7 @@ struct Node {
 pub struct Manager {
     lru: RwLock<LruCache<u64, Node>>,
     limit: usize,
+    items_watermark: Option<usize>,
     used: AtomicUsize,
     items: AtomicUsize,
     evicted_size: AtomicUsize,
@@ -56,6 +57,20 @@ impl Manager {
         Manager {
             lru: RwLock::new(LruCache::unbounded()),
             limit,
+            items_watermark: None,
+            used: AtomicUsize::new(0),
+            items: AtomicUsize::new(0),
+            evicted_size: AtomicUsize::new(0),
+            evicted_items: AtomicUsize::new(0),
+        }
+    }
+
+    /// Create a new [Manager] with optional watermark in addition to size limit `limit`.
+    pub fn new_with_watermark(limit: usize, items_watermark: Option<usize>) -> Self {
+        Manager {
+            lru: RwLock::new(LruCache::unbounded()),
+            limit,
+            items_watermark,
             used: AtomicUsize::new(0),
             items: AtomicUsize::new(0),
             evicted_size: AtomicUsize::new(0),
@@ -96,13 +111,27 @@ impl Manager {
         self.used.fetch_add(delta, Ordering::Relaxed);
     }
 
-    // evict items until the used capacity is below the limit
+    #[inline]
+    fn over_limits(&self) -> bool {
+        self.used.load(Ordering::Relaxed) > self.limit
+            || self
+                .items_watermark
+                .is_some_and(|w| self.items.load(Ordering::Relaxed) > w)
+    }
+
+    // evict items until the used capacity is below the size limit and watermark count
     fn evict(&self) -> Vec<CompactCacheKey> {
-        if self.used.load(Ordering::Relaxed) <= self.limit {
+        if self.used.load(Ordering::Relaxed) <= self.limit
+            && self
+                .items_watermark
+                .map_or(true, |w| self.items.load(Ordering::Relaxed) <= w)
+        {
             return vec![];
         }
+
         let mut to_evict = Vec::with_capacity(1); // we will at least pop 1 item
-        while self.used.load(Ordering::Relaxed) > self.limit {
+
+        while self.over_limits() {
             if let Some((_, node)) = self.lru.write().pop_lru() {
                 self.used.fetch_sub(node.size, Ordering::Relaxed);
                 self.items.fetch_sub(1, Ordering::Relaxed);
@@ -475,5 +504,24 @@ mod test {
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
+    }
+
+    #[test]
+    fn test_watermark_eviction() {
+        const SIZE_LIMIT: usize = usize::MAX / 2;
+        let lru = Manager::new_with_watermark(SIZE_LIMIT, Some(4));
+        let until = SystemTime::now();
+
+        // admit 6 items of size 1
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let key = CacheKey::new("", name, "1").to_compact();
+            let _ = lru.admit(key, 1, until);
+        }
+
+        // test items were evicted due to watermark
+        assert_eq!(lru.total_items(), 4);
+        assert_eq!(lru.evicted_items(), 2);
+        assert_eq!(lru.evicted_size(), 2);
+        assert!(lru.total_size() <= SIZE_LIMIT);
     }
 }
