@@ -164,6 +164,7 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
             .or_err(BindError, "failed to set IPV6_V6ONLY")?;
     }
 
+    #[cfg(unix)]
     if let Some(reuseport) = opt.so_reuseport {
         socket_ref
             .set_reuse_port(reuseport)
@@ -447,6 +448,7 @@ mod test {
             .expect("can connect to UDS listener");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_tcp_so_reuseport() {
         let addr = "127.0.0.1:7201";
