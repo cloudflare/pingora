@@ -16,20 +16,31 @@ use std::sync::Arc;
 
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
+use crate::protocols::{ALPN, IO};
+
 use log::debug;
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
-use pingora_rustls::load_certs_and_key_files;
-use pingora_rustls::ServerConfig;
+use pingora_rustls::{crypto_provider, load_certs_and_key_files, CertifiedKey};
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
-
-use crate::protocols::{ALPN, IO};
+use pingora_rustls::{ResolvesServerCert, ResolvesServerCertUsingSni, ServerConfig};
 
 /// The TLS settings of a listening endpoint
 pub struct TlsSettings {
     alpn_protocols: Option<Vec<Vec<u8>>>,
-    cert_path: String,
-    key_path: String,
+    cert_and_key: CertAndKey,
+}
+
+pub enum CertAndKey {
+    Single { cert_path: String, key_path: String },
+    Bundle(Vec<BundleCert>),
+    Custom(Arc<dyn ResolvesServerCert>),
+}
+
+pub struct BundleCert {
+    pub sni: String,
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 pub struct Acceptor {
@@ -46,23 +57,14 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
+        let mut config = match &self.cert_and_key {
+            CertAndKey::Single {
+                cert_path,
+                key_path,
+            } => Self::build_single(cert_path, key_path),
+            CertAndKey::Bundle(bundle) => Self::build_bundled(bundle),
+            CertAndKey::Custom(resolver) => Self::build_custom(resolver.clone()),
         };
-
-        // TODO - Add support for client auth & custom CA support
-        let mut config =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {e}")
-                })
-                .unwrap();
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -72,6 +74,65 @@ impl TlsSettings {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
             callbacks: None,
         }
+    }
+
+    fn build_bundled(bundle: &[BundleCert]) -> ServerConfig {
+        let crypto_provider = crypto_provider();
+
+        let mut resolver = ResolvesServerCertUsingSni::new();
+        for cert_key in bundle {
+            let Ok(Some((certs, key))) =
+                load_certs_and_key_files(&cert_key.cert_path, &cert_key.key_path)
+            else {
+                panic!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\" for SNI \"{}\".",
+                    cert_key.cert_path, cert_key.key_path, cert_key.sni
+                )
+            };
+
+            let Ok(ck) = CertifiedKey::from_der(certs, key, crypto_provider) else {
+                panic!(
+                    "Failed to build CertifiedKey from \"{}\" for SNI \"{}\".",
+                    cert_key.key_path, cert_key.sni
+                )
+            };
+
+            if let Err(err) = resolver.add(&cert_key.sni, ck) {
+                panic!(
+                    "SNI \"{}\" invalid for cert \"{}\" and key \"{}\": {:?}",
+                    cert_key.sni, cert_key.cert_path, cert_key.key_path, err
+                )
+            }
+        }
+
+        // TODO - Add support for client auth & custom CA support
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver))
+    }
+
+    fn build_single(cert_path: &str, key_path: &str) -> ServerConfig {
+        let Ok(Some((certs, key))) = load_certs_and_key_files(cert_path, key_path) else {
+            panic!(
+                "Failed to load provided certificates \"{}\" or key \"{}\".",
+                cert_path, key_path
+            )
+        };
+
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .explain_err(InternalError, |e| {
+                format!("Failed to create server listener config: {e}")
+            })
+            .unwrap()
+    }
+
+    fn build_custom(resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
+        // TODO - Add support for client auth & custom CA support
+        ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+            .with_no_client_auth()
+            .with_cert_resolver(resolver)
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.
@@ -90,8 +151,30 @@ impl TlsSettings {
     {
         Ok(TlsSettings {
             alpn_protocols: None,
-            cert_path: cert_path.to_string(),
-            key_path: key_path.to_string(),
+            cert_and_key: CertAndKey::Single {
+                cert_path: cert_path.to_string(),
+                key_path: key_path.to_string(),
+            },
+        })
+    }
+
+    pub fn intermediate_bundle(bundle: Vec<BundleCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_and_key: CertAndKey::Bundle(bundle),
+        })
+    }
+
+    pub fn intermediate_custom(resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_and_key: CertAndKey::Custom(resolver),
         })
     }
 
