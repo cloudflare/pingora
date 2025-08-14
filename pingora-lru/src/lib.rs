@@ -32,6 +32,7 @@ pub struct Lru<T, const N: usize> {
     units: [RwLock<LruUnit<T>>; N],
     weight: AtomicUsize,
     weight_limit: usize,
+    len_watermark: Option<usize>,
     len: AtomicUsize,
     evicted_weight: AtomicUsize,
     evicted_len: AtomicUsize,
@@ -42,17 +43,30 @@ impl<T, const N: usize> Lru<T, N> {
     ///
     /// The capacity is per shard (for simplicity). So the total capacity = capacity * N
     pub fn with_capacity(weight_limit: usize, capacity: usize) -> Self {
+        Self::with_capacity_and_watermark(weight_limit, capacity, None)
+    }
+
+    /// Create an [Lru] with the given weight limit, predicted capacity and optional watermark
+    ///
+    /// The capacity is per shard (for simplicity). So the total capacity = capacity * N
+    ///
+    /// The watermark indicates at what count we should begin evicting and acts as a limit
+    /// on the total number of allowed items.
+    pub fn with_capacity_and_watermark(
+        weight_limit: usize,
+        capacity: usize,
+        len_watermark: Option<usize>,
+    ) -> Self {
         // use the unsafe code from ArrayVec just to init the array
         let mut units = arrayvec::ArrayVec::<_, N>::new();
         for _ in 0..N {
             units.push(RwLock::new(LruUnit::with_capacity(capacity)));
         }
         Lru {
-            // we did init all N elements so safe to unwrap
-            // map_err because unwrap() requires LruUnit to TODO: impl Debug
             units: units.into_inner().map_err(|_| "").unwrap(),
             weight: AtomicUsize::new(0),
             weight_limit,
+            len_watermark,
             len: AtomicUsize::new(0),
             evicted_weight: AtomicUsize::new(0),
             evicted_len: AtomicUsize::new(0),
@@ -132,7 +146,7 @@ impl<T, const N: usize> Lru<T, N> {
         evicted
     }
 
-    /// Evict the [Lru] until the overall weight is below the limit.
+    /// Evict the [Lru] until the overall weight is below the limit (or the configured watermark).
     ///
     /// Return a list of evicted items.
     ///
@@ -140,18 +154,23 @@ impl<T, const N: usize> Lru<T, N> {
     pub fn evict_to_limit(&self) -> Vec<(T, usize)> {
         let mut evicted = vec![];
         let mut initial_weight = self.weight();
+        let mut initial_len = self.len();
         let mut shard_seed = rand::random(); // start from a random shard
         let mut empty_shard = 0;
 
         // Entries can be admitted or removed from the LRU by others during the loop below
-        // Track initial_weight not to over evict due to entries admitted after the loop starts
-        // self.weight() is also used not to over evict due to some entries are removed by others
-        while initial_weight > self.weight_limit
-            && self.weight() > self.weight_limit
+        // Track initial size not to over evict due to entries admitted after the loop starts
+        // self.weight() / self.len() is also used not to over evict
+        // due to entries already removed by others
+        while ((initial_weight > self.weight_limit && self.weight() > self.weight_limit)
+            || self
+                .len_watermark
+                .is_some_and(|w| initial_len > w && self.len() > w))
             && empty_shard < N
         {
             if let Some(i) = self.evict_shard(shard_seed) {
                 initial_weight -= i.1;
+                initial_len = initial_len.saturating_sub(1);
                 evicted.push(i)
             } else {
                 empty_shard += 1;
@@ -611,6 +630,25 @@ mod test_lru {
 
         // ignore existing ones
         assert!(!lru.insert_tail(6, 6, 7));
+    }
+
+    #[test]
+    fn test_watermark_eviction() {
+        const WEIGHT_LIMIT: usize = usize::MAX / 2;
+        let lru = Lru::<u64, 2>::with_capacity_and_watermark(WEIGHT_LIMIT, 10, Some(4));
+
+        // admit 6 items, each weight 1
+        for k in [2u64, 3, 4, 5, 6, 7] {
+            lru.admit(k, k, 1);
+        }
+
+        assert!(lru.weight() < WEIGHT_LIMIT);
+        assert_eq!(lru.len(), 6);
+
+        let evicted = lru.evict_to_limit();
+        assert_eq!(lru.len(), 4);
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(lru.evicted_len(), 2);
     }
 }
 
