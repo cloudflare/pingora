@@ -533,15 +533,15 @@ impl Hash for HttpPeer {
 
 impl Display for HttpPeer {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "addr: {}, scheme: {},", self._address, self.scheme)?;
+        write!(f, "addr: {}, scheme: {}", self._address, self.scheme)?;
         if !self.sni.is_empty() {
-            write!(f, "sni: {},", self.sni)?;
+            write!(f, ", sni: {}", self.sni)?;
         }
         if let Some(p) = self.proxy.as_ref() {
-            write!(f, "proxy: {p},")?;
+            write!(f, ", proxy: {p}")?;
         }
         if let Some(cert) = &self.client_cert_key {
-            write!(f, "client cert: {},", cert)?;
+            write!(f, ", client cert: {}", cert)?;
         }
         Ok(())
     }
