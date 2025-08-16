@@ -14,6 +14,7 @@
 
 //! HTTP/1.x client session
 
+use bstr::ByteSlice;
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{header, header::AsHeaderName, HeaderValue, StatusCode, Version};
 use log::{debug, trace};
@@ -308,7 +309,7 @@ impl HttpSession {
                 HeaderParseState::Invalid(e) => {
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
+                        format!("buf: {:?}", buf.as_bstr()),
                         e,
                     );
                 }

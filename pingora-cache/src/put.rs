@@ -363,6 +363,7 @@ mod test {
 
 mod parse_response {
     use super::*;
+    use bstr::ByteSlice;
     use bytes::BytesMut;
     use httparse::Status;
     use pingora_error::{
@@ -469,7 +470,7 @@ mod parse_response {
                     self.state = ParseState::Invalid(e);
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&self.buf)),
+                        format!("buf: {:?}", self.buf.as_bstr()),
                         e,
                     );
                 }

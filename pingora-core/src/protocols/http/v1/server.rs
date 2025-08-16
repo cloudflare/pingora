@@ -14,6 +14,7 @@
 
 //! HTTP/1.x server session
 
+use bstr::ByteSlice;
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -284,10 +285,7 @@ impl HttpSession {
                                 buf.truncate(MAX_ERR_BUF_LEN);
                                 return Error::e_because(
                                     InvalidHTTPHeader,
-                                    format!(
-                                        "buf: {}",
-                                        String::from_utf8_lossy(&buf).escape_default()
-                                    ),
+                                    format!("buf: {:?}", buf.as_bstr()),
                                     e,
                                 );
                             }
@@ -297,7 +295,7 @@ impl HttpSession {
                             buf.truncate(MAX_ERR_BUF_LEN);
                             return Error::e_because(
                                 InvalidHTTPHeader,
-                                format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
+                                format!("buf: {:?}", buf.as_bstr()),
                                 e,
                             );
                         }
