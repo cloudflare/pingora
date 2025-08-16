@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::thread;
 #[cfg(unix)]
 use tokio::signal::unix;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::time::{sleep, Duration};
 
 use crate::services::Service;
@@ -52,6 +52,49 @@ const CLOSE_TIMEOUT: u64 = 5;
 enum ShutdownType {
     Graceful,
     Quick,
+}
+
+/// The execution phase the server is currently in.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum ExecutionPhase {
+    /// The server was created, but has not started yet.
+    Setup,
+
+    /// Services are being prepared.
+    ///
+    /// During graceful upgrades this phase acquires the listening FDs from the old process.
+    Bootstrap,
+
+    /// Bootstrap has finished, listening FDs have been transferred.
+    BootstrapComplete,
+
+    /// The server is running and is listening for shutdown signals.
+    Running,
+
+    /// A QUIT signal was received, indicating that a new process wants to take over.
+    ///
+    /// The server is trying to send the fds to the new process over a Unix socket.
+    GracefulUpgradeTransferringFds,
+
+    /// FDs have been sent to the new process.
+    /// Waiting a fixed amount of time to allow the new process to take the sockets.
+    GracefulUpgradeCloseTimeout,
+
+    /// A TERM signal was received, indicating that the server should shut down gracefully.
+    GracefulTerminate,
+
+    /// The server is shutting down.
+    ShutdownStarted,
+
+    /// Waiting for the configured grace period to end before shutting down.
+    ShutdownGracePeriod,
+
+    /// Wait for runtimes to finish.
+    ShutdownRuntimes,
+
+    /// The server has stopped.
+    Terminated,
 }
 
 /// The receiver for server's shutdown event. The value will turn to true once the server starts
@@ -144,6 +187,12 @@ pub struct Server {
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
     shutdown_recv: ShutdownWatch,
+
+    /// Tracks the execution phase of the server during upgrades and graceful shutdowns.
+    ///
+    /// Users can subscribe to the phase with [`Self::watch_execution_phase()`].
+    execution_phase_watch: broadcast::Sender<ExecutionPhase>,
+
     /// The parsed server configuration
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
@@ -159,9 +208,21 @@ pub struct Server {
 // TODO: delete the pid when exit
 
 impl Server {
+    /// Acquire a receiver for the server's execution phase.
+    ///
+    /// The receiver will produce values for each transition.
+    pub fn watch_execution_phase(&self) -> broadcast::Receiver<ExecutionPhase> {
+        self.execution_phase_watch.subscribe()
+    }
+
     #[cfg(unix)]
     async fn main_loop(&self, run_args: RunArgs) -> ShutdownType {
         // waiting for exit signal
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::Running)
+            .ok();
+
         match run_args.shutdown_signal.recv().await {
             ShutdownSignal::FastShutdown => {
                 info!("SIGINT received, exiting");
@@ -181,12 +242,22 @@ impl Server {
                     }
                 }
                 info!("Broadcast graceful shutdown complete");
+
+                self.execution_phase_watch
+                    .send(ExecutionPhase::GracefulTerminate)
+                    .ok();
+
                 ShutdownType::Graceful
             }
             ShutdownSignal::GracefulUpgrade => {
                 // TODO: still need to select! on signals in case a fast shutdown is needed
                 // aka: move below to another task and only kick it off here
                 info!("SIGQUIT received, sending socks and gracefully exiting");
+
+                self.execution_phase_watch
+                    .send(ExecutionPhase::GracefulUpgradeTransferringFds)
+                    .ok();
+
                 if let Some(fds) = &self.listen_fds {
                     let fds = fds.lock().await;
                     info!("Trying to send socks");
@@ -202,6 +273,9 @@ impl Server {
                             sentry::capture_error(&e);
                         }
                     }
+                    self.execution_phase_watch
+                        .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
+                        .ok();
                     sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
                     info!("Broadcasting graceful shutdown");
                     // gracefully exiting
@@ -286,6 +360,7 @@ impl Server {
             listen_fds: None,
             shutdown_watch: tx,
             shutdown_recv: rx,
+            execution_phase_watch: broadcast::channel(100).0,
             configuration: Arc::new(conf),
             options: opt,
             #[cfg(feature = "sentry")]
@@ -333,6 +408,7 @@ impl Server {
             listen_fds: None,
             shutdown_watch: tx,
             shutdown_recv: rx,
+            execution_phase_watch: broadcast::channel(100).0,
             configuration: Arc::new(conf),
             options: opt,
             #[cfg(feature = "sentry")]
@@ -360,6 +436,10 @@ impl Server {
         info!("Bootstrap starting");
         debug!("{:#?}", self.options);
 
+        self.execution_phase_watch
+            .send(ExecutionPhase::Bootstrap)
+            .ok();
+
         /* only init sentry in release builds */
         #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
@@ -384,9 +464,19 @@ impl Server {
                 std::process::exit(1);
             }
         }
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::BootstrapComplete)
+            .ok();
     }
 
     /// Start the server using [Self::run] and default [RunArgs].
+    ///
+    /// This function will block forever until the server needs to quit. So this would be the last
+    /// function to call for this object.
+    ///
+    /// Note: this function may fork the process for daemonization, so any additional threads created
+    /// before this function will be lost to any service logic once this function is called.
     pub fn run_forever(self) -> ! {
         info!("Server starting");
 
@@ -396,13 +486,16 @@ impl Server {
         std::process::exit(0)
     }
 
-    /// Start the server
+    /// Run the server until execution finished.
     ///
-    /// This function will block forever until the server needs to quit. So this would be the last
-    /// function to call for this object.
+    /// This function will run until the server has been instructed to shut down
+    /// through a signal, and will then wait for all services to finish and
+    /// runtimes to exit.
     ///
-    /// Note: this function may fork the process for daemonization, so any additional threads created
-    /// before this function will be lost to any service logic once this function is called.
+    /// Note: if daemonization is enabled in the config, this function will
+    /// never return.
+    /// Instead it will either start the daemon process and exit, or panic
+    /// if daemonization fails.
     pub fn run(mut self, run_args: RunArgs) {
         info!("Server starting");
 
@@ -425,10 +518,12 @@ impl Server {
         #[cfg(all(not(debug_assertions), feature = "sentry"))]
         let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
-        let mut runtimes: Vec<Runtime> = Vec::new();
+        // Holds tuples of runtimes and their service name.
+        let mut runtimes: Vec<(Runtime, String)> = Vec::new();
 
         while let Some(service) = self.services.pop() {
             let threads = service.threads().unwrap_or(conf.threads);
+            let name = service.name().to_string();
             let runtime = Server::run_service(
                 service,
                 #[cfg(unix)]
@@ -438,7 +533,7 @@ impl Server {
                 conf.work_stealing,
                 self.configuration.listener_tasks_per_fd,
             );
-            runtimes.push(runtime);
+            runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
@@ -451,7 +546,15 @@ impl Server {
         #[cfg(windows)]
         let shutdown_type = ShutdownType::Graceful;
 
+        self.execution_phase_watch
+            .send(ExecutionPhase::ShutdownStarted)
+            .ok();
+
         if matches!(shutdown_type, ShutdownType::Graceful) {
+            self.execution_phase_watch
+                .send(ExecutionPhase::ShutdownGracePeriod)
+                .ok();
+
             let exit_timeout = self
                 .configuration
                 .as_ref()
@@ -472,21 +575,34 @@ impl Server {
                     .unwrap_or(5),
             ),
         };
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::ShutdownRuntimes)
+            .ok();
+
         let shutdowns: Vec<_> = runtimes
             .into_iter()
-            .map(|rt| {
+            .map(|(rt, name)| {
                 info!("Waiting for runtimes to exit!");
-                thread::spawn(move || {
+                let join = thread::spawn(move || {
                     rt.shutdown_timeout(shutdown_timeout);
                     thread::sleep(shutdown_timeout)
-                })
+                });
+                (join, name)
             })
             .collect();
-        for shutdown in shutdowns {
+        for (shutdown, name) in shutdowns {
+            info!("Waiting for service runtime {} to exit", name);
             if let Err(e) = shutdown.join() {
-                error!("Failed to shutdown runtime: {:?}", e);
+                error!("Failed to shutdown service runtime {}: {:?}", name, e);
             }
+            debug!("Service runtime {} has exited", name);
         }
+        info!("All runtimes exited, exiting now");
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::Terminated)
+            .ok();
     }
 
     fn create_runtime(name: &str, threads: usize, work_steal: bool) -> Runtime {

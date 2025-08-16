@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
@@ -82,7 +83,7 @@ impl<SV> HttpProxy<SV> {
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
-                    if let Some((mut meta, handler)) = res {
+                    if let Some((mut meta, mut handler)) = res {
                         // Vary logic
                         // Because this branch can be called multiple times in a loop, and we only
                         // need to update the vary once, check if variance is already set to
@@ -118,7 +119,7 @@ impl<SV> HttpProxy<SV> {
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
-                            .cache_hit_filter(session, &meta, is_fresh, ctx)
+                            .cache_hit_filter(session, &meta, &mut handler, is_fresh, ctx)
                             .await
                         {
                             Err(e) => {
@@ -290,7 +291,7 @@ impl<SV> HttpProxy<SV> {
 
         // process range header if the cache storage supports seek
         let range_type = if seekable && !session.ignore_downstream_range {
-            self.inner.range_header_filter(req, &mut header, ctx)
+            self.inner.range_header_filter(session, &mut header, ctx)
         } else {
             RangeType::None
         };
@@ -350,15 +351,33 @@ impl<SV> HttpProxy<SV> {
         debug!("finished sending cached header to downstream");
 
         if !header_only {
-            if let RangeType::Single(r) = range_type {
-                if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
-                    return (false, Some(e));
+            let mut maybe_range_filter = match &range_type {
+                RangeType::Single(r) => {
+                    if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
+                        return (false, Some(e));
+                    }
+                    None
                 }
-            }
+                RangeType::Multi(_) => {
+                    // TODO: seek hit handler for multipart
+                    let mut range_filter = RangeBodyFilter::new();
+                    range_filter.set(range_type.clone());
+                    Some(range_filter)
+                }
+                RangeType::Invalid => unreachable!(),
+                RangeType::None => None,
+            };
             loop {
                 match session.cache.hit_handler().read_body().await {
-                    Ok(mut body) => {
-                        let end = body.is_none();
+                    Ok(raw_body) => {
+                        let end = raw_body.is_none();
+
+                        let mut body = if let Some(range_filter) = maybe_range_filter.as_mut() {
+                            range_filter.filter_body(raw_body)
+                        } else {
+                            raw_body
+                        };
+
                         match self
                             .inner
                             .response_body_filter(session, &mut body, end, ctx)
@@ -505,7 +524,9 @@ impl<SV> HttpProxy<SV> {
                             if session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
-                                session.cache.disable(NoCacheReason::ResponseTooLarge);
+                                session
+                                    .cache
+                                    .disable(NoCacheReason::PredictedResponseTooLarge);
                                 return Ok(());
                             }
 
@@ -540,6 +561,8 @@ impl<SV> HttpProxy<SV> {
                                             NoCacheReason::ResponseTooLarge,
                                         );
                                         session.cache.disable(NoCacheReason::ResponseTooLarge);
+                                        // too large to cache, disable ranging
+                                        session.ignore_downstream_range = true;
                                     }
                                 }
                                 // if the content-length header is not specified, the miss handler
@@ -584,21 +607,31 @@ impl<SV> HttpProxy<SV> {
             HttpTask::Body(data, end_stream) => match data {
                 Some(d) => {
                     if session.cache.enabled() {
+                        // TODO: do this async
+                        // fail if writing the body would exceed the max_file_size_bytes
+                        let body_size_allowed =
+                            session.cache.track_body_bytes_for_max_file_size(d.len());
+                        if !body_size_allowed {
+                            debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
+                            session
+                                .cache
+                                .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
+
+                            return Error::e_explain(
+                                ERR_RESPONSE_TOO_LARGE,
+                                format!(
+                                    "writing data of size {} bytes would exceed max file size of {} bytes",
+                                    d.len(),
+                                    session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
+                                ),
+                            );
+                        }
+
                         // this will panic if more data is sent after we see end_stream
                         // but should be impossible in real world
                         let miss_handler = session.cache.miss_handler().unwrap();
-                        // TODO: do this async
-                        let res = miss_handler.write_body(d.clone(), *end_stream).await;
-                        if let Err(err) = res {
-                            if err.etype == ERR_RESPONSE_TOO_LARGE {
-                                debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
-                                session
-                                    .cache
-                                    .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
-                            }
 
-                            return Err(err);
-                        }
+                        miss_handler.write_body(d.clone(), *end_stream).await?;
                         if *end_stream {
                             session.cache.finish_miss_handler().await?;
                         }
@@ -884,6 +917,7 @@ fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
 // https://datatracker.ietf.org/doc/html/rfc7233#section-3
 pub mod range_filter {
     use super::*;
+    use bytes::BytesMut;
     use http::header::*;
     use std::ops::Range;
 
@@ -895,55 +929,114 @@ pub mod range_filter {
     fn parse_range_header(range: &[u8], content_length: usize) -> RangeType {
         use regex::Regex;
 
-        // single byte range only for now
-        // https://datatracker.ietf.org/doc/html/rfc7233#section-2.1
-        // https://datatracker.ietf.org/doc/html/rfc7233#appendix-C: case-insensitive
-        static RE_SINGLE_RANGE: Lazy<Regex> =
-            Lazy::new(|| Regex::new(r"(?i)bytes=(?P<start>\d*)-(?P<end>\d*)").unwrap());
+        // Match individual range parts, (e.g. "0-100", "-5", "1-")
+        static RE_SINGLE_RANGE_PART: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?i)^\s*(?P<start>\d*)-(?P<end>\d*)\s*$").unwrap());
 
-        // ignore invalid range header
-        let Ok(range_str) = str::from_utf8(range) else {
+        // Convert bytes to UTF-8 string
+        let range_str = match str::from_utf8(range) {
+            Ok(s) => s,
+            Err(_) => return RangeType::None,
+        };
+
+        // Split into "bytes=" and the actual range(s)
+        let mut parts = range_str.splitn(2, "=");
+
+        // Check if it starts with "bytes="
+        let prefix = parts.next();
+        if !prefix.is_some_and(|s| s.eq_ignore_ascii_case("bytes")) {
+            return RangeType::None;
+        }
+
+        let Some(ranges_str) = parts.next() else {
+            // No ranges provided
             return RangeType::None;
         };
 
-        let Some(captured) = RE_SINGLE_RANGE.captures(range_str) else {
-            return RangeType::None;
-        };
-        let maybe_start = captured
-            .name("start")
-            .and_then(|s| s.as_str().parse::<usize>().ok());
-        let end = captured
-            .name("end")
-            .and_then(|s| s.as_str().parse::<usize>().ok());
+        // Get the actual range string (e.g."100-200,300-400")
+        let mut range_count = 0;
+        for _ in ranges_str.split(',') {
+            range_count += 1;
+            // TODO: make configurable
+            const MAX_RANGES: usize = 100;
+            if range_count >= MAX_RANGES {
+                // If we get more than MAX_RANGES ranges, return None for now to save parsing time
+                return RangeType::None;
+            }
+        }
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(range_count);
 
-        if let Some(start) = maybe_start {
-            if start >= content_length {
-                RangeType::Invalid
-            } else {
+        // Process each range
+        let mut last_range_end = 0;
+        for part in ranges_str.split(',') {
+            let captured = match RE_SINGLE_RANGE_PART.captures(part) {
+                Some(c) => c,
+                None => {
+                    return RangeType::None;
+                }
+            };
+
+            let maybe_start = captured
+                .name("start")
+                .and_then(|s| s.as_str().parse::<usize>().ok());
+            let end = captured
+                .name("end")
+                .and_then(|s| s.as_str().parse::<usize>().ok());
+
+            let range = if let Some(start) = maybe_start {
+                if start >= content_length {
+                    // Skip the invalid range
+                    continue;
+                }
                 // open-ended range should end at the last byte
-                // over sized end is allow but ignored
+                // over sized end is allowed but ignored
                 // range end is inclusive
                 let end = std::cmp::min(end.unwrap_or(content_length - 1), content_length - 1) + 1;
                 if end <= start {
-                    RangeType::Invalid
-                } else {
-                    RangeType::new_single(start, end)
+                    // Skip the invalid range
+                    continue;
                 }
-            }
-        } else {
-            // start is empty, this changes the meaning of the value of `end`
-            // Now it means to read the last `end` bytes
-            if let Some(end) = end {
-                if content_length >= end {
-                    RangeType::new_single(content_length - end, content_length)
-                } else {
-                    // over sized end is allow but ignored
-                    RangeType::new_single(0, content_length)
-                }
+                start..end
             } else {
-                // both empty/invalid
-                RangeType::Invalid
+                // start is empty, this changes the meaning of the value of `end`
+                // Now it means to read the last `end` bytes
+                if let Some(end) = end {
+                    if content_length >= end {
+                        (content_length - end)..content_length
+                    } else {
+                        // over sized end is allowed but ignored
+                        0..content_length
+                    }
+                } else {
+                    // No start or end, skip the invalid range
+                    continue;
+                }
+            };
+            // For now we stick to non-overlapping, ascending ranges for simplicity
+            // and parity with nginx
+            if range.start < last_range_end {
+                return RangeType::None;
             }
+            last_range_end = range.end;
+            ranges.push(range);
+        }
+
+        // Note for future: we can technically coalesce multiple ranges for multipart
+        //
+        // https://www.rfc-editor.org/rfc/rfc9110#section-17.15
+        // "Servers ought to ignore, coalesce, or reject egregious range
+        // requests, such as requests for more than two overlapping ranges or
+        // for many small ranges in a single set, particularly when the ranges
+        // are requested out of order for no apparent reason. Multipart range
+        // requests are not designed to support random access."
+
+        if ranges.is_empty() {
+            // We got some ranges, processed them but none were valid
+            RangeType::Invalid
+        } else if ranges.len() == 1 {
+            RangeType::Single(ranges[0].clone()) // Only 1 index
+        } else {
+            RangeType::Multi(MultiRangeInfo::new(ranges))
         }
     }
     #[test]
@@ -978,23 +1071,203 @@ pub mod range_filter {
         assert_eq!(parse_range_header(b"bytes=", 10), RangeType::None);
     }
 
+    // Add some tests for multi-range too
+    #[test]
+    fn test_parse_range_header_multi() {
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,4-5", 10)
+                .get_multirange_info()
+                .expect("Should have multipart info for Multipart range request")
+                .ranges,
+            (vec![Range { start: 0, end: 2 }, Range { start: 4, end: 6 }])
+        );
+        // Last range is invalid because the content-length is too small
+        assert_eq!(
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 320)
+                .get_multirange_info()
+                .expect("Should have multipart info for Multipart range request")
+                .ranges,
+            (vec![
+                Range { start: 0, end: 100 },
+                Range {
+                    start: 200,
+                    end: 300
+                }
+            ])
+        );
+        // Same as above but appropriate content length
+        assert_eq!(
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 500)
+                .get_multirange_info()
+                .expect("Should have multipart info for Multipart range request")
+                .ranges,
+            vec![
+                Range { start: 0, end: 100 },
+                Range {
+                    start: 200,
+                    end: 300
+                },
+                Range {
+                    start: 400,
+                    end: 500
+                },
+            ]
+        );
+        // Looks like a range request but it is continuous, we decline to range
+        assert_eq!(parse_range_header(b"bytes=0-,-2", 10), RangeType::None,);
+        // Should not have multirange info set
+        assert!(parse_range_header(b"bytes=0-,-2", 10)
+            .get_multirange_info()
+            .is_none());
+        // Overlapping ranges, these ranges are currently declined
+        assert_eq!(parse_range_header(b"bytes=0-3,2-5", 10), RangeType::None,);
+        assert!(parse_range_header(b"bytes=0-3,2-5", 10)
+            .get_multirange_info()
+            .is_none());
+
+        // Content length is 2, so only range is 0-2.
+        assert_eq!(
+            parse_range_header(b"bytes=0-5,10-", 2),
+            RangeType::new_single(0, 2)
+        );
+        assert!(parse_range_header(b"bytes=0-5,10-", 2)
+            .get_multirange_info()
+            .is_none());
+
+        // We should ignore the last incorrect range and return the other acceptable ranges
+        assert_eq!(
+            parse_range_header(b"bytes=0-5, 10-20, 30-18", 200)
+                .get_multirange_info()
+                .expect("Should have multipart info for Multipart range request")
+                .ranges,
+            vec![Range { start: 0, end: 6 }, Range { start: 10, end: 21 },]
+        );
+        // All invalid ranges
+        assert_eq!(
+            parse_range_header(b"bytes=5-0, 20-15, 30-25", 200),
+            RangeType::Invalid
+        );
+
+        // Helper function to generate a large number of ranges for the next test
+        fn generate_range_header(count: usize) -> Vec<u8> {
+            let mut s = String::from("bytes=");
+            for i in 0..count {
+                let start = i * 4;
+                let end = start + 1;
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&start.to_string());
+                s.push('-');
+                s.push_str(&end.to_string());
+            }
+            s.into_bytes()
+        }
+
+        // Test 100 range limit for parsing.
+        let ranges = generate_range_header(101);
+        assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
+    }
+
+    // For Multipart Requests, we need to know the boundary, content length and type across
+    // the headers and the body. So let us store this information as part of the range
+    #[derive(Debug, Eq, PartialEq, Clone)]
+    pub struct MultiRangeInfo {
+        pub ranges: Vec<Range<usize>>,
+        pub boundary: String,
+        total_length: usize,
+        content_type: Option<String>,
+    }
+
+    impl MultiRangeInfo {
+        // Create a new MultiRangeInfo, when we just have the ranges
+        pub fn new(ranges: Vec<Range<usize>>) -> Self {
+            Self {
+                ranges,
+                // Directly create boundary string on initialization
+                boundary: Self::generate_boundary(),
+                total_length: 0,
+                content_type: None,
+            }
+        }
+        pub fn set_content_type(&mut self, content_type: String) {
+            self.content_type = Some(content_type)
+        }
+        pub fn set_total_length(&mut self, total_length: usize) {
+            self.total_length = total_length;
+        }
+        // Per [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#multipart.byteranges),
+        // we need generate a boundary string for each body part.
+        // Per [RFC 2046](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1), the boundary should be no longer than 70 characters
+        // and it must not match the body content.
+        fn generate_boundary() -> String {
+            use rand::Rng;
+            let mut rng: rand::prelude::ThreadRng = rand::thread_rng();
+            format!("{:016x}", rng.gen::<u64>())
+        }
+        fn calculate_multipart_length(&self) -> usize {
+            let mut total_length = 0;
+            let content_type = self.content_type.as_ref();
+            for range in self.ranges.clone() {
+                // Each part should have
+                // \r\n--boundary\r\n                         --> 4 + boundary.len() (16) + 2 = 20
+                // Content-Type: original-content-type\r\n    --> 14 + content_type.len() + 2
+                // Content-Range: bytes start-end/total\r\n   --> Variable +2
+                // \r\n                                       --> 2
+                // [data]                                     --> data.len()
+                total_length += 4 + self.boundary.len() + 2;
+                total_length += content_type.map_or(0, |ct| 14 + ct.len() + 2);
+                total_length += format!(
+                    "Content-Range: bytes {}-{}/{}",
+                    range.start,
+                    range.end - 1,
+                    self.total_length
+                )
+                .len()
+                    + 2;
+                total_length += 2;
+                total_length += range.end - range.start;
+            }
+            // Final boundary: "\r\n--<boundary>--\r\n"
+            total_length += 4 + self.boundary.len() + 4;
+            total_length
+        }
+    }
     #[derive(Debug, Eq, PartialEq, Clone)]
     pub enum RangeType {
         None,
         Single(Range<usize>),
-        // TODO: multi-range
+        Multi(MultiRangeInfo),
         Invalid,
     }
 
     impl RangeType {
+        // Helper functions for tests
+        #[allow(dead_code)]
         fn new_single(start: usize, end: usize) -> Self {
             RangeType::Single(Range { start, end })
         }
+        #[allow(dead_code)]
+        pub fn new_multi(ranges: Vec<Range<usize>>) -> Self {
+            RangeType::Multi(MultiRangeInfo::new(ranges))
+        }
+        #[allow(dead_code)]
+        fn get_multirange_info(&self) -> Option<&MultiRangeInfo> {
+            match self {
+                RangeType::Multi(multi_range_info) => Some(multi_range_info),
+                _ => None,
+            }
+        }
+        #[allow(dead_code)]
+        fn update_multirange_info(&mut self, content_length: usize, content_type: Option<String>) {
+            if let RangeType::Multi(multipart_range_info) = self {
+                multipart_range_info.content_type = content_type;
+                multipart_range_info.set_total_length(content_length);
+            }
+        }
     }
 
-    // TODO: if-range
-
-    // single range for now
+    // Handles both single-range and multipart-range requests
     pub fn range_header_filter(req: &RequestHeader, resp: &mut ResponseHeader) -> RangeType {
         // The Range header field is evaluated after evaluating the precondition
         // header fields defined in [RFC7232], and only if the result in absence
@@ -1046,9 +1319,9 @@ pub mod range_filter {
         // TODO: we can also check Accept-Range header from resp. Nginx gives uses the option
         // see proxy_force_ranges
 
-        let range_type = parse_range_header(range_header.as_bytes(), content_length);
+        let mut range_type = parse_range_header(range_header.as_bytes(), content_length);
 
-        match &range_type {
+        match &mut range_type {
             RangeType::None => { /* nothing to do*/ }
             RangeType::Single(r) => {
                 // 206 response
@@ -1060,6 +1333,31 @@ pub mod range_filter {
                     format!("bytes {}-{}/{content_length}", r.start, r.end - 1), // range end is inclusive
                 )
                 .unwrap()
+            }
+
+            RangeType::Multi(multi_range_info) => {
+                let content_type = resp
+                    .headers
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/octet-stream");
+                // Update multipart info
+                multi_range_info.set_total_length(content_length);
+                multi_range_info.set_content_type(content_type.to_string());
+
+                let total_length = multi_range_info.calculate_multipart_length();
+
+                resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.insert_header(CONTENT_LENGTH, total_length).unwrap();
+                resp.insert_header(
+                    CONTENT_TYPE,
+                    format!(
+                        "multipart/byteranges; boundary={}",
+                        multi_range_info.boundary
+                    ), // RFC 2046
+                )
+                .unwrap();
+                resp.remove_header(&CONTENT_RANGE);
             }
             RangeType::Invalid => {
                 // 416 response
@@ -1078,7 +1376,7 @@ pub mod range_filter {
     }
 
     #[test]
-    fn test_range_filter() {
+    fn test_range_filter_single() {
         fn gen_req() -> RequestHeader {
             RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap()
         }
@@ -1122,6 +1420,72 @@ pub mod range_filter {
         );
     }
 
+    // Multipart Tests
+    #[test]
+    fn test_range_filter_multipart() {
+        fn gen_req() -> RequestHeader {
+            let mut req: RequestHeader =
+                RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
+            req.append_header("Range", "bytes=0-1,3-4,6-7").unwrap();
+            req
+        }
+        fn gen_req_overlap_range() -> RequestHeader {
+            let mut req: RequestHeader =
+                RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
+            req.append_header("Range", "bytes=0-3,2-5,7-8").unwrap();
+            req
+        }
+        fn gen_resp() -> ResponseHeader {
+            let mut resp = ResponseHeader::build(200, Some(1)).unwrap();
+            resp.append_header("Content-Length", "10").unwrap();
+            resp
+        }
+
+        // valid multipart range
+        let req = gen_req();
+        let mut resp = gen_resp();
+        let result = range_header_filter(&req, &mut resp);
+        let mut boundary_str = String::new();
+
+        assert!(matches!(result, RangeType::Multi(_)));
+        if let RangeType::Multi(multi_part_info) = result {
+            assert_eq!(multi_part_info.ranges.len(), 3);
+            assert_eq!(multi_part_info.ranges[0], Range { start: 0, end: 2 });
+            assert_eq!(multi_part_info.ranges[1], Range { start: 3, end: 5 });
+            assert_eq!(multi_part_info.ranges[2], Range { start: 6, end: 8 });
+            // Verify that multipart info has been set
+            assert!(multi_part_info.content_type.is_some());
+            assert_eq!(multi_part_info.total_length, 10);
+            assert!(!multi_part_info.boundary.is_empty());
+            boundary_str = multi_part_info.boundary;
+        }
+        assert_eq!(resp.status.as_u16(), 206);
+        // Verify that boundary is the same in header and in multipartinfo
+        assert_eq!(
+            resp.headers.get("content-type").unwrap().to_str().unwrap(),
+            format!("multipart/byteranges; boundary={boundary_str}")
+        );
+        assert!(resp.headers.get("content_length").is_none());
+
+        // overlapping range, multipart range is declined
+        let req = gen_req_overlap_range();
+        let mut resp = gen_resp();
+        let result = range_header_filter(&req, &mut resp);
+
+        assert!(matches!(result, RangeType::None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert!(resp.headers.get("content-type").is_none());
+
+        // bad multipart range
+        let mut req = gen_req();
+        req.insert_header("Range", "bytes=1-0, 12-9, 50-40")
+            .unwrap();
+        let mut resp = gen_resp();
+        let result = range_header_filter(&req, &mut resp);
+        assert!(matches!(result, RangeType::Invalid));
+        assert_eq!(resp.status.as_u16(), 416);
+    }
+
     #[test]
     fn test_if_range() {
         const DATE: &str = "Fri, 07 Jul 2023 22:03:29 GMT";
@@ -1130,6 +1494,11 @@ pub mod range_filter {
         fn gen_req() -> RequestHeader {
             let mut req = RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
             req.append_header("Range", "bytes=0-1").unwrap();
+            req
+        }
+        fn get_multipart_req() -> RequestHeader {
+            let mut req = RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
+            _ = req.append_header("Range", "bytes=0-1,3-4,6-7");
             req
         }
         fn gen_resp() -> ResponseHeader {
@@ -1175,11 +1544,41 @@ pub mod range_filter {
         req.insert_header("If-Range", "1234").unwrap();
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+
+        // multipart range with If-Range
+        let mut req = get_multipart_req();
+        req.insert_header("If-Range", DATE).unwrap();
+        let mut resp = gen_resp();
+        let result = range_header_filter(&req, &mut resp);
+        assert!(matches!(result, RangeType::Multi(_)));
+        assert_eq!(resp.status.as_u16(), 206);
+
+        // multipart with matching ETag
+        let req = get_multipart_req();
+        let mut resp = gen_resp();
+        assert!(matches!(
+            range_header_filter(&req, &mut resp),
+            RangeType::Multi(_)
+        ));
+
+        // multipart with non-matching If-Range
+        let mut req = get_multipart_req();
+        req.insert_header("If-Range", "\"wrong\"").unwrap();
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(resp.status.as_u16(), 200);
     }
 
     pub struct RangeBodyFilter {
         pub range: RangeType,
         current: usize,
+        multipart_idx: Option<usize>,
+    }
+
+    impl Default for RangeBodyFilter {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl RangeBodyFilter {
@@ -1187,11 +1586,24 @@ pub mod range_filter {
             RangeBodyFilter {
                 range: RangeType::None,
                 current: 0,
+                multipart_idx: None,
             }
         }
 
         pub fn set(&mut self, range: RangeType) {
-            self.range = range;
+            self.range = range.clone();
+            if let RangeType::Multi(_) = self.range {
+                self.multipart_idx = Some(0);
+            }
+        }
+
+        // Emit final boundary footer for multipart requests
+        pub fn finalize(&self, boundary: &String) -> Option<Bytes> {
+            if let RangeType::Multi(_) = self.range {
+                Some(Bytes::from(format!("\r\n--{boundary}--\r\n")))
+            } else {
+                None
+            }
         }
 
         pub fn filter_body(&mut self, data: Option<Bytes>) -> Option<Bytes> {
@@ -1202,6 +1614,14 @@ pub mod range_filter {
                     let current = self.current;
                     self.current += data.as_ref().map_or(0, |d| d.len());
                     data.and_then(|d| Self::filter_range_data(r.start, r.end, current, d))
+                }
+
+                RangeType::Multi(_) => {
+                    let data = data?;
+                    let current = self.current;
+                    let data_len = data.len();
+                    self.current += data_len;
+                    self.filter_multi_range_body(data, current, data_len)
                 }
             }
         }
@@ -1226,10 +1646,104 @@ pub mod range_filter {
                 Some(data.slice(slice_start..slice_end))
             }
         }
+
+        // Returns the multipart header for a given range
+        fn build_multipart_header(
+            &self,
+            range: &Range<usize>,
+            boundary: &str,
+            total_length: &usize,
+            content_type: Option<&str>,
+        ) -> Bytes {
+            Bytes::from(format!(
+                "\r\n--{}\r\n{}Content-Range: bytes {}-{}/{}\r\n\r\n",
+                boundary,
+                content_type.map_or(String::new(), |ct| format!("Content-Type: {ct}\r\n")),
+                range.start,
+                range.end - 1,
+                total_length
+            ))
+        }
+
+        // Return true if chunk includes the start of the given range
+        fn current_chunk_includes_range_start(
+            &self,
+            range: &Range<usize>,
+            current: usize,
+            data_len: usize,
+        ) -> bool {
+            range.start >= current && range.start < current + data_len
+        }
+
+        // Return true if chunk includes the end of the given range
+        fn current_chunk_includes_range_end(
+            &self,
+            range: &Range<usize>,
+            current: usize,
+            data_len: usize,
+        ) -> bool {
+            range.end > current && range.end <= current + data_len
+        }
+
+        fn filter_multi_range_body(
+            &mut self,
+            data: Bytes,
+            current: usize,
+            data_len: usize,
+        ) -> Option<Bytes> {
+            let mut result = BytesMut::new();
+
+            let RangeType::Multi(multi_part_info) = &self.range else {
+                return None;
+            };
+
+            let multipart_idx = self.multipart_idx.expect("must be set on multirange");
+            let final_range = multi_part_info.ranges.last()?;
+
+            let (_, remaining_ranges) = multi_part_info.ranges.as_slice().split_at(multipart_idx);
+            // NOTE: current invariant is that the multipart info ranges are disjoint ascending
+            // this code is invalid if this invariant is not upheld
+            for range in remaining_ranges {
+                if let Some(sliced) =
+                    Self::filter_range_data(range.start, range.end, current, data.clone())
+                {
+                    if self.current_chunk_includes_range_start(range, current, data_len) {
+                        result.extend_from_slice(&self.build_multipart_header(
+                            range,
+                            multi_part_info.boundary.as_ref(),
+                            &multi_part_info.total_length,
+                            multi_part_info.content_type.as_deref(),
+                        ));
+                    }
+                    // Emit the actual data bytes
+                    result.extend_from_slice(&sliced);
+                    if self.current_chunk_includes_range_end(range, current, data_len) {
+                        // If this was the last range, we should emit the final footer too
+                        if range == final_range {
+                            if let Some(final_chunk) = self.finalize(&multi_part_info.boundary) {
+                                result.extend_from_slice(&final_chunk);
+                            }
+                        }
+                        // done with this range
+                        self.multipart_idx = Some(self.multipart_idx.expect("must be set") + 1);
+                    }
+                } else {
+                    // no part of the data was within this range,
+                    // so lower bound of this range (and remaining ranges) must be
+                    // > current + data_len
+                    break;
+                }
+            }
+            if result.is_empty() {
+                None
+            } else {
+                Some(result.freeze())
+            }
+        }
     }
 
     #[test]
-    fn test_range_body_filter() {
+    fn test_range_body_filter_single() {
         let mut body_filter = RangeBodyFilter::new();
         assert_eq!(body_filter.filter_body(Some("123".into())).unwrap(), "123");
 
@@ -1253,6 +1767,201 @@ pub mod range_filter {
         assert_eq!(body_filter.filter_body(Some("012".into())).unwrap(), "12");
         assert_eq!(body_filter.filter_body(Some("345".into())).unwrap(), "345");
         assert_eq!(body_filter.filter_body(Some("678".into())).unwrap(), "6");
+    }
+
+    #[test]
+    fn test_range_body_filter_multipart() {
+        // Test #1 - Test multipart ranges from 1 chunk
+        let data = Bytes::from("0123456789");
+        let ranges = vec![0..3, 6..9];
+        let content_length = data.len();
+        let mut body_filter = RangeBodyFilter::new();
+        body_filter.set(RangeType::new_multi(ranges.clone()));
+
+        body_filter
+            .range
+            .update_multirange_info(content_length, None);
+
+        let multi_range_info = body_filter
+            .range
+            .get_multirange_info()
+            .cloned()
+            .expect("Multipart Ranges should have MultiPartInfo struct");
+
+        // Pass the whole body in one chunk
+        let output = body_filter.filter_body(Some(data)).unwrap();
+        let footer = body_filter.finalize(&multi_range_info.boundary).unwrap();
+
+        // Convert to String so that we can inspect whole response
+        let output_str = str::from_utf8(&output).unwrap();
+        let final_boundary = str::from_utf8(&footer).unwrap();
+        let boundary = &multi_range_info.boundary;
+
+        // Check part headers
+        for (i, range) in ranges.iter().enumerate() {
+            let header = &format!(
+                "--{}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+                boundary,
+                range.start,
+                range.end - 1,
+                content_length
+            );
+            assert!(
+                output_str.contains(header),
+                "Missing part header {} in multipart body",
+                i
+            );
+            // Check body matches
+            let expected_body = &"0123456789"[range.clone()];
+            assert!(
+                output_str.contains(expected_body),
+                "Missing body {} for range {:?}",
+                expected_body,
+                range
+            )
+        }
+        // Check the final boundary footer
+        assert_eq!(final_boundary, format!("\r\n--{}--\r\n", boundary));
+
+        // Test #2 - Test multipart ranges from multiple chunks
+        let full_body = b"0123456789";
+        let ranges = vec![0..2, 4..6, 8..9];
+        let content_length = full_body.len();
+        let content_type = "text/plain".to_string();
+        let mut body_filter = RangeBodyFilter::new();
+        body_filter.set(RangeType::new_multi(ranges.clone()));
+
+        body_filter
+            .range
+            .update_multirange_info(content_length, Some(content_type.clone()));
+
+        let multi_range_info = body_filter
+            .range
+            .get_multirange_info()
+            .cloned()
+            .expect("Multipart Ranges should have MultiPartInfo struct");
+
+        // Split the body into 4 chunks
+        let chunk1 = Bytes::from_static(b"012");
+        let chunk2 = Bytes::from_static(b"345");
+        let chunk3 = Bytes::from_static(b"678");
+        let chunk4 = Bytes::from_static(b"9");
+
+        let mut collected_bytes = BytesMut::new();
+        for chunk in [chunk1, chunk2, chunk3, chunk4] {
+            if let Some(filtered) = body_filter.filter_body(Some(chunk)) {
+                collected_bytes.extend_from_slice(&filtered);
+            }
+        }
+        if let Some(final_boundary) = body_filter.finalize(&multi_range_info.boundary) {
+            collected_bytes.extend_from_slice(&final_boundary);
+        }
+
+        let output_str = str::from_utf8(&collected_bytes).unwrap();
+        let boundary = multi_range_info.boundary;
+
+        for (i, range) in ranges.iter().enumerate() {
+            let header = &format!(
+                "--{}\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+                boundary,
+                content_type,
+                range.start,
+                range.end - 1,
+                content_length
+            );
+            let expected_body = &full_body[range.clone()];
+            let expected_output = format!("{}{}", header, str::from_utf8(expected_body).unwrap());
+
+            assert!(
+                output_str.contains(&expected_output),
+                "Missing or malformed part {} in multipart body. \n Expected: \n{}\n Got: \n{}",
+                i,
+                expected_output,
+                output_str
+            )
+        }
+
+        assert!(
+            output_str.ends_with(&format!("\r\n--{}--\r\n", boundary)),
+            "Missing final boundary"
+        );
+
+        // Test #3 - Test multipart ranges from multiple chunks, with ranges spanning chunks
+        let full_body = b"abcdefghijkl";
+        let ranges = vec![2..7, 9..11];
+        let content_length = full_body.len();
+        let content_type = "application/octet-stream".to_string();
+        let mut body_filter = RangeBodyFilter::new();
+        body_filter.set(RangeType::new_multi(ranges.clone()));
+
+        body_filter
+            .range
+            .update_multirange_info(content_length, Some(content_type.clone()));
+
+        let multi_range_info = body_filter
+            .range
+            .clone()
+            .get_multirange_info()
+            .cloned()
+            .expect("Multipart Ranges should have MultiPartInfo struct");
+
+        // Split the body into 4 chunks
+        let chunk1 = Bytes::from_static(b"abc");
+        let chunk2 = Bytes::from_static(b"def");
+        let chunk3 = Bytes::from_static(b"ghi");
+        let chunk4 = Bytes::from_static(b"jkl");
+
+        let mut collected_bytes = BytesMut::new();
+        for chunk in [chunk1, chunk2, chunk3, chunk4] {
+            if let Some(filtered) = body_filter.filter_body(Some(chunk)) {
+                collected_bytes.extend_from_slice(&filtered);
+            }
+        }
+        if let Some(final_boundary) = body_filter.finalize(&multi_range_info.boundary) {
+            collected_bytes.extend_from_slice(&final_boundary);
+        }
+
+        let output_str = str::from_utf8(&collected_bytes).unwrap();
+        let boundary = &multi_range_info.boundary;
+
+        let header1 = &format!(
+            "--{}\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+            boundary,
+            content_type,
+            ranges[0].start,
+            ranges[0].end - 1,
+            content_length
+        );
+        let header2 = &format!(
+            "--{}\r\nContent-Type: {}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
+            boundary,
+            content_type,
+            ranges[1].start,
+            ranges[1].end - 1,
+            content_length
+        );
+
+        assert!(output_str.contains(header1));
+        assert!(output_str.contains(header2));
+
+        let expected_body_slices = ["cdefg", "jk"];
+
+        assert!(
+            output_str.contains(expected_body_slices[0]),
+            "Missing expected sliced body {}",
+            expected_body_slices[0]
+        );
+
+        assert!(
+            output_str.contains(expected_body_slices[1]),
+            "Missing expected sliced body {}",
+            expected_body_slices[1]
+        );
+
+        assert!(
+            output_str.ends_with(&format!("\r\n--{}--\r\n", boundary)),
+            "Missing final boundary"
+        );
     }
 }
 
@@ -1396,16 +2105,24 @@ impl ServeFromCache {
         cache: &mut HttpCache,
         range_filter: &mut RangeBodyFilter,
     ) -> Result<()> {
-        if let RangeType::Single(range) = &range_filter.range {
-            if cache.hit_handler().can_seek() {
-                cache
-                    .hit_handler()
-                    .seek(range.start, Some(range.end))
-                    .or_err(InternalError, "cannot seek hit handler")?;
-                // Because the hit handler is seeking, we no longer need the
-                // RangeBodyFilter's help to return the requested byte range.
-                range_filter.range = RangeType::None;
+        match &range_filter.range {
+            RangeType::Single(range) => {
+                if cache.hit_handler().can_seek() {
+                    cache
+                        .hit_handler()
+                        .seek(range.start, Some(range.end))
+                        .or_err(InternalError, "cannot seek hit handler")?;
+                    // Because the hit handler is seeking, we no longer need the
+                    // RangeBodyFilter's help to return the requested byte range.
+                    range_filter.range = RangeType::None;
+                }
             }
+            RangeType::Multi(_) => {
+                // For multipart ranges, we will handle the seeking in
+                // the body filter per part for now.
+                // TODO: implement seek for multipart range
+            }
+            _ => {}
         }
         *self = Self::CacheBody(false);
         Ok(())

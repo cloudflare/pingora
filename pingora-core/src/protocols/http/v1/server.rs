@@ -79,6 +79,8 @@ pub struct HttpSession {
     min_send_rate: Option<usize>,
     /// When this is enabled informational response headers will not be proxied downstream
     ignore_info_resp: bool,
+    /// Disable keepalive if response is sent before downstream body is finished
+    close_on_response_before_downstream_finish: bool,
 }
 
 impl HttpSession {
@@ -99,7 +101,7 @@ impl HttpSession {
             buf: Bytes::new(), // zero size, with be replaced by parsed header later
             raw_header: None,
             preread_body: None,
-            body_reader: BodyReader::new(),
+            body_reader: BodyReader::new(false),
             body_writer: BodyWriter::new(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
@@ -116,6 +118,7 @@ impl HttpSession {
             digest,
             min_send_rate: None,
             ignore_info_resp: false,
+            close_on_response_before_downstream_finish: false,
         }
     }
 
@@ -149,7 +152,11 @@ impl HttpSession {
                             return Ok(None);
                         }
                     },
-                    _ => match self.read_timeout {
+                    KeepaliveStatus::Infinite => {
+                        // FIXME: this should only apply to reads between requests
+                        read_event.await
+                    }
+                    KeepaliveStatus::Off => match self.read_timeout {
                         Some(t) => match timeout(t, read_event).await {
                             Ok(res) => res,
                             Err(e) => {
@@ -465,6 +472,11 @@ impl HttpSession {
             }
         }
 
+        if self.close_on_response_before_downstream_finish && !self.is_body_done() {
+            debug!("set connection close before downstream finish");
+            self.set_keepalive(None);
+        }
+
         // no need to add these headers to 1xx responses
         if !header.status.is_informational() && self.update_resp_headers {
             /* update headers */
@@ -564,6 +576,14 @@ impl HttpSession {
             None => {
                 self.keepalive_timeout = KeepaliveStatus::Off;
             }
+        }
+    }
+
+    pub fn get_keepalive_timeout(&self) -> Option<u64> {
+        match self.keepalive_timeout {
+            KeepaliveStatus::Timeout(d) => Some(d.as_secs()),
+            KeepaliveStatus::Infinite => Some(0),
+            KeepaliveStatus::Off => None,
         }
     }
 
@@ -887,15 +907,15 @@ impl HttpSession {
 
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
-        self.read_timeout = Some(timeout);
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
     /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
-    pub fn set_write_timeout(&mut self, timeout: Duration) {
-        self.write_timeout = Some(timeout);
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
     }
 
     /// Sets the total drain timeout. For HTTP/1.1, reusing a session requires
@@ -906,8 +926,8 @@ impl HttpSession {
     /// on trying to reuse the session.
     ///
     /// Note that the downstream read timeout still applies between body byte reads.
-    pub fn set_total_drain_timeout(&mut self, timeout: Duration) {
-        self.total_drain_timeout = Some(timeout);
+    pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        self.total_drain_timeout = timeout;
     }
 
     /// Sets the minimum downstream send rate in bytes per second. This
@@ -917,10 +937,12 @@ impl HttpSession {
     /// rate must be greater than zero.
     ///
     /// Calculated write timeout is guaranteed to be at least 1s if `min_send_rate`
-    /// is greater than zero, a send rate of zero is a noop.
-    pub fn set_min_send_rate(&mut self, min_send_rate: usize) {
-        if min_send_rate > 0 {
-            self.min_send_rate = Some(min_send_rate);
+    /// is greater than zero, a send rate of zero is equivalent to disabling.
+    pub fn set_min_send_rate(&mut self, min_send_rate: Option<usize>) {
+        if let Some(rate) = min_send_rate.filter(|r| *r > 0) {
+            self.min_send_rate = Some(rate);
+        } else {
+            self.min_send_rate = None;
         }
     }
 
@@ -930,6 +952,14 @@ impl HttpSession {
     /// Expect: 100-continue was set on the request.
     pub fn set_ignore_info_resp(&mut self, ignore: bool) {
         self.ignore_info_resp = ignore;
+    }
+
+    /// Sets whether keepalive should be disabled if response is written prior to
+    /// downstream body finishing.
+    ///
+    /// This may be set to avoid draining downstream if the body is no longer necessary.
+    pub fn set_close_on_response_before_downstream_finish(&mut self, close: bool) {
+        self.close_on_response_before_downstream_finish = close;
     }
 
     /// Return the [Digest] of the connection.
@@ -1906,7 +1936,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_secs(5);
 
-        http_stream.set_write_timeout(expected);
+        http_stream.set_write_timeout(Some(expected));
         assert_eq!(Some(expected), http_stream.write_timeout(50));
     }
 
@@ -1917,9 +1947,13 @@ mod tests_stream {
     }
 
     #[test]
-    fn test_get_write_timeout_min_send_rate_zero_noop() {
+    fn test_get_write_timeout_min_send_rate_zero() {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        http_stream.set_min_send_rate(0);
+        http_stream.set_min_send_rate(Some(0));
+        assert!(http_stream.write_timeout(50).is_none());
+
+        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
+        http_stream.set_min_send_rate(None);
         assert!(http_stream.write_timeout(50).is_none());
     }
 
@@ -1928,8 +1962,8 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_millis(29800);
 
-        http_stream.set_write_timeout(Duration::from_secs(60));
-        http_stream.set_min_send_rate(5000);
+        http_stream.set_write_timeout(Some(Duration::from_secs(60)));
+        http_stream.set_min_send_rate(Some(5000));
 
         assert_eq!(Some(expected), http_stream.write_timeout(149000));
     }
@@ -1939,7 +1973,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
         let expected = Duration::from_secs(1);
 
-        http_stream.set_min_send_rate(1);
+        http_stream.set_min_send_rate(Some(1));
         assert_eq!(Some(expected), http_stream.write_timeout(0));
     }
 }

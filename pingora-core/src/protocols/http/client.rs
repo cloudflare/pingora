@@ -80,22 +80,20 @@ impl HttpSession {
     /// Set the read timeout for reading header and body.
     ///
     /// The timeout is per read operation, not on the overall time reading the entire response
-    pub fn set_read_timeout(&mut self, timeout: Duration) {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
-            HttpSession::H1(h1) => h1.read_timeout = Some(timeout),
-            HttpSession::H2(h2) => h2.read_timeout = Some(timeout),
+            HttpSession::H1(h1) => h1.read_timeout = timeout,
+            HttpSession::H2(h2) => h2.read_timeout = timeout,
         }
     }
 
     /// Set the write timeout for writing header and body.
     ///
     /// The timeout is per write operation, not on the overall time writing the entire request.
-    ///
-    /// This is a noop for h2.
-    pub fn set_write_timeout(&mut self, timeout: Duration) {
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
         match self {
-            HttpSession::H1(h1) => h1.write_timeout = Some(timeout),
-            HttpSession::H2(_) => { /* no write timeout because the actual write happens async*/ }
+            HttpSession::H1(h1) => h1.write_timeout = timeout,
+            HttpSession::H2(h2) => h2.write_timeout = timeout,
         }
     }
 

@@ -47,6 +47,8 @@ async fn test_duplex() {
         .send()
         .await
         .unwrap();
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "keep-alive");
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
@@ -108,6 +110,25 @@ async fn test_upload() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
+}
+
+#[tokio::test]
+async fn test_close_on_response_before_downstream_finish() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/test2")
+        .header("x-close-on-response-before-downstream-finish", "1")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let headers = res.headers();
+    assert_eq!(headers["Connection"], "close");
+    let body = res.text().await.unwrap();
+    assert_eq!(body.len(), 11);
 }
 
 #[tokio::test]
@@ -1518,13 +1539,14 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
+            // cache lock timeout, disable cache
             assert_eq!(headers["x-cache-status"], "no-cache");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         // send the 3rd request after the 2 second cache lock timeout where the
         // first request still holds the lock (3s delay in origin)
-        sleep(Duration::from_millis(2000)).await;
+        sleep(Duration::from_millis(2200)).await;
         let task3 = tokio::spawn(async move {
             let res = reqwest::Client::new()
                 .get(url)
@@ -1535,7 +1557,9 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // this is now a miss because we will not timeout on cache lock
+            // and will fetch from origin successfully
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1553,6 +1577,46 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
         assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_wait_timeout() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_wait_timeout.txt";
+
+        let mut handles = vec![];
+        const N_REQUESTS: u64 = 8;
+        for _ in 0..N_REQUESTS {
+            handles.push(tokio::spawn(async move {
+                // Each task will attempt to wait for the origin's 1s sleep upon acquiring the
+                // cache lock, before the origin disconnects.
+                let res = reqwest::Client::new()
+                    .get(url)
+                    .header("x-lock", "true")
+                    .header("x-set-sleep", "1") // we have a 2 second cache lock timeout
+                    .header("x-abort", "1")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), 502);
+                let headers = res.headers();
+                headers
+                    .get("x-cache-lock-time-ms")
+                    .and_then(|ms| ms.to_str().ok().and_then(|s| s.parse::<u64>().ok()))
+            }));
+        }
+        let mut waited_count = 0;
+        for handle in handles {
+            let lock_time_ms = handle.await.unwrap();
+            if let Some(lock_time_ms) = lock_time_ms {
+                // should not have waited more than 2s for each response
+                waited_count += 1;
+                assert!(lock_time_ms <= 2200);
+            }
+        }
+        assert!(waited_count > 0, "at least one reader waited");
+        // This whole process /should/ have taken no longer than 4s, as each reader has an
+        // independently enforced 2s timeout
     }
 
     #[tokio::test]
@@ -1929,6 +1993,277 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "expired");
         assert_eq!(res.text().await.unwrap(), "he");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_range_request() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_multipart_range_request/now";
+
+        // 1st multipart range request - uncached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-1, 6-8") // he wor
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        // Grab boundary to verify full response
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "miss");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 0-1/11\r\n\
+            \r\n\
+            he\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 6-8/11\r\n\
+            \r\n\
+            wor\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 2nd request, cached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=2-3, 8-10") // ll rld
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 2-3/11\r\n\
+            \r\n\
+            ll\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 8-10/11\r\n\
+            \r\n\
+            rld\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 3rd request, cached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=1-2, 3-4, 8-10") // el lo rld
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 1-2/11\r\n\
+            \r\n\
+            el\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 3-4/11\r\n\
+            \r\n\
+            lo\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 8-10/11\r\n\
+            \r\n\
+            rld\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 4th request - cached and poorly formed request header
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=2-3, 8-10, 3-5")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers().clone();
+        assert_eq!(headers["content-type"], "text/plain");
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hello world");
+
+        // 5th request: Single range GET
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-2")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hel");
+
+        // 6th request invalid range
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=20-22, 30-40")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "");
+
+        // 7th request: Single range HEAD
+
+        let res = reqwest::Client::new()
+            .head(url)
+            .header("Range", "bytes=3-7")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn test_single_then_mutltipart_range_request() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_single_then_multipart_range_request/now";
+
+        // 1st request - single range request
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-4")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hello");
+
+        // 2nd request - multipart range request
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-3, 6-7") // hell wo
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 0-3/11\r\n\
+            \r\n\
+            hell\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 6-7/11\r\n\
+            \r\n\
+            wo\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 3rd request - Multipart request with one valid range
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-4, 12-14, 16-18") // hello
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(!content_type.contains("multipart/byteranges; boundary="));
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        assert_eq!(res.text().await.unwrap(), "hello");
     }
 
     #[tokio::test]
@@ -2309,16 +2644,19 @@ mod test_cache {
         assert_eq!(headers["x-cache-status"], "miss");
     }
 
-    async fn send_max_file_size_req(url: &str, max_file_size_bytes: usize) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(url)
-            .header(
-                "x-cache-max-file-size-bytes",
-                max_file_size_bytes.to_string(),
-            )
-            .send()
-            .await
-            .unwrap()
+    async fn send_max_file_size_req(
+        url: &str,
+        max_file_size_bytes: usize,
+        range: Option<(usize, usize)>,
+    ) -> reqwest::Response {
+        let mut req = reqwest::Client::new().get(url).header(
+            "x-cache-max-file-size-bytes",
+            max_file_size_bytes.to_string(),
+        );
+        if let Some(r) = range {
+            req = req.header("Range", format!("bytes={}-{}", r.0, r.1));
+        }
+        req.send().await.unwrap()
     }
 
     #[tokio::test]
@@ -2326,30 +2664,140 @@ mod test_cache {
         init();
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_100/now";
 
-        let res = send_max_file_size_req(url, 100).await;
+        let res = send_max_file_size_req(url, 100, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["content-length"], "11");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_max_file_size_req(url, 100).await;
+        let res = send_max_file_size_req(url, 100, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_1/now";
-        let res = send_max_file_size_req(url, 1).await;
+        let res = send_max_file_size_req(url, 1, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
 
-        let res = send_max_file_size_req(url, 1).await;
+        let res = send_max_file_size_req(url, 1, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // became cacheable
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_max_file_size_chunked() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_chunked_100/test3";
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_chunked_1/test3";
+        let res = send_max_file_size_req(url, 1, None).await;
+        // TODO: this can currently break with 500 when body arrives alongside header
+        assert!(matches!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR | StatusCode::OK
+        ));
+        let headers = res.headers();
+        assert!(headers
+            .get("x-cache-status")
+            .is_none_or(|s| s == "no-cache"));
+
+        let res = send_max_file_size_req(url, 1, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // became cacheable
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // will get marked on the next request
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 100, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_max_file_size_range() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_100/now";
+
+        let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let epoch1 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "ello");
+
+        let res = send_max_file_size_req(url, 100, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let epoch2 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "ello");
+        assert_eq!(epoch1, epoch2);
+
+        // disable downstream ranging on max file size exceeded
+        let url = "http://127.0.0.1:6148/unique/test_cache_max_file_size_range_1/now";
+        let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let epoch1 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // predicted uncacheable (note upstream endpoint doesn't support range)
+        let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let epoch2 = headers["x-epoch"].clone();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+        assert!(epoch1 != epoch2);
     }
 
     #[tokio::test]
@@ -2379,6 +2827,43 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_bypass_downstream_range() {
+        init();
+        let test_url =
+            "http://127.0.0.1:6148/unique/test_cache_bypass_downstream_range/cache_control/";
+
+        let res = reqwest::Client::new()
+            .get(test_url)
+            .header("Range", "bytes=6-10")
+            // We start this request as cacheable, and then this disables it.
+            // We would expect the range body filter to run since we have
+            // started to cache, and then disabled.
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "world");
+
+        // We're starting as uncacheable, so proxy origin to downstream
+        // unchanged.
+        let res = reqwest::Client::new()
+            .get(test_url)
+            // We pass this up to the upstream, but it ignores it.
+            .header("Range", "bytes=0-4")
+            .header("set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 }

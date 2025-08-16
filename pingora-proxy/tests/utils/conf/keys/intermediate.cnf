@@ -1,0 +1,3 @@
+[ v3_intermediate_ca ]
+subjectKeyIdentifier = hash
+basicConstraints = critical, CA:true

@@ -151,6 +151,9 @@ pub trait HandleHit {
 
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);
+
+    /// Helper function to cast the trait object to concrete types
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync);
 }
 
 /// Hit Handler

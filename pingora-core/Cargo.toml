@@ -1,6 +1,6 @@
 [package]
 name = "pingora-core"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -19,14 +19,14 @@ name = "pingora_core"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-runtime = { version = "0.5.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.5.0", path = "../pingora-openssl", optional = true }
-pingora-boringssl = { version = "0.5.0", path = "../pingora-boringssl", optional = true }
-pingora-pool = { version = "0.5.0", path = "../pingora-pool" }
-pingora-error = { version = "0.5.0", path = "../pingora-error" }
-pingora-timeout = { version = "0.5.0", path = "../pingora-timeout" }
-pingora-http = { version = "0.5.0", path = "../pingora-http" }
-pingora-rustls = { version = "0.5.0", path = "../pingora-rustls", optional = true }
+pingora-runtime = { version = "0.6.0", path = "../pingora-runtime" }
+pingora-openssl = { version = "0.6.0", path = "../pingora-openssl", optional = true }
+pingora-boringssl = { version = "0.6.0", path = "../pingora-boringssl", optional = true }
+pingora-pool = { version = "0.6.0", path = "../pingora-pool" }
+pingora-error = { version = "0.6.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
+pingora-http = { version = "0.6.0", path = "../pingora-http" }
+pingora-rustls = { version = "0.6.0", path = "../pingora-rustls", optional = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 futures = "0.3"
 async-trait = { workspace = true }
@@ -78,6 +78,8 @@ nix = "~0.24.3"
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+h2 = { workspace = true, features=["unstable"]}
+tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.9"
 reqwest = { version = "0.11", features = [
     "rustls-tls",

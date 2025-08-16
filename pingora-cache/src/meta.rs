@@ -15,9 +15,13 @@
 //! Metadata for caching
 
 pub use http::Extensions;
+use log::warn;
+use once_cell::sync::{Lazy, OnceCell};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use pingora_header_serde::HeaderSerde;
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
 use crate::key::HashBinary;
@@ -513,12 +517,12 @@ impl CacheMeta {
 use http::StatusCode;
 
 /// The function to generate TTL from the given [StatusCode].
-pub type FreshSecByStatusFn = fn(StatusCode) -> Option<u32>;
+pub type FreshDurationByStatusFn = fn(StatusCode) -> Option<Duration>;
 
 /// The default settings to generate [CacheMeta]
 pub struct CacheMetaDefaults {
     // if a status code is not included in fresh_sec, it's not considered cacheable by default.
-    fresh_sec_fn: FreshSecByStatusFn,
+    fresh_sec_fn: FreshDurationByStatusFn,
     stale_while_revalidate_sec: u32,
     // TODO: allow "error" condition to be configurable?
     stale_if_error_sec: u32,
@@ -527,7 +531,7 @@ pub struct CacheMetaDefaults {
 impl CacheMetaDefaults {
     /// Create a new [CacheMetaDefaults]
     pub const fn new(
-        fresh_sec_fn: FreshSecByStatusFn,
+        fresh_sec_fn: FreshDurationByStatusFn,
         stale_while_revalidate_sec: u32,
         stale_if_error_sec: u32,
     ) -> Self {
@@ -541,7 +545,7 @@ impl CacheMetaDefaults {
     /// Return the default TTL for the given [StatusCode]
     ///
     /// `None`: do no cache this code.
-    pub fn fresh_sec(&self, resp_status: StatusCode) -> Option<u32> {
+    pub fn fresh_sec(&self, resp_status: StatusCode) -> Option<Duration> {
         // safe guard to make sure 304 response to share the same default ttl of 200
         if resp_status == StatusCode::NOT_MODIFIED {
             (self.fresh_sec_fn)(StatusCode::OK)
@@ -561,53 +565,20 @@ impl CacheMetaDefaults {
     }
 }
 
-use log::warn;
-use once_cell::sync::{Lazy, OnceCell};
-use pingora_header_serde::HeaderSerde;
-use std::fs::File;
-use std::io::Read;
-
-/* load header compression engine and its dictionary globally */
-pub(crate) static COMPRESSION_DICT_PATH: OnceCell<String> = OnceCell::new();
-
-fn load_file(path: &String) -> Option<Vec<u8>> {
-    let mut file = File::open(path)
-        .map_err(|e| {
-            warn!(
-                "failed to open header compress dictionary file at {}, {:?}",
-                path, e
-            );
-            e
-        })
-        .ok()?;
-    let mut dict = Vec::new();
-    file.read_to_end(&mut dict)
-        .map_err(|e| {
-            warn!(
-                "failed to read header compress dictionary file at {}, {:?}",
-                path, e
-            );
-            e
-        })
-        .ok()?;
-
-    Some(dict)
-}
+/// The dictionary content for header compression.
+///
+/// Used during initialization of [`HEADER_SERDE`].
+static COMPRESSION_DICT_CONTENT: OnceCell<Cow<'static, [u8]>> = OnceCell::new();
 
 static HEADER_SERDE: Lazy<HeaderSerde> = Lazy::new(|| {
-    let dict_path_opt = COMPRESSION_DICT_PATH.get();
+    let dict_opt = if let Some(dict_content) = COMPRESSION_DICT_CONTENT.get() {
+        Some(dict_content.to_vec())
+    } else {
+        warn!("no header compression dictionary loaded - use set_compression_dict_content() or set_compression_dict_path() to set one");
+        None
+    };
 
-    if dict_path_opt.is_none() {
-        warn!("COMPRESSION_DICT_PATH is not set");
-    }
-
-    let result = dict_path_opt.and_then(load_file);
-
-    if result.is_none() {
-        warn!("HeaderSerde not loaded from file");
-    }
-
-    HeaderSerde::new(result)
+    HeaderSerde::new(dict_opt)
 });
 
 pub(crate) fn header_serialize(header: &ResponseHeader) -> Result<Vec<u8>> {
@@ -616,4 +587,32 @@ pub(crate) fn header_serialize(header: &ResponseHeader) -> Result<Vec<u8>> {
 
 pub(crate) fn header_deserialize<T: AsRef<[u8]>>(buf: T) -> Result<ResponseHeader> {
     HEADER_SERDE.deserialize(buf.as_ref())
+}
+
+/// Load the header compression dictionary from a file, which helps serialize http header.
+///
+/// Returns false if it is already set or if the file could not be read.
+///
+/// Use [`set_compression_dict_content`] to set the dictionary from memory instead.
+pub fn set_compression_dict_path(path: &str) -> bool {
+    match std::fs::read(path) {
+        Ok(dict) => COMPRESSION_DICT_CONTENT.set(dict.into()).is_ok(),
+        Err(e) => {
+            warn!(
+                "failed to read header compress dictionary file at {}, {:?}",
+                path, e
+            );
+            false
+        }
+    }
+}
+
+/// Set the header compression dictionary content, which helps serialize http header.
+///
+/// Returns false if it is already set.
+///
+/// This is an alernative to [`set_compression_dict_path`], allowing use of
+/// a dictionary without an external file.
+pub fn set_compression_dict_content(content: Cow<'static, [u8]>) -> bool {
+    COMPRESSION_DICT_CONTENT.set(content).is_ok()
 }

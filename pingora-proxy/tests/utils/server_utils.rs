@@ -18,8 +18,10 @@ use async_trait::async_trait;
 use clap::Parser;
 use http::header::{ACCEPT_ENCODING, VARY};
 use http::HeaderValue;
+use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
+use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
@@ -27,17 +29,21 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
-use pingora_cache::{ForcedInvalidationKind, PurgeType, VarianceBuilder};
+use pingora_cache::{
+    CacheOptionOverrides, ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder,
+};
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
-use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
+use pingora_core::protocols::{
+    http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
+};
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
-use pingora_error::{Error, ErrorSource, Result};
+use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
@@ -246,6 +252,11 @@ impl ProxyHttp for ExampleProxyHttp {
             .get("x-min-rate")
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
 
+        let close_on_response_before_downstream_finish = req
+            .headers
+            .get("x-close-on-response-before-downstream-finish")
+            .is_some();
+
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if !downstream_compression {
             // enable upstream compression for all requests by default
@@ -258,12 +269,11 @@ impl ProxyHttp for ExampleProxyHttp {
                 .adjust_level(0);
         }
 
-        if let Some(min_rate) = min_rate {
-            session.set_min_send_rate(min_rate);
-        }
-        if let Some(write_timeout) = write_timeout {
-            session.set_write_timeout(Duration::from_secs(write_timeout));
-        }
+        session.set_min_send_rate(min_rate);
+        session.set_write_timeout(write_timeout.map(Duration::from_secs));
+        session.set_close_on_response_before_downstream_finish(
+            close_on_response_before_downstream_finish,
+        );
 
         Ok(false)
     }
@@ -325,7 +335,8 @@ impl ProxyHttp for ExampleProxyHttp {
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
-const CACHE_DEFAULT: CacheMetaDefaults = CacheMetaDefaults::new(|_| Some(1), 1, 1);
+const CACHE_DEFAULT: CacheMetaDefaults =
+    CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
@@ -423,9 +434,15 @@ impl ProxyHttp for ExampleProxyCache {
             .headers
             .get("x-lock")
             .map(|_| CACHE_LOCK.as_ref());
-        session
-            .cache
-            .enable(&*CACHE_BACKEND, eviction, Some(&*CACHE_PREDICTOR), lock);
+        let mut overrides = CacheOptionOverrides::default();
+        overrides.wait_timeout = Some(Duration::from_secs(2));
+        session.cache.enable(
+            &*CACHE_BACKEND,
+            eviction,
+            Some(&*CACHE_PREDICTOR),
+            lock,
+            Some(overrides),
+        );
 
         if let Some(max_file_size_hdr) = session
             .req_header()
@@ -445,8 +462,9 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn cache_hit_filter(
         &self,
-        session: &Session,
+        session: &mut Session,
         _meta: &CacheMeta,
+        _hit_handler: &mut HitHandler,
         is_fresh: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<ForcedInvalidationKind>> {
@@ -590,6 +608,56 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        // default OSS fail_to_proxy with added headers
+        let code = match e.etype() {
+            HTTPStatus(code) => *code,
+            _ => {
+                match e.esource() {
+                    ErrorSource::Upstream => 502,
+                    ErrorSource::Downstream => {
+                        match e.etype() {
+                            WriteError | ReadError | ConnectionClosed => {
+                                /* conn already dead */
+                                0
+                            }
+                            _ => 400,
+                        }
+                    }
+                    ErrorSource::Internal | ErrorSource::Unset => 500,
+                }
+            }
+        };
+        if code > 0 {
+            let mut resp = gen_error_response(code);
+            // any relevant metadata headers to add
+            if let Some(d) = session.cache.lock_duration() {
+                resp.insert_header("x-cache-lock-time-ms", format!("{}", d.as_millis()))
+                    .unwrap();
+            }
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("failed to send error response to downstream: {e}");
+                });
+        }
+
+        FailToProxy {
+            error_code: code,
+            // default to no reuse, which is safest
+            can_reuse_downstream: false,
+        }
     }
 
     fn should_serve_stale(

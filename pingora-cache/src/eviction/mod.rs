@@ -28,7 +28,7 @@ pub mod simple_lru;
 /// NOTE: these trait methods require &self not &mut self, which means concurrency should
 /// be handled the implementations internally.
 #[async_trait]
-pub trait EvictionManager {
+pub trait EvictionManager: Send + Sync {
     /// Total size of the cache in bytes tracked by this eviction manager
     fn total_size(&self) -> usize;
     /// Number of assets tracked by this eviction manager

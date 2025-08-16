@@ -354,7 +354,7 @@ pub struct Stream {
     // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
     stream: Option<BufStream<RawStreamWrapper>>,
     // the data put back at the front of the read buffer, in order to replay the read
-    rewind_read_buf: Vec<u8>,
+    rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
     proxy_digest: Option<Arc<ProxyDigest>>,
     socket_digest: Option<Arc<SocketDigest>>,
@@ -418,7 +418,7 @@ impl Stream {
     /// Put Some data back to the head of the stream to be read again
     pub(crate) fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
-            self.rewind_read_buf.extend_from_slice(data);
+            self.rewind_read_buf.push(data.to_vec());
         }
     }
 
@@ -608,11 +608,14 @@ impl AsyncRead for Stream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let result = if !self.rewind_read_buf.is_empty() {
-            let mut data_to_read = self.rewind_read_buf.as_slice();
+            let data_to_read = self.rewind_read_buf.pop().unwrap(); // safe
+            let mut data_to_read = data_to_read.as_slice();
             let result = Pin::new(&mut data_to_read).poll_read(cx, buf);
-            // put the remaining data in another Vec
-            let remaining_buf = Vec::from(data_to_read);
-            let _ = std::mem::replace(&mut self.rewind_read_buf, remaining_buf);
+            // return the remaining data back to the head of rewind_read_buf
+            if !data_to_read.is_empty() {
+                let remaining_buf = Vec::from(data_to_read);
+                self.rewind_read_buf.push(remaining_buf);
+            }
             result
         } else {
             Pin::new(&mut self.stream_mut()).poll_read(cx, buf)
@@ -976,5 +979,53 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message);
+    }
+
+    #[tokio::test]
+    async fn test_stream_two_subsequent_peek_calls_before_read() {
+        let message = b"abcdefghijklmn";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notify = Arc::new(Notify::new());
+        let notify2 = notify.clone();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            notify2.notified().await;
+            stream.write_all(message).await.unwrap();
+            drop(stream);
+        });
+
+        notify.notify_one();
+
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+
+        // Peek 4 bytes
+        let mut buffer = vec![0u8; 4];
+        assert!(stream.try_peek(&mut buffer).await.unwrap());
+        assert_eq!(buffer, message[0..4]);
+
+        // Peek 2 bytes
+        let mut buffer = vec![0u8; 2];
+        assert!(stream.try_peek(&mut buffer).await.unwrap());
+        assert_eq!(buffer, message[0..2]);
+
+        // Read 1 byte: ['a']
+        let mut buffer = vec![0u8; 1];
+        stream.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(buffer, message[0..1]);
+
+        // Read as many bytes as possible, return 1 byte ['b']
+        //  from the first retry buffer chunk
+        let mut buffer = vec![0u8; 100];
+        let n = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(buffer[..n], message[1..2]);
+
+        // Read the rest ['cdefghijklmn']
+        let mut buffer = vec![];
+        stream.read_to_end(&mut buffer).await.unwrap();
+        assert_eq!(buffer, message[2..]);
     }
 }
