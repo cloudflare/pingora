@@ -33,9 +33,6 @@ use tokio::net::TcpSocket;
 
 #[cfg(feature = "connection_filter")]
 use super::connection_filter::ConnectionFilter;
-#[cfg(not(feature = "connection_filter"))]
-use crate::listeners::ConnectionFilter;
-
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 
@@ -311,12 +308,6 @@ impl ListenerEndpointBuilder {
     #[cfg(feature = "connection_filter")]
     pub fn connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) -> &mut Self {
         self.connection_filter = Some(filter);
-        self
-    }
-
-    #[cfg(not(feature = "connection_filter"))]
-    #[allow(unused)]
-    pub fn connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) -> &mut Self {
         self
     }
 
