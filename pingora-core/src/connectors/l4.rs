@@ -385,7 +385,13 @@ mod tests {
         let new_session = connect(&peer, Some(bind_to)).await;
         let error = new_session.unwrap_err();
         // XXX: some system will allow the socket to bind and connect without error, only to timeout
-        assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
+        assert!(
+            error.etype() == &ConnectError
+                || error.etype() == &ConnectTimedout
+                // The error seen on mac: https://github.com/cloudflare/pingora/pull/679
+                || (error.etype() == &InternalError),
+            "{error:?}"
+        )
     }
 
     #[tokio::test]
