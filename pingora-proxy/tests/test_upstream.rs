@@ -1996,6 +1996,277 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_multipart_range_request() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_multipart_range_request/now";
+
+        // 1st multipart range request - uncached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-1, 6-8") // he wor
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        // Grab boundary to verify full response
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "miss");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 0-1/11\r\n\
+            \r\n\
+            he\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 6-8/11\r\n\
+            \r\n\
+            wor\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 2nd request, cached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=2-3, 8-10") // ll rld
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 2-3/11\r\n\
+            \r\n\
+            ll\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 8-10/11\r\n\
+            \r\n\
+            rld\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 3rd request, cached
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=1-2, 3-4, 8-10") // el lo rld
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 1-2/11\r\n\
+            \r\n\
+            el\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 3-4/11\r\n\
+            \r\n\
+            lo\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 8-10/11\r\n\
+            \r\n\
+            rld\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 4th request - cached and poorly formed request header
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=2-3, 8-10, 3-5")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers().clone();
+        assert_eq!(headers["content-type"], "text/plain");
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hello world");
+
+        // 5th request: Single range GET
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-2")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hel");
+
+        // 6th request invalid range
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=20-22, 30-40")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "");
+
+        // 7th request: Single range HEAD
+
+        let res = reqwest::Client::new()
+            .head(url)
+            .header("Range", "bytes=3-7")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn test_single_then_mutltipart_range_request() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_single_then_multipart_range_request/now";
+
+        // 1st request - single range request
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-4")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "hello");
+
+        // 2nd request - multipart range request
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-3, 6-7") // hell wo
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers().clone();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        let boundary = content_type
+            .split("boundary=")
+            .nth(1)
+            .expect("Expected to have a boundary");
+        assert_eq!(
+            content_type,
+            format!("multipart/byteranges; boundary={boundary}")
+        );
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        let body = res.text().await.unwrap();
+
+        let expected_body = format!(
+            "\r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 0-3/11\r\n\
+            \r\n\
+            hell\
+            \r\n--{boundary}\r\n\
+            Content-Type: text/plain\r\n\
+            Content-Range: bytes 6-7/11\r\n\
+            \r\n\
+            wo\
+            \r\n--{boundary}--\r\n\
+        "
+        );
+        assert_eq!(body, expected_body);
+
+        // 3rd request - Multipart request with one valid range
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("Range", "bytes=0-4, 12-14, 16-18") // hello
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let headers = res.headers();
+        let content_type = headers.get("content-type").unwrap().to_str().unwrap();
+        assert!(!content_type.contains("multipart/byteranges; boundary="));
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        assert_eq!(res.text().await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
     async fn test_caching_when_downstream_bails() {
         init();
         let url = "http://127.0.0.1:6148/slow_body/test_caching_when_downstream_bails/";

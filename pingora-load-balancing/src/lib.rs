@@ -267,10 +267,11 @@ impl Backends {
                     h.observe_health(errored.is_none(), check.health_threshold(errored.is_none()));
                 if flipped {
                     check.health_status_change(backend, errored.is_none()).await;
+                    let summary = check.backend_summary(backend);
                     if let Some(e) = errored {
-                        warn!("{backend:?} becomes unhealthy, {e}");
+                        warn!("{summary} becomes unhealthy, {e}");
                     } else {
-                        info!("{backend:?} becomes healthy");
+                        info!("{summary} becomes healthy");
                     }
                 }
             }

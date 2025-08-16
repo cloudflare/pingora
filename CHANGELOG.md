@@ -2,6 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0](https://github.com/cloudflare/pingora/compare/0.5.0...0.6.0) - 2025-08-15
+ 
+### Highlights
+- This release bumps the minimum h2 crate dependency to guard against the [MadeYouReset]((https://blog.cloudflare.com/madeyoureset-an-http-2-vulnerability-thwarted-by-rapid-reset-mitigations/)) H2 attack 
+
+
+### 🚀 Features
+
+- Log runtime names during Server shutdown
+- Enabling tracking the execution phase of a server
+- Allow using in-memory compression dicts
+- Make H2Options configurable at HttpServer, HttpProxy
+  Also adds HttpServerOptions to the HttpServer implementation, and
+  updates the HttpEchoApp to use HttpServer for easier adhoc testing.
+
+### 🐛 Bug Fixes
+
+- Fix: read body without discard
+
+### Everything Else
+
+- Try loading each LRU shard individually and warn on errors
+- Update LRU save to disk to be atomic
+- Allow cache to spawn_async_purge
+- Pass hit handler in hit filter
+- Cache hit filter can mutate cache, allow resetting cache lock
+- Persist keepalive_timeout between requests on same stream
+- Properly check for H2 io ReadError retry types
+- Add cache lock wait timeout for readers
+- Fix CacheLock status timeout conditions
+- Handle close on partial chunk head
+- Allow optional to reset session timeouts
+- Clippy fixes for 1.87, add 1.87 to GitHub CI
+- Run `range_{header,body}_filter` after disabling cache
+- Convert `InterpretCacheControl` members to `Duration`
+- Disable downstream ranging on max file size
+- Allow explicit infinite keepalive timeout to be respected
+  Note that a necessary follow up is to refactor the infinite keepalive
+  timeout to only apply to first read between requests on reused conns.
+- Add method to disable keepalive if downstream is unfinished
+- Discard extra upstream body and disable keepalive
+- Explicitly disable keepalive on upstream connection when excess body
+  (content-length) is detected.
+- Add brief sleep to shutdown signal tests to avoid flake
+- Allow override of cache lock timeouts
+- Allow arbitrary bytes in CacheKey instead of just Strings
+- Corrects out-of-order data return after multiple peek calls with different buffer sizes.
+- Mark previously too large chunked assets as cacheable
+- Boring/OpenSSL load cert chain from connector options
+- Add initial support for multipart range requests
+- Adds a callback to HttpHealthCheck for collecting detailed backend summary information
+- Multipart range filter state fixes
+
+
+### Docs
+
+- Explanation of request_body_filter phase
+
+
+
 ## [0.5.0](https://github.com/cloudflare/pingora/compare/0.4.0...0.5.0) - 2025-05-09
  
 ### 🚀 Features
