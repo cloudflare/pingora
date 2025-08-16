@@ -27,6 +27,7 @@ pingora-error = { version = "0.6.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
 pingora-http = { version = "0.6.0", path = "../pingora-http" }
 pingora-rustls = { version = "0.6.0", path = "../pingora-rustls", optional = true }
+bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 futures = "0.3"
 async-trait = { workspace = true }

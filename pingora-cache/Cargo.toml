@@ -23,6 +23,7 @@ pingora-header-serde = { version = "0.6.0", path = "../pingora-header-serde" }
 pingora-http = { version = "0.6.0", path = "../pingora-http" }
 pingora-lru = { version = "0.6.0", path = "../pingora-lru" }
 pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
+bstr = { workspace = true }
 http = { workspace = true }
 indexmap = "1"
 once_cell = { workspace = true }

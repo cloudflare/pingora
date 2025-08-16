@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bstr::ByteSlice;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, trace, warn};
 use pingora_error::{
@@ -356,9 +357,7 @@ impl BodyReader {
                                 existing_buf_end {}, buf: {:?}",
                             expecting_from_io,
                             existing_buf_end,
-                            String::from_utf8_lossy(
-                                &self.body_buf.as_ref().unwrap()[..existing_buf_end]
-                            )
+                            self.body_buf.as_ref().unwrap()[..existing_buf_end].as_bstr()
                         );
                         // partial chunk payload, will read more
                         if expecting_from_io >= existing_buf_end + 2 {

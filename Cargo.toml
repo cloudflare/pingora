@@ -28,6 +28,7 @@ members = [
 ]
 
 [workspace.dependencies]
+bstr = "1.12.0"
 tokio = "1"
 async-trait = "0.1.42"
 httparse = "1"
