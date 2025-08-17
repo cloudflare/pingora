@@ -467,10 +467,12 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
-    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        let mut addrs_iter = address.to_socket_addrs().unwrap(); //TODO: handle error
+    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
+        let mut addrs_iter = address
+            .to_socket_addrs()
+            .or_err(SocketError, "invalid address")?;
         let addr = addrs_iter.next().unwrap();
-        Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni)
+        Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
