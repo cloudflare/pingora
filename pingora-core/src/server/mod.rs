@@ -121,7 +121,7 @@ pub enum ShutdownSignal {
 #[async_trait]
 pub trait ShutdownSignalWatch {
     /// Returns the desired shutdown type once one has been requested.
-    async fn recv(&self) -> ShutdownSignal;
+    async fn recv(&mut self) -> ShutdownSignal;
 }
 
 /// A Unix shutdown watcher that awaits for Unix signals.
@@ -135,7 +135,7 @@ pub struct UnixShutdownSignalWatch;
 #[cfg(unix)]
 #[async_trait]
 impl ShutdownSignalWatch for UnixShutdownSignalWatch {
-    async fn recv(&self) -> ShutdownSignal {
+    async fn recv(&mut self) -> ShutdownSignal {
         let mut graceful_upgrade_signal = unix::signal(unix::SignalKind::quit()).unwrap();
         let mut graceful_terminate_signal = unix::signal(unix::SignalKind::terminate()).unwrap();
         let mut fast_shutdown_signal = unix::signal(unix::SignalKind::interrupt()).unwrap();
@@ -216,7 +216,7 @@ impl Server {
     }
 
     #[cfg(unix)]
-    async fn main_loop(&self, run_args: RunArgs) -> ShutdownType {
+    async fn main_loop(&self, mut run_args: RunArgs) -> ShutdownType {
         // waiting for exit signal
 
         self.execution_phase_watch
