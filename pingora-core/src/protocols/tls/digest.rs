@@ -27,4 +27,6 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// the SNI used in the negotiation
+    pub sni: Option<String>,
 }
