@@ -473,11 +473,8 @@ impl Server {
     /// Note: this function may fork the process for daemonization, so any additional threads created
     /// before this function will be lost to any service logic once this function is called.
     pub fn run_forever(self) -> ! {
-        info!("Server starting");
-
         self.run(RunArgs::default());
 
-        info!("All runtimes exited, exiting now");
         std::process::exit(0)
     }
 
