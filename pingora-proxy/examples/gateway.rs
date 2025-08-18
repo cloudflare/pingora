@@ -130,9 +130,12 @@ fn main() {
     my_proxy.add_tcp("0.0.0.0:6191");
     my_server.add_service(my_proxy);
 
+    #[cfg(feature = "prometheus")]
     let mut prometheus_service_http =
         pingora_core::services::listening::Service::prometheus_http_service();
+    #[cfg(feature = "prometheus")]
     prometheus_service_http.add_tcp("127.0.0.1:6192");
+    #[cfg(feature = "prometheus")]
     my_server.add_service(prometheus_service_http);
 
     my_server.run_forever();
