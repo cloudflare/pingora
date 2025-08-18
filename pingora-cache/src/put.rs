@@ -201,6 +201,12 @@ impl<C: CachePut> CachePutCtx<C> {
         }
         self.parser.finish()?;
         self.finish().await?;
+
+        if let Some(reason) = no_cache_reason {
+            self.trace
+                .set_tag(|| Tag::new("uncacheable_reason", reason.as_str()));
+        }
+
         Ok(no_cache_reason)
     }
 }
