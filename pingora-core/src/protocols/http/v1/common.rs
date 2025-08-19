@@ -29,7 +29,7 @@ pub(super) const MAX_HEADERS: usize = 256;
 pub(super) const INIT_HEADER_BUF_SIZE: usize = 4096;
 pub(super) const MAX_HEADER_SIZE: usize = 1048575;
 
-pub(super) const BODY_BUF_LIMIT: usize = 1024 * 64;
+pub(crate) const BODY_BUF_LIMIT: usize = 1024 * 64;
 
 pub const CRLF: &[u8; 2] = b"\r\n";
 pub const HEADER_KV_DELIMITER: &[u8; 2] = b": ";
@@ -141,20 +141,18 @@ pub(crate) fn init_body_writer_comm(body_writer: &mut BodyWriter, headers: &HMap
 }
 
 #[inline]
-pub(super) fn is_header_value_chunked_encoding(
-    header_value: Option<&http::header::HeaderValue>,
-) -> bool {
+pub fn is_header_value_chunked_encoding(header_value: Option<&http::header::HeaderValue>) -> bool {
     match header_value {
         Some(value) => value.as_bytes().eq_ignore_ascii_case(b"chunked"),
         None => false,
     }
 }
 
-pub(super) fn is_upgrade_req(req: &RequestHeader) -> bool {
+pub fn is_upgrade_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11 && req.headers.get(header::UPGRADE).is_some()
 }
 
-pub(super) fn is_expect_continue_req(req: &RequestHeader) -> bool {
+pub fn is_expect_continue_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11
         // https://www.rfc-editor.org/rfc/rfc9110#section-10.1.1
         && req.headers.get(header::EXPECT).is_some_and(|v| {
@@ -166,7 +164,7 @@ pub(super) fn is_expect_continue_req(req: &RequestHeader) -> bool {
 // because when seeing 101, we assume the server accepts to switch protocol.
 // In reality it is not common that some servers don't send all the required headers to establish
 // websocket connections.
-pub(super) fn is_upgrade_resp(header: &ResponseHeader) -> bool {
+pub fn is_upgrade_resp(header: &ResponseHeader) -> bool {
     header.status == 101 && header.version == http::Version::HTTP_11
 }
 
@@ -274,7 +272,10 @@ pub(super) fn check_dup_content_length(headers: &HMap) -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
+    use http::{
+        header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+        StatusCode, Version,
+    };
 
     #[test]
     fn test_check_dup_content_length() {
@@ -290,5 +291,25 @@ mod test {
 
         headers.append(TRANSFER_ENCODING, "chunkeds".try_into().unwrap());
         assert!(check_dup_content_length(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_is_upgrade_resp() {
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(Version::HTTP_11);
+        response.insert_header("Upgrade", "websocket").unwrap();
+        response.insert_header("Connection", "upgrade").unwrap();
+        assert!(is_upgrade_resp(&response));
+
+        // wrong http version
+        response.set_version(Version::HTTP_10);
+        response.insert_header("Upgrade", "websocket").unwrap();
+        response.insert_header("Connection", "upgrade").unwrap();
+        assert!(!is_upgrade_resp(&response));
+
+        // not 101
+        response.set_status(StatusCode::OK).unwrap();
+        response.set_version(Version::HTTP_11);
+        assert!(!is_upgrade_resp(&response));
     }
 }

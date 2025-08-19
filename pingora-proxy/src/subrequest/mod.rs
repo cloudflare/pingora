@@ -12,112 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_trait::async_trait;
-use core::pin::Pin;
-use core::task::{Context, Poll};
 use pingora_cache::lock::{CacheKeyLockImpl, LockStatus, WritePermit};
 use pingora_cache::CacheKey;
-use pingora_core::protocols::raw_connect::ProxyDigest;
-use pingora_core::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl, TimingDigest,
-    UniqueID, UniqueIDType,
+use pingora_core::protocols::http::subrequest::server::{
+    HttpSession as SessionSubrequest, SubrequestHandle,
 };
 use std::any::Any;
-use std::io::Cursor;
-use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, Error, ReadBuf};
-
-// An async IO stream that returns the request when being read from and dumps the data to the void
-// when being write to
-#[derive(Debug)]
-pub(crate) struct DummyIO(Cursor<Vec<u8>>);
-
-impl DummyIO {
-    pub fn new(read_bytes: &[u8]) -> Self {
-        DummyIO(Cursor::new(Vec::from(read_bytes)))
-    }
-}
-
-impl AsyncRead for DummyIO {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if self.0.position() < self.0.get_ref().len() as u64 {
-            Pin::new(&mut self.0).poll_read(cx, buf)
-        } else {
-            // all data is read, pending forever otherwise the stream is considered closed
-            Poll::Pending
-        }
-    }
-}
-
-impl AsyncWrite for DummyIO {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl UniqueID for DummyIO {
-    fn id(&self) -> UniqueIDType {
-        0 // placeholder
-    }
-}
-
-impl Ssl for DummyIO {}
-
-impl GetTimingDigest for DummyIO {
-    fn get_timing_digest(&self) -> Vec<Option<TimingDigest>> {
-        vec![]
-    }
-}
-
-impl GetProxyDigest for DummyIO {
-    fn get_proxy_digest(&self) -> Option<Arc<ProxyDigest>> {
-        None
-    }
-}
-
-impl GetSocketDigest for DummyIO {
-    fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
-        None
-    }
-}
-
-impl Peek for DummyIO {}
-
-#[async_trait]
-impl pingora_core::protocols::Shutdown for DummyIO {
-    async fn shutdown(&mut self) -> () {}
-}
-
-#[tokio::test]
-async fn test_dummy_io() {
-    use futures::FutureExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut dummy = DummyIO::new(&[1, 2]);
-    let res = dummy.read_u8().await;
-    assert_eq!(res.unwrap(), 1);
-    let res = dummy.read_u8().await;
-    assert_eq!(res.unwrap(), 2);
-    let res = dummy.read_u8().now_or_never();
-    assert!(res.is_none()); // pending forever
-    let res = dummy.write_u8(0).await;
-    assert!(res.is_ok());
-}
 
 struct LockCtx {
     write_permit: WritePermit,
@@ -128,9 +28,19 @@ struct LockCtx {
 /// Optional user-defined subrequest context.
 pub type UserCtx = Box<(dyn Any + Sync + Send)>;
 
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum BodyMode {
+    /// No body to be sent for subrequest.
+    #[default]
+    NoBody,
+    /// Waiting on body if needed.
+    ExpectBody,
+}
+
 #[derive(Default)]
 pub struct CtxBuilder {
     lock: Option<LockCtx>,
+    body_mode: BodyMode,
     user_ctx: Option<UserCtx>,
 }
 
@@ -138,6 +48,7 @@ impl CtxBuilder {
     pub fn new() -> Self {
         Self {
             lock: None,
+            body_mode: BodyMode::NoBody,
             user_ctx: None,
         }
     }
@@ -161,9 +72,15 @@ impl CtxBuilder {
         self
     }
 
+    pub fn body_mode(mut self, body_mode: BodyMode) -> Self {
+        self.body_mode = body_mode;
+        self
+    }
+
     pub fn build(self) -> Ctx {
         Ctx {
             lock: self.lock,
+            body_mode: self.body_mode,
             user_ctx: self.user_ctx,
         }
     }
@@ -171,6 +88,7 @@ impl CtxBuilder {
 
 /// Context struct to share state across the parent and sub-request.
 pub struct Ctx {
+    body_mode: BodyMode,
     lock: Option<LockCtx>,
     // User-defined custom context.
     user_ctx: Option<UserCtx>,
@@ -209,13 +127,18 @@ impl Ctx {
         // also clear out lock ctx
         self.lock.take().map(|lock| lock.write_permit)
     }
+
+    /// Get the `BodyMode` when this subrequest was created.
+    pub fn body_mode(&self) -> BodyMode {
+        self.body_mode
+    }
 }
 
 use crate::HttpSession;
 
-pub(crate) fn create_dummy_session(parsed_session: &HttpSession) -> HttpSession {
-    // TODO: check if there is req body, we don't capture the body for now
-    HttpSession::new_http1(Box::new(DummyIO::new(&parsed_session.to_h1_raw())))
+pub(crate) fn create_session(parsed_session: &HttpSession) -> (HttpSession, SubrequestHandle) {
+    let (session, handle) = SessionSubrequest::new_from_session(parsed_session);
+    (HttpSession::new_subrequest(session), handle)
 }
 
 #[tokio::test]
@@ -228,7 +151,7 @@ async fn test_dummy_request() {
     req.read_request().await.unwrap();
     assert_eq!(input.as_slice(), req.to_h1_raw());
 
-    let mut dummy_req = create_dummy_session(&req);
-    dummy_req.read_request().await.unwrap();
-    assert_eq!(input.as_slice(), req.to_h1_raw());
+    let (mut subreq, _handle) = create_session(&req);
+    subreq.read_request().await.unwrap();
+    assert_eq!(input.as_slice(), subreq.to_h1_raw());
 }

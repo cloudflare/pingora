@@ -307,9 +307,11 @@ impl HttpSession {
         }
     }
 
-    // Validate the request header read. This function must be called after the request header
-    // read.
-    fn validate_request(&self) -> Result<()> {
+    /// Validate the request header read. This function must be called after the request header
+    /// read.
+    /// # Panics
+    /// this function and most other functions will panic if called before [`Self::read_request()`]
+    pub fn validate_request(&self) -> Result<()> {
         let req_header = self.req_header();
 
         // ad-hoc checks
@@ -346,18 +348,18 @@ impl HttpSession {
     }
 
     /// Return the method of this request. None if the request is not read yet.
-    pub(super) fn get_method(&self) -> Option<&http::Method> {
+    pub(crate) fn get_method(&self) -> Option<&http::Method> {
         self.request_header.as_ref().map(|r| &r.method)
     }
 
     /// Return the path of the request (i.e., the `/hello?1` of `GET /hello?1 HTTP1.1`)
     /// An empty slice will be used if there is no path or the request is not read yet
-    pub(super) fn get_path(&self) -> &[u8] {
+    pub(crate) fn get_path(&self) -> &[u8] {
         self.request_header.as_ref().map_or(b"", |r| r.raw_path())
     }
 
     /// Return the host header of the request. An empty slice will be used if there is no host header
-    pub(super) fn get_host(&self) -> &[u8] {
+    pub(crate) fn get_host(&self) -> &[u8] {
         self.request_header
             .as_ref()
             .and_then(|h| h.headers.get(header::HOST))
@@ -442,7 +444,7 @@ impl HttpSession {
         }
     }
 
-    /// Whether there is no (more) body need to be read.
+    /// Whether there is no (more) body to be read.
     pub fn is_body_done(&mut self) -> bool {
         self.init_body_reader();
         self.body_reader.body_done()
@@ -911,11 +913,21 @@ impl HttpSession {
         self.read_timeout = timeout;
     }
 
+    /// Gets the downstream read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
+    }
+
     /// Sets the downstream write timeout. This will trigger if we're unable
     /// to write to the stream after `timeout`. If a `min_send_rate` is
     /// configured then the `min_send_rate` calculated timeout has higher priority.
     pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
         self.write_timeout = timeout;
+    }
+
+    /// Gets the downstream write timeout.
+    pub fn get_write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
     }
 
     /// Sets the total drain timeout. For HTTP/1.1, reusing a session requires
@@ -928,6 +940,11 @@ impl HttpSession {
     /// Note that the downstream read timeout still applies between body byte reads.
     pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
         self.total_drain_timeout = timeout;
+    }
+
+    /// Get the total drain timeout.
+    pub fn get_total_drain_timeout(&self) -> Option<Duration> {
+        self.total_drain_timeout
     }
 
     /// Sets the minimum downstream send rate in bytes per second. This
@@ -1909,26 +1926,6 @@ mod tests_stream {
         let mock_io = Builder::new().write(wire).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.write_continue_response().await.unwrap();
-    }
-
-    #[test]
-    fn test_is_upgrade_resp() {
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        response.insert_header("Upgrade", "websocket").unwrap();
-        response.insert_header("Connection", "upgrade").unwrap();
-        assert!(is_upgrade_resp(&response));
-
-        // wrong http version
-        response.set_version(http::Version::HTTP_10);
-        response.insert_header("Upgrade", "websocket").unwrap();
-        response.insert_header("Connection", "upgrade").unwrap();
-        assert!(!is_upgrade_resp(&response));
-
-        // not 101
-        response.set_status(http::StatusCode::OK).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        assert!(!is_upgrade_resp(&response));
     }
 
     #[test]
