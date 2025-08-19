@@ -84,7 +84,13 @@ pub struct TcpHealthCheck {
 
 impl Default for TcpHealthCheck {
     fn default() -> Self {
-        let mut peer_template = BasicPeer::new("0.0.0.0:1");
+        let mut peer_template = match BasicPeer::new("0.0.0.0:1") {
+            Ok(peer) => peer,
+            Err(e) => {
+                // NB(@siennathesane): not sure what the desired behavior here is
+                panic!("Failed to create TCP peer template: {e}");
+            }
+        };
         peer_template.options.connection_timeout = Some(Duration::from_secs(1));
         TcpHealthCheck {
             consecutive_success: 1,
