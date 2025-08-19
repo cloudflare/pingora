@@ -79,7 +79,7 @@ mod proxy_purge;
 mod proxy_trait;
 pub mod subrequest;
 
-use subrequest::Ctx as SubrequestCtx;
+use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, RangeType};
 pub use proxy_purge::PurgeStatus;
@@ -837,11 +837,18 @@ impl SubrequestSpawner {
         ctx: SubrequestCtx,
     ) -> tokio::task::JoinHandle<()> {
         let new_app = self.app.clone(); // Clone the Arc
-        let subrequest = subrequest::create_dummy_session(session);
+        let (mut session, handle) = subrequest::create_session(session);
+        if ctx.body_mode() == BodyMode::NoBody {
+            session
+                .as_subrequest_mut()
+                .expect("created subrequest session")
+                .clear_request_body_headers();
+        }
         let sub_req_ctx = Box::new(ctx);
+        handle.drain_tasks();
         tokio::spawn(async move {
             new_app
-                .process_subrequest(Box::new(subrequest), sub_req_ctx)
+                .process_subrequest(Box::new(session), sub_req_ctx)
                 .await;
         })
     }

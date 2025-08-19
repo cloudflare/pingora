@@ -222,10 +222,20 @@ impl HttpSession {
         self.write_timeout = timeout;
     }
 
+    /// Get the write timeout.
+    pub fn get_write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
+    }
+
     /// Sets the total drain timeout. This `timeout` will be used while draining
     /// the request body.
     pub fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
         self.total_drain_timeout = timeout;
+    }
+
+    /// Get the total drain timeout.
+    pub fn get_total_drain_timeout(&self) -> Option<Duration> {
+        self.total_drain_timeout
     }
 
     // the write_* don't have timeouts because the actual writing happens on the connection
