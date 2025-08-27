@@ -45,6 +45,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
@@ -252,25 +253,30 @@ impl<SV> HttpProxy<SV> {
         session: &mut Session,
         task: &mut HttpTask,
         ctx: &mut SV::CTX,
-    ) -> Result<()>
+    ) -> Result<Option<Duration>>
     where
         SV: ProxyHttp,
     {
-        match task {
+        let duration = match task {
             HttpTask::Header(header, _eos) => {
-                self.inner.upstream_response_filter(session, header, ctx)?
+                self.inner.upstream_response_filter(session, header, ctx)?;
+                None
             }
             HttpTask::Body(data, eos) => self
                 .inner
                 .upstream_response_body_filter(session, data, *eos, ctx)?,
-            HttpTask::Trailer(Some(trailers)) => self
-                .inner
-                .upstream_response_trailer_filter(session, trailers, ctx)?,
+            HttpTask::Trailer(Some(trailers)) => {
+                self.inner
+                    .upstream_response_trailer_filter(session, trailers, ctx)?;
+                None
+            }
             _ => {
                 // task does not support a filter
+                None
             }
-        }
-        Ok(())
+        };
+
+        Ok(duration)
     }
 
     async fn finish(
