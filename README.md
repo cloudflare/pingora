@@ -10,7 +10,7 @@ Pingora is battle tested as it has been serving more than 40 million Internet re
 ## Feature highlights
 * Async Rust: fast and reliable
 * HTTP 1/2 end to end proxy
-* TLS over OpenSSL, BoringSSL or rustls(experimental).
+* TLS over OpenSSL, BoringSSL, s2n-tls, or rustls(experimental).
 * gRPC and websocket proxying
 * Graceful reload
 * Customizable load balancing and failover strategies
@@ -40,6 +40,7 @@ API docs are also available for all the crates.
 * Pingora-limits: efficient counting algorithms
 * Pingora-load-balancing: load balancing algorithm extensions for pingora-proxy
 * Pingora-memory-cache: Async in-memory caching with cache lock to prevent cache stampede
+* Pingora-s2n: SSL extensions and APIs related to s2n-tls
 * Pingora-timeout: A more efficient async timer system
 * TinyUfo: The caching algorithm behind pingora-memory-cache
 

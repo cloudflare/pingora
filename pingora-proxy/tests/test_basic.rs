@@ -936,6 +936,42 @@ async fn test_tls_diff_alt_cnt_no_reuse() {
     assert!(headers.get("x-conn-reuse").is_none());
 }
 
+#[cfg(feature = "s2n")]
+#[tokio::test]
+async fn test_tls_psk() {
+    use crate::utils::server_utils::TEST_PSK_IDENTITY;
+
+    init();
+    let client = reqwest::Client::new();
+
+    let res = client
+        .get("http://127.0.0.1:6149/")
+        .header("sni", "openrusty.org")
+        .header("psk_identity", TEST_PSK_IDENTITY)
+        .header("x-port", "6151")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[cfg(feature = "s2n")]
+#[tokio::test]
+async fn test_tls_psk_invalid() {
+    init();
+    let client = reqwest::Client::new();
+
+    let res = client
+        .get("http://127.0.0.1:6149/")
+        .header("sni", "openrusty.org")
+        .header("psk_identity", "BAD_IDENTITY")
+        .header("x-port", "6151")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+}
+
 #[tokio::test]
 async fn test_error_before_headers_sent() {
     init();
