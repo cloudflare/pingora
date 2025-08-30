@@ -347,7 +347,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_error_refused() {
-        let peer = BasicPeer::new("127.0.0.1:79"); // hopefully port 79 is not used
+        let peer = match BasicPeer::new("127.0.0.1:79") {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create peer: {e}"),
+        }; // hopefully port 79 is not used
         let new_session = connect(&peer, None).await;
         assert_eq!(new_session.unwrap_err().etype(), &ConnectRefused)
     }
@@ -356,7 +359,10 @@ mod tests {
     #[ignore]
     #[tokio::test]
     async fn test_conn_error_no_route() {
-        let peer = BasicPeer::new("[::3]:79"); // no route
+        let peer = match BasicPeer::new("[::3]:79") {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create peer: {e}"),
+        }; // no route
         let new_session = connect(&peer, None).await;
         assert_eq!(new_session.unwrap_err().etype(), &ConnectNoRoute)
     }
@@ -391,7 +397,10 @@ mod tests {
     #[tokio::test]
     async fn test_conn_timeout() {
         // 192.0.2.1 is effectively a blackhole
-        let mut peer = BasicPeer::new("192.0.2.1:79");
+        let mut peer = match BasicPeer::new("192.0.2.1:79") {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create peer: {e}"),
+        };
         peer.options.connection_timeout = Some(std::time::Duration::from_millis(1)); //1ms
         let new_session = connect(&peer, None).await;
         assert_eq!(new_session.unwrap_err().etype(), &ConnectTimedout)
@@ -403,7 +412,10 @@ mod tests {
 
         let flag = Arc::new(AtomicBool::new(INIT_FLAG));
 
-        let mut peer = BasicPeer::new("1.1.1.1:80");
+        let mut peer = match BasicPeer::new("1.1.1.1:80") {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create peer: {e}"),
+        };
 
         let move_flag = Arc::clone(&flag);
 
@@ -431,7 +443,10 @@ mod tests {
             }
         }
         // :79 shouldn't be able to be connected to
-        let mut peer = BasicPeer::new("1.1.1.1:79");
+        let mut peer = match BasicPeer::new("1.1.1.1:79") {
+            Ok(p) => p,
+            Err(e) => panic!("Failed to create peer: {e}"),
+        };
         peer.options.custom_l4 = Some(std::sync::Arc::new(MyL4 {}));
 
         let new_session = connect(&peer, None).await;
