@@ -266,8 +266,10 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
     }
 }
 
+#[cfg(feature = "prometheus")]
 use crate::apps::prometheus_http_app::PrometheusServer;
 
+#[cfg(feature = "prometheus")]
 impl Service<PrometheusServer> {
     /// The Prometheus HTTP server
     ///
