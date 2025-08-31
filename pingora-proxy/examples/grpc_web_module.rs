@@ -66,7 +66,7 @@ impl ProxyHttp for GrpcWebBridgeProxy {
             ("1.1.1.1", 443),
             true,
             "one.one.one.one".to_string(),
-        ));
+        )?);
         Ok(grpc_peer)
     }
 }
