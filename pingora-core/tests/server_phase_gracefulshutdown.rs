@@ -45,7 +45,7 @@ fn test_server_execution_phase_monitor_graceful_shutdown() {
     ));
     assert!(matches!(
         phase.blocking_recv().unwrap(),
-        ExecutionPhase::Running,
+        ExecutionPhase::Running(_),
     ));
 
     // Need to wait for startup, otherwise the signal handler is not

@@ -70,7 +70,7 @@ pub enum ExecutionPhase {
     BootstrapComplete,
 
     /// The server is running and is listening for shutdown signals.
-    Running,
+    Running(tokio::runtime::Handle),
 
     /// A QUIT signal was received, indicating that a new process wants to take over.
     ///
@@ -220,7 +220,7 @@ impl Server {
         // waiting for exit signal
 
         self.execution_phase_watch
-            .send(ExecutionPhase::Running)
+            .send(ExecutionPhase::Running(tokio::runtime::Handle::current()))
             .ok();
 
         match run_args.shutdown_signal.recv().await {
