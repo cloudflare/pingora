@@ -310,7 +310,7 @@ pub trait ProxyHttp {
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
-    fn upstream_response_body_filter(
+    async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
@@ -331,7 +331,7 @@ pub trait ProxyHttp {
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
