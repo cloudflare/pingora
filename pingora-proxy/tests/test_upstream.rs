@@ -2866,4 +2866,67 @@ mod test_cache {
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
+
+    #[tokio::test]
+    async fn test_downstream_head_miss_conn_close_h1() {
+        init();
+
+        let test_url =
+            "http://127.0.0.1:6148/unique/test_cache_downstream_head_miss_conn_close/sleep/";
+
+        let res = reqwest::Client::new()
+            .head(test_url)
+            .header("x-set-body-sleep", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "");
+        // closed connection does not impact next cache fill
+
+        let res = reqwest::Client::new().get(test_url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[cfg(feature = "any_tls")]
+    #[tokio::test]
+    async fn test_downstream_head_miss_conn_close_h2() {
+        init();
+
+        let test_url =
+            "https://127.0.0.1:6153/unique/test_cache_downstream_head_miss_conn_close/sleep/";
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client
+            .head(test_url)
+            .header("x-set-body-sleep", "0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "");
+        // closed connection does not impact next cache fill
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client.get(test_url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
 }

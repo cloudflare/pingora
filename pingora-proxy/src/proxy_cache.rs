@@ -471,17 +471,10 @@ impl<SV> HttpProxy<SV> {
             to_304(resp);
         }
         let header_only = not_modified || req.method == http::method::Method::HEAD;
-        if header_only {
-            if use_cache.is_on() {
-                // tell cache to stop after yielding header
-                use_cache.enable_header_only();
-            } else {
-                // headers only during cache miss, upstream should continue send
-                // body to cache, `session` will ignore body automatically because
-                // of the signature of `header` (304)
-                // TODO: we should drop body before/within this filter so that body
-                // filter only runs on data downstream sees
-            }
+        if header_only && use_cache.is_on() {
+            // tell cache to stop serving downstream after yielding header
+            // (misses will continue to allow admitting upstream into cache)
+            use_cache.enable_header_only();
         }
     }
 
@@ -1970,13 +1963,26 @@ pub mod range_filter {
 // miss/revalidation/error.
 #[derive(Debug)]
 pub(crate) enum ServeFromCache {
-    Off,                 // not using cache
-    CacheHeader,         // should serve cache header
-    CacheHeaderOnly,     // should serve cache header
-    CacheBody(bool), // should serve cache body with a bool to indicate if it has already called seek on the hit handler
-    CacheHeaderMiss, // should serve cache header but upstream response should be admitted to cache
-    CacheBodyMiss(bool), // should serve cache body but upstream response should be admitted to cache, bool to indicate seek status
-    Done,                // should serve cache body
+    // not using cache
+    Off,
+    // should serve cache header
+    CacheHeader,
+    // should serve cache header only
+    CacheHeaderOnly,
+    // should serve cache header only but upstream response should be admitted to cache
+    CacheHeaderOnlyMiss,
+    // should serve cache body with a bool to indicate if it has already called seek on the hit handler
+    CacheBody(bool),
+    // should serve cache header but upstream response should be admitted to cache
+    // This is the starting state for misses, which go to CacheBodyMiss or
+    // CacheHeaderOnlyMiss before ending at DoneMiss
+    CacheHeaderMiss,
+    // should serve cache body but upstream response should be admitted to cache, bool to indicate seek status
+    CacheBodyMiss(bool),
+    // done serving cache body
+    Done,
+    // done serving cache body, but upstream response should continue to be admitted to cache
+    DoneMiss,
 }
 
 impl ServeFromCache {
@@ -1989,10 +1995,18 @@ impl ServeFromCache {
     }
 
     pub fn is_miss(&self) -> bool {
-        matches!(self, Self::CacheHeaderMiss | Self::CacheBodyMiss(_))
+        matches!(
+            self,
+            Self::CacheHeaderMiss
+                | Self::CacheHeaderOnlyMiss
+                | Self::CacheBodyMiss(_)
+                | Self::DoneMiss
+        )
     }
 
     pub fn is_miss_header(&self) -> bool {
+        // NOTE: this check is for checking if miss was just enabled, so it is excluding
+        // HeaderOnlyMiss
         matches!(self, Self::CacheHeaderMiss)
     }
 
@@ -2020,8 +2034,15 @@ impl ServeFromCache {
 
     pub fn enable_header_only(&mut self) {
         match self {
-            Self::CacheBody(_) | Self::CacheBodyMiss(_) => *self = Self::Done, // TODO: make sure no body is read yet
-            _ => *self = Self::CacheHeaderOnly,
+            Self::CacheBody(_) => *self = Self::Done, // TODO: make sure no body is read yet
+            Self::CacheBodyMiss(_) => *self = Self::DoneMiss,
+            _ => {
+                if self.is_miss() {
+                    *self = Self::CacheHeaderOnlyMiss;
+                } else {
+                    *self = Self::CacheHeaderOnly;
+                }
+            }
         }
     }
 
@@ -2051,6 +2072,10 @@ impl ServeFromCache {
                 *self = Self::Done;
                 Ok(HttpTask::Header(cache_hit_header(cache), true))
             }
+            Self::CacheHeaderOnlyMiss => {
+                *self = Self::DoneMiss;
+                Ok(HttpTask::Header(cache_hit_header(cache), true))
+            }
             Self::CacheBody(should_seek) => {
                 if *should_seek {
                     self.maybe_seek_hit_handler(cache, range)?;
@@ -2070,11 +2095,12 @@ impl ServeFromCache {
                 if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
                     Ok(HttpTask::Body(Some(b), false)) // false for now
                 } else {
-                    *self = Self::Done;
+                    *self = Self::DoneMiss;
                     Ok(HttpTask::Done)
                 }
             }
             Self::Done => Ok(HttpTask::Done),
+            Self::DoneMiss => Ok(HttpTask::Done),
         }
     }
 
