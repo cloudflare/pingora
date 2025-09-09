@@ -721,6 +721,17 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    #[cfg(feature = "any_tls")]
+    {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+        let mut tls_settings =
+            pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        tls_settings.enable_h2();
+        proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
+    }
+
     let mut services: Vec<Box<dyn Service>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
