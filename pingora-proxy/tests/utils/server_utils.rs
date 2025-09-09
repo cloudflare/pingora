@@ -722,7 +722,8 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server = pingora_core::server::Server::new(Some(Opt::parse_from(opts))).unwrap();
+    let mut my_server =
+        pingora_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =
