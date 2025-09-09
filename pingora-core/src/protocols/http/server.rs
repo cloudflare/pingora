@@ -151,7 +151,12 @@ impl Session {
         }
         match self {
             Self::H1(s) => {
-                s.write_body(&data).await?;
+                if !data.is_empty() {
+                    s.write_body(&data).await?;
+                }
+                if end {
+                    s.finish_body().await?;
+                }
                 Ok(())
             }
             Self::H2(s) => s.write_body(data, end).await,
