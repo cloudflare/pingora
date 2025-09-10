@@ -61,7 +61,7 @@ fn test_server_execution_phase_monitor_graceful_shutdown() {
 
     assert!(matches!(
         phase.blocking_recv().unwrap(),
-        ExecutionPhase::GracefulTerminate,
+        ExecutionPhase::GracefulTerminate(_),
     ));
 
     assert!(matches!(
