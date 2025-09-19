@@ -165,10 +165,13 @@ impl<SV> HttpProxy<SV> {
                     match res {
                         Ok(task) => {
                             response_done = task.is_end();
+                            let type_str = task.type_str();
                             let result = tx.send(task)
-                                .await.or_err(
-                                        InternalError,
-                                        "Failed to send upstream header to pipe");
+                                .await.or_err_with(
+                                    InternalError,
+                                    || format!("Failed to send upstream task {type_str}{} to pipe",
+                                        if response_done { " (end)" } else {""})
+                                );
                             // If the request is upgraded, the downstream pipe can early exit
                             // when the downstream connection is closed.
                             // In that case, this function should ignore that the pipe is closed.
