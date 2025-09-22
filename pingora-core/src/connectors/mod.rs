@@ -53,7 +53,7 @@ pub struct ConnectorOptions {
     ///
     /// Each individual connection can use their own cert key to override this.
     pub cert_key_file: Option<(String, String)>,
-    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
+    /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOGFILE
     /// env variable. This can be used by tools like Wireshark to decrypt traffic
     /// for debugging purposes.
     pub debug_ssl_keylog: bool,
