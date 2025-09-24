@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
-use super::l4::ext::{get_original_dest, get_recv_buf, get_tcp_info, TCP_INFO};
+use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
@@ -158,6 +158,24 @@ impl SocketDigest {
     pub fn get_recv_buf(&self) -> Option<usize> {
         if self.is_inet() {
             get_recv_buf(self.raw_sock).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn get_snd_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_snd_buf(self.raw_fd).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn get_snd_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_snd_buf(self.raw_sock).ok()
         } else {
             None
         }

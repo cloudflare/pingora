@@ -320,6 +320,21 @@ pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
     Ok(0)
 }
 
+#[cfg(target_os = "linux")]
+pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as usize)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn get_snd_buf(_fd: RawFd) -> io::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(windows)]
+pub fn get_snd_buf(_sock: RawSocket) -> io::Result<usize> {
+    Ok(0)
+}
+
 /// Enable client side TCP fast open.
 #[cfg(target_os = "linux")]
 pub fn set_tcp_fastopen_connect(fd: RawFd) -> Result<()> {
