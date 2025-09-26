@@ -113,10 +113,10 @@ impl ZstdCompression {
         match &self {
             ZstdCompression::Default(c, level) => c
                 .compress(data, *level)
-                .map_err(|e| into_error(e, "decompress header")),
+                .map_err(|e| into_error(e, "compress header")),
             ZstdCompression::WithDict(c) => c
                 .compress(data)
-                .map_err(|e| into_error(e, "decompress header")),
+                .map_err(|e| into_error(e, "compress header")),
         }
     }
 
@@ -178,7 +178,8 @@ fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
         Err(e) => Error::e_because(
             ErrorType::InternalError,
             format!(
-                "parsing failed on uncompressed header, {}",
+                "parsing failed on uncompressed header, len={}, content={:?}",
+                buf.len(),
                 String::from_utf8_lossy(buf)
             ),
             e,
@@ -230,5 +231,34 @@ mod tests {
         let header2 = serde.deserialize(&compressed).unwrap();
         assert_eq!(header.status, header2.status);
         assert_eq!(header.headers, header2.headers);
+    }
+
+    #[test]
+    fn test_no_headers() {
+        let serde = HeaderSerde::new(None);
+        let header = ResponseHeader::build(200, None).unwrap(); // No headers added
+
+        // Serialize and deserialize
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+
+        assert_eq!(header.status, header2.status);
+        assert_eq!(header.headers.len(), 0);
+        assert_eq!(header2.headers.len(), 0);
+    }
+
+    #[test]
+    fn test_empty_header_wire_format() {
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut buf = vec![];
+        resp_header_to_buf(&header, &mut buf);
+
+        // Should be: "HTTP/1.1 200 OK\r\n\r\n", total 19 bytes
+        assert_eq!(buf.len(), 19);
+        assert_eq!(buf, b"HTTP/1.1 200 OK\r\n\r\n");
+
+        // Test that httparse can handle this
+        let parsed = buf_to_http_header(&buf).unwrap();
+        assert_eq!(parsed.status.as_u16(), 200);
     }
 }
