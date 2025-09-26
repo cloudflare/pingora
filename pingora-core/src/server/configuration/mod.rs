@@ -23,6 +23,7 @@ use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 
 // default maximum upstream retries for retry-able proxy errors
@@ -152,7 +153,7 @@ pub struct Opt {
 
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[clap(long, hidden = true)]
+    #[clap(long, hide = true)]
     pub nocapture: bool,
 
     /// Test the configuration and exit
@@ -248,6 +249,14 @@ impl ServerConf {
 impl Opt {
     pub fn parse_args() -> Self {
         Opt::parse()
+    }
+
+    pub fn parse_from_args<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Opt::parse_from(args)
     }
 }
 

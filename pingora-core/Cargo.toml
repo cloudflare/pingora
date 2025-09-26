@@ -36,10 +36,10 @@ http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 derivative.workspace = true
-clap = { version = "3.2.25", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 strum = "0.26.2"
 strum_macros = "0.26.2"
 libc = "0.2.70"
@@ -79,7 +79,7 @@ windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 [dev-dependencies]
 h2 = { workspace = true, features=["unstable"]}
 tokio-stream = { version = "0.1", features = ["full"] }
-env_logger = "0.9"
+env_logger = "0.11"
 reqwest = { version = "0.11", features = [
     "rustls-tls",
 ], default-features = false }

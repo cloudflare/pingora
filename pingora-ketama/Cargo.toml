@@ -13,10 +13,10 @@ keywords = ["hash", "hashing", "consistent", "pingora"]
 crc32fast = "1.3"
 
 [dev-dependencies]
-criterion = "0.4"
+criterion = "0.7"
 csv = "1.2"
 dhat = "0.3"
-env_logger = "0.9"
+env_logger = "0.11"
 log = { workspace = true }
 rand = "0.8"
 
