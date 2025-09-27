@@ -472,6 +472,16 @@ impl Session {
         self.downstream_session.write_response_header(resp).await
     }
 
+    /// Similar to `write_response_header()`, this fn will clone the `resp` internally
+    pub async fn write_response_header_ref(
+        &mut self,
+        resp: &ResponseHeader,
+        end_of_stream: bool,
+    ) -> Result<(), Box<Error>> {
+        self.write_response_header(Box::new(resp.clone()), end_of_stream)
+            .await
+    }
+
     /// Write the given HTTP response body chunk to the downstream
     ///
     /// Different from directly calling [HttpSession::write_response_body], this function also
@@ -711,7 +721,7 @@ where
                         session.cache.disable(NoCacheReason::DeclinedToUpstream);
                     }
                     if session.response_written().is_none() {
-                        match session.write_response_header_ref(&BAD_GATEWAY).await {
+                        match session.write_response_header_ref(&BAD_GATEWAY, true).await {
                             Ok(()) => {}
                             Err(e) => {
                                 return self
