@@ -227,9 +227,15 @@ pub struct BasicPeer {
 
 impl BasicPeer {
     /// Create a new [`BasicPeer`].
-    pub fn new(address: &str) -> Self {
-        let addr = SocketAddr::Inet(address.parse().unwrap()); // TODO: check error
-        Self::new_from_sockaddr(addr)
+    pub fn new(address: &str) -> Result<Self> {
+        let addr = match address.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                panic!()
+            }
+        };
+        let addr = SocketAddr::Inet(addr);
+        Ok(Self::new_from_sockaddr(addr))
     }
 
     /// Create a new [`BasicPeer`] with the given path to a Unix domain socket.
