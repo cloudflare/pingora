@@ -52,7 +52,7 @@ hyperlocal = "0.8"
 jemallocator = "0.5"
 
 [features]
-default = []
+default = ["yaml"]
 
 #! ### Tls
 #! Tls is provided by adding one of these features. If no tls-providing feature
@@ -120,3 +120,6 @@ openssl_derived = ["any_tls"]
 any_tls = []
 patched_http1 = ["pingora-core/patched_http1"]
 document-features = ["dep:document-features", "proxy", "lb", "cache", "time", "sentry"]
+
+yaml = ["pingora-core/yaml"]
+toml = ["pingora-core/toml"]

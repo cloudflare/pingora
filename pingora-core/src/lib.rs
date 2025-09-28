@@ -41,6 +41,9 @@
 // certain pingora features
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(not(any(feature = "yaml", feature = "toml")))]
+compile_error!("Must enable 'yaml' or 'toml' feature.");
+
 pub mod apps;
 pub mod connectors;
 pub mod listeners;
