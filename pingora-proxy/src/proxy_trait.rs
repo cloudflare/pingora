@@ -281,12 +281,15 @@ pub trait ProxyHttp {
     /// Responses served from cache won't trigger this filter. If the cache needed revalidation,
     /// only the 304 from upstream will trigger the filter (though it will be merged into the
     /// cached header, not served directly to downstream).
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         _session: &mut Session,
         _upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 

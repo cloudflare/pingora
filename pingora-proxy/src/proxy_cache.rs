@@ -673,7 +673,11 @@ impl<SV> HttpProxy<SV> {
                 if resp.status == StatusCode::NOT_MODIFIED {
                     if session.cache.maybe_cache_meta().is_some() {
                         // run upstream response filters on upstream 304 first
-                        if let Err(err) = self.inner.upstream_response_filter(session, resp, ctx) {
+                        if let Err(err) = self
+                            .inner
+                            .upstream_response_filter(session, resp, ctx)
+                            .await
+                        {
                             error!("upstream response filter error on 304: {err:?}");
                             session.cache.revalidate_uncacheable(
                                 *resp.clone(),

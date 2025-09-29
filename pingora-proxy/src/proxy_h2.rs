@@ -414,7 +414,7 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            if let Some(duration) = self.upstream_filter(session, &mut task, ctx)? {
+            if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
             }
