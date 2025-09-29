@@ -466,7 +466,7 @@ impl<SV> HttpProxy<SV> {
     {
         // skip caching if already served from cache
         if !from_cache {
-            if let Some(duration) = self.upstream_filter(session, &mut task, ctx)? {
+            if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
             }

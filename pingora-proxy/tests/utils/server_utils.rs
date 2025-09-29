@@ -555,15 +555,12 @@ impl ProxyHttp for ExampleProxyCache {
         ))
     }
 
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
+    ) -> Result<()> {
         ctx.upstream_status = Some(upstream_response.status.into());
         Ok(())
     }
