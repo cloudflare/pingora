@@ -65,6 +65,9 @@ pub use pingora_openssl as tls;
 #[cfg(feature = "rustls")]
 pub use pingora_rustls as tls;
 
+#[cfg(feature = "s2n")]
+pub use pingora_s2n as tls;
+
 #[cfg(not(feature = "any_tls"))]
 pub use protocols::tls::noop_tls as tls;
 
