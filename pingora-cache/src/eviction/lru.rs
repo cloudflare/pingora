@@ -281,8 +281,69 @@ impl<const N: usize> EvictionManager for Manager<N> {
             info!("Successfully loaded {}/{} shards.", loaded_shards, N)
         }
 
+        cleanup_temp_files(dir_path);
+
         Ok(())
     }
+}
+
+fn cleanup_temp_files(dir_path: &str) {
+    let dir_path = Path::new(dir_path).to_owned();
+
+    tokio::task::spawn_blocking({
+        move || {
+            if !dir_path.exists() {
+                return;
+            }
+
+            let entries = match std::fs::read_dir(&dir_path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("Failed to read directory {}: {e}", dir_path.display());
+                    return;
+                }
+            };
+
+            let mut cleaned_count = 0;
+            let mut error_count = 0;
+
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        warn!(
+                            "Failed to read directory entry in {}: {e}",
+                            dir_path.display()
+                        );
+                        error_count += 1;
+                        continue;
+                    }
+                };
+
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+
+                if file_name_str.starts_with(FILE_NAME) && file_name_str.ends_with(".tmp") {
+                    match std::fs::remove_file(entry.path()) {
+                        Ok(()) => {
+                            info!("Cleaned up orphaned temp file: {}", entry.path().display());
+                            cleaned_count += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to remove temp file {}: {e}", entry.path().display());
+                            error_count += 1;
+                        }
+                    }
+                }
+            }
+
+            if cleaned_count > 0 || error_count > 0 {
+                info!(
+                    "Temp file cleanup completed. Removed: {cleaned_count}, Errors: {error_count}"
+                );
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -482,5 +543,41 @@ mod test {
 
         assert_eq!(ser0, lru2.serialize_shard(0).unwrap());
         assert_eq!(ser1, lru2.serialize_shard(1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_temp_file_cleanup() {
+        let test_dir = "/tmp/test_lru_cleanup";
+        let dir_path = Path::new(test_dir);
+
+        // Create test directory
+        std::fs::create_dir_all(dir_path).unwrap();
+
+        // Create some fake temp files
+        let temp_files = [
+            "lru.data.0.12345678.tmp",
+            "lru.data.1.abcdef00.tmp",
+            "other_file.tmp", // Should not be removed
+            "lru.data.2",     // Should not be removed
+        ];
+
+        for file in temp_files {
+            let file_path = dir_path.join(file);
+            std::fs::write(&file_path, b"test").unwrap();
+        }
+
+        // Run cleanup
+        cleanup_temp_files(test_dir);
+
+        tokio::time::sleep(core::time::Duration::from_secs(1)).await;
+
+        // Check results
+        assert!(!dir_path.join("lru.data.0.12345678.tmp").exists());
+        assert!(!dir_path.join("lru.data.1.abcdef00.tmp").exists());
+        assert!(dir_path.join("other_file.tmp").exists()); // Should remain
+        assert!(dir_path.join("lru.data.2").exists()); // Should remain
+
+        // Cleanup test directory
+        std::fs::remove_dir_all(dir_path).unwrap();
     }
 }
