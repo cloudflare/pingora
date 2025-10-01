@@ -30,6 +30,8 @@ use pingora_timeout::fast_timeout;
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
+#[cfg(windows)]
+use tokio::signal;
 #[cfg(unix)]
 use tokio::signal::unix;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -299,6 +301,27 @@ impl Server {
         }
     }
 
+    #[cfg(windows)]
+    async fn main_loop(&self) -> ShutdownType {
+        let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
+        tokio::select! {
+            _ = graceful_terminate_signal.recv() => {
+                // we receive a graceful terminate, all instances are instructed to stop
+                info!("CTRL-C received, gracefully exiting");
+                // graceful shutdown if there are listening sockets
+                info!("Broadcasting graceful shutdown");
+                match self.shutdown_watch.send(true) {
+                    Ok(_) => { info!("Graceful shutdown started!"); }
+                    Err(e) => {
+                        error!("Graceful shutdown broadcast failed: {e}");
+                    }
+                }
+                info!("Broadcast graceful shutdown complete");
+                ShutdownType::Graceful
+            }
+        }
+    }
+
     fn run_service(
         mut service: Box<dyn Service>,
         #[cfg(unix)] fds: Option<ListenFds>,
@@ -531,12 +554,7 @@ impl Server {
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
         let server_runtime = Server::create_runtime("Server", 1, true);
-        #[cfg(unix)]
-        let shutdown_type = server_runtime
-            .get_handle()
-            .block_on(self.main_loop(run_args));
-        #[cfg(windows)]
-        let shutdown_type = ShutdownType::Graceful;
+        let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
 
         self.execution_phase_watch
             .send(ExecutionPhase::ShutdownStarted)
