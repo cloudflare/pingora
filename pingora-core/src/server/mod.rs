@@ -302,7 +302,7 @@ impl Server {
     }
 
     #[cfg(windows)]
-    async fn main_loop(&self) -> ShutdownType {
+    async fn main_loop(&self, _run_args: RunArgs) -> ShutdownType {
         let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
         tokio::select! {
             _ = graceful_terminate_signal.recv() => {
@@ -554,7 +554,9 @@ impl Server {
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
         let server_runtime = Server::create_runtime("Server", 1, true);
-        let shutdown_type = server_runtime.get_handle().block_on(self.main_loop());
+        let shutdown_type = server_runtime
+            .get_handle()
+            .block_on(self.main_loop(run_args));
 
         self.execution_phase_watch
             .send(ExecutionPhase::ShutdownStarted)
