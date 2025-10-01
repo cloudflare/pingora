@@ -920,3 +920,31 @@ where
     proxy.handle_init_modules();
     Service::new(name.to_string(), proxy)
 }
+
+/// Create a [Service] from the user implemented [ProxyHttp] with h2c (cleartext HTTP/2) support.
+///
+/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service_with_h2c<SV>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+    name: &str,
+    enable_h2c: bool,
+) -> Service<HttpProxy<SV>>
+where
+    SV: ProxyHttp,
+{
+    let mut proxy = HttpProxy::new(inner, conf.clone());
+    proxy.handle_init_modules();
+
+    if enable_h2c {
+        use pingora_core::apps::HttpServerOptions;
+        use pingora_core::protocols::http::v2::server::H2Options;
+
+        let mut opts = HttpServerOptions::default();
+        opts.h2c = true;
+        proxy.server_options = Some(opts);
+        proxy.h2_options = Some(H2Options::default());
+    }
+
+    Service::new(name.to_string(), proxy)
+}
