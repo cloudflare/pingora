@@ -156,10 +156,29 @@ impl ShutdownSignalWatch for UnixShutdownSignalWatch {
     }
 }
 
+/// A Windows shutdown watcher that awaits for Windows signals.
+///
+/// - `CTRL-C`: graceful terminate
+#[cfg(windows)]
+pub struct WindowsShutdownSignalWatch;
+
+#[cfg(windows)]
+#[async_trait]
+impl ShutdownSignalWatch for WindowsShutdownSignalWatch {
+    async fn recv(&self) -> ShutdownSignal {
+        let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
+
+        tokio::select! {
+            _ = graceful_terminate_signal.recv() => {
+                ShutdownSignal::GracefulTerminate
+            }
+        }
+    }
+}
+
 /// Arguments to configure running of the pingora server.
 pub struct RunArgs {
     /// Signal for initating shutdown
-    #[cfg(unix)]
     pub shutdown_signal: Box<dyn ShutdownSignalWatch>,
 }
 
@@ -173,7 +192,9 @@ impl Default for RunArgs {
 
     #[cfg(windows)]
     fn default() -> Self {
-        Self {}
+        Self {
+            shutdown_signal: Box::new(WindowsShutdownSignalWatch),
+        }
     }
 }
 
@@ -302,16 +323,18 @@ impl Server {
     }
 
     #[cfg(windows)]
-    async fn main_loop(&self, _run_args: RunArgs) -> ShutdownType {
+    async fn main_loop(&self, run_args: RunArgs) -> ShutdownType {
         let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
-        tokio::select! {
-            _ = graceful_terminate_signal.recv() => {
-                // we receive a graceful terminate, all instances are instructed to stop
+
+        match run_args.shutdown_signal.recv().await {
+            ShutdownSignal::GracefulUpgrade => unreachable!("Graceful Upgrade signal not set"),
+            ShutdownSignal::GracefulTerminate => {
                 info!("CTRL-C received, gracefully exiting");
-                // graceful shutdown if there are listening sockets
                 info!("Broadcasting graceful shutdown");
                 match self.shutdown_watch.send(true) {
-                    Ok(_) => { info!("Graceful shutdown started!"); }
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
                     Err(e) => {
                         error!("Graceful shutdown broadcast failed: {e}");
                     }
@@ -319,6 +342,7 @@ impl Server {
                 info!("Broadcast graceful shutdown complete");
                 ShutdownType::Graceful
             }
+            ShutdownSignal::FastShutdown => unreachable!("Fast Shutdown signal not set"),
         }
     }
 
