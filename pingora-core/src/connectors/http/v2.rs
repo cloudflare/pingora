@@ -466,7 +466,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let h2 = connector.new_http_session(&peer).await.unwrap();
         match h2 {
@@ -479,7 +479,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // a hack to force h1, new_http_session() in the future might validate this setting
         peer.options.set_http_version(1, 1);
         let h2 = connector.new_http_session(&peer).await.unwrap();
@@ -492,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
         let h2 = connector.new_http_session(&peer).await.unwrap();
         match h2 {
@@ -505,7 +505,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
         let h2 = connector.new_http_session(&peer).await.unwrap();
@@ -537,7 +537,7 @@ mod tests {
     #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 3;
         let h2 = connector.new_http_session(&peer).await.unwrap();

@@ -363,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_error_addr_not_avail() {
-        let peer = HttpPeer::new("127.0.0.1:121".to_string(), false, "".to_string());
+        let peer = HttpPeer::new("127.0.0.1:121".to_string(), false, "".to_string()).unwrap();
         let addr = "192.0.2.2:0".parse().ok();
         let bind_to = BindTo {
             addr,
@@ -375,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_error_other() {
-        let peer = HttpPeer::new("240.0.0.1:80".to_string(), false, "".to_string()); // non localhost
+        let peer = HttpPeer::new("240.0.0.1:80".to_string(), false, "".to_string()).unwrap(); // non localhost
         let addr = "127.0.0.1:0".parse().ok();
         // create an error: cannot send from src addr: localhost to dst addr: a public IP
         let bind_to = BindTo {
@@ -443,7 +443,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_connect_proxy_fail() {
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push("/tmp/123");
         peer.proxy = Some(Proxy {
@@ -481,7 +481,7 @@ mod tests {
         });
         // wait for the server to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push(MOCK_UDS_PATH);
         peer.proxy = Some(Proxy {
@@ -518,7 +518,7 @@ mod tests {
         });
         // wait for the server to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
+        let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string()).unwrap();
         let mut path = PathBuf::new();
         path.push(MOCK_BAD_UDS_PATH);
         peer.proxy = Some(Proxy {
@@ -584,7 +584,7 @@ mod tests {
         let (low, _) = get_ip_local_port_range();
         let high = low + 1;
 
-        let peer = HttpPeer::new(format!("127.0.0.1:{port}"), false, "".to_string());
+        let peer = HttpPeer::new(format!("127.0.0.1:{port}"), false, "".to_string()).unwrap();
         let mut bind_to = BindTo {
             addr: "127.0.0.1:0".parse().ok(),
             ..Default::default()
