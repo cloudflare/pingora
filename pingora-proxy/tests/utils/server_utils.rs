@@ -30,7 +30,7 @@ use pingora_cache::{
     RespCacheable,
 };
 use pingora_cache::{
-    CacheOptionOverrides, ForcedInvalidationKind, HitHandler, PurgeType, VarianceBuilder,
+    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
@@ -496,19 +496,22 @@ impl ProxyHttp for ExampleProxyCache {
         _hit_handler: &mut HitHandler,
         is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>> {
+    ) -> Result<Option<ForcedFreshness>> {
         // allow test header to control force expiry/miss
         if session.get_header_bytes("x-force-miss") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceMiss));
+            return Ok(Some(ForcedFreshness::ForceMiss));
         }
 
         if !is_fresh {
+            if session.get_header_bytes("x-force-fresh") != b"" {
+                return Ok(Some(ForcedFreshness::ForceFresh));
+            }
             // already expired
             return Ok(None);
         }
 
         if session.get_header_bytes("x-force-expire") != b"" {
-            return Ok(Some(ForcedInvalidationKind::ForceExpired));
+            return Ok(Some(ForcedFreshness::ForceExpired));
         }
         Ok(None)
     }

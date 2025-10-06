@@ -18,7 +18,7 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedInvalidationKind, HitStatus, RespCacheable::*};
+use pingora_cache::{ForcedFreshness, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
@@ -137,13 +137,14 @@ impl<SV> HttpProxy<SV> {
                                     HitStatus::Expired
                                 }
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceExpired)) => {
+                            Ok(Some(ForcedFreshness::ForceExpired)) => {
                                 // force expired asset should not be serve as stale
                                 // because force expire is usually to remove data
                                 meta.disable_serve_stale();
                                 HitStatus::ForceExpired
                             }
-                            Ok(Some(ForcedInvalidationKind::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
                         };
 
                         hit_status_opt = Some(hit_status);

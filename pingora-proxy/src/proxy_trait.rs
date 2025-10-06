@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler,
+    CacheKey, CacheMeta, ForcedFreshness, HitHandler,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -165,7 +165,7 @@ pub trait ProxyHttp {
         _hit_handler: &mut HitHandler,
         _is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>>
+    ) -> Result<Option<ForcedFreshness>>
     where
         Self::CTX: Send + Sync,
     {

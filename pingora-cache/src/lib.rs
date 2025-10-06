@@ -220,16 +220,20 @@ impl RespCacheable {
     }
 }
 
-/// Indicators of which level of purge logic to apply to an asset. As in should
-/// the purged file be revalidated or re-retrieved altogether
+/// Indicators of which level of cache freshness logic to force apply to an asset.
+///
+/// For example, should an existing fresh asset be revalidated or re-retrieved altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForcedInvalidationKind {
+pub enum ForcedFreshness {
     /// Indicates the asset should be considered stale and revalidated
     ForceExpired,
 
     /// Indicates the asset should be considered absent and treated like a miss
     /// instead of a hit
     ForceMiss,
+
+    /// Indicates the asset should be considered fresh despite possibly being stale
+    ForceFresh,
 }
 
 /// Freshness state of cache hit asset
@@ -253,6 +257,9 @@ pub enum HitStatus {
 
     /// The asset is not expired
     Fresh,
+
+    /// Asset exists but is expired, forced to be a hit
+    ForceFresh,
 }
 
 impl HitStatus {
@@ -263,7 +270,7 @@ impl HitStatus {
 
     /// Whether cached asset can be served as fresh
     pub fn is_fresh(&self) -> bool {
-        *self == HitStatus::Fresh
+        *self == HitStatus::Fresh || *self == HitStatus::ForceFresh
     }
 
     /// Check whether the hit status should be treated as a miss. A forced miss
@@ -714,7 +721,7 @@ impl HttpCache {
         }
 
         self.phase = match hit_status {
-            HitStatus::Fresh => CachePhase::Hit,
+            HitStatus::Fresh | HitStatus::ForceFresh => CachePhase::Hit,
             HitStatus::Expired | HitStatus::ForceExpired => CachePhase::Stale,
             HitStatus::FailedHitFilter | HitStatus::ForceMiss => self.phase,
         };
