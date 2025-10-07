@@ -144,7 +144,7 @@ pub trait ProxyHttp {
         Ok(CacheKey::default(req_header))
     }
 
-    /// This callback is invoked when a cacheable response is ready to be admitted to cache
+    /// This callback is invoked when a cacheable response is ready to be admitted to cache.
     fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
         session.cache.cache_miss();
     }
