@@ -1030,6 +1030,18 @@ impl HttpCache {
 
                 inner_enabled.meta.replace(meta);
 
+                let mut span = inner_enabled.traces.child("update_meta");
+                let result = inner_enabled
+                    .storage
+                    .update_meta(
+                        inner.key.as_ref().unwrap(),
+                        inner_enabled.meta.as_ref().unwrap(),
+                        &span.handle(),
+                    )
+                    .await;
+                span.set_tag(|| trace::Tag::new("updated", result.is_ok()));
+
+                // regardless of result, release the cache lock
                 if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
                     let lock = lock_ctx.lock.take();
                     if let Some(Locked::Write(permit)) = lock {
@@ -1041,17 +1053,6 @@ impl HttpCache {
                     }
                 }
 
-                let mut span = inner_enabled.traces.child("update_meta");
-                // TODO: this call can be async
-                let result = inner_enabled
-                    .storage
-                    .update_meta(
-                        inner.key.as_ref().unwrap(),
-                        inner_enabled.meta.as_ref().unwrap(),
-                        &span.handle(),
-                    )
-                    .await;
-                span.set_tag(|| trace::Tag::new("updated", result.is_ok()));
                 result
             }
             _ => panic!("wrong phase {:?}", self.phase),
