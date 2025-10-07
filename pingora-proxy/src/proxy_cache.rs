@@ -530,6 +530,9 @@ impl<SV> HttpProxy<SV> {
                                 && meta.response_header().status == StatusCode::OK
                             {
                                 self.inner.cache_miss(session, ctx);
+                                if !session.cache.enabled() {
+                                    fill_cache = false;
+                                }
                             } else {
                                 // we've allowed caching on the next request,
                                 // but do not cache _this_ request if bypassed and not 200
