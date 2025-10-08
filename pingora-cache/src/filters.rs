@@ -177,7 +177,7 @@ pub mod upstream {
     ///
     /// When `meta` is set, this function will inject `If-modified-since` according to the `Last-Modified` header
     /// and inject `If-none-match` according to `Etag` header
-    pub fn request_filter(req: &mut RequestHeader, meta: Option<&CacheMeta>) -> Result<()> {
+    pub fn request_filter(req: &mut RequestHeader, meta: Option<&CacheMeta>) {
         // change HEAD to GET, HEAD itself is not semantically cacheable
         if req.method == Method::HEAD {
             req.set_method(Method::GET);
@@ -206,8 +206,6 @@ pub mod upstream {
                 req.insert_header(header::IF_NONE_MATCH, etag).unwrap();
             }
         }
-
-        Ok(())
     }
 }
 
