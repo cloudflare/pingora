@@ -34,6 +34,9 @@ fn main() {
     let clru = parking_lot::Mutex::new(clru::CLruCache::<u64, ()>::new(
         std::num::NonZeroUsize::new(10 * 100).unwrap(),
     ));
+    let slru = parking_lot::Mutex::new(schnellru::LruMap::<u64, ()>::new(
+        schnellru::ByLength::new(10 * 100),
+    ));
 
     let plru = pingora_lru::Lru::<(), 10>::with_capacity(1000, 100);
     // populate first, then we bench access/promotion
@@ -42,6 +45,9 @@ fn main() {
     }
     for i in 0..WEIGHTS.len() {
         clru.lock().put(i as u64, ());
+    }
+    for i in 0..WEIGHTS.len() {
+        slru.lock().insert(i as u64, ());
     }
     for i in 0..WEIGHTS.len() {
         plru.admit(i as u64, (), 1);
@@ -68,6 +74,16 @@ fn main() {
     let elapsed = before.elapsed();
     println!(
         "clru promote total {elapsed:?}, {:?} avg per operation",
+        elapsed / ITERATIONS as u32
+    );
+
+    let before = Instant::now();
+    for _ in 0..ITERATIONS {
+        slru.lock().get(&(dist.sample(&mut rng) as u64));
+    }
+    let elapsed = before.elapsed();
+    println!(
+        "slru promote total {elapsed:?}, {:?} avg per operation",
         elapsed / ITERATIONS as u32
     );
 
@@ -130,6 +146,29 @@ fn main() {
             let elapsed = before.elapsed();
             println!(
                 "clru promote total {elapsed:?}, {:?} avg per operation thread {i}",
+                elapsed / ITERATIONS as u32
+            );
+        });
+        handlers.push(handler);
+    }
+    for thread in handlers {
+        thread.join().unwrap();
+    }
+
+    let slru = Arc::new(slru);
+    let mut handlers = vec![];
+    for i in 0..THREADS {
+        let slru = slru.clone();
+        let handler = thread::spawn(move || {
+            let mut rng = thread_rng();
+            let dist = WeightedIndex::new(WEIGHTS).unwrap();
+            let before = Instant::now();
+            for _ in 0..ITERATIONS {
+                slru.lock().get(&(dist.sample(&mut rng) as u64));
+            }
+            let elapsed = before.elapsed();
+            println!(
+                "slru promote total {elapsed:?}, {:?} avg per operation thread {i}",
                 elapsed / ITERATIONS as u32
             );
         });

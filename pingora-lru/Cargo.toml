@@ -25,6 +25,7 @@ rand = "0.8"
 [dev-dependencies]
 lru = { workspace = true }
 clru = "0.6.2"
+schnellru = "0.2.4"
 
 [[bench]]
 name = "bench_linked_list"
