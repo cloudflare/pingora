@@ -31,11 +31,17 @@ const THREADS: usize = 8;
 
 fn main() {
     let lru = parking_lot::Mutex::new(lru::LruCache::<u64, ()>::unbounded());
+    let clru = parking_lot::Mutex::new(clru::CLruCache::<u64, ()>::new(
+        std::num::NonZeroUsize::new(10 * 100).unwrap(),
+    ));
 
     let plru = pingora_lru::Lru::<(), 10>::with_capacity(1000, 100);
     // populate first, then we bench access/promotion
     for i in 0..WEIGHTS.len() {
         lru.lock().put(i as u64, ());
+    }
+    for i in 0..WEIGHTS.len() {
+        clru.lock().put(i as u64, ());
     }
     for i in 0..WEIGHTS.len() {
         plru.admit(i as u64, (), 1);
@@ -52,6 +58,16 @@ fn main() {
     let elapsed = before.elapsed();
     println!(
         "lru promote total {elapsed:?}, {:?} avg per operation",
+        elapsed / ITERATIONS as u32
+    );
+
+    let before = Instant::now();
+    for _ in 0..ITERATIONS {
+        clru.lock().get(&(dist.sample(&mut rng) as u64));
+    }
+    let elapsed = before.elapsed();
+    println!(
+        "clru promote total {elapsed:?}, {:?} avg per operation",
         elapsed / ITERATIONS as u32
     );
 
@@ -91,6 +107,29 @@ fn main() {
             let elapsed = before.elapsed();
             println!(
                 "lru promote total {elapsed:?}, {:?} avg per operation thread {i}",
+                elapsed / ITERATIONS as u32
+            );
+        });
+        handlers.push(handler);
+    }
+    for thread in handlers {
+        thread.join().unwrap();
+    }
+
+    let clru = Arc::new(clru);
+    let mut handlers = vec![];
+    for i in 0..THREADS {
+        let clru = clru.clone();
+        let handler = thread::spawn(move || {
+            let mut rng = thread_rng();
+            let dist = WeightedIndex::new(WEIGHTS).unwrap();
+            let before = Instant::now();
+            for _ in 0..ITERATIONS {
+                clru.lock().get(&(dist.sample(&mut rng) as u64));
+            }
+            let elapsed = before.elapsed();
+            println!(
+                "clru promote total {elapsed:?}, {:?} avg per operation thread {i}",
                 elapsed / ITERATIONS as u32
             );
         });
