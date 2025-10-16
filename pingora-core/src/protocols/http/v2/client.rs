@@ -129,16 +129,6 @@ impl Http2Session {
 
     /// Write a request body chunk
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
-        match self.write_timeout {
-            Some(t) => match timeout(t, self.do_write_request_body(data, end)).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
-            },
-            None => self.do_write_request_body(data, end).await,
-        }
-    }
-
-    pub async fn do_write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
             return Ok(());
@@ -149,7 +139,7 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        super::write_body(body_writer, data, end)
+        super::write_body(body_writer, data, end, self.write_timeout)
             .await
             .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;

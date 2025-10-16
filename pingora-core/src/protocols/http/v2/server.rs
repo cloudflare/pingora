@@ -319,7 +319,7 @@ impl HttpSession {
             ));
         };
         let data_len = data.len();
-        super::write_body(writer, data, end)
+        super::write_body(writer, data, end, self.write_timeout)
             .await
             .map_err(|e| e.into_down())?;
         self.body_sent += data_len;
