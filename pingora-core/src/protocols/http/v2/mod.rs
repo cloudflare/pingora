@@ -14,15 +14,47 @@
 
 //! HTTP/2 implementation
 
+use std::time::Duration;
+
 use crate::{Error, ErrorType::*, OrErr, Result};
+use pingora_timeout::timeout;
+
 use bytes::Bytes;
 use h2::SendStream;
 
 pub mod client;
 pub mod server;
 
+async fn reserve_and_send(
+    writer: &mut SendStream<Bytes>,
+    remaining: &mut Bytes,
+    end: bool,
+) -> Result<()> {
+    // reserve remaining bytes then wait
+    writer.reserve_capacity(remaining.len());
+    let res = std::future::poll_fn(|cx| writer.poll_capacity(cx)).await;
+
+    match res {
+        None => Error::e_explain(H2Error, "cannot reserve capacity"),
+        Some(ready) => {
+            let n = ready.or_err(H2Error, "while waiting for capacity")?;
+            let remaining_size = remaining.len();
+            let data_to_send = remaining.split_to(std::cmp::min(remaining_size, n));
+            writer
+                .send_data(data_to_send, remaining.is_empty() && end)
+                .or_err(WriteError, "while writing h2 request body")?;
+            Ok(())
+        }
+    }
+}
+
 /// A helper function to write the body of h2 streams.
-pub async fn write_body(writer: &mut SendStream<Bytes>, data: Bytes, end: bool) -> Result<()> {
+pub async fn write_body(
+    writer: &mut SendStream<Bytes>,
+    data: Bytes,
+    end: bool,
+    write_timeout: Option<Duration>,
+) -> Result<()> {
     let mut remaining = data;
 
     // Cannot poll 0 capacity, so send it directly.
@@ -34,20 +66,20 @@ pub async fn write_body(writer: &mut SendStream<Bytes>, data: Bytes, end: bool) 
     }
 
     loop {
-        writer.reserve_capacity(remaining.len());
-        match std::future::poll_fn(|cx| writer.poll_capacity(cx)).await {
-            None => return Error::e_explain(H2Error, "cannot reserve capacity"),
-            Some(ready) => {
-                let n = ready.or_err(H2Error, "while waiting for capacity")?;
-                let remaining_size = remaining.len();
-                let data_to_send = remaining.split_to(std::cmp::min(remaining_size, n));
-                writer
-                    .send_data(data_to_send, remaining.is_empty() && end)
-                    .or_err(WriteError, "while writing h2 request body")?;
-                if remaining.is_empty() {
-                    return Ok(());
-                }
+        match write_timeout {
+            Some(t) => match timeout(t, reserve_and_send(writer, &mut remaining, end)).await {
+                Ok(res) => res?,
+                Err(_) => Error::e_explain(
+                    WriteTimedout,
+                    format!("while writing h2 request body, timeout: {t:?}"),
+                )?,
+            },
+            None => {
+                reserve_and_send(writer, &mut remaining, end).await?;
             }
+        }
+        if remaining.is_empty() {
+            return Ok(());
         }
     }
 }

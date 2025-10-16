@@ -158,12 +158,15 @@ impl<SV> HttpProxy<SV> {
         }
 
         client_session.read_timeout = peer.options.read_timeout;
-        client_session.write_timeout = peer.options.write_timeout;
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
             .take_request_body_writer()
             .expect("already send request header");
+
+        // need to get the write_timeout here since we pass the h2 SendStream
+        // directly to bidirection_down_to_up
+        let write_timeout = peer.options.write_timeout;
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
@@ -172,7 +175,7 @@ impl<SV> HttpProxy<SV> {
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
-            self.bidirection_down_to_up(session, &mut client_body, rx, ctx),
+            self.bidirection_down_to_up(session, &mut client_body, rx, ctx, write_timeout),
             pipe_up_to_down_response(client_session, tx)
         );
 
@@ -221,6 +224,7 @@ impl<SV> HttpProxy<SV> {
         client_body: &mut h2::SendStream<bytes::Bytes>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
+        write_timeout: Option<Duration>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -236,6 +240,7 @@ impl<SV> HttpProxy<SV> {
                 downstream_state.is_done(),
                 client_body,
                 ctx,
+                write_timeout,
             )
             .await?;
         }
@@ -275,7 +280,7 @@ impl<SV> HttpProxy<SV> {
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx).await {
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
@@ -561,6 +566,7 @@ impl<SV> HttpProxy<SV> {
         end_of_body: bool,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
+        write_timeout: Option<Duration>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -584,13 +590,13 @@ impl<SV> HttpProxy<SV> {
 
         if let Some(data) = data {
             debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body)
+            write_body(client_body, data, end_of_body, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         } else {
             debug!("Read downstream body done");
             /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true)
+            write_body(client_body, Bytes::new(), true, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
