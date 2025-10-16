@@ -100,6 +100,7 @@ pub struct HttpProxy<SV> {
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
     max_retries: usize,
+    downstream_read_timeout: Option<Duration>,
 }
 
 impl<SV> HttpProxy<SV> {
@@ -112,6 +113,7 @@ impl<SV> HttpProxy<SV> {
             h2_options: None,
             downstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
+            downstream_read_timeout: conf.downstream_read_timeout,
         }
     }
 
@@ -132,6 +134,9 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         // phase 1 read request header
+        if self.downstream_read_timeout.is_some() {
+            downstream_session.set_read_timeout(self.downstream_read_timeout);
+        }
 
         let res = tokio::select! {
             biased; // biased select is cheaper, and we don't want to drop already buffered requests

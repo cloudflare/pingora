@@ -24,6 +24,7 @@ use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::time::Duration;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
@@ -109,6 +110,10 @@ pub struct ServerConf {
     ///
     /// This setting is a fail-safe and defaults to 16.
     pub max_retries: usize,
+    /// Downstream read timeout in seconds. If no data is received from the downstream
+    /// client for this duration, the connection will be closed. If not set, no timeout
+    /// will be applied.
+    pub downstream_read_timeout: Option<Duration>,
 }
 
 impl Default for ServerConf {
@@ -136,6 +141,7 @@ impl Default for ServerConf {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
+            downstream_read_timeout: None,
         }
     }
 }
