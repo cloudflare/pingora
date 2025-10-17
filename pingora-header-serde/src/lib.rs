@@ -26,7 +26,7 @@ mod thread_zstd;
 
 use bytes::BufMut;
 use http::Version;
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::{Error, ErrorType, ImmutStr, Result};
 use pingora_http::ResponseHeader;
 use std::cell::RefCell;
 use std::ops::DerefMut;
@@ -104,7 +104,7 @@ enum ZstdCompression {
 }
 
 #[inline]
-fn into_error(e: &'static str, context: String) -> Box<Error> {
+fn into_error<S: Into<ImmutStr>>(e: &'static str, context: S) -> Box<Error> {
     Error::because(ErrorType::InternalError, context, e)
 }
 
@@ -113,10 +113,10 @@ impl ZstdCompression {
         match &self {
             ZstdCompression::Default(c, level) => c
                 .compress(data, *level)
-                .map_err(|e| into_error(e, "compress header".to_string())),
+                .map_err(|e| into_error(e, "compress header")),
             ZstdCompression::WithDict(c) => c
                 .compress(data)
-                .map_err(|e| into_error(e, "compress header".to_string())),
+                .map_err(|e| into_error(e, "compress header")),
         }
     }
 
@@ -149,15 +149,15 @@ impl ZstdCompression {
 }
 
 #[inline]
-fn get_frame_content_size(source: &[u8]) -> String {
+fn get_frame_content_size(source: &[u8]) -> ImmutStr {
     match zstd_safe::get_frame_content_size(source) {
         Ok(Some(size)) => match size {
-            zstd_safe::CONTENTSIZE_ERROR => "invalid".to_string(),
-            zstd_safe::CONTENTSIZE_UNKNOWN => "unknown".to_string(),
-            _ => size.to_string(),
+            zstd_safe::CONTENTSIZE_ERROR => ImmutStr::from("invalid"),
+            zstd_safe::CONTENTSIZE_UNKNOWN => ImmutStr::from("unknown"),
+            _ => ImmutStr::from(size.to_string()),
         },
-        Ok(None) => "none".to_string(),
-        Err(_e) => "failed".to_string(),
+        Ok(None) => ImmutStr::from("none"),
+        Err(_e) => ImmutStr::from("failed"),
     }
 }
 
