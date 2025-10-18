@@ -36,6 +36,10 @@ impl<SV> HttpProxy<SV> {
 
         let mut req = session.req_header().clone();
 
+        // Remove hop-by-hop headers before forwarding to upstream
+        // as per RFC 7230 Section 6.1
+        req.remove_hop_by_hop_headers();
+
         // Convert HTTP2 headers to H1
         if req.version == Version::HTTP_2 {
             req.set_version(Version::HTTP_11);
