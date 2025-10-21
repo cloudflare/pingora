@@ -29,6 +29,8 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// The server name indicated by the client (SNI)
+    pub sni: Option<String>,
 }
 
 impl SslDigest {
@@ -49,6 +51,29 @@ impl SslDigest {
             organization,
             serial_number,
             cert_digest,
+            sni: None,
+        }
+    }
+
+    /// Create a new SslDigest with SNI
+    pub fn with_sni<S>(
+        cipher: S,
+        version: S,
+        organization: Option<String>,
+        serial_number: Option<String>,
+        cert_digest: Vec<u8>,
+        sni: Option<String>,
+    ) -> Self
+    where
+        S: Into<Cow<'static, str>>,
+    {
+        SslDigest {
+            cipher: cipher.into(),
+            version: version.into(),
+            organization,
+            serial_number,
+            cert_digest,
+            sni,
         }
     }
 }

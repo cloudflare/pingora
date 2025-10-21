@@ -306,12 +306,17 @@ impl SslDigest {
             }
         }
 
-        SslDigest::new(
+        // TODO: S2N API for reading SNI should be implemented when available
+        // Currently S2N doesn't expose server name / SNI through public API
+        let sni: Option<String> = None;
+
+        SslDigest::with_sni(
             cipher,
             version,
             organization,
             serial_number,
             cert_digest.unwrap_or_default(),
+            sni,
         )
     }
 }
