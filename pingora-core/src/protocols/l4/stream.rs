@@ -201,6 +201,7 @@ impl AsyncRead for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                RawStream::Virtual(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
             }
         }
     }
