@@ -300,7 +300,7 @@ impl RequestHeader {
     /// - Proxy-Authenticate
     /// - Proxy-Authorization
     /// - TE
-    /// - Trailers
+    /// - Trailer
     /// - Transfer-Encoding
     /// - Upgrade
     ///
@@ -347,7 +347,7 @@ impl RequestHeader {
             "proxy-authenticate",
             "proxy-authorization",
             "te",
-            "trailers",
+            "trailer",
             "transfer-encoding",
             "upgrade",
         ];
@@ -994,7 +994,7 @@ mod tests {
         req.insert_header("Upgrade", "websocket").unwrap();
         req.insert_header("Proxy-Authorization", "Basic xyz").unwrap();
         req.insert_header("TE", "trailers").unwrap();
-        req.insert_header("Trailers", "X-Trailer").unwrap();
+        req.insert_header("Trailer", "X-Trailer").unwrap();
 
         // Add regular headers that should stay
         req.insert_header("Host", "example.com").unwrap();
@@ -1010,7 +1010,7 @@ mod tests {
         assert!(req.headers.get("Upgrade").is_none());
         assert!(req.headers.get("Proxy-Authorization").is_none());
         assert!(req.headers.get("TE").is_none());
-        assert!(req.headers.get("Trailers").is_none());
+        assert!(req.headers.get("Trailer").is_none());
 
         // Verify regular headers remain
         assert_eq!(
