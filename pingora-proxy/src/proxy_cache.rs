@@ -728,7 +728,7 @@ impl<SV> HttpProxy<SV> {
                                 // (downstream may have a different cacheability assessment and could cache the 304)
 
                                 //TODO: log more
-                                warn!("Uncacheable {reason:?} 304 received");
+                                debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
