@@ -21,7 +21,7 @@ use crate::RespCacheable::*;
 use cache_control::DELTA_SECONDS_OVERFLOW_VALUE;
 use http::{header, HeaderValue};
 use httpdate::HttpDate;
-use log::warn;
+use log::debug;
 use pingora_http::RequestHeader;
 
 /// Decide if the request can be cacheable
@@ -128,7 +128,7 @@ pub fn calculate_expires_header_time(resp_header: &RespHeader) -> Option<SystemT
         Some(SystemTime::from(
             expires
                 .parse::<HttpDate>()
-                .map_err(|e| warn!("Invalid HttpDate in Expires: {}, error: {}", expires, e))
+                .map_err(|e| debug!("Invalid HttpDate in Expires: {}, error: {}", expires, e))
                 .ok()?,
         ))
     }
