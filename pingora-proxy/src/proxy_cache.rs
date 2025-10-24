@@ -960,7 +960,7 @@ pub mod range_filter {
         for _ in ranges_str.split(',') {
             range_count += 1;
             // TODO: make configurable
-            const MAX_RANGES: usize = 100;
+            const MAX_RANGES: usize = 200;
             if range_count >= MAX_RANGES {
                 // If we get more than MAX_RANGES ranges, return None for now to save parsing time
                 return RangeType::None;
@@ -1166,8 +1166,8 @@ pub mod range_filter {
             s.into_bytes()
         }
 
-        // Test 100 range limit for parsing.
-        let ranges = generate_range_header(101);
+        // Test 200 range limit for parsing.
+        let ranges = generate_range_header(201);
         assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
     }
 
