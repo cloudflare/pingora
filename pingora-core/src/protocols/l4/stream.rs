@@ -37,6 +37,7 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 
 use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
+use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
@@ -49,6 +50,7 @@ enum RawStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
+    Virtual(virt::VirtualSocketStream),
 }
 
 impl AsyncRead for RawStream {
@@ -63,6 +65,7 @@ impl AsyncRead for RawStream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_read(cx, buf),
             }
         }
     }
@@ -76,6 +79,7 @@ impl AsyncWrite for RawStream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write(cx, buf),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_write(cx, buf),
             }
         }
     }
@@ -87,6 +91,7 @@ impl AsyncWrite for RawStream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_flush(cx),
             }
         }
     }
@@ -98,6 +103,7 @@ impl AsyncWrite for RawStream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_shutdown(cx),
             }
         }
     }
@@ -113,6 +119,7 @@ impl AsyncWrite for RawStream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
             }
         }
     }
@@ -122,6 +129,7 @@ impl AsyncWrite for RawStream {
             RawStream::Tcp(s) => s.is_write_vectored(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.is_write_vectored(),
+            RawStream::Virtual(s) => s.is_write_vectored(),
         }
     }
 }
@@ -132,6 +140,7 @@ impl AsRawFd for RawStream {
         match self {
             RawStream::Tcp(s) => s.as_raw_fd(),
             RawStream::Unix(s) => s.as_raw_fd(),
+            RawStream::Virtual(_) => -1, // Virtual stream does not have a real fd
         }
     }
 }
@@ -192,6 +201,7 @@ impl AsyncRead for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
+                RawStream::Virtual(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
             }
         }
     }
@@ -213,6 +223,7 @@ impl AsyncRead for RawStreamWrapper {
                 match &mut rs_wrapper.stream {
                     RawStream::Tcp(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                     RawStream::Unix(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
+                    RawStream::Virtual(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                 }
             }
         }
@@ -264,6 +275,7 @@ impl AsyncRead for RawStreamWrapper {
             }
             // Unix RX timestamp only works with datagram for now, so we do not care about it
             RawStream::Unix(s) => unsafe { Pin::new_unchecked(s).poll_read(cx, buf) },
+            RawStream::Virtual(s) => unsafe { Pin::new_unchecked(s).poll_read(cx, buf) },
         }
     }
 }
@@ -276,6 +288,7 @@ impl AsyncWrite for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write(cx, buf),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_write(cx, buf),
             }
         }
     }
@@ -287,6 +300,7 @@ impl AsyncWrite for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_flush(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_flush(cx),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_flush(cx),
             }
         }
     }
@@ -298,6 +312,7 @@ impl AsyncWrite for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_shutdown(cx),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_shutdown(cx),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_shutdown(cx),
             }
         }
     }
@@ -313,6 +328,7 @@ impl AsyncWrite for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_write_vectored(cx, bufs),
             }
         }
     }
@@ -379,18 +395,32 @@ impl Stream {
 
     /// set TCP nodelay for this connection if `self` is TCP
     pub fn set_nodelay(&mut self) -> Result<()> {
-        if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
-            s.set_nodelay(true)
-                .or_err(ConnectError, "failed to set_nodelay")?;
+        match &self.stream_mut().get_mut().stream {
+            RawStream::Tcp(s) => {
+                s.set_nodelay(true)
+                    .or_err(ConnectError, "failed to set_nodelay")?;
+            }
+            RawStream::Virtual(s) => {
+                s.set_socket_option(virt::VirtualSockOpt::NoDelay)
+                    .or_err(ConnectError, "failed to set_nodelay on virtual socket")?;
+            }
+            _ => (),
         }
         Ok(())
     }
 
     /// set TCP keepalive settings for this connection if `self` is TCP
     pub fn set_keepalive(&mut self, ka: &TcpKeepalive) -> Result<()> {
-        if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
-            debug!("Setting tcp keepalive");
-            set_tcp_keepalive(s, ka)?;
+        match &self.stream_mut().get_mut().stream {
+            RawStream::Tcp(s) => {
+                debug!("Setting tcp keepalive");
+                set_tcp_keepalive(s, ka)?;
+            }
+            RawStream::Virtual(s) => {
+                s.set_socket_option(virt::VirtualSockOpt::KeepAlive(ka.clone()))
+                    .or_err(ConnectError, "failed to set_keepalive on virtual socket")?;
+            }
+            _ => (),
         }
         Ok(())
     }
@@ -442,6 +472,27 @@ impl From<TcpStream> for Stream {
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
+            )),
+            rewind_read_buf: Vec::new(),
+            buffer_write: true,
+            established_ts: SystemTime::now(),
+            proxy_digest: None,
+            socket_digest: None,
+            tracer: None,
+            read_pending_time: AccumulatedDuration::new(),
+            write_pending_time: AccumulatedDuration::new(),
+            rx_ts: None,
+        }
+    }
+}
+
+impl From<virt::VirtualSocketStream> for Stream {
+    fn from(s: virt::VirtualSocketStream) -> Self {
+        Stream {
+            stream: Some(BufStream::with_capacity(
+                0,
+                0,
+                RawStreamWrapper::new(RawStream::Virtual(s)),
             )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
@@ -576,6 +627,10 @@ impl Drop for Stream {
             RawStream::Tcp(s) => s.nodelay().err(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.local_addr().err(),
+            RawStream::Virtual(_) => {
+                // TODO: should this do something?
+                None
+            }
         };
         if let Some(e) = ret {
             match e.kind() {
