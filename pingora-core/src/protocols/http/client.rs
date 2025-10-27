@@ -22,7 +22,7 @@ use super::{custom::client::Session, v1::client::HttpSession as Http1Session};
 use crate::protocols::{Digest, SocketAddr, Stream};
 
 /// A type for Http client session. It can be either an Http1 connection or an Http2 stream.
-pub enum HttpSession<S> {
+pub enum HttpSession<S = ()> {
     H1(Http1Session),
     H2(Http2Session),
     Custom(S),
