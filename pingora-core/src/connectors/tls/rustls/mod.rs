@@ -22,8 +22,14 @@ use pingora_error::{
 };
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
-    version, CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
-    TlsConnector as RusTlsConnector,
+    version, CertificateDer, CertificateError, ClientConfig as RusTlsClientConfig,
+    DigitallySignedStruct, PrivateKeyDer, RootCertStore, RusTlsError, ServerName, SignatureScheme,
+    TlsConnector as RusTlsConnector, UnixTime, WebPkiServerVerifier,
+};
+
+// Uses custom certificate verification from rustls's 'danger' module.
+use pingora_rustls::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier as RusTlsServerCertVerifier,
 };
 
 use crate::protocols::tls::{client::handshake, TlsStream};
@@ -174,6 +180,37 @@ where
         }
     }
 
+    let needs_custom_verifier =
+        peer.sni().is_empty() || !peer.verify_cert() || !peer.verify_hostname();
+    let mut domain = peer.sni().to_string();
+
+    if peer.verify_hostname() {
+        if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
+            domain = sni_s;
+        }
+    }
+
+    if needs_custom_verifier {
+        if let Some(updated_config) = updated_config_opt.as_mut() {
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
+                .build()
+                .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
+
+            let verification_mode = if !peer.verify_cert() || peer.sni().is_empty() {
+                VerificationMode::SkipAll
+            } else {
+                VerificationMode::SkipHostname
+            };
+
+            let custom_verifier =
+                Arc::new(CustomServerCertVerifier::new(delegate, verification_mode));
+
+            updated_config
+                .dangerous()
+                .set_certificate_verifier(custom_verifier);
+        }
+    }
+
     // TODO: curve setup from peer
     // - second key share from peer, currently only used in boringssl with PQ features
 
@@ -182,21 +219,6 @@ where
     } else {
         RusTlsConnector::from(Arc::clone(config))
     };
-
-    // TODO: for consistent behavior between TLS providers some additions are required
-    // - allowing to disable verification
-    // - the validation/replace logic would need adjustments to match the boringssl/openssl behavior
-    //   implementing a custom certificate_verifier could be used to achieve matching behavior
-    //let d_conf = config.dangerous();
-    //d_conf.set_certificate_verifier(...);
-
-    let mut domain = peer.sni().to_string();
-    if peer.verify_cert() && peer.verify_hostname() {
-        // TODO: streamline logic with replacing first underscore within TLS implementations
-        if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
-            domain = sni_s;
-        }
-    }
 
     let connect_future = handshake(&tls_conn, &domain, stream);
 
@@ -209,5 +231,93 @@ where
             ),
         },
         None => connect_future.await,
+    }
+}
+
+#[derive(Debug)]
+enum VerificationMode {
+    /// Perform full verification (certificate chain and hostname).
+    /// Included for completeness, making this verifier self-contained
+    /// and explicit about all possible verification modes, not just exceptions.
+    Full,
+    SkipHostname,
+    SkipAll,
+}
+
+#[derive(Debug)]
+pub struct CustomServerCertVerifier {
+    delegate: Arc<WebPkiServerVerifier>,
+    verification_mode: VerificationMode,
+}
+
+impl CustomServerCertVerifier {
+    pub fn new(delegate: Arc<WebPkiServerVerifier>, verification_mode: VerificationMode) -> Self {
+        Self {
+            delegate,
+            verification_mode,
+        }
+    }
+}
+
+impl RusTlsServerCertVerifier for CustomServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RusTlsError> {
+        match self.verification_mode {
+            VerificationMode::Full => self.delegate.verify_server_cert(
+                _end_entity,
+                _intermediates,
+                _server_name,
+                _ocsp,
+                _now,
+            ),
+            VerificationMode::SkipHostname => {
+                match self.delegate.verify_server_cert(
+                    _end_entity,
+                    _intermediates,
+                    _server_name,
+                    _ocsp,
+                    _now,
+                ) {
+                    Ok(scv) => Ok(scv),
+                    Err(RusTlsError::InvalidCertificate(cert_error)) => {
+                        if let CertificateError::NotValidForNameContext { .. } = cert_error {
+                            Ok(ServerCertVerified::assertion())
+                        } else {
+                            Err(RusTlsError::InvalidCertificate(cert_error))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            VerificationMode::SkipAll => Ok(ServerCertVerified::assertion()),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RusTlsError> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RusTlsError> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.delegate.supported_verify_schemes()
     }
 }
