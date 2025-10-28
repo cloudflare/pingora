@@ -184,12 +184,12 @@ where
 
     //
     if let Some(updated_config) = updated_config_opt.as_mut() {
-        let verification_mode = if !peer.verify_cert() {
-            Some(VerificationMode::SkipAll)
-        } else if peer.sni().is_empty() {
+        let verification_mode = if peer.sni().is_empty() {
             updated_config.enable_sni = false;
             /* NOTE: technically we can still verify who signs the cert but turn it off to be
             consistent with nginx's behavior */
+            Some(VerificationMode::SkipAll)
+        } else if !peer.verify_cert() {
             Some(VerificationMode::SkipAll) // disable verification if sni does not exist
         } else if !peer.verify_hostname() {
             Some(VerificationMode::SkipHostname)
