@@ -180,30 +180,33 @@ where
         }
     }
 
-    let needs_custom_verifier =
-        peer.sni().is_empty() || !peer.verify_cert() || !peer.verify_hostname();
     let mut domain = peer.sni().to_string();
 
-    if peer.verify_hostname() {
-        if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
-            domain = sni_s;
-        }
-    }
+    if let Some(updated_config) = updated_config_opt.as_mut() {
+        let verification_mode = if !peer.verify_cert() {
+            Some(VerificationMode::SkipAll)
+        } else if peer.sni().is_empty() {
+            updated_config.enable_sni = false;
+            Some(VerificationMode::SkipAll)
+        } else if !peer.verify_hostname() {
+            Some(VerificationMode::SkipHostname)
+        } else {
+            if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
+                domain = sni_s;
+            }
 
-    if needs_custom_verifier {
-        if let Some(updated_config) = updated_config_opt.as_mut() {
+            None
+            // to use the custom verifier for the full verify:
+            // Some(VerificationMode::SkipHostname)
+        };
+
+        // Builds the custom_verifier when verification_mode is set.
+        if let Some(mode) = verification_mode {
             let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
                 .build()
                 .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
 
-            let verification_mode = if !peer.verify_cert() || peer.sni().is_empty() {
-                VerificationMode::SkipAll
-            } else {
-                VerificationMode::SkipHostname
-            };
-
-            let custom_verifier =
-                Arc::new(CustomServerCertVerifier::new(delegate, verification_mode));
+            let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
 
             updated_config
                 .dangerous()
@@ -236,12 +239,11 @@ where
 
 #[derive(Debug)]
 enum VerificationMode {
-    /// Perform full verification (certificate chain and hostname).
-    /// Included for completeness, making this verifier self-contained
-    /// and explicit about all possible verification modes, not just exceptions.
-    Full,
     SkipHostname,
     SkipAll,
+    Full,
+    // Note: "Full" Included for completeness, making this verifier self-contained
+    // and explicit about all possible verification modes, not just exceptions.
 }
 
 #[derive(Debug)]
@@ -259,6 +261,10 @@ impl CustomServerCertVerifier {
     }
 }
 
+// CustomServerCertVerifier delegates TLS signature verification and allows 3 VerificationMode:
+// Full: delegates all verification to the original WebPkiServerVerifier
+// SkipHostname: same as "Full" but ignores "NotValidForName" certificate errors
+// SkipAll: all certificate verification checks are skipped.
 impl RusTlsServerCertVerifier for CustomServerCertVerifier {
     fn verify_server_cert(
         &self,
