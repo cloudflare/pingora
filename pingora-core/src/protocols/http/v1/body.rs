@@ -528,6 +528,97 @@ impl BodyWriter {
         }
     }
 
+    /// Try to write body without blocking. Returns:
+    /// - Ok(Some(n)): n bytes written
+    /// - Ok(None): would block (WouldBlock error)
+    /// - Err(e): actual error
+    pub fn try_write_body<S>(&mut self, stream: &mut S, buf: &[u8]) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        use std::io::ErrorKind;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        trace!("Try writing Body, size: {}", buf.len());
+        match self.body_mode {
+            BM::Complete(_) => Ok(None),
+            BM::ContentLength(total, written) => {
+                if written >= total {
+                    return Ok(None);
+                }
+                let to_write = std::cmp::min(total - written, buf.len());
+
+                // Create a waker that does nothing (we're polling once)
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+
+                match Pin::new(stream).poll_write(&mut cx, &buf[..to_write]) {
+                    Poll::Ready(Ok(n)) if n > 0 => {
+                        self.body_mode = BM::ContentLength(total, written + n);
+                        Ok(Some(n))
+                    }
+                    Poll::Ready(Ok(_)) => {
+                        // 0 bytes written, treat as would block
+                        Ok(None)
+                    }
+                    Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+                    Poll::Ready(Err(e)) => Error::e_because(WriteError, "while writing body", e),
+                    Poll::Pending => Ok(None),
+                }
+            }
+            BM::ChunkedEncoding(written) => {
+                let chunk_size = buf.len();
+                let chunk_header = format!("{:X}\r\n", chunk_size);
+
+                // For chunked, we need to write header + data + trailer atomically
+                // For simplicity in try_write, we'll use a buffer
+                let mut combined = Vec::with_capacity(chunk_header.len() + chunk_size + 2);
+                combined.extend_from_slice(chunk_header.as_bytes());
+                combined.extend_from_slice(buf);
+                combined.extend_from_slice(b"\r\n");
+
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+
+                match Pin::new(stream).poll_write(&mut cx, &combined) {
+                    Poll::Ready(Ok(n)) if n >= chunk_header.len() => {
+                        // At least wrote the header, count data bytes
+                        let data_written = n.saturating_sub(chunk_header.len()).min(chunk_size);
+                        if data_written > 0 {
+                            self.body_mode = BM::ChunkedEncoding(written + data_written);
+                            Ok(Some(data_written))
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Poll::Ready(Ok(_)) => Ok(None),
+                    Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+                    Poll::Ready(Err(e)) => {
+                        Error::e_because(WriteError, "while writing chunked body", e)
+                    }
+                    Poll::Pending => Ok(None),
+                }
+            }
+            BM::HTTP1_0(written) => {
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+
+                match Pin::new(stream).poll_write(&mut cx, buf) {
+                    Poll::Ready(Ok(n)) if n > 0 => {
+                        self.body_mode = BM::HTTP1_0(written + n);
+                        Ok(Some(n))
+                    }
+                    Poll::Ready(Ok(_)) => Ok(None),
+                    Poll::Ready(Err(e)) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+                    Poll::Ready(Err(e)) => Error::e_because(WriteError, "while writing body", e),
+                    Poll::Pending => Ok(None),
+                }
+            }
+            BM::ToSelect => Ok(None),
+        }
+    }
+
     async fn do_write_body<S>(&mut self, stream: &mut S, buf: &[u8]) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,

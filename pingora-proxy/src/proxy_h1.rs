@@ -155,9 +155,85 @@ impl<SV> HttpProxy<SV> {
         let mut response_done = false;
         let mut send_error = None;
 
-        /* duplex mode, wait for either to complete */
+        // Pending write state machine
+        enum PendingWrite {
+            None,
+            Data(bytes::Bytes, bool, usize), // (data, is_final_chunk, bytes_written)
+            NeedFinish,                      // Channel closed, need to call finish_body()
+        }
+        let mut pending_write = PendingWrite::None;
+
+        /* duplex mode with non-blocking writes to prevent deadlock */
         while !request_done || !response_done {
+            // Handle pending write state machine
+            match pending_write {
+                PendingWrite::NeedFinish => {
+                    // Channel closed, finish the body
+                    match client_session.finish_body().await {
+                        Ok(_) => {
+                            debug!("finish sending body to upstream (channel closed)");
+                            request_done = true;
+                            if client_session.is_upgrade_req() {
+                                response_done = true;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("send error on finish: {e}");
+                            request_done = true;
+                            send_error = Some(e.into_up());
+                        }
+                    }
+                    pending_write = PendingWrite::None;
+                }
+                PendingWrite::Data(data, end, offset) => {
+                    // Try non-blocking write
+                    match client_session.try_write_body(&data[offset..]) {
+                        Ok(Some(n)) => {
+                            let new_offset = offset + n;
+                            if new_offset < data.len() {
+                                // Partial write, keep pending
+                                pending_write = PendingWrite::Data(data, end, new_offset);
+                            } else if end {
+                                // All data written and end flag, finish body
+                                match client_session.finish_body().await {
+                                    Ok(_) => {
+                                        debug!("finish sending body to upstream");
+                                        request_done = true;
+                                        if client_session.is_upgrade_req() {
+                                            response_done = true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("send error: {e}");
+                                        request_done = true;
+                                        send_error = Some(e.into_up());
+                                    }
+                                }
+                                pending_write = PendingWrite::None;
+                            } else {
+                                // All written but !end, ready for next chunk
+                                pending_write = PendingWrite::None;
+                            }
+                        }
+                        Ok(None) => {
+                            // Would block, keep pending
+                            pending_write = PendingWrite::Data(data, end, offset);
+                        }
+                        Err(e) => {
+                            debug!("send error: {e}");
+                            request_done = true;
+                            send_error = Some(e.into_up());
+                            pending_write = PendingWrite::None;
+                        }
+                    }
+                }
+                PendingWrite::None => {
+                    // No pending write, continue to select!
+                }
+            }
+
             tokio::select! {
+                // Always poll read to prevent deadlock
                 res = client_session.read_response_task(), if !response_done => {
                     match res {
                         Ok(task) => {
@@ -188,20 +264,25 @@ impl<SV> HttpProxy<SV> {
                     }
                 },
 
-                body = rx.recv(), if !request_done => {
-                    match send_body_to1(client_session, body).await {
-                        Ok(send_done) => {
-                            request_done = send_done;
-                            // An upgraded request is terminated when either side is done
-                            if request_done && client_session.is_upgrade_req() {
-                                response_done = true;
+                body = rx.recv(), if !request_done && matches!(pending_write, PendingWrite::None) => {
+                    match body {
+                        Some(HttpTask::Body(data, end)) => {
+                            if let Some(d) = data {
+                                // Store in pending_write for non-blocking write
+                                pending_write = PendingWrite::Data(d, end, 0);
+                            } else if end {
+                                // Empty body but end flag, need to finish
+                                pending_write = PendingWrite::NeedFinish;
                             }
-                        },
-                        Err(e) => {
-                           debug!("send error, draining read buf: {e}");
-                           request_done = true;
-                           send_error = Some(e);
-                           continue
+                        }
+                        Some(_) => {
+                            // Unexpected task
+                            warn!("Unexpected task sent to upstream");
+                            request_done = true;
+                        }
+                        None => {
+                            // Channel closed - need to finish body after pending writes drain
+                            pending_write = PendingWrite::NeedFinish;
                         }
                     }
                 },
@@ -627,56 +708,5 @@ impl<SV> HttpProxy<SV> {
         tx.send(HttpTask::Body(data, upstream_end_of_body));
 
         Ok(end_of_body)
-    }
-}
-
-pub(crate) async fn send_body_to1(
-    client_session: &mut HttpSessionV1,
-    recv_task: Option<HttpTask>,
-) -> Result<bool> {
-    let body_done;
-
-    if let Some(task) = recv_task {
-        match task {
-            HttpTask::Body(data, end) => {
-                body_done = end;
-                if let Some(d) = data {
-                    let m = client_session.write_body(&d).await;
-                    match m {
-                        Ok(m) => match m {
-                            Some(n) => {
-                                debug!("Write {} bytes body to upstream", n);
-                            }
-                            None => {
-                                warn!("Upstream body is already finished. Nothing to write");
-                            }
-                        },
-                        Err(e) => {
-                            return e.into_up().into_err();
-                        }
-                    }
-                }
-            }
-            _ => {
-                // should never happen, sender only sends body
-                warn!("Unexpected task sent to upstream");
-                body_done = true;
-            }
-        }
-    } else {
-        // sender dropped
-        body_done = true;
-    }
-
-    if body_done {
-        match client_session.finish_body().await {
-            Ok(_) => {
-                debug!("finish sending body to upstream");
-                Ok(true)
-            }
-            Err(e) => e.into_up().into_err(),
-        }
-    } else {
-        Ok(false)
     }
 }

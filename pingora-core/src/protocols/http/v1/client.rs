@@ -146,6 +146,22 @@ impl HttpSession {
         }
     }
 
+    /// Try to write request body without blocking. Returns:
+    /// - Ok(Some(n)): n bytes written
+    /// - Ok(None): would block (no data written)
+    /// - Err(e): actual error
+    pub fn try_write_body(&mut self, buf: &[u8]) -> Result<Option<usize>> {
+        let written = self
+            .body_writer
+            .try_write_body(&mut self.underlying_stream, buf);
+
+        if let Ok(Some(num_bytes)) = written {
+            self.bytes_sent += num_bytes;
+        }
+
+        written
+    }
+
     fn maybe_force_close_body_reader(&mut self) {
         if self.upgraded && !self.body_reader.body_done() {
             // request is done, reset the response body to close
