@@ -324,7 +324,9 @@ impl Server {
 
     #[cfg(windows)]
     async fn main_loop(&self, run_args: RunArgs) -> ShutdownType {
-        let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
+        self.execution_phase_watch
+            .send(ExecutionPhase::Running)
+            .ok();
 
         match run_args.shutdown_signal.recv().await {
             ShutdownSignal::GracefulUpgrade => unreachable!("Graceful Upgrade signal not set"),
