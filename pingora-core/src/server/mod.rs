@@ -158,7 +158,7 @@ impl ShutdownSignalWatch for UnixShutdownSignalWatch {
 
 /// A Windows shutdown watcher that awaits for Windows signals.
 ///
-/// - `CTRL-C`: graceful terminate
+/// - `CTRL-C`: fast shutdown
 #[cfg(windows)]
 pub struct WindowsShutdownSignalWatch;
 
@@ -166,11 +166,11 @@ pub struct WindowsShutdownSignalWatch;
 #[async_trait]
 impl ShutdownSignalWatch for WindowsShutdownSignalWatch {
     async fn recv(&self) -> ShutdownSignal {
-        let mut graceful_terminate_signal = signal::windows::ctrl_c().unwrap();
+        let mut fash_shutdown_signal = signal::windows::ctrl_c().unwrap();
 
         tokio::select! {
-            _ = graceful_terminate_signal.recv() => {
-                ShutdownSignal::GracefulTerminate
+            _ = fash_shutdown_signal.recv() => {
+                ShutdownSignal::FastShutdown
             }
         }
     }
@@ -331,7 +331,7 @@ impl Server {
         match run_args.shutdown_signal.recv().await {
             ShutdownSignal::GracefulUpgrade => unreachable!("Graceful Upgrade signal not set"),
             ShutdownSignal::GracefulTerminate => {
-                info!("CTRL-C received, gracefully exiting");
+                warn!("No signal for graceful terminate");
                 info!("Broadcasting graceful shutdown");
                 match self.shutdown_watch.send(true) {
                     Ok(_) => {
@@ -344,7 +344,10 @@ impl Server {
                 info!("Broadcast graceful shutdown complete");
                 ShutdownType::Graceful
             }
-            ShutdownSignal::FastShutdown => unreachable!("Fast Shutdown signal not set"),
+            ShutdownSignal::FastShutdown => {
+                info!("CTRL-C received, exiting");
+                ShutdownType::Quick
+            }
         }
     }
 
