@@ -307,12 +307,18 @@ where
             || upstream_custom
             || downstream_custom
         {
+            // partial read support, this check will also be false if cache is disabled.
+            let support_cache_partial_read =
+                session.cache.support_streaming_partial_write() == Some(true);
+
             tokio::select! {
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
-                            if serve_from_cache.is_miss() {
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(

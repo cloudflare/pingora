@@ -823,6 +823,18 @@ impl HttpCache {
         }
     }
 
+    /// Return whether the underlying storage backend supports streaming partial write.
+    ///
+    /// Returns None if cache is not enabled.
+    pub fn support_streaming_partial_write(&self) -> Option<bool> {
+        self.inner.as_ref().and_then(|inner| {
+            inner
+                .enabled_ctx
+                .as_ref()
+                .map(|c| c.storage.support_streaming_partial_write())
+        })
+    }
+
     /// Call this when cache hit is fully read.
     ///
     /// This call will release resource if any and log the timing in tracing if set.
