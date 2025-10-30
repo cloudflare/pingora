@@ -346,6 +346,10 @@ where
                 .map(|reader| reader.next())
                 .into();
 
+            // partial read support, this check will also be false if cache is disabled.
+            let support_cache_partial_read =
+                session.cache.support_streaming_partial_write() == Some(true);
+
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
@@ -357,7 +361,9 @@ where
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
-                            if serve_from_cache.is_miss() {
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
@@ -513,7 +519,7 @@ where
                         .await?;
                 },
 
-                 data = custom_inject_rx_recv, if downstream_custom_write => {
+                data = custom_inject_rx_recv, if downstream_custom_write => {
                     match data.flatten() {
                         Some(data) => {
                             if let Some(ref mut custom_writer) = downstream_custom_message_writer {

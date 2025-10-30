@@ -2348,6 +2348,108 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world!");
     }
 
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/slow_body/test_caching_when_downstream_bails_uncacheable/";
+
+        tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-no-store", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "no-cache");
+            // exit without res.text().await so that we bail early
+        });
+        // sleep just a little to make sure the req above gets the cache lock
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // entirely new request made to upstream, since the response was uncacheable
+        assert_eq!(headers["x-cache-status"], "no-cache"); // due to cache lock give up
+        assert_eq!(res.text().await.unwrap(), "hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache hit
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header_uncacheable/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .header("x-no-store", "1")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+            // note that while the downstream error is ignored,
+            // once the response is uncacheable we will still attempt to write
+            // downstream and find a broken connection that terminates the request
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache miss, as the previous fill was uncacheable
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
     async fn send_vary_req_with_headers_with_dups(
         url: &str,
         vary_field: &str,
