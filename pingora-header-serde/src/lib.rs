@@ -42,9 +42,7 @@ pub struct HeaderSerde {
     buf: ThreadLocal<RefCell<Vec<u8>>>,
 }
 
-// TODO: make header size configurable by users
-const HEADER_SIZE_LOWER_LIMIT: usize = 64 * 1024;
-const HEADER_SIZE_UPPER_LIMIT: usize = 128 * 1024;
+const MAX_HEADER_BUF_SIZE: usize = 128 * 1024; // 128KB
 
 const COMPRESS_LEVEL: i32 = 3;
 
@@ -79,7 +77,7 @@ impl HeaderSerde {
         // TODO: should convert to h1 if the incoming header is for h2
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(HEADER_SIZE_LOWER_LIMIT)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         resp_header_to_buf(header, &mut buf);
@@ -88,21 +86,9 @@ impl HeaderSerde {
 
     /// Deserialize the given response header
     pub fn deserialize(&self, data: &[u8]) -> Result<ResponseHeader> {
-        let header_size_limit = match zstd_safe::get_frame_content_size(data) {
-            Ok(Some(frame_size)) if frame_size <= HEADER_SIZE_UPPER_LIMIT as u64 => {
-                frame_size as usize
-            }
-            Ok(Some(frame_size)) => {
-                return Err(into_error(
-                    "header size too large",
-                    format!("frame content size: {}", frame_size),
-                ));
-            }
-            _ => HEADER_SIZE_UPPER_LIMIT,
-        };
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(header_size_limit)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         self.compression
