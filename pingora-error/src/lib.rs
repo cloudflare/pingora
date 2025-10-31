@@ -88,7 +88,7 @@ impl From<bool> for RetryType {
 
 impl ErrorSource {
     /// for displaying the error source
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Upstream => "Upstream",
             Self::Downstream => "Downstream",
@@ -159,7 +159,7 @@ impl ErrorType {
     }
 
     /// for displaying the error type
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ErrorType::ConnectTimedout => "ConnectTimedout",
             ErrorType::ConnectRefused => "ConnectRefused",
