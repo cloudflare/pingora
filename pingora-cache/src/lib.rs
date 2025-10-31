@@ -1262,6 +1262,18 @@ impl HttpCache {
         }
     }
 
+    /// Return the [`CacheKey`] of this asset if any.
+    ///
+    /// This is allowed to be called in any phase. If the cache key callback was not called,
+    /// this will return None.
+    pub fn maybe_cache_key(&self) -> Option<&CacheKey> {
+        (!matches!(
+            self.phase(),
+            CachePhase::Disabled(NoCacheReason::NeverEnabled) | CachePhase::Uninit
+        ))
+        .then(|| self.cache_key())
+    }
+
     /// Perform the cache lookup from the given cache storage with the given cache key
     ///
     /// A cache hit will return [CacheMeta] which contains the header and meta info about
