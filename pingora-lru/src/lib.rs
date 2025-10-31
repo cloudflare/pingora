@@ -251,6 +251,11 @@ impl<T, const N: usize> Lru<T, N> {
     pub fn shard_len(&self, shard: usize) -> usize {
         self.units[shard].read().len()
     }
+
+    /// Get the weight (total size) inside a shard
+    pub fn shard_weight(&self, shard: usize) -> usize {
+        self.units[shard].read().used_weight
+    }
 }
 
 #[inline]
