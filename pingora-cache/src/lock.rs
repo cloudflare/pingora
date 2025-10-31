@@ -15,7 +15,9 @@
 //! Cache lock
 
 use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
+use crate::{Span, Tag};
 
+use http::Extensions;
 use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +39,12 @@ pub trait CacheKeyLock {
     /// When the write lock is dropped without being released, the read lock holders will consider
     /// it to be failed so that they will compete for the write lock again.
     fn release(&self, key: &CacheKey, permit: WritePermit, reason: LockStatus);
+
+    /// Set tags on a trace span for the cache lock wait.
+    fn trace_lock_wait(&self, span: &mut Span, _read_lock: &ReadLock, lock_status: LockStatus) {
+        let tag_value: &'static str = lock_status.into();
+        span.set_tag(|| Tag::new("status", tag_value));
+    }
 }
 
 const N_SHARDS: usize = 16;
@@ -124,7 +132,8 @@ impl CacheKeyLock for CacheLock {
                 return Locked::Read(lock.read_lock());
             }
         }
-        let (permit, stub) = WritePermit::new(self.age_timeout_default, stale_writer);
+        let (permit, stub) =
+            WritePermit::new(self.age_timeout_default, stale_writer, Extensions::new());
         table.insert(key, stub);
         Locked::Write(permit)
     }
@@ -206,16 +215,18 @@ pub struct LockCore {
     // use u8 for Atomic enum
     lock_status: AtomicU8,
     stale_writer: bool,
+    extensions: Extensions,
 }
 
 impl LockCore {
-    pub fn new_arc(timeout: Duration, stale_writer: bool) -> Arc<Self> {
+    pub fn new_arc(timeout: Duration, stale_writer: bool, extensions: Extensions) -> Arc<Self> {
         Arc::new(LockCore {
             lock: Semaphore::new(0),
             age_timeout: timeout,
             lock_start: Instant::now(),
             lock_status: AtomicU8::new(LockStatus::Waiting.into()),
             stale_writer,
+            extensions,
         })
     }
 
@@ -237,6 +248,10 @@ impl LockCore {
     /// Was this lock for a stale cache fetch writer?
     pub fn stale_writer(&self) -> bool {
         self.stale_writer
+    }
+
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
     }
 }
 
@@ -300,6 +315,10 @@ impl ReadLock {
             status
         }
     }
+
+    pub fn extensions(&self) -> &Extensions {
+        self.0.extensions()
+    }
 }
 
 /// WritePermit: requires who get it need to populate the cache and then release it
@@ -311,8 +330,12 @@ pub struct WritePermit {
 
 impl WritePermit {
     /// Create a new lock, with a permit to be given to the associated writer.
-    pub fn new(timeout: Duration, stale_writer: bool) -> (WritePermit, LockStub) {
-        let lock = LockCore::new_arc(timeout, stale_writer);
+    pub fn new(
+        timeout: Duration,
+        stale_writer: bool,
+        extensions: Extensions,
+    ) -> (WritePermit, LockStub) {
+        let lock = LockCore::new_arc(timeout, stale_writer, extensions);
         let stub = LockStub(lock.clone());
         (
             WritePermit {
@@ -336,6 +359,10 @@ impl WritePermit {
     pub fn lock_status(&self) -> LockStatus {
         self.lock.lock_status()
     }
+
+    pub fn extensions(&self) -> &Extensions {
+        self.lock.extensions()
+    }
 }
 
 impl Drop for WritePermit {
@@ -353,6 +380,10 @@ pub struct LockStub(pub Arc<LockCore>);
 impl LockStub {
     pub fn read_lock(&self) -> ReadLock {
         ReadLock(self.0.clone())
+    }
+
+    pub fn extensions(&self) -> &Extensions {
+        &self.0.extensions
     }
 }
 

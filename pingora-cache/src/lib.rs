@@ -1438,7 +1438,7 @@ impl HttpCache {
         let mut span = inner_enabled.traces.child("cache_lock");
         // should always call is_cache_locked() before this function, which should guarantee that
         // the inner cache has a read lock and lock ctx
-        if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+        let (read_lock, status) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
             let lock = lock_ctx.lock.take(); // remove the lock from self
             if let Some(Locked::Read(r)) = lock {
                 let now = Instant::now();
@@ -1457,15 +1457,19 @@ impl HttpCache {
                     r.lock_status()
                 };
                 self.digest.add_lock_duration(now.elapsed());
-                let tag_value: &'static str = status.into();
-                span.set_tag(|| Tag::new("status", tag_value));
-                status
+                (r, status)
             } else {
                 panic!("cache_lock_wait on wrong type of lock")
             }
         } else {
             panic!("cache_lock_wait without cache lock")
+        };
+        if let Some(lock_ctx) = self.inner_enabled().lock_ctx.as_ref() {
+            lock_ctx
+                .cache_lock
+                .trace_lock_wait(&mut span, &read_lock, status);
         }
+        status
     }
 
     /// How long did this request wait behind the read lock
