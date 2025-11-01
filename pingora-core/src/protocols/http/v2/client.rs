@@ -55,6 +55,8 @@ pub struct Http2Session {
     pub conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
+    // Total DATA payload bytes received from upstream response
+    body_recv: usize,
 }
 
 impl Drop for Http2Session {
@@ -76,6 +78,7 @@ impl Http2Session {
             write_timeout: None,
             conn,
             ended: false,
+            body_recv: 0,
         }
     }
 
@@ -256,6 +259,7 @@ impl Http2Session {
                 .flow_control()
                 .release_capacity(data.len())
                 .or_err(ReadError, "while releasing h2 response body capacity")?;
+            self.body_recv = self.body_recv.saturating_add(data.len());
         }
 
         Ok(body)
@@ -442,6 +446,11 @@ impl Http2Session {
         self.conn.id()
     }
 
+    /// Upstream response body bytes received (HTTP/2 DATA payload; excludes headers/framing).
+    pub fn body_bytes_received(&self) -> usize {
+        self.body_recv
+    }
+
     /// take the body sender to another task to perform duplex read and write
     pub fn take_request_body_writer(&mut self) -> Option<SendStream<Bytes>> {
         self.send_body.take()
@@ -614,5 +623,69 @@ async fn do_ping_pong(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_h2 {
+    use super::*;
+    use bytes::Bytes;
+    use http::{Response, StatusCode};
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn h2_body_bytes_received_multi_frames() {
+        let (client_io, server_io) = duplex(65536);
+
+        // Server: respond with two DATA frames "a" and "bc"
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            if let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                assert_eq!(req.method(), http::Method::GET);
+                let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let mut send_stream = send_resp.send_response(resp, false).unwrap();
+                send_stream.send_data(Bytes::from("a"), false).unwrap();
+                send_stream.send_data(Bytes::from("bc"), true).unwrap();
+                // Signal graceful shutdown so the accept loop can exit after the client finishes
+                conn.graceful_shutdown();
+            }
+            // Drive the server connection until the client closes
+            while let Some(_res) = conn.accept().await {}
+        });
+
+        // Client: build Http2Session and read response
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+
+        let digest = Digest::default();
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            1,
+            digest,
+        );
+        let mut h2s = Http2Session::new(send_req, conn_ref);
+
+        // minimal request
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), true).unwrap();
+        h2s.read_response_header().await.unwrap();
+
+        let mut total = 0;
+        while let Some(chunk) = h2s.read_response_body().await.unwrap() {
+            total += chunk.len();
+        }
+        assert_eq!(total, 3);
+        assert_eq!(h2s.body_bytes_received(), 3);
     }
 }

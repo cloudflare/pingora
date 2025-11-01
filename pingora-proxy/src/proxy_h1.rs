@@ -167,6 +167,10 @@ where
         let (server_session_reuse, client_session_reuse, error) =
             self.proxy_1to1(session, client_session, peer, ctx).await;
 
+        // Record upstream response body bytes received (payload only) for logging consumers.
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
         (server_session_reuse, client_session_reuse, error)
     }
 

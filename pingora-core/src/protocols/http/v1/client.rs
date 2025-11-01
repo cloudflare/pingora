@@ -53,6 +53,8 @@ pub struct HttpSession {
     response_header: Option<Box<ResponseHeader>>,
     request_written: Option<Box<RequestHeader>>,
     bytes_sent: usize,
+    /// Total response body payload bytes received from upstream
+    body_recv: usize,
     upgraded: bool,
 }
 
@@ -81,6 +83,7 @@ impl HttpSession {
             write_timeout: None,
             digest,
             bytes_sent: 0,
+            body_recv: 0,
             upgraded: false,
         }
     }
@@ -367,13 +370,24 @@ impl HttpSession {
             None => self.do_read_body().await,
         };
 
-        result.map(|maybe_body| maybe_body.map(|body_ref| self.body_reader.get_body(&body_ref)))
+        result.map(|maybe_body| {
+            maybe_body.map(|body_ref| {
+                let slice = self.body_reader.get_body(&body_ref);
+                self.body_recv = self.body_recv.saturating_add(slice.len());
+                slice
+            })
+        })
     }
 
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         let read = self.read_body_ref().await?;
         Ok(read.map(Bytes::copy_from_slice))
+    }
+
+    /// Upstream response body bytes received (payload only; excludes headers/framing).
+    pub fn body_bytes_received(&self) -> usize {
+        self.body_recv
     }
 
     /// Whether there is no more body to read.
@@ -806,6 +820,152 @@ mod tests_stream {
         let res = http_stream.read_body_ref().await.unwrap();
         assert_eq!(res, None);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+    }
+
+    #[tokio::test]
+    async fn body_bytes_received_content_length() {
+        init_log();
+        let input_header = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+        let input_body = b"abc";
+        let input_close = b""; // simulating close
+        let mock_io = Builder::new()
+            .read(&input_header[..])
+            .read(&input_body[..])
+            .read(&input_close[..])
+            .build();
+        let mut http = HttpSession::new(Box::new(mock_io));
+        http.read_response().await.unwrap();
+        let _ = http.read_body_ref().await.unwrap();
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn body_bytes_received_chunked() {
+        init_log();
+        let input_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let input_body = b"3\r\nabc\r\n0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input_header[..])
+            .read(&input_body[..])
+            .build();
+        let mut http = HttpSession::new(Box::new(mock_io));
+        http.read_response().await.unwrap();
+        // first read returns the payload chunk
+        let first = http.read_body_ref().await.unwrap();
+        assert_eq!(first.unwrap(), b"abc");
+        // next read consumes terminating chunk
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn h1_body_bytes_received_http10_until_close() {
+        init_log();
+        let header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let body = b"abc";
+        let close = b"";
+        let mock = Builder::new()
+            .read(&header[..])
+            .read(&body[..])
+            .read(&close[..])
+            .build();
+        let mut http = HttpSession::new(Box::new(mock));
+        http.read_response().await.unwrap();
+        let _ = http.read_body_ref().await.unwrap();
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn h1_body_bytes_received_chunked_multi() {
+        init_log();
+        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let body = b"1\r\na\r\n2\r\nbc\r\n0\r\n\r\n"; // payload abc
+        let mock = Builder::new().read(&header[..]).read(&body[..]).build();
+        let mut http = HttpSession::new(Box::new(mock));
+        http.read_response().await.unwrap();
+        // first chunk
+        let s1 = http.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(s1, b"a");
+        // second chunk
+        let s2 = http.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(s2, b"bc");
+        // end
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn h1_body_bytes_received_preread_in_header_buf() {
+        init_log();
+        // header and a small body arrive together
+        let combined = b"HTTP/1.1 200 OK\r\n\r\nabc";
+        let close = b"";
+        let mock = Builder::new().read(&combined[..]).read(&close[..]).build();
+        let mut http = HttpSession::new(Box::new(mock));
+        http.read_response().await.unwrap();
+        // first body read should return the preread bytes
+        let s = http.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(s, b"abc");
+        // then EOF
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn h1_body_bytes_received_overread_content_length() {
+        init_log();
+        let header1 = b"HTTP/1.1 200 OK\r\n";
+        let header2 = b"Content-Length: 2\r\n\r\n";
+        let body = b"abc"; // one extra byte beyond CL
+        let mock = Builder::new()
+            .read(&header1[..])
+            .read(&header2[..])
+            .read(&body[..])
+            .build();
+        let mut http = HttpSession::new(Box::new(mock));
+        http.read_response().await.unwrap();
+        let s = http.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(s, b"ab");
+        // then end
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 2);
+    }
+
+    #[tokio::test]
+    async fn h1_body_bytes_received_after_100_continue() {
+        init_log();
+        let info = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
+        let body = b"x";
+        let mock = Builder::new()
+            .read(&info[..])
+            .read(&header[..])
+            .read(&body[..])
+            .build();
+        let mut http = HttpSession::new(Box::new(mock));
+        // read informational
+        match http.read_response_task().await.unwrap() {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => panic!("expected informational header"),
+        }
+        // read final header
+        match http.read_response_task().await.unwrap() {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(!eob);
+            }
+            _ => panic!("expected final header"),
+        }
+        // read body
+        let s = http.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(s, b"x");
+        let _ = http.read_body_ref().await.unwrap();
+        assert_eq!(http.body_bytes_received(), 1);
     }
 
     #[tokio::test]

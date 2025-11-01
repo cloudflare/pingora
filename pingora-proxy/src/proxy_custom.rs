@@ -61,6 +61,9 @@ where
             .custom_proxy_down_to_up(session, client_session, peer, ctx)
             .await;
 
+        // Parity with H1/H2: custom upstreams don't report payload bytes; record 0.
+        session.set_upstream_body_bytes_received(0);
+
         (server_session_reuse, error)
     }
 

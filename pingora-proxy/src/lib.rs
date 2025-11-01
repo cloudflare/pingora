@@ -398,6 +398,9 @@ pub struct Session {
     pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
+    /// Upstream response body bytes received (payload only). Set by proxy layer.
+    /// TODO: move this into an upstream session digest for future fields.
+    upstream_body_bytes_received: usize,
 }
 
 impl Session {
@@ -415,6 +418,7 @@ impl Session {
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
+            upstream_body_bytes_received: 0,
         }
     }
 
@@ -543,6 +547,16 @@ impl Session {
     /// Check whether the upstream headers were marked as mutated during the request.
     pub fn upstream_headers_mutated_for_cache(&self) -> bool {
         self.upstream_headers_mutated_for_cache
+    }
+
+    /// Get the total upstream response body bytes received (payload only) recorded by the proxy layer.
+    pub fn upstream_body_bytes_received(&self) -> usize {
+        self.upstream_body_bytes_received
+    }
+
+    /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
+    pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
+        self.upstream_body_bytes_received = n;
     }
 
     pub fn downstream_custom_message(

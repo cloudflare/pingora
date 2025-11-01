@@ -244,6 +244,10 @@ where
             .proxy_down_to_up(session, client_session, peer, ctx)
             .await;
 
+        // Record upstream response body bytes received (HTTP/2 DATA payload).
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
         (server_session_reuse, error)
     }
 
