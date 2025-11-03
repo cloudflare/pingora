@@ -528,7 +528,7 @@ impl HttpSession {
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
-    pub fn idle(&mut self) -> Idle {
+    pub fn idle(&mut self) -> Idle<'_> {
         Idle(self)
     }
 

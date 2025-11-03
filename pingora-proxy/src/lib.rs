@@ -768,6 +768,8 @@ where
 
         // serve stale if error
         // Check both error and cache before calling the function because await is not cheap
+        // allow unwrap until if let chains
+        #[allow(clippy::unnecessary_unwrap)]
         let serve_stale_result = if proxy_error.is_some() && session.cache.can_serve_stale_error() {
             self.handle_stale_if_error(&mut session, &mut ctx, proxy_error.as_ref().unwrap())
                 .await

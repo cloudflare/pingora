@@ -221,7 +221,7 @@ impl Continuum {
     ///
     /// This function is useful to find failover servers if the original ones are offline, which is
     /// cheaper than rebuilding the entire hash ring.
-    pub fn node_iter(&self, hash_key: &[u8]) -> NodeIterator {
+    pub fn node_iter(&self, hash_key: &[u8]) -> NodeIterator<'_> {
         NodeIterator {
             idx: self.node_idx(hash_key),
             continuum: self,
