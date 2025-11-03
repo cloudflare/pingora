@@ -20,7 +20,7 @@ use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub type CacheKeyLockImpl = (dyn CacheKeyLock + Send + Sync);
+pub type CacheKeyLockImpl = dyn CacheKeyLock + Send + Sync;
 
 pub trait CacheKeyLock {
     /// Try to lock a cache fetch

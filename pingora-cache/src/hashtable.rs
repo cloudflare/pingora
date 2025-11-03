@@ -49,11 +49,11 @@ where
     }
 
     #[allow(dead_code)]
-    pub fn read(&self, key: u128) -> RwLockReadGuard<HashMap<u128, V>> {
+    pub fn read(&self, key: u128) -> RwLockReadGuard<'_, HashMap<u128, V>> {
         self.get(key).read()
     }
 
-    pub fn write(&self, key: u128) -> RwLockWriteGuard<HashMap<u128, V>> {
+    pub fn write(&self, key: u128) -> RwLockWriteGuard<'_, HashMap<u128, V>> {
         self.get(key).write()
     }
 
@@ -119,11 +119,11 @@ where
     }
 
     #[allow(dead_code)]
-    pub fn read(&self, key: u128) -> RwLockReadGuard<LruCache<u128, V>> {
+    pub fn read(&self, key: u128) -> RwLockReadGuard<'_, LruCache<u128, V>> {
         self.get(key).read()
     }
 
-    pub fn write(&self, key: u128) -> RwLockWriteGuard<LruCache<u128, V>> {
+    pub fn write(&self, key: u128) -> RwLockWriteGuard<'_, LruCache<u128, V>> {
         self.get(key).write()
     }
 

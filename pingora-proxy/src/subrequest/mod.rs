@@ -26,7 +26,7 @@ struct LockCtx {
 }
 
 /// Optional user-defined subrequest context.
-pub type UserCtx = Box<(dyn Any + Sync + Send)>;
+pub type UserCtx = Box<dyn Any + Sync + Send>;
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum BodyMode {
