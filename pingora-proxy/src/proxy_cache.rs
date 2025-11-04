@@ -728,7 +728,7 @@ impl<SV> HttpProxy<SV> {
                                 // (downstream may have a different cacheability assessment and could cache the 304)
 
                                 //TODO: log more
-                                warn!("Uncacheable {reason:?} 304 received");
+                                debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
@@ -960,7 +960,7 @@ pub mod range_filter {
         for _ in ranges_str.split(',') {
             range_count += 1;
             // TODO: make configurable
-            const MAX_RANGES: usize = 100;
+            const MAX_RANGES: usize = 200;
             if range_count >= MAX_RANGES {
                 // If we get more than MAX_RANGES ranges, return None for now to save parsing time
                 return RangeType::None;
@@ -1166,8 +1166,8 @@ pub mod range_filter {
             s.into_bytes()
         }
 
-        // Test 100 range limit for parsing.
-        let ranges = generate_range_header(101);
+        // Test 200 range limit for parsing.
+        let ranges = generate_range_header(201);
         assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
     }
 
