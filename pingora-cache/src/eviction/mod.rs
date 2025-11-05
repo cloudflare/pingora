@@ -60,10 +60,18 @@ pub trait EvictionManager: Send + Sync {
     /// Adjust an item's weight upwards by a delta. If the item is not already admitted,
     /// nothing will happen.
     ///
+    /// An optional `max_weight` hint indicates the known max weight of the current key in case the
+    /// weight should not be incremented above this amount.
+    ///
     /// Return one or more items to evict. The sizes of these items are deducted
     /// from the total size already. The caller needs to make sure that these assets are actually
     /// removed from the storage.
-    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey>;
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey>;
 
     /// Remove an item from the eviction manager.
     ///
