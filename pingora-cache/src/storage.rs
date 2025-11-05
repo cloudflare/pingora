@@ -161,8 +161,10 @@ pub type HitHandler = Box<dyn HandleHit + Sync + Send>;
 
 /// MissFinishType
 pub enum MissFinishType {
+    /// A new asset was created with the given size.
     Created(usize),
-    Appended(usize),
+    /// Appended size to existing asset, with an optional max size param.
+    Appended(usize, Option<usize>),
 }
 
 /// Cache miss handling trait

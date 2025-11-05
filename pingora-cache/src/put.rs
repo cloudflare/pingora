@@ -121,7 +121,9 @@ impl<C: CachePut> CachePutCtx<C> {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
             let evicted = match finish {
-                MissFinishType::Appended(delta) => eviction.increment_weight(cache_key, delta),
+                MissFinishType::Appended(delta, max_size) => {
+                    eviction.increment_weight(&cache_key, delta, max_size)
+                }
                 MissFinishType::Created(size) => {
                     eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                 }
