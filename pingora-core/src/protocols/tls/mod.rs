@@ -14,6 +14,7 @@
 
 //! The TLS layer implementations
 
+pub mod client_hello;
 pub mod digest;
 pub use digest::*;
 

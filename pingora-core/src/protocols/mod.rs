@@ -14,6 +14,7 @@
 
 //! Abstractions and implementations for protocols including TCP, TLS and HTTP
 
+mod client_hello_wrapper;
 mod digest;
 pub mod http;
 pub mod l4;
@@ -21,6 +22,8 @@ pub mod raw_connect;
 pub mod tls;
 #[cfg(windows)]
 mod windows;
+
+pub use client_hello_wrapper::ClientHelloWrapper;
 
 pub use digest::{
     Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
