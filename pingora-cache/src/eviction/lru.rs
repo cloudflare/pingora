@@ -124,6 +124,12 @@ impl<const N: usize> Manager<N> {
             .or_err(InternalError, "when deserializing LRU")?;
         Ok(())
     }
+
+    /// Peek the weight associated with a cache key without changing its LRU order.
+    pub fn peek_weight(&self, item: &CompactCacheKey) -> Option<usize> {
+        let key = u64key(item);
+        self.0.peek_weight(key)
+    }
 }
 
 struct InsertToManager<'a, const N: usize> {
