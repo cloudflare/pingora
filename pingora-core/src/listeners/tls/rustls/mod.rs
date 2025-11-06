@@ -95,6 +95,22 @@ impl TlsSettings {
         })
     }
 
+    /// Create a new TlsSettings with a custom ServerConfig
+    ///
+    /// This allows for full control over the RustTLS ServerConfig,
+    /// including 0-RTT, session resumption, and custom certificate resolvers.
+    pub fn with_server_config(config: Arc<ServerConfig>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            custom_config: Some(config),
+        })
+    }
+
     pub fn with_callbacks() -> Result<Self>
     where
         Self: Sized,
