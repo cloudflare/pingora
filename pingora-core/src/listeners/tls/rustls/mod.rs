@@ -30,6 +30,7 @@ pub struct TlsSettings {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
     key_path: String,
+    custom_config: Option<Arc<ServerConfig>>,
 }
 
 pub struct Acceptor {
@@ -46,30 +47,37 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
+        // Use custom config if provided, otherwise load from cert/key files
+        let config = if let Some(custom_config) = self.custom_config {
+            custom_config
+        } else {
+            let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
+            else {
+                panic!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\".",
+                    self.cert_path, self.key_path
+                )
+            };
+
+            // TODO - Add support for client auth & custom CA support
+            let mut config =
+                ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .explain_err(InternalError, |e| {
+                        format!("Failed to create server listener config: {e}")
+                    })
+                    .unwrap();
+
+            if let Some(alpn_protocols) = self.alpn_protocols {
+                config.alpn_protocols = alpn_protocols;
+            }
+
+            Arc::new(config)
         };
 
-        // TODO - Add support for client auth & custom CA support
-        let mut config =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {e}")
-                })
-                .unwrap();
-
-        if let Some(alpn_protocols) = self.alpn_protocols {
-            config.alpn_protocols = alpn_protocols;
-        }
-
         Acceptor {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            acceptor: RusTlsAcceptor::from(config),
             callbacks: None,
         }
     }
@@ -92,6 +100,7 @@ impl TlsSettings {
             alpn_protocols: None,
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
+            custom_config: None,
         })
     }
 
