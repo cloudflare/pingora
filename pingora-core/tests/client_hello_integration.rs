@@ -219,5 +219,46 @@ mod tests {
 
         let _ = tokio::join!(server_task, client_task);
     }
+
+    #[tokio::test]
+    async fn test_async_extraction() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let notify = Arc::new(Notify::new());
+        let notify2 = notify.clone();
+
+        // Server task
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            notify2.notified().await;
+
+            let stream: Stream = tcp_stream.into();
+            let mut wrapper = ClientHelloWrapper::new(stream);
+
+            // Extract ClientHello using async method
+            let hello = wrapper.extract_client_hello_async().await.unwrap();
+            assert!(hello.is_some());
+            let hello = hello.unwrap();
+            assert_eq!(hello.sni, Some("example.com".to_string()));
+            assert_eq!(hello.tls_version, Some(0x0301));
+        });
+
+        // Client task
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            notify.notify_one();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+            stream.write_all(CLIENT_HELLO_WITH_SNI).await.unwrap();
+            stream.flush().await.unwrap();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        });
+
+        let _ = tokio::join!(server_task, client_task);
+    }
 }
 

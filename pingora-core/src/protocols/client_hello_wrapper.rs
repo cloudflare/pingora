@@ -103,6 +103,86 @@ impl<T: AsRawFd> ClientHelloWrapper<T> {
     }
 }
 
+#[cfg(unix)]
+impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
+    /// Async extraction of ClientHello without blocking
+    /// This polls the socket until data is available, then extracts ClientHello
+    pub async fn extract_client_hello_async(&mut self) -> io::Result<Option<Arc<ClientHello>>> {
+        if self.hello_extracted {
+            return Ok(self.client_hello.clone());
+        }
+
+        // Poll until socket is readable
+        use futures::FutureExt;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::Context;
+
+        struct ExtractFuture<'a, T: AsRawFd + AsyncRead + Unpin> {
+            wrapper: Pin<&'a mut ClientHelloWrapper<T>>,
+        }
+
+        impl<'a, T: AsRawFd + AsyncRead + Unpin> Future for ExtractFuture<'a, T> {
+            type Output = io::Result<Option<Arc<ClientHello>>>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let wrapper = self.wrapper.as_mut().get_mut();
+
+                if wrapper.hello_extracted {
+                    return Poll::Ready(Ok(wrapper.client_hello.clone()));
+                }
+
+                // Check if socket is ready for reading by polling with a zero-sized buffer
+                let mut buf = ReadBuf::new(&mut []);
+                match Pin::new(&mut wrapper.inner).poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(_)) => {
+                        // Socket is ready, try to extract
+                        wrapper.hello_extracted = true;
+                        match peek_client_hello(&wrapper.inner) {
+                            Ok(Some(hello)) => {
+                                debug!(
+                                    "Async extracted ClientHello: SNI={:?}, ALPN={:?}",
+                                    hello.sni, hello.alpn
+                                );
+                                let hello_arc = Arc::new(hello);
+                                wrapper.client_hello = Some(hello_arc.clone());
+                                Poll::Ready(Ok(Some(hello_arc)))
+                            }
+                            Ok(None) => {
+                                debug!("No ClientHello detected in stream");
+                                Poll::Ready(Ok(None))
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // Not ready yet, reset flag and continue polling
+                                wrapper.hello_extracted = false;
+                                Poll::Pending
+                            }
+                            Err(e) => {
+                                debug!("Failed to extract ClientHello: {:?}", e);
+                                Poll::Ready(Ok(None))
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // WouldBlock means not ready yet, continue polling
+                        Poll::Pending
+                    }
+                    Poll::Ready(Err(e)) => {
+                        debug!("Socket error while waiting for ClientHello: {:?}", e);
+                        Poll::Ready(Ok(None))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        ExtractFuture {
+            wrapper: Pin::new(self),
+        }
+        .await
+    }
+}
+
 impl<T: Debug> Debug for ClientHelloWrapper<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientHelloWrapper")
