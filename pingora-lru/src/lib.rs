@@ -190,7 +190,7 @@ impl<T, const N: usize> Lru<T, N> {
         evicted
     }
 
-    /// Remove the given asset
+    /// Remove the given asset.
     pub fn remove(&self, key: u64) -> Option<(T, usize)> {
         let removed = self.units[get_shard(key, N)].write().remove(key);
         if let Some((_, weight)) = removed.as_ref() {
@@ -200,7 +200,7 @@ impl<T, const N: usize> Lru<T, N> {
         removed
     }
 
-    /// Insert the item to the tail of this LRU
+    /// Insert the item to the tail of this LRU.
     ///
     /// Useful to recreate an LRU in most-to-least order
     pub fn insert_tail(&self, key: u64, data: T, weight: usize) -> bool {
@@ -216,12 +216,17 @@ impl<T, const N: usize> Lru<T, N> {
         }
     }
 
-    /// Check existence of a key without changing the order in LRU
+    /// Check existence of a key without changing the order in LRU.
     pub fn peek(&self, key: u64) -> bool {
         self.units[get_shard(key, N)].read().peek(key).is_some()
     }
 
-    /// Return the current total weight
+    /// Check the weight of a key without changing the order in LRU.
+    pub fn peek_weight(&self, key: u64) -> Option<usize> {
+        self.units[get_shard(key, N)].read().peek_weight(key)
+    }
+
+    /// Return the current total weight.
     pub fn weight(&self) -> usize {
         self.weight.load(Ordering::Relaxed)
     }
@@ -296,6 +301,11 @@ impl<T> LruUnit<T> {
     /// Peek data associated with key, if it exists.
     pub fn peek(&self, key: u64) -> Option<&T> {
         self.lookup_table.get(&key).map(|n| &n.data)
+    }
+
+    /// Peek weight associated with key, if it exists.
+    pub fn peek_weight(&self, key: u64) -> Option<usize> {
+        self.lookup_table.get(&key).map(|n| n.weight)
     }
 
     /// Admit into LRU, return old weight if there was any.
