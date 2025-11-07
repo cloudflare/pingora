@@ -1461,8 +1461,7 @@ impl HttpCache {
                         wait_timeout.saturating_sub(self.lock_duration().unwrap_or(Duration::ZERO));
                     match timeout(wait_timeout, r.wait()).await {
                         Ok(()) => r.lock_status(),
-                        // TODO: need to differentiate WaitTimeout vs. Lock(Age)Timeout (expired)?
-                        Err(_) => LockStatus::Timeout,
+                        Err(_) => LockStatus::WaitTimeout,
                     }
                 } else {
                     r.wait().await;
