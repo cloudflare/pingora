@@ -156,7 +156,7 @@ where
                         session.cache.cache_found(meta, handler, hit_status);
                     }
 
-                    if hit_status_opt.map_or(true, HitStatus::is_treated_as_miss) {
+                    if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
                         if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
@@ -406,7 +406,7 @@ where
                             return (false, Some(e));
                         }
 
-                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                        if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
                             // Don't write empty body which will end session,
                             // still more hit handler bytes to read
                             continue;

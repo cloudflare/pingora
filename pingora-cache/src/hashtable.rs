@@ -103,7 +103,7 @@ where
     pub fn new(shard_capacity: usize) -> Self {
         use std::num::NonZeroUsize;
         // safe, 1 != 0
-        const ONE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
+        const ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
         let mut cache = ConcurrentLruCache {
             lrus: Default::default(),
         };
