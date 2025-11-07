@@ -696,7 +696,7 @@ impl ProxyHttp for ExampleProxyCache {
         error: Option<&Error>, // None when it is called during stale while revalidate
     ) -> bool {
         // enable serve stale while updating
-        error.map_or(true, |e| e.esource() == &ErrorSource::Upstream)
+        error.is_none_or(|e| e.esource() == &ErrorSource::Upstream)
     }
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {

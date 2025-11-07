@@ -124,7 +124,7 @@ impl Manager {
         if self.used.load(Ordering::Relaxed) <= self.limit
             && self
                 .items_watermark
-                .map_or(true, |w| self.items.load(Ordering::Relaxed) <= w)
+                .is_none_or(|w| self.items.load(Ordering::Relaxed) <= w)
         {
             return vec![];
         }

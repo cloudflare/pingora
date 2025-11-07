@@ -264,7 +264,7 @@ where
                             if matches!(e.etype, H2Downgrade | InvalidH2) {
                                 if peer
                                     .get_alpn()
-                                    .map_or(true, |alpn| alpn.get_min_http_version() == 1)
+                                    .is_none_or(|alpn| alpn.get_min_http_version() == 1)
                                 {
                                     // Add the peer to prefer h1 so that all following requests
                                     // will use h1
