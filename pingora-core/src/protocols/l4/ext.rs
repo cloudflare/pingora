@@ -154,9 +154,7 @@ fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     get_opt(sock, opt, val, &mut payload, &mut size)?;
 
     if size != expected_size {
-        return Err(std::io::Error::other(
-            "get_opt size mismatch",
-        ));
+        return Err(std::io::Error::other("get_opt size mismatch"));
     }
     // Assume getsockopt() will set the value properly
     let payload = unsafe { payload.assume_init() };
