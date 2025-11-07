@@ -51,6 +51,10 @@ pub mod services;
 pub mod upstreams;
 pub mod utils;
 
+// Re-export ClientHello callback functions for easier access
+pub use listeners::set_client_hello_callback;
+pub use listeners::ClientHelloCallback;
+
 pub use pingora_error::{ErrorType::*, *};
 
 // If both openssl and boringssl are enabled, prefer boringssl.

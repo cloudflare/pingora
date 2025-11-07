@@ -23,6 +23,46 @@ pub mod tls;
 pub use crate::tls::listeners as tls;
 
 use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
+use log::debug;
+
+/// Callback function type for ClientHello extraction
+/// This allows external code (like moat) to generate fingerprints from ClientHello
+pub type ClientHelloCallback = Option<fn(&crate::protocols::tls::client_hello::ClientHello, Option<SocketAddr>)>;
+
+/// Global callback for ClientHello extraction
+/// This is set by moat to generate fingerprints
+static CLIENT_HELLO_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ClientHelloCallback>> = std::sync::OnceLock::new();
+
+/// Set the ClientHello callback function
+/// This is called by moat to register fingerprint generation
+///
+/// # Example
+/// ```ignore
+/// use pingora_core::listeners::set_client_hello_callback;
+/// use pingora_core::protocols::tls::client_hello::ClientHello;
+///
+/// set_client_hello_callback(Some(|hello: &ClientHello, peer_addr: Option<SocketAddr>| {
+///     // Generate fingerprint from ClientHello
+///     println!("SNI: {:?}, ALPN: {:?}", hello.sni, hello.alpn);
+/// }));
+/// ```
+pub fn set_client_hello_callback(callback: ClientHelloCallback) {
+    CLIENT_HELLO_CALLBACK.get_or_init(|| std::sync::Mutex::new(callback));
+    if let Ok(mut cb) = CLIENT_HELLO_CALLBACK.get().unwrap().lock() {
+        *cb = callback;
+    }
+}
+
+/// Call the ClientHello callback if registered
+fn call_client_hello_callback(hello: &crate::protocols::tls::client_hello::ClientHello, peer_addr: Option<SocketAddr>) {
+    if let Some(cb_guard) = CLIENT_HELLO_CALLBACK.get() {
+        if let Ok(cb) = cb_guard.lock() {
+            if let Some(callback) = *cb {
+                callback(hello, peer_addr);
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -113,8 +153,38 @@ impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
         if let Some(tls) = self.tls {
-            let tls_stream = tls.tls_handshake(self.l4).await?;
-            Ok(Box::new(tls_stream))
+            #[cfg(unix)]
+            {
+                // Use ClientHelloWrapper to extract ClientHello before TLS handshake
+                use crate::protocols::ClientHelloWrapper;
+                use std::os::unix::io::AsRawFd;
+
+                // Wrap stream with ClientHelloWrapper
+                let mut wrapper = ClientHelloWrapper::new(self.l4);
+
+                // Extract ClientHello before TLS handshake
+                if let Ok(Some(hello)) = wrapper.extract_client_hello() {
+                    // Get peer address if available
+                    let peer_addr = wrapper.get_socket_digest()
+                        .and_then(|d| d.peer_addr().cloned());
+
+                    debug!("Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}", hello.sni, hello.alpn, peer_addr);
+
+                    // Call the callback to generate fingerprint (registered by moat)
+                    call_client_hello_callback(&hello, peer_addr);
+                }
+
+                // Perform TLS handshake with wrapped stream
+                let tls_stream = tls.tls_handshake(wrapper).await?;
+                Ok(Box::new(tls_stream))
+            }
+
+            #[cfg(not(unix))]
+            {
+                // On non-Unix systems, just perform normal TLS handshake
+                let tls_stream = tls.tls_handshake(self.l4).await?;
+                Ok(Box::new(tls_stream))
+            }
         } else {
             Ok(Box::new(self.l4))
         }
