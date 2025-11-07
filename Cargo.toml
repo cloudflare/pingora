@@ -31,7 +31,7 @@ members = [
 [workspace.dependencies]
 tokio = "1"
 async-trait = "0.1.42"
-httparse = "1"
+httparse = "=1.8.0"
 bytes = "1.0"
 derivative = "2.2.0"
 http = "1.0.0"
