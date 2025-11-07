@@ -17,7 +17,7 @@ use pingora_error::{ErrorType, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
 pub use crate::protocols::tls::ALPN;
-use crate::protocols::IO;
+use crate::protocols::{GetSocketDigest, IO};
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use crate::{
     listeners::TlsAcceptCallbacks,
@@ -138,7 +138,7 @@ impl Acceptor {
     /// Perform TLS handshake with ClientHello extraction
     /// This wraps the stream with ClientHelloWrapper before TLS handshake
     #[cfg(unix)]
-    pub async fn tls_handshake_with_client_hello<S: IO + std::os::unix::io::AsRawFd>(
+    pub async fn tls_handshake_with_client_hello<S: IO + GetSocketDigest + std::os::unix::io::AsRawFd>(
         &self,
         stream: S,
     ) -> Result<SslStream<crate::protocols::ClientHelloWrapper<S>>> {

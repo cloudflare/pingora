@@ -37,9 +37,10 @@ static CLIENT_HELLO_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ClientHelloCa
 /// This is called by moat to register fingerprint generation
 ///
 /// # Example
-/// ```ignore
+/// ```
 /// use pingora_core::listeners::set_client_hello_callback;
 /// use pingora_core::protocols::tls::client_hello::ClientHello;
+/// use pingora_core::protocols::l4::socket::SocketAddr;
 ///
 /// set_client_hello_callback(Some(|hello: &ClientHello, peer_addr: Option<SocketAddr>| {
 ///     // Generate fingerprint from ClientHello
@@ -157,7 +158,6 @@ impl UninitializedStream {
             {
                 // Use ClientHelloWrapper to extract ClientHello before TLS handshake
                 use crate::protocols::ClientHelloWrapper;
-                use std::os::unix::io::AsRawFd;
 
                 // Wrap stream with ClientHelloWrapper
                 let mut wrapper = ClientHelloWrapper::new(self.l4);

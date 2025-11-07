@@ -113,7 +113,6 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
         }
 
         // Poll until socket is readable
-        use futures::FutureExt;
         use std::future::Future;
         use std::pin::Pin;
         use std::task::Context;
