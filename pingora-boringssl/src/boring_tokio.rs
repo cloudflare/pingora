@@ -265,7 +265,7 @@ where
             Err(e) => {
                 return Poll::Ready(Err(e
                     .into_io_error()
-                    .unwrap_or_else(|e| io::Error::other(e))));
+                    .unwrap_or_else(io::Error::other)));
             }
         }
 
