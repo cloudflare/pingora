@@ -114,7 +114,7 @@ impl CacheKeyLock for CacheLock {
             // requests ought to recreate the lock.
             if !matches!(
                 lock.0.lock_status(),
-                LockStatus::Dangling | LockStatus::Timeout
+                LockStatus::Dangling | LockStatus::AgeTimeout
             ) {
                 return Locked::Read(lock.read_lock());
             }
@@ -127,7 +127,7 @@ impl CacheKeyLock for CacheLock {
         if let Some(lock) = table.get(&key) {
             if !matches!(
                 lock.0.lock_status(),
-                LockStatus::Dangling | LockStatus::Timeout
+                LockStatus::Dangling | LockStatus::AgeTimeout
             ) {
                 return Locked::Read(lock.read_lock());
             }
@@ -141,13 +141,13 @@ impl CacheKeyLock for CacheLock {
     fn release(&self, key: &CacheKey, mut permit: WritePermit, reason: LockStatus) {
         let hash = key.combined_bin();
         let key = u128::from_be_bytes(hash); // endianness doesn't matter
-        if permit.lock.lock_status() == LockStatus::Timeout {
+        if permit.lock.lock_status() == LockStatus::AgeTimeout {
             // if lock age timed out, then readers are capable of
             // replacing the lock associated with this permit from the lock table
             // (see lock() implementation)
             // keep the lock status as Timeout accordingly when unlocking
             // (because we aren't removing it from the lock_table)
-            permit.unlock(LockStatus::Timeout);
+            permit.unlock(LockStatus::AgeTimeout);
         } else if let Some(_lock) = self.lock_table.write(key).remove(&key) {
             permit.unlock(reason);
         }
@@ -159,25 +159,28 @@ impl CacheKeyLock for CacheLock {
 use log::warn;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
-use strum::IntoStaticStr;
+use strum::{FromRepr, IntoStaticStr};
 use tokio::sync::Semaphore;
 
 /// Status which the read locks could possibly see.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoStaticStr)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoStaticStr, FromRepr)]
+#[repr(u8)]
 pub enum LockStatus {
     /// Waiting for the writer to populate the asset
-    Waiting,
+    Waiting = 0,
     /// The writer finishes, readers can start
-    Done,
+    Done = 1,
     /// The writer encountered error, such as network issue. A new writer will be elected.
-    TransientError,
+    TransientError = 2,
     /// The writer observed that no cache lock is needed (e.g., uncacheable), readers should start
     /// to fetch independently without a new writer
-    GiveUp,
+    GiveUp = 3,
     /// The write lock is dropped without being unlocked
-    Dangling,
-    /// The lock is held for too long
-    Timeout,
+    Dangling = 4,
+    /// Reader has held onto cache locks for too long, give up
+    WaitTimeout = 5,
+    /// The lock is held for too long by the writer
+    AgeTimeout = 6,
 }
 
 impl From<LockStatus> for u8 {
@@ -188,22 +191,15 @@ impl From<LockStatus> for u8 {
             LockStatus::TransientError => 2,
             LockStatus::GiveUp => 3,
             LockStatus::Dangling => 4,
-            LockStatus::Timeout => 5,
+            LockStatus::WaitTimeout => 5,
+            LockStatus::AgeTimeout => 6,
         }
     }
 }
 
 impl From<u8> for LockStatus {
     fn from(v: u8) -> Self {
-        match v {
-            0 => Self::Waiting,
-            1 => Self::Done,
-            2 => Self::TransientError,
-            3 => Self::GiveUp,
-            4 => Self::Dangling,
-            5 => Self::Timeout,
-            _ => Self::GiveUp, // placeholder
-        }
+        Self::from_repr(v).unwrap_or(Self::GiveUp)
     }
 }
 
@@ -235,6 +231,10 @@ impl LockCore {
     }
 
     pub fn unlock(&self, reason: LockStatus) {
+        assert!(
+            reason != LockStatus::WaitTimeout,
+            "WaitTimeout is not stored in LockCore"
+        );
         self.lock_status.store(reason.into(), Ordering::SeqCst);
         // Any small positive number will do, 10 is used for RwLock as well.
         // No need to wake up all at once.
@@ -283,14 +283,14 @@ impl ReadLock {
                 Err(_) => {
                     self.0
                         .lock_status
-                        .store(LockStatus::Timeout.into(), Ordering::SeqCst);
+                        .store(LockStatus::AgeTimeout.into(), Ordering::SeqCst);
                 }
             }
         } else {
             // expiration has already occurred, store timeout status
             self.0
                 .lock_status
-                .store(LockStatus::Timeout.into(), Ordering::SeqCst);
+                .store(LockStatus::AgeTimeout.into(), Ordering::SeqCst);
         }
     }
 
@@ -310,7 +310,7 @@ impl ReadLock {
     pub fn lock_status(&self) -> LockStatus {
         let status = self.0.lock_status();
         if matches!(status, LockStatus::Waiting) && self.expired() {
-            LockStatus::Timeout
+            LockStatus::AgeTimeout
         } else {
             status
         }
@@ -448,7 +448,7 @@ mod test {
         let handle = tokio::spawn(async move {
             // timed out
             lock.wait().await;
-            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+            assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
         });
 
         tokio::time::sleep(Duration::from_millis(2100)).await;
@@ -493,7 +493,7 @@ mod test {
         let handle = tokio::spawn(async move {
             // timed out
             lock.wait().await;
-            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+            assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
         });
 
         tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
@@ -543,9 +543,9 @@ mod test {
         };
         // reader expires write permit
         lock.wait().await;
-        assert_eq!(lock.lock_status(), LockStatus::Timeout);
-        assert_eq!(permit.lock.lock_status(), LockStatus::Timeout);
-        permit.unlock(LockStatus::Timeout);
+        assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
+        assert_eq!(permit.lock.lock_status(), LockStatus::AgeTimeout);
+        permit.unlock(LockStatus::AgeTimeout);
     }
 
     #[tokio::test]

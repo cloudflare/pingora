@@ -869,14 +869,9 @@ where
                 );
                 true
             }
-            /* We have 3 options when a lock is held too long
-             * 1. release the lock and let every request complete for it again
-             * 2. let every request cache miss
-             * 3. let every request through while disabling cache
-             * #1 could repeat the situation but protect the origin from load
-             * #2 could amplify disk writes and storage for temp file
-             * #3 is the simplest option for now */
-            LockStatus::Timeout => {
+            // If this reader has spent too long waiting on locks, let the request
+            // through while disabling cache (to avoid amplifying disk writes).
+            LockStatus::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -885,6 +880,10 @@ where
                 // not cacheable, just go to the origin.
                 false
             }
+            // When a singular cache lock has been held for too long,
+            // we should allow requests to recompete for the lock
+            // to protect upstreams from load.
+            LockStatus::AgeTimeout => true,
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
         }

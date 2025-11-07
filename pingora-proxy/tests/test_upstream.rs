@@ -1581,8 +1581,8 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // cache lock timeout, disable cache
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // cache lock timeout, try to replace lock
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1599,26 +1599,16 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // this is now a miss because we will not timeout on cache lock
+            // this is now a hit because the second task cached from origin
+            // successfully
             // and will fetch from origin successfully
-            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(headers["x-cache-status"], "hit");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         task1.await.unwrap();
         task2.await.unwrap();
         task3.await.unwrap();
-
-        let res = reqwest::Client::new()
-            .get(url)
-            .header("x-lock", "true")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
-        assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
     #[tokio::test]
