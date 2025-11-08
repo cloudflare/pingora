@@ -61,7 +61,7 @@ pub trait ServerApp {
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
-    /// Use HTTP/2 for plaintext.
+    /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
 }
 
