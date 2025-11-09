@@ -307,15 +307,18 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 mod tests {
     use super::*;
     use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
+    #[cfg(target_os = "linux")]
     use pingora_error::ErrorType;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    #[cfg(target_os = "linux")]
     use std::time::{Duration, Instant};
     use tokio::io::AsyncWriteExt;
     #[cfg(unix)]
     use tokio::net::UnixListener;
+    #[cfg(target_os = "linux")]
     use tokio::time::sleep;
 
     /// Some of the tests below are flaky when making new connections to mock
@@ -323,7 +326,7 @@ mod tests {
     /// not indicative of real errors. This function will retry the peer/server
     /// in increasing intervals until it either succeeds in connecting or a long
     /// timeout expires (max 10sec)
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,

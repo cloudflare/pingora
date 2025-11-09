@@ -688,7 +688,7 @@ impl HttpCache {
         self.inner_mut()
             .max_file_size_tracker
             .as_mut()
-            .map_or(true, |t| t.add_body_bytes(bytes_len))
+            .is_none_or(|t| t.add_body_bytes(bytes_len))
     }
 
     /// Check if the max file size has been exceeded according to max file size tracker.
