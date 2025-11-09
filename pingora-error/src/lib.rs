@@ -38,7 +38,7 @@ pub struct Error {
     /// if the error is retry-able
     pub retry: RetryType,
     /// chain to the cause of this error
-    pub cause: Option<Box<(dyn ErrorTrait + Send + Sync)>>,
+    pub cause: Option<Box<dyn ErrorTrait + Send + Sync>>,
     /// an arbitrary string that explains the context when the error happens
     pub context: Option<ImmutStr>,
 }

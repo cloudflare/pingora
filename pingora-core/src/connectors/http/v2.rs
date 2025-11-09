@@ -257,7 +257,7 @@ impl Connector {
                 if peer.tls()
                     || peer
                         .get_peer_options()
-                        .map_or(true, |o| o.alpn.get_min_http_version() == 1)
+                        .is_none_or(|o| o.alpn.get_min_http_version() == 1)
                 {
                     return Ok(HttpSession::H1(Http1Session::new(stream)));
                 }

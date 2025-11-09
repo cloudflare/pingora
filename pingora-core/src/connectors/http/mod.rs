@@ -49,7 +49,7 @@ impl Connector {
         // We assume no peer option == no ALPN == h1 only
         let h1_only = peer
             .get_peer_options()
-            .map_or(true, |o| o.alpn.get_max_http_version() == 1);
+            .is_none_or(|o| o.alpn.get_max_http_version() == 1);
         if h1_only {
             let (h1, reused) = self.h1.get_http_session(peer).await?;
             Ok((HttpSession::H1(h1), reused))
