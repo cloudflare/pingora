@@ -16,12 +16,12 @@
 
 pub use http::Extensions;
 use log::warn;
-use std::sync::{LazyLock, OnceLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_header_serde::HeaderSerde;
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::key::HashBinary;

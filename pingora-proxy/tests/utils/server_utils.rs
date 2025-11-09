@@ -19,7 +19,6 @@ use clap::Parser;
 use http::header::{ACCEPT_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
-use std::sync::LazyLock;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
@@ -46,6 +45,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 

@@ -15,8 +15,8 @@
 //! Error response generating utilities.
 
 use http::header;
-use std::sync::LazyLock;
 use pingora_http::ResponseHeader;
+use std::sync::LazyLock;
 
 use super::SERVER_NAME;
 

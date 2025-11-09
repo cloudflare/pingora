@@ -16,10 +16,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use log::debug;
-use std::sync::LazyLock;
 use pingora_timeout::timeout;
 use prometheus::{register_int_counter, IntCounter};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

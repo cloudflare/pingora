@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use log::debug;
-use std::sync::OnceLock;
 use rand::Rng;
+use std::sync::OnceLock;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 

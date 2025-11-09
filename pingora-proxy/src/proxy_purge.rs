@@ -58,7 +58,8 @@ static NOT_FOUND: LazyLock<ResponseHeader> = LazyLock::new(|| gen_purge_response
 // for when purge is sent to uncacheable assets
 static NOT_PURGEABLE: LazyLock<ResponseHeader> = LazyLock::new(|| gen_purge_response(405));
 // on cache storage or proxy error
-static INTERNAL_ERROR: LazyLock<ResponseHeader> = LazyLock::new(|| error_resp::gen_error_response(500));
+static INTERNAL_ERROR: LazyLock<ResponseHeader> =
+    LazyLock::new(|| error_resp::gen_error_response(500));
 
 impl<SV> HttpProxy<SV> {
     pub(crate) async fn proxy_purge(

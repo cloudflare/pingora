@@ -26,13 +26,13 @@ pub mod grpc_web;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
-use std::sync::OnceLock;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// The trait an HTTP traffic module needs to implement
 #[async_trait]

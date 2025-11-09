@@ -23,9 +23,9 @@
 //! This flavor is as efficient as the single-threaded runtime while allows the async
 //! program to use multiple cores.
 
-use std::sync::{LazyLock, OnceLock};
 use rand::Rng;
 use std::sync::Arc;
+use std::sync::{LazyLock, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;

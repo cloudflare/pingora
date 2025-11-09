@@ -616,8 +616,8 @@ fn test_decide_action() {
     assert_eq!(decide_action(&header, &[Brotli, Gzip]), Noop);
 }
 
-use std::sync::LazyLock;
 use regex::Regex;
+use std::sync::LazyLock;
 
 // Allow text, application, font, a few image/ MIME types and binary/octet-stream
 // TODO: fine tune this list

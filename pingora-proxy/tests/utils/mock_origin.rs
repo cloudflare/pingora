@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::LazyLock;
 use std::path::Path;
 use std::process;
+use std::sync::LazyLock;
 use std::{thread, time};
 
 pub static MOCK_ORIGIN: LazyLock<bool> = LazyLock::new(init);

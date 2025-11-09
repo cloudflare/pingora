@@ -26,8 +26,8 @@
 
 use super::timer::*;
 use super::*;
-use std::sync::LazyLock;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 static TIMER_MANAGER: LazyLock<Arc<TimerManager>> = LazyLock::new(|| {
     let tm = Arc::new(TimerManager::new());

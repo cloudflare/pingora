@@ -19,12 +19,12 @@ use super::*;
 use http::header::HeaderName;
 use http::HeaderValue;
 use indexmap::IndexMap;
-use std::sync::LazyLock;
 use pingora_error::{Error, ErrorType};
 use regex::bytes::Regex;
 use std::num::IntErrorKind;
 use std::slice;
 use std::str;
+use std::sync::LazyLock;
 
 /// The max delta-second per [RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-1.2.2)
 // "If a cache receives a delta-seconds value

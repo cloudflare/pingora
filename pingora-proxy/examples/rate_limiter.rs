@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::sync::LazyLock;
 use pingora_core::prelude::*;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_limits::rate::Rate;
@@ -7,6 +6,7 @@ use pingora_load_balancing::prelude::{RoundRobin, TcpHealthCheck};
 use pingora_load_balancing::LoadBalancer;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 fn main() {

@@ -20,12 +20,12 @@ use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, warn};
-use std::sync::LazyLock;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
