@@ -37,14 +37,20 @@ impl<SV> HttpProxy<SV> {
         let mut req = session.req_header().clone();
 
         // Strip hop-by-hop headers per RFC 2616 Section 13.5.1
-        req.remove_header(&http::header::CONNECTION);
+        // Exception: preserve Connection and Upgrade headers for websocket upgrades
+        let is_upgrade = req.version == Version::HTTP_11
+            && req.headers.get(&http::header::UPGRADE).is_some();
+
+        if !is_upgrade {
+            req.remove_header(&http::header::CONNECTION);
+            req.remove_header(&http::header::UPGRADE);
+        }
         req.remove_header("keep-alive");
         req.remove_header("proxy-connection");
         req.remove_header(&http::header::PROXY_AUTHENTICATE);
         req.remove_header(&http::header::PROXY_AUTHORIZATION);
         req.remove_header(&http::header::TE);
         req.remove_header("trailer");
-        req.remove_header(&http::header::UPGRADE);
 
         // Convert HTTP2 headers to H1
         if req.version == Version::HTTP_2 {
