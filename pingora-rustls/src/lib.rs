@@ -24,7 +24,7 @@ use std::path::Path;
 use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
-pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
+pub use rustls::{version, ClientConfig, KeyLogFile, RootCertStore, ServerConfig, Stream};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};

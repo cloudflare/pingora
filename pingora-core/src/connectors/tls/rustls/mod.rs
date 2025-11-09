@@ -22,8 +22,8 @@ use pingora_error::{
 };
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
-    version, CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
-    TlsConnector as RusTlsConnector,
+    version, CertificateDer, ClientConfig as RusTlsClientConfig, KeyLogFile, PrivateKeyDer,
+    RootCertStore, TlsConnector as RusTlsConnector,
 };
 
 use crate::protocols::tls::{client::handshake, TlsStream};
@@ -75,7 +75,6 @@ impl TlsConnector {
                 if let Some((cert, key)) = conf.cert_key_file.as_ref() {
                     certs_key = load_certs_and_key_files(cert, key)?;
                 }
-                // TODO: support SSLKEYLOGFILE
             } else {
                 load_platform_certs_incl_env_into_store(&mut ca_certs)?;
             }
@@ -88,7 +87,7 @@ impl TlsConnector {
             RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
                 .with_root_certificates(ca_certs.clone());
 
-        let config = match certs_key {
+        let mut config = match certs_key {
             Some((certs, key)) => {
                 match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
                     Ok(config) => config,
@@ -101,6 +100,13 @@ impl TlsConnector {
             }
             None => builder.with_no_client_auth(),
         };
+
+        // Enable SSLKEYLOGFILE support for debugging TLS traffic
+        if let Some(options) = options.as_ref() {
+            if options.debug_ssl_keylog {
+                config.key_log = Arc::new(KeyLogFile::new());
+            }
+        }
 
         Ok(Connector {
             ctx: Arc::new(TlsConnector {
@@ -155,10 +161,12 @@ where
             .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
             debug!("added root ca certificates");
 
-            let updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
+            let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
                 InvalidCert,
                 "Failed to use peer cert/key to update Rustls config",
             )?;
+            // Preserve keylog setting from original config
+            updated_config.key_log = Arc::clone(&config.key_log);
             Some(updated_config)
         }
     };
