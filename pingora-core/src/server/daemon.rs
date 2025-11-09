@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cf_daemonize::{Daemonize, Stdio};
+use cf_daemonize::Daemonize;
 use log::{debug, error};
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
