@@ -136,9 +136,10 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                 match Pin::new(&mut wrapper.inner).poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(_)) => {
                         // Socket is ready, try to extract
-                        wrapper.hello_extracted = true;
                         match peek_client_hello(&wrapper.inner) {
                             Ok(Some(hello)) => {
+                                // Successfully extracted ClientHello
+                                wrapper.hello_extracted = true;
                                 debug!(
                                     "Async extracted ClientHello: SNI={:?}, ALPN={:?}",
                                     hello.sni, hello.alpn
@@ -148,16 +149,14 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                                 Poll::Ready(Ok(Some(hello_arc)))
                             }
                             Ok(None) => {
-                                debug!("No ClientHello detected in stream");
-                                Poll::Ready(Ok(None))
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                // Not ready yet, reset flag and continue polling
-                                wrapper.hello_extracted = false;
+                                // peek_client_hello returns Ok(None) for EAGAIN/EWOULDBLOCK
+                                // This means data isn't available yet, keep polling
+                                debug!("No data available yet for ClientHello peek, continuing to poll");
                                 Poll::Pending
                             }
                             Err(e) => {
                                 debug!("Failed to extract ClientHello: {:?}", e);
+                                wrapper.hello_extracted = true; // Mark as attempted to avoid infinite retries
                                 Poll::Ready(Ok(None))
                             }
                         }
@@ -168,6 +167,7 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                     }
                     Poll::Ready(Err(e)) => {
                         debug!("Socket error while waiting for ClientHello: {:?}", e);
+                        wrapper.hello_extracted = true; // Mark as attempted to avoid infinite retries
                         Poll::Ready(Ok(None))
                     }
                     Poll::Pending => Poll::Pending,

@@ -60,8 +60,14 @@ fn call_client_hello_callback(hello: &crate::protocols::tls::client_hello::Clien
         if let Ok(cb) = cb_guard.lock() {
             if let Some(callback) = *cb {
                 callback(hello, peer_addr);
+            } else {
+                log::debug!("ClientHello callback is None, skipping");
             }
+        } else {
+            log::debug!("Failed to lock ClientHello callback mutex");
         }
+    } else {
+        log::debug!("ClientHello callback not registered");
     }
 }
 
@@ -162,8 +168,20 @@ impl UninitializedStream {
                 // Wrap stream with ClientHelloWrapper
                 let mut wrapper = ClientHelloWrapper::new(self.l4);
 
-                // Extract ClientHello before TLS handshake
-                if let Ok(Some(hello)) = wrapper.extract_client_hello() {
+                // Extract ClientHello synchronously (blocks until data is available)
+                let hello = match wrapper.extract_client_hello() {
+                    Ok(Some(hello)) => Some(hello),
+                    Ok(None) => {
+                        debug!("No ClientHello detected in stream");
+                        None
+                    }
+                    Err(e) => {
+                        debug!("Failed to extract ClientHello: {:?}", e);
+                        None
+                    }
+                };
+
+                if let Some(hello) = hello {
                     // Get peer address if available
                     let peer_addr = wrapper.get_socket_digest()
                         .and_then(|d| d.peer_addr().cloned());
@@ -172,6 +190,8 @@ impl UninitializedStream {
 
                     // Call the callback to generate fingerprint (registered by moat)
                     call_client_hello_callback(&hello, peer_addr);
+                } else {
+                    debug!("Could not extract ClientHello");
                 }
 
                 // Perform TLS handshake with wrapped stream

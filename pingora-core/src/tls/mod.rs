@@ -181,6 +181,24 @@ pub mod ssl {
         ) -> Result<(), ErrorStack> {
             panic!("Not implemented");
         }
+
+        /// Sets the list of supported ciphers for protocols before TLSv1.3.
+        pub fn set_cipher_list(&mut self, _cipher_list: &str) -> Result<(), ErrorStack> {
+            panic!("Not implemented");
+        }
+
+        /// Sets the list of supported cipher suites for TLSv1.3.
+        pub fn set_ciphersuites(&mut self, _ciphersuites: &str) -> Result<(), ErrorStack> {
+            panic!("Not implemented");
+        }
+
+        /// Sets the minimum supported protocol version.
+        pub fn set_min_proto_version(
+            &mut self,
+            _version: Option<SslVersion>,
+        ) -> Result<(), ErrorStack> {
+            panic!("Not implemented");
+        }
     }
 
     /// Reference to an [`SslCipher`].

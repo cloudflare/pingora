@@ -138,7 +138,7 @@ impl Acceptor {
     /// Perform TLS handshake with ClientHello extraction
     /// This wraps the stream with ClientHelloWrapper before TLS handshake
     #[cfg(unix)]
-    pub async fn tls_handshake_with_client_hello<S: IO + GetSocketDigest + std::os::unix::io::AsRawFd>(
+    pub async fn tls_handshake_with_client_hello<S: IO + GetSocketDigest + std::os::unix::io::AsRawFd + 'static>(
         &self,
         stream: S,
     ) -> Result<SslStream<crate::protocols::ClientHelloWrapper<S>>> {
@@ -147,7 +147,7 @@ impl Acceptor {
         // Wrap stream with ClientHelloWrapper
         let mut wrapper = ClientHelloWrapper::new(stream);
 
-        // Extract ClientHello before TLS handshake
+        // Extract ClientHello before TLS handshake (sync version blocks until data is available)
         if let Ok(Some(hello)) = wrapper.extract_client_hello() {
             // Get peer address if available
             let peer_addr = wrapper.get_socket_digest()
