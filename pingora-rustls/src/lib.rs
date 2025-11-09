@@ -27,7 +27,7 @@ use pingora_error::{Error, ErrorType, OrErr, Result};
 
 pub use rustls::{
     client::WebPkiServerVerifier, version, CertificateError, ClientConfig, DigitallySignedStruct,
-    Error as RusTlsError, RootCertStore, ServerConfig, SignatureScheme, Stream,
+    Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream,
 };
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
