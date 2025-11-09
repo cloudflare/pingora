@@ -1,4 +1,3 @@
-Cargo.lock
 /target
 **/*.rs.bk
 dhat-heap.json
