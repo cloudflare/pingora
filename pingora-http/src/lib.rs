@@ -42,7 +42,7 @@ use case_header_name::CaseHeaderName;
 pub use case_header_name::IntoCaseHeaderName;
 
 pub mod prelude {
-    pub use crate::RequestHeader;
+    pub use crate::{RequestHeader, ResponseHeader};
 }
 
 /* an ordered header map to store the original case of each header name
