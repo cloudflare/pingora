@@ -20,12 +20,12 @@ use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, warn};
-use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1128,8 +1128,8 @@ impl HttpSession {
 }
 
 // Regex to parse request line that has illegal chars in it
-static REQUEST_LINE_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\w+ (?P<uri>.+) HTTP/\d(?:\.\d)?").unwrap());
+static REQUEST_LINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\w+ (?P<uri>.+) HTTP/\d(?:\.\d)?").unwrap());
 
 // the chars httparse considers illegal in URL
 // Almost https://url.spec.whatwg.org/#query-percent-encode-set + {}

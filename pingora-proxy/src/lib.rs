@@ -40,11 +40,11 @@ use bytes::Bytes;
 use futures::future::FutureExt;
 use http::{header, version::Version};
 use log::{debug, error, trace, warn};
-use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
@@ -518,7 +518,7 @@ impl DerefMut for Session {
 }
 
 // generic HTTP 502 response sent when proxy_upstream_filter refuses to connect to upstream
-static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
+static BAD_GATEWAY: LazyLock<ResponseHeader> = LazyLock::new(|| {
     let mut resp = ResponseHeader::build(http::StatusCode::BAD_GATEWAY, Some(3)).unwrap();
     resp.insert_header(header::SERVER, &SERVER_NAME[..])
         .unwrap();

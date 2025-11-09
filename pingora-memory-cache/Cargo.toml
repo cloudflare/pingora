@@ -27,4 +27,3 @@ parking_lot = "0"
 pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
 
 [dev-dependencies]
-once_cell = { workspace = true }

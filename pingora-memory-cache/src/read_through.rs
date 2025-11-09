@@ -773,10 +773,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stale_while_update() {
-        use once_cell::sync::Lazy;
+        use std::sync::LazyLock;
         let ttl = Some(Duration::from_millis(100));
-        static CACHE: Lazy<RTCache<i32, i32, TestCB, ExtraOpt>> =
-            Lazy::new(|| RTCache::new(10, None, None));
+        static CACHE: LazyLock<RTCache<i32, i32, TestCB, ExtraOpt>> =
+            LazyLock::new(|| RTCache::new(10, None, None));
         let opt = Some(ExtraOpt {
             error: false,
             empty: false,

@@ -38,7 +38,6 @@ log = { workspace = true }
 h2 = { workspace = true }
 derivative.workspace = true
 clap = { version = "3.2.25", features = ["derive"] }
-once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
 strum = "0.26.2"
