@@ -15,7 +15,7 @@
 //! Error response generating utilities.
 
 use http::header;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use pingora_http::ResponseHeader;
 
 use super::SERVER_NAME;
@@ -36,6 +36,6 @@ pub fn gen_error_response(code: u16) -> ResponseHeader {
 }
 
 /// Pre-generated 502 response
-pub static HTTP_502_RESPONSE: Lazy<ResponseHeader> = Lazy::new(|| gen_error_response(502));
+pub static HTTP_502_RESPONSE: LazyLock<ResponseHeader> = LazyLock::new(|| gen_error_response(502));
 /// Pre-generated 400 response
-pub static HTTP_400_RESPONSE: Lazy<ResponseHeader> = Lazy::new(|| gen_error_response(400));
+pub static HTTP_400_RESPONSE: LazyLock<ResponseHeader> = LazyLock::new(|| gen_error_response(400));

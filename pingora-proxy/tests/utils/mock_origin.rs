@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::path::Path;
 use std::process;
 use std::{thread, time};
 
-pub static MOCK_ORIGIN: Lazy<bool> = Lazy::new(init);
+pub static MOCK_ORIGIN: LazyLock<bool> = LazyLock::new(init);
 
 fn init() -> bool {
     #[cfg(feature = "rustls")]

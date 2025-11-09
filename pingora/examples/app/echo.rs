@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use log::debug;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use pingora_timeout::timeout;
 use prometheus::{register_int_counter, IntCounter};
 use std::sync::Arc;
@@ -29,8 +29,8 @@ use pingora::protocols::http::ServerSession;
 use pingora::protocols::Stream;
 use pingora::server::ShutdownWatch;
 
-static REQ_COUNTER: Lazy<IntCounter> =
-    Lazy::new(|| register_int_counter!("reg_counter", "Number of requests").unwrap());
+static REQ_COUNTER: LazyLock<IntCounter> =
+    LazyLock::new(|| register_int_counter!("reg_counter", "Number of requests").unwrap());
 
 #[derive(Clone)]
 pub struct EchoApp;

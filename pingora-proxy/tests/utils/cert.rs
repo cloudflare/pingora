@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 #[cfg(feature = "s2n")]
 use pingora_core::tls::load_pem_file;
 #[cfg(feature = "rustls")]
@@ -47,17 +47,17 @@ mod key_types {
 
 use key_types::*;
 
-pub static INTERMEDIATE_CERT: Lazy<CertType> = Lazy::new(|| load_cert("keys/intermediate.crt"));
-pub static LEAF_CERT: Lazy<CertType> = Lazy::new(|| load_cert("keys/leaf.crt"));
-pub static LEAF2_CERT: Lazy<CertType> = Lazy::new(|| load_cert("keys/leaf2.crt"));
-pub static LEAF_KEY: Lazy<PrivateKeyType> = Lazy::new(|| load_key("keys/leaf.key"));
-pub static LEAF2_KEY: Lazy<PrivateKeyType> = Lazy::new(|| load_key("keys/leaf2.key"));
-pub static CURVE_521_TEST_KEY: Lazy<PrivateKeyType> =
-    Lazy::new(|| load_key("keys/curve_test.521.key.pem"));
-pub static CURVE_521_TEST_CERT: Lazy<CertType> = Lazy::new(|| load_cert("keys/curve_test.521.crt"));
-pub static CURVE_384_TEST_KEY: Lazy<PrivateKeyType> =
-    Lazy::new(|| load_key("keys/curve_test.384.key.pem"));
-pub static CURVE_384_TEST_CERT: Lazy<CertType> = Lazy::new(|| load_cert("keys/curve_test.384.crt"));
+pub static INTERMEDIATE_CERT: LazyLock<CertType> = LazyLock::new(|| load_cert("keys/intermediate.crt"));
+pub static LEAF_CERT: LazyLock<CertType> = LazyLock::new(|| load_cert("keys/leaf.crt"));
+pub static LEAF2_CERT: LazyLock<CertType> = LazyLock::new(|| load_cert("keys/leaf2.crt"));
+pub static LEAF_KEY: LazyLock<PrivateKeyType> = LazyLock::new(|| load_key("keys/leaf.key"));
+pub static LEAF2_KEY: LazyLock<PrivateKeyType> = LazyLock::new(|| load_key("keys/leaf2.key"));
+pub static CURVE_521_TEST_KEY: LazyLock<PrivateKeyType> =
+    LazyLock::new(|| load_key("keys/curve_test.521.key.pem"));
+pub static CURVE_521_TEST_CERT: LazyLock<CertType> = LazyLock::new(|| load_cert("keys/curve_test.521.crt"));
+pub static CURVE_384_TEST_KEY: LazyLock<PrivateKeyType> =
+    LazyLock::new(|| load_key("keys/curve_test.384.key.pem"));
+pub static CURVE_384_TEST_CERT: LazyLock<CertType> = LazyLock::new(|| load_cert("keys/curve_test.384.crt"));
 
 #[cfg(feature = "openssl_derived")]
 fn load_cert(path: &str) -> X509 {
