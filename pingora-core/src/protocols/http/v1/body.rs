@@ -410,6 +410,16 @@ impl BodyReader {
                         let chunk_size = chunk_size as usize;
                         if chunk_size == 0 {
                             /* terminating chunk. TODO: trailer */
+                            // payload_index points to where chunk payload would start
+                            // For terminating chunk, the final CRLF comes after the chunk-size line
+                            // Check if we have the trailing CRLF in buffer
+                            if payload_index + 2 <= buf.len() {
+                                // Consume the trailing CRLF to prevent "Sent data after end of body"
+                                self.finish_body_buf(
+                                    buf_index_start,
+                                    buf_index_start + payload_index + 2,
+                                );
+                            }
                             self.body_state = self.body_state.finish(0);
                             return Ok(None);
                         }
