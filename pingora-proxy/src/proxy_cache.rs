@@ -1310,15 +1310,6 @@ pub mod range_filter {
             return RangeType::None;
         }
 
-        // "A server MUST ignore a Range header field received with a request method other than GET."
-        if req.method != http::Method::GET && req.method != http::Method::HEAD {
-            return RangeType::None;
-        }
-
-        let Some(range_header) = req.headers.get(RANGE) else {
-            return RangeType::None;
-        };
-
         // Content-Length is not required by RFC but it is what nginx does and easier to implement
         // with this header present.
         let Some(content_length_bytes) = resp.headers.get(CONTENT_LENGTH) else {
@@ -1329,41 +1320,65 @@ pub mod range_filter {
             return RangeType::None;
         };
 
-        // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
-        // with resumable downloads.
-        // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
-        // Note that the RFC wants strong validation, and suggests that
-        // "A valid entity-tag can be distinguished from a valid HTTP-date
-        // by examining the first three characters for a DQUOTE,"
-        // but this current etag matching behavior most closely mirrors nginx.
-        if let Some(if_range) = req.headers.get(IF_RANGE) {
-            let ir = if_range.as_bytes();
-            let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
-                resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
-            } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
-                last_modified == if_range
-            } else {
-                false
-            };
-            if !matches {
-                return RangeType::None;
-            }
-        }
-
+        // At this point the response is allowed to be served as ranges
         // TODO: we can also check Accept-Range header from resp. Nginx gives uses the option
         // see proxy_force_ranges
 
-        let mut range_type = parse_range_header(
-            range_header.as_bytes(),
-            content_length,
-            max_multipart_ranges,
-        );
+        fn request_range_type(
+            req: &RequestHeader,
+            resp: &ResponseHeader,
+            content_length: usize,
+            max_multipart_ranges: Option<usize>,
+        ) -> RangeType {
+            // "A server MUST ignore a Range header field received with a request method other than GET."
+            if req.method != http::Method::GET && req.method != http::Method::HEAD {
+                return RangeType::None;
+            }
+
+            let Some(range_header) = req.headers.get(RANGE) else {
+                return RangeType::None;
+            };
+
+            // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
+            // with resumable downloads.
+            // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
+            // Note that the RFC wants strong validation, and suggests that
+            // "A valid entity-tag can be distinguished from a valid HTTP-date
+            // by examining the first three characters for a DQUOTE,"
+            // but this current etag matching behavior most closely mirrors nginx.
+            if let Some(if_range) = req.headers.get(IF_RANGE) {
+                let ir = if_range.as_bytes();
+                let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
+                    resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
+                } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
+                    last_modified == if_range
+                } else {
+                    false
+                };
+                if !matches {
+                    return RangeType::None;
+                }
+            }
+
+            parse_range_header(
+                range_header.as_bytes(),
+                content_length,
+                max_multipart_ranges,
+            )
+        }
+
+        let mut range_type = request_range_type(req, resp, content_length, max_multipart_ranges);
 
         match &mut range_type {
-            RangeType::None => { /* nothing to do*/ }
+            RangeType::None => {
+                // At this point, the response is _eligible_ to be served in ranges
+                // in the future, so add Accept-Ranges, mirroring nginx behavior
+                resp.insert_header(&ACCEPT_RANGES, "bytes").unwrap();
+            }
             RangeType::Single(r) => {
                 // 206 response
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(&CONTENT_LENGTH, r.end - r.start)
                     .unwrap();
                 resp.insert_header(
@@ -1386,6 +1401,7 @@ pub mod range_filter {
                 let total_length = multi_range_info.calculate_multipart_length();
 
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(CONTENT_LENGTH, total_length).unwrap();
                 resp.insert_header(
                     CONTENT_TYPE,
@@ -1403,6 +1419,7 @@ pub mod range_filter {
                 // empty body for simplicity
                 resp.insert_header(&CONTENT_LENGTH, HeaderValue::from_static("0"))
                     .unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 // TODO: remove other headers like content-encoding
                 resp.remove_header(&CONTENT_TYPE);
                 resp.insert_header(&CONTENT_RANGE, format!("bytes */{content_length}"))
@@ -1429,6 +1446,21 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
+
+        // no range, try HEAD
+        let mut req = gen_req();
+        req.method = Method::HEAD;
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // regular range
         let mut req = gen_req();
@@ -1444,11 +1476,31 @@ pub mod range_filter {
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes 0-1/10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
+
+        // regular range, accept-ranges included
+        let mut req = gen_req();
+        req.insert_header("Range", "bytes=0-1").unwrap();
+        let mut resp = gen_resp();
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        assert_eq!(
+            RangeType::new_single(0, 2),
+            range_header_filter(&req, &mut resp, None)
+        );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"2");
+        assert_eq!(
+            resp.headers.get("content-range").unwrap().as_bytes(),
+            b"bytes 0-1/10"
+        );
+        // accept-ranges stripped
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // bad range
         let mut req = gen_req();
         req.insert_header("Range", "bytes=1-0").unwrap();
         let mut resp = gen_resp();
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
         assert_eq!(
             RangeType::Invalid,
             range_header_filter(&req, &mut resp, None)
@@ -1459,6 +1511,7 @@ pub mod range_filter {
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes */10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
     }
 
     // Multipart Tests
@@ -1507,6 +1560,7 @@ pub mod range_filter {
             format!("multipart/byteranges; boundary={boundary_str}")
         );
         assert!(resp.headers.get("content_length").is_none());
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // overlapping range, multipart range is declined
         let req = gen_req_overlap_range();
@@ -1516,6 +1570,10 @@ pub mod range_filter {
         assert!(matches!(result, RangeType::None));
         assert_eq!(resp.status.as_u16(), 200);
         assert!(resp.headers.get("content-type").is_none());
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // bad multipart range
         let mut req = gen_req();
@@ -1525,6 +1583,7 @@ pub mod range_filter {
         let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Invalid));
         assert_eq!(resp.status.as_u16(), 416);
+        assert!(resp.headers.get("accept-ranges").is_none());
     }
 
     #[test]
@@ -1565,6 +1624,11 @@ pub mod range_filter {
             .unwrap();
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // match ETag
         let mut req = gen_req();
@@ -1574,17 +1638,29 @@ pub mod range_filter {
             RangeType::new_single(0, 2),
             range_header_filter(&req, &mut resp, None)
         );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // non-matching ETags do not result in range
         let mut req = gen_req();
         req.insert_header("If-Range", "\"4567\"").unwrap();
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         let mut req = gen_req();
         req.insert_header("If-Range", "1234").unwrap();
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // multipart range with If-Range
         let mut req = get_multipart_req();
@@ -1593,6 +1669,7 @@ pub mod range_filter {
         let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Multi(_)));
         assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // multipart with matching ETag
         let req = get_multipart_req();
@@ -1608,6 +1685,10 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
     }
 
     pub struct RangeBodyFilter {
