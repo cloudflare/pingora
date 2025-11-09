@@ -38,8 +38,8 @@ impl<SV> HttpProxy<SV> {
 
         // Strip hop-by-hop headers per RFC 2616 Section 13.5.1
         // Exception: preserve Connection and Upgrade headers for websocket upgrades
-        let is_upgrade = req.version == Version::HTTP_11
-            && req.headers.get(&http::header::UPGRADE).is_some();
+        let is_upgrade =
+            req.version == Version::HTTP_11 && req.headers.get(&http::header::UPGRADE).is_some();
 
         if !is_upgrade {
             req.remove_header(&http::header::CONNECTION);
