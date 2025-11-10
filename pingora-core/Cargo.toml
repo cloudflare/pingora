@@ -70,7 +70,7 @@ httpdate = "1"
 x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
 lru = { version = "0.16.0", optional = true }
-
+proxy-protocol = {git = "https://github.com/arxignis/proxy-protocol.git"}
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
 nix = "~0.24.3"
