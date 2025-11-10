@@ -90,6 +90,18 @@ pub struct TcpSocketOptions {
     /// This is useful for load balancing across multiple worker processes.
     /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
     pub so_reuseport: Option<bool>,
+    /// Enable IP_TRANSPARENT socket option for TPROXY transparent proxy mode (Linux only).
+    /// This allows binding to non-local IP addresses and is required for iptables TPROXY target.
+    /// Requires CAP_NET_ADMIN capability.
+    /// See the [kernel docs](https://docs.kernel.org/networking/tproxy.html) for more information.
+    #[cfg(target_os = "linux")]
+    pub ip_transparent: Option<bool>,
+    /// Set SO_MARK socket option for policy routing (Linux only).
+    /// This marks packets from this socket with a firewall mark for routing decisions.
+    /// Requires CAP_NET_ADMIN capability.
+    /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
+    #[cfg(target_os = "linux")]
+    pub so_mark: Option<u32>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -169,6 +181,20 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
         socket_ref
             .set_reuse_port(reuseport)
             .or_err(BindError, "failed to set SO_REUSEPORT")?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(transparent) = opt.ip_transparent {
+        socket_ref
+            .set_ip_transparent(transparent)
+            .or_err(BindError, "failed to set IP_TRANSPARENT")?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = opt.so_mark {
+        socket_ref
+            .set_mark(mark)
+            .or_err(BindError, "failed to set SO_MARK")?;
     }
 
     #[cfg(unix)]
