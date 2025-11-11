@@ -281,9 +281,6 @@ impl Listeners {
         }
     }
 
-    #[cfg(not(feature = "connection_filter"))]
-    pub fn set_connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) {}
-
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
@@ -412,7 +409,7 @@ mod test {
 
         #[async_trait]
         impl ConnectionFilter for TestFilter {
-            async fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
                 self.counter.fetch_add(1, Ordering::SeqCst);
                 true
             }
