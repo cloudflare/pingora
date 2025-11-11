@@ -144,4 +144,5 @@ document-features = [
     "cache",
     "time",
     "sentry",
+    "connection_filter"
 ]

@@ -89,7 +89,7 @@ pub trait ConnectionFilter: Debug + Send + Sync {
     ///     }
     /// }
     ///
-    async fn should_accept(&self, _addr: &SocketAddr) -> bool {
+    async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
         true
     }
 }
@@ -118,8 +118,10 @@ mod tests {
 
     #[async_trait]
     impl ConnectionFilter for BlockListFilter {
-        async fn should_accept(&self, addr: &SocketAddr) -> bool {
-            !self.blocked_ips.contains(&addr.ip())
+        async fn should_accept(&self, addr_opt: Option<&SocketAddr>) -> bool {
+            addr_opt
+                .map(|addr| !self.blocked_ips.contains(&addr.ip()))
+                .unwrap_or(true)
         }
     }
 
@@ -127,7 +129,7 @@ mod tests {
     async fn test_accept_all_filter() {
         let filter = AcceptAllFilter;
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        assert!(filter.should_accept(&addr).await);
+        assert!(filter.should_accept(Some(&addr)).await);
     }
 
     #[tokio::test]
@@ -139,7 +141,7 @@ mod tests {
         let blocked_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
         let allowed_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8080);
 
-        assert!(!filter.should_accept(&blocked_addr).await);
-        assert!(filter.should_accept(&allowed_addr).await);
+        assert!(!filter.should_accept(Some(&blocked_addr)).await);
+        assert!(filter.should_accept(Some(&allowed_addr)).await);
     }
 }

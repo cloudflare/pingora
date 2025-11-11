@@ -411,12 +411,9 @@ impl ListenerEndpoint {
                 // Performance: nested if-let avoids cloning/allocations on each connection accept
                 let should_accept = if let Some(digest) = stream.get_socket_digest() {
                     if let Some(peer_addr) = digest.peer_addr() {
-                        if let Some(inet_addr) = peer_addr.as_inet() {
-                            self.connection_filter.should_accept(inet_addr).await
-                        } else {
-                            // Unix domain socket or other non-inet address - accept by default
-                            true
-                        }
+                        self.connection_filter
+                            .should_accept(peer_addr.as_inet())
+                            .await
                     } else {
                         // No peer address available - accept by default
                         true
@@ -601,7 +598,7 @@ mod test {
 
         #[async_trait]
         impl ConnectionFilter for CountingFilter {
-            async fn should_accept(&self, _addr: &SocketAddr) -> bool {
+            async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
                 let count = self.accept_count.fetch_add(1, Ordering::SeqCst);
                 if count % 2 == 0 {
                     true
@@ -663,7 +660,7 @@ mod test {
 
         #[async_trait]
         impl ConnectionFilter for RejectAllFilter {
-            async fn should_accept(&self, _addr: &SocketAddr) -> bool {
+            async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
                 self.reject_count.fetch_add(1, Ordering::SeqCst);
                 false
             }
