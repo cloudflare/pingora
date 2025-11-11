@@ -255,7 +255,12 @@ pub trait ProxyHttp {
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> range_filter::RangeType {
-        proxy_cache::range_filter::range_header_filter(session.req_header(), resp)
+        const DEFAULT_MAX_RANGES: Option<usize> = Some(200);
+        proxy_cache::range_filter::range_header_filter(
+            session.req_header(),
+            resp,
+            DEFAULT_MAX_RANGES,
+        )
     }
 
     /// Modify the request before it is sent to the upstream
