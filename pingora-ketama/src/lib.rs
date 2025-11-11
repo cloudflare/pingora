@@ -25,12 +25,13 @@
 //! Here's a simple example of how one might use it:
 //!
 //! ```
+//! use std::net::SocketAddr;
 //! use pingora_ketama::{Bucket, Continuum};
 //!
 //! # #[allow(clippy::needless_doctest_main)]
 //! fn main() {
 //!     // Set up a continuum with a few nodes of various weight.
-//!     let mut buckets = vec![];
+//!     let mut buckets: Vec<Bucket<SocketAddr>> = vec![];
 //!     buckets.push(Bucket::new("127.0.0.1:12345".parse().unwrap(), 1));
 //!     buckets.push(Bucket::new("127.0.0.2:12345".parse().unwrap(), 2));
 //!     buckets.push(Bucket::new("127.0.0.3:12345".parse().unwrap(), 3));
@@ -67,25 +68,50 @@ use crc32fast::Hasher;
 ///
 /// A [Bucket] contains a [SocketAddr] to the server and a weight associated with it.
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
-pub struct Bucket {
+pub struct Bucket<Node = SocketAddr> {
     // The node name.
     // TODO: UDS
-    node: SocketAddr,
+    node: Node,
 
     // The weight associated with a node. A higher weight indicates that this node should
     // receive more requests.
     weight: u32,
 }
 
-impl Bucket {
+pub trait BucketNode {
+    /// Convert self to hash input bytes.
+    fn to_hash_bytes(&self) -> Vec<u8>;
+}
+
+impl BucketNode for SocketAddr {
+    fn to_hash_bytes(&self) -> Vec<u8> {
+        // We only do the following for backwards compatibility with nginx/memcache:
+        // - Convert SocketAddr to string
+        // - The hash input is as follows "HOST EMPTY PORT PREVIOUS_HASH". Spaces are only added
+        //   for readability.
+        // TODO: remove this logic and hash the literal SocketAddr once we no longer
+        // need backwards compatibility
+
+        // with_capacity = max_len(ipv6)(39) + len(null)(1) + max_len(port)(5)
+        let mut hash_bytes = Vec::with_capacity(39 + 1 + 5);
+        write!(&mut hash_bytes, "{}", self.ip()).unwrap();
+        write!(&mut hash_bytes, "\0").unwrap();
+        write!(&mut hash_bytes, "{}", self.port()).unwrap();
+
+        hash_bytes
+    }
+}
+
+impl<Node> Bucket<Node> {
     /// Return a new bucket with the given node and weight.
     ///
-    /// The chance that a [Bucket] is selected is proportional to the relative weight of all [Bucket]s.
+    /// The chance that a [Bucket] is selected is proportional to the relative weight of all
+    /// [Bucket]s.
     ///
     /// # Panics
     ///
     /// This will panic if the weight is zero.
-    pub fn new(node: SocketAddr, weight: u32) -> Self {
+    pub fn new(node: Node, weight: u32) -> Self {
         assert!(weight != 0, "weight must be at least one");
 
         Bucket { node, weight }
@@ -123,14 +149,17 @@ impl Point {
 ///
 /// A [Continuum] represents a ring of buckets where a node is associated with various points on
 /// the ring.
-pub struct Continuum {
+pub struct Continuum<Node = SocketAddr> {
     ring: Box<[Point]>,
-    addrs: Box<[SocketAddr]>,
+    addrs: Box<[Node]>,
 }
 
-impl Continuum {
+impl<Node> Continuum<Node>
+where
+    Node: BucketNode + Clone,
+{
     /// Create a new [Continuum] with the given list of buckets.
-    pub fn new(buckets: &[Bucket]) -> Self {
+    pub fn new(buckets: &[Bucket<Node>]) -> Self {
         // This constant is copied from nginx. It will create 160 points per weight unit. For
         // example, a weight of 2 will create 320 points on the ring.
         const POINT_MULTIPLE: u32 = 160;
@@ -149,27 +178,14 @@ impl Continuum {
 
         for bucket in buckets {
             let mut hasher = Hasher::new();
-
-            // We only do the following for backwards compatibility with nginx/memcache:
-            // - Convert SocketAddr to string
-            // - The hash input is as follows "HOST EMPTY PORT PREVIOUS_HASH". Spaces are only added
-            //   for readability.
-            // TODO: remove this logic and hash the literal SocketAddr once we no longer
-            // need backwards compatibility
-
-            // with_capacity = max_len(ipv6)(39) + len(null)(1) + max_len(port)(5)
-            let mut hash_bytes = Vec::with_capacity(39 + 1 + 5);
-            write!(&mut hash_bytes, "{}", bucket.node.ip()).unwrap();
-            write!(&mut hash_bytes, "\0").unwrap();
-            write!(&mut hash_bytes, "{}", bucket.node.port()).unwrap();
-            hasher.update(hash_bytes.as_ref());
+            hasher.update(&bucket.node.to_hash_bytes());
 
             // A higher weight will add more points for this node.
             let num_points = bucket.weight * POINT_MULTIPLE;
 
             // This is appended to the crc32 hash for each point.
             let mut prev_hash: u32 = 0;
-            addrs.push(bucket.node);
+            addrs.push(bucket.node.clone());
             let node = addrs.len() - 1;
             for _ in 0..num_points {
                 let mut hasher = hasher.clone();
@@ -211,24 +227,24 @@ impl Continuum {
     }
 
     /// Hash the given `hash_key` to the server address.
-    pub fn node(&self, hash_key: &[u8]) -> Option<SocketAddr> {
+    pub fn node(&self, hash_key: &[u8]) -> Option<Node> {
         self.ring
             .get(self.node_idx(hash_key)) // should we unwrap here?
-            .map(|p| self.addrs[p.node as usize])
+            .map(|p| self.addrs[p.node as usize].clone())
     }
 
     /// Get an iterator of nodes starting at the original hashed node of the `hash_key`.
     ///
     /// This function is useful to find failover servers if the original ones are offline, which is
     /// cheaper than rebuilding the entire hash ring.
-    pub fn node_iter(&self, hash_key: &[u8]) -> NodeIterator {
+    pub fn node_iter(&self, hash_key: &[u8]) -> NodeIterator<Node> {
         NodeIterator {
             idx: self.node_idx(hash_key),
             continuum: self,
         }
     }
 
-    pub fn get_addr(&self, idx: &mut usize) -> Option<&SocketAddr> {
+    pub fn get_addr(&self, idx: &mut usize) -> Option<&Node> {
         let point = self.ring.get(*idx);
         if point.is_some() {
             // only update idx for non-empty ring otherwise we will panic on modulo 0
@@ -239,13 +255,16 @@ impl Continuum {
 }
 
 /// Iterator over a Continuum
-pub struct NodeIterator<'a> {
+pub struct NodeIterator<'a, Node> {
     idx: usize,
-    continuum: &'a Continuum,
+    continuum: &'a Continuum<Node>,
 }
 
-impl<'a> Iterator for NodeIterator<'a> {
-    type Item = &'a SocketAddr;
+impl<'a, Node> Iterator for NodeIterator<'a, Node>
+where
+    Node: BucketNode + Clone,
+{
+    type Item = &'a Node;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.continuum.get_addr(&mut self.idx)
@@ -265,7 +284,7 @@ mod tests {
 
     #[test]
     fn consistency_after_adding_host() {
-        fn assert_hosts(c: &Continuum) {
+        fn assert_hosts(c: &Continuum<SocketAddr>) {
             assert_eq!(c.node(b"a"), Some(get_sockaddr("127.0.0.10:6443")));
             assert_eq!(c.node(b"b"), Some(get_sockaddr("127.0.0.5:6443")));
         }
@@ -414,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let c = Continuum::new(&[]);
+        let c = Continuum::<SocketAddr>::new(&[]);
         assert!(c.node(b"doghash").is_none());
 
         let mut iter = c.node_iter(b"doghash");
