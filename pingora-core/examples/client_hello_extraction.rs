@@ -46,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
+    println!("\nTo test proxy requests:");
+    println!("  printf 'PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\n' | socat - TCP:127.0.0.1:8443");
+
     let listener = TcpListener::bind("127.0.0.1:8443").await?;
 
     loop {
@@ -62,6 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_connection(mut tcp_stream: TcpStream, addr: SocketAddr) -> io::Result<()> {
     let proxy_header = consume_proxy_header(&mut tcp_stream).await?;
+
+    println!("Consumed proxy header");
 
     if let Some(header) = &proxy_header {
         log_proxy_header(header);
