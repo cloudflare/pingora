@@ -81,7 +81,7 @@ nix = "~0.24.3"
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-h2 = { workspace = true, features=["unstable"]}
+h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.9"
 reqwest = { version = "0.11", features = [
@@ -105,3 +105,4 @@ patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["dep:sentry"]
+connection_filter = []
