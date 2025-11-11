@@ -20,36 +20,35 @@
 //! This approach is TLS backend-agnostic and works by peeking at the
 //! TCP stream before the TLS handshake begins.
 
-use bytes::Bytes;
+use ::proxy_protocol as wire_proxy_protocol;
 use pingora_core::protocols::l4::stream::Stream;
+use pingora_core::protocols::proxy_protocol::{self, ProxyHeader};
 use pingora_core::protocols::ClientHelloWrapper;
-use proxy_protocol::ProxyHeader;
 use std::{io, net::SocketAddr};
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-
-const PROXY_V2_SIGNATURE: [u8; 12] = [
-    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
-];
-const MAX_PROXY_V1_HEADER_LEN: usize = 108;
-const MAX_PROXY_HEADER_LEN: usize = 65535 + 16;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
+    let listen_addr = "127.0.0.1:8443";
+
     println!("Starting TLS ClientHello extraction example...");
-    println!("Listening on 127.0.0.1:8443");
+    println!("Listening on {listen_addr}");
     println!("\nTo test, use:");
-    println!(
-        "  openssl s_client -connect 127.0.0.1:8443 -servername example.com -alpn h2,http/1.1"
-    );
+    println!("  openssl s_client -connect {listen_addr} -servername example.com -alpn h2,http/1.1");
     println!();
 
-    println!("\nTo test proxy requests:");
-    println!("  printf 'PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\n' | socat - TCP:127.0.0.1:8443");
+    println!("\nTo test proxy requests with socat:");
+    println!("  # Terminal 1: forward connections and inject a PROXY header");
+    println!("  socat -d -d -v TCP-LISTEN:9443,reuseaddr,fork TCP:{listen_addr},proxyproto=TCP4:203.0.113.10:54321:198.51.100.5:443");
+    println!("  # Terminal 2: connect through the forwarder");
+    println!(
+        "  openssl s_client -connect 127.0.0.1:9443 -servername example.com -alpn h2,http/1.1"
+    );
+    println!("  # Requires socat built with proxyproto support (v1.7.4 or newer).");
 
-    let listener = TcpListener::bind("127.0.0.1:8443").await?;
+    let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
@@ -63,8 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn handle_connection(mut tcp_stream: TcpStream, addr: SocketAddr) -> io::Result<()> {
-    let proxy_header = consume_proxy_header(&mut tcp_stream).await?;
+async fn handle_connection(tcp_stream: TcpStream, addr: SocketAddr) -> io::Result<()> {
+    // Convert to Pingora Stream first so we can reuse the IO stack.
+    let mut stream: Stream = tcp_stream.into();
+
+    let proxy_header = proxy_protocol::consume_proxy_header(&mut stream)
+        .await
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
     println!("Consumed proxy header");
 
@@ -73,9 +77,6 @@ async fn handle_connection(mut tcp_stream: TcpStream, addr: SocketAddr) -> io::R
     } else {
         println!("No PROXY header detected; using peer {}", addr);
     }
-
-    // Convert to Pingora Stream
-    let stream: Stream = tcp_stream.into();
 
     // Wrap the stream with ClientHelloWrapper
     let mut wrapper = ClientHelloWrapper::new(stream);
@@ -124,16 +125,16 @@ fn log_proxy_header(header: &ProxyHeader) {
     println!("\n=== PROXY protocol header ===");
     match header {
         ProxyHeader::Version1 { addresses } => match addresses {
-            proxy_protocol::version1::ProxyAddresses::Unknown => {
+            wire_proxy_protocol::version1::ProxyAddresses::Unknown => {
                 println!("Version 1: addresses unknown");
             }
-            proxy_protocol::version1::ProxyAddresses::Ipv4 {
+            wire_proxy_protocol::version1::ProxyAddresses::Ipv4 {
                 source,
                 destination,
             } => {
                 println!("Version 1: source {}, destination {}", source, destination);
             }
-            proxy_protocol::version1::ProxyAddresses::Ipv6 {
+            wire_proxy_protocol::version1::ProxyAddresses::Ipv6 {
                 source,
                 destination,
             } => {
@@ -151,22 +152,22 @@ fn log_proxy_header(header: &ProxyHeader) {
                 command, transport_protocol
             );
             match addresses {
-                proxy_protocol::version2::ProxyAddresses::Unspec => {
+                wire_proxy_protocol::version2::ProxyAddresses::Unspec => {
                     println!("Addresses: unspecified");
                 }
-                proxy_protocol::version2::ProxyAddresses::Ipv4 {
+                wire_proxy_protocol::version2::ProxyAddresses::Ipv4 {
                     source,
                     destination,
                 } => {
                     println!("Addresses: source {}, destination {}", source, destination);
                 }
-                proxy_protocol::version2::ProxyAddresses::Ipv6 {
+                wire_proxy_protocol::version2::ProxyAddresses::Ipv6 {
                     source,
                     destination,
                 } => {
                     println!("Addresses: source {}, destination {}", source, destination);
                 }
-                proxy_protocol::version2::ProxyAddresses::Unix {
+                wire_proxy_protocol::version2::ProxyAddresses::Unix {
                     source,
                     destination,
                 } => {
@@ -191,105 +192,4 @@ fn log_proxy_header(header: &ProxyHeader) {
 fn render_unix_address(raw: &[u8; 108]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     String::from_utf8_lossy(&raw[..end]).into_owned()
-}
-
-async fn consume_proxy_header(stream: &mut TcpStream) -> io::Result<Option<ProxyHeader>> {
-    let mut peek_buf = vec![0u8; MAX_PROXY_HEADER_LEN];
-
-    loop {
-        stream.readable().await?;
-
-        let n = match stream.peek(&mut peek_buf).await {
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(err) => return Err(err),
-        };
-
-        if n == 0 {
-            return Ok(None);
-        }
-
-        match detect_proxy_header(&peek_buf[..n]) {
-            ProxyDetection::NotProxy => return Ok(None),
-            ProxyDetection::NeedsMore => {
-                if n == peek_buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("PROXY header exceeds {} bytes", MAX_PROXY_HEADER_LEN),
-                    ));
-                }
-                continue;
-            }
-            ProxyDetection::Invalid => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Malformed PROXY protocol header",
-                ));
-            }
-            ProxyDetection::HeaderLength(header_len) => {
-                let mut header_bytes = vec![0u8; header_len];
-                stream.read_exact(&mut header_bytes).await?;
-                let mut bytes = Bytes::from(header_bytes);
-                let header = proxy_protocol::parse(&mut bytes)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                return Ok(Some(header));
-            }
-        }
-    }
-}
-
-enum ProxyDetection {
-    NotProxy,
-    NeedsMore,
-    Invalid,
-    HeaderLength(usize),
-}
-
-fn detect_proxy_header(data: &[u8]) -> ProxyDetection {
-    if data.is_empty() {
-        return ProxyDetection::NeedsMore;
-    }
-
-    if data[0] == b'P' {
-        if data.len() < b"PROXY".len() {
-            return ProxyDetection::NeedsMore;
-        }
-        if !data.starts_with(b"PROXY") {
-            return ProxyDetection::NotProxy;
-        }
-        if let Some(pos) = data.windows(2).position(|window| window == b"\r\n") {
-            let header_len = pos + 2;
-            if header_len > MAX_PROXY_V1_HEADER_LEN {
-                return ProxyDetection::Invalid;
-            }
-            return ProxyDetection::HeaderLength(header_len);
-        }
-        if data.len() >= MAX_PROXY_V1_HEADER_LEN {
-            return ProxyDetection::Invalid;
-        }
-        return ProxyDetection::NeedsMore;
-    }
-
-    if data[0] == PROXY_V2_SIGNATURE[0] {
-        if data.len() < PROXY_V2_SIGNATURE.len() {
-            return ProxyDetection::NeedsMore;
-        }
-        if data[..PROXY_V2_SIGNATURE.len()] != PROXY_V2_SIGNATURE {
-            return ProxyDetection::NotProxy;
-        }
-        if data.len() < 16 {
-            return ProxyDetection::NeedsMore;
-        }
-        let len = u16::from_be_bytes([data[14], data[15]]) as usize;
-        let total_len = 16 + len;
-        if total_len > MAX_PROXY_HEADER_LEN {
-            return ProxyDetection::Invalid;
-        }
-        if data.len() < total_len {
-            return ProxyDetection::NeedsMore;
-        }
-        return ProxyDetection::HeaderLength(total_len);
-    }
-
-    ProxyDetection::NotProxy
 }
