@@ -303,6 +303,7 @@ where
 
         // return a 416 with an empty body for simplicity
         let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
         match self.inner.response_filter(session, &mut header, ctx).await {
@@ -904,6 +905,12 @@ fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
         let age = cache.cache_meta().age().as_secs();
         header.insert_header(http::header::AGE, age).unwrap();
     }
+    log::debug!("cache header: {header:?} {:?}", cache.phase());
+
+    // currently storage cache is always considered an h1 upstream
+    // (header-serde serializes as h1.0 or h1.1)
+    // set this header to be h1.1
+    header.set_version(Version::HTTP_11);
 
     /* Add chunked header to tell downstream to use chunked encoding
      * during the absent of content-length in h2 */

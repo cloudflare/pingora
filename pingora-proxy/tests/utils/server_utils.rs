@@ -16,7 +16,7 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{ACCEPT_ENCODING, VARY};
+use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
@@ -589,11 +589,21 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.upstream_status = Some(upstream_response.status.into());
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-fake-http10")
+        {
+            // TODO to simulate an actual http1.0 origin
+            upstream_response.set_version(http::Version::HTTP_10);
+            upstream_response.remove_header(&CONTENT_LENGTH);
+            upstream_response.remove_header(&TRANSFER_ENCODING);
+        }
         Ok(())
     }
 
