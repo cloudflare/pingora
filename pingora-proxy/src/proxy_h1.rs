@@ -633,6 +633,10 @@ where
                     }
                 }
 
+                // TODO: just set version to Version::HTTP_11 unconditionally here,
+                // (with another todo being an option to faithfully proxy the <1.1 responses)
+                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
+
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
