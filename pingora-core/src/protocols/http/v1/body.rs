@@ -624,7 +624,7 @@ impl BodyReader {
                     let n = stream
                         .read(body_buf)
                         .await
-                        .or_err(ReadError, "when reading body")?;
+                        .or_err(ReadError, "when reading trailers end")?;
 
                     (&body_buf[..n], n)
                 };
