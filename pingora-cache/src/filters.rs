@@ -89,7 +89,7 @@ pub fn calculate_fresh_until(
     if authorization_present {
         let uncacheable = cache_control
             .as_ref()
-            .map_or(true, |cc| !cc.allow_caching_authorized_req());
+            .is_none_or(|cc| !cc.allow_caching_authorized_req());
         if uncacheable {
             return None;
         }

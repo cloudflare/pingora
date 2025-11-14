@@ -2,13 +2,13 @@ use std::{io::Error, thread, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use log::debug;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use tokio::{
     net::{TcpListener, TcpStream},
     runtime::Builder,
 };
 
-pub static WS_ECHO: Lazy<bool> = Lazy::new(init);
+pub static WS_ECHO: LazyLock<bool> = LazyLock::new(init);
 
 fn init() -> bool {
     thread::spawn(move || {

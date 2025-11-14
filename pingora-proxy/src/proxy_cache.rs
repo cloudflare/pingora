@@ -156,7 +156,7 @@ where
                         session.cache.cache_found(meta, handler, hit_status);
                     }
 
-                    if hit_status_opt.map_or(true, HitStatus::is_treated_as_miss) {
+                    if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
                         if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
@@ -406,7 +406,7 @@ where
                             return (false, Some(e));
                         }
 
-                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                        if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
                             // Don't write empty body which will end session,
                             // still more hit handler bytes to read
                             continue;
@@ -933,10 +933,11 @@ pub mod range_filter {
 
     fn parse_range_header(range: &[u8], content_length: usize) -> RangeType {
         use regex::Regex;
+        use std::sync::LazyLock;
 
         // Match individual range parts, (e.g. "0-100", "-5", "1-")
-        static RE_SINGLE_RANGE_PART: Lazy<Regex> =
-            Lazy::new(|| Regex::new(r"(?i)^\s*(?P<start>\d*)-(?P<end>\d*)\s*$").unwrap());
+        static RE_SINGLE_RANGE_PART: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)^\s*(?P<start>\d*)-(?P<end>\d*)\s*$").unwrap());
 
         // Convert bytes to UTF-8 string
         let range_str = match str::from_utf8(range) {

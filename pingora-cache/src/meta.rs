@@ -16,12 +16,12 @@
 
 pub use http::Extensions;
 use log::warn;
-use once_cell::sync::{Lazy, OnceCell};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_header_serde::HeaderSerde;
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use crate::key::HashBinary;
@@ -568,9 +568,9 @@ impl CacheMetaDefaults {
 /// The dictionary content for header compression.
 ///
 /// Used during initialization of [`HEADER_SERDE`].
-static COMPRESSION_DICT_CONTENT: OnceCell<Cow<'static, [u8]>> = OnceCell::new();
+static COMPRESSION_DICT_CONTENT: OnceLock<Cow<'static, [u8]>> = OnceLock::new();
 
-static HEADER_SERDE: Lazy<HeaderSerde> = Lazy::new(|| {
+static HEADER_SERDE: LazyLock<HeaderSerde> = LazyLock::new(|| {
     let dict_opt = if let Some(dict_content) = COMPRESSION_DICT_CONTENT.get() {
         Some(dict_content.to_vec())
     } else {

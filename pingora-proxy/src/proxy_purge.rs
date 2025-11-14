@@ -15,6 +15,7 @@
 use super::*;
 use pingora_core::protocols::http::error_resp;
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 #[derive(Debug)]
 pub enum PurgeStatus {
@@ -52,12 +53,13 @@ fn gen_purge_response(code: u16) -> ResponseHeader {
     resp
 }
 
-static OK: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(200));
-static NOT_FOUND: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(404));
+static OK: LazyLock<ResponseHeader> = LazyLock::new(|| gen_purge_response(200));
+static NOT_FOUND: LazyLock<ResponseHeader> = LazyLock::new(|| gen_purge_response(404));
 // for when purge is sent to uncacheable assets
-static NOT_PURGEABLE: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(405));
+static NOT_PURGEABLE: LazyLock<ResponseHeader> = LazyLock::new(|| gen_purge_response(405));
 // on cache storage or proxy error
-static INTERNAL_ERROR: Lazy<ResponseHeader> = Lazy::new(|| error_resp::gen_error_response(500));
+static INTERNAL_ERROR: LazyLock<ResponseHeader> =
+    LazyLock::new(|| error_resp::gen_error_response(500));
 
 impl<SV, C> HttpProxy<SV, C>
 where
