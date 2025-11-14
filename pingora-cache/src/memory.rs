@@ -427,7 +427,7 @@ impl Storage for MemCache {
 mod test {
     use super::*;
     use cf_rustracing::span::Span;
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();
@@ -445,7 +445,7 @@ mod test {
 
     #[tokio::test]
     async fn test_write_then_read() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("", "a", "1");
@@ -482,7 +482,7 @@ mod test {
 
     #[tokio::test]
     async fn test_read_range() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("", "a", "1");
@@ -527,7 +527,7 @@ mod test {
     async fn test_write_while_read() {
         use futures::FutureExt;
 
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("", "a", "1");
@@ -594,7 +594,7 @@ mod test {
 
     #[tokio::test]
     async fn test_purge_partial() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
 
         let key = CacheKey::new("", "a", "1").to_compact();
@@ -621,7 +621,7 @@ mod test {
 
     #[tokio::test]
     async fn test_purge_complete() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
 
         let key = CacheKey::new("", "a", "1").to_compact();

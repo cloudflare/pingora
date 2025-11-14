@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use log::debug;
-use once_cell::sync::OnceCell;
 use rand::Rng;
+use std::sync::OnceLock;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 
@@ -25,7 +25,7 @@ pub(crate) struct OffloadRuntime {
     thread_per_shard: usize,
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
-    pools: OnceCell<Box<[(Handle, Sender<()>)]>>,
+    pools: OnceLock<Box<[(Handle, Sender<()>)]>>,
 }
 
 impl OffloadRuntime {
@@ -35,7 +35,7 @@ impl OffloadRuntime {
         OffloadRuntime {
             shards,
             thread_per_shard,
-            pools: OnceCell::new(),
+            pools: OnceLock::new(),
         }
     }
 

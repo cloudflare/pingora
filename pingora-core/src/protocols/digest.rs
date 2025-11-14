@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use once_cell::sync::OnceCell;
+use std::sync::OnceLock;
 
 use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
@@ -67,11 +67,11 @@ pub struct SocketDigest {
     #[cfg(windows)]
     raw_sock: std::os::windows::io::RawSocket,
     /// Remote socket address
-    pub peer_addr: OnceCell<Option<SocketAddr>>,
+    pub peer_addr: OnceLock<Option<SocketAddr>>,
     /// Local socket address
-    pub local_addr: OnceCell<Option<SocketAddr>>,
+    pub local_addr: OnceLock<Option<SocketAddr>>,
     /// Original destination address
-    pub original_dst: OnceCell<Option<SocketAddr>>,
+    pub original_dst: OnceLock<Option<SocketAddr>>,
 }
 
 impl SocketDigest {
@@ -79,9 +79,9 @@ impl SocketDigest {
     pub fn from_raw_fd(raw_fd: std::os::unix::io::RawFd) -> SocketDigest {
         SocketDigest {
             raw_fd,
-            peer_addr: OnceCell::new(),
-            local_addr: OnceCell::new(),
-            original_dst: OnceCell::new(),
+            peer_addr: OnceLock::new(),
+            local_addr: OnceLock::new(),
+            original_dst: OnceLock::new(),
         }
     }
 
@@ -89,9 +89,9 @@ impl SocketDigest {
     pub fn from_raw_socket(raw_sock: std::os::windows::io::RawSocket) -> SocketDigest {
         SocketDigest {
             raw_sock,
-            peer_addr: OnceCell::new(),
-            local_addr: OnceCell::new(),
-            original_dst: OnceCell::new(),
+            peer_addr: OnceLock::new(),
+            local_addr: OnceLock::new(),
+            original_dst: OnceLock::new(),
         }
     }
 

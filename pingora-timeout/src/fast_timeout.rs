@@ -26,10 +26,9 @@
 
 use super::timer::*;
 use super::*;
-use once_cell::sync::Lazy;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-static TIMER_MANAGER: Lazy<Arc<TimerManager>> = Lazy::new(|| {
+static TIMER_MANAGER: LazyLock<Arc<TimerManager>> = LazyLock::new(|| {
     let tm = Arc::new(TimerManager::new());
     check_clock_thread(&tm);
     tm

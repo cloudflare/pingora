@@ -23,9 +23,8 @@
 //! This flavor is as efficient as the single-threaded runtime while allows the async
 //! program to use multiple cores.
 
-use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;
@@ -83,7 +82,7 @@ impl Runtime {
 }
 
 // only NoStealRuntime set the pools in thread threads
-static CURRENT_HANDLE: Lazy<ThreadLocal<Pools>> = Lazy::new(ThreadLocal::new);
+static CURRENT_HANDLE: LazyLock<ThreadLocal<Pools>> = LazyLock::new(ThreadLocal::new);
 
 /// Return the [Handle] of current runtime.
 /// If the current thread is under a `Steal` runtime, the current [Handle] is returned.
@@ -103,7 +102,7 @@ pub fn current_handle() -> Handle {
 }
 
 type Control = (Sender<Duration>, JoinHandle<()>);
-type Pools = Arc<OnceCell<Box<[Handle]>>>;
+type Pools = Arc<OnceLock<Box<[Handle]>>>;
 
 /// Multi-threaded runtime backed by a pool of single threaded tokio runtime
 pub struct NoStealRuntime {
@@ -112,7 +111,7 @@ pub struct NoStealRuntime {
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
-    controls: OnceCell<Vec<Control>>,
+    controls: OnceLock<Vec<Control>>,
 }
 
 impl NoStealRuntime {
@@ -122,8 +121,8 @@ impl NoStealRuntime {
         NoStealRuntime {
             threads,
             name: name.to_string(),
-            pools: Arc::new(OnceCell::new()),
-            controls: OnceCell::new(),
+            pools: Arc::new(OnceLock::new()),
+            controls: OnceLock::new(),
         }
     }
 
@@ -171,14 +170,25 @@ impl NoStealRuntime {
             // TODO: use a mutex to avoid creating a lot threads only to drop them
             let (pools, controls) = self.init_pools();
             // there could be another thread racing with this one to init the pools
-            match self.pools.try_insert(pools) {
-                Ok(p) => {
+            // TODO: replace with try_insert() once stable (tracking issue: https://github.com/rust-lang/rust/issues/116693)
+            // Desired code:
+            // match self.pools.try_insert(pools) {
+            //     Ok(p) => {
+            //         // unwrap to make sure that this is the one that init both pools and controls
+            //         self.controls.set(controls).unwrap();
+            //         p
+            //     }
+            //     // another thread already set it, just return it
+            //     Err((p, _my_pools)) => p,
+            // }
+            match self.pools.set(pools) {
+                Ok(()) => {
                     // unwrap to make sure that this is the one that init both pools and controls
                     self.controls.set(controls).unwrap();
-                    p
+                    self.pools.get().unwrap()
                 }
                 // another thread already set it, just return it
-                Err((p, _my_pools)) => p,
+                Err(_my_pools) => self.pools.get().unwrap(),
             }
         }
     }

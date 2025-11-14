@@ -39,7 +39,6 @@ derivative = "2.2.0"
 http = "1.0.0"
 log = "0.4"
 h2 = ">=0.4.11"
-once_cell = "1"
 lru = "0.14"
 ahash = ">=0.8.9"
 
