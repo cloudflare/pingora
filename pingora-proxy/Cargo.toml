@@ -57,12 +57,21 @@ hyperlocal = "0.8"
 [features]
 default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
-boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl", "openssl_derived"]
+boringssl = [
+    "pingora-core/boringssl",
+    "pingora-cache/boringssl",
+    "openssl_derived",
+]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
 s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+connection_filter = ["pingora-core/connection_filter"]
+
+[[example]]
+name = "connection_filter"
+required-features = ["connection_filter"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

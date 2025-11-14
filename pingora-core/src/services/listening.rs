@@ -20,7 +20,11 @@
 
 use crate::apps::ServerApp;
 use crate::listeners::tls::TlsSettings;
-use crate::listeners::{Listeners, ServerAddress, TcpSocketOptions, TransportStack};
+#[cfg(feature = "connection_filter")]
+use crate::listeners::AcceptAllFilter;
+use crate::listeners::{
+    ConnectionFilter, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
+};
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -43,6 +47,8 @@ pub struct Service<A> {
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Arc<dyn ConnectionFilter>,
 }
 
 impl<A> Service<A> {
@@ -53,6 +59,8 @@ impl<A> Service<A> {
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
             threads: None,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
         }
     }
 
@@ -64,8 +72,44 @@ impl<A> Service<A> {
             listeners,
             app_logic: Some(app_logic),
             threads: None,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
         }
     }
+
+    /// Set a custom connection filter for this service.
+    ///
+    /// The connection filter will be applied to all incoming connections
+    /// on all endpoints of this service. Connections that don't pass the
+    /// filter will be dropped immediately at the TCP level, before TLS
+    /// handshake or any HTTP processing.
+    ///
+    /// # Feature Flag
+    ///
+    /// This method requires the `connection_filter` feature to be enabled.
+    /// When the feature is disabled, this method is a no-op.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use pingora_core::listeners::{ConnectionFilter, AcceptAllFilter};
+    /// # struct MyService;
+    /// # impl MyService {
+    /// #   fn new() -> Self { MyService }
+    /// # }
+    /// let mut service = MyService::new();
+    /// let filter = Arc::new(AcceptAllFilter);
+    /// service.set_connection_filter(filter);
+    /// ```   
+    #[cfg(feature = "connection_filter")]
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        self.connection_filter = filter.clone();
+        self.listeners.set_connection_filter(filter);
+    }
+
+    #[cfg(not(feature = "connection_filter"))]
+    pub fn set_connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) {}
 
     /// Get the [`Listeners`], mostly to add more endpoints.
     pub fn endpoints(&mut self) -> &mut Listeners {
