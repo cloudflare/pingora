@@ -203,7 +203,11 @@ impl SslDigest {
             None => (Vec::new(), None, None),
         };
 
-        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest)
+        let sni = ssl
+            .servername(ssl::NameType::HOST_NAME)
+            .map(|name| name.to_string());
+
+        SslDigest::with_sni(cipher, ssl.version_str(), org, sn, cert_digest, sni)
     }
 }
 
