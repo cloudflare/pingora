@@ -599,7 +599,10 @@ impl Debug for Session {
             .field("cache", &"HttpCache")
             .field("upstream_compression", &"ResponseCompressionCtx")
             .field("ignore_downstream_range", &self.ignore_downstream_range)
-            .field("upstream_headers_mutated_for_cache", &self.upstream_headers_mutated_for_cache)
+            .field(
+                "upstream_headers_mutated_for_cache",
+                &self.upstream_headers_mutated_for_cache,
+            )
             .finish_non_exhaustive()
     }
 }
