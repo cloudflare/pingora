@@ -327,6 +327,58 @@ impl RequestHeader {
     pub fn as_owned_parts(&self) -> ReqParts {
         clone_req_parts(&self.base)
     }
+
+    /// Rewrite the path, preserving query string.
+    ///
+    /// # Example
+    /// ```
+    /// # use pingora_http::RequestHeader;
+    /// let mut req = RequestHeader::build("GET", b"/old/path?query=1", None).unwrap();
+    /// req.set_path("/new/path").unwrap();
+    /// assert_eq!(req.uri.path(), "/new/path");
+    /// assert_eq!(req.uri.query(), Some("query=1"));
+    /// ```
+    pub fn set_path(&mut self, new_path: &str) -> Result<()> {
+        let new_uri = if let Some(query) = self.uri.query() {
+            Uri::builder()
+                .path_and_query(format!("{}?{}", new_path, query))
+                .build()
+        } else {
+            Uri::builder().path_and_query(new_path).build()
+        }
+        .or_err(InvalidHTTPHeader, "invalid path")?;
+
+        self.base.uri = new_uri;
+        self.raw_path_fallback.clear();
+        Ok(())
+    }
+
+    /// Strip a prefix from the path, preserving query string.
+    ///
+    /// Returns `Ok(true)` if prefix was stripped, `Ok(false)` if prefix not found.
+    ///
+    /// # Example
+    /// ```
+    /// # use pingora_http::RequestHeader;
+    /// let mut req = RequestHeader::build("GET", b"/api/v1/users?page=1", None).unwrap();
+    /// assert!(req.strip_path_prefix("/api/v1").unwrap());
+    /// assert_eq!(req.uri.path(), "/users");
+    /// assert_eq!(req.uri.query(), Some("page=1"));
+    /// ```
+    pub fn strip_path_prefix(&mut self, prefix: &str) -> Result<bool> {
+        let path = self.uri.path().to_string();
+        if let Some(stripped) = path.strip_prefix(prefix) {
+            let new_path = if stripped.is_empty() || stripped.starts_with('/') {
+                stripped
+            } else {
+                return Err(pingora_error::Error::explain(InvalidHTTPHeader, "prefix must end with / or match full path"));
+            };
+            self.set_path(new_path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 impl Clone for RequestHeader {
