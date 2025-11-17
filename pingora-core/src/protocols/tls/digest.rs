@@ -14,10 +14,13 @@
 
 //! TLS information from the TLS connection
 
+use std::any::{Any, TypeId};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The TLS connection information
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SslDigest {
     /// The cipher used
     pub cipher: Cow<'static, str>,
@@ -29,6 +32,21 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// User-defined extensions
+    extensions: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for SslDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SslDigest")
+            .field("cipher", &self.cipher)
+            .field("version", &self.version)
+            .field("organization", &self.organization)
+            .field("serial_number", &self.serial_number)
+            .field("cert_digest", &self.cert_digest)
+            .field("extensions_count", &self.extensions.len())
+            .finish()
+    }
 }
 
 impl SslDigest {
@@ -49,6 +67,19 @@ impl SslDigest {
             organization,
             serial_number,
             cert_digest,
+            extensions: HashMap::new(),
         }
+    }
+
+    /// Insert a user-defined value
+    pub fn insert<T: Any + Send + Sync>(&mut self, value: T) {
+        self.extensions.insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// Get a user-defined value by type
+    pub fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.extensions
+            .get(&TypeId::of::<T>())
+            .and_then(|v| v.downcast_ref::<T>())
     }
 }
