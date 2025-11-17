@@ -727,6 +727,17 @@ pub trait ProxyHttp {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Called when response_sent is true from request_filter, allowing custom handling of the downstream session.
+    ///
+    /// Returns the reusable stream if the connection can be reused.
+    async fn finish_downstream_session(
+        &self,
+        downstream_session: Box<HttpSession>,
+        _ctx: &mut Self::CTX,
+    ) -> Option<ReusableHttpStream> {
+        downstream_session.finish().await.ok().flatten()
+    }
 }
 
 /// Context struct returned by `fail_to_proxy`.
