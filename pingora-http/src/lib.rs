@@ -371,7 +371,10 @@ impl RequestHeader {
             let new_path = if stripped.is_empty() || stripped.starts_with('/') {
                 stripped
             } else {
-                return Err(pingora_error::Error::explain(InvalidHTTPHeader, "prefix must end with / or match full path"));
+                return Err(pingora_error::Error::explain(
+                    InvalidHTTPHeader,
+                    "prefix must end with / or match full path",
+                ));
             };
             self.set_path(new_path)?;
             Ok(true)
