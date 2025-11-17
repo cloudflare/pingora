@@ -306,12 +306,20 @@ impl SslDigest {
             }
         }
 
+        let sni = conn.server_name().map(|s| s.to_string());
+        let alpn = conn
+            .application_protocol()
+            .ok()
+            .and_then(|p| p.map(|s| s.as_bytes().to_vec()));
+
         SslDigest::new(
             cipher,
             version,
             organization,
             serial_number,
             cert_digest.unwrap_or_default(),
+            sni,
+            alpn,
         )
     }
 }

@@ -29,6 +29,10 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// The SNI (Server Name Indication) sent by the client
+    pub sni: Option<String>,
+    /// The ALPN (Application-Layer Protocol Negotiation) selected
+    pub alpn: Option<Vec<u8>>,
 }
 
 impl SslDigest {
@@ -39,6 +43,8 @@ impl SslDigest {
         organization: Option<String>,
         serial_number: Option<String>,
         cert_digest: Vec<u8>,
+        sni: Option<String>,
+        alpn: Option<Vec<u8>>,
     ) -> Self
     where
         S: Into<Cow<'static, str>>,
@@ -49,6 +55,8 @@ impl SslDigest {
             organization,
             serial_number,
             cert_digest,
+            sni,
+            alpn,
         }
     }
 }
