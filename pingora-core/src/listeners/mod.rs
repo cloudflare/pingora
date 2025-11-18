@@ -22,8 +22,13 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
-use log::debug;
+use crate::protocols::{
+    l4::socket::SocketAddr,
+    proxy_protocol,
+    tls::TlsRef,
+    Stream,
+};
+use log::{debug, warn};
 
 /// Callback function type for ClientHello extraction
 /// This allows external code (like moat) to generate fingerprints from ClientHello
@@ -159,6 +164,7 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
+        self.maybe_consume_proxy_header().await?;
         if let Some(tls) = self.tls {
             #[cfg(unix)]
             {
@@ -215,6 +221,43 @@ impl UninitializedStream {
         self.l4
             .get_socket_digest()
             .and_then(|d| d.peer_addr().cloned())
+    }
+
+    async fn maybe_consume_proxy_header(&mut self) -> Result<()> {
+        if !proxy_protocol::proxy_protocol_enabled() {
+            return Ok(());
+        }
+
+        match proxy_protocol::consume_proxy_header(&mut self.l4).await? {
+            Some(header) => {
+                if let Some(real_addr) = proxy_protocol::source_addr_from_header(&header) {
+                    if let Some(digest) = self.l4.get_socket_digest() {
+                        let client_addr = SocketAddr::Inet(real_addr);
+                        digest.set_client_addr(client_addr.clone());
+                        if let Some(proxy_addr) = digest.transport_peer_addr() {
+                            debug!(
+                                "PROXY protocol updated downstream peer {} -> {}",
+                                proxy_addr, client_addr
+                            );
+                        } else {
+                            debug!(
+                                "PROXY protocol detected downstream client {}",
+                                client_addr
+                            );
+                        }
+                    }
+                } else if proxy_protocol::header_has_source_addr(&header) {
+                    warn!("PROXY protocol header lacked a usable client address");
+                } else {
+                    debug!("PROXY protocol header contained no client address (LOCAL command)");
+                }
+            }
+            None => {
+                debug!("PROXY protocol is enabled but downstream connection sent no header");
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -68,6 +68,8 @@ pub struct SocketDigest {
     raw_sock: std::os::windows::io::RawSocket,
     /// Remote socket address
     pub peer_addr: OnceCell<Option<SocketAddr>>,
+    /// Remote client address derived from PROXY protocol headers when enabled.
+    pub client_addr: OnceCell<Option<SocketAddr>>,
     /// Local socket address
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
@@ -80,6 +82,7 @@ impl SocketDigest {
         SocketDigest {
             raw_fd,
             peer_addr: OnceCell::new(),
+            client_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
         }
@@ -90,6 +93,7 @@ impl SocketDigest {
         SocketDigest {
             raw_sock,
             peer_addr: OnceCell::new(),
+            client_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
         }
@@ -97,6 +101,9 @@ impl SocketDigest {
 
     #[cfg(unix)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
+        if let Some(addr) = self.client_addr.get().and_then(|addr| addr.as_ref()) {
+            return Some(addr);
+        }
         self.peer_addr
             .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, true))
             .as_ref()
@@ -104,9 +111,22 @@ impl SocketDigest {
 
     #[cfg(windows)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
+        if let Some(addr) = self.client_addr.get().and_then(|addr| addr.as_ref()) {
+            return Some(addr);
+        }
         self.peer_addr
             .get_or_init(|| SocketAddr::from_raw_socket(self.raw_sock, true))
             .as_ref()
+    }
+
+    /// Address of the physical TCP peer (e.g. the load balancer) regardless of PROXY headers.
+    pub fn transport_peer_addr(&self) -> Option<&SocketAddr> {
+        self.peer_addr.get().and_then(|addr| addr.as_ref())
+    }
+
+    /// Persist the real client address as provided by the PROXY protocol header.
+    pub fn set_client_addr(&self, addr: SocketAddr) {
+        let _ = self.client_addr.set(Some(addr));
     }
 
     #[cfg(unix)]
