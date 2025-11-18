@@ -19,14 +19,23 @@ pub struct CertificateInfo {
     /// Associated IP address
     pub ip_address: IpAddr,
 
+    /// SNI hostnames (if SNI is enabled)
+    pub sni_hostnames: Vec<String>,
+
     /// Tenant ID
     pub tenant_id: String,
+
+    /// SNI enabled for this certificate
+    pub sni_enabled: bool,
 }
 
-/// TLS certificate manager for IP-based certificate selection
+/// TLS certificate manager for IP-based and SNI-based certificate selection
 pub struct TlsCertificateManager {
     /// Map IP addresses to certificates
     ip_to_cert: Arc<DashMap<IpAddr, CertificateInfo>>,
+
+    /// Map SNI hostnames to certificates
+    sni_to_cert: Arc<DashMap<String, CertificateInfo>>,
 
     /// TLS configuration
     config: TlsConfig,
@@ -37,17 +46,31 @@ impl TlsCertificateManager {
     pub fn new(config: TlsConfig) -> Self {
         Self {
             ip_to_cert: Arc::new(DashMap::new()),
+            sni_to_cert: Arc::new(DashMap::new()),
             config,
         }
     }
 
-    /// Register a certificate for an IP address
+    /// Register a certificate for an IP address with optional SNI hostnames
     pub fn register_certificate(
         &self,
         ip: IpAddr,
         cert_path: String,
         key_path: String,
         tenant_id: String,
+    ) -> RouterResult<()> {
+        self.register_certificate_with_sni(ip, cert_path, key_path, tenant_id, vec![], false)
+    }
+
+    /// Register a certificate with SNI support
+    pub fn register_certificate_with_sni(
+        &self,
+        ip: IpAddr,
+        cert_path: String,
+        key_path: String,
+        tenant_id: String,
+        sni_hostnames: Vec<String>,
+        sni_enabled: bool,
     ) -> RouterResult<()> {
         // Validate certificate files exist
         if !Path::new(&cert_path).exists() {
@@ -68,11 +91,22 @@ impl TlsCertificateManager {
             cert_path,
             key_path,
             ip_address: ip,
+            sni_hostnames: sni_hostnames.clone(),
             tenant_id,
+            sni_enabled,
         };
 
-        self.ip_to_cert.insert(ip, cert_info);
+        // Always register by IP
+        self.ip_to_cert.insert(ip, cert_info.clone());
         log::info!("Registered certificate for IP: {}", ip);
+
+        // Also register by SNI if enabled
+        if sni_enabled {
+            for hostname in sni_hostnames {
+                self.sni_to_cert.insert(hostname.clone(), cert_info.clone());
+                log::info!("Registered certificate for SNI hostname: {}", hostname);
+            }
+        }
 
         Ok(())
     }
@@ -82,8 +116,64 @@ impl TlsCertificateManager {
         self.ip_to_cert.get(ip).map(|cert| cert.clone())
     }
 
+    /// Get certificate for an SNI hostname
+    pub fn get_certificate_by_sni(&self, hostname: &str) -> Option<CertificateInfo> {
+        self.sni_to_cert.get(hostname).map(|cert| cert.clone())
+    }
+
+    /// Get certificate by SNI or fallback to IP
+    pub fn get_certificate_hybrid(&self, sni_hostname: Option<&str>, ip: &IpAddr) -> Option<CertificateInfo> {
+        use crate::config::SniMode;
+
+        match self.config.sni_mode {
+            SniMode::Disabled => {
+                // IP-only mode
+                self.get_certificate(ip)
+            }
+            SniMode::Enabled | SniMode::Hybrid => {
+                // Try SNI first if provided and prefer_sni is true
+                if self.config.prefer_sni {
+                    if let Some(hostname) = sni_hostname {
+                        if let Some(cert) = self.get_certificate_by_sni(hostname) {
+                            log::debug!("Selected certificate using SNI: {}", hostname);
+                            return Some(cert);
+                        }
+                    }
+                    // Fallback to IP
+                    log::debug!("Falling back to IP-based certificate selection");
+                    self.get_certificate(ip)
+                } else {
+                    // Try IP first, then SNI
+                    if let Some(cert) = self.get_certificate(ip) {
+                        return Some(cert);
+                    }
+                    if let Some(hostname) = sni_hostname {
+                        self.get_certificate_by_sni(hostname)
+                    } else {
+                        None
+                    }
+                }
+            }
+            SniMode::Strict => {
+                // SNI is required
+                if let Some(hostname) = sni_hostname {
+                    self.get_certificate_by_sni(hostname)
+                } else {
+                    log::warn!("Strict SNI mode: connection rejected without SNI");
+                    None
+                }
+            }
+        }
+    }
+
     /// Remove certificate for an IP address
     pub fn remove_certificate(&self, ip: &IpAddr) {
+        if let Some(cert) = self.ip_to_cert.get(ip) {
+            // Remove SNI entries too
+            for hostname in &cert.sni_hostnames {
+                self.sni_to_cert.remove(hostname);
+            }
+        }
         self.ip_to_cert.remove(ip);
         log::info!("Removed certificate for IP: {}", ip);
     }
@@ -99,11 +189,13 @@ impl TlsCertificateManager {
     /// Load certificates from tenant configurations
     pub fn load_from_tenants(&self, tenants: &[TenantConfig]) -> RouterResult<()> {
         for tenant in tenants {
-            self.register_certificate(
+            self.register_certificate_with_sni(
                 tenant.nat_ip,
                 tenant.certificate_path.to_string_lossy().to_string(),
                 tenant.key_path.to_string_lossy().to_string(),
                 tenant.id.clone(),
+                tenant.sni.hostnames.clone(),
+                tenant.sni.enabled,
             )?;
         }
 
@@ -223,6 +315,8 @@ mod tests {
 
     #[test]
     fn test_certificate_registration() {
+        use crate::config::SniMode;
+
         let config = TlsConfig {
             min_version: "1.2".to_string(),
             cipher_suites: vec![],
@@ -230,6 +324,9 @@ mod tests {
             alpn_protocols: vec!["h2".to_string()],
             mtls: false,
             ca_cert_path: None,
+            sni_mode: SniMode::Disabled,
+            prefer_sni: false,
+            strict_sni: false,
         };
 
         let manager = TlsCertificateManager::new(config);
@@ -257,7 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn test_certificate_removal() {
+    fn test_sni_registration() {
+        use crate::config::SniMode;
+
         let config = TlsConfig {
             min_version: "1.2".to_string(),
             cipher_suites: vec![],
@@ -265,6 +364,62 @@ mod tests {
             alpn_protocols: vec!["h2".to_string()],
             mtls: false,
             ca_cert_path: None,
+            sni_mode: SniMode::Enabled,
+            prefer_sni: true,
+            strict_sni: false,
+        };
+
+        let manager = TlsCertificateManager::new(config);
+
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+
+        File::create(&cert_path).unwrap();
+        File::create(&key_path).unwrap();
+
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let hostnames = vec!["example.com".to_string(), "www.example.com".to_string()];
+
+        let result = manager.register_certificate_with_sni(
+            ip,
+            cert_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+            "tenant1".to_string(),
+            hostnames.clone(),
+            true,
+        );
+
+        assert!(result.is_ok());
+
+        // Test SNI lookup
+        let cert_info = manager.get_certificate_by_sni("example.com").unwrap();
+        assert_eq!(cert_info.tenant_id, "tenant1");
+        assert!(cert_info.sni_enabled);
+
+        // Test IP lookup still works
+        let cert_info = manager.get_certificate(&ip).unwrap();
+        assert_eq!(cert_info.tenant_id, "tenant1");
+
+        // Test hybrid lookup
+        let cert_info = manager.get_certificate_hybrid(Some("example.com"), &ip).unwrap();
+        assert_eq!(cert_info.tenant_id, "tenant1");
+    }
+
+    #[test]
+    fn test_certificate_removal() {
+        use crate::config::SniMode;
+
+        let config = TlsConfig {
+            min_version: "1.2".to_string(),
+            cipher_suites: vec![],
+            enable_alpn: true,
+            alpn_protocols: vec!["h2".to_string()],
+            mtls: false,
+            ca_cert_path: None,
+            sni_mode: SniMode::Disabled,
+            prefer_sni: false,
+            strict_sni: false,
         };
 
         let manager = TlsCertificateManager::new(config);

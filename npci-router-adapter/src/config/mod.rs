@@ -102,6 +102,10 @@ pub struct TenantConfig {
     /// Private key path
     pub key_path: PathBuf,
 
+    /// SNI (Server Name Indication) configuration
+    #[serde(default)]
+    pub sni: SniConfig,
+
     /// Backend services for this tenant
     pub backends: Vec<BackendConfig>,
 
@@ -122,6 +126,23 @@ pub struct TenantConfig {
     /// Enable/disable this tenant
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// SNI (Server Name Indication) configuration for a tenant
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SniConfig {
+    /// Enable SNI for this tenant
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// SNI hostname(s) for this tenant
+    /// Multiple hostnames can be specified for the same certificate
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+
+    /// Fallback to IP-based routing if SNI doesn't match
+    #[serde(default = "default_true")]
+    pub fallback_to_ip: bool,
 }
 
 /// Backend service configuration
@@ -379,6 +400,36 @@ pub struct TlsConfig {
 
     /// CA certificate path for mTLS
     pub ca_cert_path: Option<PathBuf>,
+
+    /// Global SNI (Server Name Indication) settings
+    #[serde(default)]
+    pub sni_mode: SniMode,
+
+    /// Prefer SNI over IP-based routing (when both are available)
+    #[serde(default)]
+    pub prefer_sni: bool,
+
+    /// Strict SNI mode: reject connections without SNI when SNI is enabled
+    #[serde(default)]
+    pub strict_sni: bool,
+}
+
+/// SNI mode for certificate selection
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SniMode {
+    /// Disabled: Use only IP-based certificate selection
+    #[default]
+    Disabled,
+
+    /// Enabled: Use SNI when available, fallback to IP
+    Enabled,
+
+    /// Strict: Require SNI for all connections
+    Strict,
+
+    /// Hybrid: Support both IP and SNI simultaneously
+    Hybrid,
 }
 
 /// Header manipulation rules

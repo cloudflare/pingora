@@ -6,6 +6,7 @@ A production-grade, multi-tenant HTTP/HTTPS router built on [Pingora](https://gi
 
 ✅ **Multi-Tenant Routing**: IP-based, header-based, path-based, and combined routing strategies
 ✅ **IP-Based TLS**: Different certificates for different clients based on IP (no SNI required)
+✅ **SNI Support**: Optional Server Name Indication for future-ready domain-based routing (toggleable feature)
 ✅ **Configuration-Driven**: Fully configurable via TOML/JSON files - add tenants/products without code changes
 ✅ **Bandwidth Tracking**: Real-time bandwidth monitoring per tenant/product
 ✅ **Rate Limiting**: Token bucket, sliding window, and fixed window algorithms
@@ -326,7 +327,45 @@ min_version = "1.2"  # or "1.3"
 enable_alpn = true
 alpn_protocols = ["h2", "http/1.1"]
 mtls = false  # Set to true for mutual TLS
+
+# SNI (Server Name Indication) support - toggleable feature
+sni_mode = "hybrid"      # disabled (default), enabled, strict, hybrid
+prefer_sni = false       # Use IP-based first for NPCI compatibility
+strict_sni = false       # Don't reject connections without SNI
 ```
+
+### SNI (Server Name Indication) Support
+
+**NEW**: The router now supports SNI alongside traditional IP-based TLS!
+
+#### Traditional IP-Only (Default - NPCI Compatible)
+```toml
+[tls]
+sni_mode = "disabled"
+
+[tenants.bank1.sni]
+enabled = false
+```
+
+#### Hybrid Mode (IP + SNI)
+```toml
+[tls]
+sni_mode = "hybrid"
+prefer_sni = false  # Keep IP as primary for NPCI
+
+[tenants.bank1.sni]
+enabled = true
+hostnames = ["bank1.npci.internal", "api.bank1.npci.internal"]
+fallback_to_ip = true  # Fallback to IP if SNI doesn't match
+```
+
+**Benefits:**
+- ✅ Future-proof for when NPCI provides domain names
+- ✅ Backward compatible with IP-only setups
+- ✅ Toggleable per-tenant
+- ✅ Zero disruption to existing deployments
+
+See [SNI-SUPPORT.md](docs/SNI-SUPPORT.md) for complete guide.
 
 ### Mutual TLS (mTLS)
 

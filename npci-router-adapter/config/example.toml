@@ -48,7 +48,17 @@ enable_alpn = true
 alpn_protocols = ["h2", "http/1.1"]
 mtls = false
 
-# Tenant 1: HDFC Bank
+# SNI (Server Name Indication) configuration
+# Modes: disabled, enabled, strict, hybrid
+# - disabled: Use only IP-based certificate selection (default for NPCI)
+# - enabled: Use SNI when available, fallback to IP
+# - strict: Require SNI for all connections
+# - hybrid: Support both IP and SNI simultaneously
+sni_mode = "hybrid"
+prefer_sni = false  # Prefer IP-based routing over SNI (for NPCI compatibility)
+strict_sni = false
+
+# Tenant 1: HDFC Bank (IP-based TLS only - traditional NPCI approach)
 [tenants.hdfc]
 id = "hdfc"
 name = "HDFC Bank"
@@ -56,6 +66,12 @@ nat_ip = "192.168.10.10"
 certificate_path = "/etc/npci-router/certs/hdfc-cert.pem"
 key_path = "/etc/npci-router/certs/hdfc-key.pem"
 enabled = true
+
+# SNI configuration for this tenant (optional)
+[tenants.hdfc.sni]
+enabled = false  # Disabled for traditional NPCI IP-only setup
+hostnames = []
+fallback_to_ip = true
 
 [[tenants.hdfc.backends]]
 id = "hdfc-backend-1"
@@ -89,7 +105,7 @@ set = {}
 response_add = { "X-Router" = "NPCI-Router/1.0" }
 response_remove = []
 
-# Tenant 2: ICICI Bank
+# Tenant 2: ICICI Bank (With SNI enabled - future-ready hybrid approach)
 [tenants.icici]
 id = "icici"
 name = "ICICI Bank"
@@ -97,6 +113,12 @@ nat_ip = "192.168.10.11"
 certificate_path = "/etc/npci-router/certs/icici-cert.pem"
 key_path = "/etc/npci-router/certs/icici-key.pem"
 enabled = true
+
+# SNI configuration enabled - future-ready for domain-based routing
+[tenants.icici.sni]
+enabled = true
+hostnames = ["icici.npci.internal", "api.icici.npci.internal"]
+fallback_to_ip = true  # Still support IP-based for backward compatibility
 
 [[tenants.icici.backends]]
 id = "icici-backend-1"

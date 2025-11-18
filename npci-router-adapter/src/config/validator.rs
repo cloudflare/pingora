@@ -97,6 +97,9 @@ fn validate_tenants(config: &RouterConfig) -> Result<()> {
 
         // Validate routing configuration
         validate_routing(&tenant.routing, &tenant.id)?;
+
+        // Validate SNI configuration
+        validate_sni_config(&tenant.sni, &tenant.id)?;
     }
 
     Ok(())
@@ -280,6 +283,8 @@ fn validate_monitoring(config: &super::MonitoringConfig) -> Result<()> {
 
 /// Validate TLS configuration
 fn validate_tls(config: &super::TlsConfig) -> Result<()> {
+    use super::SniMode;
+
     // Validate TLS version
     let valid_versions = vec!["1.0", "1.1", "1.2", "1.3"];
     if !valid_versions.contains(&config.min_version.as_str()) {
@@ -298,6 +303,42 @@ fn validate_tls(config: &super::TlsConfig) -> Result<()> {
     if let Some(ca_path) = &config.ca_cert_path {
         if !ca_path.exists() {
             return Err(anyhow!("CA certificate file not found: {:?}", ca_path));
+        }
+    }
+
+    // Validate SNI configuration
+    if config.sni_mode == SniMode::Strict && !config.prefer_sni {
+        return Err(anyhow!("Strict SNI mode requires prefer_sni to be enabled"));
+    }
+
+    Ok(())
+}
+
+/// Validate SNI configuration for a tenant
+fn validate_sni_config(sni: &super::SniConfig, tenant_id: &str) -> Result<()> {
+    if sni.enabled && sni.hostnames.is_empty() {
+        return Err(anyhow!(
+            "SNI is enabled but no hostnames specified for tenant: {}",
+            tenant_id
+        ));
+    }
+
+    // Validate hostname format
+    for hostname in &sni.hostnames {
+        if hostname.is_empty() {
+            return Err(anyhow!(
+                "Empty hostname in SNI configuration for tenant: {}",
+                tenant_id
+            ));
+        }
+
+        // Basic hostname validation (could be more strict)
+        if hostname.contains(' ') || hostname.starts_with('.') || hostname.ends_with('.') {
+            return Err(anyhow!(
+                "Invalid hostname format '{}' for tenant: {}",
+                hostname,
+                tenant_id
+            ));
         }
     }
 
