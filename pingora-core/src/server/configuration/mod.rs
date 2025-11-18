@@ -41,6 +41,10 @@ const DEFAULT_MAX_RETRIES: usize = 16;
 pub struct ServerConf {
     /// Version
     pub version: usize,
+    /// Enable support for parsing HAProxy PROXY protocol headers on downstream connections.
+    /// When enabled, Pingora will consume the header before TLS/HTTP parsing and expose the
+    /// original client address via the session APIs.
+    pub enable_proxy_protocol: bool,
     /// Whether to run this process in the background.
     pub daemon: bool,
     /// When configured and `daemon` setting is `true`, error log will be written to the given
@@ -115,6 +119,7 @@ impl Default for ServerConf {
     fn default() -> Self {
         ServerConf {
             version: 0,
+            enable_proxy_protocol: false,
             client_bind_to_ipv4: vec![],
             client_bind_to_ipv6: vec![],
             ca_file: None,
@@ -273,6 +278,7 @@ mod tests {
         init_log();
         let conf = ServerConf {
             version: 1,
+            enable_proxy_protocol: false,
             client_bind_to_ipv4: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
             client_bind_to_ipv6: vec![],
             ca_file: None,
@@ -331,5 +337,6 @@ version: 1
         assert_eq!(1, conf.version);
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
+        assert!(!conf.enable_proxy_protocol);
     }
 }

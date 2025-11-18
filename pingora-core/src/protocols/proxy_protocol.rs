@@ -17,6 +17,8 @@
 use bytes::Bytes;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType, OrErr, Result};
+use std::net::SocketAddr as StdSocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncReadExt;
 
 use crate::protocols::l4::stream::Stream;
@@ -32,6 +34,80 @@ pub const MAX_PROXY_HEADER_LEN: usize = 16 + 65_535;
 const PROXY_V2_SIGNATURE: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
+
+static PROXY_PROTOCOL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable global PROXY protocol parsing.
+pub fn set_proxy_protocol_enabled(enable: bool) {
+    PROXY_PROTOCOL_ENABLED.store(enable, Ordering::Relaxed);
+}
+
+/// Check whether global PROXY protocol parsing is enabled.
+pub fn proxy_protocol_enabled() -> bool {
+    PROXY_PROTOCOL_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Extract the real client address from a parsed PROXY protocol header when available.
+pub fn source_addr_from_header(header: &ProxyHeader) -> Option<StdSocketAddr> {
+    match header {
+        ProxyHeader::Version1 { addresses } => match addresses {
+            proxy_protocol::version1::ProxyAddresses::Ipv4 { source, .. } => {
+                Some(StdSocketAddr::V4(*source))
+            }
+            proxy_protocol::version1::ProxyAddresses::Ipv6 { source, .. } => {
+                Some(StdSocketAddr::V6(*source))
+            }
+            _ => None,
+        },
+        ProxyHeader::Version2 {
+            command,
+            addresses,
+            ..
+        } => {
+            if matches!(
+                command,
+                proxy_protocol::version2::ProxyCommand::Local
+            ) {
+                return None;
+            }
+            match addresses {
+                proxy_protocol::version2::ProxyAddresses::Ipv4 { source, .. } => {
+                    Some(StdSocketAddr::V4(*source))
+                }
+                proxy_protocol::version2::ProxyAddresses::Ipv6 { source, .. } => {
+                    Some(StdSocketAddr::V6(*source))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Return true if the PROXY header carries an explicit client source address.
+pub fn header_has_source_addr(header: &ProxyHeader) -> bool {
+    match header {
+        ProxyHeader::Version1 { addresses } => matches!(
+            addresses,
+            proxy_protocol::version1::ProxyAddresses::Ipv4 { .. }
+                | proxy_protocol::version1::ProxyAddresses::Ipv6 { .. }
+        ),
+        ProxyHeader::Version2 { command, addresses, .. } => {
+            if matches!(
+                command,
+                proxy_protocol::version2::ProxyCommand::Local
+            ) {
+                return false;
+            }
+            matches!(
+                addresses,
+                proxy_protocol::version2::ProxyAddresses::Ipv4 { .. }
+                    | proxy_protocol::version2::ProxyAddresses::Ipv6 { .. }
+            )
+        }
+        _ => false,
+    }
+}
 
 /// Error type used when a PROXY protocol header is malformed or exceeds limits.
 const PROXY_PROTOCOL_ERROR: ErrorType = ErrorType::Custom("ProxyProtocolError");

@@ -35,6 +35,7 @@ use tokio::signal::unix;
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio::time::{sleep, Duration};
 
+use crate::protocols::proxy_protocol;
 use crate::services::Service;
 use configuration::{Opt, ServerConf};
 #[cfg(unix)]
@@ -52,6 +53,19 @@ const CLOSE_TIMEOUT: u64 = 5;
 enum ShutdownType {
     Graceful,
     Quick,
+}
+
+fn proxy_protocol_env_enabled() -> bool {
+    std::env::var("AX_SERVER_ENABLE_PROXY_PROTOCOL")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn configure_proxy_protocol(conf: &mut ServerConf) {
+    if proxy_protocol_env_enabled() {
+        conf.enable_proxy_protocol = true;
+    }
+    proxy_protocol::set_proxy_protocol_enabled(conf.enable_proxy_protocol);
 }
 
 /// The execution phase the server is currently in.
@@ -351,6 +365,7 @@ impl Server {
             }
             conf.merge_with_opt(opts);
         }
+        configure_proxy_protocol(&mut conf);
 
         let (tx, rx) = watch::channel(false);
 
@@ -379,7 +394,7 @@ impl Server {
         let opt = opt.into();
         let (tx, rx) = watch::channel(false);
 
-        let conf = if let Some(opt) = opt.as_ref() {
+        let mut conf = if let Some(opt) = opt.as_ref() {
             opt.conf.as_ref().map_or_else(
                 || {
                     // options, no conf, generated
@@ -396,6 +411,7 @@ impl Server {
             ServerConf::new()
                 .ok_or_else(|| Error::explain(ErrorType::ReadError, "Conf generation failed"))
         }?;
+        configure_proxy_protocol(&mut conf);
 
         Ok(Server {
             services: vec![],
