@@ -1,0 +1,314 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: npci-router
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: npci-router-config
+  namespace: npci-router
+data:
+  config.toml: |
+    [server]
+    name = "npci-router"
+    threads = 8
+    ingress_ip = "0.0.0.0"
+    ingress_port = 443
+    egress_ip = "0.0.0.0"
+    egress_port = 8443
+    enable_h2 = true
+    connection_timeout_secs = 30
+    request_timeout_secs = 30
+    keepalive_timeout_secs = 60
+    max_connections = 10000
+
+    [rate_limiting]
+    enabled = true
+    default_rps = 1000
+    window_secs = 1
+    algorithm = "tokenBucket"
+
+    [bandwidth]
+    enabled = true
+    report_interval_secs = 60
+
+    [health_check]
+    enabled = true
+    interval_secs = 5
+    timeout_secs = 2
+    check_type = "tcp"
+    failure_threshold = 3
+    success_threshold = 2
+
+    [monitoring]
+    enabled = true
+    metrics_addr = "0.0.0.0"
+    metrics_port = 9090
+    access_logs = true
+    tracing = false
+
+    [tls]
+    min_version = "1.2"
+    enable_alpn = true
+    alpn_protocols = ["h2", "http/1.1"]
+    mtls = false
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: npci-router-certs
+  namespace: npci-router
+type: Opaque
+data:
+  # Base64 encoded certificates and keys
+  # Replace with actual certificate data
+  tenant1-cert.pem: LS0tLS1CRUdJTi...
+  tenant1-key.pem: LS0tLS1CRUdJTi...
+  tenant2-cert.pem: LS0tLS1CRUdJTi...
+  tenant2-key.pem: LS0tLS1CRUdJTi...
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: npci-router
+  namespace: npci-router
+  labels:
+    app: npci-router
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: npci-router
+  template:
+    metadata:
+      labels:
+        app: npci-router
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - npci-router
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: npci-router
+          image: npci-router:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: ingress
+              containerPort: 443
+              protocol: TCP
+            - name: egress
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: config
+              mountPath: /etc/npci-router
+              readOnly: true
+            - name: certs
+              mountPath: /etc/npci-router/certs
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/npci-router
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: RUST_BACKTRACE
+              value: "1"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: config
+          configMap:
+            name: npci-router-config
+        - name: certs
+          secret:
+            secretName: npci-router-certs
+        - name: logs
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: npci-router-ingress
+  namespace: npci-router
+  labels:
+    app: npci-router
+spec:
+  type: LoadBalancer
+  # Specify the ingress IP (cloud provider specific)
+  loadBalancerIP: 203.0.113.10  # Replace with actual ingress IP
+  externalTrafficPolicy: Local
+  selector:
+    app: npci-router
+  ports:
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: npci-router-egress
+  namespace: npci-router
+  labels:
+    app: npci-router
+spec:
+  type: LoadBalancer
+  # Specify the egress IP (cloud provider specific)
+  loadBalancerIP: 203.0.113.11  # Replace with actual egress IP
+  externalTrafficPolicy: Local
+  selector:
+    app: npci-router
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: npci-router-metrics
+  namespace: npci-router
+  labels:
+    app: npci-router
+spec:
+  type: ClusterIP
+  selector:
+    app: npci-router
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: npci-router-hpa
+  namespace: npci-router
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: npci-router
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: npci-router-pdb
+  namespace: npci-router
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: npci-router
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: npci-router-netpol
+  namespace: npci-router
+spec:
+  podSelector:
+    matchLabels:
+      app: npci-router
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 8443
+        - protocol: TCP
+          port: 9090
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53

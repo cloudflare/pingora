@@ -1,0 +1,162 @@
+# NPCI Router Configuration Example (TOML)
+
+[server]
+name = "npci-router-prod"
+threads = 8
+ingress_ip = "0.0.0.0"
+ingress_port = 443
+egress_ip = "0.0.0.0"
+egress_port = 8443
+enable_h2 = true
+connection_timeout_secs = 30
+request_timeout_secs = 30
+keepalive_timeout_secs = 60
+max_connections = 10000
+
+[rate_limiting]
+enabled = true
+default_rps = 1000
+window_secs = 1
+algorithm = "tokenBucket"
+
+[bandwidth]
+enabled = true
+report_interval_secs = 60
+stats_file = "/var/log/npci-router/bandwidth.json"
+
+[health_check]
+enabled = true
+interval_secs = 5
+timeout_secs = 2
+check_type = "tcp"
+http_path = "/health"
+failure_threshold = 3
+success_threshold = 2
+
+[monitoring]
+enabled = true
+metrics_addr = "0.0.0.0"
+metrics_port = 9090
+access_logs = true
+access_log_file = "/var/log/npci-router/access.log"
+tracing = false
+
+[tls]
+min_version = "1.2"
+cipher_suites = []
+enable_alpn = true
+alpn_protocols = ["h2", "http/1.1"]
+mtls = false
+
+# Tenant 1: HDFC Bank
+[tenants.hdfc]
+id = "hdfc"
+name = "HDFC Bank"
+nat_ip = "192.168.10.10"
+certificate_path = "/etc/npci-router/certs/hdfc-cert.pem"
+key_path = "/etc/npci-router/certs/hdfc-key.pem"
+enabled = true
+
+[[tenants.hdfc.backends]]
+id = "hdfc-backend-1"
+address = "10.0.1.100:8080"
+weight = 100
+tls = false
+pool_size = 32
+
+[[tenants.hdfc.backends]]
+id = "hdfc-backend-2"
+address = "10.0.1.101:8080"
+weight = 100
+tls = false
+pool_size = 32
+
+[tenants.hdfc.routing]
+strategy = "ip"
+
+[tenants.hdfc.rate_limit]
+rps = 2000
+burst = 500
+
+[tenants.hdfc.bandwidth_limit]
+max_bps_ingress = 104857600  # 100 MB/s
+max_bps_egress = 104857600    # 100 MB/s
+
+[tenants.hdfc.headers]
+add = { "X-Source" = "NPCI", "X-Environment" = "Production" }
+remove = ["X-Internal"]
+set = {}
+response_add = { "X-Router" = "NPCI-Router/1.0" }
+response_remove = []
+
+# Tenant 2: ICICI Bank
+[tenants.icici]
+id = "icici"
+name = "ICICI Bank"
+nat_ip = "192.168.10.11"
+certificate_path = "/etc/npci-router/certs/icici-cert.pem"
+key_path = "/etc/npci-router/certs/icici-key.pem"
+enabled = true
+
+[[tenants.icici.backends]]
+id = "icici-backend-1"
+address = "10.0.2.100:8443"
+weight = 100
+tls = true
+sni = "icici-backend.internal"
+pool_size = 32
+
+[tenants.icici.routing]
+strategy = "header"
+header_name = "X-Bank-ID"
+
+[tenants.icici.rate_limit]
+rps = 1500
+
+[tenants.icici.headers]
+add = { "X-Source" = "NPCI" }
+remove = []
+set = {}
+response_add = {}
+response_remove = []
+
+# Product 1: UPI
+[products.upi]
+id = "upi"
+name = "UPI Payment Service"
+ips = ["192.168.20.10", "192.168.20.11"]
+dns = ["upi1.npci.internal", "upi2.npci.internal"]
+
+[[products.upi.backends]]
+id = "upi-backend-1"
+address = "10.1.1.100:9000"
+weight = 100
+tls = false
+pool_size = 64
+
+[[products.upi.backends]]
+id = "upi-backend-2"
+address = "10.1.1.101:9000"
+weight = 100
+tls = false
+pool_size = 64
+
+[products.upi.rate_limit]
+rps = 5000
+
+# Product 2: IMPS
+[products.imps]
+id = "imps"
+name = "IMPS Payment Service"
+ips = ["192.168.20.20", "192.168.20.21"]
+dns = ["imps1.npci.internal", "imps2.npci.internal"]
+
+[[products.imps.backends]]
+id = "imps-backend-1"
+address = "10.1.2.100:9001"
+weight = 100
+tls = false
+pool_size = 32
+
+[products.imps.rate_limit]
+rps = 3000
