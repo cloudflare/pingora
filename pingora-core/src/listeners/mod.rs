@@ -29,7 +29,7 @@ use crate::server::ListenFds;
 
 use async_trait::async_trait;
 use pingora_error::Result;
-use std::{fs::Permissions, sync::Arc};
+use std::{any::Any, fs::Permissions, sync::Arc};
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
@@ -48,6 +48,19 @@ pub trait TlsAccept {
     /// Note. This is only supported for openssl and boringssl
     async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
         // does nothing by default
+    }
+
+    /// This function is called after the TLS handshake is complete.
+    ///
+    /// Any value returned from this function (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    async fn handshake_complete_callback(
+        &self,
+        _ssl: &mut TlsRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
     }
 }
 

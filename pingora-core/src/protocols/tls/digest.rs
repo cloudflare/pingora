@@ -14,7 +14,9 @@
 
 //! TLS information from the TLS connection
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// The TLS connection information
 #[derive(Clone, Debug)]
@@ -29,6 +31,8 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// The user-defined TLS data
+    pub extension: SslDigestExtension,
 }
 
 impl SslDigest {
@@ -49,6 +53,30 @@ impl SslDigest {
             organization,
             serial_number,
             cert_digest,
+            extension: SslDigestExtension::default(),
         }
+    }
+}
+
+/// The user-defined TLS data
+#[derive(Clone, Debug, Default)]
+pub struct SslDigestExtension {
+    value: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl SslDigestExtension {
+    /// Retrieves a reference to the user-defined TLS data if it matches the specified type.
+    ///
+    /// Returns `None` if no data has been set or if the data is not of type `T`.
+    pub fn get<T>(&self) -> Option<&T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.value.as_ref().and_then(|v| v.downcast_ref::<T>())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set(&mut self, value: Arc<dyn Any + Send + Sync>) {
+        self.value = Some(value);
     }
 }

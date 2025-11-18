@@ -64,10 +64,17 @@ pub async fn handshake_with_callback<S: IO>(
             .resume_accept()
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
-        Ok(tls_stream)
-    } else {
-        Ok(tls_stream)
     }
+    {
+        // safety: we do hold a mut ref of tls_stream
+        let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
+        if let Some(extension) = callbacks.handshake_complete_callback(ssl_mut).await {
+            if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
+                digest_mut.extension.set(extension);
+            }
+        }
+    }
+    Ok(tls_stream)
 }
 
 #[async_trait]
