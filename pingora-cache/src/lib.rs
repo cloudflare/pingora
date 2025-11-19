@@ -398,8 +398,7 @@ impl HttpCache {
                         OriginNotCache | ResponseTooLarge | PredictedResponseTooLarge => {
                             LockStatus::GiveUp
                         }
-                        // not sure which LockStatus make sense, we treat it as GiveUp for now
-                        Custom(_) => LockStatus::GiveUp,
+                        Custom(reason) => lock_ctx.cache_lock.custom_lock_status(reason),
                         // should never happen, NeverEnabled shouldn't hold a lock
                         NeverEnabled => panic!("NeverEnabled holds a write lock"),
                         CacheLockGiveUp | CacheLockTimeout => {
