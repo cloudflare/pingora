@@ -250,10 +250,6 @@ where
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
                 }
-                if *shutdown.borrow() {
-                    // stop downstream from reusing if this service is shutting down soon
-                    session.set_keepalive(None);
-                }
 
                 result = self.process_new_http(session, shutdown).await;
             }

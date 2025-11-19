@@ -972,15 +972,20 @@ where
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
-        _shutdown: &ShutdownWatch,
+        shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
-        let session = match self.handle_new_request(session).await {
+        let mut session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return None, // bad request
         };
+
+        if *shutdown.borrow() {
+            // stop downstream from reusing if this service is shutting down soon
+            session.set_keepalive(None);
+        }
 
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await
