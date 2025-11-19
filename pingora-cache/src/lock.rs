@@ -45,6 +45,13 @@ pub trait CacheKeyLock {
         let tag_value: &'static str = lock_status.into();
         span.set_tag(|| Tag::new("status", tag_value));
     }
+
+    /// Set a lock status for a custom `NoCacheReason`.
+    fn custom_lock_status(&self, _custom_no_cache: &'static str) -> LockStatus {
+        // treat custom no cache reasons as GiveUp by default
+        // (like OriginNotCache)
+        LockStatus::GiveUp
+    }
 }
 
 const N_SHARDS: usize = 16;
