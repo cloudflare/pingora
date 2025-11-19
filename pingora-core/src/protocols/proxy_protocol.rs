@@ -224,8 +224,21 @@ pub async fn consume_proxy_header(stream: &mut Stream) -> Result<Option<ProxyHea
                 trace!("Stream EOF with no PROXY preface detected");
                 return Ok(None);
             } else {
-                debug!("Stream closed while reading PROXY header");
-                return Error::e_explain(PROXY_PROTOCOL_ERROR, "Incomplete PROXY protocol header");
+                // Connection closed while reading. Check if buffer looks like a PROXY header.
+                // If it doesn't match PROXY signature, treat as no PROXY header (rewind and continue).
+                match detect_proxy_header(&buffer) {
+                    ProxyDetection::NotProxy => {
+                        // Buffer doesn't look like PROXY header - rewind and treat as no PROXY header
+                        trace!("Stream EOF with data that doesn't match PROXY protocol - treating as no PROXY header");
+                        stream.rewind(&buffer);
+                        return Ok(None);
+                    }
+                    ProxyDetection::NeedsMore | ProxyDetection::Invalid | ProxyDetection::HeaderLength(_) => {
+                        // Buffer looks like it could be a PROXY header but connection closed
+                        debug!("Stream closed while reading PROXY header (buffer looks like PROXY header)");
+                        return Error::e_explain(PROXY_PROTOCOL_ERROR, "Incomplete PROXY protocol header");
+                    }
+                }
             }
         }
 

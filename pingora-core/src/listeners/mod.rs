@@ -29,6 +29,7 @@ use crate::protocols::{
     Stream,
 };
 use log::{debug, warn};
+use pingora_error::{OrErr, ErrorType::*};
 
 /// Callback function type for ClientHello extraction
 /// This allows external code (like moat) to generate fingerprints from ClientHello
@@ -174,16 +175,26 @@ impl UninitializedStream {
                 // Wrap stream with ClientHelloWrapper
                 let mut wrapper = ClientHelloWrapper::new(self.l4);
 
-                // Extract ClientHello synchronously (blocks until data is available)
-                let hello = match wrapper.extract_client_hello() {
+                // Extract ClientHello asynchronously (avoids blocking the thread)
+                let hello = match wrapper.extract_client_hello_async().await {
                     Ok(Some(hello)) => Some(hello),
                     Ok(None) => {
                         debug!("No ClientHello detected in stream");
                         None
                     }
                     Err(e) => {
-                        debug!("Failed to extract ClientHello: {:?}", e);
-                        None
+                        // Check if this is a connection error that should abort the handshake
+                        match e.kind() {
+                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                                debug!("Connection closed during ClientHello extraction: {:?}", e);
+                                // Return error to abort the connection instead of proceeding to TLS handshake
+                                return Err(e).or_err(AcceptError, "Connection closed during ClientHello extraction");
+                            }
+                            _ => {
+                                debug!("Non-fatal error extracting ClientHello: {:?}", e);
+                                None
+                            }
+                        }
                     }
                 };
 
@@ -228,8 +239,16 @@ impl UninitializedStream {
             return Ok(());
         }
 
-        match proxy_protocol::consume_proxy_header(&mut self.l4).await? {
-            Some(header) => {
+        let peer_addr = self.l4
+            .get_socket_digest()
+            .and_then(|d| d.transport_peer_addr().cloned());
+        let peer_str = peer_addr
+            .as_ref()
+            .map(|a| format!("{}", a))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        match proxy_protocol::consume_proxy_header(&mut self.l4).await {
+            Ok(Some(header)) => {
                 if let Some(real_addr) = proxy_protocol::source_addr_from_header(&header) {
                     if let Some(digest) = self.l4.get_socket_digest() {
                         let client_addr = SocketAddr::Inet(real_addr);
@@ -252,8 +271,15 @@ impl UninitializedStream {
                     debug!("PROXY protocol header contained no client address (LOCAL command)");
                 }
             }
-            None => {
-                debug!("PROXY protocol is enabled but downstream connection sent no header");
+            Ok(None) => {
+                debug!("PROXY protocol is enabled but downstream connection from {} sent no header (connection will continue)", peer_str);
+            }
+            Err(e) => {
+                // PROXY protocol parsing failed - this could be due to connection reset
+                // Log at debug level since this is expected when connections are reset
+                debug!("PROXY protocol parsing failed for connection from {}: {:?} (connection may continue if not a PROXY header)", peer_str, e);
+                // Don't propagate the error - let the connection continue
+                // The error might be due to connection reset, which is handled elsewhere
             }
         }
 
