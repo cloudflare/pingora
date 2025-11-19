@@ -137,43 +137,23 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> ResumableAccept for SslStream<S> 
     }
 }
 
-#[tokio::test]
-#[cfg(feature = "any_tls")]
-async fn test_async_cert() {
-    use crate::protocols::tls::TlsRef;
-    use tokio::io::AsyncReadExt;
+#[cfg(test)]
+mod tests {
+    use super::handshake_with_callback;
 
     use crate::listeners::{TlsAccept, TlsAcceptCallbacks};
-    let acceptor = ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls())
-        .unwrap()
-        .build();
+    use crate::protocols::tls::SslStream;
+    use crate::protocols::tls::TlsRef;
+    use crate::tls::ext;
+    use crate::tls::ssl;
 
-    struct Callback;
-    #[async_trait]
-    impl TlsAccept for Callback {
-        async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
-            assert_eq!(
-                ssl.servername(ssl::NameType::HOST_NAME).unwrap(),
-                "pingora.org"
-            );
-            let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
-            let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+    use async_trait::async_trait;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tokio::io::DuplexStream;
 
-            let cert_bytes = std::fs::read(cert).unwrap();
-            let cert = crate::tls::x509::X509::from_pem(&cert_bytes).unwrap();
-
-            let key_bytes = std::fs::read(key).unwrap();
-            let key = crate::tls::pkey::PKey::private_key_from_pem(&key_bytes).unwrap();
-            ext::ssl_use_certificate(ssl, &cert).unwrap();
-            ext::ssl_use_private_key(ssl, &key).unwrap();
-        }
-    }
-
-    let cb: TlsAcceptCallbacks = Box::new(Callback);
-
-    let (client, server) = tokio::io::duplex(1024);
-
-    tokio::spawn(async move {
+    async fn client_task(client: DuplexStream) {
+        use tokio::io::AsyncReadExt;
         let ssl_context = ssl::SslContext::builder(ssl::SslMethod::tls())
             .unwrap()
             .build();
@@ -184,9 +164,87 @@ async fn test_async_cert() {
         Pin::new(&mut stream).connect().await.unwrap();
         let mut buf = [0; 1];
         let _ = stream.read(&mut buf).await;
-    });
+    }
 
-    handshake_with_callback(&acceptor, server, &cb)
-        .await
-        .unwrap();
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_async_cert() {
+        let acceptor = ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls())
+            .unwrap()
+            .build();
+
+        struct Callback;
+        #[async_trait]
+        impl TlsAccept for Callback {
+            async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
+                assert_eq!(
+                    ssl.servername(ssl::NameType::HOST_NAME).unwrap(),
+                    "pingora.org"
+                );
+                let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+                let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+                let cert_bytes = std::fs::read(cert).unwrap();
+                let cert = crate::tls::x509::X509::from_pem(&cert_bytes).unwrap();
+
+                let key_bytes = std::fs::read(key).unwrap();
+                let key = crate::tls::pkey::PKey::private_key_from_pem(&key_bytes).unwrap();
+                ext::ssl_use_certificate(ssl, &cert).unwrap();
+                ext::ssl_use_private_key(ssl, &key).unwrap();
+            }
+        }
+
+        let cb: TlsAcceptCallbacks = Box::new(Callback);
+
+        let (client, server) = tokio::io::duplex(1024);
+
+        tokio::spawn(client_task(client));
+
+        handshake_with_callback(&acceptor, server, &cb)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "openssl_derived")]
+    async fn test_handshake_complete_callback() {
+        use pingora_openssl::ssl::SslFiletype;
+
+        let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+        let acceptor = {
+            let mut builder =
+                ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls()).unwrap();
+            builder.set_certificate_chain_file(cert).unwrap();
+            builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
+            builder.build()
+        };
+
+        struct Sni(String);
+        struct Callback;
+        #[async_trait]
+        impl TlsAccept for Callback {
+            async fn handshake_complete_callback(
+                &self,
+                ssl: &mut TlsRef,
+            ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+                let sni = ssl.servername(ssl::NameType::HOST_NAME)?.to_string();
+                Some(Arc::new(Sni(sni)))
+            }
+        }
+
+        let cb: TlsAcceptCallbacks = Box::new(Callback);
+
+        let (client, server) = tokio::io::duplex(1024);
+
+        tokio::spawn(client_task(client));
+
+        let stream = handshake_with_callback(&acceptor, server, &cb)
+            .await
+            .unwrap();
+        let ssl_digest = stream.ssl_digest().unwrap();
+        let sni = ssl_digest.extension.get::<Sni>().unwrap();
+        assert_eq!(sni.0, "pingora.org");
+    }
 }
