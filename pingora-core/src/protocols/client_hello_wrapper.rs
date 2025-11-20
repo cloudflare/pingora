@@ -131,46 +131,78 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                     return Poll::Ready(Ok(wrapper.client_hello.clone()));
                 }
 
-                // Check if socket is ready for reading by polling with a zero-sized buffer
-                let mut buf = ReadBuf::new(&mut []);
-                match Pin::new(&mut wrapper.inner).poll_read(cx, &mut buf) {
-                    Poll::Ready(Ok(_)) => {
-                        // Socket is ready, try to extract
-                        match peek_client_hello(&wrapper.inner) {
-                            Ok(Some(hello)) => {
-                                // Successfully extracted ClientHello
+                // Try to extract ClientHello directly (uses MSG_DONTWAIT internally)
+                match peek_client_hello(&wrapper.inner) {
+                    Ok(Some(hello)) => {
+                        // Successfully extracted ClientHello
+                        wrapper.hello_extracted = true;
+                        debug!(
+                            "Async extracted ClientHello: SNI={:?}, ALPN={:?}",
+                            hello.sni, hello.alpn
+                        );
+                        let hello_arc = Arc::new(hello);
+                        wrapper.client_hello = Some(hello_arc.clone());
+                        Poll::Ready(Ok(Some(hello_arc)))
+                    }
+                    Ok(None) => {
+                        // No data available yet (EAGAIN/EWOULDBLOCK) - need to wait
+                        // Poll the socket to register wakeup when data arrives
+                        let mut buf = ReadBuf::new(&mut []);
+                        match Pin::new(&mut wrapper.inner).poll_read(cx, &mut buf) {
+                            Poll::Ready(Ok(_)) => {
+                                // Socket became ready but peek_client_hello returned None
+                                // This might mean partial data - try one more time
+                                match peek_client_hello(&wrapper.inner) {
+                                    Ok(Some(hello)) => {
+                                        wrapper.hello_extracted = true;
+                                        let hello_arc = Arc::new(hello);
+                                        wrapper.client_hello = Some(hello_arc.clone());
+                                        Poll::Ready(Ok(Some(hello_arc)))
+                                    }
+                                    Ok(None) => {
+                                        // Still no data after socket ready - probably not a valid ClientHello
+                                        wrapper.hello_extracted = true;
+                                        debug!("Socket ready but no valid ClientHello found");
+                                        Poll::Ready(Ok(None))
+                                    }
+                                    Err(e) => {
+                                        wrapper.hello_extracted = true;
+                                        match e.kind() {
+                                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+                                                Poll::Ready(Err(e))
+                                            }
+                                            _ => Poll::Ready(Ok(None))
+                                        }
+                                    }
+                                }
+                            }
+                            Poll::Ready(Err(e)) => {
                                 wrapper.hello_extracted = true;
-                                debug!(
-                                    "Async extracted ClientHello: SNI={:?}, ALPN={:?}",
-                                    hello.sni, hello.alpn
-                                );
-                                let hello_arc = Arc::new(hello);
-                                wrapper.client_hello = Some(hello_arc.clone());
-                                Poll::Ready(Ok(Some(hello_arc)))
+                                match e.kind() {
+                                    io::ErrorKind::WouldBlock => Poll::Pending,
+                                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+                                        Poll::Ready(Err(e))
+                                    }
+                                    _ => Poll::Ready(Ok(None))
+                                }
                             }
-                            Ok(None) => {
-                                // peek_client_hello returns Ok(None) for EAGAIN/EWOULDBLOCK
-                                // This means data isn't available yet, keep polling
-                                debug!("No data available yet for ClientHello peek, continuing to poll");
-                                Poll::Pending
+                            Poll::Pending => Poll::Pending,
+                        }
+                    }
+                    Err(e) => {
+                        // Distinguish between fatal errors (like ConnectionReset) and non-fatal ones
+                        wrapper.hello_extracted = true;
+                        match e.kind() {
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+                                debug!("Connection closed while extracting ClientHello: {:?}", e);
+                                Poll::Ready(Err(e))
                             }
-                            Err(e) => {
-                                debug!("Failed to extract ClientHello: {:?}", e);
-                                wrapper.hello_extracted = true; // Mark as attempted to avoid infinite retries
+                            _ => {
+                                debug!("Non-fatal error extracting ClientHello: {:?}", e);
                                 Poll::Ready(Ok(None))
                             }
                         }
                     }
-                    Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // WouldBlock means not ready yet, continue polling
-                        Poll::Pending
-                    }
-                    Poll::Ready(Err(e)) => {
-                        debug!("Socket error while waiting for ClientHello: {:?}", e);
-                        wrapper.hello_extracted = true; // Mark as attempted to avoid infinite retries
-                        Poll::Ready(Ok(None))
-                    }
-                    Poll::Pending => Poll::Pending,
                 }
             }
         }

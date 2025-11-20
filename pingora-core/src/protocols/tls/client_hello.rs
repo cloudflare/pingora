@@ -509,30 +509,19 @@ use std::os::unix::io::AsRawFd;
 /// This function temporarily sets the socket to blocking mode to wait for data
 #[cfg(unix)]
 pub fn peek_client_hello<S: AsRawFd>(stream: &S) -> io::Result<Option<ClientHello>> {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::sys::socket::{recv, MsgFlags};
 
     let fd = stream.as_raw_fd();
-
-    // Get current socket flags
-    let current_flags = fcntl(fd, FcntlArg::F_GETFL)
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    let current_oflag = OFlag::from_bits_truncate(current_flags);
-    let is_non_blocking = current_oflag.contains(OFlag::O_NONBLOCK);
-
-    // Temporarily set socket to blocking mode if it's non-blocking
-    if is_non_blocking {
-        let blocking_flags = current_oflag & !OFlag::O_NONBLOCK;
-        fcntl(fd, FcntlArg::F_SETFL(blocking_flags))
-            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-    }
 
     // Maximum size for a TLS record is 16KB + 5 bytes header
     // We allocate enough space to capture most ClientHello messages
     let mut buf = vec![0u8; 16384 + 5];
 
-    // Now recv will block until data is available
-    let result = match recv(fd, &mut buf, MsgFlags::MSG_PEEK) {
+    // Use MSG_PEEK | MSG_DONTWAIT to try to peek without blocking
+    // This avoids the need to toggle socket blocking mode via fcntl
+    let flags = MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT;
+
+    match recv(fd, &mut buf, flags) {
         Ok(size) => {
             if size == 0 {
                 Ok(None)
@@ -542,18 +531,20 @@ pub fn peek_client_hello<S: AsRawFd>(stream: &S) -> io::Result<Option<ClientHell
             }
         }
         Err(e) => {
-            warn!("Failed to peek at socket: {:?}", e);
-            Err(e.into())
+            let io_err: io::Error = e.into();
+            match io_err.kind() {
+                io::ErrorKind::WouldBlock => Ok(None),
+                io::ErrorKind::ConnectionReset => {
+                    debug!("Failed to peek at socket (connection reset): {:?}", io_err);
+                    Err(io_err)
+                }
+                _ => {
+                    debug!("Failed to peek at socket: {:?}", io_err);
+                    Err(io_err)
+                }
+            }
         }
-    };
-
-    // Restore original socket flags
-    if is_non_blocking {
-        fcntl(fd, FcntlArg::F_SETFL(current_oflag))
-            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
     }
-
-    result
 }
 
 #[cfg(windows)]
