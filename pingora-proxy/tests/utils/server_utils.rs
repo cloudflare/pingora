@@ -19,7 +19,6 @@ use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
-use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
@@ -46,6 +45,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
@@ -363,16 +363,16 @@ impl ProxyHttp for ExampleProxyHttp {
     }
 }
 
-static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_BACKEND: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
-static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
-static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
-    Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static CACHE_PREDICTOR: LazyLock<Predictor<32>> = LazyLock::new(|| Predictor::new(5, None));
+static EVICTION_MANAGER: LazyLock<Manager> = LazyLock::new(|| Manager::new(8192)); // 8192 bytes
+static CACHE_LOCK: LazyLock<Box<CacheKeyLockImpl>> =
+    LazyLock::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
 // Example of how one might restrict which fields can be varied on.
-static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
-    Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
+static CACHE_VARY_ALLOWED_HEADERS: LazyLock<Option<HashSet<&str>>> =
+    LazyLock::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -862,9 +862,9 @@ impl PskTlsServer {
 }
 
 // FIXME: this still allows multiple servers to spawn across integration tests
-pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
+pub static TEST_SERVER: LazyLock<Server> = LazyLock::new(Server::start);
 #[cfg(feature = "s2n")]
-pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
+pub static TEST_PSK_TLS_SERVER: LazyLock<PskTlsServer> = LazyLock::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
 
 pub fn init() {

@@ -19,12 +19,12 @@ use super::*;
 use http::header::HeaderName;
 use http::HeaderValue;
 use indexmap::IndexMap;
-use once_cell::sync::Lazy;
 use pingora_error::{Error, ErrorType};
 use regex::bytes::Regex;
 use std::num::IntErrorKind;
 use std::slice;
 use std::str;
+use std::sync::LazyLock;
 
 /// The max delta-second per [RFC 9111](https://datatracker.ietf.org/doc/html/rfc9111#section-1.2.2)
 // "If a cache receives a delta-seconds value
@@ -157,13 +157,13 @@ impl<'a> Iterator for ListValueIter<'a> {
 // note the `token` implementation excludes disallowed ASCII ranges
 // and disallowed delimiters: https://datatracker.ietf.org/doc/html/rfc9110#section-5.6.2
 // though it does not forbid `obs-text`: %x80-FF
-static RE_CACHE_DIRECTIVE: Lazy<Regex> =
+static RE_CACHE_DIRECTIVE: LazyLock<Regex> =
     // to break our version down further:
     // `(?-u)`: unicode support disabled, which puts the regex into "ASCII compatible mode" for specifying literal bytes like \x7F: https://docs.rs/regex/1.10.4/regex/bytes/index.html#syntax
     // `(?:^|(?:\s*[,;]\s*)`: allow either , or ; as a delimiter
     // `([^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+)`: token (directive name capture group)
     // `(?:=((?:[^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+|(?:"(?:[^"\\]|\\.)*"))))`: token OR quoted-string (directive value capture-group)
-    Lazy::new(|| {
+    LazyLock::new(|| {
         Regex::new(r#"(?-u)(?:^|(?:\s*[,;]\s*))([^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+)(?:=((?:[^\x00-\x20\(\)<>@,;:\\"/\[\]\?=\{\}\x7F]+|(?:"(?:[^"\\]|\\.)*"))))?"#).unwrap()
     });
 
