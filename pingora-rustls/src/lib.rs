@@ -24,13 +24,20 @@ use std::path::Path;
 use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
-pub use rustls::{version, ClientConfig, RootCertStore, ServerConfig, Stream};
+
+pub use rustls::{
+    client::WebPkiServerVerifier, version, CertificateError, ClientConfig, DigitallySignedStruct,
+    Error as RusTlsError, RootCertStore, ServerConfig, SignatureScheme, Stream,
+};
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
-pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
+
+// This allows to skip certificate verification. Be highly cautious.
+pub use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 
 /// Load the given file from disk as a buffered reader and use the pingora Error
 /// type instead of the std::io version
