@@ -90,13 +90,10 @@ where
         let mut req = session.req_header().clone();
 
         if req.version != Version::HTTP_2 {
-            /* remove H1 specific headers */
-            // https://github.com/hyperium/h2/blob/d3b9f1e36aadc1a7a6804e2f8e86d3fe4a244b4f/src/proto/streams/send.rs#L72
-            req.remove_header(&http::header::TRANSFER_ENCODING);
-            req.remove_header(&http::header::CONNECTION);
-            req.remove_header(&http::header::UPGRADE);
-            req.remove_header("keep-alive");
-            req.remove_header("proxy-connection");
+            /* remove hop-by-hop headers as per RFC 7230 and RFC 7540 */
+            // https://tools.ietf.org/html/rfc7230#section-6.1
+            // https://tools.ietf.org/html/rfc7540#section-8.1.2
+            req.remove_hop_by_hop_headers();
         }
 
         /* turn it into h2 */

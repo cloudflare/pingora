@@ -384,7 +384,16 @@ impl SslDigest {
             .map(|(organization, serial)| (organization, Some(serial)))
             .unwrap_or_default();
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest)
+        let sni = match stream {
+            pingora_rustls::TlsStream::Server(server_stream) => server_stream
+                .get_ref()
+                .1
+                .server_name()
+                .map(|name| name.to_string()),
+            _ => None,
+        };
+
+        SslDigest::with_sni(cipher, version, organization, serial_number, cert_digest, sni)
     }
 }
 
