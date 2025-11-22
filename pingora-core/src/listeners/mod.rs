@@ -132,10 +132,13 @@ impl TransportStackBuilder {
         #[cfg(windows)]
         let l4 = builder.listen().await?;
 
-        Ok(TransportStack {
-            l4,
-            tls: self.tls.take().map(|tls| Arc::new(tls.build())),
-        })
+        let tls = if let Some(tls) = self.tls.take() {
+            Some(Arc::new(tls.build()?))
+        } else {
+            None
+        };
+
+        Ok(TransportStack { l4, tls })
     }
 }
 
