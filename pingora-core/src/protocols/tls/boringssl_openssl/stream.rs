@@ -91,6 +91,12 @@ impl<T> SslStream<T> {
     pub fn ssl_digest(&self) -> Option<Arc<SslDigest>> {
         self.digest.clone()
     }
+
+    /// Attempts to obtain a mutable reference to the SslDigest.
+    /// This method returns `None` if the SslDigest is currently held by other references.
+    pub(crate) fn ssl_digest_mut(&mut self) -> Option<&mut SslDigest> {
+        Arc::get_mut(self.digest.as_mut()?)
+    }
 }
 
 use std::ops::{Deref, DerefMut};
