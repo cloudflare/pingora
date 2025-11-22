@@ -323,6 +323,17 @@ impl RequestHeader {
         self.base.version = version;
     }
 
+    /// Return the host from the request.
+    ///
+    /// Checks (in order): `:authority` pseudo-header (HTTP/2), `Host` header (HTTP/1), URI host.
+    pub fn host(&self) -> Option<&str> {
+        self.headers
+            .get(":authority")
+            .or_else(|| self.headers.get(http::header::HOST))
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| self.uri.host())
+    }
+
     /// Clone `self` into [http::request::Parts].
     pub fn as_owned_parts(&self) -> ReqParts {
         clone_req_parts(&self.base)
