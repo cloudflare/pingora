@@ -70,19 +70,19 @@ pub enum ExecutionPhase {
     BootstrapComplete,
 
     /// The server is running and is listening for shutdown signals.
-    Running,
+    Running(tokio::runtime::Handle),
 
     /// A QUIT signal was received, indicating that a new process wants to take over.
     ///
     /// The server is trying to send the fds to the new process over a Unix socket.
-    GracefulUpgradeTransferringFds,
+    GracefulUpgradeTransferringFds(tokio::runtime::Handle),
 
     /// FDs have been sent to the new process.
     /// Waiting a fixed amount of time to allow the new process to take the sockets.
-    GracefulUpgradeCloseTimeout,
+    GracefulUpgradeCloseTimeout(tokio::runtime::Handle),
 
     /// A TERM signal was received, indicating that the server should shut down gracefully.
-    GracefulTerminate,
+    GracefulTerminate(tokio::runtime::Handle),
 
     /// The server is shutting down.
     ShutdownStarted,
@@ -220,7 +220,7 @@ impl Server {
         // waiting for exit signal
 
         self.execution_phase_watch
-            .send(ExecutionPhase::Running)
+            .send(ExecutionPhase::Running(tokio::runtime::Handle::current()))
             .ok();
 
         match run_args.shutdown_signal.recv().await {
@@ -244,7 +244,9 @@ impl Server {
                 info!("Broadcast graceful shutdown complete");
 
                 self.execution_phase_watch
-                    .send(ExecutionPhase::GracefulTerminate)
+                    .send(ExecutionPhase::GracefulTerminate(
+                        tokio::runtime::Handle::current(),
+                    ))
                     .ok();
 
                 ShutdownType::Graceful
@@ -255,7 +257,9 @@ impl Server {
                 info!("SIGQUIT received, sending socks and gracefully exiting");
 
                 self.execution_phase_watch
-                    .send(ExecutionPhase::GracefulUpgradeTransferringFds)
+                    .send(ExecutionPhase::GracefulUpgradeTransferringFds(
+                        tokio::runtime::Handle::current(),
+                    ))
                     .ok();
 
                 if let Some(fds) = &self.listen_fds {
@@ -274,7 +278,9 @@ impl Server {
                         }
                     }
                     self.execution_phase_watch
-                        .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
+                        .send(ExecutionPhase::GracefulUpgradeCloseTimeout(
+                            tokio::runtime::Handle::current(),
+                        ))
                         .ok();
                     sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
                     info!("Broadcasting graceful shutdown");
