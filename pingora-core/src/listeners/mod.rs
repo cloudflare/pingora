@@ -166,28 +166,26 @@ impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
 
-        // Extract ClientHello BEFORE consuming PROXY headers
-        // This is necessary because PROXY header consumption rewinds ClientHello to a buffer
-        // that MSG_PEEK cannot access. By extracting ClientHello first, we can peek at the
-        // raw socket which contains both PROXY headers (if present) and ClientHello.
-        let tls_opt = self.tls.clone();
-        let (l4_after_hello, extracted_hello) = if tls_opt.is_some() {
+        // Consume PROXY headers first (if enabled)
+        // This reads PROXY headers from the socket and rewinds any leftover data (ClientHello) to the rewind buffer
+        self.maybe_consume_proxy_header().await?;
+
+        if let Some(tls) = self.tls {
             #[cfg(unix)]
             {
-                // Use ClientHelloWrapper to extract ClientHello before PROXY header consumption
+                // Use ClientHelloWrapper to extract ClientHello before TLS handshake
+                // After PROXY header consumption, ClientHello is in the rewind buffer or socket buffer
+                // peek_client_hello will handle PROXY protocol detection if headers are still in socket buffer
                 use crate::protocols::ClientHelloWrapper;
 
                 // Wrap stream with ClientHelloWrapper
                 let mut wrapper = ClientHelloWrapper::new(self.l4);
 
                 // Extract ClientHello asynchronously (avoids blocking the thread)
-                // This will peek at the socket which may contain PROXY headers + ClientHello
-                let hello_result = wrapper.extract_client_hello_async().await;
-
-                // Unwrap to get the stream back
-                let l4 = wrapper.into_inner();
-
-                let hello = match hello_result {
+                // peek_client_hello will detect and skip PROXY headers if they're still in the socket buffer
+                // If PROXY headers were consumed, ClientHello will be in the rewind buffer and peek won't see it,
+                // but that's okay - TLS handshake will read it from the rewind buffer normally
+                let hello = match wrapper.extract_client_hello_async().await {
                     Ok(Some(hello)) => Some(hello),
                     Ok(None) => {
                         debug!("No ClientHello detected in stream");
@@ -209,33 +207,7 @@ impl UninitializedStream {
                     }
                 };
 
-                (l4, hello)
-            }
-            #[cfg(not(unix))]
-            {
-                (self.l4, None)
-            }
-        } else {
-            (self.l4, None)
-        };
-
-        // Update self.l4 with the stream after ClientHello extraction
-        self.l4 = l4_after_hello;
-
-        // Now consume PROXY headers (ClientHello extraction already handled PROXY headers if present)
-        self.maybe_consume_proxy_header().await?;
-
-        if let Some(tls) = self.tls {
-            #[cfg(unix)]
-            {
-                // ClientHello was already extracted above, now proceed with TLS handshake
-                use crate::protocols::ClientHelloWrapper;
-
-                // Wrap stream with ClientHelloWrapper for TLS handshake
-                let wrapper = ClientHelloWrapper::new(self.l4);
-
-                // Process the extracted ClientHello if available
-                if let Some(hello) = extracted_hello {
+                if let Some(hello) = hello {
                     // Get peer address if available
                     let peer_addr = wrapper.get_socket_digest()
                         .and_then(|d| d.peer_addr().cloned());
