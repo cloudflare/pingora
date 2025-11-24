@@ -25,7 +25,10 @@ use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
-impl<SV> HttpProxy<SV> {
+impl<SV, C> HttpProxy<SV, C>
+where
+    C: custom::Connector,
+{
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
@@ -153,7 +156,7 @@ impl<SV> HttpProxy<SV> {
                         session.cache.cache_found(meta, handler, hit_status);
                     }
 
-                    if hit_status_opt.map_or(true, HitStatus::is_treated_as_miss) {
+                    if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
                         if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
@@ -300,6 +303,7 @@ impl<SV> HttpProxy<SV> {
 
         // return a 416 with an empty body for simplicity
         let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
         match self.inner.response_filter(session, &mut header, ctx).await {
@@ -403,7 +407,7 @@ impl<SV> HttpProxy<SV> {
                             return (false, Some(e));
                         }
 
-                        if !end && body.as_ref().map_or(true, |b| b.is_empty()) {
+                        if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
                             // Don't write empty body which will end session,
                             // still more hit handler bytes to read
                             continue;
@@ -866,14 +870,9 @@ impl<SV> HttpProxy<SV> {
                 );
                 true
             }
-            /* We have 3 options when a lock is held too long
-             * 1. release the lock and let every request complete for it again
-             * 2. let every request cache miss
-             * 3. let every request through while disabling cache
-             * #1 could repeat the situation but protect the origin from load
-             * #2 could amplify disk writes and storage for temp file
-             * #3 is the simplest option for now */
-            LockStatus::Timeout => {
+            // If this reader has spent too long waiting on locks, let the request
+            // through while disabling cache (to avoid amplifying disk writes).
+            LockStatus::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -882,6 +881,10 @@ impl<SV> HttpProxy<SV> {
                 // not cacheable, just go to the origin.
                 false
             }
+            // When a singular cache lock has been held for too long,
+            // we should allow requests to recompete for the lock
+            // to protect upstreams from load.
+            LockStatus::AgeTimeout => true,
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
         }
@@ -902,6 +905,12 @@ fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
         let age = cache.cache_meta().age().as_secs();
         header.insert_header(http::header::AGE, age).unwrap();
     }
+    log::debug!("cache header: {header:?} {:?}", cache.phase());
+
+    // currently storage cache is always considered an h1 upstream
+    // (header-serde serializes as h1.0 or h1.1)
+    // set this header to be h1.1
+    header.set_version(Version::HTTP_11);
 
     /* Add chunked header to tell downstream to use chunked encoding
      * during the absent of content-length in h2 */
@@ -928,7 +937,11 @@ pub mod range_filter {
         str::from_utf8(input).ok()?.parse().ok()
     }
 
-    fn parse_range_header(range: &[u8], content_length: usize) -> RangeType {
+    fn parse_range_header(
+        range: &[u8],
+        content_length: usize,
+        max_multipart_ranges: Option<usize>,
+    ) -> RangeType {
         use regex::Regex;
 
         // Match individual range parts, (e.g. "0-100", "-5", "1-")
@@ -959,11 +972,11 @@ pub mod range_filter {
         let mut range_count = 0;
         for _ in ranges_str.split(',') {
             range_count += 1;
-            // TODO: make configurable
-            const MAX_RANGES: usize = 200;
-            if range_count >= MAX_RANGES {
-                // If we get more than MAX_RANGES ranges, return None for now to save parsing time
-                return RangeType::None;
+            if let Some(max_ranges) = max_multipart_ranges {
+                if range_count >= max_ranges {
+                    // If we get more than max configured ranges, return None for now to save parsing time
+                    return RangeType::None;
+                }
             }
         }
         let mut ranges: Vec<Range<usize>> = Vec::with_capacity(range_count);
@@ -1044,40 +1057,46 @@ pub mod range_filter {
     #[test]
     fn test_parse_range() {
         assert_eq!(
-            parse_range_header(b"bytes=0-1", 10),
+            parse_range_header(b"bytes=0-1", 10, None),
             RangeType::new_single(0, 2)
         );
         assert_eq!(
-            parse_range_header(b"bYTes=0-9", 10),
+            parse_range_header(b"bYTes=0-9", 10, None),
             RangeType::new_single(0, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=0-12", 10),
+            parse_range_header(b"bytes=0-12", 10, None),
             RangeType::new_single(0, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=0-", 10),
+            parse_range_header(b"bytes=0-", 10, None),
             RangeType::new_single(0, 10)
         );
-        assert_eq!(parse_range_header(b"bytes=2-1", 10), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=10-11", 10), RangeType::Invalid);
         assert_eq!(
-            parse_range_header(b"bytes=-2", 10),
+            parse_range_header(b"bytes=2-1", 10, None),
+            RangeType::Invalid
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=10-11", 10, None),
+            RangeType::Invalid
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=-2", 10, None),
             RangeType::new_single(8, 10)
         );
         assert_eq!(
-            parse_range_header(b"bytes=-12", 10),
+            parse_range_header(b"bytes=-12", 10, None),
             RangeType::new_single(0, 10)
         );
-        assert_eq!(parse_range_header(b"bytes=-", 10), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=", 10), RangeType::None);
+        assert_eq!(parse_range_header(b"bytes=-", 10, None), RangeType::Invalid);
+        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::None);
     }
 
     // Add some tests for multi-range too
     #[test]
     fn test_parse_range_header_multi() {
         assert_eq!(
-            parse_range_header(b"bytes=0-1,4-5", 10)
+            parse_range_header(b"bytes=0-1,4-5", 10, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1085,7 +1104,7 @@ pub mod range_filter {
         );
         // Last range is invalid because the content-length is too small
         assert_eq!(
-            parse_range_header(b"bytEs=0-99,200-299,400-499", 320)
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 320, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1099,7 +1118,7 @@ pub mod range_filter {
         );
         // Same as above but appropriate content length
         assert_eq!(
-            parse_range_header(b"bytEs=0-99,200-299,400-499", 500)
+            parse_range_header(b"bytEs=0-99,200-299,400-499", 500, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1116,29 +1135,35 @@ pub mod range_filter {
             ]
         );
         // Looks like a range request but it is continuous, we decline to range
-        assert_eq!(parse_range_header(b"bytes=0-,-2", 10), RangeType::None,);
+        assert_eq!(
+            parse_range_header(b"bytes=0-,-2", 10, None),
+            RangeType::None,
+        );
         // Should not have multirange info set
-        assert!(parse_range_header(b"bytes=0-,-2", 10)
+        assert!(parse_range_header(b"bytes=0-,-2", 10, None)
             .get_multirange_info()
             .is_none());
         // Overlapping ranges, these ranges are currently declined
-        assert_eq!(parse_range_header(b"bytes=0-3,2-5", 10), RangeType::None,);
-        assert!(parse_range_header(b"bytes=0-3,2-5", 10)
+        assert_eq!(
+            parse_range_header(b"bytes=0-3,2-5", 10, None),
+            RangeType::None,
+        );
+        assert!(parse_range_header(b"bytes=0-3,2-5", 10, None)
             .get_multirange_info()
             .is_none());
 
         // Content length is 2, so only range is 0-2.
         assert_eq!(
-            parse_range_header(b"bytes=0-5,10-", 2),
+            parse_range_header(b"bytes=0-5,10-", 2, None),
             RangeType::new_single(0, 2)
         );
-        assert!(parse_range_header(b"bytes=0-5,10-", 2)
+        assert!(parse_range_header(b"bytes=0-5,10-", 2, None)
             .get_multirange_info()
             .is_none());
 
         // We should ignore the last incorrect range and return the other acceptable ranges
         assert_eq!(
-            parse_range_header(b"bytes=0-5, 10-20, 30-18", 200)
+            parse_range_header(b"bytes=0-5, 10-20, 30-18", 200, None)
                 .get_multirange_info()
                 .expect("Should have multipart info for Multipart range request")
                 .ranges,
@@ -1146,7 +1171,7 @@ pub mod range_filter {
         );
         // All invalid ranges
         assert_eq!(
-            parse_range_header(b"bytes=5-0, 20-15, 30-25", 200),
+            parse_range_header(b"bytes=5-0, 20-15, 30-25", 200, None),
             RangeType::Invalid
         );
 
@@ -1168,7 +1193,10 @@ pub mod range_filter {
 
         // Test 200 range limit for parsing.
         let ranges = generate_range_header(201);
-        assert_eq!(parse_range_header(&ranges, 1000), RangeType::None)
+        assert_eq!(
+            parse_range_header(&ranges, 1000, Some(200)),
+            RangeType::None
+        )
     }
 
     // For Multipart Requests, we need to know the boundary, content length and type across
@@ -1270,22 +1298,17 @@ pub mod range_filter {
     }
 
     // Handles both single-range and multipart-range requests
-    pub fn range_header_filter(req: &RequestHeader, resp: &mut ResponseHeader) -> RangeType {
+    pub fn range_header_filter(
+        req: &RequestHeader,
+        resp: &mut ResponseHeader,
+        max_multipart_ranges: Option<usize>,
+    ) -> RangeType {
         // The Range header field is evaluated after evaluating the precondition
         // header fields defined in [RFC7232], and only if the result in absence
         // of the Range header field would be a 200 (OK) response
         if resp.status != StatusCode::OK {
             return RangeType::None;
         }
-
-        // "A server MUST ignore a Range header field received with a request method other than GET."
-        if req.method != http::Method::GET && req.method != http::Method::HEAD {
-            return RangeType::None;
-        }
-
-        let Some(range_header) = req.headers.get(RANGE) else {
-            return RangeType::None;
-        };
 
         // Content-Length is not required by RFC but it is what nginx does and easier to implement
         // with this header present.
@@ -1297,37 +1320,65 @@ pub mod range_filter {
             return RangeType::None;
         };
 
-        // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
-        // with resumable downloads.
-        // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
-        // Note that the RFC wants strong validation, and suggests that
-        // "A valid entity-tag can be distinguished from a valid HTTP-date
-        // by examining the first three characters for a DQUOTE,"
-        // but this current etag matching behavior most closely mirrors nginx.
-        if let Some(if_range) = req.headers.get(IF_RANGE) {
-            let ir = if_range.as_bytes();
-            let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
-                resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
-            } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
-                last_modified == if_range
-            } else {
-                false
-            };
-            if !matches {
-                return RangeType::None;
-            }
-        }
-
+        // At this point the response is allowed to be served as ranges
         // TODO: we can also check Accept-Range header from resp. Nginx gives uses the option
         // see proxy_force_ranges
 
-        let mut range_type = parse_range_header(range_header.as_bytes(), content_length);
+        fn request_range_type(
+            req: &RequestHeader,
+            resp: &ResponseHeader,
+            content_length: usize,
+            max_multipart_ranges: Option<usize>,
+        ) -> RangeType {
+            // "A server MUST ignore a Range header field received with a request method other than GET."
+            if req.method != http::Method::GET && req.method != http::Method::HEAD {
+                return RangeType::None;
+            }
+
+            let Some(range_header) = req.headers.get(RANGE) else {
+                return RangeType::None;
+            };
+
+            // if-range wants to understand if the Last-Modified / ETag value matches exactly for use
+            // with resumable downloads.
+            // https://datatracker.ietf.org/doc/html/rfc9110#name-if-range
+            // Note that the RFC wants strong validation, and suggests that
+            // "A valid entity-tag can be distinguished from a valid HTTP-date
+            // by examining the first three characters for a DQUOTE,"
+            // but this current etag matching behavior most closely mirrors nginx.
+            if let Some(if_range) = req.headers.get(IF_RANGE) {
+                let ir = if_range.as_bytes();
+                let matches = if ir.len() >= 2 && ir.last() == Some(&b'"') {
+                    resp.headers.get(ETAG).is_some_and(|etag| etag == if_range)
+                } else if let Some(last_modified) = resp.headers.get(LAST_MODIFIED) {
+                    last_modified == if_range
+                } else {
+                    false
+                };
+                if !matches {
+                    return RangeType::None;
+                }
+            }
+
+            parse_range_header(
+                range_header.as_bytes(),
+                content_length,
+                max_multipart_ranges,
+            )
+        }
+
+        let mut range_type = request_range_type(req, resp, content_length, max_multipart_ranges);
 
         match &mut range_type {
-            RangeType::None => { /* nothing to do*/ }
+            RangeType::None => {
+                // At this point, the response is _eligible_ to be served in ranges
+                // in the future, so add Accept-Ranges, mirroring nginx behavior
+                resp.insert_header(&ACCEPT_RANGES, "bytes").unwrap();
+            }
             RangeType::Single(r) => {
                 // 206 response
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(&CONTENT_LENGTH, r.end - r.start)
                     .unwrap();
                 resp.insert_header(
@@ -1350,6 +1401,7 @@ pub mod range_filter {
                 let total_length = multi_range_info.calculate_multipart_length();
 
                 resp.set_status(StatusCode::PARTIAL_CONTENT).unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 resp.insert_header(CONTENT_LENGTH, total_length).unwrap();
                 resp.insert_header(
                     CONTENT_TYPE,
@@ -1367,6 +1419,7 @@ pub mod range_filter {
                 // empty body for simplicity
                 resp.insert_header(&CONTENT_LENGTH, HeaderValue::from_static("0"))
                     .unwrap();
+                resp.remove_header(&ACCEPT_RANGES);
                 // TODO: remove other headers like content-encoding
                 resp.remove_header(&CONTENT_TYPE);
                 resp.insert_header(&CONTENT_RANGE, format!("bytes */{content_length}"))
@@ -1391,8 +1444,23 @@ pub mod range_filter {
         // no range
         let req = gen_req();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
+
+        // no range, try HEAD
+        let mut req = gen_req();
+        req.method = Method::HEAD;
+        let mut resp = gen_resp();
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // regular range
         let mut req = gen_req();
@@ -1400,7 +1468,7 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
         assert_eq!(resp.status.as_u16(), 206);
         assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"2");
@@ -1408,18 +1476,42 @@ pub mod range_filter {
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes 0-1/10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
+
+        // regular range, accept-ranges included
+        let mut req = gen_req();
+        req.insert_header("Range", "bytes=0-1").unwrap();
+        let mut resp = gen_resp();
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        assert_eq!(
+            RangeType::new_single(0, 2),
+            range_header_filter(&req, &mut resp, None)
+        );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"2");
+        assert_eq!(
+            resp.headers.get("content-range").unwrap().as_bytes(),
+            b"bytes 0-1/10"
+        );
+        // accept-ranges stripped
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // bad range
         let mut req = gen_req();
         req.insert_header("Range", "bytes=1-0").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::Invalid, range_header_filter(&req, &mut resp));
+        resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        assert_eq!(
+            RangeType::Invalid,
+            range_header_filter(&req, &mut resp, None)
+        );
         assert_eq!(resp.status.as_u16(), 416);
         assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"0");
         assert_eq!(
             resp.headers.get("content-range").unwrap().as_bytes(),
             b"bytes */10"
         );
+        assert!(resp.headers.get("accept-ranges").is_none());
     }
 
     // Multipart Tests
@@ -1446,7 +1538,7 @@ pub mod range_filter {
         // valid multipart range
         let req = gen_req();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
         let mut boundary_str = String::new();
 
         assert!(matches!(result, RangeType::Multi(_)));
@@ -1468,24 +1560,30 @@ pub mod range_filter {
             format!("multipart/byteranges; boundary={boundary_str}")
         );
         assert!(resp.headers.get("content_length").is_none());
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // overlapping range, multipart range is declined
         let req = gen_req_overlap_range();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
 
         assert!(matches!(result, RangeType::None));
         assert_eq!(resp.status.as_u16(), 200);
         assert!(resp.headers.get("content-type").is_none());
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // bad multipart range
         let mut req = gen_req();
         req.insert_header("Range", "bytes=1-0, 12-9, 50-40")
             .unwrap();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Invalid));
         assert_eq!(resp.status.as_u16(), 416);
+        assert!(resp.headers.get("accept-ranges").is_none());
     }
 
     #[test]
@@ -1517,7 +1615,7 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
 
         // non-matching date
@@ -1525,7 +1623,12 @@ pub mod range_filter {
         req.insert_header("If-Range", "Fri, 07 Jul 2023 22:03:25 GMT")
             .unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // match ETag
         let mut req = gen_req();
@@ -1533,33 +1636,46 @@ pub mod range_filter {
         let mut resp = gen_resp();
         assert_eq!(
             RangeType::new_single(0, 2),
-            range_header_filter(&req, &mut resp)
+            range_header_filter(&req, &mut resp, None)
         );
+        assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // non-matching ETags do not result in range
         let mut req = gen_req();
         req.insert_header("If-Range", "\"4567\"").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         let mut req = gen_req();
         req.insert_header("If-Range", "1234").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
+        assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
 
         // multipart range with If-Range
         let mut req = get_multipart_req();
         req.insert_header("If-Range", DATE).unwrap();
         let mut resp = gen_resp();
-        let result = range_header_filter(&req, &mut resp);
+        let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Multi(_)));
         assert_eq!(resp.status.as_u16(), 206);
+        assert!(resp.headers.get("accept-ranges").is_none());
 
         // multipart with matching ETag
         let req = get_multipart_req();
         let mut resp = gen_resp();
         assert!(matches!(
-            range_header_filter(&req, &mut resp),
+            range_header_filter(&req, &mut resp, None),
             RangeType::Multi(_)
         ));
 
@@ -1567,8 +1683,12 @@ pub mod range_filter {
         let mut req = get_multipart_req();
         req.insert_header("If-Range", "\"wrong\"").unwrap();
         let mut resp = gen_resp();
-        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp));
+        assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
+        assert_eq!(
+            resp.headers.get("accept-ranges").unwrap().as_bytes(),
+            b"bytes"
+        );
     }
 
     pub struct RangeBodyFilter {

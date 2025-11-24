@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "connection_filter")]
+use log::debug;
 use log::warn;
 use pingora_error::{
     ErrorType::{AcceptError, BindError},
@@ -29,9 +31,16 @@ use std::time::Duration;
 use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
 
+#[cfg(feature = "connection_filter")]
+use super::connection_filter::ConnectionFilter;
+#[cfg(feature = "connection_filter")]
+use crate::listeners::AcceptAllFilter;
+
 use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
+#[cfg(feature = "connection_filter")]
+use crate::protocols::GetSocketDigest;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -271,20 +280,34 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
     listener: Arc<Listener>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Arc<dyn ConnectionFilter>,
 }
 
 #[derive(Default)]
 pub struct ListenerEndpointBuilder {
     listen_addr: Option<ServerAddress>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl ListenerEndpointBuilder {
     pub fn new() -> ListenerEndpointBuilder {
-        Self { listen_addr: None }
+        Self {
+            listen_addr: None,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: None,
+        }
     }
 
     pub fn listen_addr(&mut self, addr: ServerAddress) -> &mut Self {
         self.listen_addr = Some(addr);
+        self
+    }
+
+    #[cfg(feature = "connection_filter")]
+    pub fn connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) -> &mut Self {
+        self.connection_filter = Some(filter);
         self
     }
 
@@ -313,9 +336,16 @@ impl ListenerEndpointBuilder {
             bind(&listen_addr).await?
         };
 
+        #[cfg(feature = "connection_filter")]
+        let connection_filter = self
+            .connection_filter
+            .unwrap_or_else(|| Arc::new(AcceptAllFilter));
+
         Ok(ListenerEndpoint {
             listen_addr,
             listener: Arc::new(listener),
+            #[cfg(feature = "connection_filter")]
+            connection_filter,
         })
     }
 
@@ -324,11 +354,19 @@ impl ListenerEndpointBuilder {
         let listen_addr = self
             .listen_addr
             .expect("Tried to listen with no addr specified");
+
         let listener = bind(&listen_addr).await?;
+
+        #[cfg(feature = "connection_filter")]
+        let connection_filter = self
+            .connection_filter
+            .unwrap_or_else(|| Arc::new(AcceptAllFilter));
 
         Ok(ListenerEndpoint {
             listen_addr,
             listener: Arc::new(listener),
+            #[cfg(feature = "connection_filter")]
+            connection_filter,
         })
     }
 }
@@ -361,13 +399,50 @@ impl ListenerEndpoint {
     }
 
     pub async fn accept(&self) -> Result<Stream> {
-        let mut stream = self
-            .listener
-            .accept()
-            .await
-            .or_err(AcceptError, "Fail to accept()")?;
-        self.apply_stream_settings(&mut stream)?;
-        Ok(stream)
+        #[cfg(feature = "connection_filter")]
+        {
+            loop {
+                let mut stream = self
+                    .listener
+                    .accept()
+                    .await
+                    .or_err(AcceptError, "Fail to accept()")?;
+
+                // Performance: nested if-let avoids cloning/allocations on each connection accept
+                let should_accept = if let Some(digest) = stream.get_socket_digest() {
+                    if let Some(peer_addr) = digest.peer_addr() {
+                        self.connection_filter
+                            .should_accept(peer_addr.as_inet())
+                            .await
+                    } else {
+                        // No peer address available - accept by default
+                        true
+                    }
+                } else {
+                    // No socket digest available - accept by default
+                    true
+                };
+
+                if !should_accept {
+                    debug!("Connection rejected by filter");
+                    drop(stream);
+                    continue;
+                }
+
+                self.apply_stream_settings(&mut stream)?;
+                return Ok(stream);
+            }
+        }
+        #[cfg(not(feature = "connection_filter"))]
+        {
+            let mut stream = self
+                .listener
+                .accept()
+                .await
+                .or_err(AcceptError, "Fail to accept()")?;
+            self.apply_stream_settings(&mut stream)?;
+            Ok(stream)
+        }
     }
 }
 
@@ -506,5 +581,147 @@ mod test {
 
         // Verify the first listener still works
         assert_eq!(listener1.as_str(), addr);
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[tokio::test]
+    async fn test_connection_filter_accept() {
+        use crate::listeners::ConnectionFilter;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingFilter {
+            accept_count: Arc<AtomicUsize>,
+            reject_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for CountingFilter {
+            async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
+                let count = self.accept_count.fetch_add(1, Ordering::SeqCst);
+                if count % 2 == 0 {
+                    true
+                } else {
+                    self.reject_count.fetch_add(1, Ordering::SeqCst);
+                    false
+                }
+            }
+        }
+
+        let addr = "127.0.0.1:7300";
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let reject_count = Arc::new(AtomicUsize::new(0));
+
+        let filter = Arc::new(CountingFilter {
+            accept_count: accept_count.clone(),
+            reject_count: reject_count.clone(),
+        });
+
+        let mut builder = ListenerEndpoint::builder();
+        builder
+            .listen_addr(ServerAddress::Tcp(addr.into(), None))
+            .connection_filter(filter);
+
+        #[cfg(unix)]
+        let listener = builder.listen(None).await.unwrap();
+        #[cfg(windows)]
+        let listener = builder.listen().await.unwrap();
+
+        let listener_clone = listener.clone();
+        tokio::spawn(async move {
+            let _stream1 = listener_clone.accept().await.unwrap();
+            let _stream2 = listener_clone.accept().await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let _conn1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _conn2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _conn3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(accept_count.load(Ordering::SeqCst), 3);
+        assert_eq!(reject_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[tokio::test]
+    async fn test_connection_filter_blocks_all() {
+        use crate::listeners::ConnectionFilter;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct RejectAllFilter {
+            reject_count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for RejectAllFilter {
+            async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
+                self.reject_count.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        }
+
+        let addr = "127.0.0.1:7301";
+        let reject_count = Arc::new(AtomicUsize::new(0));
+
+        let mut builder = ListenerEndpoint::builder();
+        builder
+            .listen_addr(ServerAddress::Tcp(addr.into(), None))
+            .connection_filter(Arc::new(RejectAllFilter {
+                reject_count: reject_count.clone(),
+            }));
+
+        #[cfg(unix)]
+        let listener = builder.listen(None).await.unwrap();
+        #[cfg(windows)]
+        let listener = builder.listen().await.unwrap();
+
+        let listener_clone = listener.clone();
+        let _accept_handle = tokio::spawn(async move {
+            // This will never return since all connections are rejected
+            let _ = listener_clone.accept().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let handle = tokio::spawn(async move {
+                if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                    drop(stream);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        // Wait for rejections to be counted with timeout
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+
+        loop {
+            let rejected = reject_count.load(Ordering::SeqCst);
+            if rejected >= 3 {
+                assert_eq!(rejected, 3, "Should reject exactly 3 connections");
+                break;
+            }
+
+            if start.elapsed() > timeout {
+                panic!(
+                    "Timeout waiting for rejections, got {} expected 3",
+                    rejected
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

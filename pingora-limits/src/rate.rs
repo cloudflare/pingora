@@ -38,11 +38,28 @@ pub struct RateComponents {
     pub current_interval_fraction: f64,
 }
 
-/// A stable rate estimator that reports the rate of events in the past `interval` time.
-/// It returns the average rate between `interval` * 2 and `interval` while collecting the events
-/// happening between `interval` and now.
+/// A rate calculation function which uses a good estimate of the rate of events over the past
+/// `interval` time.
 ///
-/// This estimator ignores events that happen less than once per `interval` time.
+/// Specifically, it linearly interpolates between the event counts of the previous and current
+/// periods based on how far into the current period we are, as described in this post:
+/// https://blog.cloudflare.com/counting-things-a-lot-of-different-things/
+#[allow(dead_code)]
+pub static PROPORTIONAL_RATE_ESTIMATE_CALC_FN: fn(RateComponents) -> f64 =
+    |rate_info: RateComponents| {
+        let prev = rate_info.prev_samples as f64;
+        let curr = rate_info.curr_samples as f64;
+        let interval_secs = rate_info.interval.as_secs_f64();
+        let interval_fraction = rate_info.current_interval_fraction;
+
+        let weighted_count = prev * (1. - interval_fraction) + curr;
+        weighted_count / interval_secs
+    };
+
+/// A stable rate estimator that reports the rate of events per period of `interval` time.
+///
+/// It counts events for periods of `interval` and returns the average rate of the latest completed
+/// period while counting events for the current (partial) period.
 pub struct Rate {
     // 2 slots so that we use one to collect the current events and the other to report rate
     red_slot: Estimator,
@@ -104,6 +121,8 @@ impl Rate {
     }
 
     /// Return the per second rate estimation.
+    ///
+    /// This is the average rate of the latest completed period of length `interval`.
     pub fn rate<T: Hash>(&self, key: &T) -> f64 {
         let past_ms = self.maybe_reset();
         if past_ms >= self.reset_interval_ms * 2 {
@@ -111,7 +130,7 @@ impl Rate {
             return 0f64;
         }
 
-        self.previous(self.red_or_blue()).get(key) as f64 / self.reset_interval_ms as f64 * 1000.0
+        self.previous(self.red_or_blue()).get(key) as f64 * 1000.0 / self.reset_interval_ms as f64
     }
 
     /// Report new events and return number of events seen so far in the current interval.
@@ -277,50 +296,52 @@ mod tests {
         assert_eq!(r.rate_with(&key, rate_90_10_fn), 0f64);
     }
 
-    // this is the function described in this post
-    // https://blog.cloudflare.com/counting-things-a-lot-of-different-things/
     #[test]
     fn test_observe_rate_custom_proportional() {
         let r = Rate::new(Duration::from_secs(1));
         let key = 1;
-
-        let rate_prop_fn = |rate_info: RateComponents| {
-            let prev = rate_info.prev_samples as f64;
-            let curr = rate_info.curr_samples as f64;
-            let interval_secs = rate_info.interval.as_secs_f64();
-            let interval_fraction = rate_info.current_interval_fraction;
-
-            let weighted_count = prev * (1. - interval_fraction) + curr * interval_fraction;
-            weighted_count / interval_secs
-        };
 
         // second: 0
         let observed = r.observe(&key, 3);
         assert_eq!(observed, 3);
         let observed = r.observe(&key, 2);
         assert_eq!(observed, 5);
-        assert_eq_ish(r.rate_with(&key, rate_prop_fn), 0.);
+        assert_eq_ish(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 5.);
 
         // second 0.5
         sleep(Duration::from_secs_f64(0.5));
-        assert_eq_ish(r.rate_with(&key, rate_prop_fn), 5. * 0.5);
+        assert_eq_ish(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 5.);
+        // rate() just looks at the previous interval, ignores current interval
+        assert_eq_ish(r.rate(&key), 0.);
 
         // second: 1
         sleep(Duration::from_secs_f64(0.5));
         let observed = r.observe(&key, 4);
         assert_eq!(observed, 4);
-        assert_eq_ish(r.rate_with(&key, rate_prop_fn), 5.);
+        assert_eq_ish(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 9.);
 
         // second 1.75
         sleep(Duration::from_secs_f64(0.75));
-        assert_eq_ish(r.rate_with(&key, rate_prop_fn), 5. * 0.25 + 4. * 0.75);
+        assert_eq_ish(
+            r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN),
+            5. * 0.25 + 4.,
+        );
 
         // second: 2
         sleep(Duration::from_secs_f64(0.25));
-        assert_eq_ish(r.rate_with(&key, rate_prop_fn), 4.);
+        assert_eq_ish(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 4.);
+        assert_eq_ish(r.rate(&key), 4.);
+
+        // second: 2.5
+        sleep(Duration::from_secs_f64(0.5));
+        assert_eq_ish(
+            r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN),
+            4. / 2.,
+        );
+        assert_eq_ish(r.rate(&key), 4.);
 
         // second: 3
         sleep(Duration::from_secs(1));
-        assert_eq!(r.rate_with(&key, rate_prop_fn), 0f64);
+        assert_eq!(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 0f64);
     }
 }

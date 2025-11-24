@@ -62,6 +62,29 @@ impl<const N: usize> Manager<N> {
         Manager(Lru::with_capacity_and_watermark(limit, capacity, watermark))
     }
 
+    /// Get the number of shards
+    pub fn shards(&self) -> usize {
+        self.0.shards()
+    }
+
+    /// Get the weight (total size) of a specific shard
+    pub fn shard_weight(&self, shard: usize) -> usize {
+        self.0.shard_weight(shard)
+    }
+
+    /// Get the number of items in a specific shard
+    pub fn shard_len(&self, shard: usize) -> usize {
+        self.0.shard_len(shard)
+    }
+
+    /// Get the shard index for a given cache key
+    ///
+    /// This allows callers to know which shard was affected by an operation
+    /// without acquiring any locks.
+    pub fn get_shard_for_key(&self, key: &CompactCacheKey) -> usize {
+        (u64key(key) % N as u64) as usize
+    }
+
     /// Serialize the given shard
     pub fn serialize_shard(&self, shard: usize) -> Result<Vec<u8>> {
         use rmp_serde::encode::Serializer;
@@ -100,6 +123,12 @@ impl<const N: usize> Manager<N> {
         de.deserialize_seq(visitor)
             .or_err(InternalError, "when deserializing LRU")?;
         Ok(())
+    }
+
+    /// Peek the weight associated with a cache key without changing its LRU order.
+    pub fn peek_weight(&self, item: &CompactCacheKey) -> Option<usize> {
+        let key = u64key(item);
+        self.0.peek_weight(key)
     }
 }
 
@@ -171,9 +200,14 @@ impl<const N: usize> EvictionManager for Manager<N> {
             .collect()
     }
 
-    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey> {
-        let key = u64key(&item);
-        self.0.increment_weight(key, delta);
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        let key = u64key(item);
+        self.0.increment_weight(key, delta, max_weight);
         self.0
             .evict_to_limit()
             .into_iter()

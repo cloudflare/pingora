@@ -85,6 +85,7 @@ fn titled_header_name(header_name: &HeaderName) -> Bytes {
 
 pub(crate) fn titled_header_name_str(header_name: &HeaderName) -> Option<&'static str> {
     Some(match *header_name {
+        header::ACCEPT_RANGES => "Accept-Ranges",
         header::AGE => "Age",
         header::CACHE_CONTROL => "Cache-Control",
         header::CONNECTION => "Connection",

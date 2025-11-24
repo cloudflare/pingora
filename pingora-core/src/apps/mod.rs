@@ -63,6 +63,9 @@ pub trait ServerApp {
 pub struct HttpServerOptions {
     /// Use HTTP/2 for plaintext.
     pub h2c: bool,
+
+    #[doc(hidden)]
+    pub force_custom: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +136,15 @@ pub trait HttpServerApp {
     }
 
     async fn http_cleanup(&self) {}
+
+    #[doc(hidden)]
+    async fn process_custom_session(
+        self: Arc<Self>,
+        _stream: Stream,
+        _shutdown: &ShutdownWatch,
+    ) -> Option<Stream> {
+        None
+    }
 }
 
 #[async_trait]
@@ -146,9 +158,13 @@ where
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
+        let custom = self
+            .server_options()
+            .as_ref()
+            .map_or(false, |o| o.force_custom);
 
         // try to read h2 preface
-        if h2c {
+        if h2c && !custom {
             let mut buf = [0u8; H2_PREFACE.len()];
             let peeked = stream
                 .try_peek(&mut buf)
@@ -215,6 +231,8 @@ where
                         .await;
                 });
             }
+        } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
+            return self.clone().process_custom_session(stream, shutdown).await;
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
             let mut session = ServerSession::new_http1(stream);

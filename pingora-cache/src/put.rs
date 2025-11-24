@@ -121,7 +121,9 @@ impl<C: CachePut> CachePutCtx<C> {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
             let evicted = match finish {
-                MissFinishType::Appended(delta) => eviction.increment_weight(cache_key, delta),
+                MissFinishType::Appended(delta, max_size) => {
+                    eviction.increment_weight(&cache_key, delta, max_size)
+                }
                 MissFinishType::Created(size) => {
                     eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                 }
@@ -369,6 +371,7 @@ mod test {
 
 mod parse_response {
     use super::*;
+    use bstr::ByteSlice;
     use bytes::BytesMut;
     use httparse::Status;
     use pingora_error::{
@@ -475,7 +478,7 @@ mod parse_response {
                     self.state = ParseState::Invalid(e);
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&self.buf)),
+                        format!("buf: {:?}", self.buf.as_bstr()),
                         e,
                     );
                 }

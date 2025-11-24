@@ -97,17 +97,26 @@ impl<T, const N: usize> Lru<T, N> {
         shard
     }
 
-    /// Increment the weight associated with a given key.
+    /// Increment the weight associated with a given key, up to an optional max weight.
+    /// If a `max_weight` is provided, the weight cannot exceed this max weight. If the current
+    /// weight is higher than the max, it will be capped to the max.
     ///
     /// Return the total new weight. 0 indicates the key did not exist.
-    pub fn increment_weight(&self, key: u64, delta: usize) -> usize {
+    pub fn increment_weight(&self, key: u64, delta: usize, max_weight: Option<usize>) -> usize {
         let shard = get_shard(key, N);
         let unit = &mut self.units[shard].write();
-        let new_weight = unit.increment_weight(key, delta);
-        if new_weight > 0 {
-            self.weight.fetch_add(delta, Ordering::Relaxed);
+        if let Some((old_weight, new_weight)) = unit.increment_weight(key, delta, max_weight) {
+            if new_weight >= old_weight {
+                self.weight
+                    .fetch_add(new_weight - old_weight, Ordering::Relaxed);
+            } else {
+                self.weight
+                    .fetch_sub(old_weight - new_weight, Ordering::Relaxed);
+            }
+            new_weight
+        } else {
+            0
         }
-        new_weight
     }
 
     /// Promote the key to the head of the LRU
@@ -181,7 +190,7 @@ impl<T, const N: usize> Lru<T, N> {
         evicted
     }
 
-    /// Remove the given asset
+    /// Remove the given asset.
     pub fn remove(&self, key: u64) -> Option<(T, usize)> {
         let removed = self.units[get_shard(key, N)].write().remove(key);
         if let Some((_, weight)) = removed.as_ref() {
@@ -191,7 +200,7 @@ impl<T, const N: usize> Lru<T, N> {
         removed
     }
 
-    /// Insert the item to the tail of this LRU
+    /// Insert the item to the tail of this LRU.
     ///
     /// Useful to recreate an LRU in most-to-least order
     pub fn insert_tail(&self, key: u64, data: T, weight: usize) -> bool {
@@ -207,12 +216,17 @@ impl<T, const N: usize> Lru<T, N> {
         }
     }
 
-    /// Check existence of a key without changing the order in LRU
+    /// Check existence of a key without changing the order in LRU.
     pub fn peek(&self, key: u64) -> bool {
         self.units[get_shard(key, N)].read().peek(key).is_some()
     }
 
-    /// Return the current total weight
+    /// Check the weight of a key without changing the order in LRU.
+    pub fn peek_weight(&self, key: u64) -> Option<usize> {
+        self.units[get_shard(key, N)].read().peek_weight(key)
+    }
+
+    /// Return the current total weight.
     pub fn weight(&self) -> usize {
         self.weight.load(Ordering::Relaxed)
     }
@@ -251,6 +265,11 @@ impl<T, const N: usize> Lru<T, N> {
     pub fn shard_len(&self, shard: usize) -> usize {
         self.units[shard].read().len()
     }
+
+    /// Get the weight (total size) inside a shard
+    pub fn shard_weight(&self, shard: usize) -> usize {
+        self.units[shard].read().used_weight
+    }
 }
 
 #[inline]
@@ -279,19 +298,20 @@ impl<T> LruUnit<T> {
         }
     }
 
+    /// Peek data associated with key, if it exists.
     pub fn peek(&self, key: u64) -> Option<&T> {
         self.lookup_table.get(&key).map(|n| &n.data)
     }
 
-    // admin into LRU, return old weight if there was any
+    /// Peek weight associated with key, if it exists.
+    pub fn peek_weight(&self, key: u64) -> Option<usize> {
+        self.lookup_table.get(&key).map(|n| n.weight)
+    }
+
+    /// Admit into LRU, return old weight if there was any.
     pub fn admit(&mut self, key: u64, data: T, weight: usize) -> usize {
         if let Some(node) = self.lookup_table.get_mut(&key) {
-            let old_weight = node.weight;
-            if weight != old_weight {
-                self.used_weight += weight;
-                self.used_weight -= old_weight;
-                node.weight = weight;
-            }
+            let old_weight = Self::adjust_weight(node, &mut self.used_weight, weight);
             node.data = data;
             self.order.promote(node.list_index);
             return old_weight;
@@ -307,15 +327,25 @@ impl<T> LruUnit<T> {
         0
     }
 
-    /// Increase the weight of an existing key. Returns the new weight or the key.
-    pub fn increment_weight(&mut self, key: u64, delta: usize) -> usize {
+    /// Increase the weight of an existing key. Returns the new weight or 0 if the key did not
+    /// exist, along with the new weight (or 0).
+    ///
+    /// If a `max_weight` is provided, the weight cannot exceed this max weight. If the current
+    /// weight is higher than the max, it will be capped to the max.
+    pub fn increment_weight(
+        &mut self,
+        key: u64,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Option<(usize, usize)> {
         if let Some(node) = self.lookup_table.get_mut(&key) {
-            node.weight += delta;
-            self.used_weight += delta;
+            let new_weight =
+                max_weight.map_or(node.weight + delta, |m| (node.weight + delta).min(m));
+            let old_weight = Self::adjust_weight(node, &mut self.used_weight, new_weight);
             self.order.promote(node.list_index);
-            return node.weight;
+            return Some((old_weight, new_weight));
         }
-        0
+        None
     }
 
     pub fn access(&mut self, key: u64) -> bool {
@@ -385,6 +415,19 @@ impl<T> LruUnit<T> {
             unit: self,
             iter: self.order.iter(),
         }
+    }
+
+    // Adjusts node weight to the new given weight.
+    // Returns old weight.
+    #[inline]
+    fn adjust_weight(node: &mut LruNode<T>, used_weight: &mut usize, weight: usize) -> usize {
+        let old_weight = node.weight;
+        if weight != old_weight {
+            *used_weight += weight;
+            *used_weight -= old_weight;
+            node.weight = weight;
+        }
+        old_weight
     }
 }
 
@@ -552,15 +595,18 @@ mod test_lru {
     fn test_increment_weight() {
         let lru = Lru::<_, 2>::with_capacity(6, 10);
         lru.admit(1, 1, 1);
-        lru.increment_weight(1, 1);
+        lru.increment_weight(1, 1, None);
         assert_eq!(lru.weight(), 1 + 1);
 
-        lru.increment_weight(0, 1000);
+        lru.increment_weight(0, 1000, None);
         assert_eq!(lru.weight(), 1 + 1);
 
         lru.admit(2, 2, 2);
-        lru.increment_weight(2, 2);
+        lru.increment_weight(2, 2, None);
         assert_eq!(lru.weight(), 1 + 1 + 2 + 2);
+
+        lru.increment_weight(2, 2, Some(3));
+        assert_eq!(lru.weight(), 1 + 1 + 3);
     }
 
     #[test]
@@ -742,15 +788,22 @@ mod test_lru_unit {
     fn test_increment_weight() {
         let mut lru = LruUnit::with_capacity(10);
         lru.admit(1, 1, 1);
-        lru.increment_weight(1, 1);
+        lru.increment_weight(1, 1, None);
         assert_eq!(lru.used_weight(), 1 + 1);
 
-        lru.increment_weight(0, 1000);
+        lru.increment_weight(0, 1000, None);
         assert_eq!(lru.used_weight(), 1 + 1);
 
         lru.admit(2, 2, 2);
-        lru.increment_weight(2, 2);
+        lru.increment_weight(2, 2, None);
         assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2);
+
+        lru.admit(3, 3, 3);
+        lru.increment_weight(3, 3, Some(5));
+        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2 + 3 + 2);
+
+        lru.increment_weight(3, 3, Some(3));
+        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2 + 3);
     }
 
     #[test]

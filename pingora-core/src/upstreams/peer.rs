@@ -610,6 +610,8 @@ impl Hash for HttpPeer {
         #[cfg(feature = "s2n")]
         self.get_psk().hash(state);
         self.group_key.hash(state);
+        // max h2 stream settings
+        self.options.max_h2_streams.hash(state);
     }
 }
 
