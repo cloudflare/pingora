@@ -126,8 +126,23 @@ time = []
 ## Enable sentry for error notifications
 sentry = ["pingora-core/sentry"]
 
+## Enable pre-TLS connection filtering
+connection_filter = [
+    "pingora-core/connection_filter",
+    "pingora-proxy?/connection_filter",
+]
+
+
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
 any_tls = []
 patched_http1 = ["pingora-core/patched_http1"]
-document-features = ["dep:document-features", "proxy", "lb", "cache", "time", "sentry"]
+document-features = [
+    "dep:document-features",
+    "proxy",
+    "lb",
+    "cache",
+    "time",
+    "sentry",
+    "connection_filter"
+]

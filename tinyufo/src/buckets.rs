@@ -36,7 +36,7 @@ impl<T: Send + 'static> Compact<T> {
         Self(shard_array.into_boxed_slice())
     }
 
-    pub fn get(&self, key: &Key) -> Option<Entry<Key, Bucket<T>>> {
+    pub fn get(&self, key: &Key) -> Option<Entry<'_, Key, Bucket<T>>> {
         let shard = *key as usize % self.0.len();
         self.0[shard].get(key)
     }

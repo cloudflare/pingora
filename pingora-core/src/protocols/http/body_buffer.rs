@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 
 /// A buffer with size limit. When the total amount of data written to the buffer is below the limit
 /// all the data will be held in the buffer. Otherwise, the buffer will report to be truncated.
-pub(crate) struct FixedBuffer {
+pub struct FixedBuffer {
     buffer: BytesMut,
     capacity: usize,
     truncated: bool,

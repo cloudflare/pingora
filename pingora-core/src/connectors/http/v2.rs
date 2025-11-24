@@ -14,6 +14,7 @@
 
 use super::HttpSession;
 use crate::connectors::{ConnectorOptions, TransportConnector};
+use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
@@ -62,7 +63,7 @@ pub(crate) struct ConnectionRefInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct ConnectionRef(Arc<ConnectionRefInner>);
+pub struct ConnectionRef(Arc<ConnectionRefInner>);
 
 impl ConnectionRef {
     pub fn new(
@@ -162,7 +163,7 @@ impl ConnectionRef {
     }
 }
 
-struct InUsePool {
+pub struct InUsePool {
     // TODO: use pingora hashmap to shard the lock contention
     pools: RwLock<HashMap<u64, PoolNode<ConnectionRef>>>,
 }
@@ -174,7 +175,7 @@ impl InUsePool {
         }
     }
 
-    fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
+    pub fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
         {
             let pools = self.pools.read();
             if let Some(pool) = pools.get(&reuse_hash) {
@@ -192,14 +193,14 @@ impl InUsePool {
     // retrieve a h2 conn ref to create a new stream
     // the caller should return the conn ref to this pool if there are still
     // capacity left for more streams
-    fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
+    pub fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
         let pools = self.pools.read();
         pools.get(&reuse_hash)?.get_any().map(|v| v.1)
     }
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
-    fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
+    pub fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
         let pools = self.pools.read();
         if let Some(pool) = pools.get(&reuse_hash) {
             pool.remove(id)
@@ -235,13 +236,25 @@ impl Connector {
         }
     }
 
+    pub fn transport(&self) -> &TransportConnector {
+        &self.transport
+    }
+
+    pub fn idle_pool(&self) -> &Arc<ConnectionPool<ConnectionRef>> {
+        &self.idle_pool
+    }
+
+    pub fn in_use_pool(&self) -> &InUsePool {
+        &self.in_use_pool
+    }
+
     /// Create a new Http2 connection to the given server
     ///
     /// Either an Http2 or Http1 session can be returned depending on the server's preference.
-    pub async fn new_http_session<P: Peer + Send + Sync + 'static>(
+    pub async fn new_http_session<P: Peer + Send + Sync + 'static, C: Session>(
         &self,
         peer: &P,
-    ) -> Result<HttpSession> {
+    ) -> Result<HttpSession<C>> {
         let stream = self.transport.new_stream(peer).await?;
 
         // check alpn
@@ -257,7 +270,7 @@ impl Connector {
                 if peer.tls()
                     || peer
                         .get_peer_options()
-                        .map_or(true, |o| o.alpn.get_min_http_version() == 1)
+                        .is_none_or(|o| o.alpn.get_min_http_version() == 1)
                 {
                     return Ok(HttpSession::H1(Http1Session::new(stream)));
                 }
@@ -388,7 +401,7 @@ impl Connector {
 // 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
 const H2_WINDOW_SIZE: u32 = 1 << 23;
 
-pub(crate) async fn handshake(
+pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
@@ -457,6 +470,7 @@ pub(crate) async fn handshake(
     ))
 }
 
+// TODO(slava): add custom unit tests
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,10 +482,14 @@ mod tests {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
-        let h2 = connector.new_http_session(&peer).await.unwrap();
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
         match h2 {
             HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
+            HttpSession::Custom(_) => panic!("expect h2"),
         }
     }
 
@@ -482,10 +500,14 @@ mod tests {
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         // a hack to force h1, new_http_session() in the future might validate this setting
         peer.options.set_http_version(1, 1);
-        let h2 = connector.new_http_session(&peer).await.unwrap();
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
         match h2 {
             HttpSession::H1(_) => {}
             HttpSession::H2(_) => panic!("expect h1"),
+            HttpSession::Custom(_) => panic!("expect h1"),
         }
     }
 
@@ -494,10 +516,14 @@ mod tests {
         let connector = Connector::new(None);
         let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
         peer.options.set_http_version(2, 1);
-        let h2 = connector.new_http_session(&peer).await.unwrap();
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
         match h2 {
             HttpSession::H1(_) => {}
             HttpSession::H2(_) => panic!("expect h1"),
+            HttpSession::Custom(_) => panic!("expect h1"),
         }
     }
 
@@ -508,10 +534,14 @@ mod tests {
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
-        let h2 = connector.new_http_session(&peer).await.unwrap();
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
         let h2_1 = match h2 {
             HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => h2_stream,
+            HttpSession::Custom(_) => panic!("expect h2"),
         };
 
         let id = h2_1.conn.id();
@@ -540,10 +570,14 @@ mod tests {
         let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 3;
-        let h2 = connector.new_http_session(&peer).await.unwrap();
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
         let h2_1 = match h2 {
             HttpSession::H1(_) => panic!("expect h2"),
             HttpSession::H2(h2_stream) => h2_stream,
+            HttpSession::Custom(_) => panic!("expect h2"),
         };
 
         let id = h2_1.conn.id();

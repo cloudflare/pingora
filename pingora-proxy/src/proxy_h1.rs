@@ -12,12 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::future::OptionFuture;
+use futures::StreamExt;
+
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
+use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 
-impl<SV> HttpProxy<SV> {
+impl<SV, C> HttpProxy<SV, C>
+where
+    C: custom::Connector,
+{
     pub(crate) async fn proxy_1to1(
         &self,
         session: &mut Session,
@@ -85,6 +92,11 @@ impl<SV> HttpProxy<SV> {
             }
         }
 
+        let mut downstream_custom_message_writer = session
+            .downstream_session
+            .as_custom_mut()
+            .and_then(|c| c.take_custom_message_writer());
+
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
@@ -92,9 +104,26 @@ impl<SV> HttpProxy<SV> {
 
         // start bi-directional streaming
         let ret = tokio::try_join!(
-            self.proxy_handle_downstream(session, tx_downstream, rx_upstream, ctx),
+            self.proxy_handle_downstream(
+                session,
+                tx_downstream,
+                rx_upstream,
+                ctx,
+                &mut downstream_custom_message_writer
+            ),
             self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream),
         );
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            match custom_session.restore_custom_message_writer(
+                downstream_custom_message_writer.expect("downstream be present"),
+            ) {
+                Ok(_) => { /* continue */ }
+                Err(e) => {
+                    return (false, false, Some(e));
+                }
+            }
+        }
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
@@ -137,6 +166,10 @@ impl<SV> HttpProxy<SV> {
 
         let (server_session_reuse, client_session_reuse, error) =
             self.proxy_1to1(session, client_session, peer, ctx).await;
+
+        // Record upstream response body bytes received (payload only) for logging consumers.
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
 
         (server_session_reuse, client_session_reuse, error)
     }
@@ -198,8 +231,9 @@ impl<SV> HttpProxy<SV> {
                             }
                         },
                         Err(e) => {
-                           debug!("send error, draining read buf: {e}");
+                           warn!("send error, draining read buf: {e}");
                            request_done = true;
+
                            send_error = Some(e);
                            continue
                         }
@@ -224,11 +258,33 @@ impl<SV> HttpProxy<SV> {
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
+        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        // setup custom message forwarding, if downstream supports it
+        let (
+            mut downstream_custom_read,
+            mut downstream_custom_write,
+            downstream_custom_message_custom_forwarding,
+            mut downstream_custom_message_inject_rx,
+            mut downstream_custom_message_reader,
+        ) = if downstream_custom_message_writer.is_some() {
+            let reader = session.downstream_custom_message()?;
+            let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
+            (true, true, Some(inject_tx), Some(inject_rx), reader)
+        } else {
+            (false, false, None, None, None)
+        };
+
+        if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            self.inner
+                .custom_forwarding(session, ctx, None, custom_forwarding)
+                .await?;
+        }
+
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         let buffer = session.as_ref().get_retry_buffer();
@@ -273,12 +329,30 @@ impl<SV> HttpProxy<SV> {
          * If both are done, quit the loop
          * Usually there is no request body to read for cacheable request
          */
-        while !downstream_state.is_done() || !response_state.is_done() {
+        while !downstream_state.is_done()
+            || !response_state.is_done()
+            || downstream_custom_read && !downstream_state.is_errored()
+            || downstream_custom_write
+        {
             // reserve tx capacity ahead to avoid deadlock, see below
 
             let send_permit = tx
                 .try_reserve()
                 .or_err(InternalError, "try_reserve() body pipe for upstream");
+
+            // Use optional futures to allow using optional channels in select branches
+            let custom_inject_rx_recv: OptionFuture<_> = downstream_custom_message_inject_rx
+                .as_mut()
+                .map(|rx| rx.recv())
+                .into();
+            let custom_reader_next: OptionFuture<_> = downstream_custom_message_reader
+                .as_mut()
+                .map(|reader| reader.next())
+                .into();
+
+            // partial read support, this check will also be false if cache is disabled.
+            let support_cache_partial_read =
+                session.cache.support_streaming_partial_write() == Some(true);
 
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
@@ -291,7 +365,9 @@ impl<SV> HttpProxy<SV> {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
-                            if serve_from_cache.is_miss() {
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
@@ -427,6 +503,42 @@ impl<SV> HttpProxy<SV> {
                     }
                 }
 
+                data = custom_reader_next, if downstream_custom_read && !downstream_state.is_errored()  => {
+                    let Some(data) = data.flatten() else {
+                        downstream_custom_read = false;
+                        continue;
+                    };
+
+                    let data = match data {
+                        Ok(data) => data,
+                        Err(err) =>  {
+                            warn!("downstream_custom_message_reader got error: {err}");
+                            downstream_custom_read = false;
+                            continue;
+                        },
+                    };
+
+                    self.inner
+                        .downstream_custom_message_proxy_filter(session, data, ctx, true) // true, because it's the last hop for downstream proxying
+                        .await?;
+                },
+
+                data = custom_inject_rx_recv, if downstream_custom_write => {
+                    match data.flatten() {
+                        Some(data) => {
+                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
+                                custom_writer.write_custom_message(data).await?
+                            }
+                        },
+                        None => {
+                            downstream_custom_write = false;
+                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
+                                custom_writer.finish_custom().await?;
+                            }
+                        },
+                    }
+                },
+
                 else => {
                     break;
                 }
@@ -520,6 +632,10 @@ impl<SV> HttpProxy<SV> {
                         range_body_filter.set(range_type);
                     }
                 }
+
+                // TODO: just set version to Version::HTTP_11 unconditionally here,
+                // (with another todo being an option to faithfully proxy the <1.1 responses)
+                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
 
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */

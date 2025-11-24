@@ -499,6 +499,7 @@ impl CacheMeta {
     pub fn serialize(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         let internal = self.0.internal.serialize()?;
         let header = header_serialize(&self.0.header)?;
+        log::debug!("header to serialize: {:?}", &self.0.header);
         Ok((internal, header))
     }
 

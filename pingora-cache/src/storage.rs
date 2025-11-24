@@ -157,12 +157,14 @@ pub trait HandleHit {
 }
 
 /// Hit Handler
-pub type HitHandler = Box<(dyn HandleHit + Sync + Send)>;
+pub type HitHandler = Box<dyn HandleHit + Sync + Send>;
 
 /// MissFinishType
 pub enum MissFinishType {
+    /// A new asset was created with the given size.
     Created(usize),
-    Appended(usize),
+    /// Appended size to existing asset, with an optional max size param.
+    Appended(usize, Option<usize>),
 }
 
 /// Cache miss handling trait
@@ -197,7 +199,7 @@ pub trait HandleMiss {
 }
 
 /// Miss Handler
-pub type MissHandler = Box<(dyn HandleMiss + Sync + Send)>;
+pub type MissHandler = Box<dyn HandleMiss + Sync + Send>;
 
 pub mod streaming_write {
     /// Portable u64 (sized) write id convenience type for use with streaming writes.

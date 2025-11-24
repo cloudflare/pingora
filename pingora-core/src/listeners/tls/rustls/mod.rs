@@ -80,7 +80,7 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub fn set_alpn(&mut self, alpn: ALPN) {
         self.alpn_protocols = Some(alpn.to_wire_protocols());
     }
 

@@ -198,7 +198,7 @@ where
     }
 
     // second_keyshare is default true
-    if !peer.get_peer_options().map_or(true, |o| o.second_keyshare) {
+    if !peer.get_peer_options().is_none_or(|o| o.second_keyshare) {
         ssl_use_second_key_share(&mut ssl_conf, false);
     }
 

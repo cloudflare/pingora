@@ -17,7 +17,10 @@
 use crate::Backend;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use pingora_core::connectors::http::custom;
 use pingora_core::connectors::{http::Connector as HttpConnector, TransportConnector};
+use pingora_core::custom_session;
+use pingora_core::protocols::http::custom::client::Session;
 use pingora_core::upstreams::peer::{BasicPeer, HttpPeer, Peer};
 use pingora_error::{Error, ErrorType::CustomCode, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -148,7 +151,10 @@ type Validator = Box<dyn Fn(&ResponseHeader) -> Result<()> + Send + Sync>;
 /// HTTP health check
 ///
 /// This health check checks if it can receive the expected HTTP(s) response from the given backend.
-pub struct HttpHealthCheck {
+pub struct HttpHealthCheck<C = ()>
+where
+    C: custom::Connector,
+{
     /// Number of successful checks to flip from unhealthy to healthy.
     pub consecutive_success: usize,
     /// Number of failed checks to flip from healthy to unhealthy.
@@ -170,7 +176,7 @@ pub struct HttpHealthCheck {
     pub reuse_connection: bool,
     /// The request header to send to the backend
     pub req: RequestHeader,
-    connector: HttpConnector,
+    connector: HttpConnector<C>,
     /// Optional field to define how to validate the response from the server.
     ///
     /// If not set, any response with a `200 OK` is considered a successful check.
@@ -184,7 +190,7 @@ pub struct HttpHealthCheck {
     pub backend_summary_callback: Option<BackendSummary>,
 }
 
-impl HttpHealthCheck {
+impl HttpHealthCheck<()> {
     /// Create a new [HttpHealthCheck] with the following default settings
     /// * connect timeout: 1 second
     /// * read timeout: 1 second
@@ -213,9 +219,43 @@ impl HttpHealthCheck {
             backend_summary_callback: None,
         }
     }
+}
+
+impl<C> HttpHealthCheck<C>
+where
+    C: custom::Connector,
+{
+    /// Create a new [HttpHealthCheck] with the following default settings
+    /// * connect timeout: 1 second
+    /// * read timeout: 1 second
+    /// * req: a GET to the `/` of the given host name
+    /// * consecutive_success: 1
+    /// * consecutive_failure: 1
+    /// * reuse_connection: false
+    /// * validator: `None`, any 200 response is considered successful
+    pub fn new_custom(host: &str, tls: bool, custom: HttpConnector<C>) -> Self {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.append_header("Host", host).unwrap();
+        let sni = if tls { host.into() } else { String::new() };
+        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni);
+        peer_template.options.connection_timeout = Some(Duration::from_secs(1));
+        peer_template.options.read_timeout = Some(Duration::from_secs(1));
+        HttpHealthCheck {
+            consecutive_success: 1,
+            consecutive_failure: 1,
+            peer_template,
+            connector: custom,
+            reuse_connection: false,
+            req,
+            validator: None,
+            port_override: None,
+            health_changed_callback: None,
+            backend_summary_callback: None,
+        }
+    }
 
     /// Replace the internal http connector with the given [HttpConnector]
-    pub fn set_connector(&mut self, connector: HttpConnector) {
+    pub fn set_connector(&mut self, connector: HttpConnector<C>) {
         self.connector = connector;
     }
 
@@ -228,7 +268,10 @@ impl HttpHealthCheck {
 }
 
 #[async_trait]
-impl HealthCheck for HttpHealthCheck {
+impl<C> HealthCheck for HttpHealthCheck<C>
+where
+    C: custom::Connector,
+{
     fn health_threshold(&self, success: bool) -> usize {
         if success {
             self.consecutive_success
@@ -250,6 +293,8 @@ impl HealthCheck for HttpHealthCheck {
         session.write_request_header(req).await?;
         session.finish_request_body().await?;
 
+        custom_session!(session.finish_custom().await?);
+
         if let Some(read_timeout) = peer.options.read_timeout {
             session.set_read_timeout(Some(read_timeout));
         }
@@ -270,6 +315,9 @@ impl HealthCheck for HttpHealthCheck {
         while session.read_response_body().await?.is_some() {
             // drain the body if any
         }
+
+        // TODO(slava): do it concurrently wtih body drain?
+        custom_session!(session.drain_custom_messages().await?);
 
         if self.reuse_connection {
             let idle_timeout = peer.idle_timeout();

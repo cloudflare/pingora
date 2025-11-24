@@ -222,12 +222,11 @@ impl HttpSession {
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         let read = self.read_body().await?;
-        Ok(read.map(|b| {
+        Ok(read.inspect(|b| {
             self.body_bytes_read += b.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&b);
+                buffer.write_to_buffer(b);
             }
-            b
         }))
     }
 
@@ -554,7 +553,7 @@ impl HttpSession {
         // just consume empty body or done messages, the downstream channel is not a real
         // connection and only used for this one request
         while matches!(&task, HttpTask::Done)
-            || matches!(&task, HttpTask::Body(b, _) if b.as_ref().map_or(true, |b| b.is_empty()))
+            || matches!(&task, HttpTask::Body(b, _) if b.as_ref().is_none_or(|b| b.is_empty()))
         {
             task = rx
                 .recv()

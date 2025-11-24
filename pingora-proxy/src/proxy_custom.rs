@@ -12,213 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::future::OptionFuture;
 use futures::StreamExt;
+use pingora_core::{
+    protocols::http::custom::{
+        client::Session as CustomSession, is_informational_except_101, BodyWrite,
+        CustomMessageWrite, CUSTOM_MESSAGE_QUEUE_SIZE,
+    },
+    ImmutStr,
+};
+use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
+use proxy_common::{DownstreamStateMachine, ResponseStateMachine};
+use tokio::sync::oneshot;
 
 use super::*;
-use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
-use crate::proxy_common::*;
-use http::{header::CONTENT_LENGTH, Method, StatusCode};
-use pingora_cache::CachePhase;
-use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
-use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
-
-// add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(
-    header: &mut http::request::Parts,
-    raw_host: &[u8],
-    tls: bool,
-) -> Result<()> {
-    let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
-        if s.starts_with('[') {
-            // don't mess with ipv6 host
-            s
-        } else if let Some(colon) = s.find(':') {
-            if s.len() == colon + 1 {
-                // colon is the last char, ignore
-                s
-            } else if let Some(another_colon) = s[colon + 1..].find(':') {
-                // try to get rid of extra port numbers
-                &s[..colon + 1 + another_colon]
-            } else {
-                s
-            }
-        } else {
-            s
-        }
-    } else {
-        return Error::e_explain(
-            InvalidHTTPHeader,
-            format!("invalid authority from host {:?}", raw_host),
-        );
-    };
-
-    let scheme = if tls { "https" } else { "http" };
-    let uri = http::uri::Builder::new()
-        .scheme(scheme)
-        .authority(authority)
-        .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
-        .build();
-    match uri {
-        Ok(uri) => {
-            header.uri = uri;
-            Ok(())
-        }
-        Err(_) => Error::e_explain(
-            InvalidHTTPHeader,
-            format!("invalid authority from host {}", authority),
-        ),
-    }
-}
 
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
 {
-    pub(crate) async fn proxy_down_to_up(
+    /// Proxy to a custom protocol upstream.
+    /// Returns (reuse_server, error)
+    pub(crate) async fn proxy_to_custom_upstream(
         &self,
         session: &mut Session,
-        client_session: &mut Http2Session,
-        peer: &HttpPeer,
-        ctx: &mut SV::CTX,
-    ) -> (bool, Option<Box<Error>>)
-    // (reuse_server, error)
-    where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
-    {
-        let mut req = session.req_header().clone();
-
-        if req.version != Version::HTTP_2 {
-            /* remove H1 specific headers */
-            // https://github.com/hyperium/h2/blob/d3b9f1e36aadc1a7a6804e2f8e86d3fe4a244b4f/src/proto/streams/send.rs#L72
-            req.remove_header(&http::header::TRANSFER_ENCODING);
-            req.remove_header(&http::header::CONNECTION);
-            req.remove_header(&http::header::UPGRADE);
-            req.remove_header("keep-alive");
-            req.remove_header("proxy-connection");
-        }
-
-        /* turn it into h2 */
-        req.set_version(Version::HTTP_2);
-
-        if session.cache.enabled() {
-            pingora_cache::filters::upstream::request_filter(
-                &mut req,
-                session.cache.maybe_cache_meta(),
-            );
-            session.mark_upstream_headers_mutated_for_cache();
-        }
-
-        match self
-            .inner
-            .upstream_request_filter(session, &mut req, ctx)
-            .await
-        {
-            Ok(_) => { /* continue */ }
-            Err(e) => {
-                return (false, Some(e));
-            }
-        }
-
-        // Remove H1 `Host` header, save it in order to add to :authority
-        // We do this because certain H2 servers expect request not to have a host header.
-        // The `Host` is removed after the upstream filters above for 2 reasons
-        // 1. there is no API to change the :authority header
-        // 2. the filter code needs to be aware of the host vs :authority across http versions otherwise
-        let host = req.remove_header(&http::header::HOST);
-
-        session.upstream_compression.request_filter(&req);
-        let body_empty = session.as_mut().is_body_empty();
-
-        // whether we support sending END_STREAM on HEADERS if body is empty
-        let send_end_stream = req.send_end_stream().expect("req must be h2");
-
-        let mut req: http::request::Parts = req.into();
-
-        // H2 requires authority to be set, so copy that from H1 host if that is set
-        if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
-                return (false, Some(e));
-            }
-        }
-
-        debug!("Request to h2: {req:?}");
-
-        // send END_STREAM on HEADERS
-        let send_header_eos = send_end_stream && body_empty;
-        debug!("send END_STREAM on HEADERS: {send_end_stream}");
-
-        let req = Box::new(RequestHeader::from(req));
-        if let Err(e) = client_session.write_request_header(req, send_header_eos) {
-            return (false, Some(e.into_up()));
-        }
-
-        if !send_end_stream && body_empty {
-            // send END_STREAM on empty DATA frame
-            match client_session.write_request_body(Bytes::new(), true).await {
-                Ok(()) => debug!("sent empty DATA frame to h2"),
-                Err(e) => {
-                    return (false, Some(e.into_up()));
-                }
-            }
-        }
-
-        client_session.read_timeout = peer.options.read_timeout;
-
-        let mut downstream_custom_message_writer = session
-            .downstream_session
-            .as_custom_mut()
-            .and_then(|c| c.take_custom_message_writer());
-
-        // take the body writer out of the client for easy duplex
-        let mut client_body = client_session
-            .take_request_body_writer()
-            .expect("already send request header");
-
-        // need to get the write_timeout here since we pass the h2 SendStream
-        // directly to bidirection_down_to_up
-        let write_timeout = peer.options.write_timeout;
-
-        let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
-
-        session.as_mut().enable_retry_buffering();
-
-        /* read downstream body and upstream response at the same time */
-
-        let ret = tokio::try_join!(
-            self.bidirection_down_to_up(
-                session,
-                &mut client_body,
-                rx,
-                ctx,
-                write_timeout,
-                &mut downstream_custom_message_writer
-            ),
-            pipe_up_to_down_response(client_session, tx)
-        );
-
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            match custom_session.restore_custom_message_writer(
-                downstream_custom_message_writer.expect("downstream be present"),
-            ) {
-                Ok(_) => { /* continue */ }
-                Err(e) => {
-                    return (false, Some(e));
-                }
-            }
-        }
-
-        match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
-            Err(e) => (false, Some(e)),
-        }
-    }
-
-    pub(crate) async fn proxy_to_h2_upstream(
-        &self,
-        session: &mut Session,
-        client_session: &mut Http2Session,
+        client_session: &mut C::Session,
         reused: bool,
         peer: &HttpPeer,
         ctx: &mut SV::CTX,
@@ -241,62 +58,236 @@ where
         }
 
         let (server_session_reuse, error) = self
-            .proxy_down_to_up(session, client_session, peer, ctx)
+            .custom_proxy_down_to_up(session, client_session, peer, ctx)
             .await;
 
-        // Record upstream response body bytes received (HTTP/2 DATA payload).
-        let upstream_bytes_total = client_session.body_bytes_received();
-        session.set_upstream_body_bytes_received(upstream_bytes_total);
+        // Parity with H1/H2: custom upstreams don't report payload bytes; record 0.
+        session.set_upstream_body_bytes_received(0);
 
         (server_session_reuse, error)
     }
 
-    // returns whether server (downstream) session can be reused
-    async fn bidirection_down_to_up(
+    /// Handle custom protocol proxying from downstream to upstream.
+    /// Returns (reuse_server, error)
+    async fn custom_proxy_down_to_up(
         &self,
         session: &mut Session,
-        client_body: &mut h2::SendStream<bytes::Bytes>,
+        client_session: &mut C::Session,
+        peer: &HttpPeer,
+        ctx: &mut SV::CTX,
+    ) -> (bool, Option<Box<Error>>)
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let mut req = session.req_header().clone();
+
+        if session.cache.enabled() {
+            pingora_cache::filters::upstream::request_filter(
+                &mut req,
+                session.cache.maybe_cache_meta(),
+            );
+            session.mark_upstream_headers_mutated_for_cache();
+        }
+
+        match self
+            .inner
+            .upstream_request_filter(session, &mut req, ctx)
+            .await
+        {
+            Ok(_) => { /* continue */ }
+            Err(e) => {
+                return (false, Some(e));
+            }
+        }
+
+        session.upstream_compression.request_filter(&req);
+        let body_empty = session.as_mut().is_body_empty();
+
+        debug!("Request to custom: {req:?}");
+
+        let req = Box::new(req);
+        if let Err(e) = client_session.write_request_header(req, body_empty).await {
+            return (false, Some(e.into_up()));
+        }
+
+        client_session.set_read_timeout(peer.options.read_timeout);
+        client_session.set_write_timeout(peer.options.write_timeout);
+
+        // take the body writer out of the client for easy duplex
+        let mut client_body = client_session
+            .take_request_body_writer()
+            .expect("already send request header");
+
+        let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+
+        session.as_mut().enable_retry_buffering();
+
+        // Custom message logic
+
+        let Some(upstream_custom_message_reader) = client_session.take_custom_message_reader()
+        else {
+            return (
+                false,
+                Some(Error::explain(
+                    ReadError,
+                    "can't extract custom reader from upstream",
+                )),
+            );
+        };
+
+        let Some(mut upstream_custom_message_writer) = client_session.take_custom_message_writer()
+        else {
+            return (
+                false,
+                Some(Error::explain(
+                    WriteError,
+                    "custom upstream must have a custom message writer",
+                )),
+            );
+        };
+
+        // A channel to inject custom messages to upstream from server logic.
+        let (upstream_custom_message_inject_tx, upstream_custom_message_inject_rx) =
+            mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
+
+        // Downstream reader
+        let downstream_custom_message_reader = match session.downstream_custom_message() {
+            Ok(Some(rx)) => rx,
+            Ok(None) => Box::new(futures::stream::empty::<Result<Bytes>>()),
+            Err(err) => return (false, Some(err)),
+        };
+
+        // Downstream writer
+        let (mut downstream_custom_message_writer, downstream_custom_final_hop): (
+            Box<dyn CustomMessageWrite>,
+            bool, // if this hop is final
+        ) = if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            (
+                custom_session
+                    .take_custom_message_writer()
+                    .expect("custom downstream must have a custom message writer"),
+                false,
+            )
+        } else {
+            (Box::new(()), true)
+        };
+
+        // A channel to inject custom messages to downstream from server logic.
+        let (downstream_custom_message_inject_tx, downstream_custom_message_inject_rx) =
+            mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
+
+        // Filters for ProxyHttp trait
+        let (upstream_custom_message_filter_tx, upstream_custom_message_filter_rx) =
+            mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
+        let (downstream_custom_message_filter_tx, downstream_custom_message_filter_rx) =
+            mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
+
+        // Cancellation channels for custom coroutines
+        // The transmitters act as guards: when dropped, they signal the receivers to cancel.
+        // `cancel_downstream_reader_tx` is held and later used to explicitly cancel.
+        // `_cancel_upstream_reader_tx` is unused (prefixed with _) - it will be dropped at the
+        // end of this scope, which automatically signals cancellation to the upstream reader.
+        let (cancel_downstream_reader_tx, cancel_downstream_reader_rx) = oneshot::channel();
+        let (_cancel_upstream_reader_tx, cancel_upstream_reader_rx) = oneshot::channel();
+
+        let upstream_custom_message_forwarder = CustomMessageForwarder {
+            ctx: "down_to_up".into(),
+            reader: downstream_custom_message_reader,
+            writer: &mut upstream_custom_message_writer,
+            filter: upstream_custom_message_filter_tx,
+            inject: upstream_custom_message_inject_rx,
+            cancel: cancel_downstream_reader_rx,
+        };
+
+        let downstream_custom_message_forwarder = CustomMessageForwarder {
+            ctx: "up_to_down".into(),
+            reader: upstream_custom_message_reader,
+            writer: &mut downstream_custom_message_writer,
+            filter: downstream_custom_message_filter_tx,
+            inject: downstream_custom_message_inject_rx,
+            cancel: cancel_upstream_reader_rx,
+        };
+
+        if let Err(e) = self
+            .inner
+            .custom_forwarding(
+                session,
+                ctx,
+                Some(upstream_custom_message_inject_tx),
+                downstream_custom_message_inject_tx,
+            )
+            .await
+        {
+            return (false, Some(e));
+        }
+
+        /* read downstream body and upstream response at the same time */
+        let ret = tokio::try_join!(
+            self.custom_bidirection_down_to_up(
+                session,
+                &mut client_body,
+                rx,
+                ctx,
+                upstream_custom_message_filter_rx,
+                downstream_custom_message_filter_rx,
+                downstream_custom_final_hop,
+                cancel_downstream_reader_tx,
+            ),
+            custom_pipe_up_to_down_response(client_session, tx),
+            upstream_custom_message_forwarder.proxy(),
+            downstream_custom_message_forwarder.proxy(),
+        );
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            custom_session
+                .restore_custom_message_writer(downstream_custom_message_writer)
+                .expect("downstream restore_custom_message_writer should be empty");
+        }
+
+        match ret {
+            Ok((downstream_can_reuse, _upstream, _custom_up_down, _custom_down_up)) => {
+                (downstream_can_reuse, None)
+            }
+            Err(e) => (false, Some(e)),
+        }
+    }
+
+    // returns whether server (downstream) session can be reused
+    #[allow(clippy::too_many_arguments)]
+    async fn custom_bidirection_down_to_up(
+        &self,
+        session: &mut Session,
+        client_body: &mut Box<dyn BodyWrite>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
-        write_timeout: Option<Duration>,
-        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+        mut upstream_custom_message_filter_rx: mpsc::Receiver<(
+            Bytes,
+            oneshot::Sender<Option<Bytes>>,
+        )>,
+        mut downstream_custom_message_filter_rx: mpsc::Receiver<(
+            Bytes,
+            oneshot::Sender<Option<Bytes>>,
+        )>,
+        downstream_custom_final_hop: bool,
+        cancel_downstream_reader_tx: oneshot::Sender<()>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // setup custom message forwarding, if downstream supports it
-        let (
-            mut downstream_custom_read,
-            mut downstream_custom_write,
-            downstream_custom_message_custom_forwarding,
-            mut downstream_custom_message_inject_rx,
-            mut downstream_custom_message_reader,
-        ) = if downstream_custom_message_writer.is_some() {
-            let reader = session.downstream_custom_message()?;
-            let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx), reader)
-        } else {
-            (false, false, None, None, None)
-        };
-
-        if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
-            self.inner
-                .custom_forwarding(session, ctx, None, custom_forwarding)
-                .await?;
-        }
+        let mut cancel_downstream_reader_tx = Some(cancel_downstream_reader_tx);
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            self.send_body_to2(
+            self.send_body_to_custom(
                 session,
                 Some(buffer),
                 downstream_state.is_done(),
                 client_body,
                 ctx,
-                write_timeout,
             )
             .await?;
         }
@@ -308,34 +299,23 @@ where
         let mut serve_from_cache = ServeFromCache::new();
         let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
 
+        let mut upstream_custom = true;
+        let mut downstream_custom = true;
+
         /* duplex mode
          * see the Same function for h1 for more comments
          */
         while !downstream_state.is_done()
             || !response_state.is_done()
-            || downstream_custom_read && !downstream_state.is_errored()
-            || downstream_custom_write
+            || upstream_custom
+            || downstream_custom
         {
-            // Use optional futures to allow using optional channels in select branches
-            let custom_inject_rx_recv: OptionFuture<_> = downstream_custom_message_inject_rx
-                .as_mut()
-                .map(|rx| rx.recv())
-                .into();
-            let custom_reader_next: OptionFuture<_> = downstream_custom_message_reader
-                .as_mut()
-                .map(|reader| reader.next())
-                .into();
-
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
 
-            // Similar logic in h1 need to reserve capacity first to avoid deadlock
-            // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
-                // NOTE: cannot avoid this copy since h2 owns the buf
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
-                    debug!("downstream event");
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
@@ -356,23 +336,31 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
-                        Ok(request_done) =>  {
-                            downstream_state.maybe_finished(request_done);
-                        },
-                        Err(e) => {
-                            // mark request done, attempt to drain receive
-                            warn!("Upstream h2 body send error: {e}");
-                            // upstream is what actually errored but we don't want to continue
-                            // polling the downstream body
-                            downstream_state.to_errored();
-                        }
-                    };
+
+                    match self.send_body_to_custom(session, body, is_body_done, client_body, ctx).await {
+                            Ok(request_done) =>  {
+                                downstream_state.maybe_finished(request_done);
+                            },
+                            Err(e) => {
+                                // mark request done, attempt to drain receive
+                                warn!("body send error: {e}");
+
+                                // upstream is what actually errored but we don't want to continue
+                                // polling the downstream body
+                                downstream_state.to_errored();
+
+                                // downstream still trying to send something, but the upstream is already stooped
+                                // cancel the custom downstream to upstream coroutine, because the proxy will not see EOS.
+                                let _ = cancel_downstream_reader_tx.take().expect("cancel must be set and called once").send(());
+                            }
+                        };
                 },
 
                 task = rx.recv(), if !response_state.upstream_done() => {
+                    debug!("upstream event");
+
                     if let Some(t) = task {
-                        debug!("upstream event: {:?}", t);
+                        debug!("upstream event custom: {:?}", t);
                         if serve_from_cache.should_discard_upstream() {
                             // just drain, do we need to do anything else?
                            continue;
@@ -380,13 +368,8 @@ where
                         // pull as many tasks as we can
                         let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         tasks.push(t);
-                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
-                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
-                            if let Some(t) = maybe_task {
-                                tasks.push(t);
-                            } else {
-                                break
-                            }
+                        while let Ok(task) = rx.try_recv() {
+                            tasks.push(task);
                         }
 
                         /* run filters before sending to downstream */
@@ -407,7 +390,7 @@ where
                                 }
                             }
                             filtered_tasks.push(
-                                self.h2_response_filter(session, t, ctx,
+                                self.custom_response_filter(session, t, ctx,
                                     &mut serve_from_cache,
                                     &mut range_body_filter, false).await?);
                             if serve_from_cache.is_miss_header() {
@@ -430,11 +413,9 @@ where
 
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
-                    let task = self.h2_response_filter(session, task?, ctx,
+                    let task = self.custom_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
-                    debug!("serve_from_cache task {task:?}");
-
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
                         Err(e) => if serve_from_cache.is_miss() {
@@ -457,47 +438,58 @@ where
                         }
                     }
                 }
-                data = custom_reader_next, if downstream_custom_read && !downstream_state.is_errored()  => {
-                    let Some(data) = data.flatten() else {
 
-                        downstream_custom_read = false;
+                ret = upstream_custom_message_filter_rx.recv(), if upstream_custom => {
+                    let Some(msg) = ret else {
+                        debug!("upstream_custom_message_filter_rx: custom downstream to upstream exited on reading");
+                        upstream_custom = false;
                         continue;
                     };
 
-                    let data = match data {
-                        Ok(data) => data,
-                        Err(err) =>  {
-                            warn!("downstream_custom_message_reader got error: {err}");
-                            downstream_custom_read = false;
-                            continue;
-                        },
-                    };
+                    let (data, callback) = msg;
 
-                    self.inner
-                        .downstream_custom_message_proxy_filter(session, data, ctx, true) // true, because it's the last hop for downstream proxying
+                    let new_msg = self.inner
+                        .downstream_custom_message_proxy_filter(session, data, ctx, false)  // false because the upstream is custom
                         .await?;
+
+                    if callback.send(new_msg).is_err() {
+                        debug!("upstream_custom_message_incoming_rx: custom downstream to upstream exited on callback");
+                        upstream_custom = false;
+                        continue;
+                    };
                 },
 
-                data = custom_inject_rx_recv, if downstream_custom_write => {
-                    match data.flatten() {
-                        Some(data) => {
-                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
-                                custom_writer.write_custom_message(data).await?
-                            }
-                        },
-                        None => {
-                            downstream_custom_write = false;
-                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
-                                custom_writer.finish_custom().await?;
-                            }
-                        },
-                    }
+                ret = downstream_custom_message_filter_rx.recv(), if downstream_custom => {
+                    let Some(msg) = ret else {
+                        debug!("downstream_custom_message_filter_rx: custom upstream to downstream exited on reading");
+                        downstream_custom = false;
+                        continue;
+                    };
+
+                    let (data, callback) = msg;
+
+                    let new_msg = self.inner
+                        .upstream_custom_message_proxy_filter(session, data, ctx, downstream_custom_final_hop)
+                        .await?;
+
+                    if callback.send(new_msg).is_err() {
+                        debug!("downstream_custom_message_filter_rx: custom upstream to downstream exited on callback");
+                        downstream_custom = false;
+                        continue
+                    };
                 },
 
                 else => {
                     break;
                 }
             }
+        }
+
+        // Re-raise the error then the loop is finished.
+        if downstream_state.is_errored() {
+            let err = Error::e_explain(WriteError, "downstream_state is_errored");
+            error!("custom_bidirection_down_to_up: downstream_state.is_errored",);
+            return err;
         }
 
         let mut reuse_downstream = !downstream_state.is_errored();
@@ -515,7 +507,7 @@ where
         Ok(reuse_downstream)
     }
 
-    async fn h2_response_filter(
+    async fn custom_response_filter(
         &self,
         session: &mut Session,
         mut task: HttpTask,
@@ -529,10 +521,7 @@ where
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
-                trace!("delaying upstream response for {duration:?}");
-                time::sleep(duration).await;
-            }
+            self.upstream_filter(session, &mut task, ctx).await?;
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -562,19 +551,12 @@ where
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        // normally max file size is tracked in cache_http_task filters (when cache enabled),
-        // we will track it in these filters before sending to downstream on specific conditions
-        // when cache is disabled
-        let track_max_cache_size = matches!(
-            session.cache.phase(),
-            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
-        );
-
-        let res = match task {
+        match task {
             HttpTask::Header(mut header, eos) => {
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
-                if session.upstream_headers_mutated_for_cache() {
+                // TODO: if cache is disabled during response phase, we should still do the filter
+                if session.cache.enabled() {
                     self.downstream_response_conditional_filter(
                         serve_from_cache,
                         session,
@@ -598,7 +580,7 @@ where
                     || matches!(header.status.as_u16(), 204 | 304);
 
                 /* Add chunked header to tell downstream to use chunked encoding
-                 * during the absent of content-length in h2 */
+                 * during the absent of content-length */
                 if !no_body
                     && !header.status.is_informational()
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
@@ -608,18 +590,12 @@ where
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
-                if track_max_cache_size {
-                    session
-                        .cache
-                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
-                }
-
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
                     .response_body_filter(session, &mut data, eos, ctx)?
                 {
-                    trace!("delaying downstream response for {duration:?}");
+                    trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
@@ -657,28 +633,16 @@ where
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
-        };
-        // On end, check if the response (based on file size) can be considered cacheable again
-        if let Ok(task) = res.as_ref() {
-            if track_max_cache_size
-                && task.is_end()
-                && !matches!(task, HttpTask::Failed(_))
-                && !session.cache.exceeded_max_file_size()
-            {
-                session.cache.response_became_cacheable();
-            }
         }
-        res
     }
 
-    async fn send_body_to2(
+    async fn send_body_to_custom(
         &self,
         session: &mut Session,
         mut data: Option<Bytes>,
         end_of_body: bool,
-        client_body: &mut h2::SendStream<bytes::Bytes>,
+        client_body: &mut Box<dyn BodyWrite>,
         ctx: &mut SV::CTX,
-        write_timeout: Option<Duration>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -694,22 +658,28 @@ where
             .await?;
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
-         * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
+         * Although there is no harm writing empty byte to custom, unlike h1, we ignore it
          * for consistency */
         if !end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
             return Ok(false);
         }
 
-        if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, write_timeout)
+        if let Some(mut data) = data {
+            client_body
+                .write_all_buf(&mut data)
                 .await
                 .map_err(|e| e.into_up())?;
+            if end_of_body {
+                client_body.finish().await.map_err(|e| e.into_up())?;
+            }
         } else {
             debug!("Read downstream body done");
-            /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true, write_timeout)
+            client_body
+                .finish()
                 .await
+                .map_err(|e| {
+                    Error::because(WriteError, "while shutdown send data stream on no data", e)
+                })
                 .map_err(|e| e.into_up())?;
         }
 
@@ -717,56 +687,36 @@ where
     }
 }
 
-/* Read response header, body and trailer from h2 upstream and send them to tx */
-pub(crate) async fn pipe_up_to_down_response(
-    client: &mut Http2Session,
+/* Read response header, body and trailer from custom upstream and send them to tx */
+async fn custom_pipe_up_to_down_response<S: CustomSession>(
+    client: &mut S,
     tx: mpsc::Sender<HttpTask>,
 ) -> Result<()> {
-    client
-        .read_response_header()
-        .await
-        .map_err(|e| e.into_up())?; // should we send the error as an HttpTask?
+    let mut is_informational = true;
+    while is_informational {
+        client
+            .read_response_header()
+            .await
+            .map_err(|e| e.into_up())?;
+        let resp_header = Box::new(client.response_header().expect("just read").clone());
+        // `101 Switching Protocols` is a response to the http1 Upgrade header and it's final response.
+        // The WebSocket Protocol https://datatracker.ietf.org/doc/html/rfc6455
+        is_informational = is_informational_except_101(resp_header.status.as_u16() as u32);
 
-    let resp_header = Box::new(client.response_header().expect("just read").clone());
-
-    match client.check_response_end_or_error() {
-        Ok(eos) => {
-            // XXX: the h2 crate won't check for content-length underflow
-            // if a header frame with END_STREAM is sent without data frames
-            // As stated by RFC, "204 or 304 responses contain no content,
-            // as does the response to a HEAD request"
-            // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
-            let req_header = client.request_header().expect("must have sent req");
-            if eos
-                && req_header.method != Method::HEAD
-                && resp_header.status != StatusCode::NO_CONTENT
-                && resp_header.status != StatusCode::NOT_MODIFIED
-                // RFC technically allows for leading zeroes
-                // https://datatracker.ietf.org/doc/html/rfc9110#name-content-length
-                && resp_header
-                    .headers
-                    .get(CONTENT_LENGTH)
-                    .is_some_and(|cl| cl.as_bytes().iter().any(|b| *b != b'0'))
-            {
-                let _ = tx
-                    .send(HttpTask::Failed(
-                        Error::explain(H2Error, "non-zero content-length on EOS headers frame")
-                            .into_up(),
-                    ))
-                    .await;
+        match client.check_response_end_or_error(true).await {
+            Ok(eos) => {
+                tx.send(HttpTask::Header(resp_header, eos))
+                    .await
+                    .or_err(InternalError, "sending custom headers to pipe")?;
+            }
+            Err(e) => {
+                // If upstream errored, then push error to downstream and then quit
+                // Don't care if send fails (which means downstream already gone)
+                // we were still able to retrieve the headers, so try sending
+                let _ = tx.send(HttpTask::Header(resp_header, false)).await;
+                let _ = tx.send(HttpTask::Failed(e.into_up())).await;
                 return Ok(());
             }
-            tx.send(HttpTask::Header(resp_header, eos))
-                .await
-                .or_err(InternalError, "sending h2 headers to pipe")?;
-        }
-        Err(e) => {
-            // If upstream errored, then push error to downstream and then quit
-            // Don't care if send fails (which means downstream already gone)
-            // we were still able to retrieve the headers, so try sending
-            let _ = tx.send(HttpTask::Header(resp_header, false)).await;
-            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
-            return Ok(());
         }
     }
 
@@ -785,7 +735,8 @@ pub(crate) async fn pipe_up_to_down_response(
                 return Ok(());
             }
         };
-        match client.check_response_end_or_error() {
+
+        match client.check_response_end_or_error(false).await {
             Ok(eos) => {
                 let empty = data.is_empty();
                 if empty && !eos {
@@ -797,11 +748,11 @@ pub(crate) async fn pipe_up_to_down_response(
                 let sent = tx
                     .send(HttpTask::Body(Some(data), eos))
                     .await
-                    .or_err(InternalError, "sending h2 body to pipe");
+                    .or_err(InternalError, "sending custom body to pipe");
                 // If the if the response with content-length is sent to an HTTP1 downstream,
-                // bidirection_down_to_up() could decide that the body has finished and exit without
+                // custom_bidirection_down_to_up() could decide that the body has finished and exit without
                 // waiting for this function to signal the eos. In this case tx being closed is not
-                // an sign of error. It should happen if the only thing left for the h2 to send is
+                // an sign of error. It should happen if the only thing left for the custom to send is
                 // an empty data frame with eos set.
                 if sent.is_err() && eos && empty {
                     return Ok(());
@@ -831,37 +782,125 @@ pub(crate) async fn pipe_up_to_down_response(
     if trailers.is_some() {
         tx.send(HttpTask::Trailer(trailers))
             .await
-            .or_err(InternalError, "sending h2 trailer to pipe")?;
+            .or_err(InternalError, "sending custom trailer to pipe")?;
     }
 
     tx.send(HttpTask::Done)
         .await
-        .unwrap_or_else(|_| debug!("h2 to h1 channel closed!"));
+        .unwrap_or_else(|_| debug!("custom channel closed!"));
 
     Ok(())
 }
 
-#[test]
-fn test_update_authority() {
-    let mut parts = http::request::Builder::new()
-        .body(())
-        .unwrap()
-        .into_parts()
-        .0;
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
-    assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
-    assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
-    assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
-    assert_eq!("[::1]", parts.uri.authority().unwrap());
+struct CustomMessageForwarder<'a> {
+    ctx: ImmutStr,
+    writer: &'a mut Box<dyn CustomMessageWrite>,
+    reader: Box<dyn futures::Stream<Item = Result<Bytes, Box<Error>>> + Send + Sync + Unpin>,
+    inject: mpsc::Receiver<Bytes>,
+    filter: mpsc::Sender<(Bytes, oneshot::Sender<Option<Bytes>>)>,
+    cancel: oneshot::Receiver<()>,
+}
 
-    // verify scheme
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("https://example.com", parts.uri);
-    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
-    assert_eq!("http://example.com", parts.uri);
+impl CustomMessageForwarder<'_> {
+    async fn proxy(mut self) -> Result<()> {
+        let forwarder = async {
+            let mut injector_status = true;
+            let mut reader_status = true;
+
+            debug!("{}: CustomMessageForwarder: start", self.ctx);
+
+            while injector_status || reader_status {
+                let (data, proxied) = tokio::select! {
+                    ret = self.inject.recv(), if injector_status => {
+                        let Some(data) = ret else {
+                            injector_status = false;
+                            continue
+                        };
+                        (data, false)
+                    },
+
+                    ret = self.reader.next(), if reader_status  => {
+                        let Some(data) = ret else {
+                            reader_status = false;
+                            continue
+                        };
+
+                        let data = match data {
+                            Ok(data) => data,
+                            Err(err) => {
+                                reader_status = false;
+                                warn!("{}: CustomMessageForwarder: reader returned err: {err:?}", self.ctx);
+                                continue;
+                            },
+                        };
+                        (data, true)
+                    },
+                };
+
+                let (callback_tx, callback_rx) = oneshot::channel();
+
+                // If data received from proxy send it to filter
+                if proxied {
+                    if self.filter.send((data, callback_tx)).await.is_err() {
+                        debug!(
+                            "{}: CustomMessageForwarder: filter receiver dropped",
+                            self.ctx
+                        );
+                        return Error::e_explain(
+                            WriteError,
+                            "CustomMessageForwarder: main proxy thread exited on filter send",
+                        );
+                    };
+                } else {
+                    callback_tx
+                        .send(Some(data))
+                        .expect("sending from the same thread");
+                }
+
+                match callback_rx.await {
+                    Ok(None) => continue, // message was filtered
+                    Ok(Some(msg)) => {
+                        self.writer.write_custom_message(msg).await?;
+                    }
+                    Err(err) => {
+                        debug!(
+                            "{}: CustomMessageForwarder: callback_rx return error: {err}",
+                            self.ctx
+                        );
+                        return Error::e_because(
+                            WriteError,
+                            "CustomMessageForwarder: main proxy thread exited on callback_rx await",
+                            err,
+                        );
+                    }
+                };
+            }
+
+            debug!("{}: CustomMessageForwarder: exit loop", self.ctx);
+
+            let ret = self.writer.finish_custom().await;
+            if let Err(ref err) = ret {
+                debug!(
+                    "{}: CustomMessageForwarder: finish_custom return error: {err}",
+                    self.ctx
+                );
+            };
+            ret?;
+
+            debug!(
+                "{}: CustomMessageForwarder: exit loop successfully",
+                self.ctx
+            );
+
+            Ok(())
+        };
+
+        tokio::select! {
+            ret = &mut self.cancel => {
+                debug!("{}: CustomMessageForwarder: canceled while waiting for new messages: {ret:?}", self.ctx);
+                Ok(())
+            },
+            ret = forwarder => ret
+        }
+    }
 }

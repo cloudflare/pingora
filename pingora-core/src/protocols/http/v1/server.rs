@@ -14,6 +14,7 @@
 
 //! HTTP/1.x server session
 
+use bstr::ByteSlice;
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
@@ -284,10 +285,7 @@ impl HttpSession {
                                 buf.truncate(MAX_ERR_BUF_LEN);
                                 return Error::e_because(
                                     InvalidHTTPHeader,
-                                    format!(
-                                        "buf: {}",
-                                        String::from_utf8_lossy(&buf).escape_default()
-                                    ),
+                                    format!("buf: {}", buf.escape_ascii()),
                                     e,
                                 );
                             }
@@ -297,7 +295,7 @@ impl HttpSession {
                             buf.truncate(MAX_ERR_BUF_LEN);
                             return Error::e_because(
                                 InvalidHTTPHeader,
-                                format!("buf: {}", String::from_utf8_lossy(&buf).escape_default()),
+                                format!("buf: {:?}", buf.as_bstr()),
                                 e,
                             );
                         }
@@ -1232,6 +1230,7 @@ mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
     use http::StatusCode;
+    use pingora_error::ErrorType;
     use rstest::rstest;
     use std::str;
     use tokio_test::io::Builder;
@@ -1406,7 +1405,7 @@ mod tests_stream {
     }
 
     #[tokio::test]
-    async fn read_with_body_chunked_0() {
+    async fn read_with_body_chunked_0_incomplete() {
         init_log();
         let input1 = b"GET / HTTP/1.1\r\n";
         let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -1419,10 +1418,36 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
         assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 0);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"".as_slice());
+        let e = http_stream.read_body_bytes().await.unwrap_err();
+        assert_eq!(*e.etype(), ErrorType::ConnectionClosed);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Done(0));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_chunked_0_extra() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let input3 = b"0\r\n";
+        let input4 = b"abc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input3[..])
+            .read(&input4[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_chunked_encoding());
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"".as_slice());
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"".as_slice());
+        let e = http_stream.read_body_bytes().await.unwrap_err();
+        assert_eq!(*e.etype(), ErrorType::ConnectionClosed);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
@@ -1449,6 +1474,33 @@ mod tests_stream {
         assert!(res.is_none());
         assert_eq!(http_stream.body_bytes_read(), 1);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_chunked_single_read_extra() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n";
+        let input3 = b"0\r\n\r\nabc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input3[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_chunked_encoding());
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"a".as_slice());
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::Chunked(1, 0, 0, 0)
+        );
+        let res = http_stream.read_body_bytes().await.unwrap();
+        assert!(res.is_none());
+        assert_eq!(http_stream.body_bytes_read(), 1);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
+        assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"abc");
     }
 
     #[rstest]
