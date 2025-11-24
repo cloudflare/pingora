@@ -14,7 +14,7 @@
 
 //! TLS ClientHello parsing using MSG_PEEK
 
-use log::{debug, warn};
+use log::debug;
 use std::io;
 
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
@@ -506,7 +506,11 @@ impl ClientHello {
 use std::os::unix::io::AsRawFd;
 
 /// Peek at the ClientHello from a TCP stream using MSG_PEEK
-/// This function temporarily sets the socket to blocking mode to wait for data
+///
+/// Note: In the normal flow, PROXY protocol headers are consumed BEFORE this function is called.
+/// However, if PROXY protocol is enabled and headers are still present in the socket buffer
+/// (e.g., when called directly without going through the normal flow), this function will
+/// detect and skip them before parsing ClientHello.
 #[cfg(unix)]
 pub fn peek_client_hello<S: AsRawFd>(stream: &S) -> io::Result<Option<ClientHello>> {
     use nix::sys::socket::{recv, MsgFlags};
@@ -514,8 +518,9 @@ pub fn peek_client_hello<S: AsRawFd>(stream: &S) -> io::Result<Option<ClientHell
     let fd = stream.as_raw_fd();
 
     // Maximum size for a TLS record is 16KB + 5 bytes header
-    // We allocate enough space to capture most ClientHello messages
-    let mut buf = vec![0u8; 16384 + 5];
+    // We also need space for PROXY protocol header (max 16 + 65535 bytes) in case
+    // PROXY headers haven't been consumed yet
+    let mut buf = vec![0u8; 16384 + 5 + crate::protocols::proxy_protocol::MAX_PROXY_HEADER_LEN];
 
     // Use MSG_PEEK | MSG_DONTWAIT to try to peek without blocking
     // This avoids the need to toggle socket blocking mode via fcntl
@@ -527,7 +532,49 @@ pub fn peek_client_hello<S: AsRawFd>(stream: &S) -> io::Result<Option<ClientHell
                 Ok(None)
             } else {
                 debug!("Peeked {} bytes from socket", size);
-                Ok(ClientHello::parse(&buf[..size]))
+                let data = &buf[..size];
+
+                // Check if PROXY protocol is enabled and detect header
+                // Note: In normal flow, PROXY headers are consumed before this call,
+                // but we check anyway in case this is called directly or PROXY headers
+                // are still in the socket buffer
+                let proxy_offset = if crate::protocols::proxy_protocol::proxy_protocol_enabled() {
+                    match crate::protocols::proxy_protocol::detect_proxy_header(data) {
+                        crate::protocols::proxy_protocol::ProxyDetection::HeaderLength(len) => {
+                            debug!("Detected PROXY protocol header of length {} bytes in peeked data, skipping", len);
+                            len
+                        }
+                        crate::protocols::proxy_protocol::ProxyDetection::NotProxy => {
+                            // No PROXY header detected - this is expected if PROXY headers were already consumed
+                            // or if the connection doesn't use PROXY protocol
+                            0
+                        }
+                        crate::protocols::proxy_protocol::ProxyDetection::NeedsMore => {
+                            // Not enough data to determine if PROXY header is present
+                            // This could mean:
+                            // 1. PROXY headers were already consumed (most common case)
+                            // 2. Not enough data yet to detect PROXY header
+                            // Try parsing as ClientHello directly
+                            debug!("Not enough data to detect PROXY protocol header, trying ClientHello parse");
+                            0
+                        }
+                        crate::protocols::proxy_protocol::ProxyDetection::Invalid => {
+                            // Invalid PROXY header - try parsing as ClientHello
+                            debug!("Invalid PROXY protocol header detected, trying ClientHello parse");
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+
+                // Parse ClientHello starting after PROXY header (if any)
+                if proxy_offset >= data.len() {
+                    debug!("PROXY header offset {} exceeds data length {}, no ClientHello data", proxy_offset, data.len());
+                    Ok(None)
+                } else {
+                    Ok(ClientHello::parse(&data[proxy_offset..]))
+                }
             }
         }
         Err(e) => {
@@ -884,6 +931,96 @@ mod tests {
         assert!(hello.raw_extensions.contains_key(&0x9999));
         let raw_data = hello.raw_extensions.get(&0x9999).unwrap();
         assert_eq!(raw_data, &vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    }
+
+    #[test]
+    fn test_parse_client_hello_with_proxy_protocol_v1() {
+        // PROXY protocol v1 header followed by ClientHello
+        let proxy_header = b"PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\n";
+
+        // Minimal ClientHello with SNI extension for "example.com"
+        let client_hello = vec![
+            0x16, // Content Type: Handshake
+            0x03, 0x01, // Version: TLS 1.0
+            0x00, 0x45, // Record Length (69 bytes)
+            0x01, // Handshake Type: ClientHello
+            0x00, 0x00, 0x41, // Handshake Length (65 bytes)
+            0x03, 0x03, // Client Version: TLS 1.2
+            // Random (32 bytes)
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, // Session ID Length
+            0x00, 0x04, // Cipher Suites Length (4 bytes = 2 cipher suites)
+            0x00, 0x2f, 0x00, 0x35, // Cipher suites
+            0x01, // Compression Methods Length
+            0x00, // Compression method: null
+            0x00, 0x14, // Extensions Length (20 bytes = one full SNI extension)
+            // SNI Extension
+            0x00, 0x00, // Extension Type: server_name (0)
+            0x00, 0x10, // Extension Length (16 bytes)
+            0x00, 0x0e, // Server Name List Length (14 bytes)
+            0x00, // Server Name Type: host_name (0)
+            0x00, 0x0b, // Server Name Length (11 bytes)
+            // "example.com" (11 bytes)
+            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ];
+
+        // Combine PROXY header + ClientHello
+        let mut data = Vec::from(proxy_header);
+        data.extend_from_slice(&client_hello);
+
+        // Enable PROXY protocol detection
+        crate::protocols::proxy_protocol::set_proxy_protocol_enabled(true);
+
+        // Parse should skip PROXY header and parse ClientHello
+        let hello = ClientHello::parse(&data[proxy_header.len()..]).expect("Failed to parse ClientHello");
+        assert_eq!(hello.sni, Some("example.com".to_string()));
+        assert_eq!(hello.tls_version, Some(0x0301));
+
+        // Disable PROXY protocol for other tests
+        crate::protocols::proxy_protocol::set_proxy_protocol_enabled(false);
+    }
+
+    #[test]
+    fn test_parse_client_hello_without_proxy_protocol() {
+        // ClientHello without PROXY protocol header
+        let client_hello = vec![
+            0x16, // Content Type: Handshake
+            0x03, 0x01, // Version: TLS 1.0
+            0x00, 0x45, // Record Length (69 bytes)
+            0x01, // Handshake Type: ClientHello
+            0x00, 0x00, 0x41, // Handshake Length (65 bytes)
+            0x03, 0x03, // Client Version: TLS 1.2
+            // Random (32 bytes)
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00, // Session ID Length
+            0x00, 0x04, // Cipher Suites Length (4 bytes = 2 cipher suites)
+            0x00, 0x2f, 0x00, 0x35, // Cipher suites
+            0x01, // Compression Methods Length
+            0x00, // Compression method: null
+            0x00, 0x14, // Extensions Length (20 bytes = one full SNI extension)
+            // SNI Extension
+            0x00, 0x00, // Extension Type: server_name (0)
+            0x00, 0x10, // Extension Length (16 bytes)
+            0x00, 0x0e, // Server Name List Length (14 bytes)
+            0x00, // Server Name Type: host_name (0)
+            0x00, 0x0b, // Server Name Length (11 bytes)
+            // "example.com" (11 bytes)
+            0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        ];
+
+        // Disable PROXY protocol
+        crate::protocols::proxy_protocol::set_proxy_protocol_enabled(false);
+
+        // Parse should work normally
+        let hello = ClientHello::parse(&client_hello).expect("Failed to parse ClientHello");
+        assert_eq!(hello.sni, Some("example.com".to_string()));
+        assert_eq!(hello.tls_version, Some(0x0301));
     }
 }
 

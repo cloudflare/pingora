@@ -165,18 +165,29 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
-        self.maybe_consume_proxy_header().await?;
-        if let Some(tls) = self.tls {
+
+        // Extract ClientHello BEFORE consuming PROXY headers
+        // This is necessary because PROXY header consumption rewinds ClientHello to a buffer
+        // that MSG_PEEK cannot access. By extracting ClientHello first, we can peek at the
+        // raw socket which contains both PROXY headers (if present) and ClientHello.
+        let tls_opt = self.tls.clone();
+        let (l4_after_hello, extracted_hello) = if tls_opt.is_some() {
             #[cfg(unix)]
             {
-                // Use ClientHelloWrapper to extract ClientHello before TLS handshake
+                // Use ClientHelloWrapper to extract ClientHello before PROXY header consumption
                 use crate::protocols::ClientHelloWrapper;
 
                 // Wrap stream with ClientHelloWrapper
                 let mut wrapper = ClientHelloWrapper::new(self.l4);
 
                 // Extract ClientHello asynchronously (avoids blocking the thread)
-                let hello = match wrapper.extract_client_hello_async().await {
+                // This will peek at the socket which may contain PROXY headers + ClientHello
+                let hello_result = wrapper.extract_client_hello_async().await;
+
+                // Unwrap to get the stream back
+                let l4 = wrapper.into_inner();
+
+                let hello = match hello_result {
                     Ok(Some(hello)) => Some(hello),
                     Ok(None) => {
                         debug!("No ClientHello detected in stream");
@@ -198,7 +209,33 @@ impl UninitializedStream {
                     }
                 };
 
-                if let Some(hello) = hello {
+                (l4, hello)
+            }
+            #[cfg(not(unix))]
+            {
+                (self.l4, None)
+            }
+        } else {
+            (self.l4, None)
+        };
+
+        // Update self.l4 with the stream after ClientHello extraction
+        self.l4 = l4_after_hello;
+
+        // Now consume PROXY headers (ClientHello extraction already handled PROXY headers if present)
+        self.maybe_consume_proxy_header().await?;
+
+        if let Some(tls) = self.tls {
+            #[cfg(unix)]
+            {
+                // ClientHello was already extracted above, now proceed with TLS handshake
+                use crate::protocols::ClientHelloWrapper;
+
+                // Wrap stream with ClientHelloWrapper for TLS handshake
+                let wrapper = ClientHelloWrapper::new(self.l4);
+
+                // Process the extracted ClientHello if available
+                if let Some(hello) = extracted_hello {
                     // Get peer address if available
                     let peer_addr = wrapper.get_socket_digest()
                         .and_then(|d| d.peer_addr().cloned());
