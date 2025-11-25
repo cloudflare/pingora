@@ -22,11 +22,15 @@ use nix::sys::stat;
 use nix::{Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
-#[cfg(target_os = "linux")]
-use std::io::{IoSlice, IoSliceMut};
+#[cfg(all(target_os = "linux", test))]
+use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
-use std::{thread, time};
+use {
+    std::io::{IoSlice, IoSliceMut},
+    std::os::unix::io::{AsRawFd, BorrowedFd},
+    std::{thread, time},
+};
 
 // Utilities to transfer file descriptors between sockets, e.g. during graceful upgrades.
 
@@ -122,27 +126,26 @@ where
             // TODO: warn if exist but not able to unlink
         }
     };
-    socket::bind(listen_fd, &unix_addr).unwrap();
+    socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
 
     /* sock is created before we change user, need to give permission to all */
     stat::fchmodat(
-        None,
+        unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
         stat::Mode::all(),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
 
-    socket::listen(listen_fd, 8).unwrap();
+    socket::listen(&listen_fd, socket::Backlog::new(8).unwrap()).unwrap();
 
-    let fd = match accept_with_retry(listen_fd) {
+    let fd = match accept_with_retry(listen_fd.as_raw_fd()) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
-            //cleanup
-            if nix::unistd::close(listen_fd).is_ok() {
-                nix::unistd::unlink(path).unwrap();
-            }
+            //cleanup - listen_fd is OwnedFd, will close on drop
+            drop(listen_fd);
+            let _ = nix::unistd::unlink(path);
             return Err(e);
         }
     };
@@ -158,18 +161,19 @@ where
     .unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs() {
-        if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
-            fds.append(&mut vec_fds)
-        } else {
-            warn!("Unexpected control messages: {cmsg:?}")
+    if let Ok(cmsgs) = msg.cmsgs() {
+        for cmsg in cmsgs {
+            if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
+                fds.append(&mut vec_fds)
+            } else {
+                warn!("Unexpected control messages: {cmsg:?}")
+            }
         }
     }
 
-    //cleanup
-    if nix::unistd::close(listen_fd).is_ok() {
-        nix::unistd::unlink(path).unwrap();
-    }
+    //cleanup - listen_fd is OwnedFd, will close on drop
+    drop(listen_fd);
+    let _ = nix::unistd::unlink(path);
 
     Ok((fds, msg.bytes))
 }
@@ -235,7 +239,7 @@ where
     let mut nonblocking_polls = 0;
 
     let conn_result: Result<usize, Error> = loop {
-        match socket::connect(send_fd, &unix_addr) {
+        match socket::connect(send_fd.as_raw_fd(), &unix_addr) {
             Ok(_) => break Ok(0),
             Err(e) => match e {
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
@@ -280,7 +284,7 @@ where
             let cmsg = [scm; 1];
             loop {
                 match socket::sendmsg(
-                    send_fd,
+                    send_fd.as_raw_fd(),
                     &io_vec,
                     &cmsg,
                     socket::MsgFlags::empty(),
@@ -394,7 +398,7 @@ mod tests {
             assert_eq!(1, buf[31]);
         });
 
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.into_raw_fd()];
         let buf: [u8; 128] = [1; 128];
         match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock") {
             Ok(sent) => {
@@ -421,7 +425,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key1.clone(), dumb_fd1);
+        fds.add(key1.clone(), dumb_fd1.into_raw_fd());
         let key2 = "1.1.1.1:443".to_string();
         let dumb_fd2 = socket::socket(
             AddressFamily::Unix,
@@ -430,7 +434,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key2.clone(), dumb_fd2);
+        fds.add(key2.clone(), dumb_fd2.into_raw_fd());
 
         let child = thread::spawn(move || {
             let mut fds2 = Fds::new();
