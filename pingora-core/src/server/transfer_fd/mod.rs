@@ -22,13 +22,13 @@ use nix::sys::stat;
 use nix::{Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
-#[cfg(target_os = "linux")]
-use std::io::{IoSlice, IoSliceMut};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
-use std::{thread, time};
+use {
+    std::io::{IoSlice, IoSliceMut},
+    std::os::unix::io::{AsRawFd, BorrowedFd},
+    std::{thread, time},
+};
 
 // Utilities to transfer file descriptors between sockets, e.g. during graceful upgrades.
 
@@ -157,10 +157,9 @@ where
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
-            //cleanup
-            if nix::unistd::close(listen_fd).is_ok() {
-                nix::unistd::unlink(path).unwrap();
-            }
+            //cleanup - listen_fd is OwnedFd, will close on drop
+            drop(listen_fd);
+            let _ = nix::unistd::unlink(path);
             return Err(e);
         }
     };
@@ -176,18 +175,19 @@ where
     .unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs()? {
-        if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
-            fds.append(&mut vec_fds)
-        } else {
-            warn!("Unexpected control messages: {cmsg:?}")
+    if let Ok(cmsgs) = msg.cmsgs() {
+        for cmsg in cmsgs {
+            if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
+                fds.append(&mut vec_fds)
+            } else {
+                warn!("Unexpected control messages: {cmsg:?}")
+            }
         }
     }
 
-    //cleanup
-    if nix::unistd::close(listen_fd).is_ok() {
-        nix::unistd::unlink(path).unwrap();
-    }
+    //cleanup - listen_fd is OwnedFd, will close on drop
+    drop(listen_fd);
+    let _ = nix::unistd::unlink(path);
 
     Ok((fds, msg.bytes))
 }
