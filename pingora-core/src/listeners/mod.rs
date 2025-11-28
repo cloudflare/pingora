@@ -90,6 +90,9 @@ pub use crate::protocols::tls::ALPN;
 use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
+#[cfg(feature = "proxy_protocol")]
+use crate::protocols::proxy_protocol::ProxyProtocolReceiver;
+
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
 pub trait TlsAccept {
@@ -110,6 +113,8 @@ struct TransportStackBuilder {
     tls: Option<TlsSettings>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
+    #[cfg(feature = "proxy_protocol")]
+    pp_receiver: Option<Arc<dyn ProxyProtocolReceiver>>,
 }
 
 impl TransportStackBuilder {
@@ -135,6 +140,8 @@ impl TransportStackBuilder {
         Ok(TransportStack {
             l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            #[cfg(feature = "proxy_protocol")]
+            pp_receiver: self.pp_receiver.take(),
         })
     }
 }
@@ -143,6 +150,8 @@ impl TransportStackBuilder {
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
+    #[cfg(feature = "proxy_protocol")]
+    pp_receiver: Option<Arc<dyn ProxyProtocolReceiver>>,
 }
 
 impl TransportStack {
@@ -155,6 +164,8 @@ impl TransportStack {
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
+            #[cfg(feature = "proxy_protocol")]
+            pp_receiver: self.pp_receiver.clone(),
         })
     }
 
@@ -166,11 +177,26 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    #[cfg(feature = "proxy_protocol")]
+    pp_receiver: Option<Arc<dyn ProxyProtocolReceiver>>,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
+
+        #[cfg(feature = "proxy_protocol")]
+        if let Some(receiver) = self.pp_receiver {
+            let (header, unused) = receiver.accept(&mut self.l4).await?;
+
+            self.l4.get_socket_digest().map(|sd| {
+                sd.proxy_protocol
+                    .set(Some(header))
+                    .expect("Newly created OnceCell must be empty");
+            });
+            self.l4.rewind(&unused);
+        }
+
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
@@ -288,6 +314,26 @@ impl Listeners {
             tls,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
+            #[cfg(feature = "proxy_protocol")]
+            pp_receiver: None,
+        })
+    }
+
+    #[cfg(feature = "proxy_protocol")]
+    /// Add TCP endpoint to self with optional [`TcpSocketOptions`] and [`TlsSettings`], and a [`ProxyProtocolReceiver`].
+    pub fn add_proxy_protocol_endpoint<R: ProxyProtocolReceiver + 'static>(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<TcpSocketOptions>,
+        tls: Option<TlsSettings>,
+        pp_receiver: R,
+    ) {
+        self.stacks.push(TransportStackBuilder {
+            l4: ServerAddress::Tcp(addr.into(), sock_opt),
+            tls,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: self.connection_filter.clone(),
+            pp_receiver: Some(Arc::new(pp_receiver)),
         })
     }
 

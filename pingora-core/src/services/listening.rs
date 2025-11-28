@@ -25,6 +25,8 @@ use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
     ConnectionFilter, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
 };
+#[cfg(feature = "proxy_protocol")]
+use crate::protocols::proxy_protocol::ProxyProtocolReceiver;
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -151,6 +153,19 @@ impl<A> Service<A> {
     ) {
         self.listeners
             .add_tls_with_settings(addr, sock_opt, settings)
+    }
+
+    /// Add TCP listening endpoint with optional [`TcpSocketOptions`] and [`TlsSettings`], and a [`ProxyProtocolReceiver`].
+    #[cfg(feature = "proxy_protocol")]
+    pub fn add_proxy_protocol_endpoint<R: ProxyProtocolReceiver + 'static>(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<TcpSocketOptions>,
+        tls: Option<TlsSettings>,
+        pp_receiver: R,
+    ) {
+        self.listeners
+            .add_proxy_protocol_endpoint(addr, sock_opt, tls, pp_receiver);
     }
 
     /// Add an endpoint according to the given [`ServerAddress`]
