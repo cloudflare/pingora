@@ -1,8 +1,10 @@
 use pingora_ketama::{Bucket, Continuum};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::{
+    distr::{Alphanumeric, SampleString},
+    rng,
+};
 
 #[cfg(feature = "heap-prof")]
 #[global_allocator]
@@ -19,11 +21,8 @@ fn buckets() -> Vec<Bucket> {
 }
 
 fn random_string() -> String {
-    thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(30)
-        .map(char::from)
-        .collect()
+    let mut rand = rng();
+    Alphanumeric.sample_string(&mut rand, 30)
 }
 
 pub fn criterion_benchmark(c: &mut Criterion) {

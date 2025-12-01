@@ -62,11 +62,17 @@ use std::io::Write;
 use std::net::SocketAddr;
 
 use crc32fast::Hasher;
+#[cfg(feature = "v2")]
+use i_key_sort::sort::one_key_cmp::OneKeyAndCmpSort;
+
+/// This constant is copied from nginx. It will create 160 points per weight
+/// unit. For example, a weight of 2 will create 320 points on the ring.
+pub const DEFAULT_POINT_MULTIPLE: u32 = 160;
 
 /// A [Bucket] represents a server for consistent hashing
 ///
 /// A [Bucket] contains a [SocketAddr] to the server and a weight associated with it.
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Bucket {
     // The node name.
     // TODO: UDS
@@ -94,28 +100,197 @@ impl Bucket {
 
 // A point on the continuum.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Point {
+struct PointV1 {
     // the index to the actual address
     node: u32,
     hash: u32,
 }
 
 // We only want to compare the hash when sorting, so we implement these traits by hand.
-impl Ord for Point {
+impl Ord for PointV1 {
     fn cmp(&self, other: &Self) -> Ordering {
         self.hash.cmp(&other.hash)
     }
 }
 
-impl PartialOrd for Point {
+impl PartialOrd for PointV1 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Point {
+impl PointV1 {
     fn new(node: u32, hash: u32) -> Self {
-        Point { node, hash }
+        PointV1 { node, hash }
+    }
+}
+
+/// A point on the continuum.
+///
+/// We are trying to save memory here, so this struct is equivalent to a struct
+/// this this definition, but doesn't require using the "untrustworthy" compact
+/// repr. This does mean we have to do the memory layout manually though, but
+/// the benchmarks show there is no performance hit for it.
+///
+/// #[repr(Rust, packed)]
+/// struct Point {
+///     node: u16,
+///     hash: u32,
+/// }
+#[cfg(feature = "v2")]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(transparent)]
+struct PointV2([u8; 6]);
+
+#[cfg(feature = "v2")]
+impl PointV2 {
+    fn new(node: u16, hash: u32) -> Self {
+        let mut this = [0; 6];
+
+        this[0..4].copy_from_slice(&hash.to_ne_bytes());
+        this[4..6].copy_from_slice(&node.to_ne_bytes());
+
+        Self(this)
+    }
+
+    /// Return the hash of the point which is stored in the first 4 bytes (big endian).
+    fn hash(&self) -> u32 {
+        u32::from_ne_bytes(self.0[0..4].try_into().expect("There are exactly 4 bytes"))
+    }
+
+    /// Return the node of the point which is stored in the last 2 bytes (big endian).
+    fn node(&self) -> u16 {
+        u16::from_ne_bytes(self.0[4..6].try_into().expect("There are exactly 2 bytes"))
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum Version {
+    #[default]
+    V1,
+    #[cfg(feature = "v2")]
+    V2 { point_multiple: u32 },
+}
+
+impl Version {
+    fn point_multiple(&self) -> u32 {
+        match self {
+            Version::V1 => DEFAULT_POINT_MULTIPLE,
+            #[cfg(feature = "v2")]
+            Version::V2 { point_multiple } => *point_multiple,
+        }
+    }
+}
+
+enum RingBuilder {
+    V1(Vec<PointV1>),
+    #[cfg(feature = "v2")]
+    V2(Vec<PointV2>),
+}
+
+impl RingBuilder {
+    fn new(version: Version, total_weight: u32) -> Self {
+        match version {
+            Version::V1 => RingBuilder::V1(Vec::with_capacity(
+                (total_weight * DEFAULT_POINT_MULTIPLE) as usize,
+            )),
+            #[cfg(feature = "v2")]
+            Version::V2 { point_multiple } => {
+                RingBuilder::V2(Vec::with_capacity((total_weight * point_multiple) as usize))
+            }
+        }
+    }
+
+    fn push(&mut self, node: u16, hash: u32) {
+        match self {
+            RingBuilder::V1(ring) => {
+                ring.push(PointV1::new(node as u32, hash));
+            }
+            #[cfg(feature = "v2")]
+            RingBuilder::V2(ring) => {
+                ring.push(PointV2::new(node, hash));
+            }
+        }
+    }
+
+    #[allow(unused)]
+    fn sort(&mut self, addresses: &[SocketAddr]) {
+        match self {
+            RingBuilder::V1(ring) => {
+                // Sort and remove any duplicates.
+                ring.sort_unstable();
+                ring.dedup_by(|a, b| a.hash == b.hash);
+            }
+            #[cfg(feature = "v2")]
+            RingBuilder::V2(ring) => {
+                ring.sort_by_one_key_then_by(
+                    true,
+                    |p| p.hash(),
+                    |p1, p2| addresses[p1.node() as usize].cmp(&addresses[p2.node() as usize]),
+                );
+
+                //secondary_radix_sort(ring, |p| p.hash(), |p| addresses[p.node() as usize]);
+                ring.dedup_by(|a, b| a.0[0..4] == b.0[0..4]);
+            }
+        }
+    }
+}
+
+impl From<RingBuilder> for VersionedRing {
+    fn from(ring: RingBuilder) -> Self {
+        match ring {
+            RingBuilder::V1(ring) => VersionedRing::V1(ring.into_boxed_slice()),
+            #[cfg(feature = "v2")]
+            RingBuilder::V2(ring) => VersionedRing::V2(ring.into_boxed_slice()),
+        }
+    }
+}
+
+enum VersionedRing {
+    V1(Box<[PointV1]>),
+    #[cfg(feature = "v2")]
+    V2(Box<[PointV2]>),
+}
+
+impl VersionedRing {
+    /// Find the associated index for the given input.
+    pub fn node_idx(&self, hash: u32) -> usize {
+        // The `Result` returned here is either a match or the error variant
+        // returns where the value would be inserted.
+        let search_result = match self {
+            VersionedRing::V1(ring) => ring.binary_search_by(|p| p.hash.cmp(&hash)),
+            #[cfg(feature = "v2")]
+            VersionedRing::V2(ring) => ring.binary_search_by(|p| p.hash().cmp(&hash)),
+        };
+
+        match search_result {
+            Ok(i) => i,
+            Err(i) => {
+                // We wrap around to the front if this value would be
+                // inserted at the end.
+                if i == self.len() {
+                    0
+                } else {
+                    i
+                }
+            }
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            VersionedRing::V1(ring) => ring.get(index).map(|p| p.node as usize),
+            #[cfg(feature = "v2")]
+            VersionedRing::V2(ring) => ring.get(index).map(|p| p.node() as usize),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            VersionedRing::V1(ring) => ring.len(),
+            #[cfg(feature = "v2")]
+            VersionedRing::V2(ring) => ring.len(),
+        }
     }
 }
 
@@ -124,27 +299,27 @@ impl Point {
 /// A [Continuum] represents a ring of buckets where a node is associated with various points on
 /// the ring.
 pub struct Continuum {
-    ring: Box<[Point]>,
+    ring: VersionedRing,
     addrs: Box<[SocketAddr]>,
 }
 
 impl Continuum {
-    /// Create a new [Continuum] with the given list of buckets.
     pub fn new(buckets: &[Bucket]) -> Self {
-        // This constant is copied from nginx. It will create 160 points per weight unit. For
-        // example, a weight of 2 will create 320 points on the ring.
-        const POINT_MULTIPLE: u32 = 160;
+        Self::new_with_version(buckets, Version::default())
+    }
 
+    /// Create a new [Continuum] with the given list of buckets.
+    pub fn new_with_version(buckets: &[Bucket], version: Version) -> Self {
         if buckets.is_empty() {
             return Continuum {
-                ring: Box::new([]),
+                ring: VersionedRing::V1(Box::new([])),
                 addrs: Box::new([]),
             };
         }
 
         // The total weight is multiplied by the factor of points to create many points per node.
         let total_weight: u32 = buckets.iter().fold(0, |sum, b| sum + b.weight);
-        let mut ring = Vec::with_capacity((total_weight * POINT_MULTIPLE) as usize);
+        let mut ring = RingBuilder::new(version, total_weight);
         let mut addrs = Vec::with_capacity(buckets.len());
 
         for bucket in buckets {
@@ -165,7 +340,7 @@ impl Continuum {
             hasher.update(hash_bytes.as_ref());
 
             // A higher weight will add more points for this node.
-            let num_points = bucket.weight * POINT_MULTIPLE;
+            let num_points = bucket.weight * version.point_multiple();
 
             // This is appended to the crc32 hash for each point.
             let mut prev_hash: u32 = 0;
@@ -176,45 +351,33 @@ impl Continuum {
                 hasher.update(&prev_hash.to_le_bytes());
 
                 let hash = hasher.finalize();
-                ring.push(Point::new(node as u32, hash));
+                ring.push(node as u16, hash);
                 prev_hash = hash;
             }
         }
 
+        let addrs = addrs.into_boxed_slice();
+
         // Sort and remove any duplicates.
-        ring.sort_unstable();
-        ring.dedup_by(|a, b| a.hash == b.hash);
+        ring.sort(&addrs);
 
         Continuum {
-            ring: ring.into_boxed_slice(),
-            addrs: addrs.into_boxed_slice(),
+            ring: ring.into(),
+            addrs,
         }
     }
 
     /// Find the associated index for the given input.
     pub fn node_idx(&self, input: &[u8]) -> usize {
         let hash = crc32fast::hash(input);
-
-        // The `Result` returned here is either a match or the error variant returns where the
-        // value would be inserted.
-        match self.ring.binary_search_by(|p| p.hash.cmp(&hash)) {
-            Ok(i) => i,
-            Err(i) => {
-                // We wrap around to the front if this value would be inserted at the end.
-                if i == self.ring.len() {
-                    0
-                } else {
-                    i
-                }
-            }
-        }
+        self.ring.node_idx(hash)
     }
 
     /// Hash the given `hash_key` to the server address.
     pub fn node(&self, hash_key: &[u8]) -> Option<SocketAddr> {
         self.ring
             .get(self.node_idx(hash_key)) // should we unwrap here?
-            .map(|p| self.addrs[p.node as usize])
+            .map(|n| self.addrs[n])
     }
 
     /// Get an iterator of nodes starting at the original hashed node of the `hash_key`.
@@ -234,7 +397,7 @@ impl Continuum {
             // only update idx for non-empty ring otherwise we will panic on modulo 0
             *idx = (*idx + 1) % self.ring.len();
         }
-        point.map(|p| &self.addrs[p.node as usize])
+        point.map(|n| &self.addrs[n])
     }
 }
 

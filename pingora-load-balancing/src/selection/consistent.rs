@@ -16,7 +16,7 @@
 
 use super::*;
 use pingora_core::protocols::l4::socket::SocketAddr;
-use pingora_ketama::{Bucket, Continuum};
+use pingora_ketama::{Bucket, Continuum, Version};
 use std::collections::HashMap;
 
 /// Weighted Ketama consistent hashing
@@ -26,10 +26,19 @@ pub struct KetamaHashing {
     backends: HashMap<SocketAddr, Backend>,
 }
 
+#[derive(Clone, Debug, Copy, Default)]
+pub struct KetamaConfig {
+    pub point_multiple: Option<u32>,
+}
+
 impl BackendSelection for KetamaHashing {
     type Iter = OwnedNodeIterator;
 
-    fn build(backends: &BTreeSet<Backend>) -> Self {
+    type Config = KetamaConfig;
+
+    fn build_with_config(backends: &BTreeSet<Backend>, config: &Self::Config) -> Self {
+        let KetamaConfig { point_multiple } = *config;
+
         let buckets: Vec<_> = backends
             .iter()
             .filter_map(|b| {
@@ -45,10 +54,27 @@ impl BackendSelection for KetamaHashing {
             .iter()
             .map(|b| (b.addr.clone(), b.clone()))
             .collect();
+
+        #[allow(unused)]
+        let version = if let Some(point_multiple) = point_multiple {
+            match () {
+                #[cfg(feature = "v2")]
+                () => Version::V2 { point_multiple },
+                #[cfg(not(feature = "v2"))]
+                () => Version::V1,
+            }
+        } else {
+            Version::V1
+        };
+
         KetamaHashing {
-            ring: Continuum::new(&buckets),
+            ring: Continuum::new_with_version(&buckets, version),
             backends: new_backends,
         }
+    }
+
+    fn build(backends: &BTreeSet<Backend>) -> Self {
+        Self::build_with_config(backends, &KetamaConfig::default())
     }
 
     fn iter(self: &Arc<Self>, key: &[u8]) -> Self::Iter {
