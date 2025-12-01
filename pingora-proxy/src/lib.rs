@@ -90,7 +90,7 @@ pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp};
 
 pub mod prelude {
-    pub use crate::{http_proxy_service, ProxyHttp, Session};
+    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -119,7 +119,27 @@ where
 }
 
 impl<SV> HttpProxy<SV, ()> {
-    fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+    /// Create a new [`HttpProxy`] with the given [`ProxyHttp`] implementation and [`ServerConf`].
+    ///
+    /// After creating an `HttpProxy`, you should call [`HttpProxy::handle_init_modules()`] to
+    /// initialize the downstream modules before processing requests.
+    ///
+    /// For most use cases, prefer using [`http_proxy_service()`] which wraps the `HttpProxy` in a
+    /// [`Service`]. This constructor is useful when you need to integrate `HttpProxy` into a custom
+    /// accept loop (e.g., for SNI-based routing decisions before TLS termination).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use pingora_proxy::HttpProxy;
+    /// use std::sync::Arc;
+    ///
+    /// let mut proxy = HttpProxy::new(my_proxy_app, server_conf);
+    /// proxy.handle_init_modules();
+    /// let proxy = Arc::new(proxy);
+    /// // Use proxy.process_new_http() in your custom accept loop
+    /// ```
+    pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
@@ -162,7 +182,15 @@ where
         }
     }
 
-    fn handle_init_modules(&mut self)
+    /// Initialize the downstream modules for this proxy.
+    ///
+    /// This method must be called after creating an [`HttpProxy`] with [`HttpProxy::new()`]
+    /// and before processing any requests. It invokes [`ProxyHttp::init_downstream_modules()`]
+    /// to set up any HTTP modules configured by the user's proxy implementation.
+    ///
+    /// Note: When using [`http_proxy_service()`] or [`http_proxy_service_with_name()`],
+    /// this method is called automatically.
+    pub fn handle_init_modules(&mut self)
     where
         SV: ProxyHttp,
     {
@@ -1009,6 +1037,45 @@ where
 }
 
 use pingora_core::services::listening::Service;
+
+/// Create an [`HttpProxy`] without wrapping it in a [`Service`].
+///
+/// This is useful when you need to integrate `HttpProxy` into a custom accept loop,
+/// for example when implementing SNI-based routing that decides between TLS passthrough
+/// and TLS termination on a single port.
+///
+/// The returned `HttpProxy` is fully initialized and ready to process requests via
+/// [`HttpServerApp::process_new_http()`].
+///
+/// # Example
+///
+/// ```ignore
+/// use pingora_proxy::http_proxy;
+/// use std::sync::Arc;
+///
+/// // Create the proxy
+/// let proxy = Arc::new(http_proxy(&server_conf, my_proxy_app));
+///
+/// // In your custom accept loop:
+/// loop {
+///     let (stream, addr) = listener.accept().await?;
+///     
+///     // Peek SNI, decide routing...
+///     if should_terminate_tls {
+///         let tls_stream = my_acceptor.accept(stream).await?;
+///         let session = HttpSession::new_http1(Box::new(tls_stream));
+///         proxy.process_new_http(session, &shutdown).await;
+///     }
+/// }
+/// ```
+pub fn http_proxy<SV>(conf: &Arc<ServerConf>, inner: SV) -> HttpProxy<SV>
+where
+    SV: ProxyHttp,
+{
+    let mut proxy = HttpProxy::new(inner, conf.clone());
+    proxy.handle_init_modules();
+    proxy
+}
 
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
