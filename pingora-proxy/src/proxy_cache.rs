@@ -1235,7 +1235,7 @@ pub mod range_filter {
             let mut rng: rand::prelude::ThreadRng = rand::thread_rng();
             format!("{:016x}", rng.gen::<u64>())
         }
-        fn calculate_multipart_length(&self) -> usize {
+        pub fn calculate_multipart_length(&self) -> usize {
             let mut total_length = 0;
             let content_type = self.content_type.as_ref();
             for range in self.ranges.clone() {
