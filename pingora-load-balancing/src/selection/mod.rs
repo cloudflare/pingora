@@ -24,9 +24,19 @@ use std::sync::Arc;
 use weighted::Weighted;
 
 /// [BackendSelection] is the interface to implement backend selection mechanisms.
-pub trait BackendSelection {
+pub trait BackendSelection: Sized {
     /// The [BackendIter] returned from iter() below.
     type Iter;
+
+    /// The configuration type constructing [BackendSelection]
+    type Config;
+
+    /// Create a [BackendSelection] from a set of backends and the given configuration. The
+    /// default implementation ignores the configuration and simply calls [Self::build]
+    fn build_with_config(backends: &BTreeSet<Backend>, _config: &Self::Config) -> Self {
+        Self::build(backends)
+    }
+
     /// The function to create a [BackendSelection] implementation.
     fn build(backends: &BTreeSet<Backend>) -> Self;
     /// Select backends for a given key.

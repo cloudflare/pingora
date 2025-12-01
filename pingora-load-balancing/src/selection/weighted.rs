@@ -32,6 +32,8 @@ pub struct Weighted<H = FnvHasher> {
 impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
     type Iter = WeightedIterator<H>;
 
+    type Config = ();
+
     fn build(backends: &BTreeSet<Backend>) -> Self {
         assert!(
             backends.len() <= u16::MAX as usize,
