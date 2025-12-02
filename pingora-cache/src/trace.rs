@@ -33,6 +33,28 @@ pub(crate) struct CacheTraceCTX {
     pub hit_span: Span,
 }
 
+pub fn tag_span_with_meta(span: &mut Span, meta: &CacheMeta) {
+    fn ts2epoch(ts: SystemTime) -> f64 {
+        ts.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default() // should never overflow but be safe here
+            .as_secs_f64()
+    }
+    let internal = &meta.0.internal;
+    span.set_tags(|| {
+        [
+            Tag::new("created", ts2epoch(internal.created)),
+            Tag::new("fresh_until", ts2epoch(internal.fresh_until)),
+            Tag::new("updated", ts2epoch(internal.updated)),
+            Tag::new("stale_if_error_sec", internal.stale_if_error_sec as i64),
+            Tag::new(
+                "stale_while_revalidate_sec",
+                internal.stale_while_revalidate_sec as i64,
+            ),
+            Tag::new("variance", internal.variance.is_some()),
+        ]
+    });
+}
+
 impl CacheTraceCTX {
     pub fn new() -> Self {
         CacheTraceCTX {
@@ -82,33 +104,11 @@ impl CacheTraceCTX {
         self.hit_span.set_finish_time(SystemTime::now);
     }
 
-    fn log_meta(span: &mut Span, meta: &CacheMeta) {
-        fn ts2epoch(ts: SystemTime) -> f64 {
-            ts.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default() // should never overflow but be safe here
-                .as_secs_f64()
-        }
-        let internal = &meta.0.internal;
-        span.set_tags(|| {
-            [
-                Tag::new("created", ts2epoch(internal.created)),
-                Tag::new("fresh_until", ts2epoch(internal.fresh_until)),
-                Tag::new("updated", ts2epoch(internal.updated)),
-                Tag::new("stale_if_error_sec", internal.stale_if_error_sec as i64),
-                Tag::new(
-                    "stale_while_revalidate_sec",
-                    internal.stale_while_revalidate_sec as i64,
-                ),
-                Tag::new("variance", internal.variance.is_some()),
-            ]
-        });
-    }
-
     pub fn log_meta_in_hit_span(&mut self, meta: &CacheMeta) {
-        CacheTraceCTX::log_meta(&mut self.hit_span, meta);
+        tag_span_with_meta(&mut self.hit_span, meta);
     }
 
     pub fn log_meta_in_miss_span(&mut self, meta: &CacheMeta) {
-        CacheTraceCTX::log_meta(&mut self.miss_span, meta);
+        tag_span_with_meta(&mut self.miss_span, meta);
     }
 }
