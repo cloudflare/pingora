@@ -83,8 +83,8 @@ pub async fn handshake_with_callback<S: IO>(
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     }
     {
-        let mut tls_ref = TlsRef;
-        if let Some(extension) = callbacks.handshake_complete_callback(&mut tls_ref).await {
+        let tls_ref = TlsRef;
+        if let Some(extension) = callbacks.handshake_complete_callback(&tls_ref).await {
             if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
                 digest_mut.extension.set(extension);
             }

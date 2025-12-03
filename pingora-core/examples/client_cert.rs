@@ -93,7 +93,7 @@ impl TlsAccept for MyTlsCallbacks {
     #[cfg(feature = "openssl")]
     async fn handshake_complete_callback(
         &self,
-        tls_ref: &mut TlsRef,
+        tls_ref: &TlsRef,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         // Here you can inspect the TLS connection and return an extension if needed.
 

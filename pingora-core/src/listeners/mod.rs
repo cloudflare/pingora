@@ -58,7 +58,7 @@ pub trait TlsAccept {
     /// `SslDigest` attached to the session digest.
     async fn handshake_complete_callback(
         &self,
-        _ssl: &mut TlsRef,
+        _ssl: &TlsRef,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         None
     }

@@ -66,9 +66,8 @@ pub async fn handshake_with_callback<S: IO>(
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     }
     {
-        // safety: we do hold a mut ref of tls_stream
-        let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
-        if let Some(extension) = callbacks.handshake_complete_callback(ssl_mut).await {
+        let ssl = tls_stream.ssl();
+        if let Some(extension) = callbacks.handshake_complete_callback(ssl).await {
             if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
                 digest_mut.extension.set(extension);
             }
@@ -227,7 +226,7 @@ mod tests {
         impl TlsAccept for Callback {
             async fn handshake_complete_callback(
                 &self,
-                ssl: &mut TlsRef,
+                ssl: &TlsRef,
             ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
                 let sni = ssl.servername(ssl::NameType::HOST_NAME)?.to_string();
                 Some(Arc::new(Sni(sni)))
