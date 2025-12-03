@@ -207,7 +207,7 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "openssl_derived")]
     async fn test_handshake_complete_callback() {
-        use pingora_openssl::ssl::SslFiletype;
+        use crate::tls::ssl::SslFiletype;
 
         let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
