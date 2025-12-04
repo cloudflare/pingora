@@ -41,6 +41,12 @@ pub mod noop_tls;
 #[cfg(not(feature = "any_tls"))]
 pub use noop_tls::*;
 
+/// Containing type for a user callback to generate extensions for the `SslDigest` upon handshake
+/// completion.
+pub type HandshakeCompleteHook = std::sync::Arc<
+    dyn Fn(&TlsRef) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> + Send + Sync,
+>;
+
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum ALPN {
