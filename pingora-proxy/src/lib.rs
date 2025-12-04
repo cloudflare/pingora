@@ -854,7 +854,7 @@ where
                     res.error_code,
                     retries,
                     false, // we never retry here
-                    self.inner.request_summary(&session, &ctx)
+                    self.inner.request_summary(&session, &ctx),
                 );
             }
         }

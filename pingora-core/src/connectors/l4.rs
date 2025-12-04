@@ -280,7 +280,7 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
     );
 
     let req_header = raw_connect::generate_connect_header(&proxy.host, proxy.port, &mut headers)?;
-    let fut = raw_connect::connect(stream, &req_header);
+    let fut = raw_connect::connect(stream, &req_header, peer);
     let (mut stream, digest) = match peer.connection_timeout() {
         Some(t) => pingora_timeout::timeout(t, fut)
             .await
