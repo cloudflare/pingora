@@ -17,6 +17,8 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
 #[cfg(unix)]
@@ -286,6 +288,21 @@ pub trait Peer: Display + Clone {
             .proxy_digest_user_data_hook
             .as_ref()
     }
+
+    /// Returns a hook that should be run on TLS handshake completion.
+    ///
+    /// Any value returned from the returned hook (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_handshake_complete_hook(&self) -> Option<&HandshakeCompleteHook> {
+        self.get_peer_options()?
+            .upstream_tls_handshake_complete_hook
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -433,6 +450,13 @@ pub struct PeerOptions {
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
     #[derivative(Debug = "ignore")]
     pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
+    /// Hook that allows returning an optional `SslDigestExtension`.
+    /// Any returned value will be saved into the `SslDigest`.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
 }
 
 impl PeerOptions {
@@ -471,6 +495,8 @@ impl PeerOptions {
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
             proxy_digest_user_data_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_handshake_complete_hook: None,
         }
     }
 

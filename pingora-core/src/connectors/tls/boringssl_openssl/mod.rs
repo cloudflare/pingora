@@ -246,7 +246,11 @@ where
     }
 
     clear_error_stack();
-    let connect_future = handshake(ssl_conf, peer.sni(), stream);
+
+    let complete_hook = peer
+        .get_peer_options()
+        .and_then(|o| o.upstream_tls_handshake_complete_hook.clone());
+    let connect_future = handshake(ssl_conf, peer.sni(), stream, complete_hook);
 
     match peer.connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {

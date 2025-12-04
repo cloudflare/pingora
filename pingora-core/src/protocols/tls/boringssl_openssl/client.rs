@@ -19,9 +19,10 @@ use crate::protocols::tls::SslStream;
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, TimingDigest, IO,
 };
-use crate::tls::{ssl, ssl::ConnectConfiguration, ssl_sys::X509_V_ERR_INVALID_CALL};
+use crate::tls::{ssl, ssl::ConnectConfiguration, ssl::SslRef, ssl_sys::X509_V_ERR_INVALID_CALL};
 
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ pub async fn handshake<S: IO>(
     conn_config: ConnectConfiguration,
     domain: &str,
     io: S,
+    complete_hook: Option<Arc<dyn Fn(&SslRef) -> Option<Arc<dyn Any + Send + Sync>> + Send + Sync>>,
 ) -> Result<SslStream<S>> {
     let ssl = conn_config
         .into_ssl(domain)
@@ -38,7 +40,16 @@ pub async fn handshake<S: IO>(
         .explain_err(TLSHandshakeFailure, |e| format!("ssl stream error: {e}"))?;
     let handshake_result = stream.connect().await;
     match handshake_result {
-        Ok(()) => Ok(stream),
+        Ok(()) => {
+            if let Some(hook) = complete_hook {
+                if let Some(extension) = hook(stream.ssl()) {
+                    if let Some(digest_mut) = stream.ssl_digest_mut() {
+                        digest_mut.extension.set(extension);
+                    }
+                }
+            }
+            Ok(stream)
+        }
         Err(e) => {
             let context = format!("TLS connect() failed: {e}, SNI: {domain}");
             match e.code() {
