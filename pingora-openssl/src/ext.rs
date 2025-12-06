@@ -166,6 +166,20 @@ pub fn clear_error_stack() {
     let _ = ErrorStack::get();
 }
 
+/// Export keying material from a TLS connection
+///
+/// Derives keying material for application use in accordance with RFC 5705.
+///
+/// See [SSL_export_keying_material](https://www.openssl.org/docs/man1.1.1/man3/SSL_export_keying_material.html).
+pub fn ssl_export_keying_material(
+    ssl: &SslRef,
+    out: &mut [u8],
+    label: &str,
+    context: Option<&[u8]>,
+) -> Result<(), ErrorStack> {
+    ssl.export_keying_material(out, label, context)
+}
+
 /// Create a new [Ssl] from &[SslAcceptor]
 ///
 /// this function is to unify the interface between this crate and [`pingora-boringssl`](https://docs.rs/pingora-boringssl)
@@ -227,5 +241,20 @@ mod tests {
 
         // Invalid input (contains null byte)
         assert!(ssl_set_groups_list(ssl_ref, "P-256\0P-384").is_err());
+    }
+
+    #[test]
+    fn test_ssl_export_keying_material_exists() {
+        // This test verifies that ssl_export_keying_material function exists
+        // and has the correct signature. Actual functional testing requires
+        // an established TLS connection.
+        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        let ssl = Ssl::new(&ctx_builder.build()).unwrap();
+        let ssl_ref = &ssl;
+        let mut out = [0u8; 32];
+
+        // This will fail since there's no established connection, but verifies
+        // the function signature is correct
+        let _ = ssl_export_keying_material(ssl_ref, &mut out, "test", None);
     }
 }
