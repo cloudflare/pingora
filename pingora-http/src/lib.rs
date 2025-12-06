@@ -328,6 +328,78 @@ impl RequestHeader {
     pub fn as_owned_parts(&self) -> ReqParts {
         clone_req_parts(&self.base)
     }
+
+    /// Removes all hop-by-hop headers as defined in RFC 7230 Section 6.1
+    /// and RFC 7540 Section 8.1.2
+    ///
+    /// Hop-by-hop headers are only meaningful for a single connection and
+    /// should not be forwarded by proxies. This method removes:
+    /// - Connection
+    /// - Keep-Alive
+    /// - Proxy-Authenticate
+    /// - Proxy-Authorization
+    /// - TE
+    /// - Trailer
+    /// - Transfer-Encoding
+    /// - Upgrade
+    ///
+    /// Additionally, RFC 7230 allows the Connection header to declare
+    /// other headers as hop-by-hop (e.g., "Connection: close, Custom-Header").
+    /// This method also removes any headers declared in the Connection header.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut req = RequestHeader::build("GET", "/", None)?;
+    /// req.insert_header("Connection", "close")?;
+    /// req.insert_header("Host", "example.com")?;
+    ///
+    /// req.remove_hop_by_hop_headers();
+    ///
+    /// assert!(req.get_header("Connection").is_none());
+    /// assert_eq!(req.get_header("Host").unwrap(), "example.com");
+    /// ```
+    pub fn remove_hop_by_hop_headers(&mut self) {
+        // RFC 7230 also allows the Connection header to declare
+        // additional headers as hop-by-hop. We need to handle this first, before we remove Connection itself.
+        // e.g., "Connection: X-Custom-Header, close" means X-Custom-Header is also hop-by-hop
+        let mut tokens_to_remove = Vec::new();
+        if let Some(conn_value) = self.headers.get("connection") {
+            if let Ok(conn_str) = std::str::from_utf8(conn_value.as_bytes()) {
+                for token in conn_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    // Skip known Connection values, only collect other headers to remove
+                    if !token.eq_ignore_ascii_case("close")
+                        && !token.eq_ignore_ascii_case("keep-alive")
+                        && !token.eq_ignore_ascii_case("upgrade")
+                    {
+                        tokens_to_remove.push(token.to_string());
+                    }
+                }
+            }
+        }
+
+        // Now remove the standard hop-by-hop headers
+        // See: https://tools.ietf.org/html/rfc7230#section-6.1
+        const HOP_BY_HOP: &[&str] = &[
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ];
+
+        for header_name in HOP_BY_HOP {
+            self.remove_header(*header_name);
+        }
+
+        // Finally, remove the headers declared in Connection
+        for token in tokens_to_remove {
+            self.remove_header(&token);
+        }
+    }
 }
 
 impl Clone for RequestHeader {
@@ -982,6 +1054,109 @@ mod tests {
                 .get(http::header::CONTENT_LENGTH)
                 .map(|d| d.as_bytes())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_remove_hop_by_hop_headers() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+
+        // Add standard hop-by-hop headers
+        req.insert_header("Connection", "close").unwrap();
+        req.insert_header("Keep-Alive", "timeout=5").unwrap();
+        req.insert_header("Transfer-Encoding", "chunked").unwrap();
+        req.insert_header("Upgrade", "websocket").unwrap();
+        req.insert_header("Proxy-Authorization", "Basic xyz").unwrap();
+        req.insert_header("TE", "trailers").unwrap();
+        req.insert_header("Trailer", "X-Trailer").unwrap();
+
+        // Add regular headers that should stay
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("User-Agent", "test").unwrap();
+        req.insert_header("Accept", "*/*").unwrap();
+
+        req.remove_hop_by_hop_headers();
+
+        // Verify hop-by-hop headers are removed
+        assert!(req.headers.get("Connection").is_none());
+        assert!(req.headers.get("Keep-Alive").is_none());
+        assert!(req.headers.get("Transfer-Encoding").is_none());
+        assert!(req.headers.get("Upgrade").is_none());
+        assert!(req.headers.get("Proxy-Authorization").is_none());
+        assert!(req.headers.get("TE").is_none());
+        assert!(req.headers.get("Trailer").is_none());
+
+        // Verify regular headers remain
+        assert_eq!(
+            req.headers.get("Host").map(|v| v.as_bytes()),
+            Some(b"example.com" as &[u8])
+        );
+        assert_eq!(
+            req.headers.get("User-Agent").map(|v| v.as_bytes()),
+            Some(b"test" as &[u8])
+        );
+        assert_eq!(
+            req.headers.get("Accept").map(|v| v.as_bytes()),
+            Some(b"*/*" as &[u8])
+        );
+    }
+
+    #[test]
+    fn test_connection_declared_headers() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+
+        // Connection header can declare other headers as hop-by-hop
+        // Per RFC 7230: "Connection: X-Custom-Hop, close" means X-Custom-Hop is also hop-by-hop
+        req.insert_header("Connection", "X-Custom-Hop, close").unwrap();
+        req.insert_header("X-Custom-Hop", "custom-value").unwrap();
+        req.insert_header("X-Regular-Header", "keep-me").unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+
+        req.remove_hop_by_hop_headers();
+
+        // Both Connection and declared headers should be removed
+        assert!(req.headers.get("Connection").is_none());
+        assert!(
+            req.headers.get("X-Custom-Hop").is_none(),
+            "X-Custom-Hop should be removed as it was declared in Connection header"
+        );
+
+        // Regular headers stay
+        assert_eq!(
+            req.headers.get("X-Regular-Header").map(|v| v.as_bytes()),
+            Some(b"keep-me" as &[u8])
+        );
+        assert_eq!(
+            req.headers.get("Host").map(|v| v.as_bytes()),
+            Some(b"example.com" as &[u8])
+        );
+    }
+
+    #[test]
+    fn test_remove_hop_by_hop_headers_case_insensitive() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+
+        // Test case insensitivity
+        req.insert_header("CONNECTION", "CLOSE").unwrap();
+        req.insert_header("keep-alive", "timeout=5").unwrap();
+        req.insert_header("TRANSFER-ENCODING", "chunked").unwrap();
+
+        req.insert_header("Host", "example.com").unwrap();
+
+        req.remove_hop_by_hop_headers();
+
+        // All hop-by-hop headers should be removed regardless of case
+        assert!(req.headers.get("CONNECTION").is_none());
+        assert!(req.headers.get("connection").is_none());
+        assert!(req.headers.get("keep-alive").is_none());
+        assert!(req.headers.get("KEEP-ALIVE").is_none());
+        assert!(req.headers.get("TRANSFER-ENCODING").is_none());
+        assert!(req.headers.get("transfer-encoding").is_none());
+
+        // Regular headers should stay
+        assert_eq!(
+            req.headers.get("Host").map(|v| v.as_bytes()),
+            Some(b"example.com" as &[u8])
         );
     }
 }
