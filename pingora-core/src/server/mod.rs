@@ -299,6 +299,42 @@ impl Server {
         }
     }
 
+    #[cfg(windows)]
+    async fn main_loop(&self, _run_args: RunArgs) -> ShutdownType {
+        // waiting for exit signal
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::Running)
+            .ok();
+
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Ctrl+C received, gracefully exiting");
+                // graceful shutdown if there are listening sockets
+                info!("Broadcasting graceful shutdown");
+                match self.shutdown_watch.send(true) {
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
+                    Err(e) => {
+                        error!("Graceful shutdown broadcast failed: {e}");
+                    }
+                }
+                info!("Broadcast graceful shutdown complete");
+
+                self.execution_phase_watch
+                    .send(ExecutionPhase::GracefulTerminate)
+                    .ok();
+
+                ShutdownType::Graceful
+            }
+            Err(e) => {
+                error!("Unable to listen for shutdown signal: {}", e);
+                ShutdownType::Quick
+            }
+        }
+    }
+
     fn run_service(
         mut service: Box<dyn Service>,
         #[cfg(unix)] fds: Option<ListenFds>,
@@ -536,7 +572,9 @@ impl Server {
             .get_handle()
             .block_on(self.main_loop(run_args));
         #[cfg(windows)]
-        let shutdown_type = ShutdownType::Graceful;
+        let shutdown_type = server_runtime
+            .get_handle()
+            .block_on(self.main_loop(run_args));
 
         self.execution_phase_watch
             .send(ExecutionPhase::ShutdownStarted)
