@@ -17,6 +17,8 @@
 
 #![warn(clippy::all)]
 
+pub mod ext;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
