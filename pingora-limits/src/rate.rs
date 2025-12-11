@@ -43,7 +43,7 @@ pub struct RateComponents {
 ///
 /// Specifically, it linearly interpolates between the event counts of the previous and current
 /// periods based on how far into the current period we are, as described in this post:
-/// https://blog.cloudflare.com/counting-things-a-lot-of-different-things/
+/// <https://blog.cloudflare.com/counting-things-a-lot-of-different-things/>
 #[allow(dead_code)]
 pub static PROPORTIONAL_RATE_ESTIMATE_CALC_FN: fn(RateComponents) -> f64 =
     |rate_info: RateComponents| {
