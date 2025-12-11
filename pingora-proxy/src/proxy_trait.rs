@@ -90,7 +90,7 @@ pub trait ProxyHttp {
 
     /// Returns whether this session is allowed to spawn subrequests.
     ///
-    /// This function is checked after [`early_request_filter`] to allow that filter to configure
+    /// This function is checked after [Self::early_request_filter] to allow that filter to configure
     /// this if required. This will also run for subrequests themselves, which may allowed to spawn
     /// their own subrequests.
     ///
