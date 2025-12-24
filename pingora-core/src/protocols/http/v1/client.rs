@@ -187,7 +187,17 @@ impl HttpSession {
     /// This function can be called multiple times, if the headers received are just informational
     /// headers.
     pub async fn read_response(&mut self) -> Result<usize> {
-        self.buf.clear();
+        if self.preread_body.as_ref().is_none_or(|b| b.is_empty()) {
+            // preread_body is set after a completed valid response header is read
+            // if called multiple times (i.e. after informational responses),
+            // we want to parse the already read buffer bytes as more headers.
+            // (https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
+            // "A 1xx response is terminated by the end of the header section;
+            // it cannot contain content or trailers.")
+            // If this next read_response call completes successfully,
+            // self.buf will be reset to the last response + any body.
+            self.buf.clear();
+        }
         let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
         let mut already_read: usize = 0;
         loop {
@@ -201,12 +211,18 @@ impl HttpSession {
                 );
             }
 
-            let read_fut = self.underlying_stream.read_buf(&mut buf);
-            let read_result = match self.read_timeout {
-                Some(t) => timeout(t, read_fut)
-                    .await
-                    .map_err(|_| Error::explain(ReadTimedout, "while reading response headers"))?,
-                None => read_fut.await,
+            let preread = self.preread_body.take();
+            let read_result = if let Some(preread) = preread.filter(|b| !b.is_empty()) {
+                buf.put_slice(preread.get(&self.buf));
+                Ok(preread.len())
+            } else {
+                let read_fut = self.underlying_stream.read_buf(&mut buf);
+                match self.read_timeout {
+                    Some(t) => timeout(t, read_fut).await.map_err(|_| {
+                        Error::explain(ReadTimedout, "while reading response headers")
+                    })?,
+                    None => read_fut.await,
+                }
             };
             let n = match read_result {
                 Ok(n) => match n {
@@ -260,6 +276,9 @@ impl HttpSession {
                         Some(resp.headers.len()),
                     )?);
 
+                    // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
+                    // "Since HTTP/1.0 did not define any 1xx status codes,
+                    // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
                     response_header.set_version(match resp.version {
                         Some(1) => Version::HTTP_11,
                         Some(0) => Version::HTTP_10,
@@ -1152,6 +1171,93 @@ mod tests_stream {
             }
         }
         // read 200 header next
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 204);
+                assert!(eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_informational_combined_with_final() {
+        init_log();
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nServer: pingora\r\nContent-Length: 3\r\n\r\n";
+        let body = b"abc";
+        let mock_io = Builder::new().read(&input[..]).read(&body[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // read 100 header first
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // read 200 header next
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // read body next
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Body(b, eob) => {
+                assert_eq!(b.unwrap(), &body[..]);
+                assert!(eob);
+            }
+            _ => {
+                panic!("task {task:?} should be body")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_informational_multiple_combined_with_final() {
+        init_log();
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 204 No Content\r\nServer: pingora\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // read 100 header first
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+
+        // then read 103 header
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 103);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+
+        // finally read 200 header
         let task = http_stream.read_response_task().await.unwrap();
         match task {
             HttpTask::Header(h, eob) => {
