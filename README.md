@@ -57,11 +57,11 @@ Both x86_64 and aarch64 architectures will be supported.
 
 ## Rust version
 
-Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old.
+Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old. However, we generally will not bump the highest MSRV across the workspace without a sufficiently compelling reason.
 
 Our current MSRV is 1.84.
 
-Building with the optional feature `boringssl` with Boring >= 4.14 requires Rust 1.80.
+Currently not all crates enforce `rust-version` as it is possible to use some crates on lower versions.
 
 ## Build Requirements
 
