@@ -4,6 +4,7 @@ version = "0.6.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
+rust-version = "1.84"
 repository = "https://github.com/cloudflare/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "proxy", "pingora"]
