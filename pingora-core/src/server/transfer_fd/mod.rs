@@ -200,7 +200,7 @@ fn accept_with_retry(listen_fd: i32) -> Result<i32, Error> {
                 }
                 match e {
                     Errno::EAGAIN => {
-                        error!(
+                        warn!(
                             "No incoming socket transfer, sleep {RETRY_INTERVAL:?} and try again"
                         );
                         retried += 1;
