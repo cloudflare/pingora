@@ -207,6 +207,26 @@ impl BodyReader {
         self.body_state = PS::HTTP1_0(0);
     }
 
+    // Convert how we interpret the remainder of the body as pass through
+    // (HTTP/1.0).
+    //
+    // Does nothing if already converted to HTTP1.0 mode.
+    pub fn convert_to_http10(&mut self) {
+        if matches!(self.body_state, PS::HTTP1_0(_)) {
+            // nothing to do, already HTTP1.0
+            return;
+        }
+
+        if self.rewind_buf_len == 0 {
+            // take any extra bytes and send them as-is,
+            // reset body counter
+            let extra = self.body_buf_overread.take();
+            let buf = extra.as_deref().unwrap_or_default();
+            self.prepare_buf(buf);
+        } // if rewind_buf_len is not 0, body read has not yet been polled
+        self.body_state = PS::HTTP1_0(0);
+    }
+
     pub fn get_body(&self, buf_ref: &BufRef) -> &[u8] {
         // TODO: these get_*() could panic. handle them better
         buf_ref.get(self.body_buf.as_ref().unwrap())
@@ -898,6 +918,20 @@ impl BodyWriter {
 
     pub fn init_content_length(&mut self, cl: usize) {
         self.body_mode = BM::ContentLength(cl, 0);
+    }
+
+    // Convert how we interpret the remainder of the body as pass through
+    // (HTTP/1.0).
+    pub fn convert_to_http10(&mut self) {
+        if matches!(self.body_mode, BodyMode::HTTP1_0(_)) {
+            // nothing to do, already HTTP1.0
+            return;
+        }
+
+        // NOTE: any stream buffered data will be flushed in next
+        // HTTP1_0 write
+        // reset body state to HTTP1_0
+        self.body_mode = BM::HTTP1_0(0);
     }
 
     // NOTE on buffering/flush stream when writing the body

@@ -700,6 +700,14 @@ where
                     }
                 }
             },
+            HttpTask::UpgradedBody(..) => {
+                // caching upgraded bodies isn't supported with and doesn't make sense with the HttpCache
+                // (caller of cache http task will disable cache in the session)
+                return Error::e_explain(
+                    InternalError,
+                    "Unexpected UpgradedBody task while caching",
+                );
+            }
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {

@@ -15,12 +15,16 @@
 mod utils;
 
 use utils::server_utils::init;
-use utils::websocket::WS_ECHO;
+use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
 use futures::{SinkExt, StreamExt};
+use pingora_http::ResponseHeader;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{StatusCode, Version};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 #[tokio::test]
@@ -182,6 +186,178 @@ async fn test_ws_server_ends_conn() {
     // assert graceful close
     assert!(matches!(msg, Message::Close(None)));
     assert!(ws_stream.next().await.is_none());
+}
+
+fn parse_response_header(buf: &[u8]) -> ResponseHeader {
+    let mut headers = vec![httparse::EMPTY_HEADER; 256];
+    let mut parsed = httparse::Response::new(&mut headers);
+    match parsed.parse(buf).unwrap() {
+        httparse::Status::Complete(_) => {
+            let mut resp =
+                ResponseHeader::build(parsed.code.unwrap(), Some(parsed.headers.len())).unwrap();
+            for header in parsed.headers.iter() {
+                resp.append_header(header.name.to_string(), header.value)
+                    .unwrap();
+            }
+            resp
+        }
+        _ => panic!("expects a whole response header"),
+    }
+}
+
+/// Read response header and return it along with any preread body data
+async fn read_response_header(stream: &mut tokio::net::TcpStream) -> (ResponseHeader, Vec<u8>) {
+    let mut response = vec![];
+    let mut header_end = 0;
+    let mut buf = [0; 1024];
+    loop {
+        let n = stream.read(&mut buf).await.unwrap();
+        response.extend_from_slice(&buf[..n]);
+        let mut end_of_response = false;
+        for (i, w) in response.windows(4).enumerate() {
+            if w == b"\r\n\r\n" {
+                end_of_response = true;
+                header_end = i + 4;
+                break;
+            }
+        }
+        if end_of_response {
+            break;
+        }
+    }
+    let response_header = parse_response_header(&response[..header_end]);
+    let preread_body = response[header_end..].to_vec();
+    (response_header, preread_body)
+}
+
+/// Read remaining body bytes from stream until expected_body_len is reached
+async fn read_response_body(
+    stream: &mut tokio::net::TcpStream,
+    mut body: Vec<u8>,
+    expected_body_len: usize,
+) -> Vec<u8> {
+    let mut buf = [0; 1024];
+    while body.len() < expected_body_len {
+        let n = stream.read(&mut buf).await.unwrap();
+        body.extend_from_slice(&buf[..n]);
+    }
+    if body.len() > expected_body_len {
+        panic!("more body bytes than expected");
+    }
+    body
+}
+
+async fn read_response(
+    stream: &mut tokio::net::TcpStream,
+    expected_body_len: usize,
+) -> (ResponseHeader, Vec<u8>) {
+    let (response_header, body) = read_response_header(stream).await;
+    let body = read_response_body(stream, body, expected_body_len).await;
+    (response_header, body)
+}
+
+#[tokio::test]
+async fn test_upgrade_smoke() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "GET /upgrade HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let expected_payload = b"hello\n";
+    let fut = read_response(&mut stream, expected_payload.len());
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+    assert_eq!(resp_body, expected_payload);
+}
+
+#[tokio::test]
+async fn test_upgrade_body() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "POST /upgrade_echo_body HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Content-Length: 1024\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    stream.write_all("b".repeat(1024).as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let fut = read_response(&mut stream, 1024);
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+
+    let body = "b".repeat(1024);
+    assert_eq!(resp_body, body.as_bytes());
+}
+
+#[tokio::test]
+async fn test_upgrade_body_after_101() {
+    // test content-length body is passed through after 101,
+    // and that ws payload is passed through afterwards
+    // use websocket server that flushes 101 after reading header
+    init();
+    let _ = *WS_ECHO_RAW;
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "POST /upgrade_echo_body HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "X-Port: 9284\r\n",
+        "Content-Length: 5120\r\n",
+        "X-Expected-Body-Len: 5125\r\n", // include ws payload
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+        .write_all("b".repeat(5 * 1024).as_bytes())
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    // Read response header and any preread body first (before sending ws_payload)
+    let fut = read_response_header(&mut stream);
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+
+    // Now send the websocket payload after receiving 101
+    let ws_payload = "hello";
+    stream.write_all(ws_payload.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // Read the rest of the bytes (body + ws payload), subtracting preread body length
+    let expected_total_len = 5 * 1024 + ws_payload.len();
+    let fut = read_response_body(&mut stream, resp_body, expected_total_len);
+    let resp_body = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+    let body = "b".repeat(5 * 1024) + ws_payload;
+    assert_eq!(resp_body, body.as_bytes());
 }
 
 #[tokio::test]

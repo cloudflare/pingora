@@ -424,6 +424,11 @@ where
                         }
 
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        if session.was_upgraded() {
+                            // it is very weird if the downstream session decides to upgrade
+                            // since the client h2 session cannot, return an error on this case
+                            return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
+                        }
                         response_state.maybe_set_upstream_done(response_done);
                     } else {
                         debug!("empty upstream event");
@@ -634,6 +639,11 @@ where
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
+            }
+            HttpTask::UpgradedBody(..) => {
+                // An h2 session should not be able to send an h2 upgraded response body,
+                // and logically that is impossible unless there is a bug in the client v2 session
+                panic!("Unexpected UpgradedBody task while proxy h2");
             }
             HttpTask::Trailer(mut trailers) => {
                 let trailer_buffer = match trailers.as_mut() {

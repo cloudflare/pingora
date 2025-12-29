@@ -420,6 +420,18 @@ impl HttpSession {
                     }
                     None => end,
                 },
+                HttpTask::UpgradedBody(..) => {
+                    // Seeing an Upgraded body means that the upstream session
+                    // was H1.1 that upgraded.
+                    //
+                    // While the downstream H2 session may encapsulate the opaque body bytes,
+                    // this represents an undefined discrepancy and change between how
+                    // the upstream and downstream sessions began intepreting the response body.
+                    return Error::e_explain(
+                        ErrorType::InternalError,
+                        "upgraded body on h2 server session",
+                    );
+                }
                 HttpTask::Trailer(Some(trailers)) => {
                     self.write_trailers(*trailers)?;
                     true
