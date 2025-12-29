@@ -20,7 +20,7 @@ use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
@@ -516,11 +516,26 @@ impl HttpSession {
                     // a peer discards any further data received.
                     // https://www.rfc-editor.org/rfc/rfc6455#section-1.4
                     self.upgraded = true;
+                    // Now that the upgrade was successful, we need to change
+                    // how we interpret the rest of the body as pass-through.
+                    if self.body_reader.need_init() {
+                        self.init_body_reader();
+                    } else {
+                        // already initialized
+                        // immediately start reading the rest of the body as upgraded
+                        // (in practice most upgraded requests shouldn't have any body)
+                        //
+                        // TODO: https://datatracker.ietf.org/doc/html/rfc9110#name-upgrade
+                        // the most spec-compliant behavior is to switch interpretation
+                        // after sending the former body,
+                        // we immediately switch interpretation to match nginx
+                        self.body_reader.convert_to_http10();
+                    }
                 } else {
+                    // this was a request that requested Upgrade,
+                    // but upstream did not comply
                     debug!("bad upgrade handshake!");
-                    // reset request body buf and mark as done
-                    // safe to reset an upgrade because it doesn't have body
-                    self.body_reader.init_content_length(0, b"");
+                    // continue to read body as-is, this is now just a regular request
                 }
             }
             self.init_body_writer(&header);
@@ -566,6 +581,14 @@ impl HttpSession {
         } else {
             None
         }
+    }
+
+    /// Was this request successfully turned into an upgraded connection?
+    ///
+    /// Both the request had to have been an `Upgrade` request
+    /// and the response had to have been a `101 Switching Protocols`.
+    pub fn was_upgraded(&self) -> bool {
+        self.upgraded
     }
 
     fn set_keepalive(&mut self, seconds: Option<u64>) {
@@ -758,6 +781,10 @@ impl HttpSession {
             .await
             .or_err(WriteError, "flushing body")?;
 
+        trace!(
+            "finish body (response body writer), upgraded: {}",
+            self.upgraded
+        );
         self.maybe_force_close_body_reader();
         Ok(res)
     }
@@ -792,11 +819,6 @@ impl HttpSession {
 
             /* follow https://tools.ietf.org/html/rfc7230#section-3.3.3 */
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
-
-            if self.req_header().version == Version::HTTP_11 && self.is_upgrade_req() {
-                self.body_reader.init_http10(preread_body);
-                return;
-            }
 
             if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
@@ -866,6 +888,7 @@ impl HttpSession {
     /// forever, same as [`Self::idle()`].
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
+            // XXX: account for upgraded body reader change, if the read half split from the write half
             let read = self.idle().await?;
             if read == 0 {
                 Error::e_explain(
@@ -1042,6 +1065,28 @@ impl HttpSession {
         Ok(())
     }
 
+    async fn write_non_empty_body(&mut self, data: Option<Bytes>, upgraded: bool) -> Result<()> {
+        // Both upstream and downstream should agree on upgrade status.
+        // Upgrade can only occur if both downstream and upstream sessions are H1.1
+        // and see a 101 response, which logically MUST have been received
+        // prior to this task.
+        if upgraded != self.upgraded {
+            if upgraded {
+                panic!("Unexpected UpgradedBody task received on un-upgraded downstream session");
+            } else {
+                panic!("Unexpected Body task received on upgraded downstream session");
+            }
+        }
+        let Some(d) = data else {
+            return Ok(());
+        };
+        if d.is_empty() {
+            return Ok(());
+        }
+        self.write_body(&d).await.map_err(|e| e.into_down())?;
+        Ok(())
+    }
+
     async fn response_duplex(&mut self, task: HttpTask) -> Result<bool> {
         let end_stream = match task {
             HttpTask::Header(header, end_stream) => {
@@ -1050,15 +1095,14 @@ impl HttpSession {
                     .map_err(|e| e.into_down())?;
                 end_stream
             }
-            HttpTask::Body(data, end_stream) => match data {
-                Some(d) => {
-                    if !d.is_empty() {
-                        self.write_body(&d).await.map_err(|e| e.into_down())?;
-                    }
-                    end_stream
-                }
-                None => end_stream,
-            },
+            HttpTask::Body(data, end_stream) => {
+                self.write_non_empty_body(data, false).await?;
+                end_stream
+            }
+            HttpTask::UpgradedBody(data, end_stream) => {
+                self.write_non_empty_body(data, true).await?;
+                end_stream
+            }
             HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
             HttpTask::Done => true,
             HttpTask::Failed(e) => return Err(e),
@@ -1070,6 +1114,23 @@ impl HttpSession {
         Ok(end_stream || self.body_writer.finished())
     }
 
+    fn buffer_body_data(&mut self, data: Option<Bytes>, upgraded: bool) {
+        if upgraded != self.upgraded {
+            if upgraded {
+                panic!("Unexpected Body task received on upgraded downstream session");
+            } else {
+                panic!("Unexpected UpgradedBody task received on un-upgraded downstream session");
+            }
+        }
+
+        let Some(d) = data else {
+            return;
+        };
+        if !d.is_empty() && !self.body_writer.finished() {
+            self.body_write_buf.put_slice(&d);
+        }
+    }
+
     // TODO: use vectored write to avoid copying
     pub async fn response_duplex_vec(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
         let n_tasks = tasks.len();
@@ -1077,6 +1138,7 @@ impl HttpSession {
             // fallback to single operation to avoid copy
             return self.response_duplex(tasks.pop().unwrap()).await;
         }
+
         let mut end_stream = false;
         for task in tasks.into_iter() {
             end_stream = match task {
@@ -1086,15 +1148,14 @@ impl HttpSession {
                         .map_err(|e| e.into_down())?;
                     end_stream
                 }
-                HttpTask::Body(data, end_stream) => match data {
-                    Some(d) => {
-                        if !d.is_empty() && !self.body_writer.finished() {
-                            self.body_write_buf.put_slice(&d);
-                        }
-                        end_stream
-                    }
-                    None => end_stream,
-                },
+                HttpTask::Body(data, end_stream) => {
+                    self.buffer_body_data(data, false);
+                    end_stream
+                }
+                HttpTask::UpgradedBody(data, end_stream) => {
+                    self.buffer_body_data(data, true);
+                    end_stream
+                }
                 HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
                 HttpTask::Done => true,
                 HttpTask::Failed(e) => {
@@ -1576,7 +1637,7 @@ mod tests_stream {
         assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
     }
 
-    async fn build_req(upgrade: &str, conn: &str) -> HttpSession {
+    async fn build_upgrade_req(upgrade: &str, conn: &str) -> HttpSession {
         let input = format!("GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: {upgrade}\r\nConnection: {conn}\r\n\r\n");
         let mock_io = Builder::new().read(input.as_bytes()).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
@@ -1614,10 +1675,210 @@ mod tests_stream {
         http_stream.read_request().await.unwrap();
         assert!(http_stream.is_upgrade_req());
 
-        assert!(build_req("websocket", "Upgrade").await.is_upgrade_req());
+        assert!(build_upgrade_req("websocket", "Upgrade")
+            .await
+            .is_upgrade_req());
 
         // mixed case
-        assert!(build_req("WebSocket", "Upgrade").await.is_upgrade_req());
+        assert!(build_upgrade_req("WebSocket", "Upgrade")
+            .await
+            .is_upgrade_req());
+    }
+
+    const POST_CL_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 10\r\n\r\n";
+    const POST_BODY_DATA: &[u8] = b"abcdefghij";
+    const POST_CHUNKED_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const POST_BODY_DATA_CHUNKED: &[u8] = b"3\r\nabc\r\n7\r\ndefghij\r\n0\r\n\r\n";
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_body(
+        #[case] header: &[u8],
+        #[case] body: &[u8],
+        #[case] body_wire: &[u8],
+    ) {
+        let ws_data = b"data";
+        let mock_io = Builder::new()
+            .read(header)
+            .read(body_wire)
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .read(&ws_data[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, body);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
+        assert_eq!(http_stream.body_bytes_read(), 10);
+
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
+        assert!(!http_stream.is_body_done());
+
+        // now the ws data
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, ws_data.as_slice());
+        assert!(!http_stream.is_body_done());
+
+        // EOF ends body
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_body_extra(
+        #[case] header: &[u8],
+        #[case] body: &[u8],
+        #[case] body_wire: &[u8],
+    ) {
+        let ws_data = b"data";
+        let data_wire = [body_wire, ws_data.as_slice()].concat();
+        let mock_io = Builder::new()
+            .read(header)
+            .read(&data_wire[..])
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, body);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
+        assert_eq!(http_stream.body_bytes_read(), 10);
+
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
+        assert!(!http_stream.is_body_done());
+
+        // now the ws data
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, ws_data.as_slice());
+        assert!(!http_stream.is_body_done());
+
+        // EOF ends body
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_preread_body(
+        #[case] header: &[u8],
+        #[case] body: &[u8],
+        #[case] body_wire: &[u8],
+    ) {
+        let ws_data = b"data";
+        let data_wire = [header, body_wire, ws_data.as_slice()].concat();
+        let mock_io = Builder::new()
+            .read(&data_wire[..])
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, body);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
+        assert_eq!(http_stream.body_bytes_read(), 10);
+
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
+        assert!(!http_stream.is_body_done());
+
+        // now the ws data
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, ws_data.as_slice());
+        assert!(!http_stream.is_body_done());
+
+        // EOF ends body
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA_CHUNKED)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_preread_body_after_101(
+        #[case] header: &[u8],
+        #[case] body_wire: &[u8],
+    ) {
+        let ws_data = b"data";
+        let data_wire = [header, body_wire, ws_data.as_slice()].concat();
+        let mock_io = Builder::new()
+            .read(&data_wire[..])
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches to http10
+        assert!(!http_stream.is_body_done());
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        let expected_body = [body_wire, ws_data.as_slice()].concat();
+        assert_eq!(buf, expected_body.as_bytes());
+        assert_eq!(http_stream.body_bytes_read(), expected_body.len());
+        assert!(http_stream.is_body_done());
     }
 
     #[tokio::test]
@@ -1626,6 +1887,7 @@ mod tests_stream {
         let mock_io = Builder::new()
             .read(&input[..])
             .write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
@@ -1637,7 +1899,20 @@ mod tests_stream {
             .await
             .unwrap();
         // 100 won't affect body state
+        // current GET request is done
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
         assert!(!http_stream.is_body_done());
+        // EOF ends body
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
     }
 
     #[tokio::test]
@@ -1809,7 +2084,7 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_101_switching_protocol() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let read_wire = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n";
         let wire = b"HTTP/1.1 101 Switching Protocols\r\nFoo: Bar\r\n\r\n";
         let wire_body = b"nPAYLOAD";
         let mock_io = Builder::new()
@@ -1826,10 +2101,12 @@ mod tests_stream {
             .write_response_header_ref(&response_101)
             .await
             .unwrap();
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
-        // simulate upgrade
-        http_stream.upgraded = true;
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(n));
+
         // this write should be ignored
         let response_502 = ResponseHeader::build(StatusCode::BAD_GATEWAY, None).unwrap();
         http_stream

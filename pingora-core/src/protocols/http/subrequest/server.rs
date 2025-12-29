@@ -321,11 +321,25 @@ impl HttpSession {
                     // a peer discards any further data received.
                     // https://www.rfc-editor.org/rfc/rfc6455#section-1.4
                     self.upgraded = true;
+                    // Now that the upgrade was successful, we need to change
+                    // how we interpret the rest of the body as pass-through.
+                    if self.body_reader.need_init() {
+                        self.init_body_reader();
+                    } else {
+                        // already initialized
+                        // immediately start reading the rest of the body as upgraded
+                        // (in theory most upgraded requests shouldn't have any body)
+                        //
+                        // TODO: https://datatracker.ietf.org/doc/html/rfc9110#name-upgrade
+                        // the most spec-compliant behavior is to switch interpretation
+                        // after sending the former body. For now we immediately
+                        // switch interpretation to match nginx behavior.
+                        // TODO: this has no effect resetting the body counter of TE chunked
+                        self.body_reader.convert_to_until_close();
+                    }
                 } else {
                     debug!("bad upgrade handshake!");
-                    // reset request body buf and mark as done
-                    // safe to reset an upgrade because it doesn't have body
-                    self.body_reader.init_content_length(0);
+                    // continue to read body as-is, this is now just a regular request
                 }
             }
             self.init_body_writer(&header);
@@ -358,6 +372,16 @@ impl HttpSession {
     /// `None` if the request is not an upgrade.
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
         self.v1_inner.is_upgrade(header)
+    }
+
+    /// Was this request successfully turned into an upgraded connection?
+    ///
+    /// Both the request had to have been an `Upgrade` request
+    /// and the response had to have been a `101 Switching Protocols`.
+    // XXX: this should only be valid if subrequest is standing in for
+    // a v1 session.
+    pub fn was_upgraded(&self) -> bool {
+        self.upgraded
     }
 
     fn init_body_writer(&mut self, header: &ResponseHeader) {
@@ -659,6 +683,24 @@ impl HttpSession {
         Ok(())
     }
 
+    async fn write_non_empty_body(&mut self, data: Option<Bytes>, upgraded: bool) -> Result<()> {
+        if upgraded != self.upgraded {
+            if upgraded {
+                panic!("Unexpected UpgradedBody task received on un-upgraded downstream session (subrequest)");
+            } else {
+                panic!("Unexpected Body task received on upgraded downstream session (subrequest)");
+            }
+        }
+        let Some(d) = data else {
+            return Ok(());
+        };
+        if d.is_empty() {
+            return Ok(());
+        }
+        self.write_body(d).await.map_err(|e| e.into_down())?;
+        Ok(())
+    }
+
     async fn response_duplex(&mut self, task: HttpTask) -> Result<bool> {
         let end_stream = match task {
             HttpTask::Header(header, end_stream) => {
@@ -667,15 +709,14 @@ impl HttpSession {
                     .map_err(|e| e.into_down())?;
                 end_stream
             }
-            HttpTask::Body(data, end_stream) => match data {
-                Some(d) => {
-                    if !d.is_empty() {
-                        self.write_body(d).await.map_err(|e| e.into_down())?;
-                    }
-                    end_stream
-                }
-                None => end_stream,
-            },
+            HttpTask::Body(data, end_stream) => {
+                self.write_non_empty_body(data, false).await?;
+                end_stream
+            }
+            HttpTask::UpgradedBody(data, end_stream) => {
+                self.write_non_empty_body(data, true).await?;
+                end_stream
+            }
             HttpTask::Trailer(trailers) => {
                 self.write_trailers(trailers).await?;
                 true
@@ -707,15 +748,14 @@ impl HttpSession {
                         .map_err(|e| e.into_down())?;
                     end_stream
                 }
-                HttpTask::Body(data, end_stream) => match data {
-                    Some(d) => {
-                        if !d.is_empty() {
-                            self.write_body(d).await.map_err(|e| e.into_down())?;
-                        }
-                        end_stream
-                    }
-                    None => end_stream,
-                },
+                HttpTask::Body(data, end_stream) => {
+                    self.write_non_empty_body(data, false).await?;
+                    end_stream
+                }
+                HttpTask::UpgradedBody(data, end_stream) => {
+                    self.write_non_empty_body(data, true).await?;
+                    end_stream
+                }
                 HttpTask::Done => {
                     // write done
                     // we'll send HttpTask::Done at the end of this loop in finish

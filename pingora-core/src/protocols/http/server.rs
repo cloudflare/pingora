@@ -648,12 +648,22 @@ impl Session {
         }
     }
 
-    /// Whether this request is for upgrade (e.g., websocket)
+    /// Whether this request is for upgrade (e.g., websocket).
     pub fn is_upgrade_req(&self) -> bool {
         match self {
             Self::H1(s) => s.is_upgrade_req(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.is_upgrade_req(),
+            Self::Custom(_) => false,
+        }
+    }
+
+    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    pub fn was_upgraded(&self) -> bool {
+        match self {
+            Self::H1(s) => s.was_upgraded(),
+            Self::H2(_) => false,
+            Self::Subrequest(s) => s.was_upgraded(),
             Self::Custom(_) => false,
         }
     }

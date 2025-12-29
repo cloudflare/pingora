@@ -40,6 +40,7 @@ reqwest = { version = "0.11", features = [
     "gzip",
     "rustls-tls",
 ], default-features = false }
+httparse = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
 hyper = "0.14"

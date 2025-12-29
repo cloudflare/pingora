@@ -76,6 +76,17 @@ impl BodyReader {
         self.body_state = PS::UntilClose(0);
     }
 
+    // Convert how we interpret the remainder of the body as pass through.
+    pub fn convert_to_until_close(&mut self) {
+        if matches!(self.body_state, PS::UntilClose(_)) {
+            // nothing to do
+            return;
+        }
+
+        // reset body counter
+        self.body_state = PS::UntilClose(0);
+    }
+
     pub fn body_done(&self) -> bool {
         matches!(self.body_state, PS::Complete(_) | PS::Done(_))
     }
