@@ -1564,6 +1564,15 @@ mod tests_stream {
         assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
     }
 
+    #[tokio::test]
+    async fn read_invalid_header_end() {
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\r\nConnection: keep-alive\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
+    }
+
     async fn build_req(upgrade: &str, conn: &str) -> HttpSession {
         let input = format!("GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: {upgrade}\r\nConnection: {conn}\r\n\r\n");
         let mock_io = Builder::new().read(input.as_bytes()).build();
