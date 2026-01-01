@@ -315,6 +315,9 @@ impl Connector {
         let maybe_conn = self
             .in_use_pool
             .get(reuse_hash)
+            // filter out closed, InUsePool does not have notify closed eviction like the idle pool
+            // and it's possible we get an in use connection that is closed and not yet released
+            .filter(|c| !c.is_closed())
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
             let h2_stream = conn.spawn_stream().await?;
@@ -366,14 +369,12 @@ impl Connector {
             };
             let closed = conn.0.closed.clone();
             let (notify_evicted, watch_use) = self.idle_pool.put(&meta, conn);
-            if let Some(to) = idle_timeout {
-                let pool = self.idle_pool.clone(); //clone the arc
-                let rt = pingora_runtime::current_handle();
-                rt.spawn(async move {
-                    pool.idle_timeout(&meta, to, notify_evicted, closed, watch_use)
-                        .await;
-                });
-            }
+            let pool = self.idle_pool.clone(); //clone the arc
+            let rt = pingora_runtime::current_handle();
+            rt.spawn(async move {
+                pool.idle_timeout(&meta, idle_timeout, notify_evicted, closed, watch_use)
+                    .await;
+            });
         } else {
             self.in_use_pool.insert(reuse_hash, conn);
             drop(locked);
