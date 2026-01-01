@@ -316,7 +316,7 @@ impl<S> ConnectionPool<S> {
     pub async fn idle_timeout(
         &self,
         meta: &ConnectionMeta,
-        timeout: Duration,
+        timeout: Option<Duration>,
         notify_evicted: Arc<Notify>,
         mut notify_closed: watch::Receiver<bool>,
         watch_use: oneshot::Receiver<bool>,
@@ -335,7 +335,8 @@ impl<S> ConnectionPool<S> {
                 debug!("idle connection is being closed");
                 self.pop_closed(meta);
             }
-            _ = sleep(timeout) => {
+            // async expression is evaluated if timeout is None but it's never polled, set it to MAX
+            _ = sleep(timeout.unwrap_or(Duration::MAX)), if timeout.is_some() => {
                 debug!("idle connection is being evicted");
                 self.pop_closed(meta);
             }
