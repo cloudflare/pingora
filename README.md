@@ -44,8 +44,6 @@ API docs are also available for all the crates.
 * Pingora-timeout: A more efficient async timer system
 * TinyUfo: The caching algorithm behind pingora-memory-cache
 
-Note that Pingora proxy integration with caching should be considered experimental, and as such APIs related to caching are currently highly volatile.
-
 # System requirements
 
 ## Systems
