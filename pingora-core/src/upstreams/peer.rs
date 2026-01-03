@@ -642,6 +642,17 @@ impl HttpPeer {
         }
     }
 
+    /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    pub fn new_mtls<A: ToInetSocketAddrs>(
+        address: A,
+        sni: String,
+        client_cert_key: Arc<CertKey>,
+    ) -> Self {
+        let mut peer = Self::new(address, true, sni);
+        peer.client_cert_key = Some(client_cert_key);
+        peer
+    }
+
     fn peer_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self.hash(&mut hasher);
