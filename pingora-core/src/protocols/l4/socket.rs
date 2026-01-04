@@ -66,7 +66,7 @@ impl SocketAddr {
     fn from_sockaddr_storage(sock: &SockaddrStorage) -> Option<SocketAddr> {
         if let Some(v4) = sock.as_sockaddr_in() {
             return Some(SocketAddr::Inet(StdSockAddr::V4(
-                std::net::SocketAddrV4::new(v4.ip().into(), v4.port()),
+                std::net::SocketAddrV4::new(v4.ip(), v4.port()),
             )));
         } else if let Some(v6) = sock.as_sockaddr_in6() {
             return Some(SocketAddr::Inet(StdSockAddr::V6(

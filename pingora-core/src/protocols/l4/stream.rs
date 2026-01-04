@@ -177,7 +177,7 @@ impl RawStreamWrapper {
             #[cfg(target_os = "linux")]
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
-            reusable_cmsg_space: nix::cmsg_space!(nix::sys::time::TimeSpec),
+            reusable_cmsg_space: nix::cmsg_space!([nix::sys::time::TimeSpec; 3]),
         }
     }
 
@@ -240,7 +240,7 @@ impl AsyncRead for RawStreamWrapper {
                             as *mut [u8])
                     };
                     let mut iov = [IoSliceMut::new(b)];
-                    rs_wrapper.reusable_cmsg_space.clear();
+                    rs_wrapper.reusable_cmsg_space.fill(0);
 
                     match s.try_io(Interest::READABLE, || {
                         recvmsg::<SockaddrStorage>(
@@ -252,9 +252,12 @@ impl AsyncRead for RawStreamWrapper {
                         .map_err(|errno| errno.into())
                     }) {
                         Ok(r) => {
-                            if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) = r
-                                .cmsgs()
-                                .find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_)))
+                            if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) =
+                                r.cmsgs().ok().and_then(|mut iter| {
+                                    iter.find(|i| {
+                                        matches!(i, ControlMessageOwned::ScmTimestampsns(_))
+                                    })
+                                })
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
                                 // https://docs.kernel.org/networking/timestamping.html
@@ -432,7 +435,7 @@ impl Stream {
         if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             let timestamp_options = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
                 | TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE;
-            setsockopt(s.as_raw_fd(), sockopt::Timestamping, &timestamp_options)
+            setsockopt(s, sockopt::Timestamping, &timestamp_options)
                 .or_err(InternalError, "failed to set SOF_TIMESTAMPING_RX_SOFTWARE")?;
             self.stream_mut().get_mut().enable_rx_ts(true);
         }

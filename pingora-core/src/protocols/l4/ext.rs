@@ -534,10 +534,16 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
 
     set_socket(&socket)?;
 
-    socket
-        .connect(*addr)
-        .await
-        .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))
+    let treat_addr_not_available_as_bind_error =
+        bind_to.as_ref().is_some_and(|b| b.will_fallback());
+
+    socket.connect(*addr).await.map_err(|e| {
+        wrap_os_connect_error(
+            e,
+            format!("Fail to connect to {}", *addr),
+            treat_addr_not_available_as_bind_error,
+        )
+    })
 }
 
 /// connect() to the given address while optionally binding to the specific source address.
@@ -551,16 +557,26 @@ pub async fn connect(addr: &SocketAddr, bind_to: Option<&BindTo>) -> Result<TcpS
 /// connect() to the given Unix domain socket
 #[cfg(unix)]
 pub async fn connect_uds(path: &std::path::Path) -> Result<UnixStream> {
-    UnixStream::connect(path)
-        .await
-        .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", path.display())))
+    UnixStream::connect(path).await.map_err(|e| {
+        wrap_os_connect_error(e, format!("Fail to connect to {}", path.display()), false)
+    })
 }
 
-fn wrap_os_connect_error(e: std::io::Error, context: String) -> Box<Error> {
+fn wrap_os_connect_error(
+    e: std::io::Error,
+    context: String,
+    treat_addr_not_available_as_bind_error: bool,
+) -> Box<Error> {
     match e.kind() {
         ErrorKind::ConnectionRefused => Error::because(ConnectRefused, context, e),
         ErrorKind::TimedOut => Error::because(ConnectTimedout, context, e),
-        ErrorKind::AddrNotAvailable => Error::because(BindError, context, e),
+        ErrorKind::AddrNotAvailable => {
+            if treat_addr_not_available_as_bind_error {
+                Error::because(BindError, context, e)
+            } else {
+                Error::because(ConnectError, context, e)
+            }
+        }
         ErrorKind::PermissionDenied | ErrorKind::AddrInUse => {
             Error::because(InternalError, context, e)
         }
