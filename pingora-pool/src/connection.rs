@@ -14,8 +14,9 @@
 
 //! Generic connection pooling
 
+use dashmap::DashMap;
 use log::{debug, warn};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use pingora_timeout::{sleep, timeout};
 use std::collections::HashMap;
 use std::io;
@@ -177,48 +178,37 @@ impl<T> PoolNode<T> {
     }
 }
 
+type Pool<S> = PoolNode<PoolConnection<S>>;
+
 /// Connection pool
 ///
 /// [ConnectionPool] holds reusable connections. A reusable connection is released to this pool to
 /// be picked up by another user/request.
 pub struct ConnectionPool<S> {
-    // TODO: n-way pools to reduce lock contention
-    pool: RwLock<HashMap<GroupKey, Arc<PoolNode<PoolConnection<S>>>>>,
+    // Concurrent per-key pool index; each value handles per-key connection storage.
+    pools: DashMap<GroupKey, Arc<Pool<S>>>,
     lru: Lru<ID, ConnectionMeta>,
 }
 
 impl<S> ConnectionPool<S> {
-    /// Create a new [ConnectionPool] with a size limit.
+    /// Create a new [ConnectionPool] with a global size limit.
     ///
-    /// When a connection is released to this pool, the least recently used connection will be dropped.
+    /// When a connection is released to this pool and total occupancy is at
+    /// or above `size`, the least recently used connection is dropped.
     pub fn new(size: usize) -> Self {
         ConnectionPool {
-            pool: RwLock::new(HashMap::with_capacity(size)), // this is oversized since some connections will have the same key
+            pools: DashMap::with_capacity(size),
             lru: Lru::new(size),
         }
     }
 
     /* get or create and insert a pool node for the hash key */
     fn get_pool_node(&self, key: GroupKey) -> Arc<PoolNode<PoolConnection<S>>> {
-        {
-            let pool = self.pool.read();
-            if let Some(v) = pool.get(&key) {
-                return (*v).clone();
-            }
-        } // read lock released here
-
-        {
-            // write lock section
-            let mut pool = self.pool.write();
-            // check again since another task might have already added it
-            if let Some(v) = pool.get(&key) {
-                return (*v).clone();
-            }
-            let node = Arc::new(PoolNode::new());
-            let node_ret = node.clone();
-            pool.insert(key, node); // TODO: check dup
-            node_ret
-        }
+        self.pools
+            .entry(key)
+            .or_insert_with(|| Arc::new(PoolNode::new()))
+            .value()
+            .clone()
     }
 
     /// Attempt to remove an empty [`PoolNode`] entry from the pool `HashMap`.
@@ -245,26 +235,27 @@ impl<S> ConnectionPool<S> {
     /// This trade-off matches the existing concurrency model of the pool and is
     /// consistent with how hyper-util and Go's `net/http` handle this case.
     fn try_remove_empty_node(&self, key: GroupKey) {
-        let mut pool = self.pool.write();
-        if let Some(node) = pool.get(&key) {
+        if let Some(node) = self.pools.get(&key) {
             if node.is_empty() {
-                pool.remove(&key);
+                // Release the DashMap read guard before remove_if() acquires
+                // mutable access to the same shard. Re-check emptiness in the
+                // predicate because another thread may repopulate the node in
+                // between dropping this guard and attempting removal.
+                drop(node);
+                self.pools.remove_if(&key, |_, node| node.is_empty());
             }
         }
     }
 
     // only remove from the pool because lru already removed it
     fn pop_evicted(&self, meta: &ConnectionMeta) {
-        let pool_node = {
-            let pool = self.pool.read();
-            match pool.get(&meta.key) {
-                Some(v) => (*v).clone(),
-                None => {
-                    warn!("Fail to get pool node for {:?}", meta);
-                    return;
-                } // nothing to pop, should return error?
-            }
-        }; // read lock released here
+        let pool_node = match self.pools.get(&meta.key) {
+            Some(v) => v.value().clone(),
+            None => {
+                warn!("Fail to get pool node for {meta:?}");
+                return;
+            } // nothing to pop, should return error?
+        };
 
         pool_node.remove(meta.id);
         debug!("evict fd: {} from key {}", meta.id, meta.key);
@@ -286,13 +277,10 @@ impl<S> ConnectionPool<S> {
 
     /// Get a connection from this pool under the same group key
     pub fn get(&self, key: &GroupKey) -> Option<S> {
-        let pool_node = {
-            let pool = self.pool.read();
-            match pool.get(key) {
-                Some(v) => (*v).clone(),
-                None => return None,
-            }
-        }; // read lock released here
+        let pool_node = match self.pools.get(key) {
+            Some(v) => v.value().clone(),
+            None => return None,
+        };
 
         if let Some((id, connection)) = pool_node.get_any() {
             self.lru.pop(&id); // the notified is not needed
@@ -322,10 +310,10 @@ impl<S> ConnectionPool<S> {
         meta: &ConnectionMeta,
         connection: S,
     ) -> (Arc<Notify>, oneshot::Receiver<bool>) {
-        let (notify_close, replaced) = self.lru.add(meta.id, meta.clone());
-        if let Some(meta) = replaced {
-            self.pop_evicted(&meta);
-        };
+        let (notify_close, evicted) = self.lru.add(meta.id, meta.clone());
+        for meta in &evicted {
+            self.pop_evicted(meta);
+        }
         let pool_node = self.get_pool_node(meta.key);
         let (notify_use, watch_use) = oneshot::channel();
         let connection = PoolConnection::new(notify_use, connection);
@@ -486,6 +474,14 @@ mod tests {
     use log::debug;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_test::io::{Builder, Mock};
+
+    fn pool_len<S>(pool: &ConnectionPool<S>) -> usize {
+        pool.pools.len()
+    }
+
+    fn pool_contains<S>(pool: &ConnectionPool<S>, key: GroupKey) -> bool {
+        pool.pools.contains_key(&key)
+    }
 
     #[tokio::test]
     async fn test_lookup() {
@@ -1027,12 +1023,12 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(2);
         cp.put(&meta, "v1".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1, "pool should have 1 node");
+        assert_eq!(pool_len(&cp), 1, "pool should have 1 node");
 
         cp.pop_closed(&meta);
 
         assert_eq!(
-            cp.pool.read().len(),
+            pool_len(&cp),
             0,
             "empty PoolNode should be removed after pop_closed"
         );
@@ -1048,13 +1044,13 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(2);
         cp.put(&meta, "v1".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(pool_len(&cp), 1);
 
         let conn = cp.get(&meta.key);
         assert!(conn.is_some());
 
         assert_eq!(
-            cp.pool.read().len(),
+            pool_len(&cp),
             0,
             "empty PoolNode should be removed after get() takes the last connection"
         );
@@ -1073,11 +1069,11 @@ mod tests {
         // Remove both connections via pop_closed, but the first pop_closed
         // won't remove the node since meta2 is still there.
         cp.pop_closed(&meta1);
-        assert_eq!(cp.pool.read().len(), 1, "node should still exist");
+        assert_eq!(pool_len(&cp), 1, "node should still exist");
 
         cp.pop_closed(&meta2);
         assert_eq!(
-            cp.pool.read().len(),
+            pool_len(&cp),
             0,
             "node should be removed after last connection is popped"
         );
@@ -1096,10 +1092,10 @@ mod tests {
         cp.pop_closed(&meta1);
 
         assert!(
-            cp.pool.read().contains_key(&101),
+            pool_contains(&cp, 101),
             "node should still exist because meta2's connection is still in it"
         );
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(pool_len(&cp), 1);
 
         // The remaining connection should still be retrievable
         let conn = cp.get(&meta1.key);
@@ -1115,18 +1111,18 @@ mod tests {
         cp.put(&meta_a, "a".to_string());
         cp.put(&meta_b, "b".to_string());
 
-        assert_eq!(cp.pool.read().len(), 2);
+        assert_eq!(pool_len(&cp), 2);
 
         // Remove all connections for key 101
         cp.pop_closed(&meta_a);
 
         assert_eq!(
-            cp.pool.read().len(),
+            pool_len(&cp),
             1,
             "only key 101's empty node should be removed"
         );
-        assert!(!cp.pool.read().contains_key(&101), "key 101 should be gone");
-        assert!(cp.pool.read().contains_key(&202), "key 202 should remain");
+        assert!(!pool_contains(&cp, 101), "key 101 should be gone");
+        assert!(pool_contains(&cp, 202), "key 202 should remain");
 
         // key 202's connection should still be retrievable
         let conn = cp.get(&meta_b.key);
@@ -1142,16 +1138,16 @@ mod tests {
         let cp: ConnectionPool<String> = ConnectionPool::new(1);
 
         cp.put(&meta1, "v1".to_string());
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(pool_len(&cp), 1);
 
         // This put evicts meta1 (LRU size = 1), making key 101's node empty.
         cp.put(&meta2, "v2".to_string());
 
         assert!(
-            !cp.pool.read().contains_key(&101),
+            !pool_contains(&cp, 101),
             "key 101's empty node should be removed after its only connection was evicted"
         );
-        assert!(cp.pool.read().contains_key(&202));
+        assert!(pool_contains(&cp, 202));
     }
 
     #[tokio::test]
@@ -1163,18 +1159,18 @@ mod tests {
         cp.put(&meta1, "first".to_string());
 
         cp.pop_closed(&meta1);
-        assert_eq!(cp.pool.read().len(), 0, "node should be cleaned up");
+        assert_eq!(pool_len(&cp), 0, "node should be cleaned up");
 
         // Re-insert for the same key
         let meta2 = ConnectionMeta::new(101, 2);
         cp.put(&meta2, "second".to_string());
 
-        assert_eq!(cp.pool.read().len(), 1);
+        assert_eq!(pool_len(&cp), 1);
         let conn = cp.get(&meta2.key);
         assert_eq!(conn, Some("second".to_string()));
 
         assert_eq!(
-            cp.pool.read().len(),
+            pool_len(&cp),
             0,
             "node should be cleaned up again after get"
         );

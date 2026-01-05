@@ -89,7 +89,11 @@ pub struct ConnectorOptions {
     /// env variable. This can be used by tools like Wireshark to decrypt traffic
     /// for debugging purposes.
     pub debug_ssl_keylog: bool,
-    /// How many connections to keepalive
+    /// Effective global cap for the keepalive pool. Derived from
+    /// `server_conf.upstream_keepalive_pool_size * server_conf.threads`
+    /// in [`Self::from_server_conf`] so that operator-facing config keeps
+    /// its per-worker meaning even though the pool itself now uses a single
+    /// global LRU.
     pub keepalive_pool_size: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
     ///
@@ -143,7 +147,9 @@ impl ConnectorOptions {
             #[cfg(feature = "s2n")]
             s2n_config_cache_size: server_conf.s2n_config_cache_size,
             debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
-            keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
+            keepalive_pool_size: server_conf
+                .upstream_keepalive_pool_size
+                .saturating_mul(server_conf.threads.max(1)),
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
