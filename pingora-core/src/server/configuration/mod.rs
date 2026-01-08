@@ -110,6 +110,12 @@ pub struct ServerConf {
     ///
     /// This setting is a fail-safe and defaults to 16.
     pub max_retries: usize,
+    /// Maximum number of retries for upgrade socket connect and accept operations.
+    /// This controls how many times send_fds_to will retry connecting and how many times
+    /// get_fds_from will retry accepting during graceful upgrades.
+    /// The retry interval is 1 second between attempts.
+    /// If not set, defaults to 5 retries.
+    pub upgrade_sock_connect_accept_max_retries: Option<usize>,
 }
 
 impl Default for ServerConf {
@@ -137,6 +143,7 @@ impl Default for ServerConf {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
+            upgrade_sock_connect_accept_max_retries: None,
         }
     }
 }
@@ -303,6 +310,7 @@ mod tests {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: 1,
+            upgrade_sock_connect_accept_max_retries: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
