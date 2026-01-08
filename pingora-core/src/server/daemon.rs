@@ -86,7 +86,7 @@ pub fn daemonize(conf: &ServerConf) {
             let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as i32) };
             #[cfg(target_os = "freebsd")]
             let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as u32) };
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let group_id = unsafe { gid_for_username(&user_cstr) };
 
             daemonize
