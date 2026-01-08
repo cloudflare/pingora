@@ -191,7 +191,7 @@ async fn test_download_timeout() {
     use tokio::time::sleep;
 
     let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
     let req = hyper::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
