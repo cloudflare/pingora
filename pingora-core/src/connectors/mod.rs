@@ -399,6 +399,86 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
     }
 }
 
+/// Test utilities for creating mock acceptors.
+#[cfg(all(test, unix))]
+pub(crate) mod test_utils {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+
+    /// Generates a unique socket path for testing to avoid conflicts when running in parallel
+    pub fn unique_uds_path(test_name: &str) -> String {
+        format!(
+            "/tmp/test_{test_name}_{:?}_{}.sock",
+            std::thread::current().id(),
+            std::process::id()
+        )
+    }
+
+    /// A mock UDS server that accepts one connection, sends data, and waits for shutdown signal
+    ///
+    /// Returns: (ready_rx, shutdown_tx, server_handle)
+    /// - ready_rx: Wait on this to know when server is ready to accept connections
+    /// - shutdown_tx: Send on this to tell server to shut down
+    /// - server_handle: Join handle for the server task
+    pub fn spawn_mock_uds_server(
+        socket_path: String,
+        response: &'static [u8],
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            // Signal that the server is ready to accept connections
+            let _ = ready_tx.send(());
+
+            if let Ok((mut stream, _addr)) = listener.accept().await {
+                let _ = stream.write_all(response).await;
+                // Keep the connection open until the test tells us to shutdown
+                let _ = shutdown_rx.await;
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        (ready_rx, shutdown_tx, server_handle)
+    }
+
+    /// A mock UDS server that immediately closes connections (for testing error handling)
+    ///
+    /// Returns: (ready_rx, shutdown_tx, server_handle)
+    pub fn spawn_mock_uds_server_close_immediate(
+        socket_path: String,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            // Signal that the server is ready to accept connections
+            let _ = ready_tx.send(());
+
+            if let Ok((mut stream, _addr)) = listener.accept().await {
+                let _ = stream.shutdown().await;
+                // Wait for shutdown signal before cleaning up
+                let _ = shutdown_rx.await;
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        (ready_rx, shutdown_tx, server_handle)
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "any_tls")]
 mod tests {
@@ -407,9 +487,6 @@ mod tests {
 
     use super::*;
     use crate::upstreams::peer::BasicPeer;
-    use tokio::io::AsyncWriteExt;
-    #[cfg(unix)]
-    use tokio::net::UnixListener;
 
     // 192.0.2.1 is effectively a black hole
     const BLACK_HOLE: &str = "192.0.2.1:79";
@@ -440,38 +517,34 @@ mod tests {
         assert!(reused);
     }
 
-    #[cfg(unix)]
-    const MOCK_UDS_PATH: &str = "/tmp/test_unix_transport_connector.sock";
-
-    // one-off mock server
-    #[cfg(unix)]
-    async fn mock_connect_server() {
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-        let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
-        if let Ok((mut stream, _addr)) = listener.accept().await {
-            stream.write_all(b"it works!").await.unwrap();
-            // wait a bit so that the client can read
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-    }
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn test_connect_uds() {
-        tokio::spawn(async {
-            mock_connect_server().await;
-        });
+        let socket_path = test_utils::unique_uds_path("transport_connector");
+        let (ready_rx, shutdown_tx, server_handle) =
+            test_utils::spawn_mock_uds_server(socket_path.clone(), b"it works!");
+
+        // Wait for the server to be ready before connecting
+        ready_rx.await.unwrap();
+
         // create a new service at /tmp
         let connector = TransportConnector::new(None);
-        let peer = BasicPeer::new_uds(MOCK_UDS_PATH).unwrap();
+        let peer = BasicPeer::new_uds(&socket_path).unwrap();
         // make a new connection to mock uds
         let mut stream = connector.new_stream(&peer).await.unwrap();
         let mut buf = [0; 9];
         let _ = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf, b"it works!");
-        connector.release_stream(stream, peer.reuse_hash(), None);
 
-        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        // Test connection reuse by releasing and getting the stream back
+        connector.release_stream(stream, peer.reuse_hash(), None);
+        let (stream, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+
+        // Clean up: drop the stream, tell server to shutdown, and wait for it
+        drop(stream);
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
 
     async fn do_test_conn_timeout(conf: Option<ConnectorOptions>) {
