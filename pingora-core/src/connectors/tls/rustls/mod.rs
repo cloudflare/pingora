@@ -252,8 +252,9 @@ where
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
-enum VerificationMode {
+pub enum VerificationMode {
     SkipHostname,
     SkipAll,
     Full,
