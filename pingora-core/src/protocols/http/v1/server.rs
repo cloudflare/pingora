@@ -473,7 +473,10 @@ impl HttpSession {
             }
         }
 
-        if self.close_on_response_before_downstream_finish && !self.is_body_done() {
+        // if body unfinished, or request header was not finished reading
+        if self.close_on_response_before_downstream_finish
+            && (self.request_header.is_none() || !self.is_body_done())
+        {
             debug!("set connection close before downstream finish");
             self.set_keepalive(None);
         }
