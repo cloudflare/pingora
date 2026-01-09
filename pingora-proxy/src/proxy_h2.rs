@@ -212,7 +212,15 @@ where
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
-            Err(e) => (false, Some(e)),
+            Err(e) => {
+                // On application level upstream read timeouts, send RST_STREAM CANCEL,
+                // we know we have not received END_STREAM at this point since we read timed out
+                // TODO: implement for write timeouts?
+                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                    client_body.send_reset(h2::Reason::CANCEL);
+                }
+                (false, Some(e))
+            }
         }
     }
 
