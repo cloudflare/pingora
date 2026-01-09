@@ -31,7 +31,7 @@ once_cell = { workspace = true }
 regex = "1"
 blake2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
-rmp-serde = "1"
+rmp-serde = "1.3.0"
 bytes = { workspace = true }
 httpdate = "1.0.2"
 log = { workspace = true }
@@ -39,7 +39,7 @@ async-trait = { workspace = true }
 parking_lot = "0.12"
 cf-rustracing = "1.0"
 cf-rustracing-jaeger = "1.0"
-rmp = "0.8"
+rmp = "0.8.14"
 tokio = { workspace = true }
 lru = { workspace = true }
 ahash = { workspace = true }
