@@ -180,7 +180,11 @@ where
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn get_fds_from<P>(_path: &P, _payload: &mut [u8]) -> Result<(Vec<RawFd>, usize), Error>
+pub fn get_fds_from<P>(
+    _path: &P,
+    _payload: &mut [u8],
+    _max_retry: Option<usize>,
+) -> Result<(Vec<RawFd>, usize), Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
@@ -328,7 +332,12 @@ where
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn send_fds_to<P>(_fds: Vec<RawFd>, _payload: &[u8], _path: &P) -> Result<usize, Error>
+pub fn send_fds_to<P>(
+    _fds: Vec<RawFd>,
+    _payload: &[u8],
+    _path: &P,
+    _max_retry: Option<usize>,
+) -> Result<usize, Error>
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
