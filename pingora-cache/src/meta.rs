@@ -93,8 +93,10 @@ mod internal_meta {
         //    schema to decode it
         // After full releases, remove `skip_serializing_if` so that we can add the next extended field.
         #[serde(default)]
-        #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) variance: Option<HashBinary>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) epoch_override: Option<SystemTime>,
     }
 
     impl Default for InternalMetaV2 {
@@ -108,6 +110,7 @@ mod internal_meta {
                 stale_while_revalidate_sec: 0,
                 stale_if_error_sec: 0,
                 variance: None,
+                epoch_override: None,
             }
         }
     }
@@ -258,35 +261,75 @@ mod internal_meta {
             assert_eq!(meta2.created, meta2.updated);
         }
 
+        // make sure that v2 format is backward compatible
+        // this is the base version of v2 without any extended fields
+        #[derive(Deserialize, Serialize)]
+        struct InternalMetaV2Base {
+            version: u8,
+            fresh_until: SystemTime,
+            created: SystemTime,
+            updated: SystemTime,
+            stale_while_revalidate_sec: u32,
+            stale_if_error_sec: u32,
+        }
+
+        impl InternalMetaV2Base {
+            pub const VERSION: u8 = 2;
+            pub fn serialize(&self) -> Result<Vec<u8>> {
+                assert!(self.version >= Self::VERSION);
+                rmp_serde::encode::to_vec(self).or_err(InternalError, "failed to encode cache meta")
+            }
+            fn deserialize(buf: &[u8]) -> Result<Self> {
+                rmp_serde::decode::from_slice(buf)
+                    .or_err(InternalError, "failed to decode cache meta v2")
+            }
+        }
+
+        // this is the base version of v2 with variance but without epoch_override
+        #[derive(Deserialize, Serialize)]
+        struct InternalMetaV2BaseWithVariance {
+            version: u8,
+            fresh_until: SystemTime,
+            created: SystemTime,
+            updated: SystemTime,
+            stale_while_revalidate_sec: u32,
+            stale_if_error_sec: u32,
+            #[serde(default)]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            variance: Option<HashBinary>,
+        }
+
+        impl Default for InternalMetaV2BaseWithVariance {
+            fn default() -> Self {
+                let epoch = SystemTime::UNIX_EPOCH;
+                InternalMetaV2BaseWithVariance {
+                    version: InternalMetaV2::VERSION,
+                    fresh_until: epoch,
+                    created: epoch,
+                    updated: epoch,
+                    stale_while_revalidate_sec: 0,
+                    stale_if_error_sec: 0,
+                    variance: None,
+                }
+            }
+        }
+
+        impl InternalMetaV2BaseWithVariance {
+            pub const VERSION: u8 = 2;
+            pub fn serialize(&self) -> Result<Vec<u8>> {
+                assert!(self.version >= Self::VERSION);
+                rmp_serde::encode::to_vec(self).or_err(InternalError, "failed to encode cache meta")
+            }
+            fn deserialize(buf: &[u8]) -> Result<Self> {
+                rmp_serde::decode::from_slice(buf)
+                    .or_err(InternalError, "failed to decode cache meta v2")
+            }
+        }
+
         #[test]
-        fn test_internal_meta_serde_v2_extend_fields() {
-            // make sure that v2 format is backward compatible
-            // this is the base version of v2 without any extended fields
-            #[derive(Deserialize, Serialize)]
-            pub(crate) struct InternalMetaV2Base {
-                pub(crate) version: u8,
-                pub(crate) fresh_until: SystemTime,
-                pub(crate) created: SystemTime,
-                pub(crate) updated: SystemTime,
-                pub(crate) stale_while_revalidate_sec: u32,
-                pub(crate) stale_if_error_sec: u32,
-            }
-
-            impl InternalMetaV2Base {
-                pub const VERSION: u8 = 2;
-                pub fn serialize(&self) -> Result<Vec<u8>> {
-                    assert!(self.version >= Self::VERSION);
-                    rmp_serde::encode::to_vec(self)
-                        .or_err(InternalError, "failed to encode cache meta")
-                }
-                fn deserialize(buf: &[u8]) -> Result<Self> {
-                    rmp_serde::decode::from_slice(buf)
-                        .or_err(InternalError, "failed to decode cache meta v2")
-                }
-            }
-
+        fn test_internal_meta_serde_v2_extend_fields_variance() {
             // ext V2 to base v2
-            let meta = InternalMetaV2::default();
+            let meta = InternalMetaV2BaseWithVariance::default();
             let binary = meta.serialize().unwrap();
             let meta2 = InternalMetaV2Base::deserialize(&binary).unwrap();
             assert_eq!(meta2.version, 2);
@@ -305,11 +348,62 @@ mod internal_meta {
                 stale_if_error_sec: 0,
             };
             let binary = meta.serialize().unwrap();
+            let meta2 = InternalMetaV2BaseWithVariance::deserialize(&binary).unwrap();
+            assert_eq!(meta2.version, 2);
+            assert_eq!(meta.fresh_until, meta2.fresh_until);
+            assert_eq!(meta.created, meta2.created);
+            assert_eq!(meta.updated, meta2.updated);
+        }
+
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_epoch_override() {
+            let now = SystemTime::now();
+
+            // ext V2 (with epoch_override = None) to V2 with variance (without epoch_override field)
+            let meta = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                epoch_override: None, // None means it will be skipped during serialization
+                ..Default::default()
+            };
+            let binary = meta.serialize().unwrap();
+            let meta2 = InternalMetaV2BaseWithVariance::deserialize(&binary).unwrap();
+            assert_eq!(meta2.version, 2);
+            assert_eq!(meta.fresh_until, meta2.fresh_until);
+            assert_eq!(meta.created, meta2.created);
+            assert_eq!(meta.updated, meta2.updated);
+            assert!(meta2.variance.is_none());
+
+            // V2 base with variance (without epoch_override) to ext V2 (with epoch_override)
+            let mut meta = InternalMetaV2BaseWithVariance {
+                version: InternalMetaV2::VERSION,
+                fresh_until: now,
+                created: now,
+                updated: now,
+                stale_while_revalidate_sec: 0,
+                stale_if_error_sec: 0,
+                variance: None,
+            };
+            let binary = meta.serialize().unwrap();
             let meta2 = InternalMetaV2::deserialize(&binary).unwrap();
             assert_eq!(meta2.version, 2);
             assert_eq!(meta.fresh_until, meta2.fresh_until);
             assert_eq!(meta.created, meta2.created);
             assert_eq!(meta.updated, meta2.updated);
+            assert!(meta2.variance.is_none());
+            assert!(meta2.epoch_override.is_none());
+
+            // try with variance set
+            meta.variance = Some(*b"variance_testing");
+            let binary = meta.serialize().unwrap();
+            let meta2 = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(meta2.version, 2);
+            assert_eq!(meta.fresh_until, meta2.fresh_until);
+            assert_eq!(meta.created, meta2.created);
+            assert_eq!(meta.updated, meta2.updated);
+            assert_eq!(meta.variance, meta2.variance);
+            assert!(meta2.epoch_override.is_none());
         }
     }
 }
@@ -364,6 +458,32 @@ impl CacheMeta {
         self.0.internal.updated
     }
 
+    /// The reference point for cache age. This represents the "starting point" for `fresh_until`.
+    ///
+    /// This defaults to the `updated` timestamp but is overridden by the `epoch_override` field
+    /// if set.
+    pub fn epoch(&self) -> SystemTime {
+        self.0.internal.epoch_override.unwrap_or(self.updated())
+    }
+
+    /// Get the epoch override for this asset
+    pub fn epoch_override(&self) -> Option<SystemTime> {
+        self.0.internal.epoch_override
+    }
+
+    /// Set the epoch override for this asset
+    ///
+    /// When set, this will be used as the reference point for calculating age and freshness
+    /// instead of the updated time.
+    pub fn set_epoch_override(&mut self, epoch: SystemTime) {
+        self.0.internal.epoch_override = Some(epoch);
+    }
+
+    /// Remove the epoch override for this asset
+    pub fn remove_epoch_override(&mut self) {
+        self.0.internal.epoch_override = None;
+    }
+
     /// Is the asset still valid
     pub fn is_fresh(&self, time: SystemTime) -> bool {
         // NOTE: HTTP cache time resolution is second
@@ -372,15 +492,17 @@ impl CacheMeta {
 
     /// How long (in seconds) the asset should be fresh since its admission/revalidation
     ///
-    /// This is essentially the max-age value (or its equivalence)
+    /// This is essentially the max-age value (or its equivalence).
+    /// If an epoch override is set, it will be used as the reference point instead of the updated time.
     pub fn fresh_sec(&self) -> u64 {
         // swallow `duration_since` error, assets that are always stale have earlier `fresh_until` than `created`
         // practically speaking we can always treat these as 0 ttl
         // XXX: return Error if `fresh_until` is much earlier than expected?
+        let reference = self.epoch();
         self.0
             .internal
             .fresh_until
-            .duration_since(self.0.internal.updated)
+            .duration_since(reference)
             .map_or(0, |duration| duration.as_secs())
     }
 
@@ -390,9 +512,12 @@ impl CacheMeta {
     }
 
     /// How old the asset is since its admission/revalidation
+    ///
+    /// If an epoch override is set, it will be used as the reference point instead of the updated time.
     pub fn age(&self) -> Duration {
+        let reference = self.epoch();
         SystemTime::now()
-            .duration_since(self.updated())
+            .duration_since(reference)
             .unwrap_or_default()
     }
 
@@ -616,4 +741,94 @@ pub fn set_compression_dict_path(path: &str) -> bool {
 /// a dictionary without an external file.
 pub fn set_compression_dict_content(content: Cow<'static, [u8]>) -> bool {
     COMPRESSION_DICT_CONTENT.set(content).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_cache_meta_age_without_override() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build_no_case(200, None).unwrap();
+        let meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        // Without epoch_override, age() should use updated() as reference
+        std::thread::sleep(Duration::from_millis(100));
+        let age = meta.age();
+        assert!(age.as_secs() < 1, "age should be close to 0");
+
+        // epoch() should return updated() when no override is set
+        assert_eq!(meta.epoch(), meta.updated());
+    }
+
+    #[test]
+    fn test_cache_meta_age_with_epoch_override_past() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        // Set epoch_override to 10 seconds in the past
+        let epoch_override = now - Duration::from_secs(10);
+        meta.set_epoch_override(epoch_override);
+
+        // age() should now use epoch_override as the reference
+        let age = meta.age();
+        assert!(age.as_secs() >= 10);
+        assert!(age.as_secs() < 12);
+
+        // epoch() should return the override
+        assert_eq!(meta.epoch(), epoch_override);
+        assert_eq!(meta.epoch_override(), Some(epoch_override));
+    }
+
+    #[test]
+    fn test_cache_meta_age_with_epoch_override_future() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut meta = CacheMeta::new(now + Duration::from_secs(100), now, 0, 0, header);
+
+        // Set epoch_override to a future time
+        let future_epoch = now + Duration::from_secs(10);
+        meta.set_epoch_override(future_epoch);
+
+        let age_with_epoch = meta.age();
+        // age should be 0 since epoch_override is in the future
+        assert_eq!(age_with_epoch, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_cache_meta_fresh_sec() {
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            SystemTime::now() + Duration::from_secs(100),
+            SystemTime::now() - Duration::from_secs(100),
+            0,
+            0,
+            header,
+        );
+
+        meta.0.internal.updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        meta.0.internal.fresh_until = SystemTime::UNIX_EPOCH + Duration::from_secs(1100);
+
+        // Without epoch_override, fresh_sec should use updated as reference
+        let fresh_sec_without_override = meta.fresh_sec();
+        assert_eq!(fresh_sec_without_override, 100); // 1100 - 1000 = 100 seconds
+
+        // With epoch_override set to a later time (1050), fresh_sec should be calculated from that reference
+        let epoch_override = SystemTime::UNIX_EPOCH + Duration::from_secs(1050);
+        meta.set_epoch_override(epoch_override);
+        assert_eq!(meta.epoch_override(), Some(epoch_override));
+        assert_eq!(meta.epoch(), epoch_override);
+
+        let fresh_sec_with_override = meta.fresh_sec();
+        // fresh_until - epoch_override = 1100 - 1050 = 50 seconds
+        assert_eq!(fresh_sec_with_override, 50);
+
+        meta.remove_epoch_override();
+        assert_eq!(meta.epoch_override(), None);
+        assert_eq!(meta.epoch(), meta.updated());
+        assert_eq!(meta.fresh_sec(), 100); // back to normal calculation
+    }
 }
