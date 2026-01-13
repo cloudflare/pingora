@@ -98,6 +98,11 @@ pub trait Session: Send + Sync + Unpin + 'static {
         &mut self,
     ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>>;
 
+    fn restore_custom_message_reader(
+        &mut self,
+        reader: Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+    ) -> Result<()>;
+
     fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>>;
 
     fn restore_custom_message_writer(&mut self, writer: Box<dyn CustomMessageWrite>) -> Result<()>;
@@ -249,6 +254,13 @@ impl Session for () {
     fn take_custom_message_reader(
         &mut self,
     ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+        unreachable!("server session: get_custom_message_reader")
+    }
+
+    fn restore_custom_message_reader(
+        &mut self,
+        _reader: Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+    ) -> Result<()> {
         unreachable!("server session: get_custom_message_reader")
     }
 
