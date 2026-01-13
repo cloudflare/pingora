@@ -125,7 +125,7 @@ where
 
         // Custom message logic
 
-        let Some(upstream_custom_message_reader) = client_session.take_custom_message_reader()
+        let Some(mut upstream_custom_message_reader) = client_session.take_custom_message_reader()
         else {
             return (
                 false,
@@ -152,7 +152,7 @@ where
             mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
 
         // Downstream reader
-        let downstream_custom_message_reader = match session.downstream_custom_message() {
+        let mut downstream_custom_message_reader = match session.downstream_custom_message() {
             Ok(Some(rx)) => rx,
             Ok(None) => Box::new(futures::stream::empty::<Result<Bytes>>()),
             Err(err) => return (false, Some(err)),
@@ -193,7 +193,7 @@ where
 
         let upstream_custom_message_forwarder = CustomMessageForwarder {
             ctx: "down_to_up".into(),
-            reader: downstream_custom_message_reader,
+            reader: &mut downstream_custom_message_reader,
             writer: &mut upstream_custom_message_writer,
             filter: upstream_custom_message_filter_tx,
             inject: upstream_custom_message_inject_rx,
@@ -202,7 +202,7 @@ where
 
         let downstream_custom_message_forwarder = CustomMessageForwarder {
             ctx: "up_to_down".into(),
-            reader: upstream_custom_message_reader,
+            reader: &mut upstream_custom_message_reader,
             writer: &mut downstream_custom_message_writer,
             filter: downstream_custom_message_filter_tx,
             inject: downstream_custom_message_inject_rx,
@@ -243,6 +243,10 @@ where
             custom_session
                 .restore_custom_message_writer(downstream_custom_message_writer)
                 .expect("downstream restore_custom_message_writer should be empty");
+
+            custom_session
+                .restore_custom_message_reader(downstream_custom_message_reader)
+                .expect("downstream restore_custom_message_reader should be empty");
         }
 
         match ret {
@@ -795,7 +799,8 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
 struct CustomMessageForwarder<'a> {
     ctx: ImmutStr,
     writer: &'a mut Box<dyn CustomMessageWrite>,
-    reader: Box<dyn futures::Stream<Item = Result<Bytes, Box<Error>>> + Send + Sync + Unpin>,
+    reader:
+        &'a mut Box<dyn futures::Stream<Item = Result<Bytes, Box<Error>>> + Send + Sync + Unpin>,
     inject: mpsc::Receiver<Bytes>,
     filter: mpsc::Sender<(Bytes, oneshot::Sender<Option<Bytes>>)>,
     cancel: oneshot::Receiver<()>,
