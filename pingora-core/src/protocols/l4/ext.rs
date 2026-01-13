@@ -146,6 +146,8 @@ fn get_opt<T>(
     }
 }
 
+// allow_smaller: exact size checks reject older kernels that return shorter, versioned structs;
+// allowing smaller means the tail stays zeroed and those fields may be “absent,” not real zeros.
 #[cfg(target_os = "linux")]
 fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int, allow_smaller: bool) -> io::Result<T> {
     let mut payload = mem::MaybeUninit::zeroed();
@@ -153,7 +155,7 @@ fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int, allow_smaller: bool) ->
     let mut size = expected_size;
     get_opt(sock, opt, val, &mut payload, &mut size)?;
 
-    if (!allow_smaller && size != expected_size) || (allow_smaller && size > expected_size) {
+    if size > expected_size || (!allow_smaller && size != expected_size) {
         return Err(std::io::Error::other("get_opt size mismatch"));
     }
     // Assume getsockopt() will set the value properly
@@ -272,8 +274,7 @@ fn set_keepalive(_sock: RawSocket, _ka: &TcpKeepalive) -> io::Result<()> {
 /// Get the kernel TCP_INFO for the given FD.
 #[cfg(target_os = "linux")]
 pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
-    let allow_smaller = true;
-    get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO, allow_smaller)
+    get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO, true)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -305,8 +306,7 @@ pub fn set_recv_buf(_sock: RawSocket, _: usize) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
-    let allow_smaller = false;
-    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, allow_smaller).map(|v| v as usize)
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, false).map(|v| v as usize)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -321,8 +321,7 @@ pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
 
 #[cfg(target_os = "linux")]
 pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
-    let allow_smaller = false;
-    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, allow_smaller).map(|v| v as usize)
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, false).map(|v| v as usize)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -406,8 +405,7 @@ pub fn set_dscp(_sock: RawSocket, _value: u8) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub fn get_socket_cookie(fd: RawFd) -> io::Result<u64> {
-    let allow_smaller = false;
-    get_opt_sized::<c_ulonglong>(fd, libc::SOL_SOCKET, libc::SO_COOKIE, allow_smaller)
+    get_opt_sized::<c_ulonglong>(fd, libc::SOL_SOCKET, libc::SO_COOKIE, false)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -427,16 +425,15 @@ pub fn get_original_dest(fd: RawFd) -> Result<Option<SocketAddr>> {
         .and_then(|s| s.as_inet())
         .or_err(SocketError, "failed get original dest, invalid IP socket")?;
 
-    let allow_smaller = false;
     let dest = if addr.is_ipv4() {
-        get_opt_sized::<libc::sockaddr_in>(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST, allow_smaller).map(|addr| {
+        get_opt_sized::<libc::sockaddr_in>(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST, false).map(|addr| {
             SocketAddr::V4(SocketAddrV4::new(
                 u32::from_be(addr.sin_addr.s_addr).into(),
                 u16::from_be(addr.sin_port),
             ))
         })
     } else {
-        get_opt_sized::<libc::sockaddr_in6>(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST, allow_smaller).map(
+        get_opt_sized::<libc::sockaddr_in6>(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST, false).map(
             |addr| {
                 SocketAddr::V6(SocketAddrV6::new(
                     addr.sin6_addr.s6_addr.into(),
