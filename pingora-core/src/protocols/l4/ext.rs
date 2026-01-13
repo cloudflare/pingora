@@ -426,23 +426,24 @@ pub fn get_original_dest(fd: RawFd) -> Result<Option<SocketAddr>> {
         .or_err(SocketError, "failed get original dest, invalid IP socket")?;
 
     let dest = if addr.is_ipv4() {
-        get_opt_sized::<libc::sockaddr_in>(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST, false).map(|addr| {
-            SocketAddr::V4(SocketAddrV4::new(
-                u32::from_be(addr.sin_addr.s_addr).into(),
-                u16::from_be(addr.sin_port),
-            ))
-        })
-    } else {
-        get_opt_sized::<libc::sockaddr_in6>(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST, false).map(
+        get_opt_sized::<libc::sockaddr_in>(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST, false).map(
             |addr| {
+                SocketAddr::V4(SocketAddrV4::new(
+                    u32::from_be(addr.sin_addr.s_addr).into(),
+                    u16::from_be(addr.sin_port),
+                ))
+            },
+        )
+    } else {
+        get_opt_sized::<libc::sockaddr_in6>(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST, false)
+            .map(|addr| {
                 SocketAddr::V6(SocketAddrV6::new(
                     addr.sin6_addr.s6_addr.into(),
                     u16::from_be(addr.sin6_port),
                     addr.sin6_flowinfo,
                     addr.sin6_scope_id,
                 ))
-            },
-        )
+            })
     };
     dest.or_err(SocketError, "failed to get original dest")
         .map(Some)
