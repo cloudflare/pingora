@@ -40,7 +40,7 @@ http = "1"
 log = "0.4"
 h2 = ">=0.4.11"
 once_cell = "1"
-lru = "0.14"
+lru = "0.16.3"
 ahash = ">=0.8.9"
 
 [profile.bench]
