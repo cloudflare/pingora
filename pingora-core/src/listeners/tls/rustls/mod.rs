@@ -20,6 +20,7 @@ use log::debug;
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
 use pingora_rustls::load_certs_and_key_files;
+use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -30,6 +31,7 @@ pub struct TlsSettings {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
     key_path: String,
+    client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
 }
 
 pub struct Acceptor {
@@ -54,15 +56,19 @@ impl TlsSettings {
             )
         };
 
-        // TODO - Add support for client auth & custom CA support
-        let mut config =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .explain_err(InternalError, |e| {
-                    format!("Failed to create server listener config: {e}")
-                })
-                .unwrap();
+        let builder =
+            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+        let builder = if let Some(verifier) = self.client_cert_verifier {
+            builder.with_client_cert_verifier(verifier)
+        } else {
+            builder.with_no_client_auth()
+        };
+        let mut config = builder
+            .with_single_cert(certs, key)
+            .explain_err(InternalError, |e| {
+                format!("Failed to create server listener config: {e}")
+            })
+            .unwrap();
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -84,6 +90,11 @@ impl TlsSettings {
         self.alpn_protocols = Some(alpn.to_wire_protocols());
     }
 
+    /// Configure mTLS by providing a rustls client certificate verifier.
+    pub fn set_client_cert_verifier(&mut self, verifier: Arc<dyn ClientCertVerifier>) {
+        self.client_cert_verifier = Some(verifier);
+    }
+
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
@@ -92,6 +103,7 @@ impl TlsSettings {
             alpn_protocols: None,
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
+            client_cert_verifier: None,
         })
     }
 
