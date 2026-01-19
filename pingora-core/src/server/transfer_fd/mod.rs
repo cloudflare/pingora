@@ -209,7 +209,7 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
                 }
                 match e {
                     Errno::EAGAIN => {
-                        error!(
+                        warn!(
                             "No incoming socket transfer, sleep {RETRY_INTERVAL:?} and try again"
                         );
                         retried += 1;
