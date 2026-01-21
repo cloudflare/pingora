@@ -25,7 +25,7 @@
 
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;
@@ -113,6 +113,7 @@ pub struct NoStealRuntime {
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
     controls: OnceCell<Vec<Control>>,
+    init_lock: Mutex<()>,
 }
 
 impl NoStealRuntime {
@@ -124,6 +125,7 @@ impl NoStealRuntime {
             name: name.to_string(),
             pools: Arc::new(OnceCell::new()),
             controls: OnceCell::new(),
+            init_lock: Mutex::new(()),
         }
     }
 
@@ -168,18 +170,16 @@ impl NoStealRuntime {
         if let Some(p) = self.pools.get() {
             p
         } else {
-            // TODO: use a mutex to avoid creating a lot threads only to drop them
-            let (pools, controls) = self.init_pools();
-            // there could be another thread racing with this one to init the pools
-            match self.pools.try_insert(pools) {
-                Ok(p) => {
-                    // unwrap to make sure that this is the one that init both pools and controls
-                    self.controls.set(controls).unwrap();
-                    p
-                }
-                // another thread already set it, just return it
-                Err((p, _my_pools)) => p,
+            let _guard = self.init_lock.lock().unwrap();
+            // Double check: may have been initialized while waiting for the lock
+            if let Some(p) = self.pools.get() {
+                return p;
             }
+            let (pools, controls) = self.init_pools();
+            // Safe to set since we're protected by the mutex
+            self.pools.set(pools).unwrap();
+            self.controls.set(controls).unwrap();
+            self.pools.get().unwrap()
         }
     }
 
