@@ -312,7 +312,8 @@ impl HttpSession {
                                 }
                             }
                         } else {
-                            // safe because this is from what we parsed
+                            // `from_maybe_shared_unchecked` function is safe,
+                            // but marked unsafe: https://github.com/hyperium/http/pull/419
                             unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
                         };
                         response_header

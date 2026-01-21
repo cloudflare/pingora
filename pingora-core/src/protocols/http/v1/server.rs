@@ -240,7 +240,8 @@ impl HttpSession {
                             let header_name = header.get_name_bytes(&buf);
                             let header_name = header_name.into_case_header_name();
                             let value_bytes = header.get_value_bytes(&buf);
-                            // safe because this is from what we parsed
+                            // `from_maybe_shared_unchecked` function is safe,
+                            // but marked unsafe: https://github.com/hyperium/http/pull/419
                             let header_value = unsafe {
                                 http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
                             };
