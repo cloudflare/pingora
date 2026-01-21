@@ -150,6 +150,8 @@ where
         #[cfg(unix)]
         let raw = client_session.id();
 
+        let initial_write_pending = client_session.stream().get_write_pending_time();
+
         if let Err(e) = self
             .inner
             .connected_to_upstream(
@@ -171,6 +173,11 @@ where
         // Record upstream response body bytes received (payload only) for logging consumers.
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
+
+        // Record upstream write pending time for this session only (delta from baseline).
+        let current_write_pending = client_session.stream().get_write_pending_time();
+        let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);
+        session.set_upstream_write_pending_time(upstream_write_pending);
 
         (server_session_reuse, client_session_reuse, error)
     }

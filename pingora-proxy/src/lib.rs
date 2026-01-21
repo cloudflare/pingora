@@ -435,6 +435,8 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
+    upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -456,6 +458,7 @@ impl Session {
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
         }
     }
@@ -615,6 +618,16 @@ impl Session {
     /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
         self.upstream_body_bytes_received = n;
+    }
+
+    /// Get the upstream write pending time recorded by the proxy layer. Returns [`Duration::ZERO`] for HTTP/2.
+    pub fn upstream_write_pending_time(&self) -> Duration {
+        self.upstream_write_pending_time
+    }
+
+    /// Set the upstream write pending time. Intended for internal use by proxy layer.
+    pub(crate) fn set_upstream_write_pending_time(&mut self, d: Duration) {
+        self.upstream_write_pending_time = d;
     }
 
     /// Is the proxy process in the process of shutting down (e.g. due to graceful upgrade)?
