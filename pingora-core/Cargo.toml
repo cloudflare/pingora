@@ -49,18 +49,18 @@ libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
 prometheus = "0.13"
 sentry = { version = "0.36", features = [
-    "backtrace",
-    "contexts",
-    "panic",
-    "reqwest",
-    "rustls",
+  "backtrace",
+  "contexts",
+  "panic",
+  "reqwest",
+  "rustls",
 ], default-features = false, optional = true }
 regex = "1"
 percent-encoding = "2.1"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 socket2 = { version = ">=0.4, <1.0.0", features = ["all"] }
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
-sfv = "0.10.4"
+sfv = "0.11.0"
 rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
@@ -85,7 +85,7 @@ h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
 reqwest = { version = "0.11", features = [
-    "rustls-tls",
+  "rustls-tls",
 ], default-features = false }
 hyper = "0.14"
 rstest = "0.23.0"
