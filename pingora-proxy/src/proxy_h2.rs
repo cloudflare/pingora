@@ -249,6 +249,8 @@ where
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
+        // Note: upstream_write_pending_time is not tracked for HTTP/2 (multiplexed streams).
+
         (server_session_reuse, error)
     }
 
