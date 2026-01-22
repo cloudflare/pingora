@@ -445,8 +445,11 @@ impl Stream {
         Ok(())
     }
 
-    /// Put Some data back to the head of the stream to be read again
-    pub(crate) fn rewind(&mut self, data: &[u8]) {
+    /// Put some data back to the head of the stream to be read again.
+    ///
+    /// This is useful when you've read data to detect a protocol (e.g., PROXY protocol)
+    /// but the data wasn't what you expected, so you need to "unread" it.
+    pub fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
             self.rewind_read_buf.push(data.to_vec());
         }
