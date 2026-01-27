@@ -472,6 +472,18 @@ impl HttpSession {
             self.set_keepalive(None);
             return;
         }
+
+        // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
+        // if Transfer-Encoding is received in HTTP/1.0 response, connection MUST be closed after processing.
+        if self.resp_header().map(|h| h.version) == Some(Version::HTTP_10)
+            && self
+                .resp_header()
+                .and_then(|h| h.headers.get(header::TRANSFER_ENCODING))
+                .is_some()
+        {
+            self.set_keepalive(None);
+            return;
+        }
         if let Some(keepalive) = self.is_connection_keepalive() {
             if keepalive {
                 let (timeout, _max_use) = self.get_keepalive_values();
@@ -649,7 +661,9 @@ impl HttpSession {
     }
 
     fn is_chunked_encoding(&self) -> bool {
-        is_header_value_chunked_encoding(self.get_header(header::TRANSFER_ENCODING))
+        self.resp_header()
+            .map(|h| is_chunked_encoding_from_headers(&h.headers))
+            .unwrap_or(false)
     }
 
     fn init_req_body_writer(&mut self, header: &RequestHeader) {
@@ -657,8 +671,7 @@ impl HttpSession {
     }
 
     fn init_body_writer_comm(&mut self, headers: &HMap) {
-        let te_value = headers.get(http::header::TRANSFER_ENCODING);
-        if is_header_value_chunked_encoding(te_value) {
+        if is_chunked_encoding_from_headers(headers) {
             // transfer-encoding takes priority over content-length
             self.body_writer.init_chunked();
         } else {
@@ -1756,6 +1769,101 @@ mod tests_stream {
     }
 
     /* Note: body tests are covered in server.rs */
+
+    #[tokio::test]
+    async fn test_http10_response_with_transfer_encoding_disables_keepalive() {
+        // Transfer-Encoding in HTTP/1.0 response requires connection close
+        let input = b"HTTP/1.0 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: keep-alive\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+
+        // Keepalive must be disabled even if Connection: keep-alive header present
+        assert!(!http_stream.will_keepalive());
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
+    }
+
+    #[tokio::test]
+    async fn test_http11_response_with_transfer_encoding_allows_keepalive() {
+        // HTTP/1.1 with Transfer-Encoding should allow keepalive (contrast with HTTP/1.0)
+        let input = b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+
+        // HTTP/1.1 should allow keepalive by default
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn test_response_multiple_transfer_encoding_headers() {
+        init_log();
+        // Multiple TE headers should be treated as comma-separated
+        let input = b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: gzip\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+
+        // Should correctly identify chunked encoding from last header
+        assert!(http_stream.is_chunked_encoding());
+
+        // Verify body can be read correctly
+        let body = http_stream.read_body_bytes().await.unwrap();
+        assert_eq!(body.as_ref().unwrap().as_ref(), b"hello");
+        http_stream.finish_body().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_response_multiple_te_headers_chunked_not_last() {
+        init_log();
+        // Chunked in first header but not last - should NOT be chunked
+        let input = b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+Transfer-Encoding: identity\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+
+        // Should NOT be chunked - identity is final encoding
+        assert!(!http_stream.is_chunked_encoding());
+    }
+
+    #[test]
+    fn test_is_chunked_encoding_before_response() {
+        // Test that is_chunked_encoding returns false when no response received yet
+        let mock_io = Builder::new().build();
+        let http_stream = HttpSession::new(Box::new(mock_io));
+
+        // Should return false when no response header exists yet
+        assert!(!http_stream.is_chunked_encoding());
+    }
 }
 
 #[cfg(test)]
