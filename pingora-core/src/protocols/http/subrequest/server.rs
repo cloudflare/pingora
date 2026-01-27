@@ -47,7 +47,7 @@ use crate::protocols::http::{
     body_buffer::FixedBuffer,
     server::Session as GenericHttpSession,
     subrequest::dummy::DummyIO,
-    v1::common::{header_value_content_length, is_header_value_chunked_encoding, BODY_BUF_LIMIT},
+    v1::common::{header_value_content_length, is_chunked_encoding_from_headers, BODY_BUF_LIMIT},
     v1::server::HttpSession as SessionV1,
     HttpTask,
 };
@@ -408,23 +408,20 @@ impl HttpSession {
 
         if self.is_upgrade(header) == Some(true) {
             self.body_writer.init_until_close();
+        } else if is_chunked_encoding_from_headers(&header.headers) {
+            // transfer-encoding takes priority over content-length
+            self.body_writer.init_until_close();
         } else {
-            let te_value = header.headers.get(http::header::TRANSFER_ENCODING);
-            if is_header_value_chunked_encoding(te_value) {
-                // transfer-encoding takes priority over content-length
-                self.body_writer.init_until_close();
-            } else {
-                let content_length =
-                    header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH));
-                match content_length {
-                    Some(length) => {
-                        self.body_writer.init_content_length(length);
-                    }
-                    None => {
-                        /* TODO: 1. connection: keepalive cannot be used,
-                        2. mark connection must be closed */
-                        self.body_writer.init_until_close();
-                    }
+            let content_length =
+                header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH));
+            match content_length {
+                Some(length) => {
+                    self.body_writer.init_content_length(length);
+                }
+                None => {
+                    /* TODO: 1. connection: keepalive cannot be used,
+                    2. mark connection must be closed */
+                    self.body_writer.init_until_close();
                 }
             }
         }
@@ -508,7 +505,7 @@ impl HttpSession {
     }
 
     fn is_chunked_encoding(&self) -> bool {
-        is_header_value_chunked_encoding(self.get_header(header::TRANSFER_ENCODING))
+        is_chunked_encoding_from_headers(&self.req_header().headers)
     }
 
     /// Clear body-related subrequest headers.

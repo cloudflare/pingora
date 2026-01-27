@@ -258,7 +258,12 @@ impl HttpSession {
                         // Transfer encoding overrides content length, so when
                         // both are present, we can remove content length. This
                         // is per https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
-                        if contains_content_length && contains_transfer_encoding {
+                        //
+                        // RFC 9112 Section 6.1 (https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-15)
+                        // also requires us to disable keepalive when both headers are present.
+                        let has_both_te_and_cl =
+                            contains_content_length && contains_transfer_encoding;
+                        if has_both_te_and_cl {
                             request_header.remove_header(&CONTENT_LENGTH);
                         }
 
@@ -268,6 +273,11 @@ impl HttpSession {
                         self.body_reader.reinit();
                         self.response_written = None;
                         self.respect_keepalive();
+
+                        // Disable keepalive if both Transfer-Encoding and Content-Length were present
+                        if has_both_te_and_cl {
+                            self.set_keepalive(None);
+                        }
                         self.validate_request()?;
 
                         return Ok(Some(s));
@@ -315,6 +325,18 @@ impl HttpSession {
 
         // ad-hoc checks
         super::common::check_dup_content_length(&req_header.headers)?;
+
+        // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
+        // HTTP/1.0 requests with Transfer-Encoding MUST be treated as having faulty framing.
+        // We reject with 400 Bad Request and close the connection.
+        if req_header.version == http::Version::HTTP_10
+            && req_header.headers.contains_key(TRANSFER_ENCODING)
+        {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "HTTP/1.0 requests cannot include Transfer-Encoding header",
+            );
+        }
 
         Ok(())
     }
@@ -800,7 +822,7 @@ impl HttpSession {
     }
 
     fn is_chunked_encoding(&self) -> bool {
-        is_header_value_chunked_encoding(self.get_header(header::TRANSFER_ENCODING))
+        is_chunked_encoding_from_headers(&self.req_header().headers)
     }
 
     fn get_content_length(&self) -> Option<usize> {
@@ -2360,6 +2382,145 @@ mod tests_stream {
 
         http_stream.set_min_send_rate(Some(1));
         assert_eq!(Some(expected), http_stream.write_timeout(0));
+    }
+
+    #[tokio::test]
+    async fn test_te_and_cl_disables_keepalive() {
+        // When both Transfer-Encoding and Content-Length are present,
+        // we must disable keepalive per RFC 9112 Section 6.1
+        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-15
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+Content-Length: 10\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Keepalive should be disabled
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
+
+        // Content-Length header should have been removed
+        assert!(!http_stream
+            .req_header()
+            .headers
+            .contains_key(CONTENT_LENGTH));
+
+        // Transfer-Encoding should still be present
+        assert!(http_stream
+            .req_header()
+            .headers
+            .contains_key(TRANSFER_ENCODING));
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_with_transfer_encoding_rejected() {
+        // HTTP/1.0 requests MUST NOT contain Transfer-Encoding
+        let input = b"POST / HTTP/1.0\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should be rejected with InvalidHTTPHeader error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(err.to_string().contains("Transfer-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_without_transfer_encoding_accepted() {
+        // HTTP/1.0 requests without Transfer-Encoding should be accepted
+        let input = b"POST / HTTP/1.0\r\n\
+Host: pingora.org\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(http_stream.req_header().version, http::Version::HTTP_10);
+    }
+
+    #[tokio::test]
+    async fn test_http11_request_with_transfer_encoding_accepted() {
+        // HTTP/1.1 with Transfer-Encoding should be accepted (contrast with HTTP/1.0)
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(http_stream.req_header().version, http::Version::HTTP_11);
+    }
+
+    #[tokio::test]
+    async fn test_request_multiple_transfer_encoding_headers() {
+        init_log();
+        // Multiple TE headers should be treated as comma-separated
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: gzip\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Should correctly identify chunked encoding from last header
+        assert!(http_stream.is_chunked_encoding());
+
+        // Verify body can be read correctly
+        let body = http_stream.read_body_bytes().await.unwrap();
+        assert_eq!(body.unwrap().as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_request_multiple_te_headers_chunked_not_last() {
+        init_log();
+        // Chunked in first header but not last - should NOT be chunked
+        // Only the final Transfer-Encoding determines if body is chunked
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+Transfer-Encoding: identity\r\n\
+Content-Length: 5\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Should NOT be chunked - identity is final encoding
+        assert!(!http_stream.is_chunked_encoding());
     }
 }
 
