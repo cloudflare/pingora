@@ -1048,7 +1048,17 @@ impl HttpSession {
             }
             _ => {
                 self.drain_request_body().await?;
-                Ok(Some(self.underlying_stream))
+                // XXX: currently pipelined requests are not properly read without
+                // pipelining support, and pingora 400s if pipelined requests are sent
+                // in the middle of another request.
+                // We will mark the connection as un-reusable so it may be closed,
+                // the pipelined request left unread, and the client can attempt to resend
+                if self.body_reader.has_bytes_overread() {
+                    debug!("bytes overread on request, disallowing reuse");
+                    Ok(None)
+                } else {
+                    Ok(Some(self.underlying_stream))
+                }
             }
         }
     }
@@ -2466,5 +2476,113 @@ mod test_timeouts {
         let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+    }
+}
+
+#[cfg(test)]
+mod test_overread {
+    use super::*;
+    use rstest::rstest;
+    use tokio_test::io::Builder;
+
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    /// Test session reuse with preread body (all data in single read).
+    /// When extra bytes are read beyond the request body, the session should NOT be reused.
+    /// Test matrix includes whether reading body bytes is polled.
+    #[rstest]
+    #[case(0, None, true, true)] // CL:0, no extra, read body -> should reuse
+    #[case(0, None, false, true)] // CL:0, no extra, no read -> should reuse
+    #[case(0, Some(&b"extra_data_here"[..]), true, false)] // CL:0, extra, read body -> should NOT reuse
+    #[case(0, Some(&b"extra_data_here"[..]), false, false)] // CL:0, extra, no read -> should NOT reuse
+    #[case(5, None, true, true)] // CL:5, no extra, read body -> should reuse
+    #[case(5, None, false, true)] // CL:5, no extra, no read -> should reuse
+    #[case(5, Some(&b"extra"[..]), true, false)] // CL:5, extra, read body -> should NOT reuse
+    #[case(5, Some(&b"extra"[..]), false, false)] // CL:5, extra, no read -> should NOT reuse
+    #[tokio::test]
+    async fn test_reuse_with_preread_body_overread(
+        #[case] content_length: usize,
+        #[case] extra_bytes: Option<&[u8]>,
+        #[case] read_body: bool,
+        #[case] expect_reuse: bool,
+    ) {
+        init_log();
+
+        let body = b"hello";
+
+        // Build the complete HTTP request in a single buffer
+        // (all body is preread with header)
+        let mut request_data = Vec::new();
+        request_data.extend_from_slice(b"GET / HTTP/1.1\r\n");
+        request_data.extend_from_slice(
+            format!("Host: pingora.org\r\nContent-Length: {content_length}\r\n\r\n",).as_bytes(),
+        );
+
+        if content_length > 0 {
+            request_data.extend_from_slice(&body[..content_length]);
+        }
+
+        if let Some(extra) = extra_bytes {
+            request_data.extend_from_slice(extra);
+        }
+
+        let mock_io = Builder::new().read(&request_data).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Conditionally read the body
+        if read_body {
+            let result = http_stream.read_body_bytes().await.unwrap();
+
+            if content_length == 0 {
+                assert!(
+                    result.is_none(),
+                    "Body should be empty for Content-Length: 0"
+                );
+            } else {
+                let body_result = result.unwrap();
+                assert_eq!(body_result.as_ref(), &body[..content_length]);
+            }
+            assert_eq!(http_stream.body_bytes_read(), content_length);
+        }
+
+        let reused = http_stream.reuse().await.unwrap();
+        assert_eq!(reused.is_some(), expect_reuse);
+    }
+
+    /// Test session reuse with chunked encoding and separate reads.
+    /// When extra bytes are read beyond the request body, the session should NOT be reused.
+    /// Test matrix includes whether reading body bytes is polled.
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn test_reuse_with_chunked_body_overread(#[case] read_body: bool) {
+        init_log();
+
+        let headers = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let body_and_extra = b"5\r\nhello\r\n0\r\n\r\nextra";
+
+        let mock_io = Builder::new().read(headers).read(body_and_extra).build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_chunked_encoding());
+
+        if read_body {
+            let result = http_stream.read_body_bytes().await.unwrap();
+            assert_eq!(result.unwrap().as_ref(), b"hello");
+
+            // Read terminating chunk (returns None)
+            let result = http_stream.read_body_bytes().await.unwrap();
+            assert!(result.is_none());
+
+            assert_eq!(http_stream.body_bytes_read(), 5);
+        }
+
+        let reused = http_stream.reuse().await.unwrap();
+        assert!(reused.is_none());
     }
 }
