@@ -194,7 +194,15 @@ impl BodyReader {
 
     pub fn init_content_length(&mut self, cl: usize, buf_to_rewind: &[u8]) {
         match cl {
-            0 => self.body_state = PS::Complete(0),
+            0 => {
+                self.body_state = PS::Complete(0);
+                // Store any extra bytes that were read as overread
+                if !buf_to_rewind.is_empty() {
+                    let mut overread = BytesMut::with_capacity(buf_to_rewind.len());
+                    overread.put_slice(buf_to_rewind);
+                    self.body_buf_overread = Some(overread);
+                }
+            }
             _ => {
                 self.prepare_buf(buf_to_rewind);
                 self.body_state = PS::Partial(0, cl);
