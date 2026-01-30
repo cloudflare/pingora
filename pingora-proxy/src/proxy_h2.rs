@@ -360,6 +360,9 @@ where
                                     e,
                                     self.inner.request_summary(session, ctx)
                                 );
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
                                 continue;
                            } else {
                                 return Err(e.into_down());
@@ -462,6 +465,9 @@ where
                                 e,
                                 self.inner.request_summary(session, ctx)
                             );
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session regardless
+                            session.downstream_session.on_proxy_failure(e);
                             continue;
                         } else {
                             return Err(e);

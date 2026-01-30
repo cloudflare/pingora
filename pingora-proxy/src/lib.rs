@@ -63,6 +63,7 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
+use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
@@ -378,13 +379,19 @@ where
         mut session: Session,
         ctx: &mut SV::CTX,
         reuse: bool,
-        error: Option<&Error>,
+        error: Option<Box<Error>>,
     ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        self.inner.logging(&mut session, error, ctx).await;
+        self.inner
+            .logging(&mut session, error.as_deref(), ctx)
+            .await;
+
+        if let Some(e) = error {
+            session.downstream_session.on_proxy_failure(e);
+        }
 
         if reuse {
             // TODO: log error
@@ -765,7 +772,7 @@ where
 
         if let Some((reuse, err)) = self.proxy_cache(&mut session, &mut ctx).await {
             // cache hit
-            return self.finish(session, &mut ctx, reuse, err.as_deref()).await;
+            return self.finish(session, &mut ctx, reuse, err).await;
         }
         // either uncacheable, or cache miss
 
@@ -901,7 +908,7 @@ where
         }
 
         // logging() will be called in finish()
-        self.finish(session, &mut ctx, server_reuse, final_error.as_deref())
+        self.finish(session, &mut ctx, server_reuse, final_error)
             .await
     }
 
@@ -927,6 +934,8 @@ where
         }
         self.inner.logging(&mut session, Some(&e), ctx).await;
         self.cleanup_sub_req(&mut session);
+
+        session.downstream_session.on_proxy_failure(e);
 
         if res.can_reuse_downstream {
             let persistent_settings = HttpPersistentSettings::for_session(&session);
@@ -1001,6 +1010,29 @@ pub struct SubrequestSpawner {
     app: Arc<dyn Subrequest + Send + Sync>,
 }
 
+/// A [`PreparedSubrequest`] that is ready to run.
+pub struct PreparedSubrequest {
+    app: Arc<dyn Subrequest + Send + Sync>,
+    session: Box<HttpSession>,
+    sub_req_ctx: Box<SubrequestCtx>,
+}
+
+impl PreparedSubrequest {
+    pub async fn run(self) {
+        self.app
+            .process_subrequest(self.session, self.sub_req_ctx)
+            .await
+    }
+
+    pub fn session(&self) -> &HttpSession {
+        self.session.as_ref()
+    }
+
+    pub fn session_mut(&mut self) -> &mut HttpSession {
+        self.session.deref_mut()
+    }
+}
+
 impl SubrequestSpawner {
     /// Create a new [`SubrequestSpawner`].
     pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
@@ -1029,6 +1061,35 @@ impl SubrequestSpawner {
                 .process_subrequest(Box::new(session), sub_req_ctx)
                 .await;
         })
+    }
+
+    /// Create a subrequest that listens to `HttpTask`s sent from the returned `Sender`
+    /// and sends `HttpTask`s to the returned `Receiver`.
+    ///
+    /// To run that subrequest, call `run()`.
+    // TODO: allow configuring the subrequest session before use
+    pub fn create_subrequest(
+        &self,
+        session: &HttpSession,
+        ctx: SubrequestCtx,
+    ) -> (PreparedSubrequest, SubrequestHandle) {
+        let new_app = self.app.clone(); // Clone the Arc
+        let (mut session, handle) = subrequest::create_session(session);
+        if ctx.body_mode() == BodyMode::NoBody {
+            session
+                .as_subrequest_mut()
+                .expect("created subrequest session")
+                .clear_request_body_headers();
+        }
+        let sub_req_ctx = Box::new(ctx);
+        (
+            PreparedSubrequest {
+                app: new_app,
+                session: Box::new(session),
+                sub_req_ctx,
+            },
+            handle,
+        )
     }
 }
 
