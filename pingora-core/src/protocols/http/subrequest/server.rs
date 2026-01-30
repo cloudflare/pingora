@@ -61,6 +61,7 @@ pub struct HttpSession {
     // Currently subrequest session is initialized via a dummy SessionV1 only
     // TODO: need to be able to indicate H2 / other HTTP versions here
     v1_inner: Box<SessionV1>,
+    proxy_error: Option<oneshot::Sender<Box<Error>>>, // option to consume the sender
     read_req_header: bool,
     response_written: Option<ResponseHeader>,
     read_timeout: Option<Duration>,
@@ -84,8 +85,9 @@ pub struct SubrequestHandle {
     /// Channel receiver (for subrequest output)
     pub rx: mpsc::Receiver<HttpTask>,
     /// Indicates when subrequest wants to start reading body input
-    // TODO: use when piping subrequest input/output
     pub subreq_wants_body: oneshot::Receiver<()>,
+    /// Any final or downstream error that was encountered while proxying
+    pub subreq_proxy_error: oneshot::Receiver<Box<Error>>,
 }
 
 impl SubrequestHandle {
@@ -111,11 +113,13 @@ impl HttpSession {
         let (downstream_tx, downstream_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let (upstream_tx, upstream_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let (wants_body_tx, wants_body_rx) = oneshot::channel();
+        let (proxy_error_tx, proxy_error_rx) = oneshot::channel();
         (
             HttpSession {
                 v1_inner: Box::new(v1_inner),
                 tx: Some(upstream_tx),
                 rx: Some(downstream_rx),
+                proxy_error: Some(proxy_error_tx),
                 body_reader: BodyReader::new(Some(wants_body_tx)),
                 body_writer: BodyWriter::new(),
                 read_req_header: false,
@@ -134,6 +138,7 @@ impl HttpSession {
                 tx: downstream_tx,
                 rx: upstream_rx,
                 subreq_wants_body: wants_body_rx,
+                subreq_proxy_error: proxy_error_rx,
             },
         )
     }
@@ -475,6 +480,21 @@ impl HttpSession {
 
         self.maybe_force_close_body_reader();
         Ok(res)
+    }
+
+    /// Signal to error listener held by SubrequestHandle that a proxy error was encountered,
+    /// and pass along what that error was.
+    ///
+    /// This is helpful to signal what errors were encountered outside of the proxy state machine,
+    /// e.g. during subrequest request filters.
+    ///
+    /// Note: in the case of multiple proxy failures e.g. when caching, only the first error will
+    /// be propagated (i.e. downstream error first if it goes away before upstream).
+    pub fn on_proxy_failure(&mut self, e: Box<Error>) {
+        // fine if handle is gone
+        if let Some(sender) = self.proxy_error.take() {
+            let _ = sender.send(e);
+        }
     }
 
     /// Return how many response body bytes (application, not wire) already sent downstream
