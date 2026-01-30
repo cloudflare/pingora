@@ -333,6 +333,8 @@ pub enum Algorithm {
     Gzip,
     Brotli,
     Zstd,
+    Dcb,
+    Dcz,
     // TODO: Identity,
     // TODO: Deflate
     Other, // anything unknown
@@ -344,6 +346,8 @@ impl Algorithm {
             Algorithm::Gzip => "gzip",
             Algorithm::Brotli => "br",
             Algorithm::Zstd => "zstd",
+            Algorithm::Dcb => "dcb",
+            Algorithm::Dcz => "dcz",
             Algorithm::Any => "*",
             Algorithm::Other => "other",
         }
@@ -390,6 +394,10 @@ impl From<&str> for Algorithm {
             Algorithm::Brotli
         } else if coding == UniCase::ascii("zstd") {
             Algorithm::Zstd
+        } else if coding == UniCase::ascii("dcb") {
+            Algorithm::Dcb
+        } else if coding == UniCase::ascii("dcz") {
+            Algorithm::Dcz
         } else if s.is_empty() {
             Algorithm::Any
         } else {
@@ -614,6 +622,36 @@ fn test_decide_action() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-encoding", "gzip").unwrap();
     assert_eq!(decide_action(&header, &[Brotli, Gzip]), Noop);
+
+    // dcb passthrough: client accepts dcb, response has dcb
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "dcb").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb, Brotli]), Noop);
+
+    // dcz passthrough: client accepts dcz, response has dcz
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "dcz").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz, Zstd]), Noop);
+
+    // Client wants dcz but response has brotli, decompress brotli
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "br").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz]), Decompress(Brotli));
+
+    // Client wants dcz but response has zstd, decompress zstd
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "zstd").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz]), Decompress(Zstd));
+
+    // Client wants dcb but response has gzip, decompress gzip
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "gzip").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb]), Decompress(Gzip));
+
+    // Client wants dcb but response has brotli, decompress brotli
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "br").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb]), Decompress(Brotli));
 }
 
 use once_cell::sync::Lazy;
