@@ -2,10 +2,91 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.6.0](https://github.com/cloudflare/pingora/compare/0.5.0...0.6.0) - 2025-08-15
- 
+## [0.7.0](https://github.com/cloudflare/pingora/compare/0.6.0...0.7.0) - 2026-01-30
+
 ### Highlights
-- This release bumps the minimum h2 crate dependency to guard against the [MadeYouReset]((https://blog.cloudflare.com/madeyoureset-an-http-2-vulnerability-thwarted-by-rapid-reset-mitigations/)) H2 attack 
+
+- Extensible SslDigest to save user-defined TLS context
+- Add ConnectionFilter trait for early TCP connection filtering
+
+### 🚀 Features
+
+- Add ConnectionFilter trait for early TCP connection filtering
+- Introduce a virtual L4 stream abstraction
+- Add support for verify_cert and verify_hostname using rustls
+- Exposes the HttpProxy struct to allow external crates to customize the proxy logic.
+- Exposes a new_mtls method for creating a HttpProxy with a client_cert_key to enable mtls peers.
+- Add SSLKEYLOGFILE support to rustls connector
+- Allow spawning background subrequests from main session
+- Allow Extensions in cache LockCore and user tracing
+- Add body-bytes tracking across H1/H2 and proxy metrics
+- Allow setting max_weight on MissFinishType::Appended
+- Allow adding SslDigestExtensions on downstream and upstream
+- Add Custom session support for encapsulated HTTP
+
+### 🐛 Bug Fixes
+
+- Use write timeout consistently for h2 body writes
+- Prevent downstream error prior to header from canceling cache fill
+- Fix debug log and new tests
+- Fix size calculation for buffer capacity
+- Fix cache admission on header only misses
+- Fix duplicate zero-size chunk on cache hit
+- Fix chunked trailer end parsing
+- Lock age timeouts cause lock reacquisition
+- Fix transfer fd compile error for non linux os
+
+### Sec
+
+- Removed atty
+- Upgrade lru to >= 0.16.3 crate version because of RUSTSEC-2026-0002
+
+### Everything Else
+
+- Add tracing to log reason for not caching an asset on cache put
+- Evict when asset count exceeds optional watermark
+- Remove trailing comma from Display for HttpPeer
+- Make ProxyHTTP::upstream_response_body_filter return an optional duration for rate limiting
+- Restore daemonize STDOUT/STDERR when error log file is not specified
+- Log task info when upstream header failed to send
+- Check cache enablement to determine cache fill
+- Update meta when revalidating before lock release
+- Add ForceFresh status to cache hit filter
+- Pass stale status to cache lock
+- Bump max multipart ranges to 200
+- Downgrade Expires header warn to debug log
+- CI and effective msrv bump to 1.83
+- Add default noop custom param to client Session
+- Use static str in ErrorSource or ErrorType as_str
+- Use bstr for formatting byte strings
+- Tweak the implementation of and documentation of `connection_filter` feature
+- Set h1.1 when proxying cacheable responses
+- Add or remove accept-ranges on range header filter
+- Update msrv in github ci, fixup .bleep
+- Override request keepalive on process shutdown
+- Add shutdown flag to proxy session
+- Add ResponseHeader in pingora_http crate's prelude
+- Add a configurable upgrade for pingora-ketama that reduces runtime cpu and memory
+- Add to cache api spans
+- Increase visibility of multirange items
+- Use seek_multipart on body readers
+- Log read error when reading trailers end
+- Re-add the warning about cache-api volatility
+- Default to close on downstream response before body finish
+- Ensure idle_timeout is polled even if idle_timeout is unset so notify events are registered for h2 idle pool, filter out closed connections when retrieving from h2 in use pool.
+- Add simple read test for invalid extra char in header end
+- Allow customizing lock status on Custom NoCacheReasons
+- Close h1 conn by default if req header unfinished
+- Add configurable retries for upgrade sock connect/accept
+- Deflake test by increasing write size
+- Make the version restrictions on rmp and rmp-serde more strict to prevent forcing consumers to use 2024 edition
+- Rewind preread bytes when parsing next H1 response
+- Add epoch and epoch_override to CacheMeta
+
+## [0.6.0](https://github.com/cloudflare/pingora/compare/0.5.0...0.6.0) - 2025-08-15
+
+### Highlights
+- This release bumps the minimum h2 crate dependency to guard against the [MadeYouReset]((https://blog.cloudflare.com/madeyoureset-an-http-2-vulnerability-thwarted-by-rapid-reset-mitigations/)) H2 attack
 
 
 ### 🚀 Features
@@ -63,7 +144,7 @@ All notable changes to this project will be documented in this file.
 
 
 ## [0.5.0](https://github.com/cloudflare/pingora/compare/0.4.0...0.5.0) - 2025-05-09
- 
+
 ### 🚀 Features
 
 - [Add tweak_new_upstream_tcp_connection hook to invoke logic on new upstream TCP sockets prior to connection](https://github.com/cloudflare/pingora/commit/be4a023d18c2b061f64ad5efd0868f9498199c91)
@@ -76,7 +157,7 @@ All notable changes to this project will be documented in this file.
 - [Add get_stale and get_stale_while_update for memory-cache](https://github.com/cloudflare/pingora/commit/bb28044cbe9ac9251940b8a313d970c7d15aaff6)
 
 ### 🐛 Bug Fixes
- 
+
 - [Fix deadloop if proxy_handle_upstream exits earlier than proxy_handle_downstream](https://github.com/cloudflare/pingora/commit/bb111aaa92b3753e650957df3a68f56b0cffc65d)
 - [Check on h2 stream end if error occurred for forwarding HTTP tasks](https://github.com/cloudflare/pingora/commit/e18f41bb6ddb1d6354e824df3b91d77f3255bea2)
 - [Check for content-length underflow on end of stream h2 header](https://github.com/cloudflare/pingora/commit/575d1aafd7c679a50a443701a4c55dcfdbc443b2)
@@ -91,9 +172,9 @@ All notable changes to this project will be documented in this file.
 - [Always drain v1 request body before session reuse](https://github.com/cloudflare/pingora/commit/fda3317ec822678564d641e7cf1c9b77ee3759ff)
 - [Fixes HTTP1 client reads to properly timeout on initial read](https://github.com/cloudflare/pingora/commit/3c7db34acb0d930ae7043290a88bc56c1cd77e45)
 - [Fixes issue where if TLS client never sends any bytes, hangs forever](https://github.com/cloudflare/pingora/commit/d1bf0bcac98f943fd716278d674e7d10dce2223e)
- 
+
 ### Everything Else
- 
+
 - [Add builder api for pingora listeners](https://github.com/cloudflare/pingora/commit/3f564af3ae56e898478e13e71d67d095d7f5dbbd)
 - [Better handling for h1 requests that contain both transfer-encoding and content-length](https://github.com/cloudflare/pingora/commit/9287b82645be4a52b0b63530ba38aa0c7ddc4b77)
 - [Allow setting raw path in request to support non-UTF8 use cases](https://github.com/cloudflare/pingora/commit/e6b823c5d89860bb97713fdf14f197f799aed6af)
@@ -209,7 +290,7 @@ All notable changes to this project will be documented in this file.
 ## [0.1.1](https://github.com/cloudflare/pingora/compare/0.1.0...0.1.1) - 2024-04-05
 
 ### 🚀 Features
-- `Server::new` now accepts `Into<Option<T>>` 
+- `Server::new` now accepts `Into<Option<T>>`
 - Implemented client `HttpSession::get_keepalive_values` for Keep-Alive parsing
 - Expose `ListenFds` and `Fds` to fix a voldemort types issue
 - Expose config options in `ServerConf`, provide new `Server` constructor
