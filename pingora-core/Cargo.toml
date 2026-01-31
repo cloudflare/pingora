@@ -74,7 +74,7 @@ ouroboros = { version = "0.18.4", optional = true }
 lru = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5.0"
+cf-daemonize = "0.3.0"
 nix = "~0.24.3"
 
 [target.'cfg(windows)'.dependencies]
