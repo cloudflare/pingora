@@ -133,7 +133,7 @@ pub(crate) fn init_body_writer_comm(body_writer: &mut BodyWriter, headers: &HMap
             None => {
                 /* TODO: 1. connection: keepalive cannot be used,
                 2. mark connection must be closed */
-                body_writer.init_http10();
+                body_writer.init_close_delimited();
             }
         }
     }

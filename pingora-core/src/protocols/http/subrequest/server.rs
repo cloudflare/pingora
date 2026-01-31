@@ -340,7 +340,7 @@ impl HttpSession {
                         // after sending the former body. For now we immediately
                         // switch interpretation to match nginx behavior.
                         // TODO: this has no effect resetting the body counter of TE chunked
-                        self.body_reader.convert_to_until_close();
+                        self.body_reader.convert_to_close_delimited();
                     }
                 } else {
                     debug!("bad upgrade handshake!");
@@ -407,10 +407,10 @@ impl HttpSession {
         }
 
         if self.is_upgrade(header) == Some(true) {
-            self.body_writer.init_until_close();
+            self.body_writer.init_close_delimited();
         } else if is_chunked_encoding_from_headers(&header.headers) {
             // transfer-encoding takes priority over content-length
-            self.body_writer.init_until_close();
+            self.body_writer.init_close_delimited();
         } else {
             let content_length =
                 header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH));
@@ -421,7 +421,7 @@ impl HttpSession {
                 None => {
                     /* TODO: 1. connection: keepalive cannot be used,
                     2. mark connection must be closed */
-                    self.body_writer.init_until_close();
+                    self.body_writer.init_close_delimited();
                 }
             }
         }
@@ -531,7 +531,7 @@ impl HttpSession {
             }
 
             if self.req_header().version == Version::HTTP_11 && self.is_upgrade_req() {
-                self.body_reader.init_until_close();
+                self.body_reader.init_close_delimited();
                 return;
             }
 
@@ -539,7 +539,7 @@ impl HttpSession {
                 // if chunked encoding, content-length should be ignored
                 // TE is not visible at subrequest HttpTask level
                 // so this means read until request closure
-                self.body_reader.init_until_close();
+                self.body_reader.init_close_delimited();
             } else {
                 let cl = header_value_content_length(self.get_header(header::CONTENT_LENGTH));
                 match cl {
@@ -547,15 +547,11 @@ impl HttpSession {
                         self.body_reader.init_content_length(i);
                     }
                     None => {
-                        match self.req_header().version {
-                            Version::HTTP_11 => {
-                                // Per RFC assume no body by default in HTTP 1.1
-                                self.body_reader.init_content_length(0);
-                            }
-                            _ => {
-                                self.body_reader.init_until_close();
-                            }
-                        }
+                        // Per RFC 9112: "Request messages are never close-delimited because they are
+                        // always explicitly framed by length or transfer coding, with the absence of
+                        // both implying the request ends immediately after the header section."
+                        // All HTTP/1.x requests without Content-Length or Transfer-Encoding have 0 body
+                        self.body_reader.init_content_length(0);
                     }
                 }
             }

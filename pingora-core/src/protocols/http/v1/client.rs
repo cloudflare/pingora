@@ -59,6 +59,9 @@ pub struct HttpSession {
     upgraded: bool,
     // Tracks whether downstream request body started sending upgraded bytes
     received_upgrade_req_body: bool,
+    // Tracks whether the response read was ever close-delimited
+    // (even after body complete)
+    close_delimited_resp: bool,
 }
 
 /// HTTP 1.x client session
@@ -89,6 +92,7 @@ impl HttpSession {
             body_recv: 0,
             upgraded: false,
             received_upgrade_req_body: false,
+            close_delimited_resp: false,
         }
     }
     /// Write the request header to the server
@@ -333,14 +337,12 @@ impl HttpSession {
                     self.upgraded = self
                         .is_upgrade(self.response_header.as_deref().expect("init above"))
                         .unwrap_or(false);
-                    if self.upgraded {
-                        // upgrade response is definitely final response, so we can init body
-                        // reader (next read_response_task will also initialize but prefer to
-                        // update body reader and writer at the same time for easier reasoning)
-                        self.init_body_reader();
-                        // note that the (request) body writer is converted to http10
-                        // when the upgraded body tasks are received
-                    }
+                    // init body reader if upgrade status has changed body mode
+                    // (read_response_task will immediately try to init body afterwards anyways)
+                    // informational headers will automatically avoid initializing body reader
+                    self.init_body_reader();
+                    // note that the (request) body writer is converted to close delimit
+                    // when the upgraded body tasks are received
                     return Ok(s);
                 }
                 HeaderParseState::Partial => { /* continue the loop */ }
@@ -466,6 +468,13 @@ impl HttpSession {
             self.set_keepalive(None);
             return;
         }
+        if self.body_reader.need_init() || self.close_delimited_resp {
+            // Defense-in-depth: response body close-delimited (or no body interpretation
+            // upon reuse check)
+            // explicitly disable reuse
+            self.set_keepalive(None);
+            return;
+        }
         if self.body_reader.has_bytes_overread() {
             // if more bytes sent than expected, there are likely more bytes coming
             // so don't reuse this connection
@@ -504,8 +513,6 @@ impl HttpSession {
 
     // Whether this session will be kept alive
     pub fn will_keepalive(&self) -> bool {
-        // TODO: check self.body_writer. If it is http1.0 type then keepalive
-        // cannot be used because the connection close is the signal of end body
         !matches!(self.keepalive_timeout, KeepaliveStatus::Off)
     }
 
@@ -576,7 +583,7 @@ impl HttpSession {
 
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
-            /* follow https://tools.ietf.org/html/rfc7230#section-3.3.3 */
+            // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
             if let Some(req) = self.request_written.as_ref() {
@@ -605,14 +612,16 @@ impl HttpSession {
             };
 
             if upgraded {
-                self.body_reader.init_http10(preread_body);
+                self.body_reader.init_close_delimited(preread_body);
+                self.close_delimited_resp = true;
             } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
             } else if let Some(cl) = self.get_content_length() {
                 self.body_reader.init_content_length(cl, preread_body);
             } else {
-                self.body_reader.init_http10(preread_body);
+                self.body_reader.init_close_delimited(preread_body);
+                self.close_delimited_resp = true;
             }
         }
     }
@@ -649,7 +658,7 @@ impl HttpSession {
     pub fn maybe_upgrade_body_writer(&mut self) {
         if self.was_upgraded() {
             self.received_upgrade_req_body = true;
-            self.body_writer.convert_to_http10();
+            self.body_writer.convert_to_close_delimited();
         }
     }
 
@@ -682,9 +691,11 @@ impl HttpSession {
                     self.body_writer.init_content_length(length);
                 }
                 None => {
-                    /* TODO: 1. connection: keepalive cannot be used,
-                    2. mark connection must be closed */
-                    self.body_writer.init_http10();
+                    // Per RFC 9112: "Request messages are never close-delimited because they are
+                    // always explicitly framed by length or transfer coding, with the absence of
+                    // both implying the request ends immediately after the header section."
+                    // Requests without Content-Length or Transfer-Encoding have 0 body
+                    self.body_writer.init_content_length(0);
                 }
             }
         }
@@ -882,7 +893,10 @@ mod tests_stream {
         assert_eq!(input_header.len(), res.unwrap());
         let res = http_stream.read_body_ref().await.unwrap();
         assert_eq!(res.unwrap(), input_body);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(3));
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(3)
+        );
         let res = http_stream.read_body_ref().await.unwrap();
         assert_eq!(res, None);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
@@ -1164,7 +1178,8 @@ mod tests_stream {
     #[tokio::test]
     #[should_panic(expected = "There is still data left to write.")]
     async fn write_body_timeout() {
-        let header = b"POST /test HTTP/1.1\r\n\r\n";
+        // Test needs Content-Length header to actually attempt to write body
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 3\r\n\r\n";
         let body = b"abc";
         let mock_io = Builder::new()
             .write(&header[..])
@@ -1174,7 +1189,8 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.write_timeout = Some(Duration::from_secs(1));
 
-        let new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "3").unwrap();
         http_stream
             .write_request_header(Box::new(new_request))
             .await
@@ -1318,6 +1334,74 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn read_informational_then_keepalive_response() {
+        init_log();
+        // Test that after reading an informational response (100 Continue),
+        // keepalive still works properly
+        let wire = b"GET / HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n"; // Proper Content-Length
+        let body = b"response body";
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&body[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // Write request
+        let new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be informational header")
+            }
+        }
+
+        // Read final 200 OK header
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(!eob); // Should not be end of body yet
+            }
+            _ => {
+                panic!("task should be final header")
+            }
+        }
+
+        // Read body
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Body(b, eob) => {
+                assert_eq!(b.unwrap(), &body[..]);
+                assert!(eob); // EOF - body is complete
+            }
+            _ => {
+                panic!("task {task:?} should be body")
+            }
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(13));
+
+        // Keepalive should be enabled for properly-framed HTTP/1.1
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
     async fn init_body_for_upgraded_req() {
         let wire =
             b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
@@ -1357,13 +1441,16 @@ mod tests_stream {
             }
         }
         // changed body mode
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
         // request writer will be explicitly initialized in a separate call
         assert!(http_stream.body_writer.finished());
         http_stream.maybe_upgrade_body_writer();
 
         assert!(!http_stream.body_writer.finished());
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
 
         http_stream.write_body(&ws_data[..]).await.unwrap();
         // read WS
@@ -1417,13 +1504,16 @@ mod tests_stream {
             }
         }
         // changed body mode
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
         // request writer will be explicitly initialized in a separate call
         assert!(http_stream.body_writer.finished());
         http_stream.maybe_upgrade_body_writer();
 
         assert!(!http_stream.body_writer.finished());
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
 
         http_stream.write_body(&ws_data[..]).await.unwrap();
         // read WS
@@ -1482,7 +1572,10 @@ mod tests_stream {
             }
         }
         // changed body mode
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0)
+        );
 
         // write regular request payload
         http_stream.write_body(&body_data[..]).await.unwrap();
@@ -1506,10 +1599,10 @@ mod tests_stream {
         http_stream.maybe_upgrade_body_writer();
 
         assert!(!http_stream.body_writer.finished());
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
 
         http_stream.write_body(&ws_data[..]).await.unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(4));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(4));
         http_stream.finish_body().await.unwrap();
     }
 
@@ -1626,7 +1719,9 @@ mod tests_stream {
         init_log();
 
         async fn build_resp_with_keepalive(conn: &str) -> HttpSession {
-            let input = format!("HTTP/1.1 200 OK\r\nConnection: {conn}\r\n\r\n");
+            // Include Content-Length to avoid triggering defense-in-depth close-delimited check
+            let input =
+                format!("HTTP/1.1 200 OK\r\nConnection: {conn}\r\nContent-Length: 0\r\n\r\n");
             let mock_io = Builder::new().read(input.as_bytes()).build();
             let mut http_stream = HttpSession::new(Box::new(mock_io));
             let res = http_stream.read_response().await;
@@ -1863,6 +1958,98 @@ hello";
 
         // Should return false when no response header exists yet
         assert!(!http_stream.is_chunked_encoding());
+    }
+
+    #[tokio::test]
+    async fn write_request_body_implicit_zero_content_length() {
+        init_log();
+        let header = b"POST /test HTTP/1.1\r\n\r\n";
+        let mock_io = Builder::new().write(&header[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_request_body_with_content_length() {
+        init_log();
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 3\r\n\r\n";
+        let body = b"abc";
+        let mock_io = Builder::new().write(&header[..]).write(&body[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "3").unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(3, 0)
+        );
+
+        http_stream.write_body(body).await.unwrap();
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(3, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn close_delimited_response_explicitly_disables_keepalive() {
+        init_log();
+        // Defense-in-depth: if we read a close-delimited response body,
+        // keepalive should be disabled
+        let wire = b"GET / HTTP/1.1\r\n\r\n";
+        let input_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let input_body = b"abc";
+        let input_close = b""; // simulating close
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input_header[..])
+            .read(&input_body[..])
+            .read(&input_close[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // Write request first
+        let new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read response
+        http_stream.read_response().await.unwrap();
+
+        // Read the body (this will initialize the body reader)
+        http_stream.read_body_ref().await.unwrap();
+
+        // Body reader should be in UntilClose mode (close-delimited response)
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(3)
+        );
+
+        let res2 = http_stream.read_body_ref().await.unwrap();
+        assert!(res2.is_none()); // EOF
+
+        // Body should now be Complete
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+
+        http_stream.respect_keepalive();
+        assert!(!http_stream.will_keepalive());
     }
 }
 

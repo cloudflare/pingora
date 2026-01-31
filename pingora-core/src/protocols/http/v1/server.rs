@@ -551,7 +551,7 @@ impl HttpSession {
                         // the most spec-compliant behavior is to switch interpretation
                         // after sending the former body,
                         // we immediately switch interpretation to match nginx
-                        self.body_reader.convert_to_http10();
+                        self.body_reader.convert_to_close_delimited();
                     }
                 } else {
                     // this was a request that requested Upgrade,
@@ -561,6 +561,12 @@ impl HttpSession {
                 }
             }
             self.init_body_writer(&header);
+        }
+
+        // Defense-in-depth: if response body is close-delimited, mark session
+        // as un-reusable
+        if self.body_writer.is_close_delimited() {
+            self.set_keepalive(None);
         }
 
         // Don't have to flush response with content length because it is less
@@ -638,8 +644,6 @@ impl HttpSession {
 
     /// Return whether the session will be keepalived for connection reuse.
     pub fn will_keepalive(&self) -> bool {
-        // TODO: check self.body_writer. If it is http1.0 type then keepalive
-        // cannot be used because the connection close is the signal of end body
         !matches!(self.keepalive_timeout, KeepaliveStatus::Off)
     }
 
@@ -717,7 +721,7 @@ impl HttpSession {
         }
 
         if self.is_upgrade(header) == Some(true) {
-            self.body_writer.init_http10();
+            self.body_writer.init_close_delimited();
         } else {
             init_body_writer_comm(&mut self.body_writer, &header.headers);
         }
@@ -839,7 +843,7 @@ impl HttpSession {
                 buffer.clear();
             }
 
-            /* follow https://tools.ietf.org/html/rfc7230#section-3.3.3 */
+            // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
             if self.is_chunked_encoding() {
@@ -852,15 +856,11 @@ impl HttpSession {
                         self.body_reader.init_content_length(i, preread_body);
                     }
                     None => {
-                        match self.req_header().version {
-                            Version::HTTP_11 => {
-                                // Per RFC assume no body by default in HTTP 1.1
-                                self.body_reader.init_content_length(0, preread_body);
-                            }
-                            _ => {
-                                self.body_reader.init_http10(preread_body);
-                            }
-                        }
+                        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
+                        // "Request messages are never close-delimited because they are
+                        // always explicitly framed by length or transfer coding, with the absence of
+                        // both implying the request ends immediately after the header section."
+                        self.body_reader.init_content_length(0, preread_body);
                     }
                 }
             }
@@ -1436,12 +1436,13 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "There is still data left to read.")]
     async fn read_with_body_http10() {
         init_log();
         let input1 = b"GET / HTTP/1.0\r\n";
         let input2 = b"Host: pingora.org\r\n\r\n";
-        let input3 = b"a";
-        let input4 = b""; // simulating close
+        let input3 = b"a"; // This should NOT be read as body
+        let input4 = b""; // simulating close - should also NOT be reached
         let mock_io = Builder::new()
             .read(&input1[..])
             .read(&input2[..])
@@ -1450,41 +1451,26 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, input3.as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        assert_eq!(http_stream.body_bytes_read(), 1);
         let res = http_stream.read_body_bytes().await.unwrap();
         assert!(res.is_none());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
-        assert_eq!(http_stream.body_bytes_read(), 1);
+        assert_eq!(http_stream.body_bytes_read(), 0);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
     }
 
     #[tokio::test]
     async fn read_with_body_http10_single_read() {
         init_log();
+        // should have 0 body, even when data follows the headers
         let input1 = b"GET / HTTP/1.0\r\n";
         let input2 = b"Host: pingora.org\r\n\r\na";
-        let input3 = b"b";
-        let input4 = b""; // simulating close
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .read(&input4[..])
-            .build();
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"a".as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"b".as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(2));
         let res = http_stream.read_body_bytes().await.unwrap();
-        assert_eq!(http_stream.body_bytes_read(), 2);
         assert!(res.is_none());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(2));
+        assert_eq!(http_stream.body_bytes_read(), 0);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+        assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"a");
     }
 
     #[tokio::test]
@@ -1499,6 +1485,25 @@ mod tests_stream {
         assert!(res.is_none());
         assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_http10_with_content_length() {
+        init_log();
+        let input1 = b"POST / HTTP/1.0\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
+        let input3 = b"abc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input3[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, input3.as_slice());
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+        assert_eq!(http_stream.body_bytes_read(), 3);
     }
 
     #[tokio::test]
@@ -2133,11 +2138,11 @@ mod tests_stream {
             .write_response_header_ref(&response_101)
             .await
             .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
 
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(n));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(n));
 
         // this write should be ignored
         let response_502 = ResponseHeader::build(StatusCode::BAD_GATEWAY, None).unwrap();
@@ -2194,7 +2199,7 @@ mod tests_stream {
             .write_response_header_ref(&new_response)
             .await
             .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
         let n = http_stream.finish_body().await.unwrap().unwrap();
@@ -2521,6 +2526,33 @@ Content-Length: 5\r\n\
 
         // Should NOT be chunked - identity is final encoding
         assert!(!http_stream.is_chunked_encoding());
+    }
+
+    #[tokio::test]
+    async fn test_close_delimited_response_explicitly_disables_reuse() {
+        init_log();
+        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&wire_req[..])
+            .write(wire_header)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
+
+        http_stream.finish_body().await.unwrap().unwrap();
+
+        let reused = http_stream.reuse().await.unwrap();
+        assert!(reused.is_none());
     }
 }
 

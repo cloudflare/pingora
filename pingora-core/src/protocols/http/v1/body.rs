@@ -61,8 +61,8 @@ pub enum ParseState {
     ChunkedFinal(usize, usize, usize, u8),
     // Done: done but there is error, size read
     Done(usize),
-    // HTTP1_0: read until connection closed, size read
-    HTTP1_0(usize),
+    // UntilClose: read until connection closed, size read
+    UntilClose(usize),
 }
 
 type PS = ParseState;
@@ -73,7 +73,7 @@ impl ParseState {
             PS::Partial(read, to_read) => PS::Complete(read + to_read),
             PS::Chunked(read, _, _, _) => PS::Complete(read + additional_bytes),
             PS::ChunkedFinal(read, _, _, _) => PS::Complete(read + additional_bytes),
-            PS::HTTP1_0(read) => PS::Complete(read + additional_bytes),
+            PS::UntilClose(read) => PS::Complete(read + additional_bytes),
             _ => self.clone(), /* invalid transaction */
         }
     }
@@ -83,7 +83,7 @@ impl ParseState {
             PS::Partial(read, _) => PS::Done(read + additional_bytes),
             PS::Chunked(read, _, _, _) => PS::Done(read + additional_bytes),
             PS::ChunkedFinal(read, _, _, _) => PS::Done(read + additional_bytes),
-            PS::HTTP1_0(read) => PS::Done(read + additional_bytes),
+            PS::UntilClose(read) => PS::Done(read + additional_bytes),
             _ => self.clone(), /* invalid transaction */
         }
     }
@@ -210,18 +210,18 @@ impl BodyReader {
         }
     }
 
-    pub fn init_http10(&mut self, buf_to_rewind: &[u8]) {
+    pub fn init_close_delimited(&mut self, buf_to_rewind: &[u8]) {
         self.prepare_buf(buf_to_rewind);
-        self.body_state = PS::HTTP1_0(0);
+        self.body_state = PS::UntilClose(0);
     }
 
-    // Convert how we interpret the remainder of the body as pass through
-    // (HTTP/1.0).
-    //
-    // Does nothing if already converted to HTTP1.0 mode.
-    pub fn convert_to_http10(&mut self) {
-        if matches!(self.body_state, PS::HTTP1_0(_)) {
-            // nothing to do, already HTTP1.0
+    /// Convert how we interpret the remainder of the body to read until close.
+    /// This is used for responses without explicit framing (e.g., HTTP/1.0 responses).
+    ///
+    /// Does nothing if already in close-delimited mode.
+    pub fn convert_to_close_delimited(&mut self) {
+        if matches!(self.body_state, PS::UntilClose(_)) {
+            // nothing to do, already in close-delimited mode
             return;
         }
 
@@ -232,7 +232,7 @@ impl BodyReader {
             let buf = extra.as_deref().unwrap_or_default();
             self.prepare_buf(buf);
         } // if rewind_buf_len is not 0, body read has not yet been polled
-        self.body_state = PS::HTTP1_0(0);
+        self.body_state = PS::UntilClose(0);
     }
 
     pub fn get_body(&self, buf_ref: &BufRef) -> &[u8] {
@@ -275,7 +275,7 @@ impl BodyReader {
             PS::Partial(_, _) => self.do_read_body(stream).await,
             PS::Chunked(..) => self.do_read_chunked_body(stream).await,
             PS::ChunkedFinal(..) => self.do_read_chunked_body_final(stream).await,
-            PS::HTTP1_0(_) => self.do_read_body_until_closed(stream).await,
+            PS::UntilClose(_) => self.do_read_body_until_closed(stream).await,
             PS::ToStart => panic!("need to init BodyReader first"),
         }
     }
@@ -349,12 +349,12 @@ impl BodyReader {
                 .or_err(ReadError, "when reading body")?;
         }
         match self.body_state {
-            PS::HTTP1_0(read) => {
+            PS::UntilClose(read) => {
                 if n == 0 {
                     self.body_state = PS::Complete(read);
                     Ok(None)
                 } else {
-                    self.body_state = PS::HTTP1_0(read + n);
+                    self.body_state = PS::UntilClose(read + n);
                     Ok(Some(BufRef::new(0, n)))
                 }
             }
@@ -899,7 +899,7 @@ pub enum BodyMode {
     ToSelect,
     ContentLength(usize, usize), // total length to write, bytes already written
     ChunkedEncoding(usize),      //bytes written
-    HTTP1_0(usize),              //bytes written
+    UntilClose(usize),           //bytes written
     Complete(usize),             //bytes written
 }
 
@@ -920,26 +920,24 @@ impl BodyWriter {
         self.body_mode = BM::ChunkedEncoding(0);
     }
 
-    pub fn init_http10(&mut self) {
-        self.body_mode = BM::HTTP1_0(0);
+    pub fn init_close_delimited(&mut self) {
+        self.body_mode = BM::UntilClose(0);
     }
 
     pub fn init_content_length(&mut self, cl: usize) {
         self.body_mode = BM::ContentLength(cl, 0);
     }
 
-    // Convert how we interpret the remainder of the body as pass through
-    // (HTTP/1.0).
-    pub fn convert_to_http10(&mut self) {
-        if matches!(self.body_mode, BodyMode::HTTP1_0(_)) {
-            // nothing to do, already HTTP1.0
+    pub fn convert_to_close_delimited(&mut self) {
+        if matches!(self.body_mode, BodyMode::UntilClose(_)) {
+            // nothing to do, already in close-delimited mode
             return;
         }
 
         // NOTE: any stream buffered data will be flushed in next
-        // HTTP1_0 write
-        // reset body state to HTTP1_0
-        self.body_mode = BM::HTTP1_0(0);
+        // close-delimited write
+        // reset body state to close-delimited (UntilClose)
+        self.body_mode = BM::UntilClose(0);
     }
 
     // NOTE on buffering/flush stream when writing the body
@@ -957,7 +955,7 @@ impl BodyWriter {
             BM::Complete(_) => Ok(None),
             BM::ContentLength(_, _) => self.do_write_body(stream, buf).await,
             BM::ChunkedEncoding(_) => self.do_write_chunked_body(stream, buf).await,
-            BM::HTTP1_0(_) => self.do_write_http1_0_body(stream, buf).await,
+            BM::UntilClose(_) => self.do_write_until_close_body(stream, buf).await,
             BM::ToSelect => Ok(None), // Error here?
         }
     }
@@ -968,6 +966,10 @@ impl BodyWriter {
             BM::ContentLength(total, written) => written >= total,
             _ => false,
         }
+    }
+
+    pub fn is_close_delimited(&self) -> bool {
+        matches!(self.body_mode, BM::UntilClose(_))
     }
 
     async fn do_write_body<S>(&mut self, stream: &mut S, buf: &[u8]) -> Result<Option<usize>>
@@ -1028,7 +1030,7 @@ impl BodyWriter {
         }
     }
 
-    async fn do_write_http1_0_body<S>(
+    async fn do_write_until_close_body<S>(
         &mut self,
         stream: &mut S,
         buf: &[u8],
@@ -1037,11 +1039,11 @@ impl BodyWriter {
         S: AsyncWrite + Unpin + Send,
     {
         match self.body_mode {
-            BM::HTTP1_0(written) => {
+            BM::UntilClose(written) => {
                 let res = stream.write_all(buf).await;
                 match res {
                     Ok(()) => {
-                        self.body_mode = BM::HTTP1_0(written + buf.len());
+                        self.body_mode = BM::UntilClose(written + buf.len());
                         stream.flush().await.or_err(WriteError, "flushing body")?;
                         Ok(Some(buf.len()))
                     }
@@ -1060,7 +1062,7 @@ impl BodyWriter {
             BM::Complete(_) => Ok(None),
             BM::ContentLength(_, _) => self.do_finish_body(stream),
             BM::ChunkedEncoding(_) => self.do_finish_chunked_body(stream).await,
-            BM::HTTP1_0(_) => self.do_finish_http1_0_body(stream),
+            BM::UntilClose(_) => self.do_finish_until_close_body(stream),
             BM::ToSelect => Ok(None),
         }
     }
@@ -1098,9 +1100,9 @@ impl BodyWriter {
         }
     }
 
-    fn do_finish_http1_0_body<S>(&mut self, _stream: &mut S) -> Result<Option<usize>> {
+    fn do_finish_until_close_body<S>(&mut self, _stream: &mut S) -> Result<Option<usize>> {
         match self.body_mode {
-            BM::HTTP1_0(written) => {
+            BM::UntilClose(written) => {
                 self.body_mode = BM::Complete(written);
                 Ok(Some(written))
             }
@@ -1237,10 +1239,10 @@ mod tests {
         let input2 = b""; // simulating close
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut body_reader = BodyReader::new(false);
-        body_reader.init_http10(b"");
+        body_reader.init_close_delimited(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
-        assert_eq!(body_reader.body_state, ParseState::HTTP1_0(1));
+        assert_eq!(body_reader.body_state, ParseState::UntilClose(1));
         assert_eq!(input1, body_reader.get_body(&res));
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
         assert_eq!(res, None);
@@ -1256,14 +1258,14 @@ mod tests {
         let input2 = b""; // simulating close
         let mut mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut body_reader = BodyReader::new(false);
-        body_reader.init_http10(rewind);
+        body_reader.init_close_delimited(rewind);
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 2));
-        assert_eq!(body_reader.body_state, ParseState::HTTP1_0(2));
+        assert_eq!(body_reader.body_state, ParseState::UntilClose(2));
         assert_eq!(rewind, body_reader.get_body(&res));
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 1));
-        assert_eq!(body_reader.body_state, ParseState::HTTP1_0(3));
+        assert_eq!(body_reader.body_state, ParseState::UntilClose(3));
         assert_eq!(input1, body_reader.get_body(&res));
         let res = body_reader.read_body(&mut mock_io).await.unwrap();
         assert_eq!(res, None);
@@ -2322,22 +2324,22 @@ mod tests {
         let data = b"a";
         let mut mock_io = Builder::new().write(&data[..]).write(&data[..]).build();
         let mut body_writer = BodyWriter::new();
-        body_writer.init_http10();
-        assert_eq!(body_writer.body_mode, BodyMode::HTTP1_0(0));
+        body_writer.init_close_delimited();
+        assert_eq!(body_writer.body_mode, BodyMode::UntilClose(0));
         let res = body_writer
             .write_body(&mut mock_io, &data[..])
             .await
             .unwrap()
             .unwrap();
         assert_eq!(res, 1);
-        assert_eq!(body_writer.body_mode, BodyMode::HTTP1_0(1));
+        assert_eq!(body_writer.body_mode, BodyMode::UntilClose(1));
         let res = body_writer
             .write_body(&mut mock_io, &data[..])
             .await
             .unwrap()
             .unwrap();
         assert_eq!(res, 1);
-        assert_eq!(body_writer.body_mode, BodyMode::HTTP1_0(2));
+        assert_eq!(body_writer.body_mode, BodyMode::UntilClose(2));
         let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, 2);
         assert_eq!(body_writer.body_mode, BodyMode::Complete(2));
