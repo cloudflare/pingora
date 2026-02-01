@@ -16,7 +16,7 @@
 
 use http::{header, HeaderValue};
 use log::warn;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::*, Result};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
 use std::time::Duration;
@@ -200,13 +200,13 @@ pub fn header_value_content_length(
     header_value: Option<&http::header::HeaderValue>,
 ) -> Option<usize> {
     match header_value {
-        Some(value) => buf_to_content_length(Some(value.as_bytes())),
+        Some(value) => buf_to_content_length(Some(value.as_bytes())).ok().flatten(),
         None => None,
     }
 }
 
 #[inline]
-pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize> {
+pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Result<Option<usize>> {
     match header_value {
         Some(buf) => {
             match str::from_utf8(buf) {
@@ -214,24 +214,30 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize
                 Ok(str_cl_value) => match str_cl_value.parse::<i64>() {
                     Ok(cl_length) => {
                         if cl_length >= 0 {
-                            Some(cl_length as usize)
+                            Ok(Some(cl_length as usize))
                         } else {
                             warn!("negative content-length header value {cl_length}");
-                            None
+                            Error::e_explain(
+                                InvalidHTTPHeader,
+                                format!("negative Content-Length header value: {cl_length}"),
+                            )
                         }
                     }
                     Err(_) => {
                         warn!("invalid content-length header value {str_cl_value}");
-                        None
+                        Error::e_explain(
+                            InvalidHTTPHeader,
+                            format!("invalid Content-Length header value: {str_cl_value}"),
+                        )
                     }
                 },
                 Err(_) => {
                     warn!("invalid content-length header encoding");
-                    None
+                    Error::e_explain(InvalidHTTPHeader, "invalid Content-Length header encoding")
                 }
             }
         }
-        None => None,
+        None => Ok(None),
     }
 }
 

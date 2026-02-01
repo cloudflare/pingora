@@ -1087,6 +1087,65 @@ mod tests_stream {
         }
     }
 
+    async fn session_from_input_no_validate(input: &[u8]) -> (HttpSession, SubrequestHandle) {
+        let mock_io = Builder::new().read(input).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        // Read the request in v1 inner session to set up headers properly
+        http_stream.read_request().await.unwrap();
+        let (http_stream, handle) = HttpSession::new_from_session(&http_stream);
+        (http_stream, handle)
+    }
+
+    #[rstest]
+    #[case::negative("-1")]
+    #[case::not_a_number("abc")]
+    #[case::float("1.5")]
+    #[case::empty("")]
+    #[case::spaces("  ")]
+    #[case::mixed("123abc")]
+    #[tokio::test]
+    async fn validate_request_rejects_invalid_content_length(#[case] invalid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            invalid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        // read_request calls validate_request internally on the v1 inner stream, so it should fail here
+        let res = http_stream.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[rstest]
+    #[case::valid_zero("0")]
+    #[case::valid_small("123")]
+    #[case::valid_large("999999")]
+    #[tokio::test]
+    async fn validate_request_accepts_valid_content_length(#[case] valid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            valid_value
+        );
+        let (mut http_stream, _handle) = session_from_input_no_validate(input.as_bytes()).await;
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_request_accepts_no_content_length() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let (mut http_stream, _handle) = session_from_input_no_validate(input).await;
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
     const POST_CL_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 10\r\n\r\n";
     const POST_CHUNKED_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
     const POST_BODY_DATA: &[u8] = b"abcdefghij";
