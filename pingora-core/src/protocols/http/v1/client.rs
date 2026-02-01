@@ -617,7 +617,7 @@ impl HttpSession {
             } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
-            } else if let Some(cl) = self.get_content_length() {
+            } else if let Some(cl) = self.get_content_length().unwrap_or(None) {
                 self.body_reader.init_content_length(cl, preread_body);
             } else {
                 self.body_reader.init_close_delimited(preread_body);
@@ -662,7 +662,7 @@ impl HttpSession {
         }
     }
 
-    fn get_content_length(&self) -> Option<usize> {
+    fn get_content_length(&self) -> Result<Option<usize>> {
         buf_to_content_length(
             self.get_header(header::CONTENT_LENGTH)
                 .map(|v| v.as_bytes()),

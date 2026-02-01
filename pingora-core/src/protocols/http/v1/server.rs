@@ -337,6 +337,8 @@ impl HttpSession {
                 "HTTP/1.0 requests cannot include Transfer-Encoding header",
             );
         }
+        // validate content-length value if present to avoid ambiguous framing
+        self.get_content_length()?;
 
         Ok(())
     }
@@ -829,7 +831,7 @@ impl HttpSession {
         is_chunked_encoding_from_headers(&self.req_header().headers)
     }
 
-    fn get_content_length(&self) -> Option<usize> {
+    fn get_content_length(&self) -> Result<Option<usize>> {
         buf_to_content_length(
             self.get_header(header::CONTENT_LENGTH)
                 .map(|v| v.as_bytes()),
@@ -850,7 +852,9 @@ impl HttpSession {
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
             } else {
-                let cl = self.get_content_length();
+                // At this point, validate_request() should have already been called,
+                // so get_content_length() should not return an error for invalid values
+                let cl = self.get_content_length().unwrap_or(None);
                 match cl {
                     Some(i) => {
                         self.body_reader.init_content_length(i, preread_body);
@@ -1652,6 +1656,55 @@ mod tests_stream {
                 assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
             }
         }
+    }
+
+    #[rstest]
+    #[case::negative("-1")]
+    #[case::not_a_number("abc")]
+    #[case::float("1.5")]
+    #[case::empty("")]
+    #[case::spaces("  ")]
+    #[case::mixed("123abc")]
+    #[tokio::test]
+    async fn validate_request_rejects_invalid_content_length(#[case] invalid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            invalid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // read_request calls validate_request internally, so it should fail here
+        let res = http_stream.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().etype(), &InvalidHTTPHeader);
+    }
+
+    #[rstest]
+    #[case::valid_zero("0")]
+    #[case::valid_small("123")]
+    #[case::valid_large("999999")]
+    #[tokio::test]
+    async fn validate_request_accepts_valid_content_length(#[case] valid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            valid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_request_accepts_no_content_length() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
     }
 
     #[tokio::test]
