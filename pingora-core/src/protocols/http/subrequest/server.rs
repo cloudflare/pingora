@@ -34,7 +34,7 @@
 
 use bytes::Bytes;
 use http::HeaderValue;
-use http::{header, header::AsHeaderName, HeaderMap, Method, Version};
+use http::{header, header::AsHeaderName, HeaderMap, Method};
 use log::{debug, trace, warn};
 use pingora_error::{Error, ErrorType::*, OkOrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -530,11 +530,6 @@ impl HttpSession {
                 buffer.clear();
             }
 
-            if self.req_header().version == Version::HTTP_11 && self.is_upgrade_req() {
-                self.body_reader.init_close_delimited();
-                return;
-            }
-
             if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 // TE is not visible at subrequest HttpTask level
@@ -807,7 +802,9 @@ impl HttpSession {
 mod tests_stream {
     use super::*;
     use crate::protocols::http::subrequest::body::{BodyMode, ParseState};
+    use bytes::BufMut;
     use http::StatusCode;
+    use rstest::rstest;
 
     use std::str;
     use tokio_test::io::Builder;
@@ -886,7 +883,7 @@ mod tests_stream {
             .await
             .unwrap();
         // 100 won't affect body state
-        assert!(!http_stream.is_body_done());
+        assert!(http_stream.is_body_done());
     }
 
     #[tokio::test]
@@ -1088,5 +1085,73 @@ mod tests_stream {
             }
             t => panic!("unexpected task {t:?}"),
         }
+    }
+
+    const POST_CL_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 10\r\n\r\n";
+    const POST_CHUNKED_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const POST_BODY_DATA: &[u8] = b"abcdefghij";
+
+    async fn build_upgrade_req_with_body(header: &[u8]) -> (HttpSession, SubrequestHandle) {
+        let mock_io = Builder::new().read(header).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let (mut http_stream, handle) = HttpSession::new_from_session(&http_stream);
+        http_stream.read_request().await.unwrap();
+        (http_stream, handle)
+    }
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_body(#[case] header: &[u8]) {
+        init_log();
+        let (mut http_stream, handle) = build_upgrade_req_with_body(header).await;
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        // Send body via the handle
+        handle
+            .tx
+            .send(HttpTask::Body(Some(Bytes::from(POST_BODY_DATA)), true))
+            .await
+            .unwrap();
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, POST_BODY_DATA);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
+        assert_eq!(http_stream.body_bytes_read(), 10);
+
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
+        assert!(!http_stream.is_body_done());
+
+        // now send ws data
+        let ws_data = b"data";
+        handle
+            .tx
+            .send(HttpTask::Body(Some(Bytes::from(&ws_data[..])), false))
+            .await
+            .unwrap();
+
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, ws_data.as_slice());
+        assert!(!http_stream.is_body_done());
+
+        // EOF ends body
+        drop(handle.tx);
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
     }
 }
