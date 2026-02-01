@@ -62,6 +62,9 @@ pub struct HttpSession {
     // Tracks whether the response read was ever close-delimited
     // (even after body complete)
     close_delimited_resp: bool,
+    // If allowed, does not fail with error on invalid content-length
+    // (treats as close-delimited response).
+    allow_h1_response_invalid_content_length: bool,
 }
 
 /// HTTP 1.x client session
@@ -93,8 +96,10 @@ impl HttpSession {
             upgraded: false,
             received_upgrade_req_body: false,
             close_delimited_resp: false,
+            allow_h1_response_invalid_content_length: false,
         }
     }
+
     /// Write the request header to the server
     /// After the request header is sent. The caller can either start reading the response or
     /// sending request body if any.
@@ -187,6 +192,12 @@ impl HttpSession {
 
         // ad-hoc checks
         super::common::check_dup_content_length(&resp_header.headers)?;
+
+        // Validate content-length value if present
+        // Note: Content-Length is already removed if Transfer-Encoding is present
+        if !self.allow_h1_response_invalid_content_length {
+            self.get_content_length()?;
+        }
 
         Ok(())
     }
@@ -328,6 +339,19 @@ impl HttpSession {
                             .or_err(InvalidHTTPHeader, "while parsing request header")?;
                     }
 
+                    let contains_transfer_encoding = response_header
+                        .headers
+                        .contains_key(header::TRANSFER_ENCODING);
+                    let contains_content_length =
+                        response_header.headers.contains_key(header::CONTENT_LENGTH);
+
+                    // Transfer encoding overrides content length, so when
+                    // both are present, we MUST remove content length. This is
+                    // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
+                    if contains_content_length && contains_transfer_encoding {
+                        response_header.remove_header(&header::CONTENT_LENGTH);
+                    }
+
                     self.buf = buf;
                     self.response_header = Some(response_header);
                     self.validate_response()?;
@@ -432,6 +456,10 @@ impl HttpSession {
     pub fn is_body_done(&mut self) -> bool {
         self.init_body_reader();
         self.body_reader.body_done()
+    }
+
+    pub fn set_allow_h1_response_invalid_content_length(&mut self, allow: bool) {
+        self.allow_h1_response_invalid_content_length = allow;
     }
 
     pub(super) fn get_headers_raw(&self) -> &[u8] {
@@ -845,7 +873,9 @@ impl UniqueID for HttpSession {
 mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
+    use crate::upstreams::peer::PeerOptions;
     use crate::ErrorType;
+    use rstest::rstest;
     use tokio_test::io::Builder;
 
     fn init_log() {
@@ -1155,6 +1185,138 @@ mod tests_stream {
             .await
             .unwrap();
         assert_eq!(wire.len(), n);
+    }
+
+    #[rstest]
+    #[case::negative("-1")]
+    #[case::not_a_number("abc")]
+    #[case::float("1.5")]
+    #[case::empty("")]
+    #[case::spaces("  ")]
+    #[case::mixed("123abc")]
+    #[tokio::test]
+    async fn validate_response_rejects_invalid_content_length(#[case] invalid_value: &str) {
+        init_log();
+        let input = format!(
+            "HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: {}\r\n\r\n",
+            invalid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // read_response calls validate_response internally, so it should fail here
+        let res = http_stream.read_response().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().etype(), &ErrorType::InvalidHTTPHeader);
+    }
+
+    #[tokio::test]
+    async fn allow_invalid_content_length_close_delimited_when_configured() {
+        init_log();
+        let input_header = b"HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: abc\r\n\r\n";
+        let input_body = b"abc";
+        let input_close = b"";
+        let mock_io = Builder::new()
+            .read(&input_header[..])
+            .read(&input_body[..])
+            .read(&input_close[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut peer_options = PeerOptions::new();
+        peer_options.allow_h1_response_invalid_content_length = true;
+        http_stream.set_allow_h1_response_invalid_content_length(
+            peer_options.allow_h1_response_invalid_content_length,
+        );
+
+        let res = http_stream.read_response().await;
+        assert!(res.is_ok());
+        let body = http_stream.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(body, input_body);
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(3)
+        );
+        let body = http_stream.read_body_ref().await.unwrap();
+        assert!(body.is_none());
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+    }
+
+    #[rstest]
+    #[case::valid_zero("0")]
+    #[case::valid_small("123")]
+    #[case::valid_large("999999")]
+    #[tokio::test]
+    async fn validate_response_accepts_valid_content_length(#[case] valid_value: &str) {
+        init_log();
+        let input = format!(
+            "HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: {}\r\n\r\n",
+            valid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_response_accepts_no_content_length() {
+        init_log();
+        let input = b"HTTP/1.1 200 OK\r\nServer: test\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert!(res.is_ok());
+    }
+
+    #[rstest]
+    #[case(None, None, None)]
+    #[case(Some("transfer-encoding"), None, None)]
+    #[case(Some("transfer-encoding"), Some("CONTENT-LENGTH"), Some("4"))]
+    #[case(Some("TRANSFER-ENCODING"), Some("CONTENT-LENGTH"), Some("4"))]
+    #[case(Some("TRANSFER-ENCODING"), None, None)]
+    #[case(None, Some("CONTENT-LENGTH"), Some("4"))]
+    #[case(Some("TRANSFER-ENCODING"), Some("content-length"), Some("4"))]
+    #[case(None, Some("content-length"), Some("4"))]
+    #[case(Some("TRANSFER-ENCODING"), Some("CONTENT-LENGTH"), Some("abc"))]
+    #[tokio::test]
+    async fn response_transfer_encoding_and_content_length_handling(
+        #[case] transfer_encoding_header: Option<&str>,
+        #[case] content_length_header: Option<&str>,
+        #[case] content_length_value: Option<&str>,
+    ) {
+        init_log();
+        let input1 = b"HTTP/1.1 200 OK\r\n";
+        let mut input2 = "Server: test\r\n".to_owned();
+
+        if let Some(transfer_encoding) = transfer_encoding_header {
+            input2 += &format!("{transfer_encoding}: chunked\r\n");
+        }
+        if let Some(content_length) = content_length_header {
+            let value = content_length_value.unwrap_or("4");
+            input2 += &format!("{content_length}: {value}\r\n")
+        }
+
+        input2 += "\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(input2.as_bytes())
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let _ = http_stream.read_response().await.unwrap();
+
+        match (content_length_header, transfer_encoding_header) {
+            (Some(_) | None, Some(_)) => {
+                assert!(http_stream.get_header(header::TRANSFER_ENCODING).is_some());
+                assert!(http_stream.get_header(header::CONTENT_LENGTH).is_none());
+            }
+            (Some(_), None) => {
+                assert!(http_stream.get_header(header::TRANSFER_ENCODING).is_none());
+                assert!(http_stream.get_header(header::CONTENT_LENGTH).is_some());
+            }
+            _ => {
+                assert!(http_stream.get_header(header::CONTENT_LENGTH).is_none());
+                assert!(http_stream.get_header(header::TRANSFER_ENCODING).is_none());
+            }
+        }
     }
 
     #[tokio::test]
