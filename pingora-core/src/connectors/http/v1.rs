@@ -35,7 +35,12 @@ impl Connector {
         peer: &P,
     ) -> Result<(HttpSession, bool)> {
         let (stream, reused) = self.transport.get_stream(peer).await?;
-        let http = HttpSession::new(stream);
+        let mut http = HttpSession::new(stream);
+        if let Some(options) = peer.get_peer_options() {
+            http.set_allow_h1_response_invalid_content_length(
+                options.allow_h1_response_invalid_content_length,
+            );
+        }
         Ok((http, reused))
     }
 
@@ -43,10 +48,14 @@ impl Connector {
         &self,
         peer: &P,
     ) -> Option<HttpSession> {
-        self.transport
-            .reused_stream(peer)
-            .await
-            .map(HttpSession::new)
+        let stream = self.transport.reused_stream(peer).await?;
+        let mut http = HttpSession::new(stream);
+        if let Some(options) = peer.get_peer_options() {
+            http.set_allow_h1_response_invalid_content_length(
+                options.allow_h1_response_invalid_content_length,
+            );
+        }
+        Some(http)
     }
 
     pub async fn release_http_session<P: Peer + Send + Sync + 'static>(
