@@ -370,6 +370,7 @@ where
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
 
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
@@ -500,7 +501,7 @@ where
                     }
                 },
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
 
                     let task = self.h1_response_filter(session, task?, ctx,
@@ -720,7 +721,13 @@ where
                 Ok(HttpTask::Body(data, end))
             }
             HttpTask::UpgradedBody(mut data, end) => {
-                // range / caching doesn't apply to upgraded body
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
+                // range doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
                     .response_body_filter(session, &mut data, end, ctx)?

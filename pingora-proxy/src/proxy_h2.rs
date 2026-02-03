@@ -340,6 +340,7 @@ where
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
 
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
@@ -447,7 +448,7 @@ where
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,

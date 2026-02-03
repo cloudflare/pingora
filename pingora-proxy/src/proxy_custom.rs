@@ -317,6 +317,7 @@ where
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
 
             tokio::select! {
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
@@ -423,7 +424,7 @@ where
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.custom_response_filter(session, task?, ctx,
                         &mut serve_from_cache,

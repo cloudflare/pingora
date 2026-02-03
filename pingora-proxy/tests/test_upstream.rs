@@ -1139,6 +1139,55 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_websocket_101() {
+        // Test the unlikely scenario in which users may want to cache WS
+        init();
+
+        // First request - should be a miss
+        let mut stream = TcpStream::connect("127.0.0.1:6148").await.unwrap();
+        let req = concat!(
+            "GET /unique/test_cache_websocket_101/upgrade HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "X-Cache-Websocket: 1\r\n",
+            "\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let expected_payload = b"hello\n";
+        let fut = read_response(&mut stream, expected_payload.len());
+        let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+        assert_eq!(resp_header.status, 101);
+        assert_eq!(resp_header.headers["Upgrade"], "websocket");
+        assert_eq!(resp_header.headers["x-cache-status"], "miss");
+        assert_eq!(resp_body, expected_payload);
+
+        // Second request - should be a cache hit
+        let mut stream = TcpStream::connect("127.0.0.1:6148").await.unwrap();
+        let req = concat!(
+            "GET /unique/test_cache_websocket_101/upgrade HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "X-Cache-Websocket: 1\r\n",
+            "\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let fut = read_response(&mut stream, expected_payload.len());
+        let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+        assert_eq!(resp_header.status, 101);
+        assert_eq!(resp_header.headers["Upgrade"], "websocket");
+        assert_eq!(resp_header.headers["x-cache-status"], "hit");
+        assert_eq!(resp_body, expected_payload);
+    }
+
+    #[tokio::test]
     async fn test_1xx_caching() {
         // 1xx shouldn't interfere with HTTP caching
 
