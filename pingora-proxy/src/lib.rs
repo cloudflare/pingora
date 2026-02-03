@@ -357,7 +357,7 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) => self
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
                 .inner
                 .upstream_response_body_filter(session, data, *eos, ctx)?,
             HttpTask::Trailer(Some(trailers)) => {
@@ -563,6 +563,7 @@ impl Session {
     }
 
     pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
         for task in tasks.iter_mut() {
             match task {
                 HttpTask::Header(resp, end) => {
@@ -571,6 +572,11 @@ impl Session {
                         .await?;
                 }
                 HttpTask::Body(data, end) => {
+                    self.downstream_modules_ctx
+                        .response_body_filter(data, *end)?;
+                }
+                HttpTask::UpgradedBody(data, end) => {
+                    seen_upgraded = true;
                     self.downstream_modules_ctx
                         .response_body_filter(data, *end)?;
                 }
@@ -584,6 +590,7 @@ impl Session {
                         //
                         // Note, this will not work if end of stream has already
                         // been seen or we've written content-length bytes.
+                        // (Trailers should never come after upgraded body)
                         *task = HttpTask::Body(Some(buf), true);
                     }
                 }
@@ -597,7 +604,11 @@ impl Session {
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
                     if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        *task = HttpTask::Body(Some(buf), true);
+                        if seen_upgraded {
+                            *task = HttpTask::UpgradedBody(Some(buf), true);
+                        } else {
+                            *task = HttpTask::Body(Some(buf), true);
+                        }
                     }
                 }
                 _ => { /* Failed */ }
