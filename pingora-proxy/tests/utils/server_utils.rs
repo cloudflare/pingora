@@ -47,7 +47,7 @@ use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub struct ExampleProxyHttps {}
 
@@ -574,10 +574,26 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
+        // Allow testing the unlikely case of caching a 101 response
+        if resp.status == 101
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-cache-websocket")
+        {
+            return Ok(RespCacheable::Cacheable(CacheMeta::new(
+                SystemTime::now() + Duration::from_secs(5),
+                SystemTime::now(),
+                0,
+                0,
+                resp.clone(),
+            )));
+        }
+
         let cc = CacheControl::from_resp_headers(resp);
         Ok(resp_cacheable(
             cc.as_ref(),

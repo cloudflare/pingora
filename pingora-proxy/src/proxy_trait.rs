@@ -130,7 +130,10 @@ pub trait ProxyHttp {
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
-    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 

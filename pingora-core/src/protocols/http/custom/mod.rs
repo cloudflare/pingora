@@ -60,6 +60,8 @@ impl CustomMessageWrite for () {
 pub trait BodyWrite: Send + Sync + Unpin + 'static {
     async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()>;
     async fn finish(&mut self) -> Result<()>;
+    async fn cleanup(&mut self) -> Result<()>;
+    fn upgrade_body_writer(&mut self);
 }
 
 pub async fn drain_custom_messages(

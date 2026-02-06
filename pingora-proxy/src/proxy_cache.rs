@@ -661,45 +661,50 @@ where
                     }
                 }
             }
-            HttpTask::Body(data, end_stream) => match data {
-                Some(d) => {
-                    if session.cache.enabled() {
-                        // TODO: do this async
-                        // fail if writing the body would exceed the max_file_size_bytes
-                        let body_size_allowed =
-                            session.cache.track_body_bytes_for_max_file_size(d.len());
-                        if !body_size_allowed {
-                            debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
-                            session
-                                .cache
-                                .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
+            HttpTask::Body(data, end_stream) | HttpTask::UpgradedBody(data, end_stream) => {
+                // It is not normally advisable to cache upgraded responses
+                // e.g. they are essentially close-delimited, so they are easily truncated
+                // but the framework still allows for it
+                match data {
+                    Some(d) => {
+                        if session.cache.enabled() {
+                            // TODO: do this async
+                            // fail if writing the body would exceed the max_file_size_bytes
+                            let body_size_allowed =
+                                session.cache.track_body_bytes_for_max_file_size(d.len());
+                            if !body_size_allowed {
+                                debug!("chunked response exceeded max cache size, remembering that it is uncacheable");
+                                session
+                                    .cache
+                                    .response_became_uncacheable(NoCacheReason::ResponseTooLarge);
 
-                            return Error::e_explain(
-                                ERR_RESPONSE_TOO_LARGE,
-                                format!(
-                                    "writing data of size {} bytes would exceed max file size of {} bytes",
-                                    d.len(),
-                                    session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
-                                ),
-                            );
+                                return Error::e_explain(
+                                    ERR_RESPONSE_TOO_LARGE,
+                                    format!(
+                                        "writing data of size {} bytes would exceed max file size of {} bytes",
+                                        d.len(),
+                                        session.cache.max_file_size_bytes().expect("max file size bytes must be set to exceed size")
+                                    ),
+                                );
+                            }
+
+                            // this will panic if more data is sent after we see end_stream
+                            // but should be impossible in real world
+                            let miss_handler = session.cache.miss_handler().unwrap();
+
+                            miss_handler.write_body(d.clone(), *end_stream).await?;
+                            if *end_stream {
+                                session.cache.finish_miss_handler().await?;
+                            }
                         }
-
-                        // this will panic if more data is sent after we see end_stream
-                        // but should be impossible in real world
-                        let miss_handler = session.cache.miss_handler().unwrap();
-
-                        miss_handler.write_body(d.clone(), *end_stream).await?;
-                        if *end_stream {
+                    }
+                    None => {
+                        if session.cache.enabled() && *end_stream {
                             session.cache.finish_miss_handler().await?;
                         }
                     }
                 }
-                None => {
-                    if session.cache.enabled() && *end_stream {
-                        session.cache.finish_miss_handler().await?;
-                    }
-                }
-            },
+            }
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
@@ -2277,7 +2282,16 @@ impl ServeFromCache {
         &mut self,
         cache: &mut HttpCache,
         range: &mut RangeBodyFilter,
+        upgraded: bool,
     ) -> Result<HttpTask> {
+        fn body_task(data: Bytes, upgraded: bool) -> HttpTask {
+            if upgraded {
+                HttpTask::UpgradedBody(Some(data), false)
+            } else {
+                HttpTask::Body(Some(data), false)
+            }
+        }
+
         if !cache.enabled() {
             // Cache is disabled due to internal error
             // TODO: if nothing is sent to eyeball yet, figure out a way to recovery by
@@ -2309,7 +2323,7 @@ impl ServeFromCache {
                 }
                 loop {
                     if let Some(b) = cache.hit_handler().read_body().await? {
-                        return Ok(HttpTask::Body(Some(b), false)); // false for now
+                        return Ok(body_task(b, upgraded));
                     }
                     // EOF from hit handler for body requested
                     // if multipart, then seek again
@@ -2328,7 +2342,7 @@ impl ServeFromCache {
                 // safety: caller of enable_miss() call it only if the async_body_reader exist
                 loop {
                     if let Some(b) = cache.miss_body_reader().unwrap().read_body().await? {
-                        return Ok(HttpTask::Body(Some(b), false)); // false for now
+                        return Ok(body_task(b, upgraded));
                     } else {
                         // EOF from hit handler for body requested
                         // if multipart, then seek again

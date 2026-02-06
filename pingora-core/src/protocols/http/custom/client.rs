@@ -48,6 +48,8 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_header(&self) -> Option<&ResponseHeader>;
 
+    fn was_upgraded(&self) -> bool;
+
     fn digest(&self) -> Option<&Digest>;
 
     fn digest_mut(&mut self) -> Option<&mut Digest>;
@@ -116,6 +118,10 @@ impl Session for () {
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         unreachable!("client session: response_header")
+    }
+
+    fn was_upgraded(&self) -> bool {
+        unreachable!("client session: was upgraded")
     }
 
     fn digest(&self) -> Option<&Digest> {

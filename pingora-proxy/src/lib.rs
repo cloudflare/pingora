@@ -63,6 +63,7 @@ use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
+use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
@@ -356,7 +357,7 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) => self
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
                 .inner
                 .upstream_response_body_filter(session, data, *eos, ctx)?,
             HttpTask::Trailer(Some(trailers)) => {
@@ -378,13 +379,19 @@ where
         mut session: Session,
         ctx: &mut SV::CTX,
         reuse: bool,
-        error: Option<&Error>,
+        error: Option<Box<Error>>,
     ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        self.inner.logging(&mut session, error, ctx).await;
+        self.inner
+            .logging(&mut session, error.as_deref(), ctx)
+            .await;
+
+        if let Some(e) = error {
+            session.downstream_session.on_proxy_failure(e);
+        }
 
         if reuse {
             // TODO: log error
@@ -435,6 +442,8 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
+    upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -456,6 +465,7 @@ impl Session {
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
         }
     }
@@ -553,6 +563,7 @@ impl Session {
     }
 
     pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
         for task in tasks.iter_mut() {
             match task {
                 HttpTask::Header(resp, end) => {
@@ -561,6 +572,11 @@ impl Session {
                         .await?;
                 }
                 HttpTask::Body(data, end) => {
+                    self.downstream_modules_ctx
+                        .response_body_filter(data, *end)?;
+                }
+                HttpTask::UpgradedBody(data, end) => {
+                    seen_upgraded = true;
                     self.downstream_modules_ctx
                         .response_body_filter(data, *end)?;
                 }
@@ -574,6 +590,7 @@ impl Session {
                         //
                         // Note, this will not work if end of stream has already
                         // been seen or we've written content-length bytes.
+                        // (Trailers should never come after upgraded body)
                         *task = HttpTask::Body(Some(buf), true);
                     }
                 }
@@ -587,7 +604,11 @@ impl Session {
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
                     if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        *task = HttpTask::Body(Some(buf), true);
+                        if seen_upgraded {
+                            *task = HttpTask::UpgradedBody(Some(buf), true);
+                        } else {
+                            *task = HttpTask::Body(Some(buf), true);
+                        }
                     }
                 }
                 _ => { /* Failed */ }
@@ -615,6 +636,16 @@ impl Session {
     /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
         self.upstream_body_bytes_received = n;
+    }
+
+    /// Get the upstream write pending time recorded by the proxy layer. Returns [`Duration::ZERO`] for HTTP/2.
+    pub fn upstream_write_pending_time(&self) -> Duration {
+        self.upstream_write_pending_time
+    }
+
+    /// Set the upstream write pending time. Intended for internal use by proxy layer.
+    pub(crate) fn set_upstream_write_pending_time(&mut self, d: Duration) {
+        self.upstream_write_pending_time = d;
     }
 
     /// Is the proxy process in the process of shutting down (e.g. due to graceful upgrade)?
@@ -752,7 +783,7 @@ where
 
         if let Some((reuse, err)) = self.proxy_cache(&mut session, &mut ctx).await {
             // cache hit
-            return self.finish(session, &mut ctx, reuse, err.as_deref()).await;
+            return self.finish(session, &mut ctx, reuse, err).await;
         }
         // either uncacheable, or cache miss
 
@@ -888,7 +919,7 @@ where
         }
 
         // logging() will be called in finish()
-        self.finish(session, &mut ctx, server_reuse, final_error.as_deref())
+        self.finish(session, &mut ctx, server_reuse, final_error)
             .await
     }
 
@@ -914,6 +945,8 @@ where
         }
         self.inner.logging(&mut session, Some(&e), ctx).await;
         self.cleanup_sub_req(&mut session);
+
+        session.downstream_session.on_proxy_failure(e);
 
         if res.can_reuse_downstream {
             let persistent_settings = HttpPersistentSettings::for_session(&session);
@@ -988,6 +1021,29 @@ pub struct SubrequestSpawner {
     app: Arc<dyn Subrequest + Send + Sync>,
 }
 
+/// A [`PreparedSubrequest`] that is ready to run.
+pub struct PreparedSubrequest {
+    app: Arc<dyn Subrequest + Send + Sync>,
+    session: Box<HttpSession>,
+    sub_req_ctx: Box<SubrequestCtx>,
+}
+
+impl PreparedSubrequest {
+    pub async fn run(self) {
+        self.app
+            .process_subrequest(self.session, self.sub_req_ctx)
+            .await
+    }
+
+    pub fn session(&self) -> &HttpSession {
+        self.session.as_ref()
+    }
+
+    pub fn session_mut(&mut self) -> &mut HttpSession {
+        self.session.deref_mut()
+    }
+}
+
 impl SubrequestSpawner {
     /// Create a new [`SubrequestSpawner`].
     pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
@@ -1016,6 +1072,35 @@ impl SubrequestSpawner {
                 .process_subrequest(Box::new(session), sub_req_ctx)
                 .await;
         })
+    }
+
+    /// Create a subrequest that listens to `HttpTask`s sent from the returned `Sender`
+    /// and sends `HttpTask`s to the returned `Receiver`.
+    ///
+    /// To run that subrequest, call `run()`.
+    // TODO: allow configuring the subrequest session before use
+    pub fn create_subrequest(
+        &self,
+        session: &HttpSession,
+        ctx: SubrequestCtx,
+    ) -> (PreparedSubrequest, SubrequestHandle) {
+        let new_app = self.app.clone(); // Clone the Arc
+        let (mut session, handle) = subrequest::create_session(session);
+        if ctx.body_mode() == BodyMode::NoBody {
+            session
+                .as_subrequest_mut()
+                .expect("created subrequest session")
+                .clear_request_body_headers();
+        }
+        let sub_req_ctx = Box::new(ctx);
+        (
+            PreparedSubrequest {
+                app: new_app,
+                session: Box::new(session),
+                sub_req_ctx,
+            },
+            handle,
+        )
     }
 }
 
