@@ -415,11 +415,11 @@ fn parse_accept_encoding(accept_encoding: Option<&http::HeaderValue>, list: &mut
             return;
         }
         // properly parse AC header
-        match sfv::Parser::parse_list(ac.as_bytes()) {
+        match sfv::Parser::new(ac.as_bytes()).parse_list() {
             Ok(parsed) => {
                 for item in parsed {
                     if let sfv::ListEntry::Item(i) = item {
-                        if let Some(s) = i.bare_item.as_token() {
+                        if let Some(s) = i.bare_item.as_token().map(sfv::TokenRef::as_str) {
                             // TODO: support q value
                             let algorithm = Algorithm::from(s);
                             // ignore algorithms that we don't understand ignore
