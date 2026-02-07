@@ -669,6 +669,21 @@ impl DerefMut for Session {
     }
 }
 
+impl Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("downstream_session", &"HttpSession")
+            .field("cache", &"HttpCache")
+            .field("upstream_compression", &"ResponseCompressionCtx")
+            .field("ignore_downstream_range", &self.ignore_downstream_range)
+            .field(
+                "upstream_headers_mutated_for_cache",
+                &self.upstream_headers_mutated_for_cache,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 // generic HTTP 502 response sent when proxy_upstream_filter refuses to connect to upstream
 static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     let mut resp = ResponseHeader::build(http::StatusCode::BAD_GATEWAY, Some(3)).unwrap();
