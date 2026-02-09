@@ -82,6 +82,10 @@ pub struct HttpSession {
     ignore_info_resp: bool,
     /// Disable keepalive if response is sent before downstream body is finished
     close_on_response_before_downstream_finish: bool,
+
+    /// Number of times the upstream connection associated with this session can be reused
+    /// after this session ends
+    keepalive_reuses_remaining: Option<u32>,
 }
 
 impl HttpSession {
@@ -121,6 +125,7 @@ impl HttpSession {
             ignore_info_resp: false,
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
+            keepalive_reuses_remaining: None,
         }
     }
 
@@ -644,9 +649,20 @@ impl HttpSession {
         }
     }
 
+    pub fn set_keepalive_reuses_remaining(&mut self, remaining: Option<u32>) {
+        self.keepalive_reuses_remaining = remaining;
+    }
+
+    pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
+        self.keepalive_reuses_remaining
+    }
+
     /// Return whether the session will be keepalived for connection reuse.
     pub fn will_keepalive(&self) -> bool {
-        !matches!(self.keepalive_timeout, KeepaliveStatus::Off)
+        !matches!(
+            (&self.keepalive_timeout, self.keepalive_reuses_remaining),
+            (KeepaliveStatus::Off, _) | (_, Some(0))
+        )
     }
 
     // `Keep-Alive: timeout=5, max=1000` => 5, 1000
@@ -1066,25 +1082,22 @@ impl HttpSession {
     /// returned. If there was an error while draining any remaining request body that error will
     /// be returned.
     pub async fn reuse(mut self) -> Result<Option<Stream>> {
-        match self.keepalive_timeout {
-            KeepaliveStatus::Off => {
-                debug!("HTTP shutdown connection");
-                self.shutdown().await;
+        if !self.will_keepalive() {
+            debug!("HTTP shutdown connection");
+            self.shutdown().await;
+            Ok(None)
+        } else {
+            self.drain_request_body().await?;
+            // XXX: currently pipelined requests are not properly read without
+            // pipelining support, and pingora 400s if pipelined requests are sent
+            // in the middle of another request.
+            // We will mark the connection as un-reusable so it may be closed,
+            // the pipelined request left unread, and the client can attempt to resend
+            if self.body_reader.has_bytes_overread() {
+                debug!("bytes overread on request, disallowing reuse");
                 Ok(None)
-            }
-            _ => {
-                self.drain_request_body().await?;
-                // XXX: currently pipelined requests are not properly read without
-                // pipelining support, and pingora 400s if pipelined requests are sent
-                // in the middle of another request.
-                // We will mark the connection as un-reusable so it may be closed,
-                // the pipelined request left unread, and the client can attempt to resend
-                if self.body_reader.has_bytes_overread() {
-                    debug!("bytes overread on request, disallowing reuse");
-                    Ok(None)
-                } else {
-                    Ok(Some(self.underlying_stream))
-                }
+            } else {
+                Ok(Some(self.underlying_stream))
             }
         }
     }
@@ -2579,6 +2592,39 @@ Content-Length: 5\r\n\
 
         // Should NOT be chunked - identity is final encoding
         assert!(!http_stream.is_chunked_encoding());
+    }
+
+    #[tokio::test]
+    async fn test_no_more_reuses_explicitly_disables_reuse() {
+        init_log();
+        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&wire_req[..])
+            .write(wire_header)
+            .build();
+        let mut http_session = HttpSession::new(Box::new(mock_io));
+
+        // Setting the number of keepalive reuses here overrides the keepalive
+        // setting below
+        http_session.set_keepalive_reuses_remaining(Some(0));
+
+        http_session.read_request().await.unwrap();
+
+        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_session.update_resp_headers = false;
+        http_session
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+
+        assert_eq!(http_session.body_writer.body_mode, BodyMode::UntilClose(0));
+
+        http_session.finish_body().await.unwrap().unwrap();
+
+        http_session.set_keepalive(Some(100));
+        let reused = http_session.reuse().await.unwrap();
+        assert!(reused.is_none());
     }
 
     #[tokio::test]
