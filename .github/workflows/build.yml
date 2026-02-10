@@ -52,7 +52,7 @@ jobs:
 
       - name: Run cargo audit
         run: |
-          [[ ${{ matrix.toolchain }} != 1.91.1 ]] || (cargo install --locked cargo-audit && cargo audit)
+          [[ ${{ matrix.toolchain }} != 1.91.1 ]] || (cargo install --locked cargo-audit && cargo generate-lockfile --ignore-rust-version && cargo audit)
 
       - name: Run cargo machete
         run: |
