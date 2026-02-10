@@ -20,3 +20,19 @@ static MY_COUNTER: Lazy<IntGauge> = Lazy::new(|| {
 ```
 
 This static metric will automatically appear in the Prometheus metric endpoint.
+
+## Prometheus Crate Version Compatibility
+
+**Important:** Your application must use the same version of the `prometheus` crate as Pingora. Using different versions will result in separate metric registries, causing your metrics to not appear in the Prometheus endpoint.
+
+To ensure compatibility, either:
+
+1. Match the exact `prometheus` version that Pingora uses (check `pingora-core`'s `Cargo.toml`)
+2. Use `version = "*"` in your `Cargo.toml` to automatically match Pingora's version:
+
+```toml
+[dependencies]
+prometheus = "*"
+```
+
+This is necessary because the `prometheus` crate uses semantic versioning where 0.x versions are considered incompatible (e.g., 0.13 and 0.14 maintain separate global registries).
