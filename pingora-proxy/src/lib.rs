@@ -167,7 +167,8 @@ where
         inner: SV,
         conf: Arc<ServerConf>,
         connector: C,
-        on_custom: ProcessCustomSession<SV, C>,
+        on_custom: Option<ProcessCustomSession<SV, C>>,
+        server_options: Option<HttpServerOptions>,
     ) -> Self
     where
         SV: ProxyHttp + Send + Sync + 'static,
@@ -181,10 +182,10 @@ where
             client_upstream,
             shutdown: Notify::new(),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            server_options: None,
+            server_options,
             downstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
-            process_custom_session: Some(on_custom),
+            process_custom_session: on_custom,
             h2_options: None,
         }
     }
@@ -1191,7 +1192,7 @@ use pingora_core::services::listening::Service;
 /// // In your custom accept loop:
 /// loop {
 ///     let (stream, addr) = listener.accept().await?;
-///     
+///
 ///     // Peek SNI, decide routing...
 ///     if should_terminate_tls {
 ///         let tls_stream = my_acceptor.accept(stream).await?;
@@ -1250,8 +1251,126 @@ where
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
-    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, on_custom);
+    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None);
     proxy.handle_init_modules();
 
     Service::new(name.to_string(), proxy)
+}
+
+/// A builder for a [Service] that can be used to create a [HttpProxy] instance
+///
+/// The [ProxyServiceBuilder] can be used to construct a [HttpProxy] service with a custom name,
+/// connector, and custom session handler.
+///
+pub struct ProxyServiceBuilder<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    conf: Arc<ServerConf>,
+    inner: SV,
+    name: String,
+    connector: C,
+    custom: Option<ProcessCustomSession<SV, C>>,
+    server_options: Option<HttpServerOptions>,
+}
+
+impl<SV> ProxyServiceBuilder<SV, ()>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+{
+    /// Create a new [ProxyServiceBuilder] with the given [ServerConf] and [ProxyHttp]
+    /// implementation.
+    ///
+    /// The returned builder can be used to construct a [HttpProxy] service with a custom name,
+    /// connector, and custom session handler.
+    ///
+    /// The [ProxyServiceBuilder] will default to using the [ProxyHttp] implementation and no custom
+    /// session handler.
+    ///
+    pub fn new(conf: &Arc<ServerConf>, inner: SV) -> Self {
+        ProxyServiceBuilder {
+            conf: conf.clone(),
+            inner,
+            name: "Pingora HTTP Proxy Service".into(),
+            connector: (),
+            custom: None,
+            server_options: None,
+        }
+    }
+}
+
+impl<SV, C> ProxyServiceBuilder<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    /// Sets the name of the [HttpProxy] service.
+    pub fn name(mut self, name: impl AsRef<str>) -> Self {
+        self.name = name.as_ref().to_owned();
+        self
+    }
+
+    /// Set a custom connector and custom session handler for the [ProxyServiceBuilder].
+    ///
+    /// The custom connector is used to establish a connection to the upstream server.
+    ///
+    /// The custom session handler is used to handle custom protocol specific logic
+    /// between the proxy and the upstream server.
+    ///
+    /// Returns a new [ProxyServiceBuilder] with the custom connector and session handler.
+    pub fn custom<C2: custom::Connector>(
+        self,
+        connector: C2,
+        on_custom: ProcessCustomSession<SV, C2>,
+    ) -> ProxyServiceBuilder<SV, C2> {
+        let Self {
+            conf,
+            inner,
+            name,
+            server_options,
+            ..
+        } = self;
+        ProxyServiceBuilder {
+            conf,
+            inner,
+            name,
+            connector,
+            custom: Some(on_custom),
+            server_options,
+        }
+    }
+
+    /// Set the server options for the [ProxyServiceBuilder].
+    ///
+    /// Returns a new [ProxyServiceBuilder] with the server options set.
+    pub fn server_options(mut self, options: HttpServerOptions) -> Self {
+        self.server_options = Some(options);
+        self
+    }
+
+    /// Builds a new [Service] from the [ProxyServiceBuilder].
+    ///
+    /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
+    /// a fully initialized [HttpProxy].
+    ///
+    /// The returned [Service] is ready to be used by a [pingora_core::server::Server].
+    pub fn build(self) -> Service<HttpProxy<SV, C>> {
+        let Self {
+            conf,
+            inner,
+            name,
+            connector,
+            custom,
+            server_options,
+        } = self;
+
+        let mut proxy = HttpProxy::new_custom(inner, conf, connector, custom, server_options);
+
+        proxy.handle_init_modules();
+        Service::new(name, proxy)
+    }
 }
