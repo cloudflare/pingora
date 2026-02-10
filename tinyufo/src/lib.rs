@@ -215,11 +215,11 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                 };
                 let old = buckets.insert(key, bucket);
                 if old.is_none() {
-                    // Always push key first before updating weight
-                    // If doing the other order, another concurrent thread might not
-                    // find things to evict
-                    self.small.push(key);
+                    // Always updating weight's before push key
+                    // another concurrent thread might evict it before we add weight's
+                    // risking an usize underflow
                     self.small_weight.fetch_add(weight as usize, SeqCst);
+                    self.small.push(key);
                 } // else: two threads are racing adding the item
                   // TODO: compare old.weight and update accordingly
                 return evicted;
