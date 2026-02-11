@@ -118,11 +118,50 @@ pub trait TlsAccept {
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 
+/// Callback for processing raw bytes before TLS handshake.
+///
+/// This trait allows applications to read and process data from the raw TCP stream
+/// before the TLS handshake occurs. This is useful for protocols like HAProxy's
+/// PROXY protocol, which sends client address information before TLS.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use pingora_core::listeners::PreTlsProcess;
+/// use pingora_core::protocols::l4::stream::Stream as L4Stream;
+/// use async_trait::async_trait;
+///
+/// struct ProxyProtocolHandler;
+///
+/// #[async_trait]
+/// impl PreTlsProcess for ProxyProtocolHandler {
+///     async fn process(&self, stream: &mut L4Stream) -> pingora_error::Result<()> {
+///         // Read PROXY protocol header, update socket digest, etc.
+///         Ok(())
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait PreTlsProcess: Send + Sync {
+    /// Process the raw stream before TLS handshake.
+    ///
+    /// The implementation can read bytes from the stream (e.g., PROXY protocol header)
+    /// and update the stream's socket digest with parsed information such as the
+    /// real client address.
+    ///
+    /// If this method returns an error, the connection will be dropped.
+    async fn process(&self, stream: &mut L4Stream) -> Result<()>;
+}
+
+/// Type alias for a boxed pre-TLS processor.
+pub type PreTlsCallback = Arc<dyn PreTlsProcess>;
+
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
+    pre_tls_callback: Option<PreTlsCallback>,
 }
 
 impl TransportStackBuilder {
@@ -148,6 +187,7 @@ impl TransportStackBuilder {
         Ok(TransportStack {
             l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            pre_tls_callback: self.pre_tls_callback.clone(),
         })
     }
 }
@@ -156,6 +196,7 @@ impl TransportStackBuilder {
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
+    pre_tls_callback: Option<PreTlsCallback>,
 }
 
 impl TransportStack {
@@ -168,6 +209,7 @@ impl TransportStack {
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
+            pre_tls_callback: self.pre_tls_callback.clone(),
         })
     }
 
@@ -179,11 +221,18 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    pre_tls_callback: Option<PreTlsCallback>,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
+
+        // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
+        if let Some(ref callback) = self.pre_tls_callback {
+            callback.process(&mut self.l4).await?;
+        }
+
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
@@ -205,6 +254,7 @@ pub struct Listeners {
     stacks: Vec<TransportStackBuilder>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
+    pre_tls_callback: Option<PreTlsCallback>,
 }
 
 impl Listeners {
@@ -214,6 +264,7 @@ impl Listeners {
             stacks: vec![],
             #[cfg(feature = "connection_filter")]
             connection_filter: None,
+            pre_tls_callback: None,
         }
     }
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
@@ -294,6 +345,35 @@ impl Listeners {
         }
     }
 
+    /// Set a pre-TLS callback for all endpoints in this listener collection.
+    ///
+    /// The callback will be invoked after TCP accept but before the TLS handshake,
+    /// allowing the application to read and process data such as PROXY protocol
+    /// headers that arrive before TLS.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pingora_core::listeners::{Listeners, PreTlsProcess};
+    /// use std::sync::Arc;
+    ///
+    /// let callback = Arc::new(MyProxyProtocolHandler::new());
+    /// let mut listeners = Listeners::new();
+    /// listeners.set_pre_tls_callback(callback);
+    /// listeners.add_tls("0.0.0.0:443", "cert.pem", "key.pem")?;
+    /// ```
+    pub fn set_pre_tls_callback(&mut self, callback: PreTlsCallback) {
+        log::debug!("Setting pre-TLS callback on Listeners");
+
+        // Store the callback for future endpoints
+        self.pre_tls_callback = Some(callback.clone());
+
+        // Apply to existing stacks
+        for stack in &mut self.stacks {
+            stack.pre_tls_callback = Some(callback.clone());
+        }
+    }
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
@@ -301,6 +381,7 @@ impl Listeners {
             tls,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
+            pre_tls_callback: self.pre_tls_callback.clone(),
         })
     }
 

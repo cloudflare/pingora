@@ -452,6 +452,19 @@ impl Session {
         }
     }
 
+    /// Give up the H2 stream with a custom reason.
+    ///
+    /// For H2, this sends a `RST_STREAM` frame with the specified reason.
+    /// For H1, subrequests, and custom sessions, this is a no-op since they don't support
+    /// stream reset reasons.
+    ///
+    /// See [`super::v2::server::HttpSession::shutdown_with_reason`] for available reasons.
+    pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
+        if let Self::H2(s) = self {
+            s.shutdown_with_reason(reason);
+        }
+    }
+
     pub fn to_h1_raw(&self) -> Bytes {
         match self {
             Self::H1(s) => s.get_headers_raw_bytes(),

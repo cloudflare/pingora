@@ -477,10 +477,23 @@ impl HttpSession {
 
     /// Give up the stream abruptly.
     ///
-    /// This will send a `INTERNAL_ERROR` stream error to the client
+    /// This will send an `INTERNAL_ERROR` stream error to the client.
     pub fn shutdown(&mut self) {
+        self.shutdown_with_reason(h2::Reason::INTERNAL_ERROR);
+    }
+
+    /// Give up the stream abruptly with a custom reason.
+    ///
+    /// This will send a `RST_STREAM` frame with the given reason to the client.
+    ///
+    /// Useful reasons include:
+    /// - [`h2::Reason::HTTP_1_1_REQUIRED`] - Signal to the client that HTTP/1.1 should be used
+    ///   instead. Per RFC 7540 §9.1.2, clients should retry the request over HTTP/1.1.
+    /// - [`h2::Reason::CANCEL`] - Indicate the stream is no longer needed.
+    /// - [`h2::Reason::REFUSED_STREAM`] - Indicate the stream was refused before processing.
+    pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
         if !self.ended {
-            self.send_response.send_reset(h2::Reason::INTERNAL_ERROR);
+            self.send_response.send_reset(reason);
         }
     }
 
