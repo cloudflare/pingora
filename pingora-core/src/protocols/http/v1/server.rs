@@ -331,16 +331,21 @@ impl HttpSession {
         // ad-hoc checks
         super::common::check_dup_content_length(&req_header.headers)?;
 
-        // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
-        // HTTP/1.0 requests with Transfer-Encoding MUST be treated as having faulty framing.
-        // We reject with 400 Bad Request and close the connection.
-        if req_header.version == http::Version::HTTP_10
-            && req_header.headers.contains_key(TRANSFER_ENCODING)
-        {
-            return Error::e_explain(
-                InvalidHTTPHeader,
-                "HTTP/1.0 requests cannot include Transfer-Encoding header",
-            );
+        if req_header.headers.contains_key(TRANSFER_ENCODING) {
+            // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
+            // HTTP/1.0 requests with Transfer-Encoding MUST be treated as having faulty framing.
+            // We reject with 400 Bad Request and close the connection.
+            if req_header.version == http::Version::HTTP_10 {
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    "HTTP/1.0 requests cannot include Transfer-Encoding header",
+                );
+            }
+            // If chunked is not the final Transfer-Encoding, reject request
+            // See https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.4.3
+            if !self.is_chunked_encoding() {
+                return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
+            }
         }
         // validate content-length value if present to avoid ambiguous framing
         self.get_content_length()?;
@@ -2588,10 +2593,8 @@ Content-Length: 5\r\n\
 
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        // Should NOT be chunked - identity is final encoding
-        assert!(!http_stream.is_chunked_encoding());
+        // should fail validation
+        http_stream.read_request().await.unwrap_err();
     }
 
     #[tokio::test]
