@@ -29,7 +29,7 @@ pub trait BackendSelection: Sized {
     type Iter;
 
     /// The configuration type constructing [BackendSelection]
-    type Config;
+    type Config: Send + Sync;
 
     /// Create a [BackendSelection] from a set of backends and the given configuration. The
     /// default implementation ignores the configuration and simply calls [Self::build]

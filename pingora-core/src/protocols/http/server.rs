@@ -25,7 +25,7 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::Result;
+use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
 
@@ -249,6 +249,21 @@ impl Session {
                 s.finish().await?;
                 Ok(None)
             }
+        }
+    }
+
+    /// Callback for cleanup logic on downstream specifically when we fail to proxy the session
+    /// other than cleanup via finish().
+    ///
+    /// If caching the downstream failure may be independent of (and precede) an upstream error in
+    /// which case this function may be called more than once.
+    pub fn on_proxy_failure(&mut self, e: Box<Error>) {
+        match self {
+            Self::H1(_) | Self::H2(_) | Self::Custom(_) => {
+                // all cleanup logic handled in finish(),
+                // stream and resources dropped when session dropped
+            }
+            Self::Subrequest(ref mut s) => s.on_proxy_failure(e),
         }
     }
 
@@ -648,12 +663,22 @@ impl Session {
         }
     }
 
-    /// Whether this request is for upgrade (e.g., websocket)
+    /// Whether this request is for upgrade (e.g., websocket).
     pub fn is_upgrade_req(&self) -> bool {
         match self {
             Self::H1(s) => s.is_upgrade_req(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.is_upgrade_req(),
+            Self::Custom(_) => false,
+        }
+    }
+
+    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    pub fn was_upgraded(&self) -> bool {
+        match self {
+            Self::H1(s) => s.was_upgraded(),
+            Self::H2(_) => false,
+            Self::Subrequest(s) => s.was_upgraded(),
             Self::Custom(_) => false,
         }
     }

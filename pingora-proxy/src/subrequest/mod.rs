@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Bytes;
 use pingora_cache::lock::{CacheKeyLockImpl, LockStatus, WritePermit};
 use pingora_cache::CacheKey;
 use pingora_core::protocols::http::subrequest::server::{
@@ -19,10 +20,21 @@ use pingora_core::protocols::http::subrequest::server::{
 };
 use std::any::Any;
 
+pub mod pipe;
+
 struct LockCtx {
     write_permit: WritePermit,
     cache_lock: &'static CacheKeyLockImpl,
     key: CacheKey,
+}
+
+// Thin wrapper to allow iterating over InputBody Vec.
+pub(crate) struct InputBodyReader(std::vec::IntoIter<Bytes>);
+
+impl InputBodyReader {
+    pub fn read_body(&mut self) -> Option<Bytes> {
+        self.0.next()
+    }
 }
 
 /// Optional user-defined subrequest context.

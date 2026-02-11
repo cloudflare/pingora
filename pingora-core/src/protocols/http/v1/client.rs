@@ -55,7 +55,10 @@ pub struct HttpSession {
     bytes_sent: usize,
     /// Total response body payload bytes received from upstream
     body_recv: usize,
+    // Tracks whether upgrade handshake was successfully completed
     upgraded: bool,
+    // Tracks whether downstream request body started sending upgraded bytes
+    received_upgrade_req_body: bool,
 }
 
 /// HTTP 1.x client session
@@ -85,6 +88,7 @@ impl HttpSession {
             bytes_sent: 0,
             body_recv: 0,
             upgraded: false,
+            received_upgrade_req_body: false,
         }
     }
     /// Write the request header to the server
@@ -150,7 +154,7 @@ impl HttpSession {
     }
 
     fn maybe_force_close_body_reader(&mut self) {
-        if self.upgraded && !self.body_reader.body_done() {
+        if self.upgraded && self.received_upgrade_req_body && !self.body_reader.body_done() {
             // request is done, reset the response body to close
             self.body_reader.init_content_length(0, b"");
         }
@@ -321,9 +325,22 @@ impl HttpSession {
                     }
 
                     self.buf = buf;
-                    self.upgraded = self.is_upgrade(&response_header).unwrap_or(false);
                     self.response_header = Some(response_header);
                     self.validate_response()?;
+                    // convert to upgrade body type
+                    // https://datatracker.ietf.org/doc/html/rfc9110#status.101
+                    // as an "informational" header, this cannot have a body
+                    self.upgraded = self
+                        .is_upgrade(self.response_header.as_deref().expect("init above"))
+                        .unwrap_or(false);
+                    if self.upgraded {
+                        // upgrade response is definitely final response, so we can init body
+                        // reader (next read_response_task will also initialize but prefer to
+                        // update body reader and writer at the same time for easier reasoning)
+                        self.init_body_reader();
+                        // note that the (request) body writer is converted to http10
+                        // when the upgraded body tasks are received
+                    }
                     return Ok(s);
                 }
                 HeaderParseState::Partial => { /* continue the loop */ }
@@ -444,7 +461,7 @@ impl HttpSession {
     /// For HTTP 1.1, assume keepalive as long as there is no `Connection: Close` request header.
     /// For HTTP 1.0, only keepalive if there is an explicit header `Connection: keep-alive`.
     pub fn respect_keepalive(&mut self) {
-        if self.get_status() == Some(StatusCode::SWITCHING_PROTOCOLS) {
+        if self.upgraded || self.get_status() == Some(StatusCode::SWITCHING_PROTOCOLS) {
             // make sure the connection is closed at the end when 101/upgrade is used
             self.set_keepalive(None);
             return;
@@ -607,6 +624,23 @@ impl HttpSession {
         }
     }
 
+    /// Was this request successfully turned into an upgraded connection?
+    ///
+    /// Both the request had to have been an `Upgrade` request
+    /// and the response had to have been a `101 Switching Protocols`.
+    pub fn was_upgraded(&self) -> bool {
+        self.upgraded
+    }
+
+    /// If upgraded but not yet converted, then body writer will be
+    /// converted to http1.0 mode (pass through bytes as-is).
+    pub fn maybe_upgrade_body_writer(&mut self) {
+        if self.was_upgraded() {
+            self.received_upgrade_req_body = true;
+            self.body_writer.convert_to_http10();
+        }
+    }
+
     fn get_content_length(&self) -> Option<usize> {
         buf_to_content_length(
             self.get_header(header::CONTENT_LENGTH)
@@ -619,11 +653,7 @@ impl HttpSession {
     }
 
     fn init_req_body_writer(&mut self, header: &RequestHeader) {
-        if is_upgrade_req(header) {
-            self.body_writer.init_http10();
-        } else {
-            self.init_body_writer_comm(&header.headers)
-        }
+        self.init_body_writer_comm(&header.headers)
     }
 
     fn init_body_writer_comm(&mut self, headers: &HMap) {
@@ -679,8 +709,12 @@ impl HttpSession {
                 "Response body: {} bytes, end: {end_of_body}",
                 body.as_ref().map_or(0, |b| b.len())
             );
-            trace!("Response body: {body:?}");
-            Ok(HttpTask::Body(body, end_of_body))
+            trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
+            if self.upgraded {
+                Ok(HttpTask::UpgradedBody(body, end_of_body))
+            } else {
+                Ok(HttpTask::Body(body, end_of_body))
+            }
         }
         // TODO: support h1 trailer
     }
@@ -786,7 +820,7 @@ impl UniqueID for HttpSession {
 #[cfg(test)]
 mod tests_stream {
     use super::*;
-    use crate::protocols::http::v1::body::ParseState;
+    use crate::protocols::http::v1::body::{BodyMode, ParseState};
     use crate::ErrorType;
     use tokio_test::io::Builder;
 
@@ -1272,31 +1306,229 @@ mod tests_stream {
 
     #[tokio::test]
     async fn init_body_for_upgraded_req() {
-        use crate::protocols::http::v1::body::BodyMode;
-
         let wire =
             b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let input1 = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+        let input2 = b"PAYLOAD";
+        let ws_data = b"data";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(&input1[..])
+            .write(&ws_data[..])
+            .read(&input2[..])
+            .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
         new_request.insert_header("Connection", "Upgrade").unwrap();
         new_request.insert_header("Upgrade", "WS").unwrap();
-        // CL is ignored when Upgrade presents
         new_request.insert_header("Content-Length", "0").unwrap();
         let _ = http_stream
             .write_request_header(Box::new(new_request))
             .await
             .unwrap();
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(0, 0)
+        );
+        assert!(http_stream.body_writer.finished());
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 101);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // changed body mode
+        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+        // request writer will be explicitly initialized in a separate call
+        assert!(http_stream.body_writer.finished());
+        http_stream.maybe_upgrade_body_writer();
+
+        assert!(!http_stream.body_writer.finished());
         assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+
+        http_stream.write_body(&ws_data[..]).await.unwrap();
+        // read WS
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be upgraded body")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn init_preread_body_for_upgraded_req() {
+        let wire =
+            b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
+        let input = b"HTTP/1.1 101 Switching Protocols\r\n\r\nPAYLOAD";
+        let ws_data = b"data";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(&input[..])
+            .write(&ws_data[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        new_request.insert_header("Connection", "Upgrade").unwrap();
+        new_request.insert_header("Upgrade", "WS").unwrap();
+        new_request.insert_header("Content-Length", "0").unwrap();
+        let _ = http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(0, 0)
+        );
+        assert!(http_stream.body_writer.finished());
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 101);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // changed body mode
+        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+        // request writer will be explicitly initialized in a separate call
+        assert!(http_stream.body_writer.finished());
+        http_stream.maybe_upgrade_body_writer();
+
+        assert!(!http_stream.body_writer.finished());
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+
+        http_stream.write_body(&ws_data[..]).await.unwrap();
+        // read WS
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &b"PAYLOAD"[..]);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be upgraded body")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_body_eos_after_upgrade() {
+        let wire =
+            b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 10\r\n\r\n";
+        let input1 = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+        let input2 = b"PAYLOAD";
+        let body_data = b"0123456789";
+        let ws_data = b"data";
+
+        let mock_io = Builder::new()
+            .write(wire)
+            .read(&input1[..])
+            .write(&body_data[..])
+            .read(&input2[..])
+            .write(&ws_data[..])
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        new_request.insert_header("Connection", "Upgrade").unwrap();
+        new_request.insert_header("Upgrade", "WS").unwrap();
+        new_request.insert_header("Content-Length", "10").unwrap();
+        let _ = http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(10, 0)
+        );
+        assert!(!http_stream.body_writer.finished());
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 101);
+                assert!(!eob);
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+        // changed body mode
+        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(0));
+
+        // write regular request payload
+        http_stream.write_body(&body_data[..]).await.unwrap();
+        http_stream.finish_body().await.unwrap();
+
+        // we should still be able to read more response body
+        // read WS
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::UpgradedBody(b, eob) => {
+                assert_eq!(b.unwrap(), &input2[..]);
+                assert!(!eob);
+            }
+            t => {
+                panic!("task {t:?} should be upgraded body")
+            }
+        }
+
+        // body IS finished, prior to upgrade on the downstream side
+        assert!(http_stream.body_writer.finished());
+        http_stream.maybe_upgrade_body_writer();
+
+        assert!(!http_stream.body_writer.finished());
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+
+        http_stream.write_body(&ws_data[..]).await.unwrap();
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(4));
+        http_stream.finish_body().await.unwrap();
     }
 
     #[tokio::test]
     async fn read_switching_protocol() {
         init_log();
+
+        let wire =
+            b"GET / HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: WS\r\nContent-Length: 0\r\n\r\n";
         let input1 = b"HTTP/1.1 101 Continue\r\n\r\n";
         let input2 = b"PAYLOAD";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        new_request.insert_header("Connection", "Upgrade").unwrap();
+        new_request.insert_header("Upgrade", "WS").unwrap();
+        new_request.insert_header("Content-Length", "0").unwrap();
+        let _ = http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        assert_eq!(
+            http_stream.body_writer.body_mode,
+            BodyMode::ContentLength(0, 0)
+        );
+        assert!(http_stream.body_writer.finished());
 
         // read 100 header first
         let task = http_stream.read_response_task().await.unwrap();
@@ -1312,18 +1544,18 @@ mod tests_stream {
         // read body
         let task = http_stream.read_response_task().await.unwrap();
         match task {
-            HttpTask::Body(b, eob) => {
+            HttpTask::UpgradedBody(b, eob) => {
                 assert_eq!(b.unwrap(), &input2[..]);
                 assert!(!eob);
             }
             _ => {
-                panic!("task should be body")
+                panic!("task should be upgraded body")
             }
         }
         // read body
         let task = http_stream.read_response_task().await.unwrap();
         match task {
-            HttpTask::Body(b, eob) => {
+            HttpTask::UpgradedBody(b, eob) => {
                 assert!(b.is_none());
                 assert!(eob);
             }

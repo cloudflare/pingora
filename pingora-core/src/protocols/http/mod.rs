@@ -37,8 +37,10 @@ pub const SERVER_NAME: &[u8; 7] = b"Pingora";
 pub enum HttpTask {
     /// the response header and the boolean end of response flag
     Header(Box<pingora_http::ResponseHeader>, bool),
-    /// A piece of response body and the end of response boolean flag
+    /// A piece of request or response body and the end of request/response boolean flag.
     Body(Option<bytes::Bytes>, bool),
+    /// Request or response body bytes that have been upgraded on H1.1, and EOF bool flag.
+    UpgradedBody(Option<bytes::Bytes>, bool),
     /// HTTP response trailer
     Trailer(Option<Box<http::HeaderMap>>),
     /// Signal that the response is already finished
@@ -53,6 +55,7 @@ impl HttpTask {
         match self {
             HttpTask::Header(_, end) => *end,
             HttpTask::Body(_, end) => *end,
+            HttpTask::UpgradedBody(_, end) => *end,
             HttpTask::Trailer(_) => true,
             HttpTask::Done => true,
             HttpTask::Failed(_) => true,
@@ -64,6 +67,7 @@ impl HttpTask {
         match self {
             HttpTask::Header(..) => "Header",
             HttpTask::Body(..) => "Body",
+            HttpTask::UpgradedBody(..) => "UpgradedBody",
             HttpTask::Trailer(_) => "Trailer",
             HttpTask::Done => "Done",
             HttpTask::Failed(_) => "Failed",

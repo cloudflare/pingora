@@ -43,6 +43,12 @@ impl DownstreamStateMachine {
         }
     }
 
+    /// Reset if we should continue reading from the downstream again.
+    /// Only used with upgraded connections when body mode changes.
+    pub fn reset(&mut self) {
+        *self = Self::Reading;
+    }
+
     pub fn to_errored(&mut self) {
         *self = Self::Errored
     }

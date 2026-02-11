@@ -194,7 +194,15 @@ impl BodyReader {
 
     pub fn init_content_length(&mut self, cl: usize, buf_to_rewind: &[u8]) {
         match cl {
-            0 => self.body_state = PS::Complete(0),
+            0 => {
+                self.body_state = PS::Complete(0);
+                // Store any extra bytes that were read as overread
+                if !buf_to_rewind.is_empty() {
+                    let mut overread = BytesMut::with_capacity(buf_to_rewind.len());
+                    overread.put_slice(buf_to_rewind);
+                    self.body_buf_overread = Some(overread);
+                }
+            }
             _ => {
                 self.prepare_buf(buf_to_rewind);
                 self.body_state = PS::Partial(0, cl);
@@ -204,6 +212,26 @@ impl BodyReader {
 
     pub fn init_http10(&mut self, buf_to_rewind: &[u8]) {
         self.prepare_buf(buf_to_rewind);
+        self.body_state = PS::HTTP1_0(0);
+    }
+
+    // Convert how we interpret the remainder of the body as pass through
+    // (HTTP/1.0).
+    //
+    // Does nothing if already converted to HTTP1.0 mode.
+    pub fn convert_to_http10(&mut self) {
+        if matches!(self.body_state, PS::HTTP1_0(_)) {
+            // nothing to do, already HTTP1.0
+            return;
+        }
+
+        if self.rewind_buf_len == 0 {
+            // take any extra bytes and send them as-is,
+            // reset body counter
+            let extra = self.body_buf_overread.take();
+            let buf = extra.as_deref().unwrap_or_default();
+            self.prepare_buf(buf);
+        } // if rewind_buf_len is not 0, body read has not yet been polled
         self.body_state = PS::HTTP1_0(0);
     }
 
@@ -898,6 +926,20 @@ impl BodyWriter {
 
     pub fn init_content_length(&mut self, cl: usize) {
         self.body_mode = BM::ContentLength(cl, 0);
+    }
+
+    // Convert how we interpret the remainder of the body as pass through
+    // (HTTP/1.0).
+    pub fn convert_to_http10(&mut self) {
+        if matches!(self.body_mode, BodyMode::HTTP1_0(_)) {
+            // nothing to do, already HTTP1.0
+            return;
+        }
+
+        // NOTE: any stream buffered data will be flushed in next
+        // HTTP1_0 write
+        // reset body state to HTTP1_0
+        self.body_mode = BM::HTTP1_0(0);
     }
 
     // NOTE on buffering/flush stream when writing the body
