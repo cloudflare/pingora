@@ -578,7 +578,6 @@ impl Server {
                 info!("Waiting for runtimes to exit!");
                 let join = thread::spawn(move || {
                     rt.shutdown_timeout(shutdown_timeout);
-                    thread::sleep(shutdown_timeout)
                 });
                 (join, name)
             })
