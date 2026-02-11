@@ -106,6 +106,20 @@ pub trait Session: Send + Sync + Unpin + 'static {
     fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>>;
 
     fn restore_custom_message_writer(&mut self, writer: Box<dyn CustomMessageWrite>) -> Result<()>;
+
+    /// Whether this request is for upgrade (e.g., websocket).
+    ///
+    /// Returns `true` if the request has HTTP/1.1 version and contains an Upgrade header.
+    fn is_upgrade_req(&self) -> bool {
+        false
+    }
+
+    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    ///
+    /// Returns `true` if the request was an upgrade request and a 101 response was sent.
+    fn was_upgraded(&self) -> bool {
+        false
+    }
 }
 
 #[doc(hidden)]
@@ -273,5 +287,13 @@ impl Session for () {
         _writer: Box<dyn CustomMessageWrite>,
     ) -> Result<()> {
         unreachable!("server session: restore_custom_message_writer")
+    }
+
+    fn is_upgrade_req(&self) -> bool {
+        unreachable!("server session: is_upgrade_req")
+    }
+
+    fn was_upgraded(&self) -> bool {
+        unreachable!("server session: was_upgraded")
     }
 }

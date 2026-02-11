@@ -688,7 +688,7 @@ impl Session {
             Self::H1(s) => s.is_upgrade_req(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.is_upgrade_req(),
-            Self::Custom(_) => false,
+            Self::Custom(s) => s.is_upgrade_req(),
         }
     }
 
@@ -698,7 +698,7 @@ impl Session {
             Self::H1(s) => s.was_upgraded(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.was_upgraded(),
-            Self::Custom(_) => false,
+            Self::Custom(s) => s.was_upgraded(),
         }
     }
 
