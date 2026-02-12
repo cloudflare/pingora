@@ -764,12 +764,10 @@ where
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
                     let persistent_settings = HttpPersistentSettings::for_session(&session);
-                    return session
-                        .downstream_session
-                        .finish()
+                    return self
+                        .inner
+                        .finish_downstream_session(session.downstream_session, &mut ctx)
                         .await
-                        .ok()
-                        .flatten()
                         .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
                 }
                 /* else continue */
