@@ -76,18 +76,28 @@ pub struct TimerStub(Arc<Notify>, Arc<AtomicBool>);
 impl TimerStub {
     /// Wait for the timer to expire.
     pub fn poll(self) -> TimerStubFuture {
-        TimerStubFuture {
-            notify: self.0.notified_owned(),
-            fired: self.1,
-        }
+        TimerStubFuture::new(self.0, self.1)
     }
 }
 
 pin_project! {
     pub struct TimerStubFuture {
+        notify_src: Option<Arc<Notify>>,
         #[pin]
-        notify: OwnedNotified,
-        fired: Arc<AtomicBool>
+        notified: Option<OwnedNotified>,
+        fired: Arc<AtomicBool>,
+        checked_once: bool,
+    }
+}
+
+impl TimerStubFuture {
+    fn new(notify: Arc<Notify>, fired: Arc<AtomicBool>) -> Self {
+        TimerStubFuture {
+            notify_src: Some(notify),
+            notified: None,
+            fired,
+            checked_once: false,
+        }
     }
 }
 
@@ -95,13 +105,24 @@ impl Future for TimerStubFuture {
     type Output = ();
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+        let mut this = self.project();
 
-        if this.fired.load(Ordering::SeqCst) {
-            return Poll::Ready(());
+        if !*this.checked_once {
+            *this.checked_once = true;
+
+            if this.fired.load(Ordering::SeqCst) {
+                return Poll::Ready(());
+            }
+
+            let notify = this.notify_src.take().expect("polled after completion");
+            this.notified.set(Some(notify.notified_owned()));
         }
 
-        this.notify.poll(cx)
+        this.notified
+            .as_mut()
+            .as_pin_mut()
+            .expect("initialized on first poll")
+            .poll(cx)
     }
 }
 
