@@ -29,11 +29,15 @@
 //! - drop: 10.694154ms total, 106ns avg per iteration
 
 use parking_lot::RwLock;
+use pin_project_lite::pin_project;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use thread_local::ThreadLocal;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
 
 const RESOLUTION_MS: u64 = 10;
@@ -71,11 +75,54 @@ pub struct TimerStub(Arc<Notify>, Arc<AtomicBool>);
 
 impl TimerStub {
     /// Wait for the timer to expire.
-    pub async fn poll(self) {
-        if self.1.load(Ordering::SeqCst) {
-            return;
+    pub fn poll(self) -> TimerStubFuture {
+        TimerStubFuture::new(self.0, self.1)
+    }
+}
+
+pin_project! {
+    pub struct TimerStubFuture {
+        notify_src: Option<Arc<Notify>>,
+        #[pin]
+        notified: Option<OwnedNotified>,
+        fired: Arc<AtomicBool>,
+        checked_once: bool,
+    }
+}
+
+impl TimerStubFuture {
+    fn new(notify: Arc<Notify>, fired: Arc<AtomicBool>) -> Self {
+        TimerStubFuture {
+            notify_src: Some(notify),
+            notified: None,
+            fired,
+            checked_once: false,
         }
-        self.0.notified().await;
+    }
+}
+
+impl Future for TimerStubFuture {
+    type Output = ();
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+
+        if !*this.checked_once {
+            *this.checked_once = true;
+
+            if this.fired.load(Ordering::SeqCst) {
+                return Poll::Ready(());
+            }
+
+            let notify = this.notify_src.take().expect("polled after completion");
+            this.notified.set(Some(notify.notified_owned()));
+        }
+
+        this.notified
+            .as_mut()
+            .as_pin_mut()
+            .expect("initialized on first poll")
+            .poll(cx)
     }
 }
 
