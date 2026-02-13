@@ -64,6 +64,11 @@ pub struct HttpServerOptions {
     /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
 
+    /// Allow proxying CONNECT requests when handling HTTP traffic.
+    ///
+    /// When disabled, CONNECT requests are rejected with 405 by proxy services.
+    pub allow_connect_method_proxying: bool,
+
     #[doc(hidden)]
     pub force_custom: bool,
 

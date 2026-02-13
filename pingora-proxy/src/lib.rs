@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
-use http::{header, version::Version};
+use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -251,6 +251,27 @@ where
             "Request header: {:?}",
             downstream_session.req_header().as_ref()
         );
+        // CONNECT method proxying is not default supported by the proxy http logic itself,
+        // since the tunneling process changes the request-response flow.
+        // https://datatracker.ietf.org/doc/html/rfc9110#name-connect
+        // Also because the method impacts message framing in a way is currently unaccounted for
+        // (https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.2)
+        // it is safest to disallow use of the method by default.
+        if !self
+            .server_options
+            .as_ref()
+            .is_some_and(|opts| opts.allow_connect_method_proxying)
+            && downstream_session.req_header().method == Method::CONNECT
+        {
+            downstream_session
+                .respond_error(405)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("failed to send error response to downstream: {e}");
+                });
+            downstream_session.shutdown().await;
+            return None;
+        }
         Some(downstream_session)
     }
 

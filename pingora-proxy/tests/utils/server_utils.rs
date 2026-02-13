@@ -748,6 +748,14 @@ fn test_main() {
     #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
 
+    let mut proxy_service_http_connect =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+    let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.allow_connect_method_proxying = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_http_connect.add_tcp("0.0.0.0:6160");
+
     let mut proxy_service_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
 
@@ -791,6 +799,7 @@ fn test_main() {
     let mut services: Vec<Box<dyn Service>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
+        Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
     ];
 

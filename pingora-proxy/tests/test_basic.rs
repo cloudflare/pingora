@@ -21,7 +21,8 @@ use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::init;
 
@@ -743,6 +744,77 @@ async fn test_connect_close() {
     assert_eq!(headers[header::CONNECTION], "close");
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
+}
+
+#[tokio::test]
+async fn test_connect_proxying_disallowed_h1() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let request = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+    stream.write_all(request).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 405 "));
+}
+
+#[tokio::test]
+async fn test_connect_proxying_disallowed_h2() {
+    init();
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut h2, connection) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+
+    let request = Request::builder()
+        .method("CONNECT")
+        .uri("http://pingora.org:443/")
+        .body(())
+        .unwrap();
+    let (response, _body) = h2.send_request(request, true).unwrap();
+    let (head, mut body) = response.await.unwrap().into_parts();
+    assert_eq!(head.status.as_u16(), 405);
+    while let Some(chunk) = body.data().await {
+        assert!(chunk.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_connect_proxying_allowed_h1() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    // Note per RFC CONNECT 2xx responses are not allowed to have response
+    // bodies, so this is non-standard behavior.
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        socket.write_all(response).await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
 }
 
 #[tokio::test]
