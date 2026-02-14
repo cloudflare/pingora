@@ -320,6 +320,23 @@ impl Connector {
             .filter(|c| !c.is_closed())
             .or_else(|| self.idle_pool.get(&reuse_hash));
         if let Some(conn) = maybe_conn {
+            #[cfg(unix)]
+            if !peer.matches_fd(conn.id()) {
+                return Ok(None);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::{AsRawSocket, RawSocket};
+                struct WrappedRawSocket(RawSocket);
+                impl AsRawSocket for WrappedRawSocket {
+                    fn as_raw_socket(&self) -> RawSocket {
+                        self.0
+                    }
+                }
+                if !peer.matches_sock(WrappedRawSocket(conn.id() as RawSocket)) {
+                    return Ok(None);
+                }
+            }
             let h2_stream = conn.spawn_stream().await?;
             if conn.more_streams_allowed() {
                 self.in_use_pool.insert(reuse_hash, conn);
@@ -607,5 +624,76 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    #[cfg(all(feature = "any_tls", unix))]
+    #[tokio::test]
+    async fn test_h2_reuse_rejects_fd_mismatch() {
+        use crate::protocols::l4::socket::SocketAddr;
+        use crate::upstreams::peer::Peer;
+        use std::fmt::{Display, Formatter, Result as FmtResult};
+        use std::os::unix::prelude::AsRawFd;
+
+        #[derive(Clone)]
+        struct MismatchPeer {
+            reuse_hash: u64,
+            address: SocketAddr,
+        }
+
+        impl Display for MismatchPeer {
+            fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+                write!(f, "{:?}", self.address)
+            }
+        }
+
+        impl Peer for MismatchPeer {
+            fn address(&self) -> &SocketAddr {
+                &self.address
+            }
+
+            fn tls(&self) -> bool {
+                true
+            }
+
+            fn sni(&self) -> &str {
+                ""
+            }
+
+            fn reuse_hash(&self) -> u64 {
+                self.reuse_hash
+            }
+
+            fn matches_fd<V: AsRawFd>(&self, _fd: V) -> bool {
+                false
+            }
+        }
+
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        peer.options.set_http_version(2, 2);
+        peer.options.max_h2_streams = 1;
+
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
+        let h2_stream = match h2 {
+            HttpSession::H1(_) => panic!("expect h2"),
+            HttpSession::H2(h2_stream) => h2_stream,
+            HttpSession::Custom(_) => panic!("expect h2"),
+        };
+
+        connector.release_http_session(h2_stream, &peer, None);
+
+        let mismatch_peer = MismatchPeer {
+            reuse_hash: peer.reuse_hash(),
+            address: peer.address().clone(),
+        };
+
+        assert!(connector
+            .reused_http_session(&mismatch_peer)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
