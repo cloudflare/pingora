@@ -302,9 +302,25 @@ where
                 .await?;
         }
 
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        // Check if body was pre-buffered (before upstream connection)
+        // If so, use buffered body and skip downstream reading
+        let pre_buffered_body = session.take_buffered_body();
+        let body_was_buffered = session.is_body_buffered() && pre_buffered_body.is_some();
 
-        let buffer = session.as_ref().get_retry_buffer();
+        // If body was pre-buffered, use PreBuffered state to skip all downstream polling.
+        // This prevents "Sent data after end of body" errors from Content-Length mismatches.
+        let mut downstream_state = if body_was_buffered {
+            DownstreamStateMachine::PreBuffered
+        } else {
+            DownstreamStateMachine::new(session.as_mut().is_body_done())
+        };
+
+        // Use pre-buffered body if available, otherwise check for retry buffer
+        let buffer = if body_was_buffered {
+            pre_buffered_body
+        } else {
+            session.as_ref().get_retry_buffer()
+        };
 
         // retry, send buffer if it exists or body empty
         if buffer.is_some() || session.as_mut().is_body_empty() {
@@ -773,16 +789,20 @@ where
         // affected by the request_body_filter
         let end_of_body = end_of_body || data.is_none();
 
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
-            .await?;
+        // Skip request_body_filter if body was already pre-buffered and filtered
+        // (before upstream connection, in buffer_request_body_early)
+        if !session.is_body_buffered() {
+            session
+                .downstream_modules_ctx
+                .request_body_filter(&mut data, end_of_body)
+                .await?;
 
-        // TODO: request body filter to have info about upgraded status?
-        // (can also check session.was_upgraded())
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+            // TODO: request body filter to have info about upgraded status?
+            // (can also check session.was_upgraded())
+            self.inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await?;
+        }
 
         // the flag to signal to upstream
         let upstream_end_of_body = end_of_body || data.is_none();

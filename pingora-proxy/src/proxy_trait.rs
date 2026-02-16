@@ -196,6 +196,30 @@ pub trait ProxyHttp {
         Ok(true)
     }
 
+    /// Determine whether to buffer the entire request body before connecting to upstream.
+    ///
+    /// This is called after [`Self::early_request_filter()`] but before [`Self::request_filter()`]
+    /// and [`Self::upstream_peer()`]. The body is buffered in `Session::buffered_request_body`
+    /// and can be accessed via [`Session::get_buffered_body()`].
+    ///
+    /// # Returns
+    /// - `None`: Don't buffer, stream body to upstream (default)
+    /// - `Some(max_size)`: Buffer body with size limit, return 413 error if exceeded
+    ///
+    /// # Use Cases
+    /// - Auth signature verification (need full body before auth decision)
+    /// - Content-based routing decisions
+    /// - Body transformation before upstream selection
+    ///
+    /// # Size Limit Enforcement
+    /// When returning `Some(max_size)`:
+    /// - Content-Length header is checked first (fail fast before reading)
+    /// - Body size is checked during accumulation (streaming protection)
+    /// - If exceeded, returns HTTP 413 (Payload Too Large)
+    fn request_body_buffer_limit(&self, _session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+        None // Default: stream body to upstream
+    }
+
     /// Decide if the response is cacheable
     fn response_cache_filter(
         &self,

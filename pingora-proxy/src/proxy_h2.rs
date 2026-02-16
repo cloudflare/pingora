@@ -297,10 +297,28 @@ where
                 .await?;
         }
 
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        // Check if body was pre-buffered (before upstream connection)
+        // If so, use buffered body and skip downstream reading
+        let pre_buffered_body = session.take_buffered_body();
+        let body_was_buffered = session.is_body_buffered() && pre_buffered_body.is_some();
+
+        // If body was pre-buffered, use PreBuffered state to skip all downstream polling.
+        // This prevents "Sent data after end of body" errors from Content-Length mismatches.
+        let mut downstream_state = if body_was_buffered {
+            DownstreamStateMachine::PreBuffered
+        } else {
+            DownstreamStateMachine::new(session.as_mut().is_body_done())
+        };
+
+        // Use pre-buffered body if available, otherwise check for retry buffer
+        let buffer = if body_was_buffered {
+            pre_buffered_body
+        } else {
+            session.as_mut().get_retry_buffer()
+        };
 
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = buffer {
             self.send_body_to2(
                 session,
                 Some(buffer),
@@ -720,14 +738,18 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
-            .await?;
+        // Skip request_body_filter if body was already pre-buffered and filtered
+        // (before upstream connection, in buffer_request_body_early)
+        if !session.is_body_buffered() {
+            session
+                .downstream_modules_ctx
+                .request_body_filter(&mut data, end_of_body)
+                .await?;
 
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+            self.inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await?;
+        }
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
