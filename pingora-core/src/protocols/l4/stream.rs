@@ -242,7 +242,7 @@ impl AsyncRead for RawStreamWrapper {
                     let mut iov = [IoSliceMut::new(b)];
 
                     rs_wrapper.reusable_cmsg_space.fill(0);
-                    
+
                     match s.try_io(Interest::READABLE, || {
                         recvmsg::<SockaddrStorage>(
                             s.as_raw_fd(),

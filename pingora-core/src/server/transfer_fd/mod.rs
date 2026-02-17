@@ -24,11 +24,11 @@ use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd};
 
 // Utilities to transfer file descriptors between sockets, e.g. during graceful upgrades.
 
