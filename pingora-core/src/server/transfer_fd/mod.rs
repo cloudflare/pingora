@@ -16,7 +16,7 @@
 use log::{debug, error, warn};
 use nix::errno::Errno;
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{self, AddressFamily, RecvMsg, SockFlag, SockType, UnixAddr};
+use nix::sys::socket::{self, AddressFamily, Backlog, RecvMsg, SockFlag, SockType, UnixAddr};
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
 use nix::{Error, NixPath};
@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -131,20 +133,27 @@ where
             // TODO: warn if exist but not able to unlink
         }
     };
-    socket::bind(listen_fd, &unix_addr).unwrap();
+    socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
 
     /* sock is created before we change user, need to give permission */
     stat::fchmodat(
-        None,
+        // SAFETY: AT_FDCWD is a well-defined POSIX sentinel constant used by *at() syscalls
+        // to indicate the current working directory. It is not a real file descriptor and does
+        // not require ownership or lifetime guarantees.
+        unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
         stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
 
-    socket::listen(listen_fd, 8).unwrap();
+    socket::listen(
+        &listen_fd,
+        Backlog::new(8).expect("8 is well within SOMAXCONN"),
+    )
+    .unwrap();
 
-    let fd = match accept_with_retry_timeout(listen_fd, max_retry) {
+    let fd = match accept_with_retry_timeout(listen_fd.as_raw_fd(), max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
@@ -167,7 +176,7 @@ where
     .unwrap();
 
     let mut fds: Vec<RawFd> = Vec::new();
-    for cmsg in msg.cmsgs() {
+    for cmsg in msg.cmsgs()? {
         if let socket::ControlMessageOwned::ScmRights(mut vec_fds) = cmsg {
             fds.append(&mut vec_fds)
         } else {
@@ -254,7 +263,7 @@ where
     let mut nonblocking_polls = 0;
 
     let conn_result: Result<usize, Error> = loop {
-        match socket::connect(send_fd, &unix_addr) {
+        match socket::connect(send_fd.as_raw_fd(), &unix_addr) {
             Ok(_) => break Ok(0),
             Err(e) => match e {
                 /* If the new process hasn't created the upgrade sock we'll get an ENOENT.
@@ -299,7 +308,7 @@ where
             let cmsg = [scm; 1];
             loop {
                 match socket::sendmsg(
-                    send_fd,
+                    send_fd.as_raw_fd(),
                     &io_vec,
                     &cmsg,
                     socket::MsgFlags::empty(),
@@ -351,6 +360,8 @@ where
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
     use log::{debug, error};
 
@@ -419,7 +430,7 @@ mod tests {
             assert_eq!(1, buf[31]);
         });
 
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.as_raw_fd()];
         let buf: [u8; 128] = [1; 128];
         match send_fds_to(fds, &buf, "/tmp/pingora_fds_receive.sock", None) {
             Ok(sent) => {
@@ -446,7 +457,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key1.clone(), dumb_fd1);
+        fds.add(key1.clone(), dumb_fd1.as_raw_fd());
         let key2 = "1.1.1.1:443".to_string();
         let dumb_fd2 = socket::socket(
             AddressFamily::Unix,
@@ -455,7 +466,7 @@ mod tests {
             None,
         )
         .unwrap();
-        fds.add(key2.clone(), dumb_fd2);
+        fds.add(key2.clone(), dumb_fd2.as_raw_fd());
 
         let child = thread::spawn(move || {
             let mut fds2 = Fds::new();
@@ -482,7 +493,7 @@ mod tests {
         )
         .unwrap();
 
-        let fds = vec![dumb_fd];
+        let fds = vec![dumb_fd.as_raw_fd()];
         let buf: [u8; 32] = [1; 32];
 
         // Try to send with a custom max_retries of 2
