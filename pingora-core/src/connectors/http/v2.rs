@@ -175,6 +175,21 @@ impl InUsePool {
         }
     }
 
+    /// Attempt to remove an empty [`PoolNode`] entry from the pools `HashMap`.
+    ///
+    /// Same rationale as [`ConnectionPool::try_remove_empty_node`]: prevents
+    /// unbounded growth when many unique reuse hashes are seen over time.
+    /// The write lock + re-check ensures we never remove a node that was
+    /// concurrently repopulated.
+    fn try_remove_empty_node(&self, reuse_hash: u64) {
+        let mut pools = self.pools.write();
+        if let Some(pool) = pools.get(&reuse_hash) {
+            if pool.is_empty() {
+                pools.remove(&reuse_hash);
+            }
+        }
+    }
+
     pub fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
         {
             let pools = self.pools.read();
@@ -194,19 +209,42 @@ impl InUsePool {
     // the caller should return the conn ref to this pool if there are still
     // capacity left for more streams
     pub fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            match pools.get(&reuse_hash) {
+                Some(pool) => match pool.get_any() {
+                    Some((_, conn)) => (Some(conn), pool.is_empty()),
+                    None => (None, true),
+                },
+                None => (None, false),
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
+        }
+
+        result
     }
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
     pub fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        if let Some(pool) = pools.get(&reuse_hash) {
-            pool.remove(id)
-        } else {
-            None
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            if let Some(pool) = pools.get(&reuse_hash) {
+                let removed = pool.remove(id);
+                (removed, pool.is_empty())
+            } else {
+                (None, false)
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
         }
+
+        result
     }
 }
 
