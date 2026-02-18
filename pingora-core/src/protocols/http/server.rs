@@ -467,7 +467,7 @@ impl Session {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
-            Self::Custom(s) => s.shutdown(1, "shutdown").await,
+            Self::Custom(s) => s.shutdown(0, "shutdown").await,
         }
     }
 
