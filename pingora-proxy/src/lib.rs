@@ -1125,9 +1125,19 @@ where
 
         // Read body chunks until end of stream
         loop {
-            // read_body_or_idle(false) means we expect a body (not done yet)
+            // read_body_or_idle(false) means we expect a body (not done yet).
+            // Only known client-side read failures are explicitly marked downstream.
+            // Leave other errors unchanged so we do not mask internal failures.
             let body_chunk: Option<Bytes> =
-                session.downstream_session.read_body_or_idle(false).await?;
+                match session.downstream_session.read_body_or_idle(false).await {
+                    Ok(chunk) => chunk,
+                    Err(mut e) => {
+                        if matches!(e.etype(), ConnectionClosed | ReadTimedout) {
+                            e.as_down();
+                        }
+                        return Err(e);
+                    }
+                };
 
             match body_chunk {
                 Some(data) => {
