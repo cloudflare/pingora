@@ -869,7 +869,11 @@ impl HttpSession {
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
-            if self.is_chunked_encoding() {
+            if self.was_upgraded() {
+                // if upgraded _post_ 101 (and body was not init yet)
+                // treat as upgraded body (pass through until closed)
+                self.body_reader.init_close_delimited(preread_body);
+            } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
             } else {
@@ -2021,6 +2025,46 @@ mod tests_stream {
         // EOF ends body
         assert!(http_stream.read_body_bytes().await.unwrap().is_none());
         assert!(http_stream.is_body_done());
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_without_content_length_with_ws_data() {
+        let request = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+        let ws_data = b"websocket data";
+
+        let mock_io = Builder::new()
+            .read(request)
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .read(ws_data) // websocket data sent after 101
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+
+        // When enabled (default), is_body_done() is called before the upgrade
+        http_stream.set_close_on_response_before_downstream_finish(false);
+
+        // Send 101 response - this is where the bug occurs
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0),
+            "Body reader should be in UntilClose mode after 101 for upgraded connections"
+        );
+
+        // Try to read websocket data
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, ws_data, "Expected to read websocket data after 101");
     }
 
     #[tokio::test]
