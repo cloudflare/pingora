@@ -20,9 +20,9 @@ use pingora_core::services::background::background_service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_load_balancing::{
-    discovery, health_check,
-    selection::{LeastConnLease, LeastConnections, LeastConnectionsConfig},
-    Backends, LoadBalancer,
+    health_check,
+    selection::{LeastConnLease, LeastConnections},
+    LoadBalancer,
 };
 use pingora_proxy::{ProxyHttp, Session};
 use std::sync::Arc;
@@ -83,12 +83,7 @@ fn main() {
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 
-    // We pass the state store least connections through config so that
-    // when the selector is rebuilt, counters for unchanged backends can be reused
-    let mut upstreams = LoadBalancer::<LeastConnections>::from_backends_with_config(
-        Backends::new(discovery::Static::try_from_iter(["1.1.1.1:443", "1.0.0.1:443"]).unwrap()),
-        Some(LeastConnectionsConfig::new()),
-    );
+    let mut upstreams = LoadBalancer::try_from_iter(["1.1.1.1:443", "1.0.0.1:443"]).unwrap();
 
     let hc = health_check::TcpHealthCheck::new();
     upstreams.set_health_check(hc);
