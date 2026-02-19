@@ -530,7 +530,11 @@ impl HttpSession {
                 buffer.clear();
             }
 
-            if self.is_chunked_encoding() {
+            if self.was_upgraded() {
+                // if upgraded _post_ 101 (and body was not init yet)
+                // treat as upgraded body (pass through until closed)
+                self.body_reader.init_close_delimited();
+            } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 // TE is not visible at subrequest HttpTask level
                 // so this means read until request closure
