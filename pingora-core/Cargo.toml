@@ -72,6 +72,7 @@ httpdate = "1"
 x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
 lru = { workspace = true, optional = true }
+daggy = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"

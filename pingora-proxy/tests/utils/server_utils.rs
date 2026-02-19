@@ -38,7 +38,7 @@ use pingora_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
 use pingora_core::server::configuration::Opt;
-use pingora_core::services::Service;
+use pingora_core::services::{Service, ServiceWithDependents};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
@@ -765,7 +765,7 @@ fn test_main() {
     http_logic.server_options = Some(http_server_options);
     proxy_service_h2c.add_tcp("0.0.0.0:6146");
 
-    let mut proxy_service_https_opt: Option<Box<dyn Service>> = None;
+    let mut proxy_service_https_opt: Option<Box<dyn ServiceWithDependents>> = None;
 
     #[cfg(feature = "any_tls")]
     {
@@ -796,7 +796,7 @@ fn test_main() {
         proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
     }
 
-    let mut services: Vec<Box<dyn Service>> = vec![
+    let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
         Box::new(proxy_service_http_connect),
