@@ -26,8 +26,8 @@ use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
-    set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
-    RespCacheable,
+    set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
+    NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
     CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
@@ -487,6 +487,35 @@ impl ProxyHttp for ExampleProxyCache {
         }
 
         Ok(())
+    }
+
+    /// Reference `cache_key_callback` implementation for integration tests.
+    ///
+    /// Builds the primary key as `{host}{path_and_query}` from the request.
+    /// This is **not production ready**: it does not account for `Vary`, custom
+    /// request filters, or scheme differences. See the rustdoc on
+    /// [`ProxyHttp::cache_key_callback`] for details.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let req_header = session.req_header();
+
+        let host = req_header
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req_header.uri.authority().map(|a| a.as_str()))
+            .unwrap_or("");
+
+        let path_and_query = req_header
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(
+            String::new(),
+            format!("{host}{path_and_query}"),
+            String::new(),
+        ))
     }
 
     async fn cache_hit_filter(
