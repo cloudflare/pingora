@@ -35,12 +35,7 @@ impl Connector {
         peer: &P,
     ) -> Result<(HttpSession, bool)> {
         let (stream, reused) = self.transport.get_stream(peer).await?;
-        let mut http = HttpSession::new(stream);
-        if let Some(options) = peer.get_peer_options() {
-            http.set_allow_h1_response_invalid_content_length(
-                options.allow_h1_response_invalid_content_length,
-            );
-        }
+        let http = HttpSession::new_with_options(stream, peer);
         Ok((http, reused))
     }
 
@@ -49,12 +44,7 @@ impl Connector {
         peer: &P,
     ) -> Option<HttpSession> {
         let stream = self.transport.reused_stream(peer).await?;
-        let mut http = HttpSession::new(stream);
-        if let Some(options) = peer.get_peer_options() {
-            http.set_allow_h1_response_invalid_content_length(
-                options.allow_h1_response_invalid_content_length,
-            );
-        }
+        let http = HttpSession::new_with_options(stream, peer);
         Some(http)
     }
 
