@@ -100,6 +100,17 @@ impl HttpSession {
         }
     }
 
+    /// Create a new http client session and apply peer options
+    pub fn new_with_options<P: crate::upstreams::peer::Peer>(stream: Stream, peer: &P) -> Self {
+        let mut session = Self::new(stream);
+        if let Some(options) = peer.get_peer_options() {
+            session.set_allow_h1_response_invalid_content_length(
+                options.allow_h1_response_invalid_content_length,
+            );
+        }
+        session
+    }
+
     /// Write the request header to the server
     /// After the request header is sent. The caller can either start reading the response or
     /// sending request body if any.

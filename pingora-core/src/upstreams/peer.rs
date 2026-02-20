@@ -436,6 +436,9 @@ pub struct PeerOptions {
     /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
     /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise

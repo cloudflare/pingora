@@ -262,7 +262,9 @@ impl Connector {
             Some(ALPN::H2) => { /* continue */ }
             Some(_) => {
                 // H2 not supported
-                return Ok(HttpSession::H1(Http1Session::new(stream)));
+                return Ok(HttpSession::H1(Http1Session::new_with_options(
+                    stream, peer,
+                )));
             }
             None => {
                 // if tls but no ALPN, default to h1
@@ -272,7 +274,9 @@ impl Connector {
                         .get_peer_options()
                         .is_none_or(|o| o.alpn.get_min_http_version() == 1)
                 {
-                    return Ok(HttpSession::H1(Http1Session::new(stream)));
+                    return Ok(HttpSession::H1(Http1Session::new_with_options(
+                        stream, peer,
+                    )));
                 }
                 // else: min http version=H2 over plaintext, there is no ALPN anyways, we trust
                 // the caller that the server speaks h2c
