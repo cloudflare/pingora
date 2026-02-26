@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
@@ -1490,8 +1490,9 @@ pub mod range_filter {
                 resp.insert_header(&CONTENT_LENGTH, HeaderValue::from_static("0"))
                     .unwrap();
                 resp.remove_header(&ACCEPT_RANGES);
-                // TODO: remove other headers like content-encoding
                 resp.remove_header(&CONTENT_TYPE);
+                resp.remove_header(&CONTENT_ENCODING);
+                resp.remove_header(&TRANSFER_ENCODING);
                 resp.insert_header(&CONTENT_RANGE, format!("bytes */{content_length}"))
                     .unwrap()
             }
@@ -1571,6 +1572,8 @@ pub mod range_filter {
         req.insert_header("Range", "bytes=1-0").unwrap();
         let mut resp = gen_resp();
         resp.insert_header("Accept-Ranges", "bytes").unwrap();
+        resp.insert_header("Content-Encoding", "gzip").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
         assert_eq!(
             RangeType::Invalid,
             range_header_filter(&req, &mut resp, None)
@@ -1582,6 +1585,8 @@ pub mod range_filter {
             b"bytes */10"
         );
         assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     // Multipart Tests
@@ -1650,10 +1655,14 @@ pub mod range_filter {
         req.insert_header("Range", "bytes=1-0, 12-9, 50-40")
             .unwrap();
         let mut resp = gen_resp();
+        resp.insert_header("Content-Encoding", "br").unwrap();
+        resp.insert_header("Transfer-Encoding", "chunked").unwrap();
         let result = range_header_filter(&req, &mut resp, None);
         assert!(matches!(result, RangeType::Invalid));
         assert_eq!(resp.status.as_u16(), 416);
         assert!(resp.headers.get("accept-ranges").is_none());
+        assert!(resp.headers.get("content-encoding").is_none());
+        assert!(resp.headers.get("transfer-encoding").is_none());
     }
 
     #[test]
