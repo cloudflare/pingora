@@ -14,6 +14,7 @@
 
 //! Server process and configuration management
 
+mod bootstrap_services;
 pub mod configuration;
 #[cfg(unix)]
 mod daemon;
@@ -38,6 +39,8 @@ use tokio::signal::unix;
 use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
 use tokio::time::{sleep, Duration};
 
+use crate::prelude::background_service;
+use crate::server::bootstrap_services::{Bootstrap, BootstrapService, SentryInitService};
 use crate::services::{
     DependencyGraph, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch, ServiceWithDependents,
 };
@@ -194,9 +197,11 @@ impl Default for RunArgs {
 /// services (see [crate::services]). The server object handles signals, reading configuration,
 /// zero downtime upgrade and error reporting.
 pub struct Server {
+    // This is a way to add services that have to be run before any others
+    // without requiring dependencies to be set directly
+    init_services: Vec<Box<dyn ServiceWithDependents + 'static>>,
+
     services: HashMap<NodeIndex, ServiceWrapper>,
-    #[cfg(unix)]
-    listen_fds: Option<ListenFds>,
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
     shutdown_recv: ShutdownWatch,
@@ -209,16 +214,13 @@ pub struct Server {
     /// Specification of service level dependencies
     dependencies: Arc<Mutex<DependencyGraph>>,
 
+    /// Service initialization
+    bootstrap: Arc<Mutex<Bootstrap>>,
+
     /// The parsed server configuration
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
     pub options: Option<Opt>,
-    #[cfg(feature = "sentry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
-    /// The Sentry ClientOptions.
-    ///
-    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
-    pub sentry: Option<ClientOptions>,
 }
 
 // TODO: delete the pid when exit
@@ -274,7 +276,7 @@ impl Server {
                     .send(ExecutionPhase::GracefulUpgradeTransferringFds)
                     .ok();
 
-                if let Some(fds) = &self.listen_fds {
+                if let Some(fds) = self.listen_fds() {
                     let fds = fds.lock().await;
                     info!("Trying to send socks");
                     // XXX: this is blocking IO
@@ -351,6 +353,21 @@ impl Server {
         }
     }
 
+    #[cfg(feature = "sentry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
+    /// The Sentry ClientOptions.
+    ///
+    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
+    pub fn set_sentry_config(&mut self, sentry_config: ClientOptions) {
+        self.bootstrap.lock().set_sentry_config(Some(sentry_config));
+    }
+
+    /// Get the configured file descriptors for listening
+    #[cfg(unix)]
+    fn listen_fds(&self) -> Option<ListenFds> {
+        self.bootstrap.lock().get_fds()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_service(
         mut service: Box<dyn ServiceWithDependents>,
@@ -402,17 +419,6 @@ impl Server {
         service_runtime
     }
 
-    #[cfg(unix)]
-    fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        let mut fds = Fds::new();
-        if upgrade {
-            debug!("Trying to receive socks");
-            fds.get_from_sock(self.configuration.as_ref().upgrade_sock.as_str())?
-        }
-        self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
-        Ok(())
-    }
-
     /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
     ///
     /// This method is intended for pingora frontends that are NOT using the built-in
@@ -431,18 +437,23 @@ impl Server {
 
         let (tx, rx) = watch::channel(false);
 
+        let execution_phase_watch = broadcast::channel(100).0;
+        let bootstrap = Arc::new(Mutex::new(Bootstrap::new(
+            &opt,
+            &conf,
+            &execution_phase_watch,
+        )));
+
         Server {
             services: Default::default(),
-            #[cfg(unix)]
-            listen_fds: None,
+            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
-            execution_phase_watch: broadcast::channel(100).0,
+            execution_phase_watch,
             configuration: Arc::new(conf),
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
-            #[cfg(feature = "sentry")]
-            sentry: None,
+            bootstrap,
         }
     }
 
@@ -457,6 +468,7 @@ impl Server {
         let opt = opt.into();
         let (tx, rx) = watch::channel(false);
 
+        let execution_phase_watch = broadcast::channel(100).0;
         let conf = if let Some(opt) = opt.as_ref() {
             opt.conf.as_ref().map_or_else(
                 || {
@@ -475,19 +487,48 @@ impl Server {
                 .ok_or_else(|| Error::explain(ErrorType::ReadError, "Conf generation failed"))
         }?;
 
+        let bootstrap = Arc::new(Mutex::new(Bootstrap::new(
+            &opt,
+            &conf,
+            &execution_phase_watch,
+        )));
+
         Ok(Server {
             services: Default::default(),
-            #[cfg(unix)]
-            listen_fds: None,
+            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
-            execution_phase_watch: broadcast::channel(100).0,
+            execution_phase_watch,
             configuration: Arc::new(conf),
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
-            #[cfg(feature = "sentry")]
-            sentry: None,
+            bootstrap,
         })
+    }
+
+    /// Add a service that all other services will wait on before starting.
+    fn add_init_service(&mut self, service: impl ServiceWithDependents + 'static) {
+        let boxed_service = Box::new(service);
+        self.init_services.push(boxed_service);
+    }
+
+    /// Add the init services as dependencies for all existing services
+    fn apply_init_service_dependencies(&mut self) {
+        let services = self
+            .services
+            .values()
+            .map(|service| service.service_handle.clone())
+            .collect::<Vec<_>>();
+        let global_deps = self
+            .init_services
+            .drain(..)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|dep| self.add_boxed_service(dep))
+            .collect::<Vec<_>>();
+        for service in services {
+            service.add_dependencies(&global_deps);
+        }
     }
 
     /// Add a service to this server.
@@ -562,41 +603,28 @@ impl Server {
     /// When trying to zero downtime upgrade from an older version of the server which is already
     /// running, this function will try to get all its listening sockets in order to take them over.
     pub fn bootstrap(&mut self) {
-        info!("Bootstrap starting");
-        debug!("{:#?}", self.options);
+        self.bootstrap.lock().bootstrap();
+    }
 
-        self.execution_phase_watch
-            .send(ExecutionPhase::Bootstrap)
-            .ok();
+    /// Create a service that will run to prepare the service to start
+    ///
+    /// The created service will handle the zero-downtime upgrade from an older version of the server
+    /// to this one. It will try to get all its listening sockets in order to take them over.
+    ///
+    /// Other bootstrapping functionality like sentry initialization will also be handled, but as a
+    /// service that will complete before any other service starts.
+    pub fn bootstrap_as_a_service(&mut self) -> ServiceHandle {
+        let bootstrap_service =
+            background_service("Bootstrap Service", BootstrapService::new(&self.bootstrap));
 
-        /* only init sentry in release builds */
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
+        let sentry_service = background_service(
+            "Sentry Init Service",
+            SentryInitService::new(&self.bootstrap),
+        );
 
-        if self.options.as_ref().is_some_and(|o| o.test) {
-            info!("Server Test passed, exiting");
-            std::process::exit(0);
-        }
+        self.add_init_service(sentry_service);
 
-        // load fds
-        #[cfg(unix)]
-        match self.load_fds(self.options.as_ref().is_some_and(|o| o.upgrade)) {
-            Ok(_) => {
-                info!("Bootstrap done");
-            }
-            Err(e) => {
-                // sentry log error on fd load failure
-                #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                sentry::capture_error(&e);
-
-                error!("Bootstrap failed on error: {:?}, exiting.", e);
-                std::process::exit(1);
-            }
-        }
-
-        self.execution_phase_watch
-            .send(ExecutionPhase::BootstrapComplete)
-            .ok();
+        self.add_service(bootstrap_service)
     }
 
     /// Start the server using [Self::run] and default [RunArgs].
@@ -623,6 +651,8 @@ impl Server {
     /// Instead it will either start the daemon process and exit, or panic
     /// if daemonization fails.
     pub fn run(mut self, run_args: RunArgs) {
+        self.apply_init_service_dependencies();
+
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
@@ -639,10 +669,6 @@ impl Server {
         if conf.daemon {
             panic!("Daemonizing under windows is not supported");
         }
-
-        /* only init sentry in release builds */
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
 
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
@@ -710,7 +736,7 @@ impl Server {
             let runtime = Server::run_service(
                 wrapper.service,
                 #[cfg(unix)]
-                self.listen_fds.clone(),
+                self.listen_fds(),
                 self.shutdown_recv.clone(),
                 threads,
                 conf.work_stealing,
