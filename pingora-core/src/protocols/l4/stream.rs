@@ -150,6 +150,7 @@ impl AsRawSocket for RawStream {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
         match self {
             RawStream::Tcp(s) => s.as_raw_socket(),
+            RawStream::Virtual(_) => u64::MAX, // Virtual stream does not have a real fd
         }
     }
 }
