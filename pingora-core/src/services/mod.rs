@@ -353,15 +353,14 @@ where
         // Signal ready immediately
         ready_notifier.notify_ready();
 
-        #[cfg(unix)]
-        {
-            S::start_service(self, fds, shutdown, listeners_per_fd).await
-        }
-
-        #[cfg(not(unix))]
-        {
-            S::start_service(self, shutdown, listeners_per_fd).await
-        }
+        S::start_service(
+            self,
+            #[cfg(unix)]
+            fds,
+            shutdown,
+            listeners_per_fd,
+        )
+        .await
     }
 
     fn name(&self) -> &str {
