@@ -1028,6 +1028,12 @@ pub mod range_filter {
             return RangeType::None;
         };
 
+        // "bytes=" with an empty (or whitespace-only) range-set is syntactically a
+        // range request with zero satisfiable range-specs, so return 416.
+        if ranges_str.trim().is_empty() {
+            return RangeType::Invalid;
+        }
+
         // Get the actual range string (e.g."100-200,300-400")
         let mut range_count = 0;
         for _ in ranges_str.split(',') {
@@ -1149,7 +1155,11 @@ pub mod range_filter {
             RangeType::new_single(0, 10)
         );
         assert_eq!(parse_range_header(b"bytes=-", 10, None), RangeType::Invalid);
-        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::None);
+        assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::Invalid);
+        assert_eq!(
+            parse_range_header(b"bytes=  ", 10, None),
+            RangeType::Invalid
+        );
     }
 
     // Add some tests for multi-range too
