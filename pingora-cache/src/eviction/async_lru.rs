@@ -367,7 +367,7 @@ mod tests {
             tokio::runtime::Handle::current(),
         )
         .build();
-        let key = CacheKey::new("", "missing", "1").to_compact();
+        let key = CacheKey::new("missing", "1").to_compact();
 
         manager.increment_weight(&key, 7, Some(10));
         manager.shard_weight(0).await;

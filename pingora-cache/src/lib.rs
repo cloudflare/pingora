@@ -1952,7 +1952,7 @@ mod tests {
         let mut cache = HttpCache::new();
         cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
         cache.set_admission_policy(&RAW_MISS_DEFER_POLICY);
-        cache.set_cache_key(CacheKey::new("", "deferred-storage-miss", ""));
+        cache.set_cache_key(CacheKey::new("deferred-storage-miss", ""));
 
         assert!(cache.cache_lookup().await.unwrap().is_none());
         assert_eq!(cache.phase(), CachePhase::Disabled(NoCacheReason::Deferred));
@@ -1965,7 +1965,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_storage_miss_can_proceed_to_fill() {
-        let key = CacheKey::new("", "two-use-admission", "");
+        let key = CacheKey::new("two-use-admission", "");
 
         let mut first = HttpCache::new();
         first.enable(&UPDATE_OK_STORAGE, None, None, None, None);
@@ -1994,7 +1994,7 @@ mod tests {
         let mut cache = HttpCache::new();
         cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
         cache.set_admission_policy(&RAW_MISS_READY_POLICY);
-        cache.set_cache_key(CacheKey::new("", "repeated-ready-admission", ""));
+        cache.set_cache_key(CacheKey::new("repeated-ready-admission", ""));
 
         assert!(cache.cache_lookup().await.unwrap().is_none());
         assert!(cache.cache_lookup().await.unwrap().is_none());
@@ -2008,7 +2008,7 @@ mod tests {
     #[tokio::test]
     async fn stale_refill_does_not_observe_admission() {
         STALE_DEFER_POLICY.0.store(0, Ordering::Relaxed);
-        let key = CacheKey::new("", "stale-refill-admission", "");
+        let key = CacheKey::new("stale-refill-admission", "");
         let mut cache = HttpCache::new();
         cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
         cache.set_admission_policy(&STALE_DEFER_POLICY);
@@ -2027,7 +2027,7 @@ mod tests {
     async fn valid_after_rejection_does_not_observe_admission() {
         VALID_AFTER_DEFER_POLICY.0.store(0, Ordering::Relaxed);
         let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let key = CacheKey::new("", "valid-after-not-admission", "");
+        let key = CacheKey::new("valid-after-not-admission", "");
         ONE_SHOT_LOOKUP_STORAGE
             .entries
             .lock()
@@ -2056,7 +2056,7 @@ mod tests {
         let mut old_meta = test_meta(created);
         old_meta.set_provenance(family_start);
         old_meta.set_variance_key(variance);
-        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "preserve", ""));
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("preserve", ""));
 
         cache.set_cache_meta(test_meta(refresh));
 
@@ -2074,7 +2074,7 @@ mod tests {
 
         let mut old_meta = test_meta(created);
         old_meta.set_provenance(family_start);
-        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "revalidate", ""));
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("revalidate", ""));
 
         cache
             .revalidate_cache_meta(test_meta(revalidated_at))
@@ -2097,7 +2097,7 @@ mod tests {
         let mut old_meta = test_meta(created);
         old_meta.set_provenance(family_start);
         old_meta.set_variance_key(variance);
-        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "same-vary", ""));
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("same-vary", ""));
 
         cache.set_cache_meta(test_meta(refresh));
         cache.update_variance(Some(variance));
@@ -2118,7 +2118,7 @@ mod tests {
         let mut old_meta = test_meta(created);
         old_meta.set_provenance(family_start);
         old_meta.set_variance_key(old_variance);
-        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "changed-vary", ""));
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("changed-vary", ""));
 
         cache.set_cache_meta(test_meta(refresh));
         cache.update_variance(Some(new_variance));
@@ -2137,7 +2137,7 @@ mod tests {
 
         let mut old_meta = test_meta(created);
         old_meta.set_provenance(family_start);
-        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "vary-appears", ""));
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("vary-appears", ""));
 
         cache.set_cache_meta(test_meta(refresh));
         cache.update_variance(Some(variance));
@@ -2153,7 +2153,7 @@ mod tests {
         let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
         let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
         let old_variance = [1; 16];
-        let mut key = CacheKey::new("", "secondary-takeover", "");
+        let mut key = CacheKey::new("secondary-takeover", "");
         key.set_variance_key(old_variance);
 
         let mut old_meta = test_meta(created);
@@ -2175,7 +2175,7 @@ mod tests {
         let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
         let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
         let variance = [1; 16];
-        let mut key = CacheKey::new("", "secondary-same-vary", "");
+        let mut key = CacheKey::new("secondary-same-vary", "");
         key.set_variance_key(variance);
 
         let mut old_meta = test_meta(created);
@@ -2207,7 +2207,7 @@ mod tests {
         secondary_meta.set_provenance(family_start);
         secondary_meta.set_variance_key(secondary_variance);
 
-        let mut cache = cache_with_lookup_storage(CacheKey::new("", "valid-after-provenance", ""));
+        let mut cache = cache_with_lookup_storage(CacheKey::new("valid-after-provenance", ""));
         assert!(!cache.cache_vary_lookup(secondary_variance, &primary_meta));
         assert_eq!(
             cache.inner_enabled().valid_after,

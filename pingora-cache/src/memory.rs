@@ -448,7 +448,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -485,7 +485,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -530,7 +530,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -597,7 +597,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
 
-        let key = CacheKey::new("", "a", "1").to_compact();
+        let key = CacheKey::new("a", "1").to_compact();
         let hash = key.combined();
         let meta = (
             "meta_key".as_bytes().to_vec(),
@@ -624,7 +624,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
 
-        let key = CacheKey::new("", "a", "1").to_compact();
+        let key = CacheKey::new("a", "1").to_compact();
         let hash = key.combined();
         let meta = (
             "meta_key".as_bytes().to_vec(),

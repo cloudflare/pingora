@@ -26,7 +26,7 @@ fn main() {
     let manager2 = Manager::<32>::with_capacity(ITEMS, ITEMS / 32);
     let unused_ttl = std::time::SystemTime::now();
     for i in 0..ITEMS {
-        let item = CacheKey::new("", i.to_string(), "").to_compact();
+        let item = CacheKey::new(i.to_string(), "").to_compact();
         manager.admit(item, 1, unused_ttl);
     }
 

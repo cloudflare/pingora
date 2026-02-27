@@ -402,7 +402,7 @@ mod test {
     #[test]
     fn test_get_release() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let locked1 = cache_lock.lock(&key1, false);
         assert!(locked1.is_write()); // write permit
         let locked2 = cache_lock.lock(&key1, false);
@@ -420,7 +420,7 @@ mod test {
     #[tokio::test]
     async fn test_lock() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1000));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let mut permit = match cache_lock.lock(&key1, false) {
             Locked::Write(w) => w,
             _ => panic!(),
@@ -441,7 +441,7 @@ mod test {
     #[tokio::test]
     async fn test_lock_timeout() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let mut permit = match cache_lock.lock(&key1, false) {
             Locked::Write(w) => w,
             _ => panic!(),
@@ -486,7 +486,7 @@ mod test {
     #[tokio::test]
     async fn test_lock_expired_release() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let permit = match cache_lock.lock(&key1, false) {
             Locked::Write(w) => w,
             _ => panic!(),
@@ -534,7 +534,7 @@ mod test {
     #[tokio::test]
     async fn test_lock_expired_no_reader() {
         let cache_lock = CacheLock::new_boxed(Duration::from_secs(1));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let mut permit = match cache_lock.lock(&key1, false) {
             Locked::Write(w) => w,
             _ => panic!(),
@@ -560,7 +560,7 @@ mod test {
         let _ = env_logger::builder().is_test(true).try_init();
         // Test that concurrent attempts to compete for a lock run without issues
         let cache_lock = Arc::new(CacheLock::new_boxed(Duration::from_secs(1)));
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
 
         let mut handles = vec![];
 

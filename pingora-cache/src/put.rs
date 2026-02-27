@@ -257,7 +257,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -291,7 +291,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_uncacheable() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -312,7 +312,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_204_invalid_body() {
-        let key = CacheKey::new("", "b", "1");
+        let key = CacheKey::new("b", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -352,7 +352,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_extra_body() {
-        let key = CacheKey::new("", "c", "1");
+        let key = CacheKey::new("c", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);

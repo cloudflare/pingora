@@ -717,7 +717,6 @@ impl ProxyHttp for ExampleProxyCache {
             .unwrap_or("/");
 
         Ok(CacheKey::new(
-            String::new(),
             format!("{host}{path_and_query}"),
             String::new(),
         ))

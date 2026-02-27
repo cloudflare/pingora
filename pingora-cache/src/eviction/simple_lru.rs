@@ -341,20 +341,20 @@ mod test {
     #[test]
     fn test_admission() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
         // lru si full (4) now
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         // need to reduce used by at least 2, both key1 and key2 are evicted to make room for 3
         assert_eq!(v.len(), 2);
@@ -365,14 +365,14 @@ mod test {
     #[test]
     fn test_access() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -381,7 +381,7 @@ mod test {
         lru.access(&key1, 1, until);
         assert_eq!(v.len(), 0);
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -390,14 +390,14 @@ mod test {
     #[test]
     fn test_remove() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -406,7 +406,7 @@ mod test {
         lru.remove(&key1);
 
         // key2 is the least recently used one now
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -417,14 +417,14 @@ mod test {
         let lru = Manager::new(4);
         let until = SystemTime::now(); // unused value as a placeholder
 
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         lru.access(&key1, 1, until);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         lru.access(&key2, 2, until);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         lru.access(&key3, 2, until);
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         // need to reduce used by at least 2, both key1 and key2 are evicted to make room for 3
         assert_eq!(v.len(), 2);
@@ -435,13 +435,13 @@ mod test {
     #[test]
     fn test_increment_weight_adds_missing_item() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         assert!(lru.increment_weight(&key1, 2, None).is_empty());
         assert!(lru.peek(&key1));
         assert_eq!(lru.total_size(), 2);
         assert_eq!(lru.total_items(), 1);
 
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let evicted = lru.increment_weight(&key2, 100, Some(3));
         assert_eq!(evicted, vec![key1]);
         assert!(lru.peek(&key2));
@@ -453,12 +453,12 @@ mod test {
     fn test_increment_weight_admits_zero_and_does_not_shrink() {
         let lru = Manager::new(10);
 
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         assert!(lru.increment_weight(&key1, 0, None).is_empty());
         assert!(lru.peek(&key1));
         assert_eq!(lru.total_size(), 1);
 
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         assert!(lru.increment_weight(&key2, 3, None).is_empty());
         assert!(lru.increment_weight(&key2, 100, Some(2)).is_empty());
         assert_eq!(lru.total_size(), 4);
@@ -468,14 +468,14 @@ mod test {
     #[test]
     fn test_admit_update() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -485,7 +485,7 @@ mod test {
         assert_eq!(v.len(), 0);
 
         // lru is not full anymore
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4.clone(), 1, until);
         assert_eq!(v.len(), 0);
 
@@ -499,14 +499,14 @@ mod test {
     #[test]
     fn test_serde() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -520,7 +520,7 @@ mod test {
         let lru2 = Manager::new(4);
         lru2.deserialize(&ser).unwrap();
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -529,14 +529,14 @@ mod test {
     #[tokio::test]
     async fn test_save_to_disk() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -550,7 +550,7 @@ mod test {
         let lru2 = Manager::new(4);
         lru2.load("/tmp/test_simple_lru_save").await.unwrap();
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -564,7 +564,7 @@ mod test {
 
         // admit 6 items of size 1
         for name in ["a", "b", "c", "d", "e", "f"] {
-            let key = CacheKey::new("", name, "1").to_compact();
+            let key = CacheKey::new(name, "1").to_compact();
             let _ = lru.admit(key, 1, until);
         }
 
