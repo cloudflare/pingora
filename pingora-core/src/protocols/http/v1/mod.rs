@@ -17,4 +17,5 @@
 pub(crate) mod body;
 pub mod client;
 pub mod common;
+pub(crate) mod header;
 pub mod server;
