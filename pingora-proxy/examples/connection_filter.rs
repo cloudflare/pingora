@@ -49,7 +49,7 @@ struct BlockAllFilter;
 
 #[async_trait]
 impl ConnectionFilter for BlockAllFilter {
-    async fn should_accept(&self, addr: &std::net::SocketAddr) -> bool {
+    fn should_accept(&self, addr: &std::net::SocketAddr) -> bool {
         info!("BLOCKING connection from {} (BlockAllFilter active)", addr);
         false
     }
