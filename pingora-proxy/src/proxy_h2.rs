@@ -444,6 +444,7 @@ where
                             continue;
                         }
 
+                        // TODO: If downstream supports proxy task API, should use send_downstream_proxy_task()
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
                         if session.was_upgraded() {
                             // it is very weird if the downstream session decides to upgrade
@@ -464,6 +465,7 @@ where
                         &mut range_body_filter, true).await?;
                     debug!("serve_from_cache task {task:?}");
 
+                    // TODO: If downstream supports proxy task API, should use send_downstream_proxy_task()
                     match session.write_response_tasks(vec![task]).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
                         Err(e) => if serve_from_cache.is_miss() {

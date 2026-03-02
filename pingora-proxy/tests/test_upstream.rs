@@ -2913,6 +2913,154 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
+    #[tokio::test]
+    async fn test_caching_when_downstream_stalls() {
+        use std::net::ToSocketAddrs;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_stalls/download/";
+
+        // Connection 1: read 10KiB then stall, holding the cache lock while
+        // the proxy populates cache from upstream.
+        let slow_task = tokio::spawn(async move {
+            let addr = "127.0.0.1:6148".to_socket_addrs().unwrap().next().unwrap();
+            let mut stream = TcpStream::connect(&addr).await.unwrap();
+
+            let request = concat!(
+                "GET /unique/test_caching_when_downstream_stalls/download/ HTTP/1.1\r\n",
+                "Host: 127.0.0.1:6148\r\n",
+                "x-lock: true\r\n",
+                "x-set-cache-control: public, max-age=60\r\n",
+                "\r\n",
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+
+            let mut buf = [0; 10 * 1024];
+            let mut b = &mut buf[..];
+            while !b.is_empty() {
+                let n = stream.read(b).await.unwrap();
+                b = &mut b[n..]
+            }
+
+            // Hold the stalled connection open long enough
+            sleep(Duration::from_secs(10)).await;
+        });
+
+        // Give connection 1 time to acquire the cache lock
+        sleep(Duration::from_secs(1)).await;
+
+        // Connection 2: should get a cache hit once the proxy finishes
+        // populating cache from upstream (independent of stall).
+        let start = tokio::time::Instant::now();
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-cache-control", "public, max-age=60")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+
+        // If the cache was populated fast enough (before connection 2 arrived),
+        // there is no lock contention and x-cache-lock-time-ms is absent.
+        // If there was contention, the wait should be short.
+        if let Some(lock_ms) = headers.get("x-cache-lock-time-ms") {
+            let ms: u64 = lock_ms.to_str().unwrap().parse().unwrap();
+            assert!(
+                ms < 2000,
+                "lock wait {ms}ms should be well under the 2s timeout"
+            );
+        }
+
+        assert_eq!(
+            res.text().await.unwrap(),
+            String::from("A").repeat(4 * 1024 * 1024)
+        );
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "second request took {elapsed:?}, should be fast"
+        );
+
+        // Don't wait for the slow connection
+        slow_task.abort();
+    }
+
+    // Same as test_caching_when_downstream_stalls but the proxy connects
+    // to the origin over H2 (via the x-h2 header).
+    //
+    // Ignored until proxy_h2 gets the proxy task API.
+    #[tokio::test]
+    #[ignore]
+    async fn test_caching_h2_upstream_when_downstream_stalls() {
+        use std::net::ToSocketAddrs;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_h2_upstream_when_downstream_stalls/download/";
+
+        let slow_task = tokio::spawn(async move {
+            let addr = "127.0.0.1:6148".to_socket_addrs().unwrap().next().unwrap();
+            let mut stream = TcpStream::connect(&addr).await.unwrap();
+
+            let request = concat!(
+                "GET /unique/test_caching_h2_upstream_when_downstream_stalls/download/ HTTP/1.1\r\n",
+                "Host: 127.0.0.1:6148\r\n",
+                "x-h2: true\r\n",
+                "x-lock: true\r\n",
+                "x-set-cache-control: public, max-age=60\r\n",
+                "\r\n",
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+
+            let mut buf = [0; 10 * 1024];
+            let mut b = &mut buf[..];
+            while !b.is_empty() {
+                let n = stream.read(b).await.unwrap();
+                b = &mut b[n..]
+            }
+
+            sleep(Duration::from_secs(10)).await;
+        });
+
+        sleep(Duration::from_secs(1)).await;
+
+        let start = tokio::time::Instant::now();
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-h2", "true")
+            .header("x-lock", "true")
+            .header("x-set-cache-control", "public, max-age=60")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(
+            res.text().await.unwrap(),
+            String::from("A").repeat(4 * 1024 * 1024)
+        );
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "second request took {elapsed:?}, should be fast (upstream-speed-bound)"
+        );
+
+        slow_task.abort();
+    }
+
     async fn send_vary_req_with_headers_with_dups(
         url: &str,
         vary_field: &str,
@@ -3535,5 +3683,146 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    // Ignored until H2 downstream gets the proxy task API
+    // (write_response_tasks blocks on flow control today).
+    // multi_thread needed for h2 connection driver tasks.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn test_cache_h2_downstream_stalls() {
+        init();
+
+        use h2::client;
+        use http::Request;
+        use tokio::net::TcpStream;
+        use tokio::time::{timeout, Duration};
+
+        // Step 1: Connection 1 - Open h2 connection to h2c cache proxy (port 6154) and STALL
+        let tcp1 = TcpStream::connect("127.0.0.1:6154").await.unwrap();
+        let (mut h2_client1, h2_conn1) = client::handshake(tcp1).await.unwrap();
+
+        tokio::spawn(async move {
+            if let Err(e) = h2_conn1.await {
+                eprintln!("H2 connection 1 error: {:?}", e);
+            }
+        });
+
+        // Request the cached resource on connection 1
+        let request1 = Request::builder()
+            .uri("http://127.0.0.1/unique/test_h2_stall/download/")
+            .body(())
+            .unwrap();
+
+        let (response1, _) = h2_client1.send_request(request1, true).unwrap();
+        let response1 = response1.await.unwrap();
+        assert_eq!(response1.status(), 200);
+        assert_eq!(response1.headers()["x-cache-status"], "miss");
+
+        let mut body1 = response1.into_body();
+
+        // Read first chunk but don't release flow control to stall connection 1
+        let first_chunk = body1.data().await.unwrap().unwrap();
+        assert!(!first_chunk.is_empty());
+
+        // Connection 2 - While conn 1 is stalled, try to get the same cached resource
+        let tcp2 = TcpStream::connect("127.0.0.1:6154").await.unwrap();
+        let (mut h2_client2, h2_conn2) = client::handshake(tcp2).await.unwrap();
+
+        tokio::spawn(async move {
+            if let Err(e) = h2_conn2.await {
+                eprintln!("H2 connection 2 error: {:?}", e);
+            }
+        });
+
+        let request2 = Request::builder()
+            .uri("http://127.0.0.1/unique/test_h2_stall/download/")
+            .body(())
+            .unwrap();
+
+        let (response2, _) = h2_client2.send_request(request2, true).unwrap();
+
+        // Try to read, proxy should not be blocked
+        let response2 = match timeout(Duration::from_secs(5), response2).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => panic!("Connection 2 failed: {:?}", e),
+            Err(_) => panic!("Connection 2 timed out - proxy blocked without proxy task API!"),
+        };
+
+        assert_eq!(response2.status(), 200);
+        assert_eq!(response2.headers()["x-cache-status"], "hit");
+
+        // Read full response from connection 2
+        let mut body2 = response2.into_body();
+        let mut received2 = Vec::new();
+        while let Some(Ok(chunk)) = timeout(Duration::from_secs(5), body2.data())
+            .await
+            .expect("should not time out waiting for data")
+        {
+            let len = chunk.len();
+            received2.extend_from_slice(&chunk);
+            body2.flow_control().release_capacity(len).unwrap();
+        }
+
+        assert_eq!(
+            received2.len(),
+            4 * 1024 * 1024,
+            "Connection 2 should receive full cached response"
+        );
+
+        // Clean up: unstall connection 1
+        body1
+            .flow_control()
+            .release_capacity(first_chunk.len())
+            .unwrap();
+    }
+
+    // Test cache population from H2 upstream origin with H1 downstream.
+    #[tokio::test]
+    async fn test_cache_upstream_h2_downstream_h1() {
+        init();
+
+        let test_url = "http://127.0.0.1:6148/unique/test_h2_upstream/download/";
+
+        // Step 1: Populate cache from H2 origin (cache miss)
+        let client = reqwest::Client::new();
+        let res = client
+            .get(test_url)
+            .header("x-h2", "true")
+            .header("x-lock", "true")
+            .header("x-set-cache-control", "public, max-age=60")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        assert_eq!(res.headers()["origin-http2"], "h2c");
+
+        let body = res.bytes().await.unwrap();
+        assert_eq!(
+            body.len(),
+            4 * 1024 * 1024,
+            "Should receive full 4MB response"
+        );
+
+        // Step 2: Request again and verify cache hit
+        let res = client
+            .get(test_url)
+            .header("x-h2", "true")
+            .header("x-set-cache-control", "public, max-age=60")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+
+        let body = res.bytes().await.unwrap();
+        assert_eq!(
+            body.len(),
+            4 * 1024 * 1024,
+            "Should receive full 4MB from cache"
+        );
     }
 }

@@ -267,6 +267,81 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn process_upstream_tasks(
+        &self,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
+        initial_task: HttpTask,
+        rx: &mut mpsc::Receiver<HttpTask>,
+        serve_from_cache: &mut ServeFromCache,
+        range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
+        response_state: &mut ResponseStateMachine,
+    ) -> Result<Option<bool>>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if serve_from_cache.should_discard_upstream() {
+            // just drain, do we need to do anything else?
+            return Ok(None);
+        }
+
+        // Batch: pull as many tasks as we can from rx
+        let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
+        tasks.push(initial_task);
+        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
+            debug!("upstream event now: {:?}", maybe_task);
+            if let Some(t) = maybe_task {
+                tasks.push(t);
+            } else {
+                break; // upstream closed
+            }
+        }
+
+        /* run filters before sending to downstream */
+        let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
+        for mut t in tasks {
+            if self.revalidate_or_stale(session, &mut t, ctx).await {
+                serve_from_cache.enable();
+                response_state.enable_cached_response();
+                // skip downstream filtering entirely as the 304 will not be sent
+                break;
+            }
+            #[cfg(feature = "adjust_upstream_modules")]
+            if let HttpTask::Header(header, end_of_stream) = &t {
+                self.inner
+                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
+                    .await?;
+            }
+            session.upstream_compression.response_filter(&mut t);
+            let task = self
+                .h1_response_filter(session, t, ctx, serve_from_cache, range_body_filter, false)
+                .await?;
+            if serve_from_cache.is_miss_header() {
+                response_state.enable_cached_response();
+            }
+            // check error and abort
+            // otherwise the error is surfaced via write_response_tasks()
+            if !serve_from_cache.should_send_to_downstream() {
+                if let HttpTask::Failed(e) = task {
+                    return Err(e);
+                }
+            }
+            filtered_tasks.push(task);
+        }
+
+        if !serve_from_cache.should_send_to_downstream() {
+            // TODO: need to derive response_done from filtered_tasks in case downstream failed already
+            return Ok(None);
+        }
+
+        let response_done = session.write_response_tasks(filtered_tasks).await?;
+
+        Ok(Some(response_done))
+    }
+
     // todo use this function to replace bidirection_1to2()
     // returns whether this server (downstream) session can be reused
     async fn proxy_handle_downstream(
@@ -328,6 +403,8 @@ where
         // use cache when upstream revalidates (or TODO: error)
         let mut serve_from_cache = proxy_cache::ServeFromCache::new();
         let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
+
+        let mut next_upstream_task: Option<HttpTask> = None;
 
         /* duplex mode without caching
          * Read body from downstream while reading response from upstream
@@ -424,74 +501,56 @@ where
                     // If tx is closed, the upstream has already finished its job.
                     downstream_state.maybe_finished(tx.is_closed());
                     debug!("waiting for permit {send_permit:?}, upstream closed {}", tx.is_closed());
-                    /* No permit, wait on more capacity to avoid starving.
+                     /* No permit, wait on more capacity to avoid starving.
                      * Otherwise this select only blocks on rx, which might send no data
                      * before the entire body is uploaded.
                      * once more capacity arrives we just loop back
                      */
                 },
 
-                task = rx.recv(), if !response_state.upstream_done() => {
+                // Handle buffered upstream task from previous iteration
+                task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
+                    debug!("buffered upstream event: {:?}", task);
+                    if let Some(t) = task {
+                        let Some(response_done) = self.process_upstream_tasks(
+                            session,
+                            ctx,
+                            t,
+                            &mut rx,
+                            &mut serve_from_cache,
+                            &mut range_body_filter,
+                            &mut response_state,
+                        ).await? else {
+                            // nothing sent downstream e.g. serve_from_cache
+                            continue;
+                        };
+                        response_state.maybe_set_upstream_done(response_done);
+                        // unsuccessful upgrade response may force the request done
+                        downstream_state.maybe_finished(session.is_body_done());
+                    } else {
+                        debug!("empty upstream event");
+                        response_state.maybe_set_upstream_done(true);
+                    }
+                },
+
+                task = rx.recv(), if !response_state.upstream_done() && next_upstream_task.is_none() => {
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
-                        if serve_from_cache.should_discard_upstream() {
-                            // just drain, do we need to do anything else?
-                           continue;
-                        }
-                        // pull as many tasks as we can
-                        let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        tasks.push(t);
-                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
-                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
-                            debug!("upstream event now: {:?}", maybe_task);
-                            if let Some(t) = maybe_task {
-                                tasks.push(t);
-                            } else {
-                                break; // upstream closed
-                            }
-                        }
-
-                        /* run filters before sending to downstream */
-                        let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        for mut t in tasks {
-                            if self.revalidate_or_stale(session, &mut t, ctx).await {
-                                serve_from_cache.enable();
-                                response_state.enable_cached_response();
-                                // skip downstream filtering entirely as the 304 will not be sent
-                                break;
-                            }
-                            #[cfg(feature = "adjust_upstream_modules")]
-                            if let HttpTask::Header(header, end_of_stream) = &t {
-                                self.inner
-                                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                                    .await?;
-                            }
-                            session.upstream_compression.response_filter(&mut t);
-                            let task = self.h1_response_filter(session, t, ctx,
-                                &mut serve_from_cache,
-                                &mut range_body_filter, false).await?;
-                            if serve_from_cache.is_miss_header() {
-                                response_state.enable_cached_response();
-                            }
-                            // check error and abort
-                            // otherwise the error is surfaced via write_response_tasks()
-                            if !serve_from_cache.should_send_to_downstream() {
-                                if let HttpTask::Failed(e) = task {
-                                    return Err(e);
-                                }
-                            }
-                            filtered_tasks.push(task);
-                        }
-
-                        if !serve_from_cache.should_send_to_downstream() {
-                            // TODO: need to derive response_done from filtered_tasks in case downstream failed already
-                            continue;
-                        }
-
-                        // set to downstream
                         let upgraded = session.was_upgraded();
-                        let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        let Some(response_done) = self.process_upstream_tasks(
+                            session,
+                            ctx,
+                            t,
+                            &mut rx,
+                            &mut serve_from_cache,
+                            &mut range_body_filter,
+                            &mut response_state,
+                        ).await? else {
+                            // nothing sent downstream e.g. serve_from_cache
+                            continue;
+                        };
                         if !upgraded && session.was_upgraded() && downstream_state.can_poll() {
+                            // TODO: write can happen async now
                             // just upgraded, the downstream state should be reset to continue to
                             // poll body
                             trace!("reset downstream state on upgrade");
@@ -508,35 +567,96 @@ where
                 },
 
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
-                    if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
+                    if !response_state.cached_done()
+                        && !downstream_state.is_errored()
+                        && serve_from_cache.is_on()
+                        && !session.has_pending_downstream_tasks() => { // backpressure: don't queue if pending writes
 
                     let task = self.h1_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
                     debug!("serve_from_cache task {task:?}");
 
-                    match session.write_response_tasks(vec![task]).await {
-                        Ok(b) => response_state.maybe_set_cache_done(b),
-                        Err(e) => if serve_from_cache.is_miss() {
-                            // give up writing to downstream but wait for upstream cache write to finish
-                            downstream_state.to_errored();
-                            response_state.maybe_set_cache_done(true);
-                            warn!(
-                                "Downstream Error ignored during caching: {}, {}",
-                                e,
-                                self.inner.request_summary(session, ctx)
-                            );
-                            // This will not be treated as a final error, but we should signal to
-                            // downstream session regardless
-                            session.downstream_session.on_proxy_failure(e);
-                            continue;
-                        } else {
-                            return Err(e);
+                    if session.downstream_session.supports_proxy_task_api() {
+                        session.send_downstream_proxy_task(task).await?;
+                    } else {
+                        match session.write_response_tasks(vec![task]).await {
+                            Ok(b) => response_state.maybe_set_cache_done(b),
+                            Err(e) => if serve_from_cache.is_miss() {
+                                // give up writing to downstream but wait for upstream cache write to finish
+                                downstream_state.to_errored();
+                                response_state.maybe_set_cache_done(true);
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
+                                continue;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        if response_state.cached_done() {
+                            if let Err(e) = session.cache.finish_hit_handler().await {
+                                warn!("Error during finish_hit_handler: {}", e);
+                            }
                         }
                     }
-                    if response_state.cached_done() {
-                        if let Err(e) = session.cache.finish_hit_handler().await {
-                            warn!("Error during finish_hit_handler: {}", e);
+                }
+
+                // Write queued downstream proxy tasks while also polling for upstream tasks.
+                // This allows cache writes to continue even when downstream is stalled.
+                //
+                // "Gate" branch: ready(()) resolves immediately, so the guard controls
+                // whether we enter. This is not a busy-loop because every path through
+                // the inner select either (a) drains all pending tasks via
+                // write_downstream_proxy_tasks (making the guard false), (b) stores an
+                // upstream task in next_upstream_task (making the guard false), or
+                // (c) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                    tokio::select! {
+                        // Try to write downstream proxy tasks (cancel-safe)
+                        write_result = session.write_downstream_proxy_tasks() => {
+                            match write_result {
+                                Ok(end) => {
+                                    response_state.maybe_set_cache_done(end);
+                                    if response_state.cached_done() {
+                                        if let Err(e) = session.cache.finish_hit_handler().await {
+                                            warn!("Error during finish_hit_handler: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => if serve_from_cache.is_miss() {
+                                    // give up writing to downstream but wait for upstream cache write to finish
+                                    downstream_state.to_errored();
+                                    response_state.maybe_set_cache_done(true);
+                                    warn!(
+                                        "Downstream write error ignored during caching: {}, {}",
+                                        e,
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                    // This will not be treated as a final error, but we should signal to
+                                    // downstream session regardless
+                                    session.downstream_session.on_proxy_failure(e);
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+
+                        // Also poll for upstream tasks - if we get one, cancel the write and handle it.
+                        // Only poll if there is no buffered task already waiting to be processed.
+                        upstream_task = rx.recv(), if !response_state.upstream_done() && serve_from_cache.is_on() && next_upstream_task.is_none() => {
+                            if let Some(t) = upstream_task {
+                                // Store this upstream task to be processed next iteration
+                                next_upstream_task = Some(t);
+                                continue;
+                            } else {
+                                response_state.maybe_set_upstream_done(true);
+                            }
                         }
                     }
                 }

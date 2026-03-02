@@ -1,3 +1,17 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /// Possible downstream states during request multiplexing
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DownstreamStateMachine {
@@ -36,19 +50,28 @@ impl DownstreamStateMachine {
         matches!(self, Self::Errored)
     }
 
-    /// Move the state machine to Finished state if `set` is true
+    /// Move the state machine to Finished state if `set` is true.
+    ///
+    /// No-op when the current state is [`Errored`](Self::Errored) — once errored the
+    /// downstream connection must not be reused, and late upstream chunks arriving
+    /// via `rx.recv()` must not overwrite that decision.
     pub fn maybe_finished(&mut self, set: bool) {
-        if set {
+        if set && !self.is_errored() {
             *self = Self::ReadingFinished
         }
     }
 
-    /// Reset if we should continue reading from the downstream again.
-    /// Only used with upgraded connections when body mode changes.
+    /// Reset to [`Reading`](Self::Reading) for upgraded connections when body mode changes.
+    ///
+    /// No-op when the current state is [`Errored`](Self::Errored).
     pub fn reset(&mut self) {
-        *self = Self::Reading;
+        if !self.is_errored() {
+            *self = Self::Reading;
+        }
     }
 
+    /// Transition to [`Errored`](Self::Errored). This is a terminal state: once entered,
+    /// no other state transition is permitted and the connection must not be reused.
     pub fn to_errored(&mut self) {
         *self = Self::Errored
     }
@@ -95,5 +118,63 @@ impl ResponseStateMachine {
         if done {
             self.cached_response_done = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_lifecycle() {
+        let mut ds = DownstreamStateMachine::new(false);
+        assert!(ds.is_reading());
+        assert!(ds.can_poll());
+        assert!(!ds.is_errored());
+
+        ds.maybe_finished(true);
+        assert!(!ds.is_reading());
+        assert!(ds.is_done());
+        assert!(ds.can_poll()); // ReadingFinished still allows polling (for idle)
+        assert!(!ds.is_errored());
+    }
+
+    #[test]
+    fn errored_is_terminal() {
+        let mut ds = DownstreamStateMachine::new(false);
+        ds.to_errored();
+        assert!(ds.is_errored());
+        assert!(!ds.can_poll());
+        assert!(ds.is_done());
+    }
+
+    /// `maybe_finished(false)` is always a no-op regardless of state.
+    #[test]
+    fn maybe_finished_false_is_noop() {
+        let mut ds = DownstreamStateMachine::new(false);
+        ds.to_errored();
+        ds.maybe_finished(false); // must not panic
+        assert!(ds.is_errored());
+        assert!(!ds.can_poll());
+    }
+
+    /// `maybe_finished(true)` on `Errored` is a no-op — `Errored` is terminal.
+    #[test]
+    fn maybe_finished_true_noop_on_errored() {
+        let mut ds = DownstreamStateMachine::new(false);
+        ds.to_errored();
+        ds.maybe_finished(true); // must not overwrite Errored
+        assert!(ds.is_errored());
+        assert!(!ds.can_poll());
+    }
+
+    /// `reset()` on `Errored` is a no-op — `Errored` is terminal.
+    #[test]
+    fn reset_noop_on_errored() {
+        let mut ds = DownstreamStateMachine::new(false);
+        ds.to_errored();
+        ds.reset(); // must not overwrite Errored
+        assert!(ds.is_errored());
+        assert!(!ds.can_poll());
     }
 }

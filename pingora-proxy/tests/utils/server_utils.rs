@@ -658,6 +658,12 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.remove_header(&CONTENT_LENGTH);
             upstream_response.remove_header(&TRANSFER_ENCODING);
         }
+        // Allow tests to inject Cache-Control into the upstream response
+        if let Some(cc) = session.req_header().headers.get("x-set-cache-control") {
+            upstream_response
+                .insert_header(http::header::CACHE_CONTROL, cc)
+                .unwrap();
+        }
         Ok(())
     }
 
@@ -823,6 +829,15 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    // H2C-enabled cache proxy on port 6154
+    let mut proxy_service_cache_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
+    let cache_h2c_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
+    let mut cache_h2c_options = HttpServerOptions::default();
+    cache_h2c_options.h2c = true;
+    cache_h2c_logic.server_options = Some(cache_h2c_options);
+    proxy_service_cache_h2c.add_tcp("0.0.0.0:6154");
+
     #[cfg(feature = "any_tls")]
     {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -839,6 +854,7 @@ fn test_main() {
         Box::new(proxy_service_http),
         Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
+        Box::new(proxy_service_cache_h2c),
     ];
 
     if let Some(proxy_service_https) = proxy_service_https_opt {
