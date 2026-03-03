@@ -89,7 +89,20 @@ fn entry_point(opt: Option<Opt>) {
     let echo_service_http =
         Service::with_listeners("Echo Service HTTP".to_string(), listeners, EchoApp);
 
+    // Echo service with h2c enabled + TLS listener (for testing h2c + TLS interaction)
+    let mut h2c_tls_settings =
+        pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+    h2c_tls_settings.enable_h2();
+    let mut h2c_listeners = Listeners::tcp("0.0.0.0:6160");
+    h2c_listeners.add_tls_with_settings("0.0.0.0:6161", None, h2c_tls_settings);
+    let mut h2c_app = pingora_core::apps::http_app::HttpServer::new_app(EchoApp);
+    h2c_app.server_options.get_or_insert_default().h2c = true;
+
+    let echo_service_h2c =
+        Service::with_listeners("Echo Service H2C".to_string(), h2c_listeners, h2c_app);
+
     my_server.add_service(echo_service_http);
+    my_server.add_service(echo_service_h2c);
     my_server.run_forever();
 }
 
