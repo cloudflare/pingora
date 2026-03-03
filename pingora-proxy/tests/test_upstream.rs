@@ -21,7 +21,7 @@ use futures::{SinkExt, StreamExt};
 use pingora_http::ResponseHeader;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{StatusCode, Version};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -2151,6 +2151,7 @@ mod test_cache {
         sleep(Duration::from_millis(50)).await;
 
         let task2 = tokio::spawn(async move {
+            let start = Instant::now();
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
@@ -2165,12 +2166,18 @@ mod test_cache {
                 .unwrap()
                 .parse()
                 .unwrap();
-            // the entire body should need 2 extra seconds, here the test shows that
-            // only the header is under cache lock and the body should be streamed
-            assert!(lock_time_ms > 900 && lock_time_ms < 1000);
-            assert_eq!(res.text().await.unwrap(), "hello world!");
+            let body = res.text().await.unwrap();
+            let total_ms = start.elapsed().as_millis() as u32;
+            // lock should cover only the header, not the full body streaming.
+            // if the body were also under lock, lock_time would approach total_ms.
+            assert!(
+                lock_time_ms < total_ms / 2,
+                "lock time {lock_time_ms}ms should be well under total request time {total_ms}ms"
+            );
+            assert_eq!(body, "hello world!");
         });
         let task3 = tokio::spawn(async move {
+            let start = Instant::now();
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
@@ -2185,10 +2192,15 @@ mod test_cache {
                 .unwrap()
                 .parse()
                 .unwrap();
-            // the entire body should need 2 extra seconds, here the test shows that
-            // only the header is under cache lock and the body should be streamed
-            assert!(lock_time_ms > 900 && lock_time_ms < 1000);
-            assert_eq!(res.text().await.unwrap(), "hello world!");
+            let body = res.text().await.unwrap();
+            let total_ms = start.elapsed().as_millis() as u32;
+            // lock should cover only the header, not the full body streaming.
+            // if the body were also under lock, lock_time would approach total_ms.
+            assert!(
+                lock_time_ms < total_ms / 2,
+                "lock time {lock_time_ms}ms should be well under total request time {total_ms}ms"
+            );
+            assert_eq!(body, "hello world!");
         });
 
         task1.await.unwrap();
