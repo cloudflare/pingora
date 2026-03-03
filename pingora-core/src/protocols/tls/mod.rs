@@ -190,6 +190,7 @@ impl ALPN {
             ALPN::H1 => vec![b"http/1.1".to_vec()],
             ALPN::H2 => vec![b"h2".to_vec()],
             ALPN::H2H1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            ALPN::Custom(custom) => vec![custom.protocol().to_vec()],
         }
     }
 }

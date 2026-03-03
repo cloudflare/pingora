@@ -129,11 +129,11 @@ where
     };
     socket::bind(listen_fd, &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission to all */
+    /* sock is created before we change user, need to give permission */
     stat::fchmodat(
         None,
         path,
-        stat::Mode::all(),
+        stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();

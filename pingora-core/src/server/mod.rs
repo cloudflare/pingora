@@ -14,6 +14,7 @@
 
 //! Server process and configuration management
 
+mod bootstrap_services;
 pub mod configuration;
 #[cfg(unix)]
 mod daemon;
@@ -23,20 +24,28 @@ pub(crate) mod transfer_fd;
 use async_trait::async_trait;
 #[cfg(unix)]
 use daemon::daemonize;
+use daggy::NodeIndex;
 use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use pingora_runtime::Runtime;
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
+use std::time::SystemTime;
 #[cfg(unix)]
 use tokio::signal::unix;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
 use tokio::time::{sleep, Duration};
 
-use crate::services::Service;
+use crate::prelude::background_service;
+use crate::server::bootstrap_services::{Bootstrap, BootstrapService, SentryInitService};
+use crate::services::{
+    DependencyGraph, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch, ServiceWithDependents,
+};
 use configuration::{Opt, ServerConf};
+use std::collections::HashMap;
 #[cfg(unix)]
 pub use transfer_fd::Fds;
 
@@ -52,6 +61,13 @@ const CLOSE_TIMEOUT: u64 = 5;
 enum ShutdownType {
     Graceful,
     Quick,
+}
+
+/// Internal wrapper for services with dependency metadata.
+pub(crate) struct ServiceWrapper {
+    ready_notifier: Option<ServiceReadyNotifier>,
+    service: Box<dyn ServiceWithDependents>,
+    service_handle: ServiceHandle,
 }
 
 /// The execution phase the server is currently in.
@@ -101,7 +117,7 @@ pub enum ExecutionPhase {
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
 #[cfg(unix)]
-pub type ListenFds = Arc<Mutex<Fds>>;
+pub type ListenFds = Arc<TokioMutex<Fds>>;
 
 /// The type of shutdown process that has been requested.
 #[derive(Debug)]
@@ -181,9 +197,11 @@ impl Default for RunArgs {
 /// services (see [crate::services]). The server object handles signals, reading configuration,
 /// zero downtime upgrade and error reporting.
 pub struct Server {
-    services: Vec<Box<dyn Service>>,
-    #[cfg(unix)]
-    listen_fds: Option<ListenFds>,
+    // This is a way to add services that have to be run before any others
+    // without requiring dependencies to be set directly
+    init_services: Vec<Box<dyn ServiceWithDependents + 'static>>,
+
+    services: HashMap<NodeIndex, ServiceWrapper>,
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
     shutdown_recv: ShutdownWatch,
@@ -193,16 +211,16 @@ pub struct Server {
     /// Users can subscribe to the phase with [`Self::watch_execution_phase()`].
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
+    /// Specification of service level dependencies
+    dependencies: Arc<Mutex<DependencyGraph>>,
+
+    /// Service initialization
+    bootstrap: Arc<Mutex<Bootstrap>>,
+
     /// The parsed server configuration
     pub configuration: Arc<ServerConf>,
     /// The parser command line options
     pub options: Option<Opt>,
-    #[cfg(feature = "sentry")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
-    /// The Sentry ClientOptions.
-    ///
-    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
-    pub sentry: Option<ClientOptions>,
 }
 
 // TODO: delete the pid when exit
@@ -258,7 +276,7 @@ impl Server {
                     .send(ExecutionPhase::GracefulUpgradeTransferringFds)
                     .ok();
 
-                if let Some(fds) = &self.listen_fds {
+                if let Some(fds) = self.listen_fds() {
                     let fds = fds.lock().await;
                     info!("Trying to send socks");
                     // XXX: this is blocking IO
@@ -299,41 +317,106 @@ impl Server {
         }
     }
 
+    #[cfg(windows)]
+    async fn main_loop(&self, _run_args: RunArgs) -> ShutdownType {
+        // waiting for exit signal
+
+        self.execution_phase_watch
+            .send(ExecutionPhase::Running)
+            .ok();
+
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Ctrl+C received, gracefully exiting");
+                // graceful shutdown if there are listening sockets
+                info!("Broadcasting graceful shutdown");
+                match self.shutdown_watch.send(true) {
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
+                    Err(e) => {
+                        error!("Graceful shutdown broadcast failed: {e}");
+                    }
+                }
+                info!("Broadcast graceful shutdown complete");
+
+                self.execution_phase_watch
+                    .send(ExecutionPhase::GracefulTerminate)
+                    .ok();
+
+                ShutdownType::Graceful
+            }
+            Err(e) => {
+                error!("Unable to listen for shutdown signal: {}", e);
+                ShutdownType::Quick
+            }
+        }
+    }
+
+    #[cfg(feature = "sentry")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
+    /// The Sentry ClientOptions.
+    ///
+    /// Panics and other events sentry captures will be sent to this DSN **only in release mode**
+    pub fn set_sentry_config(&mut self, sentry_config: ClientOptions) {
+        self.bootstrap.lock().set_sentry_config(Some(sentry_config));
+    }
+
+    /// Get the configured file descriptors for listening
+    #[cfg(unix)]
+    fn listen_fds(&self) -> Option<ListenFds> {
+        self.bootstrap.lock().get_fds()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn run_service(
-        mut service: Box<dyn Service>,
+        mut service: Box<dyn ServiceWithDependents>,
         #[cfg(unix)] fds: Option<ListenFds>,
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
         listeners_per_fd: usize,
+        ready_notifier: ServiceReadyNotifier,
+        dependency_watches: Vec<ServiceReadyWatch>,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
         let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
+        let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
+            // Wait for all dependencies to be ready
+            let mut time_waited_opt: Option<Duration> = None;
+            for mut watch in dependency_watches {
+                let start = SystemTime::now();
+
+                if watch.wait_for(|&ready| ready).await.is_err() {
+                    error!(
+                        "Service '{}' dependency channel closed before ready",
+                        service_name
+                    );
+                }
+
+                *time_waited_opt.get_or_insert_default() += start.elapsed().unwrap_or_default()
+            }
+
+            if let Some(time_waited) = time_waited_opt {
+                service.on_startup_delay(time_waited);
+            }
+
+            // Start the actual service, passing the ready notifier
             service
                 .start_service(
                     #[cfg(unix)]
                     fds,
                     shutdown,
                     listeners_per_fd,
+                    ready_notifier,
                 )
                 .await;
-            info!("service exited.")
+            info!("service '{}' exited.", service_name);
         });
         service_runtime
-    }
-
-    #[cfg(unix)]
-    fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        let mut fds = Fds::new();
-        if upgrade {
-            debug!("Trying to receive socks");
-            fds.get_from_sock(self.configuration.as_ref().upgrade_sock.as_str())?
-        }
-        self.listen_fds = Some(Arc::new(Mutex::new(fds)));
-        Ok(())
     }
 
     /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
@@ -354,17 +437,23 @@ impl Server {
 
         let (tx, rx) = watch::channel(false);
 
+        let execution_phase_watch = broadcast::channel(100).0;
+        let bootstrap = Arc::new(Mutex::new(Bootstrap::new(
+            &opt,
+            &conf,
+            &execution_phase_watch,
+        )));
+
         Server {
-            services: vec![],
-            #[cfg(unix)]
-            listen_fds: None,
+            services: Default::default(),
+            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
-            execution_phase_watch: broadcast::channel(100).0,
+            execution_phase_watch,
             configuration: Arc::new(conf),
             options: opt,
-            #[cfg(feature = "sentry")]
-            sentry: None,
+            dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
+            bootstrap,
         }
     }
 
@@ -379,6 +468,7 @@ impl Server {
         let opt = opt.into();
         let (tx, rx) = watch::channel(false);
 
+        let execution_phase_watch = broadcast::channel(100).0;
         let conf = if let Some(opt) = opt.as_ref() {
             opt.conf.as_ref().map_or_else(
                 || {
@@ -397,30 +487,115 @@ impl Server {
                 .ok_or_else(|| Error::explain(ErrorType::ReadError, "Conf generation failed"))
         }?;
 
+        let bootstrap = Arc::new(Mutex::new(Bootstrap::new(
+            &opt,
+            &conf,
+            &execution_phase_watch,
+        )));
+
         Ok(Server {
-            services: vec![],
-            #[cfg(unix)]
-            listen_fds: None,
+            services: Default::default(),
+            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
-            execution_phase_watch: broadcast::channel(100).0,
+            execution_phase_watch,
             configuration: Arc::new(conf),
             options: opt,
-            #[cfg(feature = "sentry")]
-            sentry: None,
+            dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
+            bootstrap,
         })
+    }
+
+    /// Add a service that all other services will wait on before starting.
+    fn add_init_service(&mut self, service: impl ServiceWithDependents + 'static) {
+        let boxed_service = Box::new(service);
+        self.init_services.push(boxed_service);
+    }
+
+    /// Add the init services as dependencies for all existing services
+    fn apply_init_service_dependencies(&mut self) {
+        let services = self
+            .services
+            .values()
+            .map(|service| service.service_handle.clone())
+            .collect::<Vec<_>>();
+        let global_deps = self
+            .init_services
+            .drain(..)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|dep| self.add_boxed_service(dep))
+            .collect::<Vec<_>>();
+        for service in services {
+            service.add_dependencies(&global_deps);
+        }
     }
 
     /// Add a service to this server.
     ///
-    /// A service is anything that implements [`Service`].
-    pub fn add_service(&mut self, service: impl Service + 'static) {
-        self.services.push(Box::new(service));
+    /// Returns a [`ServiceHandle`] that can be used to declare dependencies.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let db_id = server.add_service(database_service);
+    /// let api_id = server.add_service(api_service);
+    ///
+    /// // Declare that API depends on database
+    /// api_id.add_dependency(&db_id);
+    /// ```
+    pub fn add_service(&mut self, service: impl ServiceWithDependents + 'static) -> ServiceHandle {
+        self.add_boxed_service(Box::new(service))
     }
 
-    /// Similar to [`Self::add_service()`], but take a list of services
-    pub fn add_services(&mut self, services: Vec<Box<dyn Service>>) {
-        self.services.extend(services);
+    /// Add a pre-boxed service to this server.
+    ///
+    /// Returns a [`ServiceHandle`] that can be used to declare dependencies.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let db_id = server.add_service(database_service);
+    /// let api_id = server.add_service(api_service);
+    ///
+    /// // Declare that API depends on database
+    /// api_id.add_dependency(&db_id);
+    /// ```
+    pub fn add_boxed_service(
+        &mut self,
+        service_box: Box<dyn ServiceWithDependents>,
+    ) -> ServiceHandle {
+        let name = service_box.name().to_string();
+
+        // Create a readiness notifier for this service
+        let (tx, rx) = watch::channel(false);
+
+        let id = self.dependencies.lock().add_node(name.clone(), rx.clone());
+
+        let service_handle = ServiceHandle::new(id, name, rx, &self.dependencies);
+
+        let wrapper = ServiceWrapper {
+            ready_notifier: Some(ServiceReadyNotifier::new(tx)),
+            service: service_box,
+            service_handle: service_handle.clone(),
+        };
+
+        self.services.insert(id, wrapper);
+
+        service_handle
+    }
+
+    /// Similar to [`Self::add_service()`], but take a list of services.
+    ///
+    /// Returns a `Vec<ServiceHandle>` for all added services.
+    pub fn add_services(
+        &mut self,
+        services: Vec<Box<dyn ServiceWithDependents>>,
+    ) -> Vec<ServiceHandle> {
+        services
+            .into_iter()
+            .map(|service| self.add_boxed_service(service))
+            .collect()
     }
 
     /// Prepare the server to start
@@ -428,41 +603,28 @@ impl Server {
     /// When trying to zero downtime upgrade from an older version of the server which is already
     /// running, this function will try to get all its listening sockets in order to take them over.
     pub fn bootstrap(&mut self) {
-        info!("Bootstrap starting");
-        debug!("{:#?}", self.options);
+        self.bootstrap.lock().bootstrap();
+    }
 
-        self.execution_phase_watch
-            .send(ExecutionPhase::Bootstrap)
-            .ok();
+    /// Create a service that will run to prepare the service to start
+    ///
+    /// The created service will handle the zero-downtime upgrade from an older version of the server
+    /// to this one. It will try to get all its listening sockets in order to take them over.
+    ///
+    /// Other bootstrapping functionality like sentry initialization will also be handled, but as a
+    /// service that will complete before any other service starts.
+    pub fn bootstrap_as_a_service(&mut self) -> ServiceHandle {
+        let bootstrap_service =
+            background_service("Bootstrap Service", BootstrapService::new(&self.bootstrap));
 
-        /* only init sentry in release builds */
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
+        let sentry_service = background_service(
+            "Sentry Init Service",
+            SentryInitService::new(&self.bootstrap),
+        );
 
-        if self.options.as_ref().is_some_and(|o| o.test) {
-            info!("Server Test passed, exiting");
-            std::process::exit(0);
-        }
+        self.add_init_service(sentry_service);
 
-        // load fds
-        #[cfg(unix)]
-        match self.load_fds(self.options.as_ref().is_some_and(|o| o.upgrade)) {
-            Ok(_) => {
-                info!("Bootstrap done");
-            }
-            Err(e) => {
-                // sentry log error on fd load failure
-                #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                sentry::capture_error(&e);
-
-                error!("Bootstrap failed on error: {:?}, exiting.", e);
-                std::process::exit(1);
-            }
-        }
-
-        self.execution_phase_watch
-            .send(ExecutionPhase::BootstrapComplete)
-            .ok();
+        self.add_service(bootstrap_service)
     }
 
     /// Start the server using [Self::run] and default [RunArgs].
@@ -489,6 +651,8 @@ impl Server {
     /// Instead it will either start the daemon process and exit, or panic
     /// if daemonization fails.
     pub fn run(mut self, run_args: RunArgs) {
+        self.apply_init_service_dependencies();
+
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
@@ -506,24 +670,79 @@ impl Server {
             panic!("Daemonizing under windows is not supported");
         }
 
-        /* only init sentry in release builds */
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
-
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
 
-        while let Some(service) = self.services.pop() {
-            let threads = service.threads().unwrap_or(conf.threads);
-            let name = service.name().to_string();
+        // Get services in topological order (dependencies first)
+        let startup_order = match self.dependencies.lock().topological_sort() {
+            Ok(order) => order,
+            Err(e) => {
+                error!("Failed to determine service startup order: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        // Log service names in startup order
+        let service_names: Vec<String> = startup_order
+            .iter()
+            .map(|(_, service)| service.name.clone())
+            .collect();
+        info!("Starting services in dependency order: {:?}", service_names);
+
+        // Start services in dependency order
+        for (service_id, service) in startup_order {
+            let mut wrapper = match self.services.remove(&service_id) {
+                Some(w) => w,
+                None => {
+                    warn!(
+                        "Service ID {:?}-{} in startup order but not found",
+                        service_id, service.name
+                    );
+                    continue;
+                }
+            };
+
+            let threads = wrapper.service.threads().unwrap_or(conf.threads);
+            let name = wrapper.service.name().to_string();
+
+            // Extract dependency watches from the ServiceHandle
+            let dependencies = self
+                .dependencies
+                .lock()
+                .get_dependencies(wrapper.service_handle.id);
+
+            // Get the readiness notifier for this service by taking it from the Option.
+            // Since service_id is the index, we can directly access it.
+            // We take() the notifier, leaving None in its place.
+            let ready_notifier = wrapper
+                .ready_notifier
+                .take()
+                .expect("Service notifier should exist");
+
+            if !dependencies.is_empty() {
+                info!(
+                    "Service '{name}' will wait for dependencies: {:?}",
+                    dependencies.iter().map(|s| &s.name).collect::<Vec<_>>()
+                );
+            } else {
+                info!("Starting service: {}", name);
+            }
+
+            let dependency_watches = dependencies
+                .iter()
+                .map(|s| s.ready_watch.clone())
+                .collect::<Vec<_>>();
+
             let runtime = Server::run_service(
-                service,
+                wrapper.service,
                 #[cfg(unix)]
-                self.listen_fds.clone(),
+                self.listen_fds(),
                 self.shutdown_recv.clone(),
                 threads,
                 conf.work_stealing,
                 self.configuration.listener_tasks_per_fd,
+                ready_notifier,
+                dependency_watches,
             );
             runtimes.push((runtime, name));
         }
@@ -536,7 +755,9 @@ impl Server {
             .get_handle()
             .block_on(self.main_loop(run_args));
         #[cfg(windows)]
-        let shutdown_type = ShutdownType::Graceful;
+        let shutdown_type = server_runtime
+            .get_handle()
+            .block_on(self.main_loop(run_args));
 
         self.execution_phase_watch
             .send(ExecutionPhase::ShutdownStarted)

@@ -163,7 +163,7 @@ impl<S: Session> HttpSession<S> {
         match self {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
-            Self::Custom(c) => c.shutdown(1, "shutdown").await,
+            Self::Custom(c) => c.shutdown(0, "shutdown").await,
         }
     }
 

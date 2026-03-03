@@ -34,7 +34,7 @@
 
 use bytes::Bytes;
 use http::HeaderValue;
-use http::{header, header::AsHeaderName, HeaderMap, Method, Version};
+use http::{header, header::AsHeaderName, HeaderMap, Method};
 use log::{debug, trace, warn};
 use pingora_error::{Error, ErrorType::*, OkOrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -47,7 +47,7 @@ use crate::protocols::http::{
     body_buffer::FixedBuffer,
     server::Session as GenericHttpSession,
     subrequest::dummy::DummyIO,
-    v1::common::{header_value_content_length, is_header_value_chunked_encoding, BODY_BUF_LIMIT},
+    v1::common::{header_value_content_length, is_chunked_encoding_from_headers, BODY_BUF_LIMIT},
     v1::server::HttpSession as SessionV1,
     HttpTask,
 };
@@ -340,7 +340,7 @@ impl HttpSession {
                         // after sending the former body. For now we immediately
                         // switch interpretation to match nginx behavior.
                         // TODO: this has no effect resetting the body counter of TE chunked
-                        self.body_reader.convert_to_until_close();
+                        self.body_reader.convert_to_close_delimited();
                     }
                 } else {
                     debug!("bad upgrade handshake!");
@@ -407,24 +407,21 @@ impl HttpSession {
         }
 
         if self.is_upgrade(header) == Some(true) {
-            self.body_writer.init_until_close();
+            self.body_writer.init_close_delimited();
+        } else if is_chunked_encoding_from_headers(&header.headers) {
+            // transfer-encoding takes priority over content-length
+            self.body_writer.init_close_delimited();
         } else {
-            let te_value = header.headers.get(http::header::TRANSFER_ENCODING);
-            if is_header_value_chunked_encoding(te_value) {
-                // transfer-encoding takes priority over content-length
-                self.body_writer.init_until_close();
-            } else {
-                let content_length =
-                    header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH));
-                match content_length {
-                    Some(length) => {
-                        self.body_writer.init_content_length(length);
-                    }
-                    None => {
-                        /* TODO: 1. connection: keepalive cannot be used,
-                        2. mark connection must be closed */
-                        self.body_writer.init_until_close();
-                    }
+            let content_length =
+                header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH));
+            match content_length {
+                Some(length) => {
+                    self.body_writer.init_content_length(length);
+                }
+                None => {
+                    /* TODO: 1. connection: keepalive cannot be used,
+                    2. mark connection must be closed */
+                    self.body_writer.init_close_delimited();
                 }
             }
         }
@@ -508,7 +505,7 @@ impl HttpSession {
     }
 
     fn is_chunked_encoding(&self) -> bool {
-        is_header_value_chunked_encoding(self.get_header(header::TRANSFER_ENCODING))
+        is_chunked_encoding_from_headers(&self.req_header().headers)
     }
 
     /// Clear body-related subrequest headers.
@@ -533,16 +530,15 @@ impl HttpSession {
                 buffer.clear();
             }
 
-            if self.req_header().version == Version::HTTP_11 && self.is_upgrade_req() {
-                self.body_reader.init_until_close();
-                return;
-            }
-
-            if self.is_chunked_encoding() {
+            if self.was_upgraded() {
+                // if upgraded _post_ 101 (and body was not init yet)
+                // treat as upgraded body (pass through until closed)
+                self.body_reader.init_close_delimited();
+            } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 // TE is not visible at subrequest HttpTask level
                 // so this means read until request closure
-                self.body_reader.init_until_close();
+                self.body_reader.init_close_delimited();
             } else {
                 let cl = header_value_content_length(self.get_header(header::CONTENT_LENGTH));
                 match cl {
@@ -550,15 +546,11 @@ impl HttpSession {
                         self.body_reader.init_content_length(i);
                     }
                     None => {
-                        match self.req_header().version {
-                            Version::HTTP_11 => {
-                                // Per RFC assume no body by default in HTTP 1.1
-                                self.body_reader.init_content_length(0);
-                            }
-                            _ => {
-                                self.body_reader.init_until_close();
-                            }
-                        }
+                        // Per RFC 9112: "Request messages are never close-delimited because they are
+                        // always explicitly framed by length or transfer coding, with the absence of
+                        // both implying the request ends immediately after the header section."
+                        // All HTTP/1.x requests without Content-Length or Transfer-Encoding have 0 body
+                        self.body_reader.init_content_length(0);
                     }
                 }
             }
@@ -814,7 +806,9 @@ impl HttpSession {
 mod tests_stream {
     use super::*;
     use crate::protocols::http::subrequest::body::{BodyMode, ParseState};
+    use bytes::BufMut;
     use http::StatusCode;
+    use rstest::rstest;
 
     use std::str;
     use tokio_test::io::Builder;
@@ -893,7 +887,7 @@ mod tests_stream {
             .await
             .unwrap();
         // 100 won't affect body state
-        assert!(!http_stream.is_body_done());
+        assert!(http_stream.is_body_done());
     }
 
     #[tokio::test]
@@ -1095,5 +1089,132 @@ mod tests_stream {
             }
             t => panic!("unexpected task {t:?}"),
         }
+    }
+
+    async fn session_from_input_no_validate(input: &[u8]) -> (HttpSession, SubrequestHandle) {
+        let mock_io = Builder::new().read(input).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        // Read the request in v1 inner session to set up headers properly
+        http_stream.read_request().await.unwrap();
+        let (http_stream, handle) = HttpSession::new_from_session(&http_stream);
+        (http_stream, handle)
+    }
+
+    #[rstest]
+    #[case::negative("-1")]
+    #[case::not_a_number("abc")]
+    #[case::float("1.5")]
+    #[case::empty("")]
+    #[case::spaces("  ")]
+    #[case::mixed("123abc")]
+    #[tokio::test]
+    async fn validate_request_rejects_invalid_content_length(#[case] invalid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            invalid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        // read_request calls validate_request internally on the v1 inner stream, so it should fail here
+        let res = http_stream.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[rstest]
+    #[case::valid_zero("0")]
+    #[case::valid_small("123")]
+    #[case::valid_large("999999")]
+    #[tokio::test]
+    async fn validate_request_accepts_valid_content_length(#[case] valid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            valid_value
+        );
+        let (mut http_stream, _handle) = session_from_input_no_validate(input.as_bytes()).await;
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_request_accepts_no_content_length() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let (mut http_stream, _handle) = session_from_input_no_validate(input).await;
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
+    const POST_CL_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 10\r\n\r\n";
+    const POST_CHUNKED_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const POST_BODY_DATA: &[u8] = b"abcdefghij";
+
+    async fn build_upgrade_req_with_body(header: &[u8]) -> (HttpSession, SubrequestHandle) {
+        let mock_io = Builder::new().read(header).build();
+        let mut http_stream = GenericHttpSession::new_http1(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let (mut http_stream, handle) = HttpSession::new_from_session(&http_stream);
+        http_stream.read_request().await.unwrap();
+        (http_stream, handle)
+    }
+
+    #[rstest]
+    #[case::content_length(POST_CL_UPGRADE_REQ)]
+    #[case::chunked(POST_CHUNKED_UPGRADE_REQ)]
+    #[tokio::test]
+    async fn read_upgrade_req_with_body(#[case] header: &[u8]) {
+        init_log();
+        let (mut http_stream, handle) = build_upgrade_req_with_body(header).await;
+        assert!(http_stream.is_upgrade_req());
+        // request has body
+        assert!(!http_stream.is_body_done());
+
+        // Send body via the handle
+        handle
+            .tx
+            .send(HttpTask::Body(Some(Bytes::from(POST_BODY_DATA)), true))
+            .await
+            .unwrap();
+
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, POST_BODY_DATA);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
+        assert_eq!(http_stream.body_bytes_read(), 10);
+
+        assert!(http_stream.is_body_done());
+
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        // body reader type switches
+        assert!(!http_stream.is_body_done());
+
+        // now send ws data
+        let ws_data = b"data";
+        handle
+            .tx
+            .send(HttpTask::Body(Some(Bytes::from(&ws_data[..])), false))
+            .await
+            .unwrap();
+
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, ws_data.as_slice());
+        assert!(!http_stream.is_body_done());
+
+        // EOF ends body
+        drop(handle.tx);
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
     }
 }

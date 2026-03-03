@@ -82,6 +82,10 @@ pub struct HttpSession {
     ignore_info_resp: bool,
     /// Disable keepalive if response is sent before downstream body is finished
     close_on_response_before_downstream_finish: bool,
+
+    /// Number of times the upstream connection associated with this session can be reused
+    /// after this session ends
+    keepalive_reuses_remaining: Option<u32>,
 }
 
 impl HttpSession {
@@ -121,6 +125,7 @@ impl HttpSession {
             ignore_info_resp: false,
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
+            keepalive_reuses_remaining: None,
         }
     }
 
@@ -258,7 +263,12 @@ impl HttpSession {
                         // Transfer encoding overrides content length, so when
                         // both are present, we can remove content length. This
                         // is per https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
-                        if contains_content_length && contains_transfer_encoding {
+                        //
+                        // RFC 9112 Section 6.1 (https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-15)
+                        // also requires us to disable keepalive when both headers are present.
+                        let has_both_te_and_cl =
+                            contains_content_length && contains_transfer_encoding;
+                        if has_both_te_and_cl {
                             request_header.remove_header(&CONTENT_LENGTH);
                         }
 
@@ -268,6 +278,11 @@ impl HttpSession {
                         self.body_reader.reinit();
                         self.response_written = None;
                         self.respect_keepalive();
+
+                        // Disable keepalive if both Transfer-Encoding and Content-Length were present
+                        if has_both_te_and_cl {
+                            self.set_keepalive(None);
+                        }
                         self.validate_request()?;
 
                         return Ok(Some(s));
@@ -315,6 +330,25 @@ impl HttpSession {
 
         // ad-hoc checks
         super::common::check_dup_content_length(&req_header.headers)?;
+
+        if req_header.headers.contains_key(TRANSFER_ENCODING) {
+            // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
+            // HTTP/1.0 requests with Transfer-Encoding MUST be treated as having faulty framing.
+            // We reject with 400 Bad Request and close the connection.
+            if req_header.version == http::Version::HTTP_10 {
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    "HTTP/1.0 requests cannot include Transfer-Encoding header",
+                );
+            }
+            // If chunked is not the final Transfer-Encoding, reject request
+            // See https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.4.3
+            if !self.is_chunked_encoding() {
+                return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
+            }
+        }
+        // validate content-length value if present to avoid ambiguous framing
+        self.get_content_length()?;
 
         Ok(())
     }
@@ -529,7 +563,7 @@ impl HttpSession {
                         // the most spec-compliant behavior is to switch interpretation
                         // after sending the former body,
                         // we immediately switch interpretation to match nginx
-                        self.body_reader.convert_to_http10();
+                        self.body_reader.convert_to_close_delimited();
                     }
                 } else {
                     // this was a request that requested Upgrade,
@@ -539,6 +573,12 @@ impl HttpSession {
                 }
             }
             self.init_body_writer(&header);
+        }
+
+        // Defense-in-depth: if response body is close-delimited, mark session
+        // as un-reusable
+        if self.body_writer.is_close_delimited() {
+            self.set_keepalive(None);
         }
 
         // Don't have to flush response with content length because it is less
@@ -614,11 +654,20 @@ impl HttpSession {
         }
     }
 
+    pub fn set_keepalive_reuses_remaining(&mut self, remaining: Option<u32>) {
+        self.keepalive_reuses_remaining = remaining;
+    }
+
+    pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
+        self.keepalive_reuses_remaining
+    }
+
     /// Return whether the session will be keepalived for connection reuse.
     pub fn will_keepalive(&self) -> bool {
-        // TODO: check self.body_writer. If it is http1.0 type then keepalive
-        // cannot be used because the connection close is the signal of end body
-        !matches!(self.keepalive_timeout, KeepaliveStatus::Off)
+        !matches!(
+            (&self.keepalive_timeout, self.keepalive_reuses_remaining),
+            (KeepaliveStatus::Off, _) | (_, Some(0))
+        )
     }
 
     // `Keep-Alive: timeout=5, max=1000` => 5, 1000
@@ -695,7 +744,7 @@ impl HttpSession {
         }
 
         if self.is_upgrade(header) == Some(true) {
-            self.body_writer.init_http10();
+            self.body_writer.init_close_delimited();
         } else {
             init_body_writer_comm(&mut self.body_writer, &header.headers);
         }
@@ -800,10 +849,10 @@ impl HttpSession {
     }
 
     fn is_chunked_encoding(&self) -> bool {
-        is_header_value_chunked_encoding(self.get_header(header::TRANSFER_ENCODING))
+        is_chunked_encoding_from_headers(&self.req_header().headers)
     }
 
-    fn get_content_length(&self) -> Option<usize> {
+    fn get_content_length(&self) -> Result<Option<usize>> {
         buf_to_content_length(
             self.get_header(header::CONTENT_LENGTH)
                 .map(|v| v.as_bytes()),
@@ -817,28 +866,30 @@ impl HttpSession {
                 buffer.clear();
             }
 
-            /* follow https://tools.ietf.org/html/rfc7230#section-3.3.3 */
+            // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
-            if self.is_chunked_encoding() {
+            if self.was_upgraded() {
+                // if upgraded _post_ 101 (and body was not init yet)
+                // treat as upgraded body (pass through until closed)
+                self.body_reader.init_close_delimited(preread_body);
+            } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
                 self.body_reader.init_chunked(preread_body);
             } else {
-                let cl = self.get_content_length();
+                // At this point, validate_request() should have already been called,
+                // so get_content_length() should not return an error for invalid values
+                let cl = self.get_content_length().unwrap_or(None);
                 match cl {
                     Some(i) => {
                         self.body_reader.init_content_length(i, preread_body);
                     }
                     None => {
-                        match self.req_header().version {
-                            Version::HTTP_11 => {
-                                // Per RFC assume no body by default in HTTP 1.1
-                                self.body_reader.init_content_length(0, preread_body);
-                            }
-                            _ => {
-                                self.body_reader.init_http10(preread_body);
-                            }
-                        }
+                        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
+                        // "Request messages are never close-delimited because they are
+                        // always explicitly framed by length or transfer coding, with the absence of
+                        // both implying the request ends immediately after the header section."
+                        self.body_reader.init_content_length(0, preread_body);
                     }
                 }
             }
@@ -1040,25 +1091,22 @@ impl HttpSession {
     /// returned. If there was an error while draining any remaining request body that error will
     /// be returned.
     pub async fn reuse(mut self) -> Result<Option<Stream>> {
-        match self.keepalive_timeout {
-            KeepaliveStatus::Off => {
-                debug!("HTTP shutdown connection");
-                self.shutdown().await;
+        if !self.will_keepalive() {
+            debug!("HTTP shutdown connection");
+            self.shutdown().await;
+            Ok(None)
+        } else {
+            self.drain_request_body().await?;
+            // XXX: currently pipelined requests are not properly read without
+            // pipelining support, and pingora 400s if pipelined requests are sent
+            // in the middle of another request.
+            // We will mark the connection as un-reusable so it may be closed,
+            // the pipelined request left unread, and the client can attempt to resend
+            if self.body_reader.has_bytes_overread() {
+                debug!("bytes overread on request, disallowing reuse");
                 Ok(None)
-            }
-            _ => {
-                self.drain_request_body().await?;
-                // XXX: currently pipelined requests are not properly read without
-                // pipelining support, and pingora 400s if pipelined requests are sent
-                // in the middle of another request.
-                // We will mark the connection as un-reusable so it may be closed,
-                // the pipelined request left unread, and the client can attempt to resend
-                if self.body_reader.has_bytes_overread() {
-                    debug!("bytes overread on request, disallowing reuse");
-                    Ok(None)
-                } else {
-                    Ok(Some(self.underlying_stream))
-                }
+            } else {
+                Ok(Some(self.underlying_stream))
             }
         }
     }
@@ -1414,12 +1462,13 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "There is still data left to read.")]
     async fn read_with_body_http10() {
         init_log();
         let input1 = b"GET / HTTP/1.0\r\n";
         let input2 = b"Host: pingora.org\r\n\r\n";
-        let input3 = b"a";
-        let input4 = b""; // simulating close
+        let input3 = b"a"; // This should NOT be read as body
+        let input4 = b""; // simulating close - should also NOT be reached
         let mock_io = Builder::new()
             .read(&input1[..])
             .read(&input2[..])
@@ -1428,41 +1477,26 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, input3.as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        assert_eq!(http_stream.body_bytes_read(), 1);
         let res = http_stream.read_body_bytes().await.unwrap();
         assert!(res.is_none());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
-        assert_eq!(http_stream.body_bytes_read(), 1);
+        assert_eq!(http_stream.body_bytes_read(), 0);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
     }
 
     #[tokio::test]
     async fn read_with_body_http10_single_read() {
         init_log();
+        // should have 0 body, even when data follows the headers
         let input1 = b"GET / HTTP/1.0\r\n";
         let input2 = b"Host: pingora.org\r\n\r\na";
-        let input3 = b"b";
-        let input4 = b""; // simulating close
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .read(&input4[..])
-            .build();
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"a".as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(1));
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"b".as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::HTTP1_0(2));
         let res = http_stream.read_body_bytes().await.unwrap();
-        assert_eq!(http_stream.body_bytes_read(), 2);
         assert!(res.is_none());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(2));
+        assert_eq!(http_stream.body_bytes_read(), 0);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+        assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"a");
     }
 
     #[tokio::test]
@@ -1477,6 +1511,25 @@ mod tests_stream {
         assert!(res.is_none());
         assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_http10_with_content_length() {
+        init_log();
+        let input1 = b"POST / HTTP/1.0\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
+        let input3 = b"abc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input3[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, input3.as_slice());
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+        assert_eq!(http_stream.body_bytes_read(), 3);
     }
 
     #[tokio::test]
@@ -1625,6 +1678,55 @@ mod tests_stream {
                 assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
             }
         }
+    }
+
+    #[rstest]
+    #[case::negative("-1")]
+    #[case::not_a_number("abc")]
+    #[case::float("1.5")]
+    #[case::empty("")]
+    #[case::spaces("  ")]
+    #[case::mixed("123abc")]
+    #[tokio::test]
+    async fn validate_request_rejects_invalid_content_length(#[case] invalid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            invalid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // read_request calls validate_request internally, so it should fail here
+        let res = http_stream.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().etype(), &InvalidHTTPHeader);
+    }
+
+    #[rstest]
+    #[case::valid_zero("0")]
+    #[case::valid_small("123")]
+    #[case::valid_large("999999")]
+    #[tokio::test]
+    async fn validate_request_accepts_valid_content_length(#[case] valid_value: &str) {
+        init_log();
+        let input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            valid_value
+        );
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_request_accepts_no_content_length() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert!(res.is_ok());
     }
 
     #[tokio::test]
@@ -1926,6 +2028,46 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn test_upgrade_without_content_length_with_ws_data() {
+        let request = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+        let ws_data = b"websocket data";
+
+        let mock_io = Builder::new()
+            .read(request)
+            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            .read(ws_data) // websocket data sent after 101
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_upgrade_req());
+
+        // When enabled (default), is_body_done() is called before the upgrade
+        http_stream.set_close_on_response_before_downstream_finish(false);
+
+        // Send 101 response - this is where the bug occurs
+        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        response.set_version(http::Version::HTTP_11);
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            http_stream.body_reader.body_state,
+            ParseState::UntilClose(0),
+            "Body reader should be in UntilClose mode after 101 for upgraded connections"
+        );
+
+        // Try to read websocket data
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, ws_data, "Expected to read websocket data after 101");
+    }
+
+    #[tokio::test]
     async fn set_server_keepalive() {
         // close
         let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nConnection: close\r\n\r\n";
@@ -2111,11 +2253,11 @@ mod tests_stream {
             .write_response_header_ref(&response_101)
             .await
             .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
 
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(n));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(n));
 
         // this write should be ignored
         let response_502 = ResponseHeader::build(StatusCode::BAD_GATEWAY, None).unwrap();
@@ -2172,7 +2314,7 @@ mod tests_stream {
             .write_response_header_ref(&new_response)
             .await
             .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::HTTP1_0(0));
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
         let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
         let n = http_stream.finish_body().await.unwrap().unwrap();
@@ -2360,6 +2502,203 @@ mod tests_stream {
 
         http_stream.set_min_send_rate(Some(1));
         assert_eq!(Some(expected), http_stream.write_timeout(0));
+    }
+
+    #[tokio::test]
+    async fn test_te_and_cl_disables_keepalive() {
+        // When both Transfer-Encoding and Content-Length are present,
+        // we must disable keepalive per RFC 9112 Section 6.1
+        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-15
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+Content-Length: 10\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Keepalive should be disabled
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
+
+        // Content-Length header should have been removed
+        assert!(!http_stream
+            .req_header()
+            .headers
+            .contains_key(CONTENT_LENGTH));
+
+        // Transfer-Encoding should still be present
+        assert!(http_stream
+            .req_header()
+            .headers
+            .contains_key(TRANSFER_ENCODING));
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_with_transfer_encoding_rejected() {
+        // HTTP/1.0 requests MUST NOT contain Transfer-Encoding
+        let input = b"POST / HTTP/1.0\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should be rejected with InvalidHTTPHeader error
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(err.to_string().contains("Transfer-Encoding"));
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_without_transfer_encoding_accepted() {
+        // HTTP/1.0 requests without Transfer-Encoding should be accepted
+        let input = b"POST / HTTP/1.0\r\n\
+Host: pingora.org\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(http_stream.req_header().version, http::Version::HTTP_10);
+    }
+
+    #[tokio::test]
+    async fn test_http11_request_with_transfer_encoding_accepted() {
+        // HTTP/1.1 with Transfer-Encoding should be accepted (contrast with HTTP/1.0)
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let result = http_stream.read_request().await;
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(http_stream.req_header().version, http::Version::HTTP_11);
+    }
+
+    #[tokio::test]
+    async fn test_request_multiple_transfer_encoding_headers() {
+        init_log();
+        // Multiple TE headers should be treated as comma-separated
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: gzip\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+5\r\n\
+hello\r\n\
+0\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        // Should correctly identify chunked encoding from last header
+        assert!(http_stream.is_chunked_encoding());
+
+        // Verify body can be read correctly
+        let body = http_stream.read_body_bytes().await.unwrap();
+        assert_eq!(body.unwrap().as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_request_multiple_te_headers_chunked_not_last() {
+        init_log();
+        // Chunked in first header but not last - should NOT be chunked
+        // Only the final Transfer-Encoding determines if body is chunked
+        let input = b"POST / HTTP/1.1\r\n\
+Host: pingora.org\r\n\
+Transfer-Encoding: chunked\r\n\
+Transfer-Encoding: identity\r\n\
+Content-Length: 5\r\n\
+\r\n";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        // should fail validation
+        http_stream.read_request().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_no_more_reuses_explicitly_disables_reuse() {
+        init_log();
+        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&wire_req[..])
+            .write(wire_header)
+            .build();
+        let mut http_session = HttpSession::new(Box::new(mock_io));
+
+        // Setting the number of keepalive reuses here overrides the keepalive
+        // setting below
+        http_session.set_keepalive_reuses_remaining(Some(0));
+
+        http_session.read_request().await.unwrap();
+
+        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_session.update_resp_headers = false;
+        http_session
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+
+        assert_eq!(http_session.body_writer.body_mode, BodyMode::UntilClose(0));
+
+        http_session.finish_body().await.unwrap().unwrap();
+
+        http_session.set_keepalive(Some(100));
+        let reused = http_session.reuse().await.unwrap();
+        assert!(reused.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_close_delimited_response_explicitly_disables_reuse() {
+        init_log();
+        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&wire_req[..])
+            .write(wire_header)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+
+        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+
+        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
+
+        http_stream.finish_body().await.unwrap().unwrap();
+
+        let reused = http_stream.reuse().await.unwrap();
+        assert!(reused.is_none());
     }
 }
 

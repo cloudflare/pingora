@@ -137,14 +137,24 @@ pub trait ProxyHttp {
         Ok(())
     }
 
-    /// This callback generates the cache key
+    /// This callback generates the cache key.
     ///
-    /// This callback is called only when cache is enabled for this request
+    /// This callback is called only when cache is enabled for this request.
     ///
-    /// By default this callback returns a default cache key generated from the request.
-    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
-        let req_header = session.req_header();
-        Ok(CacheKey::default(req_header))
+    /// There is no sensible default cache key for all proxy applications. The
+    /// correct key depends on which request properties affect upstream responses
+    /// (e.g. `Vary` headers, custom request filters that modify the origin host).
+    /// Getting this wrong leads to cache poisoning.
+    ///
+    /// See `pingora-proxy/tests/utils/server_utils.rs` for a minimal (not
+    /// production-ready) reference implementation.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics. You **must** override this method when
+    /// caching is enabled.
+    fn cache_key_callback(&self, _session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        unimplemented!("cache_key_callback must be implemented when caching is enabled")
     }
 
     /// This callback is invoked when a cacheable response is ready to be admitted to cache.

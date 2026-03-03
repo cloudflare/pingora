@@ -101,7 +101,7 @@ impl<A> Service<A> {
     /// let mut service = MyService::new();
     /// let filter = Arc::new(AcceptAllFilter);
     /// service.set_connection_filter(filter);
-    /// ```   
+    /// ```
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
         self.connection_filter = filter.clone();

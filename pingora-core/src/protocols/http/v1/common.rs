@@ -16,7 +16,7 @@
 
 use http::{header, HeaderValue};
 use log::warn;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::*, Result};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
 use std::str;
 use std::time::Duration;
@@ -121,8 +121,7 @@ fn parse_connection_header(value: &[u8]) -> ConnectionValue {
 }
 
 pub(crate) fn init_body_writer_comm(body_writer: &mut BodyWriter, headers: &HMap) {
-    let te_value = headers.get(http::header::TRANSFER_ENCODING);
-    if is_header_value_chunked_encoding(te_value) {
+    if is_chunked_encoding_from_headers(headers) {
         // transfer-encoding takes priority over content-length
         body_writer.init_chunked();
     } else {
@@ -134,18 +133,46 @@ pub(crate) fn init_body_writer_comm(body_writer: &mut BodyWriter, headers: &HMap
             None => {
                 /* TODO: 1. connection: keepalive cannot be used,
                 2. mark connection must be closed */
-                body_writer.init_http10();
+                body_writer.init_close_delimited();
             }
         }
     }
 }
 
+/// Find the last comma-separated token in a Transfer-Encoding header value.
+/// Takes the literal last token after the last comma, even if empty.
 #[inline]
-pub fn is_header_value_chunked_encoding(header_value: Option<&http::header::HeaderValue>) -> bool {
-    match header_value {
-        Some(value) => value.as_bytes().eq_ignore_ascii_case(b"chunked"),
-        None => false,
+fn find_last_te_token(bytes: &[u8]) -> &[u8] {
+    let last_token = bytes
+        .iter()
+        .rposition(|&b| b == b',')
+        .map(|pos| &bytes[pos + 1..])
+        .unwrap_or(bytes);
+
+    last_token.trim_ascii()
+}
+
+/// Check if chunked encoding is the final encoding across all transfer-encoding headers
+pub(crate) fn is_chunked_encoding_from_headers(headers: &HMap) -> bool {
+    // Get the last Transfer-Encoding header value
+    let last_te = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .into_iter()
+        .next_back();
+
+    let Some(last_header_value) = last_te else {
+        return false;
+    };
+
+    let bytes = last_header_value.as_bytes();
+
+    // Fast path: exact match for "chunked"
+    if bytes.eq_ignore_ascii_case(b"chunked") {
+        return true;
     }
+
+    // Slow path: parse comma-separated values
+    find_last_te_token(bytes).eq_ignore_ascii_case(b"chunked")
 }
 
 pub fn is_upgrade_req(req: &RequestHeader) -> bool {
@@ -173,13 +200,13 @@ pub fn header_value_content_length(
     header_value: Option<&http::header::HeaderValue>,
 ) -> Option<usize> {
     match header_value {
-        Some(value) => buf_to_content_length(Some(value.as_bytes())),
+        Some(value) => buf_to_content_length(Some(value.as_bytes())).ok().flatten(),
         None => None,
     }
 }
 
 #[inline]
-pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize> {
+pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Result<Option<usize>> {
     match header_value {
         Some(buf) => {
             match str::from_utf8(buf) {
@@ -187,24 +214,30 @@ pub(super) fn buf_to_content_length(header_value: Option<&[u8]>) -> Option<usize
                 Ok(str_cl_value) => match str_cl_value.parse::<i64>() {
                     Ok(cl_length) => {
                         if cl_length >= 0 {
-                            Some(cl_length as usize)
+                            Ok(Some(cl_length as usize))
                         } else {
                             warn!("negative content-length header value {cl_length}");
-                            None
+                            Error::e_explain(
+                                InvalidHTTPHeader,
+                                format!("negative Content-Length header value: {cl_length}"),
+                            )
                         }
                     }
                     Err(_) => {
                         warn!("invalid content-length header value {str_cl_value}");
-                        None
+                        Error::e_explain(
+                            InvalidHTTPHeader,
+                            format!("invalid Content-Length header value: {str_cl_value}"),
+                        )
                     }
                 },
                 Err(_) => {
                     warn!("invalid content-length header encoding");
-                    None
+                    Error::e_explain(InvalidHTTPHeader, "invalid Content-Length header encoding")
                 }
             }
         }
-        None => None,
+        None => Ok(None),
     }
 }
 
@@ -276,6 +309,7 @@ mod test {
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
         StatusCode, Version,
     };
+    use rstest::rstest;
 
     #[test]
     fn test_check_dup_content_length() {
@@ -311,5 +345,45 @@ mod test {
         response.set_status(StatusCode::OK).unwrap();
         response.set_version(Version::HTTP_11);
         assert!(!is_upgrade_resp(&response));
+    }
+
+    #[test]
+    fn test_is_chunked_encoding_from_headers_empty() {
+        let empty_headers = HMap::new();
+        assert!(!is_chunked_encoding_from_headers(&empty_headers));
+    }
+
+    #[rstest]
+    #[case::single_chunked("chunked", true)]
+    #[case::comma_separated_final("identity, chunked", true)]
+    #[case::whitespace_around("  chunked  ", true)]
+    #[case::empty_elements_before(", , , chunked", true)]
+    #[case::only_identity("identity", false)]
+    #[case::trailing_comma("chunked, ", false)]
+    #[case::multiple_trailing_commas("chunked, , ", false)]
+    #[case::empty_value("", false)]
+    #[case::whitespace_only("   ", false)]
+    fn test_is_chunked_encoding_single_header(#[case] value: &str, #[case] expected: bool) {
+        let mut headers = HMap::new();
+        headers.insert(TRANSFER_ENCODING, value.try_into().unwrap());
+        assert_eq!(is_chunked_encoding_from_headers(&headers), expected);
+    }
+
+    #[rstest]
+    #[case::two_headers_chunked_last(&["identity", "chunked"], true)]
+    #[case::three_headers_chunked_last(&["gzip", "identity", "chunked"], true)]
+    #[case::last_has_comma_separated(&["gzip", "identity, chunked"], true)]
+    #[case::whitespace_in_last(&["gzip", "  chunked  "], true)]
+    #[case::two_headers_no_chunked(&["identity", "gzip"], false)]
+    #[case::chunked_not_last(&["chunked", "identity"], false)]
+    #[case::last_has_chunked_not_final(&["gzip", "chunked, identity"], false)]
+    #[case::chunked_overridden(&["chunked", "identity, gzip"], false)]
+    #[case::trailing_comma_in_last(&["gzip", "chunked, "], false)]
+    fn test_is_chunked_encoding_multiple_headers(#[case] values: &[&str], #[case] expected: bool) {
+        let mut headers = HMap::new();
+        for value in values {
+            headers.append(TRANSFER_ENCODING, (*value).try_into().unwrap());
+        }
+        assert_eq!(is_chunked_encoding_from_headers(&headers), expected);
     }
 }
