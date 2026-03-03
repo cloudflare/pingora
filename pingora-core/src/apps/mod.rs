@@ -193,8 +193,13 @@ where
             .as_ref()
             .map_or(false, |o| o.force_custom);
 
+        // h2c is for cleartext connections; on TLS, ALPN handles protocol negotiation.
+        // Otherwise, h2c stays true on TLS streams, forcing HTTP/1.1 clients into HTTP/2
+        if stream.get_ssl_digest().is_some() {
+            h2c = false;
+        }
         // try to read h2 preface
-        if h2c && !custom {
+        else if h2c && !custom {
             let mut buf = [0u8; H2_PREFACE.len()];
             let peeked = stream
                 .try_peek(&mut buf)
