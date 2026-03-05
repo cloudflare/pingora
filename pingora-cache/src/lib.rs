@@ -16,7 +16,6 @@
 
 #![allow(clippy::new_without_default)]
 
-use cf_rustracing::tag::Tag;
 use http::{method::Method, request::Parts as ReqHeader, response::Parts as RespHeader};
 use key::{CacheHashKey, CompactCacheKey, HashBinary};
 use lock::WritePermit;
@@ -27,7 +26,7 @@ use pingora_timeout::timeout;
 use std::time::{Duration, Instant, SystemTime};
 use storage::MissFinishType;
 use strum::IntoStaticStr;
-use trace::{CacheTraceCTX, Span};
+use trace::{CacheTraceCTX, Span, Tag};
 
 pub mod cache_control;
 pub mod eviction;
@@ -435,6 +434,7 @@ impl HttpCache {
                 self.phase = CachePhase::Disabled(reason);
                 self.release_write_lock(reason);
                 // enabled_ctx will be cleared out
+                #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
                 let mut inner_enabled = self
                     .inner_mut()
                     .enabled_ctx
@@ -1049,6 +1049,7 @@ impl HttpCache {
 
                 inner_enabled.meta.replace(meta);
 
+                #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
                 let mut span = inner_enabled.traces.child("update_meta");
                 let result = inner_enabled
                     .storage
@@ -1291,6 +1292,7 @@ impl HttpCache {
                     .enabled_ctx
                     .as_mut()
                     .expect("Cache enabled on cache_lookup");
+                #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
                 let mut span = inner_enabled.traces.child("lookup");
                 let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
                 let now = Instant::now();
@@ -1446,6 +1448,7 @@ impl HttpCache {
     /// Check [Self::is_cache_locked()], panic if this request doesn't have a read lock.
     pub async fn cache_lock_wait(&mut self) -> LockStatus {
         let inner_enabled = self.inner_enabled_mut();
+        #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut span = inner_enabled.traces.child("cache_lock");
         // should always call is_cache_locked() before this function, which should guarantee that
         // the inner cache has a read lock and lock ctx
@@ -1535,6 +1538,7 @@ impl HttpCache {
         })
     }
 
+    #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
     async fn purge_impl(
         storage: &'static (dyn storage::Storage + Sync),
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,

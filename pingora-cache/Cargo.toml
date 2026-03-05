@@ -37,8 +37,8 @@ httpdate = "1.0.2"
 log = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = "0.12"
-cf-rustracing = "1.0"
-cf-rustracing-jaeger = "1.0"
+cf-rustracing = { version = "1.0", optional = true }
+cf-rustracing-jaeger = { version = "1.0", optional = true }
 rmp = "0.8.14"
 tokio = { workspace = true }
 lru = { workspace = true }
@@ -49,6 +49,8 @@ strum = { version = "0.26", features = ["derive"] }
 rand = "0.8"
 
 [dev-dependencies]
+cf-rustracing = "1.0"
+cf-rustracing-jaeger = "1.0"
 tokio-test = "0.4"
 tokio = { workspace = true, features = ["fs"] }
 env_logger = "0.11"
@@ -73,3 +75,4 @@ openssl = ["pingora-core/openssl"]
 boringssl = ["pingora-core/boringssl"]
 rustls = ["pingora-core/rustls"]
 s2n = ["pingora-core/s2n"]
+trace = ["dep:cf-rustracing", "dep:cf-rustracing-jaeger"]

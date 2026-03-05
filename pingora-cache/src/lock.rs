@@ -14,8 +14,8 @@
 
 //! Cache lock
 
+use crate::trace::{Span, Tag};
 use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
-use crate::{Span, Tag};
 
 use http::Extensions;
 use pingora_timeout::timeout;
