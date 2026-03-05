@@ -72,6 +72,7 @@ sentry = ["pingora-core/sentry"]
 adjust_upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 prometheus = ["pingora-core/prometheus"]
+trace = ["pingora-cache/trace"]
 
 [[example]]
 name = "connection_filter"

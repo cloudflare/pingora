@@ -153,3 +153,4 @@ document-features = [
     "connection_filter"
 ]
 prometheus = ["pingora-core/prometheus"]
+trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]
