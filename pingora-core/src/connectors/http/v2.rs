@@ -199,9 +199,15 @@ impl InUsePool {
             }
         } // drop read lock
 
+        let mut pools = self.pools.write();
+        // Double-check: another thread may have inserted a node between
+        // dropping the read lock and acquiring this write lock.
+        if let Some(pool) = pools.get(&reuse_hash) {
+            pool.insert(conn.id(), conn);
+            return;
+        }
         let pool = PoolNode::new();
         pool.insert(conn.id(), conn);
-        let mut pools = self.pools.write();
         pools.insert(reuse_hash, pool);
     }
 
