@@ -18,7 +18,7 @@ use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
 use log::debug;
 use pingora_error::ErrorType::InternalError;
-use pingora_error::{Error, OrErr, Result};
+use pingora_error::{OrErr, Result};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
@@ -32,6 +32,7 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    callbacks: Option<TlsAcceptCallbacks>,
 }
 
 pub struct Acceptor {
@@ -76,7 +77,7 @@ impl TlsSettings {
 
         Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
-            callbacks: None,
+            callbacks: self.callbacks,
         }
     }
 
@@ -95,6 +96,16 @@ impl TlsSettings {
         self.client_cert_verifier = Some(verifier);
     }
 
+    /// Set the path to the certificate chain file (PEM format).
+    pub fn set_certificate_chain_file(&mut self, path: &str) {
+        self.cert_path = path.to_string();
+    }
+
+    /// Set the path to the private key file (PEM format).
+    pub fn set_private_key_file(&mut self, path: &str) {
+        self.key_path = path.to_string();
+    }
+
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
@@ -104,18 +115,29 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            callbacks: None,
         })
     }
 
-    pub fn with_callbacks() -> Result<Self>
+    /// Create a new [`TlsSettings`] with post-handshake callbacks.
+    ///
+    /// The provided callbacks will be invoked after TLS handshake completes.
+    /// The [`TlsRef`](crate::protocols::tls::TlsRef) passed to the callback
+    /// provides access to the peer certificate chain and negotiated cipher suite.
+    ///
+    /// Certificate and key files must be set separately via the builder methods
+    /// on the returned `TlsSettings`.
+    pub fn with_callbacks(callbacks: TlsAcceptCallbacks) -> Result<Self>
     where
         Self: Sized,
     {
-        // TODO: verify if/how callback in handshake can be done using Rustls
-        Error::e_explain(
-            InternalError,
-            "Certificate callbacks are not supported with feature \"rustls\".",
-        )
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            callbacks: Some(callbacks),
+        })
     }
 }
 
