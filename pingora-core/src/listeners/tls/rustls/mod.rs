@@ -50,6 +50,12 @@ impl TlsSettings {
     pub fn build(self) -> Acceptor {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
+        assert!(
+            !self.cert_path.is_empty() && !self.key_path.is_empty(),
+            "Certificate and key paths must be set before calling build(). \
+             When using with_callbacks(), call set_certificate_chain_file() \
+             and set_private_key_file() first."
+        );
 
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
