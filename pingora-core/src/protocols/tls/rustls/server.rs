@@ -72,6 +72,9 @@ pub async fn handshake_with_callback<S: IO>(
     let mut tls_stream = prepare_tls_stream(acceptor, io).await?;
     let done = Pin::new(&mut tls_stream).start_accept().await?;
     if !done {
+        // NOTE: certificate_callback is not invoked for rustls. Dynamic cert selection
+        // should use a custom ResolvesServerCert instead.
+        warn!("certificate_callback is not supported with the rustls backend; use ResolvesServerCert for dynamic cert selection");
         Pin::new(&mut tls_stream)
             .resume_accept()
             .await
