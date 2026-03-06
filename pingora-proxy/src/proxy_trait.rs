@@ -293,6 +293,39 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Adjust upstream modules before they process the response header.
+    ///
+    /// This filter is called when the upstream response header arrives, before upstream modules
+    /// (such as `upstream_compression`) run their response header filter. Use this to configure
+    /// module behavior based on the response, e.g. setting a dictionary for dictionary-based
+    /// content encoding.
+    ///
+    /// This filter may be called more than once per request if the upstream sends informational
+    /// (1xx) response headers before the final response. Implementations can check
+    /// [`upstream_response.status.is_informational()`](http::StatusCode::is_informational) to
+    /// distinguish informational headers from the final response if needed.
+    ///
+    /// `end_of_stream` indicates whether the response header is also the end of the response
+    /// (e.g. for HEAD responses or 304s with no body).
+    ///
+    /// The response header is provided as an immutable reference. To modify the response header
+    /// itself, use [`Self::upstream_response_filter()`] instead.
+    ///
+    /// This filter requires the `adjust_upstream_modules` feature to be enabled.
+    #[cfg(feature = "adjust_upstream_modules")]
+    async fn adjust_upstream_modules(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// Modify the response header from the upstream
     ///
     /// The modification is before caching, so any change here will be stored in the cache if enabled.

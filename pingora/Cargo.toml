@@ -126,6 +126,12 @@ time = []
 ## Enable sentry for error notifications
 sentry = ["pingora-core/sentry"]
 
+## Enable the `adjust_upstream_modules` filter phase on [ProxyHttp](crate::proxy::ProxyHttp)
+##
+## Allows configuring upstream modules (e.g. upstream compression) based on the
+## response header before they process it.
+adjust_upstream_modules = ["pingora-proxy?/adjust_upstream_modules"]
+
 ## Enable pre-TLS connection filtering
 connection_filter = [
     "pingora-core/connection_filter",
