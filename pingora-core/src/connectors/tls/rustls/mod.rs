@@ -116,7 +116,7 @@ impl TlsConnector {
                     let signing_key = provider
                         .key_provider
                         .load_private_key(key)
-                        .expect("Failed to load client private key");
+                        .or_err(InvalidCert, "Failed to load client private key")?;
                     let certified_key =
                         Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
                     builder.with_client_cert_resolver(Arc::new(SingleCertClientResolver(
@@ -215,7 +215,7 @@ where
                 let signing_key = provider
                     .key_provider
                     .load_private_key(private_key)
-                    .expect("Failed to load peer client private key");
+                    .or_err(InvalidCert, "Failed to load peer client private key")?;
                 let certified_key =
                     Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
 
