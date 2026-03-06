@@ -19,7 +19,39 @@ mod stream;
 pub use stream::*;
 
 use crate::utils::tls::WrappedX509;
+use pingora_rustls::CertificateDer;
 
 pub type CaType = [WrappedX509];
 
-pub struct TlsRef;
+/// TLS connection state exposed to post-handshake callbacks.
+///
+/// Provides access to peer certificates and negotiated cipher suite
+/// after a TLS handshake completes. This is the rustls equivalent of
+/// the OpenSSL `SslRef` that is used as `TlsRef` in the boringssl/openssl path.
+pub struct TlsRef {
+    /// Peer certificate chain (DER-encoded). The first entry is the leaf certificate.
+    peer_certs: Option<Vec<CertificateDer<'static>>>,
+    /// Negotiated cipher suite name (e.g. "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+    cipher: Option<&'static str>,
+}
+
+impl TlsRef {
+    /// Returns the peer's leaf certificate in DER encoding, if present.
+    pub fn peer_certificate_der(&self) -> Option<&[u8]> {
+        self.peer_certs
+            .as_ref()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref())
+    }
+
+    /// Returns the full peer certificate chain in DER encoding.
+    /// The first entry is the leaf; subsequent entries are intermediates.
+    pub fn peer_cert_chain_der(&self) -> Option<&[CertificateDer<'static>]> {
+        self.peer_certs.as_deref()
+    }
+
+    /// Returns the negotiated cipher suite name, if available.
+    pub fn current_cipher_name(&self) -> Option<&'static str> {
+        self.cipher
+    }
+}
