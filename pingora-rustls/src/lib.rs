@@ -40,6 +40,7 @@ pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
 
+pub use rustls::client::ResolvesClientCert;
 pub use rustls::sign;
 
 // This allows to skip certificate verification. Be highly cautious.

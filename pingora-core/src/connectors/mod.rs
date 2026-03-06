@@ -79,6 +79,16 @@ pub struct ConnectorOptions {
     pub bind_to_v4: Vec<SocketAddr>,
     /// Bind to any of the given source IPv4 addresses
     pub bind_to_v6: Vec<SocketAddr>,
+    /// Optional custom server certificate verifier for the rustls backend.
+    ///
+    /// When set, the connector uses `dangerous().with_custom_certificate_verifier()` instead of
+    /// building a `RootCertStore` and using webpki for server cert validation. This is necessary
+    /// for certificates with custom critical extensions that webpki rejects (e.g. IEEE 2030.5).
+    ///
+    /// The verifier must handle TLS signature verification as well, since webpki is bypassed.
+    /// `ca_file` is ignored when this is set.
+    #[cfg(feature = "rustls")]
+    pub server_cert_verifier: Option<Arc<dyn pingora_rustls::ServerCertVerifier>>,
 }
 
 impl ConnectorOptions {
@@ -119,6 +129,8 @@ impl ConnectorOptions {
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
+            #[cfg(feature = "rustls")]
+            server_cert_verifier: None,
         }
     }
 
@@ -134,6 +146,8 @@ impl ConnectorOptions {
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
+            #[cfg(feature = "rustls")]
+            server_cert_verifier: None,
         }
     }
 }
