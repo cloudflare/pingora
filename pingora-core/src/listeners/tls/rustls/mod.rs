@@ -17,8 +17,7 @@ use std::sync::Arc;
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
 use log::debug;
-use pingora_error::ErrorType::InternalError;
-use pingora_error::{OrErr, Result};
+use pingora_error::Result;
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
@@ -59,17 +58,36 @@ impl TlsSettings {
 
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+        let provider = builder.crypto_provider().clone();
         let builder = if let Some(verifier) = self.client_cert_verifier {
             builder.with_client_cert_verifier(verifier)
         } else {
             builder.with_no_client_auth()
         };
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| {
-                format!("Failed to create server listener config: {e}")
-            })
-            .unwrap();
+
+        // Use CertifiedKey::new() + with_cert_resolver() instead of with_single_cert()
+        // to match the OpenSSL backend behavior: load cert+key without upfront validation.
+        // with_single_cert() runs webpki validation on the server's own cert chain, which
+        // rejects certificates with unrecognized critical extensions.
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .expect("Failed to load server private key");
+        let certified_key = Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+
+        use pingora_rustls::ResolvesServerCert;
+        #[derive(Debug)]
+        struct SingleCert(Arc<pingora_rustls::sign::CertifiedKey>);
+        impl ResolvesServerCert for SingleCert {
+            fn resolve(
+                &self,
+                _client_hello: pingora_rustls::ClientHello<'_>,
+            ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let mut config = builder.with_cert_resolver(Arc::new(SingleCert(certified_key)));
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
