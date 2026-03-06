@@ -111,6 +111,16 @@ pub struct ConnectorOptions {
     /// Optional callback for observing how long upstream connections stayed idle
     /// before leaving the keep-alive pool without reuse.
     pub keepalive_pool_callback: Option<PoolCallback>,
+    /// Optional custom server certificate verifier for the rustls backend.
+    ///
+    /// When set, the connector uses `dangerous().with_custom_certificate_verifier()` instead of
+    /// building a `RootCertStore` and using webpki for server cert validation. This is necessary
+    /// for certificates with custom critical extensions that webpki rejects (e.g. IEEE 2030.5).
+    ///
+    /// The verifier must handle TLS signature verification as well, since webpki is bypassed.
+    /// `ca_file` is ignored when this is set.
+    #[cfg(feature = "rustls")]
+    pub server_cert_verifier: Option<Arc<dyn pingora_rustls::ServerCertVerifier>>,
 }
 
 impl ConnectorOptions {
@@ -154,6 +164,8 @@ impl ConnectorOptions {
             bind_to_v4,
             bind_to_v6,
             keepalive_pool_callback: None,
+            #[cfg(feature = "rustls")]
+            server_cert_verifier: None,
         }
     }
 
@@ -170,6 +182,8 @@ impl ConnectorOptions {
             bind_to_v4: vec![],
             bind_to_v6: vec![],
             keepalive_pool_callback: None,
+            #[cfg(feature = "rustls")]
+            server_cert_verifier: None,
         }
     }
 }
