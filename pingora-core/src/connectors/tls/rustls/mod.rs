@@ -135,9 +135,25 @@ where
 {
     let config = &tls_ctx.config;
 
-    // TODO: setup CA/verify cert store from peer
-    // peer.get_ca() returns None by default. It must be replaced by the
-    // implementation of `peer`
+    // Build per-peer CA store if provided
+    let peer_ca_store: Option<Arc<RootCertStore>> = if let Some(ca_list) = peer.get_ca() {
+        let mut ca_store = RootCertStore::empty();
+        for ca_cert in &***ca_list {
+            let cert_der: CertificateDer = ca_cert.into();
+            ca_store.add(cert_der).or_err(
+                InvalidCert,
+                "Failed to add per-peer CA certificate to root store",
+            )?;
+        }
+
+        Some(Arc::new(ca_store))
+    } else {
+        None
+    };
+
+    // Determine effective CA store for this connection
+    let effective_ca_store = peer_ca_store.as_ref().unwrap_or(&tls_ctx.ca_certs);
+
     let key_pair = peer.get_client_cert_key();
     let mut updated_config_opt: Option<RusTlsClientConfig> = match key_pair {
         None => None,
@@ -164,7 +180,7 @@ where
                 &version::TLS12,
                 &version::TLS13,
             ])
-            .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
+            .with_root_certificates(Arc::clone(effective_ca_store));
             debug!("added root ca certificates");
 
             let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
@@ -176,6 +192,18 @@ where
             Some(updated_config)
         }
     };
+
+    // Ensure config is updated if per-peer CA is set but no client cert
+    if peer_ca_store.is_some() && updated_config_opt.is_none() {
+        let builder =
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_root_certificates(Arc::clone(effective_ca_store))
+                .with_no_client_auth();
+
+        let mut updated_config = builder;
+        updated_config.key_log = Arc::clone(&config.key_log);
+        updated_config_opt = Some(updated_config);
+    }
 
     if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
         let alpn_protocols = alpn.to_wire_protocols();
@@ -212,7 +240,7 @@ where
 
         // Builds the custom_verifier when verification_mode is set.
         if let Some(mode) = verification_mode {
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
                 .build()
                 .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
 
