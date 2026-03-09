@@ -919,7 +919,7 @@ impl PskTlsServer {
             let (tcp_stream, _) = listener.accept().await.unwrap();
             let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write(response).await.unwrap();
+            stream.write_all(response).await.unwrap();
             stream.shutdown().await;
         }
     }

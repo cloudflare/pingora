@@ -89,7 +89,7 @@ impl TlsSettings {
 
         let config = builder.build().unwrap();
         let connection_builder = S2NConnectionBuilder {
-            config: config,
+            config,
             psk_config: self.psk_config.clone(),
             security_policy: Some(policy.clone()),
         };
@@ -105,7 +105,7 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
-    fn set_alpn(&mut self, alpn: ALPN) {
+    pub fn set_alpn(&mut self, alpn: ALPN) {
         self.alpn = Some(alpn);
     }
 
