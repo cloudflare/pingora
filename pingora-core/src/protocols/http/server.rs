@@ -457,6 +457,22 @@ impl Session {
         }
     }
 
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
+    /// stays pending so the proxy can finish delivering the upstream response.
+    ///
+    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        match self {
+            Self::H1(s) => s.set_abort_on_close(abort),
+            Self::H2(_) => {}
+            Self::Subrequest(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {
