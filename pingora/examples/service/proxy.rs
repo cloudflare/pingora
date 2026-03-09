@@ -18,7 +18,13 @@ use pingora_core::services::listening::Service;
 use pingora_core::upstreams::peer::BasicPeer;
 
 pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
-    let proxy_to = BasicPeer::new(proxy_addr);
+    let proxy_to = match BasicPeer::new(proxy_addr) {
+        Ok(peer) => peer,
+        Err(e) => {
+            eprintln!("Failed to create proxy peer: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     Service::with_listeners(
         "Proxy Service".to_string(),
@@ -34,7 +40,13 @@ pub fn proxy_service_tls(
     cert_path: &str,
     key_path: &str,
 ) -> Service<ProxyApp> {
-    let mut proxy_to = BasicPeer::new(proxy_addr);
+    let mut proxy_to = match BasicPeer::new(proxy_addr) {
+        Ok(peer) => peer,
+        Err(e) => {
+            eprintln!("Failed to create proxy peer: {}", e);
+            std::process::exit(1);
+        }
+    };
     // set SNI to enable TLS
     proxy_to.sni = proxy_sni.into();
     Service::with_listeners(
