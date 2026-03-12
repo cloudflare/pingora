@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -198,7 +198,7 @@ where
     }
 
     // second_keyshare is default true
-    if !peer.get_peer_options().map_or(true, |o| o.second_keyshare) {
+    if !peer.get_peer_options().is_none_or(|o| o.second_keyshare) {
         ssl_use_second_key_share(&mut ssl_conf, false);
     }
 
@@ -246,7 +246,11 @@ where
     }
 
     clear_error_stack();
-    let connect_future = handshake(ssl_conf, peer.sni(), stream);
+
+    let complete_hook = peer
+        .get_peer_options()
+        .and_then(|o| o.upstream_tls_handshake_complete_hook.clone());
+    let connect_future = handshake(ssl_conf, peer.sni(), stream, complete_hook);
 
     match peer.connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use bytes::{Bytes, BytesMut};
 
 /// A buffer with size limit. When the total amount of data written to the buffer is below the limit
 /// all the data will be held in the buffer. Otherwise, the buffer will report to be truncated.
-pub(crate) struct FixedBuffer {
+pub struct FixedBuffer {
     buffer: BytesMut,
     capacity: usize,
     truncated: bool,

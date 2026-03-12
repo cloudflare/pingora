@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -117,18 +117,39 @@ pub trait HandleHit {
         trace: &SpanHandle,
     ) -> Result<()>;
 
-    /// Whether this storage allow seeking to a certain range of body
+    /// Whether this storage allows seeking to a certain range of body for single ranges.
     fn can_seek(&self) -> bool {
         false
     }
 
-    /// Try to seek to a certain range of the body
+    /// Whether this storage allows seeking to a certain range of body for multipart ranges.
+    ///
+    /// By default uses the `can_seek` implementation.
+    fn can_seek_multipart(&self) -> bool {
+        self.can_seek()
+    }
+
+    /// Try to seek to a certain range of the body for single ranges.
     ///
     /// `end: None` means to read to the end of the body.
     fn seek(&mut self, _start: usize, _end: Option<usize>) -> Result<()> {
         // to prevent impl can_seek() without impl seek
         todo!("seek() needs to be implemented")
     }
+
+    /// Try to seek to a certain range of the body for multipart ranges.
+    ///
+    /// Works in an identical manner to `seek()`.
+    ///
+    /// `end: None` means to read to the end of the body.
+    ///
+    /// By default uses the `seek` implementation, but hit handlers may customize the
+    /// implementation specifically to anticipate multipart requests.
+    fn seek_multipart(&mut self, start: usize, end: Option<usize>) -> Result<()> {
+        // to prevent impl can_seek() without impl seek
+        self.seek(start, end)
+    }
+
     // TODO: fn is_stream_hit()
 
     /// Should we count this hit handler instance as an access in the eviction manager.
@@ -157,12 +178,14 @@ pub trait HandleHit {
 }
 
 /// Hit Handler
-pub type HitHandler = Box<(dyn HandleHit + Sync + Send)>;
+pub type HitHandler = Box<dyn HandleHit + Sync + Send>;
 
 /// MissFinishType
 pub enum MissFinishType {
+    /// A new asset was created with the given size.
     Created(usize),
-    Appended(usize),
+    /// Appended size to existing asset, with an optional max size param.
+    Appended(usize, Option<usize>),
 }
 
 /// Cache miss handling trait
@@ -197,7 +220,7 @@ pub trait HandleMiss {
 }
 
 /// Miss Handler
-pub type MissHandler = Box<(dyn HandleMiss + Sync + Send)>;
+pub type MissHandler = Box<dyn HandleMiss + Sync + Send>;
 
 pub mod streaming_write {
     /// Portable u64 (sized) write id convenience type for use with streaming writes.

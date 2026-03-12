@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -238,8 +238,7 @@ impl std::net::ToSocketAddrs for SocketAddr {
         if let Some(inet) = self.as_inet() {
             Ok(std::iter::once(*inet))
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(std::io::Error::other(
                 "UDS socket cannot be used as inet socket",
             ))
         }

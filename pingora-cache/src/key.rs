@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,8 +13,6 @@
 // limitations under the License.
 
 //! Cache key
-
-use super::*;
 
 use blake2::{Blake2b, Digest};
 use http::Extensions;
@@ -212,18 +210,6 @@ impl CacheKey {
         hasher.update(&self.namespace);
         hasher.update(&self.primary);
         hasher
-    }
-
-    /// Create a default [CacheKey] from a request, which just takes its URI as the primary key.
-    pub fn default(req_header: &ReqHeader) -> Self {
-        CacheKey {
-            namespace: Vec::new(),
-            primary: format!("{}", req_header.uri).into_bytes(),
-            primary_bin_override: None,
-            variance: None,
-            user_tag: "".into(),
-            extensions: Extensions::new(),
-        }
     }
 
     /// Create a new [CacheKey] from the given namespace, primary, and user_tag input.

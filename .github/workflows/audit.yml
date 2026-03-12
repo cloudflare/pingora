@@ -24,7 +24,7 @@ jobs:
 
       - name: Generate Cargo.lock
         # https://github.com/rustsec/audit-check/issues/27
-        run: cargo generate-lockfile
+        run: cargo generate-lockfile --ignore-rust-version
 
       - name: Audit Check
         # https://github.com/rustsec/audit-check/issues/2

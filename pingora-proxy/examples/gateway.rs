@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use clap::Parser;
 use log::info;
 use prometheus::register_int_counter;
 
@@ -117,7 +116,7 @@ fn main() {
     env_logger::init();
 
     // read command line arguments
-    let opt = Opt::parse();
+    let opt = Opt::parse_args();
     let mut my_server = Server::new(Some(opt)).unwrap();
     my_server.bootstrap();
 

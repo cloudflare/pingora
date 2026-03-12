@@ -29,16 +29,18 @@ members = [
 ]
 
 [workspace.dependencies]
+bstr = "1.12.0"
 tokio = "1"
+tokio-stream = { version = "0.1" }
 async-trait = "0.1.42"
 httparse = "1"
 bytes = "1.0"
 derivative = "2.2.0"
-http = "1.0.0"
+http = "1"
 log = "0.4"
 h2 = ">=0.4.11"
 once_cell = "1"
-lru = "0.14"
+lru = "0.16.3"
 ahash = ">=0.8.9"
 
 [profile.bench]

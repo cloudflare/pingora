@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,20 +18,24 @@ use std::time::{Duration, Instant};
 
 use super::{BackendIter, BackendSelection, LoadBalancer};
 use async_trait::async_trait;
-use pingora_core::services::background::BackgroundService;
+use pingora_core::services::{background::BackgroundService, ServiceReadyNotifier};
 
-#[async_trait]
-impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancer<S>
+impl<S: Send + Sync + BackendSelection + 'static> LoadBalancer<S>
 where
     S::Iter: BackendIter,
 {
-    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
+    pub async fn run(
+        &self,
+        shutdown: pingora_core::server::ShutdownWatch,
+        mut ready_opt: Option<ServiceReadyNotifier>,
+    ) -> () {
         // 136 years
         const NEVER: Duration = Duration::from_secs(u32::MAX as u64);
         let mut now = Instant::now();
         // run update and health check once
         let mut next_update = now;
         let mut next_health_check = now;
+
         loop {
             if *shutdown.borrow() {
                 return;
@@ -41,6 +45,12 @@ where
                 // TODO: log err
                 let _ = self.update().await;
                 next_update = now + self.update_frequency.unwrap_or(NEVER);
+            }
+
+            // After the first update, discovery and selection setup will be
+            // done, so we will notify dependents
+            if let Some(ready) = ready_opt.take() {
+                ServiceReadyNotifier::notify_ready(ready)
             }
 
             if next_health_check <= now {
@@ -57,5 +67,26 @@ where
             tokio::time::sleep_until(to_wake.into()).await;
             now = Instant::now();
         }
+    }
+}
+
+/// Implement [BackgroundService] for [LoadBalancer]. For backward-compatibility
+/// reasons, we implement both the `start` and `start_with_ready_notifier`
+/// methods.
+#[async_trait]
+impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancer<S>
+where
+    S::Iter: BackendIter,
+{
+    async fn start_with_ready_notifier(
+        &self,
+        shutdown: pingora_core::server::ShutdownWatch,
+        ready: ServiceReadyNotifier,
+    ) -> () {
+        self.run(shutdown, Some(ready)).await
+    }
+
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
+        self.run(shutdown, None).await
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
@@ -48,6 +49,7 @@ pub use h2::server::Builder as H2Options;
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
     let options = options.unwrap_or_default();
     let res = options.handshake(io).await;
+
     match res {
         Ok(connection) => {
             debug!("H2 handshake done.");
@@ -186,6 +188,27 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_body_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            self.body_read += data.len();
+            self.request_body_reader
+                .flow_control()
+                .release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
     }
 
     async fn do_drain_request_body(&mut self) -> Result<()> {
@@ -397,6 +420,18 @@ impl HttpSession {
                     }
                     None => end,
                 },
+                HttpTask::UpgradedBody(..) => {
+                    // Seeing an Upgraded body means that the upstream session
+                    // was H1.1 that upgraded.
+                    //
+                    // While the downstream H2 session may encapsulate the opaque body bytes,
+                    // this represents an undefined discrepancy and change between how
+                    // the upstream and downstream sessions began intepreting the response body.
+                    return Error::e_explain(
+                        ErrorType::InternalError,
+                        "upgraded body on h2 server session",
+                    );
+                }
                 HttpTask::Trailer(Some(trailers)) => {
                     self.write_trailers(*trailers)?;
                     true
@@ -447,6 +482,11 @@ impl HttpSession {
         if !self.ended {
             self.send_response.send_reset(h2::Reason::INTERNAL_ERROR);
         }
+    }
+
+    #[doc(hidden)]
+    pub fn take_response_body_writer(&mut self) -> Option<SendStream<Bytes>> {
+        self.send_response_body.take()
     }
 
     // This is a hack for pingora-proxy to create subrequests from h2 server session
@@ -500,7 +540,7 @@ impl HttpSession {
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
-    pub fn idle(&mut self) -> Idle {
+    pub fn idle(&mut self) -> Idle<'_> {
         Idle(self)
     }
 

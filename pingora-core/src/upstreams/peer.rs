@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
 #[cfg(unix)]
@@ -45,6 +47,23 @@ use std::time::Duration;
 use tokio::net::TcpSocket;
 
 pub use crate::protocols::tls::ALPN;
+
+/// A hook function that may generate user data for [`crate::protocols::raw_connect::ProxyDigest`].
+///
+/// Takes the request and response headers from the proxy connection establishment, and may produce
+/// arbitrary data to be stored in ProxyDigest's user_data field.
+///
+/// This can be useful when, for example, you want to store some parameter(s) from the request or
+/// response headers from when the proxy connection was first established.
+pub type ProxyDigestUserDataHook = Arc<
+    dyn Fn(
+            &http::request::Parts,         // request headers
+            &pingora_http::ResponseHeader, // response headers
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
@@ -261,6 +280,29 @@ pub trait Peer: Display + Clone {
             .upstream_tcp_sock_tweak_hook
             .as_ref()
     }
+
+    /// Returns a [`ProxyDigestUserDataHook`] that may generate user data for
+    /// [`crate::protocols::raw_connect::ProxyDigest`] when establishing a new proxy connection.
+    fn proxy_digest_user_data_hook(&self) -> Option<&ProxyDigestUserDataHook> {
+        self.get_peer_options()?
+            .proxy_digest_user_data_hook
+            .as_ref()
+    }
+
+    /// Returns a hook that should be run on TLS handshake completion.
+    ///
+    /// Any value returned from the returned hook (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_handshake_complete_hook(&self) -> Option<&HandshakeCompleteHook> {
+        self.get_peer_options()?
+            .upstream_tls_handshake_complete_hook
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -391,6 +433,13 @@ pub struct PeerOptions {
     pub max_blinding_delay: Option<u32>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
+    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    ///
+    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    /// It exists primarily for compatibility with legacy servers that send malformed headers.
+    pub allow_h1_response_invalid_content_length: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise
     // if `None`, the default curves will be used
@@ -406,6 +455,15 @@ pub struct PeerOptions {
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
+    #[derivative(Debug = "ignore")]
+    pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
+    /// Hook that allows returning an optional `SslDigestExtension`.
+    /// Any returned value will be saved into the `SslDigest`.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
 }
 
 impl PeerOptions {
@@ -436,6 +494,7 @@ impl PeerOptions {
             #[cfg(feature = "s2n")]
             max_blinding_delay: None,
             max_h2_streams: 1,
+            allow_h1_response_invalid_content_length: false,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -443,6 +502,9 @@ impl PeerOptions {
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
+            proxy_digest_user_data_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_handshake_complete_hook: None,
         }
     }
 
@@ -588,6 +650,17 @@ impl HttpPeer {
         }
     }
 
+    /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    pub fn new_mtls<A: ToInetSocketAddrs>(
+        address: A,
+        sni: String,
+        client_cert_key: Arc<CertKey>,
+    ) -> Self {
+        let mut peer = Self::new(address, true, sni);
+        peer.client_cert_key = Some(client_cert_key);
+        peer
+    }
+
     fn peer_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self.hash(&mut hasher);
@@ -610,6 +683,8 @@ impl Hash for HttpPeer {
         #[cfg(feature = "s2n")]
         self.get_psk().hash(state);
         self.group_key.hash(state);
+        // max h2 stream settings
+        self.options.max_h2_streams.hash(state);
     }
 }
 

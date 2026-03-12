@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::future::OptionFuture;
+use futures::StreamExt;
+
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
+use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
 // add scheme and authority as required by h2 lib
@@ -67,7 +71,10 @@ fn update_h2_scheme_authority(
     }
 }
 
-impl<SV> HttpProxy<SV> {
+impl<SV, C> HttpProxy<SV, C>
+where
+    C: custom::Connector,
+{
     pub(crate) async fn proxy_down_to_up(
         &self,
         session: &mut Session,
@@ -159,6 +166,11 @@ impl<SV> HttpProxy<SV> {
 
         client_session.read_timeout = peer.options.read_timeout;
 
+        let mut downstream_custom_message_writer = session
+            .downstream_session
+            .as_custom_mut()
+            .and_then(|c| c.take_custom_message_writer());
+
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
             .take_request_body_writer()
@@ -175,13 +187,40 @@ impl<SV> HttpProxy<SV> {
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
-            self.bidirection_down_to_up(session, &mut client_body, rx, ctx, write_timeout),
+            self.bidirection_down_to_up(
+                session,
+                &mut client_body,
+                rx,
+                ctx,
+                write_timeout,
+                &mut downstream_custom_message_writer
+            ),
             pipe_up_to_down_response(client_session, tx)
         );
 
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
+                match custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, Some(e));
+                    }
+                }
+            }
+        }
+
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
-            Err(e) => (false, Some(e)),
+            Err(e) => {
+                // On application level upstream read timeouts, send RST_STREAM CANCEL,
+                // we know we have not received END_STREAM at this point since we read timed out
+                // TODO: implement for write timeouts?
+                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                    client_body.send_reset(h2::Reason::CANCEL);
+                }
+                (false, Some(e))
+            }
         }
     }
 
@@ -214,6 +253,12 @@ impl<SV> HttpProxy<SV> {
             .proxy_down_to_up(session, client_session, peer, ctx)
             .await;
 
+        // Record upstream response body bytes received (HTTP/2 DATA payload).
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
+        // Note: upstream_write_pending_time is not tracked for HTTP/2 (multiplexed streams).
+
         (server_session_reuse, error)
     }
 
@@ -225,11 +270,33 @@ impl<SV> HttpProxy<SV> {
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
         write_timeout: Option<Duration>,
+        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        // setup custom message forwarding, if downstream supports it
+        let (
+            mut downstream_custom_read,
+            mut downstream_custom_write,
+            downstream_custom_message_custom_forwarding,
+            mut downstream_custom_message_inject_rx,
+            mut downstream_custom_message_reader,
+        ) = if downstream_custom_message_writer.is_some() {
+            let reader = session.downstream_custom_message()?;
+            let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
+            (true, true, Some(inject_tx), Some(inject_rx), reader)
+        } else {
+            (false, false, None, None, None)
+        };
+
+        if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            self.inner
+                .custom_forwarding(session, ctx, None, custom_forwarding)
+                .await?;
+        }
+
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         // retry, send buffer if it exists
@@ -255,7 +322,26 @@ impl<SV> HttpProxy<SV> {
         /* duplex mode
          * see the Same function for h1 for more comments
          */
-        while !downstream_state.is_done() || !response_state.is_done() {
+        while !downstream_state.is_done()
+            || !response_state.is_done()
+            || downstream_custom_read && !downstream_state.is_errored()
+            || downstream_custom_write
+        {
+            // Use optional futures to allow using optional channels in select branches
+            let custom_inject_rx_recv: OptionFuture<_> = downstream_custom_message_inject_rx
+                .as_mut()
+                .map(|rx| rx.recv())
+                .into();
+            let custom_reader_next: OptionFuture<_> = downstream_custom_message_reader
+                .as_mut()
+                .map(|reader| reader.next())
+                .into();
+
+            // partial read support, this check will also be false if cache is disabled.
+            let support_cache_partial_read =
+                session.cache.support_streaming_partial_write() == Some(true);
+            let upgraded = session.was_upgraded();
+
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
@@ -265,7 +351,9 @@ impl<SV> HttpProxy<SV> {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
-                            if serve_from_cache.is_miss() {
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
                                 warn!(
@@ -273,6 +361,9 @@ impl<SV> HttpProxy<SV> {
                                     e,
                                     self.inner.request_summary(session, ctx)
                                 );
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
                                 continue;
                            } else {
                                 return Err(e.into_down());
@@ -345,6 +436,11 @@ impl<SV> HttpProxy<SV> {
                         }
 
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        if session.was_upgraded() {
+                            // it is very weird if the downstream session decides to upgrade
+                            // since the client h2 session cannot, return an error on this case
+                            return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
+                        }
                         response_state.maybe_set_upstream_done(response_done);
                     } else {
                         debug!("empty upstream event");
@@ -352,7 +448,7 @@ impl<SV> HttpProxy<SV> {
                     }
                 }
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter),
+                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
@@ -370,6 +466,9 @@ impl<SV> HttpProxy<SV> {
                                 e,
                                 self.inner.request_summary(session, ctx)
                             );
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session regardless
+                            session.downstream_session.on_proxy_failure(e);
                             continue;
                         } else {
                             return Err(e);
@@ -381,10 +480,54 @@ impl<SV> HttpProxy<SV> {
                         }
                     }
                 }
+                data = custom_reader_next, if downstream_custom_read && !downstream_state.is_errored()  => {
+                    let Some(data) = data.flatten() else {
+
+                        downstream_custom_read = false;
+                        continue;
+                    };
+
+                    let data = match data {
+                        Ok(data) => data,
+                        Err(err) =>  {
+                            warn!("downstream_custom_message_reader got error: {err}");
+                            downstream_custom_read = false;
+                            continue;
+                        },
+                    };
+
+                    self.inner
+                        .downstream_custom_message_proxy_filter(session, data, ctx, true) // true, because it's the last hop for downstream proxying
+                        .await?;
+                },
+
+                data = custom_inject_rx_recv, if downstream_custom_write => {
+                    match data.flatten() {
+                        Some(data) => {
+                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
+                                custom_writer.write_custom_message(data).await?
+                            }
+                        },
+                        None => {
+                            downstream_custom_write = false;
+                            if let Some(ref mut custom_writer) = downstream_custom_message_writer {
+                                custom_writer.finish_custom().await?;
+                            }
+                        },
+                    }
+                },
 
                 else => {
                     break;
                 }
+            }
+        }
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                custom_session
+                    .restore_custom_message_reader(downstream_custom_message_reader)
+                    .expect("downstream restore_custom_message_reader should be empty");
             }
         }
 
@@ -511,6 +654,11 @@ impl<SV> HttpProxy<SV> {
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
+            }
+            HttpTask::UpgradedBody(..) => {
+                // An h2 session should not be able to send an h2 upgraded response body,
+                // and logically that is impossible unless there is a bug in the client v2 session
+                panic!("Unexpected UpgradedBody task while proxy h2");
             }
             HttpTask::Trailer(mut trailers) => {
                 let trailer_buffer = match trailers.as_mut() {

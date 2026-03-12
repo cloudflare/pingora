@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -61,24 +61,57 @@ pub trait ServerApp {
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
-    /// Use HTTP/2 for plaintext.
+    /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
+
+    /// Allow proxying CONNECT requests when handling HTTP traffic.
+    ///
+    /// When disabled, CONNECT requests are rejected with 405 by proxy services.
+    pub allow_connect_method_proxying: bool,
+
+    #[doc(hidden)]
+    pub force_custom: bool,
+
+    /// Maximum number of requests that this connection will handle. This is
+    /// equivalent to [Nginx's keepalive requests](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_requests)
+    /// which says:
+    ///
+    /// > Closing connections periodically is necessary to free per-connection
+    /// > memory allocations. Therefore, using too high maximum number of
+    /// > requests could result in excessive memory usage and not recommended.
+    ///
+    /// Unlike nginx, the default behavior here is _no limit_.
+    pub keepalive_request_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpPersistentSettings {
     keepalive_timeout: Option<u64>,
+    keepalive_reuses_remaining: Option<u32>,
 }
 
 impl HttpPersistentSettings {
     pub fn for_session(session: &ServerSession) -> Self {
         HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
+            keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
         }
     }
 
-    pub fn apply_to_session(&self, session: &mut ServerSession) {
-        session.set_keepalive(self.keepalive_timeout);
+    pub fn apply_to_session(self, session: &mut ServerSession) {
+        let Self {
+            keepalive_timeout,
+            mut keepalive_reuses_remaining,
+        } = self;
+
+        // Reduce the number of times the connection for this session can be
+        // reused by one. A session with reuse count of zero won't be reused
+        if let Some(reuses) = keepalive_reuses_remaining.as_mut() {
+            *reuses = reuses.saturating_sub(1);
+        }
+
+        session.set_keepalive(keepalive_timeout);
+        session.set_keepalive_reuses_remaining(keepalive_reuses_remaining);
     }
 }
 
@@ -133,6 +166,15 @@ pub trait HttpServerApp {
     }
 
     async fn http_cleanup(&self) {}
+
+    #[doc(hidden)]
+    async fn process_custom_session(
+        self: Arc<Self>,
+        _stream: Stream,
+        _shutdown: &ShutdownWatch,
+    ) -> Option<Stream> {
+        None
+    }
 }
 
 #[async_trait]
@@ -146,9 +188,13 @@ where
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
         let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
+        let custom = self
+            .server_options()
+            .as_ref()
+            .map_or(false, |o| o.force_custom);
 
         // try to read h2 preface
-        if h2c {
+        if h2c && !custom {
             let mut buf = [0u8; H2_PREFACE.len()];
             let peeked = stream
                 .try_peek(&mut buf)
@@ -215,6 +261,8 @@ where
                         .await;
                 });
             }
+        } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
+            return self.clone().process_custom_session(stream, shutdown).await;
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
             let mut session = ServerSession::new_http1(stream);
@@ -225,16 +273,16 @@ where
                 // default 60s
                 session.set_keepalive(Some(60));
             }
+            session.set_keepalive_reuses_remaining(
+                self.server_options()
+                    .and_then(|opts| opts.keepalive_request_limit),
+            );
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
                 let mut session = ServerSession::new_http1(stream);
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
-                }
-                if *shutdown.borrow() {
-                    // stop downstream from reusing if this service is shutting down soon
-                    session.set_keepalive(None);
                 }
 
                 result = self.process_new_http(session, shutdown).await;
