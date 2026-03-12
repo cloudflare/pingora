@@ -60,14 +60,9 @@ pub fn source_addr_from_header(header: &ProxyHeader) -> Option<StdSocketAddr> {
             _ => None,
         },
         ProxyHeader::Version2 {
-            command,
-            addresses,
-            ..
+            command, addresses, ..
         } => {
-            if matches!(
-                command,
-                proxy_protocol::version2::ProxyCommand::Local
-            ) {
+            if matches!(command, proxy_protocol::version2::ProxyCommand::Local) {
                 return None;
             }
             match addresses {
@@ -92,11 +87,10 @@ pub fn header_has_source_addr(header: &ProxyHeader) -> bool {
             proxy_protocol::version1::ProxyAddresses::Ipv4 { .. }
                 | proxy_protocol::version1::ProxyAddresses::Ipv6 { .. }
         ),
-        ProxyHeader::Version2 { command, addresses, .. } => {
-            if matches!(
-                command,
-                proxy_protocol::version2::ProxyCommand::Local
-            ) {
+        ProxyHeader::Version2 {
+            command, addresses, ..
+        } => {
+            if matches!(command, proxy_protocol::version2::ProxyCommand::Local) {
                 return false;
             }
             matches!(
@@ -233,10 +227,15 @@ pub async fn consume_proxy_header(stream: &mut Stream) -> Result<Option<ProxyHea
                         stream.rewind(&buffer);
                         return Ok(None);
                     }
-                    ProxyDetection::NeedsMore | ProxyDetection::Invalid | ProxyDetection::HeaderLength(_) => {
+                    ProxyDetection::NeedsMore
+                    | ProxyDetection::Invalid
+                    | ProxyDetection::HeaderLength(_) => {
                         // Buffer looks like it could be a PROXY header but connection closed
                         debug!("Stream closed while reading PROXY header (buffer looks like PROXY header)");
-                        return Error::e_explain(PROXY_PROTOCOL_ERROR, "Incomplete PROXY protocol header");
+                        return Error::e_explain(
+                            PROXY_PROTOCOL_ERROR,
+                            "Incomplete PROXY protocol header",
+                        );
                     }
                 }
             }

@@ -168,10 +168,11 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                                     Err(e) => {
                                         wrapper.hello_extracted = true;
                                         match e.kind() {
-                                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+                                            io::ErrorKind::ConnectionReset
+                                            | io::ErrorKind::ConnectionAborted => {
                                                 Poll::Ready(Err(e))
                                             }
-                                            _ => Poll::Ready(Ok(None))
+                                            _ => Poll::Ready(Ok(None)),
                                         }
                                     }
                                 }
@@ -180,10 +181,9 @@ impl<T: AsRawFd + AsyncRead + Unpin> ClientHelloWrapper<T> {
                                 wrapper.hello_extracted = true;
                                 match e.kind() {
                                     io::ErrorKind::WouldBlock => Poll::Pending,
-                                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
-                                        Poll::Ready(Err(e))
-                                    }
-                                    _ => Poll::Ready(Ok(None))
+                                    io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted => Poll::Ready(Err(e)),
+                                    _ => Poll::Ready(Ok(None)),
                                 }
                             }
                             Poll::Pending => Poll::Pending,
@@ -373,4 +373,3 @@ mod tests {
         assert_eq!(inner.into_inner(), data);
     }
 }
-
