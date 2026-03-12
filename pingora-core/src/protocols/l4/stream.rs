@@ -446,7 +446,10 @@ impl Stream {
     }
 
     /// Put Some data back to the head of the stream to be read again
-    pub(crate) fn rewind(&mut self, data: &[u8]) {
+    /// This can be used in cases where we "peek" at data only to find
+    /// it doesn't match what's expected, and so it needs to be put back
+    /// for a different protocol to potentially use it.
+    pub fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
             self.rewind_read_buf.push(data.to_vec());
         }
