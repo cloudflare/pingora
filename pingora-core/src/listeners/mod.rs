@@ -74,22 +74,19 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{
-    l4::socket::SocketAddr,
-    proxy_protocol,
-    tls::TlsRef,
-    Stream,
-};
+use crate::protocols::{l4::socket::SocketAddr, proxy_protocol, tls::TlsRef, Stream};
 use log::{debug, warn};
-use pingora_error::{OrErr, ErrorType::*};
+use pingora_error::{ErrorType::*, OrErr};
 
 /// Callback function type for ClientHello extraction
 /// This allows external code (like moat) to generate fingerprints from ClientHello
-pub type ClientHelloCallback = Option<fn(&crate::protocols::tls::client_hello::ClientHello, Option<SocketAddr>)>;
+pub type ClientHelloCallback =
+    Option<fn(&crate::protocols::tls::client_hello::ClientHello, Option<SocketAddr>)>;
 
 /// Global callback for ClientHello extraction
 /// This is set by moat to generate fingerprints
-static CLIENT_HELLO_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ClientHelloCallback>> = std::sync::OnceLock::new();
+static CLIENT_HELLO_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ClientHelloCallback>> =
+    std::sync::OnceLock::new();
 
 /// Set the ClientHello callback function
 /// This is called by moat to register fingerprint generation
@@ -113,7 +110,10 @@ pub fn set_client_hello_callback(callback: ClientHelloCallback) {
 }
 
 /// Call the ClientHello callback if registered
-fn call_client_hello_callback(hello: &crate::protocols::tls::client_hello::ClientHello, peer_addr: Option<SocketAddr>) {
+fn call_client_hello_callback(
+    hello: &crate::protocols::tls::client_hello::ClientHello,
+    peer_addr: Option<SocketAddr>,
+) {
     if let Some(cb_guard) = CLIENT_HELLO_CALLBACK.get() {
         if let Ok(cb) = cb_guard.lock() {
             if let Some(callback) = *cb {
@@ -268,10 +268,14 @@ impl UninitializedStream {
                     Err(e) => {
                         // Check if this is a connection error that should abort the handshake
                         match e.kind() {
-                            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                            std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted => {
                                 debug!("Connection closed during ClientHello extraction: {:?}", e);
                                 // Return error to abort the connection instead of proceeding to TLS handshake
-                                return Err(e).or_err(AcceptError, "Connection closed during ClientHello extraction");
+                                return Err(e).or_err(
+                                    AcceptError,
+                                    "Connection closed during ClientHello extraction",
+                                );
                             }
                             _ => {
                                 debug!("Non-fatal error extracting ClientHello: {:?}", e);
@@ -309,10 +313,14 @@ impl UninitializedStream {
                 // Process the extracted ClientHello if available
                 if let Some(hello) = extracted_hello {
                     // Get peer address if available
-                    let peer_addr = wrapper.get_socket_digest()
+                    let peer_addr = wrapper
+                        .get_socket_digest()
                         .and_then(|d| d.peer_addr().cloned());
 
-                    debug!("Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}", hello.sni, hello.alpn, peer_addr);
+                    debug!(
+                        "Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}",
+                        hello.sni, hello.alpn, peer_addr
+                    );
 
                     // Call the callback to generate fingerprint (registered by moat)
                     call_client_hello_callback(&hello, peer_addr);
@@ -348,7 +356,8 @@ impl UninitializedStream {
             return Ok(());
         }
 
-        let peer_addr = self.l4
+        let peer_addr = self
+            .l4
             .get_socket_digest()
             .and_then(|d| d.transport_peer_addr().cloned());
         let peer_str = peer_addr
@@ -368,10 +377,7 @@ impl UninitializedStream {
                                 proxy_addr, client_addr
                             );
                         } else {
-                            debug!(
-                                "PROXY protocol detected downstream client {}",
-                                client_addr
-                            );
+                            debug!("PROXY protocol detected downstream client {}", client_addr);
                         }
                     }
                 } else if proxy_protocol::header_has_source_addr(&header) {

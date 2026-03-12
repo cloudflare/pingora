@@ -151,7 +151,9 @@ impl Acceptor {
     /// Perform TLS handshake with ClientHello extraction
     /// This wraps the stream with ClientHelloWrapper before TLS handshake
     #[cfg(unix)]
-    pub async fn tls_handshake_with_client_hello<S: IO + GetSocketDigest + std::os::unix::io::AsRawFd + 'static>(
+    pub async fn tls_handshake_with_client_hello<
+        S: IO + GetSocketDigest + std::os::unix::io::AsRawFd + 'static,
+    >(
         &self,
         stream: S,
     ) -> Result<SslStream<crate::protocols::ClientHelloWrapper<S>>> {
@@ -163,10 +165,14 @@ impl Acceptor {
         // Extract ClientHello before TLS handshake (sync version blocks until data is available)
         if let Ok(Some(hello)) = wrapper.extract_client_hello() {
             // Get peer address if available
-            let peer_addr = wrapper.get_socket_digest()
+            let peer_addr = wrapper
+                .get_socket_digest()
                 .and_then(|d| d.peer_addr().cloned());
 
-            debug!("Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}", hello.sni, hello.alpn, peer_addr);
+            debug!(
+                "Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}",
+                hello.sni, hello.alpn, peer_addr
+            );
 
             // Generate fingerprint from raw ClientHello bytes
             // This will be handled by moat's tls_client_hello module

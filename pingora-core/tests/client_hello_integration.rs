@@ -222,7 +222,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_extraction() {
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let notify = Arc::new(Notify::new());
@@ -260,4 +259,3 @@ mod tests {
         let _ = tokio::join!(server_task, client_task);
     }
 }
-
