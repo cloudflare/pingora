@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs;
 
 // default maximum upstream retries for retry-able proxy errors
@@ -113,6 +114,12 @@ pub struct ServerConf {
     ///
     /// This setting is a fail-safe and defaults to 16.
     pub max_retries: usize,
+    /// Maximum number of retries for upgrade socket connect and accept operations.
+    /// This controls how many times send_fds_to will retry connecting and how many times
+    /// get_fds_from will retry accepting during graceful upgrades.
+    /// The retry interval is 1 second between attempts.
+    /// If not set, defaults to 5 retries.
+    pub upgrade_sock_connect_accept_max_retries: Option<usize>,
 }
 
 impl Default for ServerConf {
@@ -141,6 +148,7 @@ impl Default for ServerConf {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
+            upgrade_sock_connect_accept_max_retries: None,
         }
     }
 }
@@ -166,7 +174,7 @@ pub struct Opt {
 
     /// Not actually used. This flag is there so that the server is not upset seeing this flag
     /// passed from `cargo test` sometimes
-    #[clap(long, hidden = true)]
+    #[clap(long, hide = true)]
     pub nocapture: bool,
 
     /// Test the configuration and exit
@@ -263,6 +271,14 @@ impl Opt {
     pub fn parse_args() -> Self {
         Opt::parse()
     }
+
+    pub fn parse_from_args<I, T>(args: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        Opt::parse_from(args)
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +316,7 @@ mod tests {
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: 1,
+            upgrade_sock_connect_accept_max_retries: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());

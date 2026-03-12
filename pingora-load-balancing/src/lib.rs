@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -308,9 +308,15 @@ impl Backends {
 ///
 /// In order to run service discovery and health check at the designated frequencies, the [LoadBalancer]
 /// needs to be run as a [pingora_core::services::background::BackgroundService].
-pub struct LoadBalancer<S> {
+pub struct LoadBalancer<S>
+where
+    S: BackendSelection,
+{
     backends: Backends,
     selector: ArcSwap<S>,
+
+    config: Option<S::Config>,
+
     /// How frequent the health check logic (if set) should run.
     ///
     /// If `None`, the health check logic will only run once at the beginning.
@@ -323,7 +329,7 @@ pub struct LoadBalancer<S> {
     pub parallel_health_check: bool,
 }
 
-impl<S: BackendSelection> LoadBalancer<S>
+impl<S> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
     S::Iter: BackendIter,
@@ -346,16 +352,29 @@ where
         Ok(lb)
     }
 
-    /// Build a [LoadBalancer] with the given [Backends].
-    pub fn from_backends(backends: Backends) -> Self {
-        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend())));
+    /// Build a [LoadBalancer] with the given [Backends] and the config.
+    pub fn from_backends_with_config(backends: Backends, config_opt: Option<S::Config>) -> Self {
+        let selector_raw = if let Some(config) = config_opt.as_ref() {
+            S::build_with_config(&backends.get_backend(), config)
+        } else {
+            S::build(&backends.get_backend())
+        };
+
+        let selector = ArcSwap::new(Arc::new(selector_raw));
+
         LoadBalancer {
             backends,
             selector,
+            config: config_opt,
             health_check_frequency: None,
             update_frequency: None,
             parallel_health_check: false,
         }
+    }
+
+    /// Build a [LoadBalancer] with the given [Backends].
+    pub fn from_backends(backends: Backends) -> Self {
+        Self::from_backends_with_config(backends, None)
     }
 
     /// Run the service discovery and update the selection algorithm.
@@ -364,7 +383,15 @@ where
     /// is running as a background service.
     pub async fn update(&self) -> Result<()> {
         self.backends
-            .update(|backends| self.selector.store(Arc::new(S::build(&backends))))
+            .update(|backends| {
+                let selector = if let Some(config) = &self.config {
+                    S::build_with_config(&backends, config)
+                } else {
+                    S::build(&backends)
+                };
+
+                self.selector.store(Arc::new(selector))
+            })
             .await
     }
 

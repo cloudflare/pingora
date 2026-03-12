@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -124,7 +124,7 @@ impl Manager {
         if self.used.load(Ordering::Relaxed) <= self.limit
             && self
                 .items_watermark
-                .map_or(true, |w| self.items.load(Ordering::Relaxed) <= w)
+                .is_none_or(|w| self.items.load(Ordering::Relaxed) <= w)
         {
             return vec![];
         }
@@ -235,8 +235,13 @@ impl EvictionManager for Manager {
         self.evict()
     }
 
-    fn increment_weight(&self, item: CompactCacheKey, delta: usize) -> Vec<CompactCacheKey> {
-        let key = u64key(&item);
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        _max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        let key = u64key(item);
         self.increase_weight(key, delta);
         self.evict()
     }

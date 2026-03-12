@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,6 +34,9 @@ pub trait CachePut {
 
     /// Return the [CacheMetaDefaults]
     fn cache_defaults() -> &'static CacheMetaDefaults;
+
+    /// Put interesting things in the span given the parsed response header.
+    fn trace_header(&mut self, _response: &ResponseHeader) {}
 }
 
 use parse_response::ResponseParse;
@@ -81,11 +84,12 @@ impl<C: CachePut> CachePutCtx<C> {
     }
 
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
-        let trace = self.trace.child("cache put header", |o| o.start()).handle();
+        let mut trace = self.trace.child("cache put header", |o| o.start());
         let miss_handler = self
             .storage
-            .get_miss_handler(&self.key, &meta, &trace)
+            .get_miss_handler(&self.key, &meta, &trace.handle())
             .await?;
+        trace::tag_span_with_meta(&mut trace, &meta);
         self.miss_handler = Some(miss_handler);
         self.meta = Some(meta);
         Ok(())
@@ -121,7 +125,9 @@ impl<C: CachePut> CachePutCtx<C> {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
             let evicted = match finish {
-                MissFinishType::Appended(delta) => eviction.increment_weight(cache_key, delta),
+                MissFinishType::Appended(delta, max_size) => {
+                    eviction.increment_weight(&cache_key, delta, max_size)
+                }
                 MissFinishType::Created(size) => {
                     eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                 }
@@ -144,29 +150,48 @@ impl<C: CachePut> CachePutCtx<C> {
         Ok(())
     }
 
+    fn trace_header(&mut self, header: &ResponseHeader) {
+        self.trace.set_tag(|| {
+            Tag::new(
+                "cache-control",
+                header
+                    .headers
+                    .get_all(http::header::CACHE_CONTROL)
+                    .into_iter()
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        });
+    }
+
     async fn do_cache_put(&mut self, data: &[u8]) -> Result<Option<NoCacheReason>> {
         let tasks = self.parser.inject_data(data)?;
         for task in tasks {
             match task {
-                HttpTask::Header(header, _eos) => match self.cache_put.cacheable(*header) {
-                    RespCacheable::Cacheable(meta) => {
-                        if let Some(max_file_size_tracker) = &self.max_file_size_tracker {
-                            let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
-                            if let Some(content_length) =
-                                header_value_content_length(content_length_hdr)
-                            {
-                                if content_length > max_file_size_tracker.max_file_size_bytes() {
-                                    return Ok(Some(NoCacheReason::ResponseTooLarge));
+                HttpTask::Header(header, _eos) => {
+                    self.trace_header(&header);
+                    match self.cache_put.cacheable(*header) {
+                        RespCacheable::Cacheable(meta) => {
+                            if let Some(max_file_size_tracker) = &self.max_file_size_tracker {
+                                let content_length_hdr = meta.headers().get(header::CONTENT_LENGTH);
+                                if let Some(content_length) =
+                                    header_value_content_length(content_length_hdr)
+                                {
+                                    if content_length > max_file_size_tracker.max_file_size_bytes()
+                                    {
+                                        return Ok(Some(NoCacheReason::ResponseTooLarge));
+                                    }
                                 }
                             }
-                        }
 
-                        self.put_header(meta).await?;
+                            self.put_header(meta).await?;
+                        }
+                        RespCacheable::Uncacheable(reason) => {
+                            return Ok(Some(reason));
+                        }
                     }
-                    RespCacheable::Uncacheable(reason) => {
-                        return Ok(Some(reason));
-                    }
-                },
+                }
                 HttpTask::Body(data, eos) => {
                     if let Some(data) = data {
                         self.put_body(data, eos).await?;
@@ -369,6 +394,7 @@ mod test {
 
 mod parse_response {
     use super::*;
+    use bstr::ByteSlice;
     use bytes::BytesMut;
     use httparse::Status;
     use pingora_error::{
@@ -475,7 +501,7 @@ mod parse_response {
                     self.state = ParseState::Invalid(e);
                     return Error::e_because(
                         InvalidHTTPHeader,
-                        format!("buf: {:?}", String::from_utf8_lossy(&self.buf)),
+                        format!("buf: {:?}", self.buf.as_bstr()),
                         e,
                     );
                 }

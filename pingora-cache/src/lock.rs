@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,14 @@
 //! Cache lock
 
 use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
+use crate::{Span, Tag};
 
+use http::Extensions;
 use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub type CacheKeyLockImpl = (dyn CacheKeyLock + Send + Sync);
+pub type CacheKeyLockImpl = dyn CacheKeyLock + Send + Sync;
 
 pub trait CacheKeyLock {
     /// Try to lock a cache fetch
@@ -37,6 +39,19 @@ pub trait CacheKeyLock {
     /// When the write lock is dropped without being released, the read lock holders will consider
     /// it to be failed so that they will compete for the write lock again.
     fn release(&self, key: &CacheKey, permit: WritePermit, reason: LockStatus);
+
+    /// Set tags on a trace span for the cache lock wait.
+    fn trace_lock_wait(&self, span: &mut Span, _read_lock: &ReadLock, lock_status: LockStatus) {
+        let tag_value: &'static str = lock_status.into();
+        span.set_tag(|| Tag::new("status", tag_value));
+    }
+
+    /// Set a lock status for a custom `NoCacheReason`.
+    fn custom_lock_status(&self, _custom_no_cache: &'static str) -> LockStatus {
+        // treat custom no cache reasons as GiveUp by default
+        // (like OriginNotCache)
+        LockStatus::GiveUp
+    }
 }
 
 const N_SHARDS: usize = 16;
@@ -106,7 +121,7 @@ impl CacheKeyLock for CacheLock {
             // requests ought to recreate the lock.
             if !matches!(
                 lock.0.lock_status(),
-                LockStatus::Dangling | LockStatus::Timeout
+                LockStatus::Dangling | LockStatus::AgeTimeout
             ) {
                 return Locked::Read(lock.read_lock());
             }
@@ -119,12 +134,13 @@ impl CacheKeyLock for CacheLock {
         if let Some(lock) = table.get(&key) {
             if !matches!(
                 lock.0.lock_status(),
-                LockStatus::Dangling | LockStatus::Timeout
+                LockStatus::Dangling | LockStatus::AgeTimeout
             ) {
                 return Locked::Read(lock.read_lock());
             }
         }
-        let (permit, stub) = WritePermit::new(self.age_timeout_default, stale_writer);
+        let (permit, stub) =
+            WritePermit::new(self.age_timeout_default, stale_writer, Extensions::new());
         table.insert(key, stub);
         Locked::Write(permit)
     }
@@ -132,13 +148,13 @@ impl CacheKeyLock for CacheLock {
     fn release(&self, key: &CacheKey, mut permit: WritePermit, reason: LockStatus) {
         let hash = key.combined_bin();
         let key = u128::from_be_bytes(hash); // endianness doesn't matter
-        if permit.lock.lock_status() == LockStatus::Timeout {
+        if permit.lock.lock_status() == LockStatus::AgeTimeout {
             // if lock age timed out, then readers are capable of
             // replacing the lock associated with this permit from the lock table
             // (see lock() implementation)
             // keep the lock status as Timeout accordingly when unlocking
             // (because we aren't removing it from the lock_table)
-            permit.unlock(LockStatus::Timeout);
+            permit.unlock(LockStatus::AgeTimeout);
         } else if let Some(_lock) = self.lock_table.write(key).remove(&key) {
             permit.unlock(reason);
         }
@@ -150,25 +166,28 @@ impl CacheKeyLock for CacheLock {
 use log::warn;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
-use strum::IntoStaticStr;
+use strum::{FromRepr, IntoStaticStr};
 use tokio::sync::Semaphore;
 
 /// Status which the read locks could possibly see.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoStaticStr)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoStaticStr, FromRepr)]
+#[repr(u8)]
 pub enum LockStatus {
     /// Waiting for the writer to populate the asset
-    Waiting,
+    Waiting = 0,
     /// The writer finishes, readers can start
-    Done,
+    Done = 1,
     /// The writer encountered error, such as network issue. A new writer will be elected.
-    TransientError,
+    TransientError = 2,
     /// The writer observed that no cache lock is needed (e.g., uncacheable), readers should start
     /// to fetch independently without a new writer
-    GiveUp,
+    GiveUp = 3,
     /// The write lock is dropped without being unlocked
-    Dangling,
-    /// The lock is held for too long
-    Timeout,
+    Dangling = 4,
+    /// Reader has held onto cache locks for too long, give up
+    WaitTimeout = 5,
+    /// The lock is held for too long by the writer
+    AgeTimeout = 6,
 }
 
 impl From<LockStatus> for u8 {
@@ -179,22 +198,15 @@ impl From<LockStatus> for u8 {
             LockStatus::TransientError => 2,
             LockStatus::GiveUp => 3,
             LockStatus::Dangling => 4,
-            LockStatus::Timeout => 5,
+            LockStatus::WaitTimeout => 5,
+            LockStatus::AgeTimeout => 6,
         }
     }
 }
 
 impl From<u8> for LockStatus {
     fn from(v: u8) -> Self {
-        match v {
-            0 => Self::Waiting,
-            1 => Self::Done,
-            2 => Self::TransientError,
-            3 => Self::GiveUp,
-            4 => Self::Dangling,
-            5 => Self::Timeout,
-            _ => Self::GiveUp, // placeholder
-        }
+        Self::from_repr(v).unwrap_or(Self::GiveUp)
     }
 }
 
@@ -206,16 +218,18 @@ pub struct LockCore {
     // use u8 for Atomic enum
     lock_status: AtomicU8,
     stale_writer: bool,
+    extensions: Extensions,
 }
 
 impl LockCore {
-    pub fn new_arc(timeout: Duration, stale_writer: bool) -> Arc<Self> {
+    pub fn new_arc(timeout: Duration, stale_writer: bool, extensions: Extensions) -> Arc<Self> {
         Arc::new(LockCore {
             lock: Semaphore::new(0),
             age_timeout: timeout,
             lock_start: Instant::now(),
             lock_status: AtomicU8::new(LockStatus::Waiting.into()),
             stale_writer,
+            extensions,
         })
     }
 
@@ -224,6 +238,10 @@ impl LockCore {
     }
 
     pub fn unlock(&self, reason: LockStatus) {
+        assert!(
+            reason != LockStatus::WaitTimeout,
+            "WaitTimeout is not stored in LockCore"
+        );
         self.lock_status.store(reason.into(), Ordering::SeqCst);
         // Any small positive number will do, 10 is used for RwLock as well.
         // No need to wake up all at once.
@@ -237,6 +255,10 @@ impl LockCore {
     /// Was this lock for a stale cache fetch writer?
     pub fn stale_writer(&self) -> bool {
         self.stale_writer
+    }
+
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
     }
 }
 
@@ -268,14 +290,14 @@ impl ReadLock {
                 Err(_) => {
                     self.0
                         .lock_status
-                        .store(LockStatus::Timeout.into(), Ordering::SeqCst);
+                        .store(LockStatus::AgeTimeout.into(), Ordering::SeqCst);
                 }
             }
         } else {
             // expiration has already occurred, store timeout status
             self.0
                 .lock_status
-                .store(LockStatus::Timeout.into(), Ordering::SeqCst);
+                .store(LockStatus::AgeTimeout.into(), Ordering::SeqCst);
         }
     }
 
@@ -295,10 +317,14 @@ impl ReadLock {
     pub fn lock_status(&self) -> LockStatus {
         let status = self.0.lock_status();
         if matches!(status, LockStatus::Waiting) && self.expired() {
-            LockStatus::Timeout
+            LockStatus::AgeTimeout
         } else {
             status
         }
+    }
+
+    pub fn extensions(&self) -> &Extensions {
+        self.0.extensions()
     }
 }
 
@@ -311,8 +337,12 @@ pub struct WritePermit {
 
 impl WritePermit {
     /// Create a new lock, with a permit to be given to the associated writer.
-    pub fn new(timeout: Duration, stale_writer: bool) -> (WritePermit, LockStub) {
-        let lock = LockCore::new_arc(timeout, stale_writer);
+    pub fn new(
+        timeout: Duration,
+        stale_writer: bool,
+        extensions: Extensions,
+    ) -> (WritePermit, LockStub) {
+        let lock = LockCore::new_arc(timeout, stale_writer, extensions);
         let stub = LockStub(lock.clone());
         (
             WritePermit {
@@ -336,6 +366,10 @@ impl WritePermit {
     pub fn lock_status(&self) -> LockStatus {
         self.lock.lock_status()
     }
+
+    pub fn extensions(&self) -> &Extensions {
+        self.lock.extensions()
+    }
 }
 
 impl Drop for WritePermit {
@@ -353,6 +387,10 @@ pub struct LockStub(pub Arc<LockCore>);
 impl LockStub {
     pub fn read_lock(&self) -> ReadLock {
         ReadLock(self.0.clone())
+    }
+
+    pub fn extensions(&self) -> &Extensions {
+        &self.0.extensions
     }
 }
 
@@ -417,7 +455,7 @@ mod test {
         let handle = tokio::spawn(async move {
             // timed out
             lock.wait().await;
-            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+            assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
         });
 
         tokio::time::sleep(Duration::from_millis(2100)).await;
@@ -462,7 +500,7 @@ mod test {
         let handle = tokio::spawn(async move {
             // timed out
             lock.wait().await;
-            assert_eq!(lock.lock_status(), LockStatus::Timeout);
+            assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
         });
 
         tokio::time::sleep(Duration::from_millis(1100)).await; // let lock age time out
@@ -512,9 +550,9 @@ mod test {
         };
         // reader expires write permit
         lock.wait().await;
-        assert_eq!(lock.lock_status(), LockStatus::Timeout);
-        assert_eq!(permit.lock.lock_status(), LockStatus::Timeout);
-        permit.unlock(LockStatus::Timeout);
+        assert_eq!(lock.lock_status(), LockStatus::AgeTimeout);
+        assert_eq!(permit.lock.lock_status(), LockStatus::AgeTimeout);
+        permit.unlock(LockStatus::AgeTimeout);
     }
 
     #[tokio::test]

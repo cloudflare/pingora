@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +36,7 @@ impl<T: Send + 'static> Compact<T> {
         Self(shard_array.into_boxed_slice())
     }
 
-    pub fn get(&self, key: &Key) -> Option<Entry<Key, Bucket<T>>> {
+    pub fn get(&self, key: &Key) -> Option<Entry<'_, Key, Bucket<T>>> {
         let shard = *key as usize % self.0.len();
         self.0[shard].get(key)
     }

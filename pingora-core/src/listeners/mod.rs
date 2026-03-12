@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,9 +13,61 @@
 // limitations under the License.
 
 //! The listening endpoints (TCP and TLS) and their configurations.
+//!
+//! This module provides the infrastructure for setting up network listeners
+//! that accept incoming connections. It supports TCP, Unix domain sockets,
+//! and TLS endpoints.
+//!
+//! # Connection Filtering
+//!
+//! With the `connection_filter` feature enabled, this module also provides
+//! early connection filtering capabilities through the [`ConnectionFilter`] trait.
+//! This allows dropping unwanted connections at the TCP level before any
+//! expensive operations like TLS handshakes.
+//!
+//! ## Example with Connection Filtering
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "connection_filter")]
+//! # {
+//! use pingora_core::listeners::{Listeners, ConnectionFilter};
+//! use std::sync::Arc;
+//!
+//! // Create a custom filter
+//! let filter = Arc::new(MyCustomFilter::new());
+//!
+//! // Apply to listeners
+//! let mut listeners = Listeners::new();
+//! listeners.set_connection_filter(filter);
+//! listeners.add_tcp("0.0.0.0:8080");
+//! # }
+//! ```
 
 mod l4;
 
+#[cfg(feature = "connection_filter")]
+pub mod connection_filter;
+
+#[cfg(feature = "connection_filter")]
+pub use connection_filter::{AcceptAllFilter, ConnectionFilter};
+
+#[cfg(not(feature = "connection_filter"))]
+#[derive(Debug, Clone)]
+pub struct AcceptAllFilter;
+
+#[cfg(not(feature = "connection_filter"))]
+pub trait ConnectionFilter: std::fmt::Debug + Send + Sync {
+    fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+        true
+    }
+}
+
+#[cfg(not(feature = "connection_filter"))]
+impl ConnectionFilter for AcceptAllFilter {
+    fn should_accept(&self, _addr: &std::net::SocketAddr) -> bool {
+        true
+    }
+}
 #[cfg(feature = "any_tls")]
 pub mod tls;
 
@@ -82,7 +134,7 @@ use crate::server::ListenFds;
 
 use async_trait::async_trait;
 use pingora_error::Result;
-use std::{fs::Permissions, sync::Arc};
+use std::{any::Any, fs::Permissions, sync::Arc};
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
@@ -102,6 +154,19 @@ pub trait TlsAccept {
     async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
         // does nothing by default
     }
+
+    /// This function is called after the TLS handshake is complete.
+    ///
+    /// Any value returned from this function (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    async fn handshake_complete_callback(
+        &self,
+        _ssl: &TlsRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 }
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
@@ -109,6 +174,8 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl TransportStackBuilder {
@@ -119,6 +186,11 @@ impl TransportStackBuilder {
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
+
+        #[cfg(feature = "connection_filter")]
+        if let Some(filter) = &self.connection_filter {
+            builder.connection_filter(filter.clone());
+        }
 
         #[cfg(unix)]
         let l4 = builder.listen(upgrade_listeners).await?;
@@ -327,14 +399,19 @@ impl UninitializedStream {
 /// The struct to hold one more multiple listening endpoints
 pub struct Listeners {
     stacks: Vec<TransportStackBuilder>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl Listeners {
     /// Create a new [`Listeners`] with no listening endpoints.
     pub fn new() -> Self {
-        Listeners { stacks: vec![] }
+        Listeners {
+            stacks: vec![],
+            #[cfg(feature = "connection_filter")]
+            connection_filter: None,
+        }
     }
-
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
     pub fn tcp(addr: &str) -> Self {
         let mut listeners = Self::new();
@@ -399,9 +476,28 @@ impl Listeners {
         self.add_endpoint(addr, None);
     }
 
+    /// Set a connection filter for all endpoints in this listener collection
+    #[cfg(feature = "connection_filter")]
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        log::debug!("Setting connection filter on Listeners");
+
+        // Store the filter for future endpoints
+        self.connection_filter = Some(filter.clone());
+
+        // Apply to existing stacks
+        for stack in &mut self.stacks {
+            stack.connection_filter = Some(filter.clone());
+        }
+    }
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
-        self.stacks.push(TransportStackBuilder { l4, tls })
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: self.connection_filter.clone(),
+        })
     }
 
     pub(crate) async fn build(
@@ -432,6 +528,8 @@ impl Listeners {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "connection_filter")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -508,5 +606,54 @@ mod test {
 
         let res = client.get(format!("https://{addr}")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_connection_filter_inheritance() {
+        #[derive(Debug, Clone)]
+        struct TestFilter {
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for TestFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }
+
+        let mut listeners = Listeners::new();
+
+        // Add an endpoint before setting filter
+        listeners.add_tcp("127.0.0.1:7104");
+
+        // Set the connection filter
+        let filter = Arc::new(TestFilter {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        listeners.set_connection_filter(filter.clone());
+
+        // Add endpoints after setting filter
+        listeners.add_tcp("127.0.0.1:7105");
+        #[cfg(feature = "any_tls")]
+        {
+            // Only test TLS if the feature is enabled
+            if let Ok(tls_settings) = TlsSettings::intermediate(
+                &format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR")),
+                &format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR")),
+            ) {
+                listeners.add_tls_with_settings("127.0.0.1:7106", None, tls_settings);
+            }
+        }
+
+        // Verify all stacks have the filter (only when feature is enabled)
+        for stack in &listeners.stacks {
+            assert!(
+                stack.connection_filter.is_some(),
+                "All stacks should have the connection filter set"
+            );
+        }
     }
 }

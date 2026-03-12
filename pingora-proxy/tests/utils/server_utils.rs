@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{ACCEPT_ENCODING, VARY};
+use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
@@ -26,8 +26,8 @@ use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
-    set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
-    RespCacheable,
+    set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
+    NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
     CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
@@ -38,7 +38,7 @@ use pingora_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
 use pingora_core::server::configuration::Opt;
-use pingora_core::services::Service;
+use pingora_core::services::{Service, ServiceWithDependents};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
@@ -47,7 +47,7 @@ use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub struct ExampleProxyHttps {}
 
@@ -489,6 +489,35 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    /// Reference `cache_key_callback` implementation for integration tests.
+    ///
+    /// Builds the primary key as `{host}{path_and_query}` from the request.
+    /// This is **not production ready**: it does not account for `Vary`, custom
+    /// request filters, or scheme differences. See the rustdoc on
+    /// [`ProxyHttp::cache_key_callback`] for details.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let req_header = session.req_header();
+
+        let host = req_header
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req_header.uri.authority().map(|a| a.as_str()))
+            .unwrap_or("");
+
+        let path_and_query = req_header
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(
+            String::new(),
+            format!("{host}{path_and_query}"),
+            String::new(),
+        ))
+    }
+
     async fn cache_hit_filter(
         &self,
         session: &mut Session,
@@ -574,10 +603,26 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
+        // Allow testing the unlikely case of caching a 101 response
+        if resp.status == 101
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-cache-websocket")
+        {
+            return Ok(RespCacheable::Cacheable(CacheMeta::new(
+                SystemTime::now() + Duration::from_secs(5),
+                SystemTime::now(),
+                0,
+                0,
+                resp.clone(),
+            )));
+        }
+
         let cc = CacheControl::from_resp_headers(resp);
         Ok(resp_cacheable(
             cc.as_ref(),
@@ -589,11 +634,21 @@ impl ProxyHttp for ExampleProxyCache {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.upstream_status = Some(upstream_response.status.into());
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-fake-http10")
+        {
+            // TODO to simulate an actual http1.0 origin
+            upstream_response.set_version(http::Version::HTTP_10);
+            upstream_response.remove_header(&CONTENT_LENGTH);
+            upstream_response.remove_header(&TRANSFER_ENCODING);
+        }
         Ok(())
     }
 
@@ -696,7 +751,7 @@ impl ProxyHttp for ExampleProxyCache {
         error: Option<&Error>, // None when it is called during stale while revalidate
     ) -> bool {
         // enable serve stale while updating
-        error.map_or(true, |e| e.esource() == &ErrorSource::Upstream)
+        error.is_none_or(|e| e.esource() == &ErrorSource::Upstream)
     }
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
@@ -712,7 +767,8 @@ fn test_main() {
         "-c".into(),
         "tests/pingora_conf.yaml".into(),
     ];
-    let mut my_server = pingora_core::server::Server::new(Some(Opt::parse_from(opts))).unwrap();
+    let mut my_server =
+        pingora_core::server::Server::new(Some(Opt::parse_from_args(opts))).unwrap();
     my_server.bootstrap();
 
     let mut proxy_service_http =
@@ -720,6 +776,14 @@ fn test_main() {
     proxy_service_http.add_tcp("0.0.0.0:6147");
     #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
+
+    let mut proxy_service_http_connect =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+    let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.allow_connect_method_proxying = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_http_connect.add_tcp("0.0.0.0:6160");
 
     let mut proxy_service_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
@@ -730,7 +794,7 @@ fn test_main() {
     http_logic.server_options = Some(http_server_options);
     proxy_service_h2c.add_tcp("0.0.0.0:6146");
 
-    let mut proxy_service_https_opt: Option<Box<dyn Service>> = None;
+    let mut proxy_service_https_opt: Option<Box<dyn ServiceWithDependents>> = None;
 
     #[cfg(feature = "any_tls")]
     {
@@ -761,9 +825,10 @@ fn test_main() {
         proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
     }
 
-    let mut services: Vec<Box<dyn Service>> = vec![
+    let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
+        Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
     ];
 

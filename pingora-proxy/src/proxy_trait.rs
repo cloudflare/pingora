@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -90,7 +90,7 @@ pub trait ProxyHttp {
 
     /// Returns whether this session is allowed to spawn subrequests.
     ///
-    /// This function is checked after [`early_request_filter`] to allow that filter to configure
+    /// This function is checked after [Self::early_request_filter] to allow that filter to configure
     /// this if required. This will also run for subrequests themselves, which may allowed to spawn
     /// their own subrequests.
     ///
@@ -130,18 +130,31 @@ pub trait ProxyHttp {
     ///
     /// By default this filter does nothing which effectively disables caching.
     // Ideally only session.cache should be modified, TODO: reflect that in this interface
-    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+    fn request_cache_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 
-    /// This callback generates the cache key
+    /// This callback generates the cache key.
     ///
-    /// This callback is called only when cache is enabled for this request
+    /// This callback is called only when cache is enabled for this request.
     ///
-    /// By default this callback returns a default cache key generated from the request.
-    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
-        let req_header = session.req_header();
-        Ok(CacheKey::default(req_header))
+    /// There is no sensible default cache key for all proxy applications. The
+    /// correct key depends on which request properties affect upstream responses
+    /// (e.g. `Vary` headers, custom request filters that modify the origin host).
+    /// Getting this wrong leads to cache poisoning.
+    ///
+    /// See `pingora-proxy/tests/utils/server_utils.rs` for a minimal (not
+    /// production-ready) reference implementation.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics. You **must** override this method when
+    /// caching is enabled.
+    fn cache_key_callback(&self, _session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        unimplemented!("cache_key_callback must be implemented when caching is enabled")
     }
 
     /// This callback is invoked when a cacheable response is ready to be admitted to cache.
@@ -255,7 +268,12 @@ pub trait ProxyHttp {
         resp: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> range_filter::RangeType {
-        proxy_cache::range_filter::range_header_filter(session.req_header(), resp)
+        const DEFAULT_MAX_RANGES: Option<usize> = Some(200);
+        proxy_cache::range_filter::range_header_filter(
+            session.req_header(),
+            resp,
+            DEFAULT_MAX_RANGES,
+        )
     }
 
     /// Modify the request before it is sent to the upstream
@@ -307,6 +325,51 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(())
+    }
+
+    // custom_forwarding is called when downstream and upstream connections are successfully established.
+    #[doc(hidden)]
+    async fn custom_forwarding(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: mpsc::Sender<Bytes>,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
+    // received a custom message from the downstream before sending it to the upstream.
+    #[doc(hidden)]
+    async fn downstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
+    }
+
+    // received a custom message from the upstream before sending it to the downstream.
+    #[doc(hidden)]
+    async fn upstream_custom_message_proxy_filter(
+        &self,
+        _session: &mut Session,
+        custom_message: Bytes,
+        _ctx: &mut Self::CTX,
+        _final_hop: bool,
+    ) -> Result<Option<Bytes>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(Some(custom_message))
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response body

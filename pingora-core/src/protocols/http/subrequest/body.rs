@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -72,7 +72,19 @@ impl BodyReader {
         }
     }
 
-    pub fn init_until_close(&mut self) {
+    pub fn init_close_delimited(&mut self) {
+        self.body_state = PS::UntilClose(0);
+    }
+
+    /// Convert how we interpret the remainder of the body to read until close.
+    /// This is used for responses without explicit framing.
+    pub fn convert_to_close_delimited(&mut self) {
+        if matches!(self.body_state, PS::UntilClose(_)) {
+            // nothing to do, already in close-delimited mode
+            return;
+        }
+
+        // reset body counter
         self.body_state = PS::UntilClose(0);
     }
 
@@ -214,7 +226,7 @@ impl BodyWriter {
         }
     }
 
-    pub fn init_until_close(&mut self) {
+    pub fn init_close_delimited(&mut self) {
         self.body_mode = BM::UntilClose(0);
     }
 
@@ -494,7 +506,7 @@ mod tests {
         let input2 = b""; // zero length body but not actually close
         let (tx, mut rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let mut body_reader = BodyReader::new(None);
-        body_reader.init_until_close();
+        body_reader.init_close_delimited();
 
         tx.send(HttpTask::Body(Some(Bytes::from(&input1[..])), false))
             .await
@@ -566,7 +578,7 @@ mod tests {
         let data = b"a";
         let (mut tx, mut rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let mut body_writer = BodyWriter::new();
-        body_writer.init_until_close();
+        body_writer.init_close_delimited();
         assert_eq!(body_writer.body_mode, BodyMode::UntilClose(0));
         let res = body_writer
             .write_body(&mut tx, Bytes::from(&data[..]))

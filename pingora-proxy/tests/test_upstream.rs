@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,16 @@
 mod utils;
 
 use utils::server_utils::init;
-use utils::websocket::WS_ECHO;
+use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
 use futures::{SinkExt, StreamExt};
+use pingora_http::ResponseHeader;
 use reqwest::header::{HeaderName, HeaderValue};
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Version};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 #[tokio::test]
@@ -184,6 +188,178 @@ async fn test_ws_server_ends_conn() {
     assert!(ws_stream.next().await.is_none());
 }
 
+fn parse_response_header(buf: &[u8]) -> ResponseHeader {
+    let mut headers = vec![httparse::EMPTY_HEADER; 256];
+    let mut parsed = httparse::Response::new(&mut headers);
+    match parsed.parse(buf).unwrap() {
+        httparse::Status::Complete(_) => {
+            let mut resp =
+                ResponseHeader::build(parsed.code.unwrap(), Some(parsed.headers.len())).unwrap();
+            for header in parsed.headers.iter() {
+                resp.append_header(header.name.to_string(), header.value)
+                    .unwrap();
+            }
+            resp
+        }
+        _ => panic!("expects a whole response header"),
+    }
+}
+
+/// Read response header and return it along with any preread body data
+async fn read_response_header(stream: &mut tokio::net::TcpStream) -> (ResponseHeader, Vec<u8>) {
+    let mut response = vec![];
+    let mut header_end = 0;
+    let mut buf = [0; 1024];
+    loop {
+        let n = stream.read(&mut buf).await.unwrap();
+        response.extend_from_slice(&buf[..n]);
+        let mut end_of_response = false;
+        for (i, w) in response.windows(4).enumerate() {
+            if w == b"\r\n\r\n" {
+                end_of_response = true;
+                header_end = i + 4;
+                break;
+            }
+        }
+        if end_of_response {
+            break;
+        }
+    }
+    let response_header = parse_response_header(&response[..header_end]);
+    let preread_body = response[header_end..].to_vec();
+    (response_header, preread_body)
+}
+
+/// Read remaining body bytes from stream until expected_body_len is reached
+async fn read_response_body(
+    stream: &mut tokio::net::TcpStream,
+    mut body: Vec<u8>,
+    expected_body_len: usize,
+) -> Vec<u8> {
+    let mut buf = [0; 1024];
+    while body.len() < expected_body_len {
+        let n = stream.read(&mut buf).await.unwrap();
+        body.extend_from_slice(&buf[..n]);
+    }
+    if body.len() > expected_body_len {
+        panic!("more body bytes than expected");
+    }
+    body
+}
+
+async fn read_response(
+    stream: &mut tokio::net::TcpStream,
+    expected_body_len: usize,
+) -> (ResponseHeader, Vec<u8>) {
+    let (response_header, body) = read_response_header(stream).await;
+    let body = read_response_body(stream, body, expected_body_len).await;
+    (response_header, body)
+}
+
+#[tokio::test]
+async fn test_upgrade_smoke() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "GET /upgrade HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let expected_payload = b"hello\n";
+    let fut = read_response(&mut stream, expected_payload.len());
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+    assert_eq!(resp_body, expected_payload);
+}
+
+#[tokio::test]
+async fn test_upgrade_body() {
+    init();
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "POST /upgrade_echo_body HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Content-Length: 1024\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    stream.write_all("b".repeat(1024).as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let fut = read_response(&mut stream, 1024);
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+
+    let body = "b".repeat(1024);
+    assert_eq!(resp_body, body.as_bytes());
+}
+
+#[tokio::test]
+async fn test_upgrade_body_after_101() {
+    // test content-length body is passed through after 101,
+    // and that ws payload is passed through afterwards
+    // use websocket server that flushes 101 after reading header
+    init();
+    let _ = *WS_ECHO_RAW;
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "POST /upgrade_echo_body HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "X-Port: 9284\r\n",
+        "Content-Length: 5120\r\n",
+        "X-Expected-Body-Len: 5125\r\n", // include ws payload
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+        .write_all("b".repeat(5 * 1024).as_bytes())
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    // Read response header and any preread body first (before sending ws_payload)
+    let fut = read_response_header(&mut stream);
+    let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+    assert_eq!(resp_header.status, 101);
+    assert_eq!(resp_header.headers["Upgrade"], "websocket");
+    assert_eq!(resp_header.headers["Connection"], "upgrade");
+
+    // Now send the websocket payload after receiving 101
+    let ws_payload = "hello";
+    stream.write_all(ws_payload.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // Read the rest of the bytes (body + ws payload), subtracting preread body length
+    let expected_total_len = 5 * 1024 + ws_payload.len();
+    let fut = read_response_body(&mut stream, resp_body, expected_total_len);
+    let resp_body = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+    let body = "b".repeat(5 * 1024) + ws_payload;
+    assert_eq!(resp_body, body.as_bytes());
+}
+
 #[tokio::test]
 async fn test_download_timeout() {
     init();
@@ -191,7 +367,7 @@ async fn test_download_timeout() {
     use tokio::time::sleep;
 
     let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let uri: hyper::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
     let req = hyper::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
@@ -361,6 +537,61 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "no if headers detected\n");
+    }
+
+    #[tokio::test]
+    async fn test_cache_http10() {
+        // allow caching http1.0 from origin, but proxy as h1.1 downstream
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_http10/now";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1") // fake http1.0 in upstream response filter
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_expired_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "expired");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert!(cache_expired_epoch > cache_hit_epoch);
     }
 
     #[tokio::test]
@@ -905,6 +1136,55 @@ mod test_cache {
             .unwrap();
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(res.text().await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn test_cache_websocket_101() {
+        // Test the unlikely scenario in which users may want to cache WS
+        init();
+
+        // First request - should be a miss
+        let mut stream = TcpStream::connect("127.0.0.1:6148").await.unwrap();
+        let req = concat!(
+            "GET /unique/test_cache_websocket_101/upgrade HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "X-Cache-Websocket: 1\r\n",
+            "\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let expected_payload = b"hello\n";
+        let fut = read_response(&mut stream, expected_payload.len());
+        let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+        assert_eq!(resp_header.status, 101);
+        assert_eq!(resp_header.headers["Upgrade"], "websocket");
+        assert_eq!(resp_header.headers["x-cache-status"], "miss");
+        assert_eq!(resp_body, expected_payload);
+
+        // Second request - should be a cache hit
+        let mut stream = TcpStream::connect("127.0.0.1:6148").await.unwrap();
+        let req = concat!(
+            "GET /unique/test_cache_websocket_101/upgrade HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "X-Cache-Websocket: 1\r\n",
+            "\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let fut = read_response(&mut stream, expected_payload.len());
+        let (resp_header, resp_body) = timeout(Duration::from_secs(5), fut).await.unwrap();
+
+        assert_eq!(resp_header.status, 101);
+        assert_eq!(resp_header.headers["Upgrade"], "websocket");
+        assert_eq!(resp_header.headers["x-cache-status"], "hit");
+        assert_eq!(resp_body, expected_payload);
     }
 
     #[tokio::test]
@@ -1581,8 +1861,8 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // cache lock timeout, disable cache
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // cache lock timeout, try to replace lock
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1599,26 +1879,16 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // this is now a miss because we will not timeout on cache lock
+            // this is now a hit because the second task cached from origin
+            // successfully
             // and will fetch from origin successfully
-            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(headers["x-cache-status"], "hit");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         task1.await.unwrap();
         task2.await.unwrap();
         task3.await.unwrap();
-
-        let res = reqwest::Client::new()
-            .get(url)
-            .header("x-lock", "true")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
-        assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
     #[tokio::test]
@@ -2346,6 +2616,108 @@ mod test_cache {
         // only the header is under cache lock and the body should be streamed
         assert!(lock_time_ms > 900 && lock_time_ms < 1000);
         assert_eq!(res.text().await.unwrap(), "hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/slow_body/test_caching_when_downstream_bails_uncacheable/";
+
+        tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-no-store", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "no-cache");
+            // exit without res.text().await so that we bail early
+        });
+        // sleep just a little to make sure the req above gets the cache lock
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        // entirely new request made to upstream, since the response was uncacheable
+        assert_eq!(headers["x-cache-status"], "no-cache"); // due to cache lock give up
+        assert_eq!(res.text().await.unwrap(), "hello world!");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache hit
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_caching_when_downstream_bails_header_uncacheable() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_caching_when_downstream_bails_header_uncacheable/sleep";
+
+        tokio::spawn(async move {
+            // this should always time out
+            reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "2")
+                .header("x-no-store", "1")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+                .unwrap_err()
+            // note that while the downstream error is ignored,
+            // once the response is uncacheable we will still attempt to write
+            // downstream and find a broken connection that terminates the request
+        });
+        // sleep after cache fill
+        sleep(Duration::from_millis(2500)).await;
+
+        // next request should be a cache miss, as the previous fill was uncacheable
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
     async fn send_vary_req_with_headers_with_dups(

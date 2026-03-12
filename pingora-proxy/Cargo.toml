@@ -1,9 +1,10 @@
 [package]
 name = "pingora-proxy"
-version = "0.6.0"
+version = "0.8.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
+rust-version = "1.84"
 repository = "https://github.com/cloudflare/pingora"
 categories = ["asynchronous", "network-programming"]
 keywords = ["async", "http", "proxy", "pingora"]
@@ -18,11 +19,11 @@ name = "pingora_proxy"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-error = { version = "0.6.0", path = "../pingora-error" }
-pingora-core = { version = "0.6.0", path = "../pingora-core", default-features = false }
-pingora-cache = { version = "0.6.0", path = "../pingora-cache", default-features = false }
+pingora-error = { version = "0.8.0", path = "../pingora-error" }
+pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
+pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features = false }
 tokio = { workspace = true, features = ["macros", "net"] }
-pingora-http = { version = "0.6.0", path = "../pingora-http" }
+pingora-http = { version = "0.8.0", path = "../pingora-http" }
 http = { workspace = true }
 futures = "0.3"
 bytes = { workspace = true }
@@ -30,7 +31,7 @@ async-trait = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
 once_cell = { workspace = true }
-clap = { version = "3.2.25", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 regex = "1"
 rand = "0.8"
 
@@ -39,17 +40,18 @@ reqwest = { version = "0.11", features = [
     "gzip",
     "rustls-tls",
 ], default-features = false }
+httparse = { workspace = true }
 tokio-test = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 hyper = "0.14"
 tokio-tungstenite = "0.20.1"
-pingora-limits = { version = "0.6.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.6.0", path = "../pingora-load-balancing", default-features=false }
+pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
+pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.8"
@@ -57,12 +59,21 @@ hyperlocal = "0.8"
 [features]
 default = []
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
-boringssl = ["pingora-core/boringssl", "pingora-cache/boringssl", "openssl_derived"]
+boringssl = [
+    "pingora-core/boringssl",
+    "pingora-cache/boringssl",
+    "openssl_derived",
+]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
 s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+connection_filter = ["pingora-core/connection_filter"]
+
+[[example]]
+name = "connection_filter"
+required-features = ["connection_filter"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

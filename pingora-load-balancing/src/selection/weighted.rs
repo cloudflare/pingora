@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@ pub struct Weighted<H = FnvHasher> {
 
 impl<H: SelectionAlgorithm> BackendSelection for Weighted<H> {
     type Iter = WeightedIterator<H>;
+
+    type Config = ();
 
     fn build(backends: &BTreeSet<Backend>) -> Self {
         assert!(
