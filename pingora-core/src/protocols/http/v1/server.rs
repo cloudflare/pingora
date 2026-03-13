@@ -86,6 +86,13 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// Whether the client has closed the TCP connection (sent FIN / read returned 0).
+    half_closed: bool,
+    /// When true (default), a client close after the request body is surfaced as a
+    /// `ConnectionClosed` error so the proxy aborts immediately. When false, the
+    /// close is tolerated and `read_body_or_idle` stays pending so the proxy can
+    /// finish delivering the upstream response (RFC 9112 Section 9.6).
+    abort_on_close: bool,
 }
 
 impl HttpSession {
@@ -126,6 +133,8 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            half_closed: false,
+            abort_on_close: true,
         }
     }
 
@@ -937,25 +946,59 @@ impl HttpSession {
     /// This function will return body bytes (same as [`Self::read_body_bytes()`]), but after
     /// the client body finishes (`Ok(None)` is returned), calling this function again will block
     /// forever, same as [`Self::idle()`].
+    ///
+    /// By default (`abort_on_close = true`), if the client closes the connection
+    /// (sends TCP FIN, i.e. `read == 0`) after the request body is complete, a
+    /// `ConnectionClosed` error is returned.
+    ///
+    /// When `abort_on_close` is **disabled**, the close is tolerated: the future stays
+    /// pending so the proxy can finish delivering the upstream response via the write
+    /// path (per RFC 9112 Section 9.6). A true disconnect (RST) will be caught later
+    /// when the response write fails.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
+            if self.half_closed {
+                if self.abort_on_close {
+                    return Error::e_explain(
+                        ConnectionClosed,
+                        if self.response_written.is_none() {
+                            "Prematurely before response header is sent"
+                        } else {
+                            "Prematurely before response body is complete"
+                        },
+                    );
+                }
+                return std::future::pending().await;
+            }
             // XXX: account for upgraded body reader change, if the read half split from the write half
             let read = self.idle().await?;
             if read == 0 {
-                Error::e_explain(
-                    ConnectionClosed,
-                    if self.response_written.is_none() {
-                        "Prematurely before response header is sent"
-                    } else {
-                        "Prematurely before response body is complete"
-                    },
-                )
+                self.half_closed = true;
+                self.set_keepalive(None);
+                if self.abort_on_close {
+                    Error::e_explain(
+                        ConnectionClosed,
+                        if self.response_written.is_none() {
+                            "Prematurely before response header is sent"
+                        } else {
+                            "Prematurely before response body is complete"
+                        },
+                    )
+                } else {
+                    debug!("downstream closed (FIN), keeping write side open");
+                    std::future::pending().await
+                }
             } else {
                 Error::e_explain(ConnectError, "Sent data after end of body")
             }
         } else {
             self.read_body_bytes().await
         }
+    }
+
+    /// Whether the client has half-closed the TCP connection.
+    pub fn is_half_closed(&self) -> bool {
+        self.half_closed
     }
 
     /// Return the raw bytes of the request header.
@@ -1053,6 +1096,18 @@ impl HttpSession {
     /// This may be set to avoid draining downstream if the body is no longer necessary.
     pub fn set_close_on_response_before_downstream_finish(&mut self, close: bool) {
         self.close_on_response_before_downstream_finish = close;
+    }
+
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately.
+    ///
+    /// When **disabled**, `read_body_or_idle` stays pending on a client close so the
+    /// proxy can finish delivering the upstream response (RFC 9112 Section 9.6). A true
+    /// disconnect (RST) will surface later when the response write fails.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        self.abort_on_close = abort;
     }
 
     /// Return the [Digest] of the connection.
@@ -2923,5 +2978,118 @@ mod test_overread {
 
         let reused = http_stream.reuse().await.unwrap();
         assert!(reused.is_none());
+    }
+}
+
+#[cfg(test)]
+mod test_abort_on_close {
+    use super::*;
+    use pingora_error::ErrorType;
+    use tokio_test::io::Builder;
+
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    /// Helper: create an HttpSession whose request has been read and body is done,
+    /// with the mock stream returning EOF on the next read (simulating client FIN).
+    async fn session_with_eof() -> HttpSession {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn default_abort_on_close_returns_error() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.abort_on_close);
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        assert_eq!(*err.etype(), ErrorType::ConnectionClosed);
+        assert!(s.is_half_closed());
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_false_stays_pending() {
+        init_log();
+        let mut s = session_with_eof().await;
+        s.set_abort_on_close(false);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            s.read_body_or_idle(true),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected timeout (pending), got a result");
+        assert!(s.is_half_closed());
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_error_message_before_response() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.response_written().is_none());
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response header is sent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_error_message_after_response_header() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        // Simulate that a response header has already been sent.
+        let resp = ResponseHeader::build(200, None).unwrap();
+        s.response_written = Some(Box::new(resp));
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response body is complete"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_body_expected_false_reads_body_then_idles() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).read(b"abc").build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // 1) no_body_expected = false should still read request body while not done.
+        let body = s.read_body_or_idle(false).await.unwrap().unwrap();
+        assert_eq!(body.as_ref(), b"abc");
+        assert!(s.is_body_done());
+
+        // 2) Once body is naturally done, it transitions to idle behavior on the next call.
+        let err = s.read_body_or_idle(false).await.unwrap_err();
+        assert_eq!(*err.etype(), ErrorType::ConnectionClosed);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response header is sent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_abort_on_close_toggles() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.abort_on_close);
+        s.set_abort_on_close(false);
+        assert!(!s.abort_on_close);
+        s.set_abort_on_close(true);
+        assert!(s.abort_on_close);
     }
 }
