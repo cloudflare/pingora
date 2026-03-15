@@ -433,6 +433,13 @@ pub struct PeerOptions {
     pub max_blinding_delay: Option<u32>,
     // how many concurrent h2 stream are allowed in the same connection
     pub max_h2_streams: usize,
+    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    ///
+    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    /// It exists primarily for compatibility with legacy servers that send malformed headers.
+    pub allow_h1_response_invalid_content_length: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     // The list of curve the tls connection should advertise
     // if `None`, the default curves will be used
@@ -487,6 +494,7 @@ impl PeerOptions {
             #[cfg(feature = "s2n")]
             max_blinding_delay: None,
             max_h2_streams: 1,
+            allow_h1_response_invalid_content_length: false,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves

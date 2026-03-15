@@ -89,7 +89,10 @@ where
                 }
                 // Negotiated ALPN is not custom, create a new H1 session
                 Connection::Stream(s) => {
-                    return Ok((HttpSession::H1(Http1Session::new(s)), false));
+                    return Ok((
+                        HttpSession::H1(Http1Session::new_with_options(s, peer)),
+                        false,
+                    ));
                 }
             }
         }

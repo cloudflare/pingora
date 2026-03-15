@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0](https://github.com/cloudflare/pingora/compare/0.7.0...0.8.0) - 2026-03-02
+
+
+**🚀 Features**
+
+* Add support for client certificate verification in mTLS configuration.
+* Add upstream\_write\_pending\_time to Session for upload diagnostics.
+* Pipe subrequests utility: creates a state machine to treat subrequests as a "pipe," enabling direct sending of request body and writing of response tasks, with a handler for error propagation and support for reusing a preset or captured input body for chained subrequests.
+* Add the ability to limit the number of times a downstream connection can be reused
+* Add a system for specifying and using service-level dependencies
+* Add a builder for pingora proxy service, e.g. to specify ServerOptions.
+
+**🐛 Bug Fixes**
+
+* Fix various Windows compiler issues.
+* Handle custom ALPNs in s2n impl of ALPN::to\_wire\_protocols() to fix s2n compile issues.
+* Fix: don't use “all” permissions for socket.
+* Fix a bug with the ketama load balancing where configurations were not persisted after updates.
+* Ensure http1 downstream session is not reused on more body bytes than expected.
+* Send RST\_STREAM CANCEL on application read timeouts for h2 client.
+* Start close-delimited body mode after 101 is received for WebSocket upgrades. `UpgradedBody` is now an explicit HttpTask.
+* Avoid close delimit mode on http/1.0 req.
+* Reject invalid content-length http/1 requests to eliminate ambiguous request framing.
+* Validate invalid content-length on http/1 resp by default, and removes content-length from the response if transfer-encoding is present, per RFC.
+* Correct the custom protocol code for shutdown: changed the numeric code passed on shutdown to 0 to indicate an explicit shutdown rather than a transport error.
+
+**⚙️ Miscellaneous Tasks**
+
+* Remove `CacheKey::default` impl, users of caching should implement `cache_key_callback` themselves
+* Allow server bootstrapping to take place in the context of services with dependents and dependencies
+* Don't consider "bytes=" a valid range header: added an early check for an empty/whitespace-only range-set after the `bytes=` prefix, returning 416 Range Not Satisfiable, consistent with RFC 9110 14.1.2.
+* Strip {content, transfer}-encoding from 416s to mirror the behavior for 304 Not Modified responses.
+* Disable CONNECT method proxying by default, with an option to enable via server options; unsupported requests will now be automatically rejected.
+
 ## [0.7.0](https://github.com/cloudflare/pingora/compare/0.6.0...0.7.0) - 2026-01-30
 
 ### Highlights

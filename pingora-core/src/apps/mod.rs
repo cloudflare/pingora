@@ -64,24 +64,54 @@ pub struct HttpServerOptions {
     /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
 
+    /// Allow proxying CONNECT requests when handling HTTP traffic.
+    ///
+    /// When disabled, CONNECT requests are rejected with 405 by proxy services.
+    pub allow_connect_method_proxying: bool,
+
     #[doc(hidden)]
     pub force_custom: bool,
+
+    /// Maximum number of requests that this connection will handle. This is
+    /// equivalent to [Nginx's keepalive requests](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_requests)
+    /// which says:
+    ///
+    /// > Closing connections periodically is necessary to free per-connection
+    /// > memory allocations. Therefore, using too high maximum number of
+    /// > requests could result in excessive memory usage and not recommended.
+    ///
+    /// Unlike nginx, the default behavior here is _no limit_.
+    pub keepalive_request_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpPersistentSettings {
     keepalive_timeout: Option<u64>,
+    keepalive_reuses_remaining: Option<u32>,
 }
 
 impl HttpPersistentSettings {
     pub fn for_session(session: &ServerSession) -> Self {
         HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
+            keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
         }
     }
 
-    pub fn apply_to_session(&self, session: &mut ServerSession) {
-        session.set_keepalive(self.keepalive_timeout);
+    pub fn apply_to_session(self, session: &mut ServerSession) {
+        let Self {
+            keepalive_timeout,
+            mut keepalive_reuses_remaining,
+        } = self;
+
+        // Reduce the number of times the connection for this session can be
+        // reused by one. A session with reuse count of zero won't be reused
+        if let Some(reuses) = keepalive_reuses_remaining.as_mut() {
+            *reuses = reuses.saturating_sub(1);
+        }
+
+        session.set_keepalive(keepalive_timeout);
+        session.set_keepalive_reuses_remaining(keepalive_reuses_remaining);
     }
 }
 
@@ -243,6 +273,10 @@ where
                 // default 60s
                 session.set_keepalive(Some(60));
             }
+            session.set_keepalive_reuses_remaining(
+                self.server_options()
+                    .and_then(|opts| opts.keepalive_request_limit),
+            );
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {

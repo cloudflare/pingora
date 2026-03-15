@@ -14,7 +14,7 @@
 
 //! HTTP response (de)compression libraries
 //!
-//! Brotli and Gzip and partially supported.
+//! Gzip, Brotli, Zstd, and dictionary-compressed Zstd (dcz, [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842)) are supported.
 
 use super::HttpTask;
 
@@ -30,6 +30,9 @@ use strum_macros::EnumCount as EnumCountMacro;
 mod brotli;
 mod gzip;
 mod zstd;
+
+/// Re-export [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) constants for external use.
+pub use zstd::{DCZ_HEADER_SIZE, DCZ_MAGIC};
 
 /// The type of error to return when (de)compression fails
 pub const COMPRESSION_ERROR: ErrorType = ErrorType::new("CompressionError");
@@ -64,6 +67,13 @@ pub trait Encode {
 /// - Gzip compression: if the response is uncompressed, this ctx can compress it with gzip
 pub struct ResponseCompressionCtx(CtxInner);
 
+/// Dictionary data for [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) shared dictionary compression.
+#[derive(Clone, Debug)]
+pub struct DictionaryData {
+    pub bytes: Bytes,
+    pub hash: [u8; 32],
+}
+
 enum CtxInner {
     HeaderPhase {
         // Store the preferred list to compare with content-encoding
@@ -71,6 +81,8 @@ enum CtxInner {
         encoding_levels: [u32; Algorithm::COUNT],
         decompress_enable: [bool; Algorithm::COUNT],
         preserve_etag: [bool; Algorithm::COUNT],
+        // Optional dictionary for dcz compression (RFC 9842).
+        dictionary: Option<DictionaryData>,
     },
     BodyPhase(Option<Box<dyn Encode + Send + Sync>>),
 }
@@ -87,6 +99,7 @@ impl ResponseCompressionCtx {
             encoding_levels: [compression_level; Algorithm::COUNT],
             decompress_enable: [decompress_enable; Algorithm::COUNT],
             preserve_etag: [preserve_etag; Algorithm::COUNT],
+            dictionary: None,
         })
     }
 
@@ -194,6 +207,41 @@ impl ResponseCompressionCtx {
         }
     }
 
+    /// Set the dictionary for [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) dictionary compression.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn set_dictionary(&mut self, dictionary_bytes: Bytes, dictionary_hash: [u8; 32]) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => {
+                *dictionary = Some(DictionaryData {
+                    bytes: dictionary_bytes,
+                    hash: dictionary_hash,
+                });
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
+    /// Check if a dictionary has been set.
+    pub fn has_dictionary(&self) -> bool {
+        match &self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => dictionary.is_some(),
+            CtxInner::BodyPhase(_) => false,
+        }
+    }
+
+    /// Clear any previously set dictionary.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn clear_dictionary(&mut self) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => {
+                *dictionary = None;
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
     /// Feed the request header into this ctx.
     pub fn request_filter(&mut self, req: &RequestHeader) {
         if !self.is_enabled() {
@@ -221,6 +269,7 @@ impl ResponseCompressionCtx {
                 preserve_etag,
                 accept_encoding,
                 encoding_levels: levels,
+                dictionary,
             } => {
                 if resp.status.is_informational() {
                     if resp.status == http::status::StatusCode::SWITCHING_PROTOCOLS {
@@ -253,7 +302,13 @@ impl ResponseCompressionCtx {
                     Action::Noop => (None, false),
                     Action::Compress(algorithm) => {
                         let idx = algorithm.index();
-                        (algorithm.compressor(levels[idx]), preserve_etag[idx])
+                        let compressor = match algorithm {
+                            Algorithm::Dcz => dictionary.as_ref().and_then(|d| {
+                                algorithm.maybe_compressor_with_dictionary(levels[idx], d)
+                            }),
+                            _ => algorithm.compressor(levels[idx]),
+                        };
+                        (compressor, preserve_etag[idx])
                     }
                     Action::Decompress(algorithm) => {
                         let idx = algorithm.index();
@@ -333,6 +388,8 @@ pub enum Algorithm {
     Gzip,
     Brotli,
     Zstd,
+    Dcb,
+    Dcz,
     // TODO: Identity,
     // TODO: Deflate
     Other, // anything unknown
@@ -344,6 +401,8 @@ impl Algorithm {
             Algorithm::Gzip => "gzip",
             Algorithm::Brotli => "br",
             Algorithm::Zstd => "zstd",
+            Algorithm::Dcb => "dcb",
+            Algorithm::Dcz => "dcz",
             Algorithm::Any => "*",
             Algorithm::Other => "other",
         }
@@ -358,6 +417,30 @@ impl Algorithm {
                 Self::Brotli => Some(Box::new(brotli::Compressor::new(level))),
                 Self::Zstd => Some(Box::new(zstd::Compressor::new(level))),
                 _ => None, // not implemented
+            }
+        }
+    }
+
+    pub fn maybe_compressor_with_dictionary(
+        &self,
+        level: u32,
+        dictionary: &DictionaryData,
+    ) -> Option<Box<dyn Encode + Send + Sync>> {
+        if level == 0 {
+            None
+        } else {
+            match self {
+                Self::Dcz => {
+                    match zstd::DictionaryCompressor::new(level, &dictionary.bytes, dictionary.hash)
+                    {
+                        Ok(c) => Some(Box::new(c)),
+                        Err(e) => {
+                            warn!("Failed to create DCZ compressor: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
             }
         }
     }
@@ -390,6 +473,10 @@ impl From<&str> for Algorithm {
             Algorithm::Brotli
         } else if coding == UniCase::ascii("zstd") {
             Algorithm::Zstd
+        } else if coding == UniCase::ascii("dcb") {
+            Algorithm::Dcb
+        } else if coding == UniCase::ascii("dcz") {
+            Algorithm::Dcz
         } else if s.is_empty() {
             Algorithm::Any
         } else {
@@ -614,6 +701,36 @@ fn test_decide_action() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-encoding", "gzip").unwrap();
     assert_eq!(decide_action(&header, &[Brotli, Gzip]), Noop);
+
+    // dcb passthrough: client accepts dcb, response has dcb
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "dcb").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb, Brotli]), Noop);
+
+    // dcz passthrough: client accepts dcz, response has dcz
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "dcz").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz, Zstd]), Noop);
+
+    // Client wants dcz but response has brotli, decompress brotli
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "br").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz]), Decompress(Brotli));
+
+    // Client wants dcz but response has zstd, decompress zstd
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "zstd").unwrap();
+    assert_eq!(decide_action(&header, &[Dcz]), Decompress(Zstd));
+
+    // Client wants dcb but response has gzip, decompress gzip
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "gzip").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb]), Decompress(Gzip));
+
+    // Client wants dcb but response has brotli, decompress brotli
+    let mut header = ResponseHeader::build(200, None).unwrap();
+    header.insert_header("content-encoding", "br").unwrap();
+    assert_eq!(decide_action(&header, &[Dcb]), Decompress(Brotli));
 }
 
 use once_cell::sync::Lazy;
@@ -887,4 +1004,166 @@ fn test_adjust_response_header() {
     header.insert_header("etag", "abc123").unwrap();
     adjust_response_header(&mut header, &Compress(Gzip), true);
     assert_eq!(header.headers.get("etag").unwrap().as_bytes(), b"abc123");
+}
+
+#[cfg(test)]
+mod tests_dictionary_compression {
+    use super::*;
+
+    const TEST_DICTIONARY: &[u8] = b"The quick brown fox jumps over the lazy dog. \
+        Common HTTP headers: Content-Type, Accept-Encoding, Cache-Control. \
+        JSON patterns: {\"key\": \"value\"}, [\"array\", \"items\"].";
+
+    fn test_dictionary_hash() -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        for (i, byte) in TEST_DICTIONARY.iter().take(32).enumerate() {
+            hash[i] = *byte;
+        }
+        hash
+    }
+
+    #[test]
+    fn set_and_clear_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        assert!(!ctx.has_dictionary());
+
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), test_dictionary_hash());
+        assert!(ctx.has_dictionary());
+
+        ctx.clear_dictionary();
+        assert!(!ctx.has_dictionary());
+    }
+
+    #[test]
+    fn dcz_compression_with_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        let hash = test_dictionary_hash();
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), hash);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz, br, gzip")
+            .unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"dcz"
+        );
+
+        let input = Bytes::from_static(b"The quick brown fox jumps over the lazy dog again.");
+        let compressed = ctx.response_body_filter(Some(&input), true).unwrap();
+
+        assert!(compressed.len() >= 40);
+        assert_eq!(&compressed[..8], &zstd::DCZ_MAGIC);
+        assert_eq!(&compressed[8..40], &hash);
+    }
+
+    #[test]
+    fn dcz_without_dictionary_no_compression() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        // no dictionary set, no compression applied
+        assert!(resp.headers.get("content-encoding").is_none());
+    }
+
+    #[test]
+    fn dcz_no_fallback_without_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz, br, gzip")
+            .unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        // dcz first but no dictionary, no automatic fallback
+        assert!(resp.headers.get("content-encoding").is_none());
+    }
+
+    #[test]
+    fn maybe_compressor_with_dictionary_dcz_only() {
+        let dict_data = DictionaryData {
+            bytes: Bytes::from_static(TEST_DICTIONARY),
+            hash: test_dictionary_hash(),
+        };
+
+        // only Dcz returns a compressor
+        assert!(Algorithm::Dcz
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_some());
+        assert!(Algorithm::Gzip
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        assert!(Algorithm::Brotli
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        assert!(Algorithm::Zstd
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        // level 0 disables
+        assert!(Algorithm::Dcz
+            .maybe_compressor_with_dictionary(0, &dict_data)
+            .is_none());
+    }
+
+    #[test]
+    fn dcz_full_flow() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        let hash = test_dictionary_hash();
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), hash);
+
+        let mut req = RequestHeader::build("GET", b"/app.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "500").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"dcz"
+        );
+        assert!(resp.headers.get("content-length").is_none());
+        assert_eq!(
+            resp.headers.get("transfer-encoding").unwrap().as_bytes(),
+            b"chunked"
+        );
+
+        let chunk1 = Bytes::from_static(b"First chunk. ");
+        let output1 = ctx.response_body_filter(Some(&chunk1), false);
+        assert!(output1.is_some());
+
+        let chunk2 = Bytes::from_static(b"Second chunk.");
+        let output2 = ctx.response_body_filter(Some(&chunk2), true);
+        assert!(output2.is_some());
+
+        let (name, total_in, total_out, _) = ctx.get_info().unwrap();
+        assert_eq!(name, "dcz");
+        assert_eq!(total_in, chunk1.len() + chunk2.len());
+        assert!(total_out > 0);
+    }
 }

@@ -298,6 +298,25 @@ impl Session {
         }
     }
 
+    /// Set the number of times the upstream connection connection for this
+    /// session can be reused via keepalive. Noop for h2 and subrequest
+    pub fn set_keepalive_reuses_remaining(&mut self, reuses: Option<u32>) {
+        if let Self::H1(s) = self {
+            s.set_keepalive_reuses_remaining(reuses);
+        }
+    }
+
+    /// Get the number of times the upstream connection connection for this
+    /// session can be reused via keepalive. Not applicable for h2 or
+    /// subrequest
+    pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
+        if let Self::H1(s) = self {
+            s.get_keepalive_reuses_remaining()
+        } else {
+            None
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
@@ -448,7 +467,7 @@ impl Session {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
-            Self::Custom(s) => s.shutdown(1, "shutdown").await,
+            Self::Custom(s) => s.shutdown(0, "shutdown").await,
         }
     }
 
@@ -669,7 +688,7 @@ impl Session {
             Self::H1(s) => s.is_upgrade_req(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.is_upgrade_req(),
-            Self::Custom(_) => false,
+            Self::Custom(s) => s.is_upgrade_req(),
         }
     }
 
@@ -679,7 +698,7 @@ impl Session {
             Self::H1(s) => s.was_upgraded(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.was_upgraded(),
-            Self::Custom(_) => false,
+            Self::Custom(s) => s.was_upgraded(),
         }
     }
 
