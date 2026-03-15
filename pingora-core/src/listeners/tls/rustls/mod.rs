@@ -17,8 +17,7 @@ use std::sync::Arc;
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
 use log::debug;
-use pingora_error::ErrorType::InternalError;
-use pingora_error::{Error, OrErr, Result};
+use pingora_error::Result;
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
@@ -32,6 +31,7 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    callbacks: Option<TlsAcceptCallbacks>,
 }
 
 pub struct Acceptor {
@@ -48,6 +48,13 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
+        assert!(
+            !self.cert_path.is_empty() && !self.key_path.is_empty(),
+            "Certificate and key paths must be set before calling build(). \
+             When using with_callbacks(), call set_certificate_chain_file() \
+             and set_private_key_file() first."
+        );
+
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
             panic!(
@@ -58,17 +65,36 @@ impl TlsSettings {
 
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+        let provider = builder.crypto_provider().clone();
         let builder = if let Some(verifier) = self.client_cert_verifier {
             builder.with_client_cert_verifier(verifier)
         } else {
             builder.with_no_client_auth()
         };
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| {
-                format!("Failed to create server listener config: {e}")
-            })
-            .unwrap();
+
+        // Use CertifiedKey::new() + with_cert_resolver() instead of with_single_cert()
+        // to match the OpenSSL backend behavior: load cert+key without upfront validation.
+        // with_single_cert() runs webpki validation on the server's own cert chain, which
+        // rejects certificates with unrecognized critical extensions.
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .expect("Failed to load server private key");
+        let certified_key = Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+
+        use pingora_rustls::ResolvesServerCert;
+        #[derive(Debug)]
+        struct SingleCert(Arc<pingora_rustls::sign::CertifiedKey>);
+        impl ResolvesServerCert for SingleCert {
+            fn resolve(
+                &self,
+                _client_hello: pingora_rustls::ClientHello<'_>,
+            ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let mut config = builder.with_cert_resolver(Arc::new(SingleCert(certified_key)));
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -76,7 +102,7 @@ impl TlsSettings {
 
         Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
-            callbacks: None,
+            callbacks: self.callbacks,
         }
     }
 
@@ -95,6 +121,16 @@ impl TlsSettings {
         self.client_cert_verifier = Some(verifier);
     }
 
+    /// Set the path to the certificate chain file (PEM format).
+    pub fn set_certificate_chain_file(&mut self, path: &str) {
+        self.cert_path = path.to_string();
+    }
+
+    /// Set the path to the private key file (PEM format).
+    pub fn set_private_key_file(&mut self, path: &str) {
+        self.key_path = path.to_string();
+    }
+
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
@@ -104,18 +140,29 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            callbacks: None,
         })
     }
 
-    pub fn with_callbacks() -> Result<Self>
+    /// Create a new [`TlsSettings`] with post-handshake callbacks.
+    ///
+    /// The provided callbacks will be invoked after TLS handshake completes.
+    /// The [`TlsRef`](crate::protocols::tls::TlsRef) passed to the callback
+    /// provides access to the peer certificate chain and negotiated cipher suite.
+    ///
+    /// Certificate and key files must be set separately via the builder methods
+    /// on the returned `TlsSettings`.
+    pub fn with_callbacks(callbacks: TlsAcceptCallbacks) -> Result<Self>
     where
         Self: Sized,
     {
-        // TODO: verify if/how callback in handshake can be done using Rustls
-        Error::e_explain(
-            InternalError,
-            "Certificate callbacks are not supported with feature \"rustls\".",
-        )
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            callbacks: Some(callbacks),
+        })
     }
 }
 

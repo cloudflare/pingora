@@ -141,6 +141,32 @@ impl<T> TlsStream<T> {
     }
 }
 
+impl<T> TlsStream<T> {
+    /// Build a [`TlsRef`] from the current connection state.
+    ///
+    /// Extracts peer certificates and negotiated cipher suite from the underlying
+    /// rustls session so they can be passed to a [`TlsAcceptCallbacks`] implementation.
+    pub(crate) fn build_tls_ref(&self) -> crate::protocols::tls::TlsRef {
+        use crate::protocols::tls::TlsRef;
+
+        let stream = self.tls.stream.as_ref();
+        match stream {
+            Some(s) => {
+                let (_io, session) = s.get_ref();
+                let peer_certs = session.peer_certificates().map(|certs| certs.to_vec());
+                let cipher = session
+                    .negotiated_cipher_suite()
+                    .and_then(|suite| suite.suite().as_str());
+                TlsRef { peer_certs, cipher }
+            }
+            None => TlsRef {
+                peer_certs: None,
+                cipher: None,
+            },
+        }
+    }
+}
+
 impl<T> Deref for TlsStream<T> {
     type Target = InnerStream<T>;
 

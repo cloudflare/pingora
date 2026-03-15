@@ -54,6 +54,8 @@ impl Connector {
 pub struct TlsConnector {
     config: Arc<RusTlsClientConfig>,
     ca_certs: Arc<RootCertStore>,
+    /// Custom server cert verifier, stored for per-connection config rebuilds in connect().
+    custom_verifier: Option<Arc<dyn RusTlsServerCertVerifier>>,
 }
 
 impl TlsConnector {
@@ -68,15 +70,24 @@ impl TlsConnector {
         // - set supported ciphers/algorithms/curves
         // - add options for CRL/OCSP validation
 
+        let custom_verifier = options
+            .as_ref()
+            .and_then(|o| o.server_cert_verifier.clone());
+
         let (ca_certs, certs_key) = {
             let mut ca_certs = RootCertStore::empty();
             let mut certs_key = None;
 
             if let Some(conf) = options.as_ref() {
-                if let Some(ca_file_path) = conf.ca_file.as_ref() {
-                    load_ca_file_into_store(ca_file_path, &mut ca_certs)?;
-                } else {
-                    load_platform_certs_incl_env_into_store(&mut ca_certs)?;
+                // When a custom verifier is provided, skip RootCertStore loading entirely.
+                // The custom verifier handles CA validation without webpki, which would
+                // reject certificates with unrecognized critical extensions.
+                if custom_verifier.is_none() {
+                    if let Some(ca_file_path) = conf.ca_file.as_ref() {
+                        load_ca_file_into_store(ca_file_path, &mut ca_certs)?;
+                    } else {
+                        load_platform_certs_incl_env_into_store(&mut ca_certs)?;
+                    }
                 }
                 if let Some((cert, key)) = conf.cert_key_file.as_ref() {
                     certs_key = load_certs_and_key_files(cert, key)?;
@@ -88,23 +99,53 @@ impl TlsConnector {
             (ca_certs, certs_key)
         };
 
-        // TODO: WebPkiServerVerifier for CRL/OCSP validation
-        let builder =
-            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
-                .with_root_certificates(ca_certs.clone());
+        let mut config = if let Some(ref verifier) = custom_verifier {
+            // Use the custom verifier — bypasses webpki for CA and server cert validation.
+            let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
+                &version::TLS12,
+                &version::TLS13,
+            ])
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::clone(verifier));
 
-        let mut config = match certs_key {
-            Some((certs, key)) => {
-                match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
-                    Ok(config) => config,
-                    Err(err) => {
-                        // TODO: is there a viable alternative to the panic?
-                        // falling back to no client auth... does not seem to be reasonable.
-                        panic!("Failed to configure client auth cert/key. Error: {}", err);
+            match certs_key {
+                Some((certs, key)) => {
+                    // Use with_client_cert_resolver() instead of with_client_auth_cert()
+                    // to avoid webpki validation of the client certificate chain.
+                    let provider = builder.crypto_provider().clone();
+                    let signing_key = provider
+                        .key_provider
+                        .load_private_key(key)
+                        .or_err(InvalidCert, "Failed to load client private key")?;
+                    let certified_key =
+                        Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+                    builder.with_client_cert_resolver(Arc::new(SingleCertClientResolver(
+                        certified_key,
+                    )))
+                }
+                None => builder.with_no_client_auth(),
+            }
+        } else {
+            // Default webpki path (unchanged from original behavior)
+            let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
+                &version::TLS12,
+                &version::TLS13,
+            ])
+            .with_root_certificates(ca_certs.clone());
+
+            match certs_key {
+                Some((certs, key)) => {
+                    match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
+                        Ok(config) => config,
+                        Err(err) => {
+                            // TODO: is there a viable alternative to the panic?
+                            // falling back to no client auth... does not seem to be reasonable.
+                            panic!("Failed to configure client auth cert/key. Error: {}", err);
+                        }
                     }
                 }
+                None => builder.with_no_client_auth(),
             }
-            None => builder.with_no_client_auth(),
         };
 
         // Enable SSLKEYLOGFILE support for debugging TLS traffic
@@ -118,6 +159,7 @@ impl TlsConnector {
             ctx: Arc::new(TlsConnector {
                 config: Arc::new(config),
                 ca_certs: Arc::new(ca_certs),
+                custom_verifier,
             }),
         })
     }
@@ -160,20 +202,45 @@ where
             let private_key: PrivateKeyDer =
                 key_arc.key().as_slice().to_owned().try_into().unwrap();
 
-            let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
-                &version::TLS12,
-                &version::TLS13,
-            ])
-            .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
-            debug!("added root ca certificates");
+            if let Some(ref verifier) = tls_ctx.custom_verifier {
+                // Custom verifier path: bypass webpki for both server cert and client cert
+                let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
+                    &version::TLS12,
+                    &version::TLS13,
+                ])
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::clone(verifier));
 
-            let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
-                InvalidCert,
-                "Failed to use peer cert/key to update Rustls config",
-            )?;
-            // Preserve keylog setting from original config
-            updated_config.key_log = Arc::clone(&config.key_log);
-            Some(updated_config)
+                let provider = builder.crypto_provider().clone();
+                let signing_key = provider
+                    .key_provider
+                    .load_private_key(private_key)
+                    .or_err(InvalidCert, "Failed to load peer client private key")?;
+                let certified_key =
+                    Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+
+                debug!("added client cert via resolver (custom verifier)");
+                let mut updated_config = builder
+                    .with_client_cert_resolver(Arc::new(SingleCertClientResolver(certified_key)));
+                updated_config.key_log = Arc::clone(&config.key_log);
+                Some(updated_config)
+            } else {
+                // Default webpki path
+                let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
+                    &version::TLS12,
+                    &version::TLS13,
+                ])
+                .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
+                debug!("added root ca certificates");
+
+                let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
+                    InvalidCert,
+                    "Failed to use peer cert/key to update Rustls config",
+                )?;
+                // Preserve keylog setting from original config
+                updated_config.key_log = Arc::clone(&config.key_log);
+                Some(updated_config)
+            }
         }
     };
 
@@ -212,15 +279,23 @@ where
 
         // Builds the custom_verifier when verification_mode is set.
         if let Some(mode) = verification_mode {
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
-                .build()
-                .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
-
-            let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
-
-            updated_config
-                .dangerous()
-                .set_certificate_verifier(custom_verifier);
+            if let Some(ref verifier) = tls_ctx.custom_verifier {
+                // Wrap the custom verifier with verification mode logic
+                let custom_verifier =
+                    Arc::new(CustomServerCertVerifier::new(Arc::clone(verifier), mode));
+                updated_config
+                    .dangerous()
+                    .set_certificate_verifier(custom_verifier);
+            } else {
+                // Default: wrap the WebPkiServerVerifier
+                let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
+                    .build()
+                    .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
+                let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
+                updated_config
+                    .dangerous()
+                    .set_certificate_verifier(custom_verifier);
+            }
         }
     }
 
@@ -260,6 +335,26 @@ where
     }
 }
 
+/// Client cert resolver that returns a pre-loaded CertifiedKey without webpki validation.
+/// Used when `ConnectorOptions::server_cert_verifier` is set, to avoid webpki rejecting
+/// certificates with unrecognized critical extensions.
+#[derive(Debug)]
+struct SingleCertClientResolver(Arc<pingora_rustls::sign::CertifiedKey>);
+
+impl pingora_rustls::ResolvesClientCert for SingleCertClientResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum VerificationMode {
@@ -272,12 +367,15 @@ pub enum VerificationMode {
 
 #[derive(Debug)]
 pub struct CustomServerCertVerifier {
-    delegate: Arc<WebPkiServerVerifier>,
+    delegate: Arc<dyn RusTlsServerCertVerifier>,
     verification_mode: VerificationMode,
 }
 
 impl CustomServerCertVerifier {
-    pub fn new(delegate: Arc<WebPkiServerVerifier>, verification_mode: VerificationMode) -> Self {
+    pub fn new(
+        delegate: Arc<dyn RusTlsServerCertVerifier>,
+        verification_mode: VerificationMode,
+    ) -> Self {
         Self {
             delegate,
             verification_mode,
@@ -286,7 +384,7 @@ impl CustomServerCertVerifier {
 }
 
 // CustomServerCertVerifier delegates TLS signature verification and allows 3 VerificationMode:
-// Full: delegates all verification to the original WebPkiServerVerifier
+// Full: delegates all verification to the underlying ServerCertVerifier
 // SkipHostname: same as "Full" but ignores "NotValidForName" certificate errors
 // SkipAll: all certificate verification checks are skipped.
 impl RusTlsServerCertVerifier for CustomServerCertVerifier {
