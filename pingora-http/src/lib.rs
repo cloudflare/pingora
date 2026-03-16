@@ -717,6 +717,22 @@ where
     removed
 }
 
+/// Write a header value to the buffer, stripping any \r or \n bytes to prevent
+/// CRLF header injection. This is a defense-in-depth measure; parsing should
+/// already reject such values.
+#[inline]
+fn sanitize_header_value(buf: &mut impl BufMut, val: &[u8]) {
+    if val.iter().any(|&b| b == b'\r' || b == b'\n') {
+        for &b in val {
+            if b != b'\r' && b != b'\n' {
+                buf.put_u8(b);
+            }
+        }
+    } else {
+        buf.put_slice(val);
+    }
+}
+
 #[inline]
 fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl BufMut) {
     const CRLF: &[u8; 2] = b"\r\n";
@@ -726,7 +742,7 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
         case_header_iter(key_map.into(), value_map).for_each(|(case_header, val)| {
             buf.put_slice(case_header.as_slice());
             buf.put_slice(HEADER_KV_DELIMITER);
-            buf.put_slice(val.as_ref());
+            sanitize_header_value(buf, val.as_ref());
             buf.put_slice(CRLF);
         });
     } else {
@@ -735,7 +751,7 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
                 case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
             buf.put_slice(titled_header.as_bytes());
             buf.put_slice(HEADER_KV_DELIMITER);
-            buf.put_slice(value.as_ref());
+            sanitize_header_value(buf, value.as_ref());
             buf.put_slice(CRLF);
         }
     }

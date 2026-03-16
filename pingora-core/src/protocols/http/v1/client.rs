@@ -323,27 +323,24 @@ impl HttpSession {
                         let header_name = header.get_name_bytes(&buf);
                         let header_name = header_name.into_case_header_name();
                         let value_bytes = header.get_value_bytes(&buf);
-                        let header_value = if cfg!(debug_assertions) {
-                            // from_maybe_shared_unchecked() in debug mode still checks whether
-                            // the header value is valid, which breaks the _obsolete_multiline
-                            // support. To work around this, in debug mode, we replace CRLF with
-                            // whitespace
-                            if let Some(p) = value_bytes.windows(CRLF.len()).position(|w| w == CRLF)
-                            {
-                                let mut new_header = Vec::from_iter(value_bytes);
-                                new_header[p] = b' ';
-                                new_header[p + 1] = b' ';
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(new_header)
-                                }
-                            } else {
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
-                                }
-                            }
+                        // Strip any CRLF sequences to handle obsolete multiline headers
+                        // and prevent header injection attacks, then validate
+                        let sanitized = if value_bytes.windows(CRLF.len()).any(|w| w == CRLF) {
+                            let cleaned: Vec<u8> = value_bytes
+                                .iter()
+                                .copied()
+                                .filter(|&b| b != b'\r' && b != b'\n')
+                                .collect();
+                            Bytes::from(cleaned)
                         } else {
-                            // safe because this is from what we parsed
-                            unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
+                            value_bytes
+                        };
+                        let header_value = match http::HeaderValue::from_maybe_shared(sanitized) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                // Skip headers with invalid values to prevent header injection
+                                continue;
+                            }
                         };
                         response_header
                             .append_header(header_name, header_value)

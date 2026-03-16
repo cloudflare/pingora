@@ -109,7 +109,7 @@ impl Connector {
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
         builder
-            .set_min_proto_version(Some(SslVersion::TLS1))
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
             .unwrap();
         if let Some(conf) = options.as_ref() {
             if let Some(ca_file_path) = conf.ca_file.as_ref() {
@@ -202,14 +202,13 @@ where
         ssl_use_second_key_share(&mut ssl_conf, false);
     }
 
-    // disable verification if sni does not exist
+    // disable SNI indication if sni does not exist
     // XXX: verify on empty string cause null string seg fault
     if peer.sni().is_empty() {
         ssl_conf.set_use_server_name_indication(false);
-        /* NOTE: technically we can still verify who signs the cert but turn it off to be
-        consistent with nginx's behavior */
-        ssl_conf.set_verify(SslVerifyMode::NONE);
-    } else if peer.verify_cert() {
+    }
+
+    if !peer.sni().is_empty() && peer.verify_cert() {
         if peer.verify_hostname() {
             let verify_param = ssl_conf.param_mut();
             add_host(verify_param, peer.sni()).or_err(InternalError, "failed to add host")?;

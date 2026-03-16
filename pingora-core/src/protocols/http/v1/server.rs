@@ -245,9 +245,15 @@ impl HttpSession {
                             let header_name = header.get_name_bytes(&buf);
                             let header_name = header_name.into_case_header_name();
                             let value_bytes = header.get_value_bytes(&buf);
-                            // safe because this is from what we parsed
-                            let header_value = unsafe {
-                                http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
+                            let header_value = match http::HeaderValue::from_maybe_shared(
+                                value_bytes,
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    // Skip headers with invalid values (e.g. containing CRLF)
+                                    // to prevent header injection attacks
+                                    continue;
+                                }
                             };
 
                             request_header

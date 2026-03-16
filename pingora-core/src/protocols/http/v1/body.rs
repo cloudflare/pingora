@@ -179,10 +179,7 @@ impl BodyReader {
             body_buf.put_slice(buf_to_rewind);
         }
         if self.body_buf_size > buf_to_rewind.len() {
-            //body_buf.resize(self.body_buf_size, 0);
-            unsafe {
-                body_buf.set_len(self.body_buf_size);
-            }
+            body_buf.resize(self.body_buf_size, 0);
         }
         self.body_buf = Some(body_buf);
     }
