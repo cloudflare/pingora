@@ -1276,7 +1276,7 @@ pub mod range_filter {
         pub ranges: Vec<Range<usize>>,
         pub boundary: String,
         total_length: usize,
-        content_type: Option<String>,
+        pub content_type: Option<String>,
     }
 
     impl MultiRangeInfo {
