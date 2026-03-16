@@ -27,7 +27,7 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use pingora_runtime::Runtime;
+use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -378,11 +378,13 @@ impl Server {
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
+        blocking_opts: BlockingPoolOpts,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
-        let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
+        let service_runtime =
+            Server::create_runtime(service.name(), threads, work_stealing, blocking_opts);
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
@@ -670,6 +672,11 @@ impl Server {
             panic!("Daemonizing under windows is not supported");
         }
 
+        let blocking_opts = BlockingPoolOpts {
+            max_threads: conf.max_blocking_threads,
+            thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
+        };
+
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
 
@@ -743,13 +750,14 @@ impl Server {
                 self.configuration.listener_tasks_per_fd,
                 ready_notifier,
                 dependency_watches,
+                blocking_opts.clone(),
             );
             runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
-        let server_runtime = Server::create_runtime("Server", 1, true);
+        let server_runtime = Server::create_runtime("Server", 1, true, BlockingPoolOpts::default());
         #[cfg(unix)]
         let shutdown_type = server_runtime
             .get_handle()
@@ -818,11 +826,15 @@ impl Server {
             .ok();
     }
 
-    fn create_runtime(name: &str, threads: usize, work_steal: bool) -> Runtime {
-        if work_steal {
-            Runtime::new_steal(threads, name)
-        } else {
-            Runtime::new_no_steal(threads, name)
-        }
+    fn create_runtime(
+        name: &str,
+        threads: usize,
+        work_steal: bool,
+        blocking_opts: BlockingPoolOpts,
+    ) -> Runtime {
+        RuntimeBuilder::new(threads, name)
+            .work_steal(work_steal)
+            .blocking_pool_opts(blocking_opts)
+            .build()
     }
 }
