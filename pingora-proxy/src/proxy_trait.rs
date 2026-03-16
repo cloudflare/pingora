@@ -19,6 +19,7 @@ use pingora_cache::{
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
+use std::any::Any;
 use std::time::Duration;
 
 /// The interface to control the HTTP proxy
@@ -436,6 +437,39 @@ pub trait ProxyHttp {
     where
         Self::CTX: Send + Sync,
     {
+    }
+
+    /// Called after [`Self::logging`] when the downstream connection will be reused for another
+    /// HTTP/1.x keepalive request. The returned value, if any, will be carried to the next
+    /// request on this connection and delivered via [`Self::on_connection_reuse`].
+    ///
+    /// Use this to persist debugging or timing information across keepalive requests.
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is also called on error paths when the downstream connection is eligible for reuse.
+    ///
+    /// The default implementation returns `None` (no context persisted).
+    fn persist_connection_context(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Called at the start of a new request on a reused HTTP/1.x keepalive connection,
+    /// before [`Self::early_request_filter`]. The `prev_ctx` argument is the value returned
+    /// by [`Self::persist_connection_context`] from the previous request on this connection.
+    ///
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is not called when `persist_connection_context` returned `None` on the previous request.
+    ///
+    /// Use this to transfer state from the previous request into the new request's context.
+    fn on_connection_reuse(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _prev_ctx: Box<dyn Any + Send + Sync>,
+    ) {
     }
 
     /// A value of true means that the log message will be suppressed. The default value is false.
