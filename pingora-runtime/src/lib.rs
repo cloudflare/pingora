@@ -32,6 +32,22 @@ use thread_local::ThreadLocal;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 
+/// Configuration options for the blocking thread pool used by the runtime.
+///
+/// These options control the behavior of the blocking thread pool that handles
+/// [`tokio::task::spawn_blocking`] tasks.
+#[derive(Debug, Clone, Default)]
+pub struct BlockingPoolOpts {
+    /// The maximum number of threads in the blocking thread pool.
+    ///
+    /// When not set, the tokio default (512) is used.
+    pub max_threads: Option<usize>,
+    /// The duration that idle blocking threads are kept alive before being shut down.
+    ///
+    /// When not set, the tokio default (10 seconds) is used.
+    pub thread_keep_alive: Option<Duration>,
+}
+
 /// Pingora async multi-threaded runtime
 ///
 /// The `Steal` flavor is effectively tokio multi-threaded runtime.
@@ -42,22 +58,95 @@ pub enum Runtime {
     NoSteal(NoStealRuntime),
 }
 
+/// Apply [`BlockingPoolOpts`] to a tokio [`Builder`].
+fn apply_blocking_opts(builder: &mut Builder, opts: &BlockingPoolOpts) {
+    if let Some(max) = opts.max_threads {
+        builder.max_blocking_threads(max);
+    }
+    if let Some(ttl) = opts.thread_keep_alive {
+        builder.thread_keep_alive(ttl);
+    }
+}
+
+/// Builder for constructing a [`Runtime`].
+///
+/// # Example
+///
+/// ```
+/// use pingora_runtime::{RuntimeBuilder, BlockingPoolOpts};
+/// use std::time::Duration;
+///
+/// let rt = RuntimeBuilder::new(4, "my-service")
+///     .blocking_pool_opts(BlockingPoolOpts {
+///         max_threads: Some(64),
+///         thread_keep_alive: Some(Duration::from_secs(30)),
+///     })
+///     .build();
+/// ```
+pub struct RuntimeBuilder {
+    threads: usize,
+    name: String,
+    work_steal: bool,
+    blocking_pool_opts: BlockingPoolOpts,
+}
+
+impl RuntimeBuilder {
+    /// Create a new builder with the given number of worker threads and runtime name.
+    ///
+    /// Work stealing is enabled by default.
+    pub fn new(threads: usize, name: &str) -> Self {
+        Self {
+            threads,
+            name: name.to_string(),
+            work_steal: true,
+            blocking_pool_opts: BlockingPoolOpts::default(),
+        }
+    }
+
+    /// Set whether work stealing is enabled.
+    ///
+    /// When `true` (the default), a tokio multi-thread runtime is used.
+    /// When `false`, a pool of single-threaded tokio runtimes is used instead.
+    pub fn work_steal(mut self, enabled: bool) -> Self {
+        self.work_steal = enabled;
+        self
+    }
+
+    /// Set the [`BlockingPoolOpts`] for the runtime's blocking thread pool.
+    pub fn blocking_pool_opts(mut self, opts: BlockingPoolOpts) -> Self {
+        self.blocking_pool_opts = opts;
+        self
+    }
+
+    /// Build the [`Runtime`].
+    pub fn build(self) -> Runtime {
+        if self.work_steal {
+            let mut builder = Builder::new_multi_thread();
+            builder
+                .enable_all()
+                .worker_threads(self.threads)
+                .thread_name(&self.name);
+            apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
+            Runtime::Steal(builder.build().unwrap())
+        } else {
+            Runtime::NoSteal(NoStealRuntime::new(
+                self.threads,
+                &self.name,
+                self.blocking_pool_opts,
+            ))
+        }
+    }
+}
+
 impl Runtime {
     /// Create a `Steal` flavor runtime. This just a regular tokio runtime
     pub fn new_steal(threads: usize, name: &str) -> Self {
-        Self::Steal(
-            Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(threads)
-                .thread_name(name)
-                .build()
-                .unwrap(),
-        )
+        RuntimeBuilder::new(threads, name).build()
     }
 
     /// Create a `NoSteal` flavor runtime. This is backed by multiple tokio current-thread runtime
     pub fn new_no_steal(threads: usize, name: &str) -> Self {
-        Self::NoSteal(NoStealRuntime::new(threads, name))
+        RuntimeBuilder::new(threads, name).work_steal(false).build()
     }
 
     /// Return the &[Handle] of the [Runtime].
@@ -109,6 +198,7 @@ type Pools = Arc<OnceCell<Box<[Handle]>>>;
 pub struct NoStealRuntime {
     threads: usize,
     name: String,
+    blocking_opts: BlockingPoolOpts,
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
@@ -116,12 +206,13 @@ pub struct NoStealRuntime {
 }
 
 impl NoStealRuntime {
-    /// Create a new [NoStealRuntime]. Panic if `threads` is 0
-    pub fn new(threads: usize, name: &str) -> Self {
+    /// Create a new [`NoStealRuntime`] with blocking pool options. Panic if `threads` is 0.
+    pub fn new(threads: usize, name: &str, blocking_opts: BlockingPoolOpts) -> Self {
         assert!(threads != 0);
         NoStealRuntime {
             threads,
             name: name.to_string(),
+            blocking_opts,
             pools: Arc::new(OnceCell::new()),
             controls: OnceCell::new(),
         }
@@ -131,7 +222,10 @@ impl NoStealRuntime {
         let mut pools = Vec::with_capacity(self.threads);
         let mut controls = Vec::with_capacity(self.threads);
         for _ in 0..self.threads {
-            let rt = Builder::new_current_thread().enable_all().build().unwrap();
+            let mut builder = Builder::new_current_thread();
+            builder.enable_all();
+            apply_blocking_opts(&mut builder, &self.blocking_opts);
+            let rt = builder.build().unwrap();
             let handler = rt.handle().clone();
             let (tx, rx) = channel::<Duration>();
             let pools_ref = self.pools.clone();
