@@ -789,20 +789,16 @@ where
         // affected by the request_body_filter
         let end_of_body = end_of_body || data.is_none();
 
-        // Skip request_body_filter if body was already pre-buffered and filtered
-        // (before upstream connection, in buffer_request_body_early)
-        if !session.is_body_buffered() {
-            session
-                .downstream_modules_ctx
-                .request_body_filter(&mut data, end_of_body)
-                .await?;
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
 
-            // TODO: request body filter to have info about upgraded status?
-            // (can also check session.was_upgraded())
-            self.inner
-                .request_body_filter(session, &mut data, end_of_body, ctx)
-                .await?;
-        }
+        // TODO: request body filter to have info about upgraded status?
+        // (can also check session.was_upgraded())
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
 
         // the flag to signal to upstream
         let upstream_end_of_body = end_of_body || data.is_none();

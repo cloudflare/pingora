@@ -1075,7 +1075,7 @@ where
 
     /// Buffer the entire request body before connecting to upstream.
     ///
-    /// This enables request_body_filter to run BEFORE upstream_peer selection,
+    /// This enables early_request_body_filter to run BEFORE upstream_peer selection,
     /// allowing auth signature verification and content-based routing.
     ///
     /// Buffering is controlled by the trait method `request_body_buffer_limit()`:
@@ -1150,14 +1150,11 @@ where
             // reports done after delivering the final chunk.
             let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
 
-            // Run body filters on the chunk (or None for end-of-stream signal)
+            // Run early body filter (not module filters — modules haven't
+            // had their header filter phase yet).
             let mut filter_data = body_chunk;
-            session
-                .downstream_modules_ctx
-                .request_body_filter(&mut filter_data, end_of_body)
-                .await?;
             self.inner
-                .request_body_filter(session, &mut filter_data, end_of_body, ctx)
+                .early_request_body_filter(session, &mut filter_data, end_of_body, ctx)
                 .await?;
 
             // Accumulate the (possibly filtered) data

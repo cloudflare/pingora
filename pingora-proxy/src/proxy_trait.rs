@@ -230,6 +230,29 @@ pub trait ProxyHttp {
         None // Default: stream body to upstream
     }
 
+    /// Handle each chunk of request body during early buffering.
+    ///
+    /// This is called during [`buffer_request_body_early()`] for each body chunk, **before**
+    /// [`Self::request_filter()`] and [`Self::upstream_peer()`]. Use this for processing
+    /// that must happen before header filters run (e.g., streaming decompression).
+    ///
+    /// Unlike [`Self::request_body_filter()`], this callback explicitly runs before any
+    /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
+    ///
+    /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
+    async fn early_request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// Decide if the response is cacheable
     fn response_cache_filter(
         &self,

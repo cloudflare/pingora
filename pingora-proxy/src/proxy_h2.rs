@@ -738,18 +738,14 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // Skip request_body_filter if body was already pre-buffered and filtered
-        // (before upstream connection, in buffer_request_body_early)
-        if !session.is_body_buffered() {
-            session
-                .downstream_modules_ctx
-                .request_body_filter(&mut data, end_of_body)
-                .await?;
+        session
+            .downstream_modules_ctx
+            .request_body_filter(&mut data, end_of_body)
+            .await?;
 
-            self.inner
-                .request_body_filter(session, &mut data, end_of_body, ctx)
-                .await?;
-        }
+        self.inner
+            .request_body_filter(session, &mut data, end_of_body, ctx)
+            .await?;
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it

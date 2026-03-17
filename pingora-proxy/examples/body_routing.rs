@@ -14,13 +14,18 @@
 
 //! Example: early request body buffering for routing and body mutation.
 //!
-//! Demonstrates two patterns enabled by `request_body_buffer_limit()`:
+//! Demonstrates three patterns enabled by `request_body_buffer_limit()` and
+//! `early_request_body_filter()`:
 //!
-//! 1. **Peek**: read the buffered body with `get_buffered_body()` to make
-//!    routing decisions without modifying the body.
+//! 1. **Stream**: process each body chunk as it arrives in
+//!    `early_request_body_filter()` — before any header-phase filters run.
+//!    The example logs each chunk's byte count to show the streaming nature.
 //!
-//! 2. **Mutate**: read the buffered body, transform it, and replace it with
-//!    `set_buffered_body()` so the upstream receives the modified version.
+//! 2. **Peek**: read the assembled buffered body with `get_buffered_body()`
+//!    in `request_filter()` to make routing decisions.
+//!
+//! 3. **Mutate**: replace the buffered body with `set_buffered_body()` so
+//!    the upstream receives the modified version.
 //!
 //! Uses httpbin.org as the upstream — its `/post` endpoint echoes back the
 //! request body, so you can verify mutations in the response.
@@ -39,13 +44,19 @@ pub struct MyProxy;
 
 pub struct MyCtx {
     route_beta: bool,
+    chunks_received: usize,
+    bytes_received: usize,
 }
 
 #[async_trait]
 impl ProxyHttp for MyProxy {
     type CTX = MyCtx;
     fn new_ctx(&self) -> Self::CTX {
-        MyCtx { route_beta: false }
+        MyCtx {
+            route_beta: false,
+            chunks_received: 0,
+            bytes_received: 0,
+        }
     }
 
     /// Opt in to body buffering for POST requests up to 4KB.
@@ -55,6 +66,35 @@ impl ProxyHttp for MyProxy {
         } else {
             None
         }
+    }
+
+    /// Stream: process each body chunk as it arrives during early buffering.
+    ///
+    /// This fires per-chunk, BEFORE request_filter sees the assembled body.
+    async fn early_request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if let Some(data) = body {
+            ctx.chunks_received += 1;
+            ctx.bytes_received += data.len();
+            info!(
+                "early_request_body_filter: chunk {} ({} bytes, {} total)",
+                ctx.chunks_received,
+                data.len(),
+                ctx.bytes_received
+            );
+        }
+        if end_of_stream {
+            info!(
+                "early_request_body_filter: done — {} chunks, {} bytes total",
+                ctx.chunks_received, ctx.bytes_received
+            );
+        }
+        Ok(())
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -100,6 +140,9 @@ impl ProxyHttp for MyProxy {
 // Peek + mutate — body is inspected for routing then wrapped in an envelope:
 //   curl -X POST 127.0.0.1:6193/post -H "Host: httpbin.org" -H "Content-Type: application/json" -d '{"route": "beta"}'
 //   curl -X POST 127.0.0.1:6193/post -H "Host: httpbin.org" -H "Content-Type: application/json" -d '{"route": "default"}'
+//
+// Multi-chunk — use chunked transfer encoding to see early_request_body_filter fire per-chunk:
+//   printf 'POST /post HTTP/1.1\r\nHost: httpbin.org\r\nTransfer-Encoding: chunked\r\n\r\na\r\n{"part":1}\r\na\r\n{"part":2}\r\n0\r\n\r\n' | nc 127.0.0.1 6193
 //
 // No buffering — GET requests pass through unchanged:
 //   curl 127.0.0.1:6193/get -H "Host: httpbin.org"

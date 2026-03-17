@@ -17,7 +17,8 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
 ```mermaid
  graph TD;
     start("new request")-->early_request_filter;
-    early_request_filter-->request_filter;
+    early_request_filter-->early_request_body_filter;
+    early_request_body_filter-->request_filter;
     request_filter-->upstream_peer;
 
     upstream_peer-->Connect{{IO: connect to upstream}};
@@ -59,11 +60,16 @@ This is the first phase of every request.
 
 This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
+### `early_request_body_filter()`
+This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection.
+
+Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
+
 ### `request_filter()`
-This phase is usually for validating request inputs, rate limiting, and initializing context.
+This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.
 
 ### `request_body_filter()`
-This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received.
+This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received. This runs during the upstream forwarding phase, after `upstream_peer()` and connection establishment.
 
 ### `proxy_upstream_filter()`
 This phase determines if we should continue to the upstream to serve a response. If we short-circuit, a 502 is returned by default, but a different response can be implemented.
