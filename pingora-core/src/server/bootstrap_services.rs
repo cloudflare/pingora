@@ -38,24 +38,9 @@ pub struct BootstrapService {
     inner: Arc<Mutex<Bootstrap>>,
 }
 
-/// Sentry is typically started as part of the bootstrap process, but if the
-/// bootstrap service is used, we want to initialize Sentry before anything else
-/// to make sure errors are captured.
-pub struct SentryInitService {
-    inner: Arc<Mutex<Bootstrap>>,
-}
-
 impl BootstrapService {
     pub fn new(inner: &Arc<Mutex<Bootstrap>>) -> Self {
         BootstrapService {
-            inner: Arc::clone(inner),
-        }
-    }
-}
-
-impl SentryInitService {
-    pub fn new(inner: &Arc<Mutex<Bootstrap>>) -> Self {
-        SentryInitService {
             inner: Arc::clone(inner),
         }
     }
@@ -82,6 +67,14 @@ pub struct Bootstrap {
     /// Panics and other events sentry captures will be sent to this DSN **only
     /// in release mode**
     pub sentry: Option<ClientOptions>,
+
+    /// The Sentry [`ClientInitGuard`](sentry::ClientInitGuard) returned by
+    /// [`sentry::init`].
+    ///
+    /// This guard must be kept alive for the lifetime of the server, because
+    /// dropping it flushes and disables the Sentry client.
+    #[cfg(all(not(debug_assertions), feature = "sentry"))]
+    sentry_guard: Option<sentry::ClientInitGuard>,
 }
 
 impl Bootstrap {
@@ -107,6 +100,8 @@ impl Bootstrap {
             completed: false,
             #[cfg(feature = "sentry")]
             sentry: None,
+            #[cfg(all(not(debug_assertions), feature = "sentry"))]
+            sentry_guard: None,
         }
     }
 
@@ -115,13 +110,26 @@ impl Bootstrap {
         self.sentry = sentry_config;
     }
 
-    /// Start sentry based on the configured options. To prevent multiple
-    /// initializations, this function will consume the sentry configuration
-    /// stored in the bootstrap
-    fn start_sentry(&mut self) {
-        // Only init sentry in release builds
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.take().map(|opts| sentry::init(opts));
+    /// Initialize the Sentry client from the configured [`ClientOptions`] and
+    /// store the resulting guard.
+    ///
+    /// The [`ClientOptions`] are preserved (not consumed) so that sentry can be
+    /// re-initialized after daemonization, when the transport thread spawned by
+    /// the previous [`sentry::init`] call is lost due to `fork()`.
+    ///
+    /// The resulting [`sentry::ClientInitGuard`] is stored in `self` so that it
+    /// lives as long as the [`Bootstrap`] (and therefore the
+    /// [`Server`](super::Server)), keeping the Sentry client active for the
+    /// lifetime of the process.
+    ///
+    /// Sentry is only initialized in release builds; in debug builds this is a
+    /// no-op.
+    #[cfg(feature = "sentry")]
+    pub(super) fn start_sentry(&mut self) {
+        #[cfg(not(debug_assertions))]
+        {
+            self.sentry_guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
+        }
     }
 
     pub fn bootstrap(&mut self) {
@@ -136,7 +144,17 @@ impl Bootstrap {
             .send(ExecutionPhase::Bootstrap)
             .ok();
 
-        self.start_sentry();
+        // Temporarily initialize sentry if it isn't already active, so that
+        // errors during fd loading are captured. If sentry was already
+        // initialized with a persistent guard by `Server::run()` (as in
+        // the `bootstrap_as_a_service` path), we skip this to avoid
+        // clobbering the persistent guard.
+        #[cfg(all(not(debug_assertions), feature = "sentry"))]
+        let _guard = if self.sentry_guard.is_none() {
+            self.sentry.as_ref().map(|opts| sentry::init(opts.clone()))
+        } else {
+            None
+        };
 
         if self.test {
             info!("Server Test passed, exiting");
@@ -191,18 +209,6 @@ impl BackgroundService for BootstrapService {
         notifier: ServiceReadyNotifier,
     ) {
         self.inner.lock().bootstrap();
-        notifier.notify_ready();
-    }
-}
-
-#[async_trait]
-impl BackgroundService for SentryInitService {
-    async fn start_with_ready_notifier(
-        &self,
-        _shutdown: ShutdownWatch,
-        notifier: ServiceReadyNotifier,
-    ) {
-        self.inner.lock().start_sentry();
         notifier.notify_ready();
     }
 }
