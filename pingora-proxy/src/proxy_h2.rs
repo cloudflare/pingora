@@ -297,24 +297,18 @@ where
                 .await?;
         }
 
-        // Check if body was pre-buffered (before upstream connection)
-        // If so, use buffered body and skip downstream reading
-        let pre_buffered_body = session.take_buffered_body();
-        let body_was_buffered = session.is_body_buffered() && pre_buffered_body.is_some();
-
-        // If body was pre-buffered, use PreBuffered state to skip all downstream polling.
-        // This prevents "Sent data after end of body" errors from Content-Length mismatches.
-        let mut downstream_state = if body_was_buffered {
-            DownstreamStateMachine::PreBuffered
+        // determine initial downstream state and body buffer
+        // pre-buffered body (from buffer_request_body_early) takes precedence over retry buffer
+        let (mut downstream_state, buffer) = if let Some(body) = session
+            .take_buffered_body()
+            .filter(|_| session.is_body_buffered())
+        {
+            (DownstreamStateMachine::PreBuffered, Some(body))
         } else {
-            DownstreamStateMachine::new(session.as_mut().is_body_done())
-        };
-
-        // Use pre-buffered body if available, otherwise check for retry buffer
-        let buffer = if body_was_buffered {
-            pre_buffered_body
-        } else {
-            session.as_mut().get_retry_buffer()
+            (
+                DownstreamStateMachine::new(session.as_mut().is_body_done()),
+                session.as_mut().get_retry_buffer(),
+            )
         };
 
         // retry, send buffer if it exists

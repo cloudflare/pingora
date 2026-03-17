@@ -226,7 +226,11 @@ pub trait ProxyHttp {
     /// - Content-Length header is checked first (fail fast before reading)
     /// - Body size is checked during accumulation (streaming protection)
     /// - If exceeded, returns HTTP 413 (Payload Too Large)
-    fn request_body_buffer_limit(&self, _session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+    fn early_request_body_buffer_limit(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<usize> {
         None // Default: stream body to upstream
     }
 

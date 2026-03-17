@@ -687,7 +687,7 @@ impl Session {
     /// Returns a reference to the buffered request body, if any.
     ///
     /// The body is buffered by `buffer_request_body_early()` when the trait method
-    /// `request_body_buffer_limit()` returns `Some(max_size)`.
+    /// `early_request_body_buffer_limit()` returns `Some(max_size)`.
     pub fn get_buffered_body(&self) -> Option<&Bytes> {
         self.buffered_request_body.as_ref()
     }
@@ -833,11 +833,8 @@ where
                 .await;
         }
 
-        // Early body buffering: read full request body BEFORE request_filter.
-        // This allows request_filter to access the body for auth signature verification
-        // and other content-based decisions. The body is buffered based on the size limit
-        // returned by request_body_buffer_limit() (set in early_request_filter via route matching).
-        // See: https://github.com/cloudflare/pingora/issues/780
+        // early body buffering: read full request body before request_filter
+        // see https://github.com/cloudflare/pingora/issues/780
         if !session.is_body_buffered() {
             if let Err(e) = self.buffer_request_body_early(&mut session, &mut ctx).await {
                 return self
@@ -1078,7 +1075,7 @@ where
     /// This enables early_request_body_filter to run BEFORE upstream_peer selection,
     /// allowing auth signature verification and content-based routing.
     ///
-    /// Buffering is controlled by the trait method `request_body_buffer_limit()`:
+    /// Buffering is controlled by the trait method `early_request_body_buffer_limit()`:
     /// - Returns `None`: Skip buffering, stream body to upstream (default)
     /// - Returns `Some(max_size)`: Buffer body with size limit enforcement
     ///
@@ -1095,17 +1092,16 @@ where
         SV: ProxyHttp + Send + Sync,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
-        // Check trait method for opt-in and size limit
-        let Some(max_size) = self.inner.request_body_buffer_limit(session, ctx) else {
-            return Ok(()); // No buffering requested
+        // check trait method for opt-in and size limit
+        let Some(max_size) = self.inner.early_request_body_buffer_limit(session, ctx) else {
+            return Ok(());
         };
 
-        // Skip if already buffered (e.g., by request_filter)
+        // skip if already buffered
         if session.is_body_buffered() {
             return Ok(());
         }
 
-        // Get Content-Length if present (for early size check)
         let content_length = session
             .downstream_session
             .req_header()
@@ -1114,7 +1110,7 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok());
 
-        // Fail fast: check Content-Length before reading
+        // fail fast: reject before reading if Content-Length exceeds limit
         if let Some(cl) = content_length {
             if cl > max_size {
                 return Error::e_explain(
@@ -1127,9 +1123,9 @@ where
             }
         }
 
-        // Content-Length: 0 explicitly means no body. For all other cases
-        // (no Content-Length, Transfer-Encoding, HTTP/2 without Content-Length),
-        // attempt to read — read_body_or_idle returns None immediately if empty.
+        // Content-Length: 0 means no body; for all other cases (no Content-Length,
+        // Transfer-Encoding, HTTP/2) attempt to read. read_body_or_idle returns
+        // None immediately if there's nothing.
         if content_length == Some(0) {
             session.mark_body_buffered();
             return Ok(());
@@ -1138,7 +1134,7 @@ where
         let mut body_parts: Vec<Bytes> = Vec::new();
         let mut total_size: usize = 0;
 
-        // Read body chunks until end of stream
+        // read body chunks until end of stream
         loop {
             let body_chunk: Option<Bytes> =
                 match session.downstream_session.read_body_or_idle(false).await {
@@ -1146,22 +1142,20 @@ where
                     Err(e) => return Err(e.into_down()),
                 };
 
-            // Determine end-of-stream: None means no more data, or downstream
-            // reports done after delivering the final chunk.
+            // end of stream: None means no more data, or downstream reports done
             let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
 
-            // Run early body filter (not module filters — modules haven't
-            // had their header filter phase yet).
+            // run early body filter (not module filters, they haven't run header filter yet)
             let mut filter_data = body_chunk;
             self.inner
                 .early_request_body_filter(session, &mut filter_data, end_of_body, ctx)
                 .await?;
 
-            // Accumulate the (possibly filtered) data
+            // accumulate the (possibly filtered) data
             if let Some(filtered) = filter_data {
                 total_size += filtered.len();
 
-                // Check size limit during accumulation (streaming protection)
+                // check size limit during accumulation
                 if total_size > max_size {
                     return Error::e_explain(
                         HTTPStatus(413),
@@ -1180,7 +1174,7 @@ where
             }
         }
 
-        // Combine all chunks into a single Bytes buffer
+        // combine all chunks into a single Bytes buffer
         if total_size > 0 {
             let mut combined = bytes::BytesMut::with_capacity(total_size);
             for part in body_parts {

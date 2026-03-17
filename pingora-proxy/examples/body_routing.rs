@@ -14,7 +14,7 @@
 
 //! Example: early request body buffering for routing and body mutation.
 //!
-//! Demonstrates three patterns enabled by `request_body_buffer_limit()` and
+//! Demonstrates three patterns enabled by `early_request_body_buffer_limit()` and
 //! `early_request_body_filter()`:
 //!
 //! 1. **Stream**: process each body chunk as it arrives in
@@ -60,7 +60,11 @@ impl ProxyHttp for MyProxy {
     }
 
     /// Opt in to body buffering for POST requests up to 4KB.
-    fn request_body_buffer_limit(&self, session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+    fn early_request_body_buffer_limit(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<usize> {
         if session.req_header().method == http::Method::POST {
             Some(4096)
         } else {
