@@ -42,7 +42,7 @@ hyper = "0.14"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-prometheus = "0.13"
+prometheus = "0.14"
 once_cell = { workspace = true }
 bytes = { workspace = true }
 regex = "1"
