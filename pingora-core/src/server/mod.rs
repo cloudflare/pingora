@@ -40,7 +40,7 @@ use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
 use tokio::time::{sleep, Duration};
 
 use crate::prelude::background_service;
-use crate::server::bootstrap_services::{Bootstrap, BootstrapService, SentryInitService};
+use crate::server::bootstrap_services::{Bootstrap, BootstrapService};
 use crate::services::{
     DependencyGraph, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch, ServiceWithDependents,
 };
@@ -197,10 +197,6 @@ impl Default for RunArgs {
 /// services (see [crate::services]). The server object handles signals, reading configuration,
 /// zero downtime upgrade and error reporting.
 pub struct Server {
-    // This is a way to add services that have to be run before any others
-    // without requiring dependencies to be set directly
-    init_services: Vec<Box<dyn ServiceWithDependents + 'static>>,
-
     services: HashMap<NodeIndex, ServiceWrapper>,
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
@@ -448,7 +444,6 @@ impl Server {
 
         Server {
             services: Default::default(),
-            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
             execution_phase_watch,
@@ -497,7 +492,6 @@ impl Server {
 
         Ok(Server {
             services: Default::default(),
-            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
             execution_phase_watch,
@@ -506,31 +500,6 @@ impl Server {
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             bootstrap,
         })
-    }
-
-    /// Add a service that all other services will wait on before starting.
-    fn add_init_service(&mut self, service: impl ServiceWithDependents + 'static) {
-        let boxed_service = Box::new(service);
-        self.init_services.push(boxed_service);
-    }
-
-    /// Add the init services as dependencies for all existing services
-    fn apply_init_service_dependencies(&mut self) {
-        let services = self
-            .services
-            .values()
-            .map(|service| service.service_handle.clone())
-            .collect::<Vec<_>>();
-        let global_deps = self
-            .init_services
-            .drain(..)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|dep| self.add_boxed_service(dep))
-            .collect::<Vec<_>>();
-        for service in services {
-            service.add_dependencies(&global_deps);
-        }
     }
 
     /// Add a service to this server.
@@ -612,19 +581,9 @@ impl Server {
     ///
     /// The created service will handle the zero-downtime upgrade from an older version of the server
     /// to this one. It will try to get all its listening sockets in order to take them over.
-    ///
-    /// Other bootstrapping functionality like sentry initialization will also be handled, but as a
-    /// service that will complete before any other service starts.
     pub fn bootstrap_as_a_service(&mut self) -> ServiceHandle {
         let bootstrap_service =
             background_service("Bootstrap Service", BootstrapService::new(&self.bootstrap));
-
-        let sentry_service = background_service(
-            "Sentry Init Service",
-            SentryInitService::new(&self.bootstrap),
-        );
-
-        self.add_init_service(sentry_service);
 
         self.add_service(bootstrap_service)
     }
@@ -653,8 +612,6 @@ impl Server {
     /// Instead it will either start the daemon process and exit, or panic
     /// if daemonization fails.
     pub fn run(mut self, run_args: RunArgs) {
-        self.apply_init_service_dependencies();
-
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
@@ -676,6 +633,15 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
+
+        // Initialize (or re-initialize) sentry and persist the guard for
+        // the lifetime of the server. When daemonizing, the transport
+        // thread spawned by any earlier `sentry::init` during
+        // `bootstrap()` is lost after `fork()`, so a fresh init in the
+        // child process is required. In non-daemon mode this is the
+        // authoritative initialization that keeps sentry active.
+        #[cfg(feature = "sentry")]
+        self.bootstrap.lock().start_sentry();
 
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
