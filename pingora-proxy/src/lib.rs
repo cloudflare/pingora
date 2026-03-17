@@ -1127,17 +1127,10 @@ where
             }
         }
 
-        // Check if there's a body to read (Content-Length > 0 or Transfer-Encoding)
-        let has_body = content_length.is_some_and(|len| len > 0)
-            || session
-                .downstream_session
-                .req_header()
-                .headers
-                .get(header::TRANSFER_ENCODING)
-                .is_some();
-
-        if !has_body {
-            // No body to buffer, mark as done
+        // Content-Length: 0 explicitly means no body. For all other cases
+        // (no Content-Length, Transfer-Encoding, HTTP/2 without Content-Length),
+        // attempt to read — read_body_or_idle returns None immediately if empty.
+        if content_length == Some(0) {
             session.mark_body_buffered();
             return Ok(());
         }
@@ -1147,79 +1140,46 @@ where
 
         // Read body chunks until end of stream
         loop {
-            // read_body_or_idle(false) means we expect a body (not done yet).
             let body_chunk: Option<Bytes> =
                 match session.downstream_session.read_body_or_idle(false).await {
                     Ok(chunk) => chunk,
                     Err(e) => return Err(e.into_down()),
                 };
 
-            match body_chunk {
-                Some(data) => {
-                    let is_body_done = session.downstream_session.is_body_done();
+            // Determine end-of-stream: None means no more data, or downstream
+            // reports done after delivering the final chunk.
+            let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
 
-                    // Call request_body_filter for each chunk
-                    let mut filter_data: Option<Bytes> = Some(data);
-                    session
-                        .downstream_modules_ctx
-                        .request_body_filter(&mut filter_data, is_body_done)
-                        .await?;
-                    self.inner
-                        .request_body_filter(session, &mut filter_data, is_body_done, ctx)
-                        .await?;
+            // Run body filters on the chunk (or None for end-of-stream signal)
+            let mut filter_data = body_chunk;
+            session
+                .downstream_modules_ctx
+                .request_body_filter(&mut filter_data, end_of_body)
+                .await?;
+            self.inner
+                .request_body_filter(session, &mut filter_data, end_of_body, ctx)
+                .await?;
 
-                    // Accumulate the (possibly filtered) data
-                    if let Some(filtered) = filter_data {
-                        total_size += filtered.len();
+            // Accumulate the (possibly filtered) data
+            if let Some(filtered) = filter_data {
+                total_size += filtered.len();
 
-                        // Check size limit during accumulation (streaming protection)
-                        if total_size > max_size {
-                            return Error::e_explain(
-                                HTTPStatus(413),
-                                format!(
-                                    "Request body exceeded limit: {} > {} bytes",
-                                    total_size, max_size
-                                ),
-                            );
-                        }
-
-                        body_parts.push(filtered);
-                    }
-
-                    if is_body_done {
-                        break;
-                    }
+                // Check size limit during accumulation (streaming protection)
+                if total_size > max_size {
+                    return Error::e_explain(
+                        HTTPStatus(413),
+                        format!(
+                            "Request body exceeded limit: {} > {} bytes",
+                            total_size, max_size
+                        ),
+                    );
                 }
-                None => {
-                    // End of body, call filter with end_of_stream=true
-                    let mut filter_data: Option<Bytes> = None;
-                    session
-                        .downstream_modules_ctx
-                        .request_body_filter(&mut filter_data, true)
-                        .await?;
-                    self.inner
-                        .request_body_filter(session, &mut filter_data, true, ctx)
-                        .await?;
 
-                    // Collect any final data from the filter
-                    if let Some(filtered) = filter_data {
-                        total_size += filtered.len();
+                body_parts.push(filtered);
+            }
 
-                        // Final size check
-                        if total_size > max_size {
-                            return Error::e_explain(
-                                HTTPStatus(413),
-                                format!(
-                                    "Request body exceeded limit: {} > {} bytes",
-                                    total_size, max_size
-                                ),
-                            );
-                        }
-
-                        body_parts.push(filtered);
-                    }
-                    break;
-                }
+            if end_of_body {
+                break;
             }
         }
 
