@@ -27,6 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,15 +153,23 @@ impl ConnectionRef {
             Err(e) => {
                 // fail to create the stream, reset the counter
                 self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
-                // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
-                // accepts new streams. We can still try to create new connection.
-                if e.root_cause()
+
+                // Check for graceful shutdown conditions where we can retry with a new connection
+                let is_graceful_shutdown = e
+                    .root_cause()
                     .downcast_ref::<h2::Error>()
                     .map(|e| {
-                        e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR)
+                        // Remote sends GOAWAY(NO_ERROR): graceful shutdown
+                        (e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR))
+                        // Or broken pipe wrapped inside an h2::Error: stream closed unexpectedly
+                        || (e.is_io()
+                            && e.get_io()
+                                .map(|io| io.kind() == ErrorKind::BrokenPipe)
+                                .unwrap_or(false))
                     })
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+
+                if is_graceful_shutdown {
                     self.mark_shutdown();
                     Ok(None)
                 } else {
@@ -680,6 +689,46 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    /// `spawn_stream` must return `Ok(None)` and mark the connection as shutting
+    /// down when the underlying I/O channel is closed (BrokenPipe).  This
+    /// exercises the BrokenPipe branch of `spawn_stream` directly without going
+    /// through the full proxy stack.
+    #[tokio::test]
+    async fn test_spawn_stream_broken_pipe_marks_shutdown() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        // Drive the H2 client connection task in the background.
+        // When the connection terminates it will signal via closed_tx.
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+            // Signal that the connection task has finished.
+            let _ = closed_tx.send(true);
+        });
+
+        // Complete the server-side H2 handshake, then drop the server connection.
+        // Dropping server_conn closes the write end of the duplex, so the client
+        // connection task will read EOF and terminate with BrokenPipe.
+        let server_conn = h2::server::handshake(server_io).await.unwrap();
+        drop(server_conn);
+
+        // Wait until the client connection task has fully processed the EOF.
+        conn_handle.await.unwrap();
+
+        // spawn_stream must detect BrokenPipe, mark shutdown, and return Ok(None)
+        // so the caller can retry on a fresh connection rather than propagating the error.
+        let result = conn.spawn_stream().await;
+        assert!(result.is_ok(), "expected Ok(None), got Err");
+        assert!(result.unwrap().is_none(), "expected None stream");
+        assert!(
+            conn.is_shutting_down(),
+            "connection should be marked as shutting down"
+        );
     }
 
     #[tokio::test]
