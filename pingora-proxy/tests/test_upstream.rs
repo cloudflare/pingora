@@ -532,6 +532,74 @@ async fn test_h2_upstream_no_end_stream_read_timeout() {
     }
 }
 
+/// Mock origin that sends 100 Continue then a final response for any request.
+/// Returns the port the server is listening on.
+async fn mock_100_continue_server() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _addr)) = listener.accept().await {
+            // Read the request (just drain it)
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+
+            // Send 100 Continue
+            stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .unwrap();
+            // Small delay so the client reads the 100 separately
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Send final 200 OK with Content-Length (but no body for HEAD)
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    port
+}
+
+#[tokio::test]
+async fn test_head_with_100_continue() {
+    init();
+
+    let port = mock_100_continue_server().await;
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    stream
+        .write_all(
+            format!("HEAD / HTTP/1.1\r\nHost: localhost\r\nx-port: {port}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    // Read through any 1xx until we get the final (non-1xx) response
+    let result = timeout(Duration::from_secs(5), async {
+        let mut resp;
+        let mut body;
+        loop {
+            (resp, body) = read_response_header(&mut stream).await;
+            if resp.status.as_u16() >= 200 {
+                return (resp, body);
+            }
+        }
+    })
+    .await
+    .expect("should not time out waiting for final response");
+
+    let (resp, body) = result;
+    assert_eq!(resp.status.as_u16(), 200);
+    // HEAD responses have no body even with Content-Length
+    assert!(body.is_empty(), "HEAD response should have no body");
+}
+
 mod test_cache {
     use super::*;
     use std::str::FromStr;
