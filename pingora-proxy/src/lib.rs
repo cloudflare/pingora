@@ -587,57 +587,106 @@ impl Session {
             .await
     }
 
-    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        let mut seen_upgraded = self.was_upgraded();
-        for task in tasks.iter_mut() {
-            match task {
-                HttpTask::Header(resp, end) => {
-                    self.downstream_modules_ctx
-                        .response_header_filter(resp, *end)
-                        .await?;
-                }
-                HttpTask::Body(data, end) => {
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::UpgradedBody(data, end) => {
-                    seen_upgraded = true;
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::Trailer(trailers) => {
-                    if let Some(buf) = self
-                        .downstream_modules_ctx
-                        .response_trailer_filter(trailers)?
-                    {
-                        // Write the trailers into the body if the filter
-                        // returns a buffer.
-                        //
-                        // Note, this will not work if end of stream has already
-                        // been seen or we've written content-length bytes.
-                        // (Trailers should never come after upgraded body)
-                        *task = HttpTask::Body(Some(buf), true);
-                    }
-                }
-                HttpTask::Done => {
-                    // `Done` can be sent in certain response paths to mark end
-                    // of response if not already done via trailers or body with
-                    // end flag set.
-                    // If the filter returns body bytes on Done,
-                    // write them into the response.
+    // Run downstream module response filters on a single task, updating
+    // `seen_upgraded` to track whether an upgrade has been seen. Used by both
+    // `send_downstream_proxy_task` and `write_response_tasks`.
+    async fn downstream_response_task_filter(
+        &mut self,
+        task: &mut HttpTask,
+        seen_upgraded: &mut bool,
+    ) -> Result<()> {
+        match task {
+            HttpTask::Header(resp, end) => {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+            }
+            HttpTask::Body(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::UpgradedBody(data, end) => {
+                *seen_upgraded = true;
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .downstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    // Write the trailers into the body if the filter
+                    // returns a buffer.
                     //
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
-                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        if seen_upgraded {
-                            *task = HttpTask::UpgradedBody(Some(buf), true);
-                        } else {
-                            *task = HttpTask::Body(Some(buf), true);
-                        }
+                    // (Trailers should never come after upgraded body)
+                    *task = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                // `Done` can be sent in certain response paths to mark end
+                // of response if not already done via trailers or body with
+                // end flag set.
+                // If the filter returns body bytes on Done,
+                // write them into the response.
+                //
+                // Note, this will not work if end of stream has already
+                // been seen or we've written content-length bytes.
+                if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                    if *seen_upgraded {
+                        *task = HttpTask::UpgradedBody(Some(buf), true);
+                    } else {
+                        *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Failed */ }
             }
+            _ => { /* Failed */ }
+        }
+        Ok(())
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing after running
+    /// downstream module filters. This allows decoupling cache writes from
+    /// downstream writes.
+    ///
+    /// Only works with sessions that support the proxy task API (currently H1).
+    ///
+    /// # Panics
+    /// Panics if the session doesn't support the proxy task API.
+    /// Use `write_response_tasks()` for sessions that don't support the proxy task API.
+    pub async fn send_downstream_proxy_task(&mut self, mut task: HttpTask) -> Result<()> {
+        let mut seen_upgraded = self.was_upgraded();
+        self.downstream_response_task_filter(&mut task, &mut seen_upgraded)
+            .await?;
+        self.downstream_session.send_downstream_proxy_task(task);
+        Ok(())
+    }
+
+    /// Check if there are pending downstream tasks queued for writing.
+    /// Used for backpressure - don't queue more cache tasks if we have pending writes.
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_tasks(&self) -> bool {
+        self.downstream_session.supports_proxy_task_api()
+            && self.downstream_session.has_pending_downstream_proxy_tasks()
+    }
+
+    /// Write all queued downstream proxy tasks. This is cancel-safe and can be called
+    /// in a select! loop while waiting for upstream tasks.
+    /// For sessions that don't support the proxy task API, this is a no-op.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        if self.downstream_session.supports_proxy_task_api() {
+            self.downstream_session.write_downstream_proxy_tasks().await
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
+        for task in tasks.iter_mut() {
+            self.downstream_response_task_filter(task, &mut seen_upgraded)
+                .await?;
         }
         self.downstream_session.response_duplex_vec(tasks).await
     }
