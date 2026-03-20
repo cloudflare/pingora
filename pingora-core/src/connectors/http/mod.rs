@@ -21,6 +21,8 @@ use crate::protocols::http::client::HttpSession;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub mod custom;
@@ -150,6 +152,17 @@ where
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.h2.prefer_h1(peer);
+    }
+
+    /// Return the number of times a pooled connection was found to contain
+    /// unexpected data from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.h1.unexpected_data_connection_count()
+    }
+
+    /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.h1.unexpected_data_connection_counter()
     }
 }
 
