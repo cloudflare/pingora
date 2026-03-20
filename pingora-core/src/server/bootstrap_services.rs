@@ -58,7 +58,7 @@ pub struct Bootstrap {
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
     #[cfg(unix)]
-    listen_fds: Option<ListenFds>,
+    listen_fds: ListenFds,
 
     #[cfg(feature = "sentry")]
     #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
@@ -95,7 +95,7 @@ impl Bootstrap {
             upgrade,
             upgrade_sock,
             #[cfg(unix)]
-            listen_fds: None,
+            listen_fds: Arc::new(TokioMutex::new(Fds::new())),
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
             #[cfg(feature = "sentry")]
@@ -186,17 +186,18 @@ impl Bootstrap {
 
     #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        let mut fds = Fds::new();
         if upgrade {
             debug!("Trying to receive socks");
-            fds.get_from_sock(self.upgrade_sock.as_str())?
+            let mut fds = Fds::new();
+            fds.get_from_sock(self.upgrade_sock.as_str())?;
+            // Mutate through the existing Arc so all clones held by services see the update.
+            *self.listen_fds.blocking_lock() = fds;
         }
-        self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
         Ok(())
     }
 
     #[cfg(unix)]
-    pub fn get_fds(&self) -> Option<ListenFds> {
+    pub fn get_fds(&self) -> ListenFds {
         self.listen_fds.clone()
     }
 }

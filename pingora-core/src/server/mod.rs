@@ -272,8 +272,11 @@ impl Server {
                     .send(ExecutionPhase::GracefulUpgradeTransferringFds)
                     .ok();
 
-                if let Some(fds) = self.listen_fds() {
-                    let fds = fds.lock().await;
+                let fds = self.listen_fds();
+                let fds = fds.lock().await;
+                if fds.is_empty() {
+                    info!("No socks to send, shutting down.");
+                } else {
                     info!("Trying to send socks");
                     // XXX: this is blocking IO
                     match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
@@ -291,24 +294,21 @@ impl Server {
                         .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
                         .ok();
                     sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
-                    info!("Broadcasting graceful shutdown");
-                    // gracefully exiting
-                    match self.shutdown_watch.send(true) {
-                        Ok(_) => {
-                            info!("Graceful shutdown started!");
-                        }
-                        Err(e) => {
-                            error!("Graceful shutdown broadcast failed: {e}");
-                            // switch to fast shutdown
-                            return ShutdownType::Graceful;
-                        }
-                    }
-                    info!("Broadcast graceful shutdown complete");
-                    ShutdownType::Graceful
-                } else {
-                    info!("No socks to send, shutting down.");
-                    ShutdownType::Graceful
                 }
+                info!("Broadcasting graceful shutdown");
+                // gracefully exiting
+                match self.shutdown_watch.send(true) {
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
+                    Err(e) => {
+                        error!("Graceful shutdown broadcast failed: {e}");
+                        // switch to fast shutdown
+                        return ShutdownType::Graceful;
+                    }
+                }
+                info!("Broadcast graceful shutdown complete");
+                ShutdownType::Graceful
             }
         }
     }
@@ -360,14 +360,14 @@ impl Server {
 
     /// Get the configured file descriptors for listening
     #[cfg(unix)]
-    fn listen_fds(&self) -> Option<ListenFds> {
+    fn listen_fds(&self) -> ListenFds {
         self.bootstrap.lock().get_fds()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_service(
         mut service: Box<dyn ServiceWithDependents>,
-        #[cfg(unix)] fds: Option<ListenFds>,
+        #[cfg(unix)] fds: ListenFds,
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
@@ -406,7 +406,7 @@ impl Server {
             service
                 .start_service(
                     #[cfg(unix)]
-                    fds,
+                    Some(fds),
                     shutdown,
                     listeners_per_fd,
                     ready_notifier,
