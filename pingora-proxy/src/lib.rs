@@ -663,6 +663,15 @@ impl Session {
         Ok(())
     }
 
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    ///
+    /// When disabled, the proxy falls back to the blocking `write_response_tasks`
+    /// path. This can be called from request filters to opt out on a per-request
+    /// basis.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.downstream_session.set_proxy_tasks_enabled(enabled);
+    }
+
     /// Check if there are pending downstream tasks queued for writing.
     /// Used for backpressure - don't queue more cache tasks if we have pending writes.
     /// Returns false for sessions that don't support the proxy task API.

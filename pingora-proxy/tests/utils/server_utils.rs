@@ -253,8 +253,19 @@ impl ProxyHttp for ExampleProxyHttp {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let req = session.req_header();
-        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        let proxy_tasks_enabled = session
+            .req_header()
+            .headers
+            .get("x-proxy-tasks-enabled")
+            .is_some();
+        if proxy_tasks_enabled {
+            session.downstream_session.set_proxy_tasks_enabled(true);
+        }
+        let downstream_compression = session
+            .req_header()
+            .headers
+            .get("x-downstream-compression")
+            .is_some();
         if downstream_compression {
             session
                 .downstream_modules_ctx

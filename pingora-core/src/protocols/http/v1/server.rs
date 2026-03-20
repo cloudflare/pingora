@@ -876,6 +876,16 @@ impl HttpSession {
         }
     }
 
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    pub fn proxy_tasks_enabled(&self) -> bool {
+        self.proxy_tasks_enabled
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.proxy_tasks_enabled = enabled;
+    }
+
     async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
         // Don't flush empty chunks, they are considered end of body for chunks
         if self.body_write_buf.is_empty() {
