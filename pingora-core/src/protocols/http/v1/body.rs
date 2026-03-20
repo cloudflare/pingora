@@ -943,7 +943,6 @@ impl BodyMode {
 /// Type alias for the chunked encoding buffer chain
 type ChunkedBuf = bytes::buf::Chain<bytes::buf::Chain<Bytes, Bytes>, &'static [u8]>;
 
-#[allow(dead_code)]
 enum WriteBuf<C = ChunkedBuf> {
     /// Simple bytes buffer
     Simple(Bytes),
@@ -975,7 +974,6 @@ impl<C: Buf> Buf for WriteBuf<C> {
     }
 }
 
-#[allow(dead_code)]
 enum WriteState {
     /// No write in progress
     Idle,
@@ -1004,7 +1002,6 @@ impl std::fmt::Debug for WriteState {
     }
 }
 
-#[allow(dead_code)]
 enum FinishWriteState {
     /// No finish task queued
     NotStarted,
@@ -1079,9 +1076,7 @@ impl SendBodyState {
 pub struct BodyWriter {
     pub body_mode: BodyMode,
     // Boxed to reduce inline size. Only used by the cancel-safe proxy task API.
-    #[allow(dead_code)]
     send_body_state: Box<SendBodyState>,
-    #[allow(dead_code)]
     send_finish_state: FinishWriteState,
 }
 
@@ -1313,7 +1308,6 @@ impl BodyWriter {
     ///
     /// The timeout, if provided, will be enforced internally across all
     /// write attempts, even if the write is cancelled and resumed via `tokio::select!`.
-    #[allow(dead_code)]
     pub fn send_body_task(&mut self, bytes: Bytes, timeout: Option<std::time::Duration>) {
         assert!(
             matches!(
@@ -1335,7 +1329,6 @@ impl BodyWriter {
     ///
     /// This function can be safely used in a `tokio::select!` loop.
     /// Returns `Ok(Some(bytes_written))` when complete, `Ok(None)` if no bytes to write.
-    #[allow(dead_code)]
     pub async fn write_current_body_task<S>(&mut self, stream: &mut S) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
@@ -1425,7 +1418,6 @@ impl BodyWriter {
     ///
     /// This API is stateful and cancel-safe - use it when you need to finish
     /// the body in a `tokio::select!` loop or other cancellable context.
-    #[allow(dead_code)]
     pub fn send_finish_task(&mut self) {
         self.send_finish_state = FinishWriteState::Idle;
     }
@@ -1436,7 +1428,6 @@ impl BodyWriter {
     ///
     /// This API is stateful - it tracks progress across cancellations and can be
     /// safely resumed after being dropped mid-execution.
-    #[allow(dead_code)]
     pub async fn write_current_finish_task<S>(&mut self, stream: &mut S) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
@@ -3067,6 +3058,7 @@ mod tests {
 #[cfg(test)]
 mod test_body_task_api {
     use super::*;
+    use crate::protocols::http::v1::test_util::FlushTrackingMock;
     use tokio_test::io::Builder;
 
     // Cancel-safety tests use tokio::select! to race a short sleep against a mock
@@ -3687,6 +3679,7 @@ mod test_body_task_api {
     // Cancel-safe finish task for chunked encoding: send_finish_task() queues
     // the terminating chunk, write_current_finish_task() writes it and can be
     // cancelled and resumed in a select! loop.
+    // Verifies that the finish flushes the stream exactly once.
     #[tokio::test(start_paused = true)]
     async fn cancel_safe_finish_task_chunked() {
         init_log();
@@ -3694,7 +3687,8 @@ mod test_body_task_api {
         let data = Bytes::from("hello");
         let expected_chunk = b"5\r\nhello\r\n";
 
-        let mut mock_io = Builder::new().write(expected_chunk).build();
+        let mock_io = Builder::new().write(expected_chunk).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
 
         let mut body_writer = BodyWriter::new();
         body_writer.init_chunked();
@@ -3702,19 +3696,27 @@ mod test_body_task_api {
         // Write body data via task API
         body_writer.send_body_task(data, None);
         body_writer
-            .write_current_body_task(&mut mock_io)
+            .write_current_body_task(&mut flush_mock)
             .await
             .unwrap();
+
+        // Chunked body writes always flush after each chunk
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "Chunked body data write should flush once"
+        );
 
         // Queue the finish task
         body_writer.send_finish_task();
         assert!(body_writer.has_pending_finish_task());
 
         // Write the finish in a select! loop with cancellations
-        let mut mock_io_finish = Builder::new()
+        let mock_io_finish = Builder::new()
             .wait(std::time::Duration::from_millis(100))
             .write(b"0\r\n\r\n")
             .build();
+        let (mut flush_mock_finish, flush_count_finish) = FlushTrackingMock::new(mock_io_finish);
 
         let mut cancel_count = 0;
 
@@ -3727,7 +3729,7 @@ mod test_body_task_api {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
                     cancel_count += 1;
                 }
-                result = body_writer.write_current_finish_task(&mut mock_io_finish) => {
+                result = body_writer.write_current_finish_task(&mut flush_mock_finish) => {
                     assert!(result.is_ok());
                     break;
                 }
@@ -3736,33 +3738,53 @@ mod test_body_task_api {
 
         assert!(cancel_count > 0, "Should have cancelled at least once");
         assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count_finish),
+            1,
+            "Chunked finish should flush exactly once"
+        );
     }
 
     // Finish task for content-length is a no-op (no terminating chunk needed),
     // but it should still transition body_mode to Complete.
+    // Verifies that no flush occurs (content-length finish has no I/O).
     #[tokio::test]
     async fn finish_task_content_length() {
         init_log();
 
         let data = b"hello";
-        let mut mock_io = Builder::new().write(data).build();
+        let mock_io = Builder::new().write(data).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
 
         let mut body_writer = BodyWriter::new();
         body_writer.init_content_length(data.len());
 
         body_writer.send_body_task(Bytes::from_static(data), None);
         body_writer
-            .write_current_body_task(&mut mock_io)
+            .write_current_body_task(&mut flush_mock)
             .await
             .unwrap();
 
+        // Content-length body write flushes when all bytes are written
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "Content-length body write should flush once (all bytes written)"
+        );
+
         body_writer.send_finish_task();
-        let mut mock_io_finish = Builder::new().build();
+        let mock_io_finish = Builder::new().build();
+        let (mut flush_mock_finish, flush_count_finish) = FlushTrackingMock::new(mock_io_finish);
         let result = body_writer
-            .write_current_finish_task(&mut mock_io_finish)
+            .write_current_finish_task(&mut flush_mock_finish)
             .await;
         assert!(result.is_ok());
         assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count_finish),
+            0,
+            "Content-length finish should not flush (no I/O needed)"
+        );
     }
 
     // Verifies that body_mode byte tracking is correct when writing

@@ -811,4 +811,55 @@ impl Session {
             Self::Custom(_) => None,
         }
     }
+
+    /// Check if this session supports the cancel-safe proxy task API.
+    pub fn supports_proxy_task_api(&self) -> bool {
+        // only H1 for now
+        matches!(self, Self::H1(_))
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
+        match self {
+            Self::H1(s) => s.send_proxy_task(task),
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
+
+    /// Check if there are pending downstream proxy tasks queued for writing.
+    ///
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
+        match self {
+            Self::H1(s) => s.has_pending_proxy_tasks(),
+            Self::H2(_) => false,         // TODO: implement for H2
+            Self::Subrequest(_) => false, // TODO: implement for subrequests
+            Self::Custom(_) => false,     // TODO: implement for custom
+        }
+    }
+
+    /// Write all queued downstream proxy tasks in a cancel-safe manner.
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.write_proxy_tasks().await,
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
 }

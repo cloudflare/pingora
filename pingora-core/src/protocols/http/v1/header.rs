@@ -22,7 +22,6 @@ use tokio::io::AsyncWrite;
 
 use crate::protocols::l4::stream::async_write_vec::poll_write_all_buf;
 
-#[allow(dead_code)]
 enum HeaderWriteState {
     /// No write in progress
     Idle,
@@ -53,7 +52,6 @@ impl std::fmt::Debug for HeaderWriteState {
 ///
 /// Tracks the pending header bytes, write progress (idle → writing → flushing → done),
 /// and an optional timeout that is lazily created on the first `Pending` poll.
-#[allow(dead_code)]
 struct SendHeaderState {
     /// Serialized header bytes ready to be written
     pending_header: Option<Bytes>,
@@ -84,7 +82,6 @@ impl std::fmt::Debug for SendHeaderState {
 }
 
 impl SendHeaderState {
-    #[allow(dead_code)]
     fn new() -> Self {
         SendHeaderState {
             pending_header: None,
@@ -114,7 +111,6 @@ impl SendHeaderState {
 ///
 /// A timeout, if set, is enforced *across* cancellations — the clock keeps
 /// ticking even when the future is dropped and re-polled.
-#[allow(dead_code)]
 pub struct HeaderWriter {
     // Boxed to reduce inline size. Only used by the cancel-safe proxy task API.
     send_header_state: Box<SendHeaderState>,
@@ -127,7 +123,6 @@ impl Default for HeaderWriter {
 }
 
 impl HeaderWriter {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         HeaderWriter {
             send_header_state: Box::new(SendHeaderState::new()),
@@ -146,7 +141,6 @@ impl HeaderWriter {
     /// Queue serialized header bytes as a write task with an optional timeout.
     /// This is a non-async function that just saves the bytes.
     /// Call [`write_current_header_task`](Self::write_current_header_task) to actually perform the write.
-    #[allow(dead_code)]
     pub fn send_header_task(
         &mut self,
         header_bytes: Bytes,
@@ -171,7 +165,6 @@ impl HeaderWriter {
     /// Async function that writes the current queued header task to the stream.
     /// This function is cancel-safe and can be called in a `tokio::select!` loop.
     /// Returns `Ok(bytes_written)` when complete, `Ok(0)` if no bytes to write.
-    #[allow(dead_code)]
     pub async fn write_current_header_task<S>(&mut self, stream: &mut S) -> Result<usize>
     where
         S: AsyncWrite + Unpin + Send,
@@ -304,6 +297,7 @@ impl HeaderWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::http::v1::test_util::FlushTrackingMock;
     use tokio_test::io::Builder;
 
     fn init_log() {
@@ -311,18 +305,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simple_header_write() {
+    async fn test_simple_header_write_no_flush() {
         init_log();
         let header_data = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
 
-        let mut mock_io = Builder::new().write(header_data).build();
+        let mock_io = Builder::new().write(header_data).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
 
         let mut header_writer = HeaderWriter::new();
         header_writer.send_header_task(Bytes::from_static(header_data), false, None);
 
-        let result = header_writer.write_current_header_task(&mut mock_io).await;
+        let result = header_writer
+            .write_current_header_task(&mut flush_mock)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), header_data.len());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            0,
+            "should_flush=false should not flush"
+        );
     }
 
     #[tokio::test]
@@ -330,14 +332,22 @@ mod tests {
         init_log();
         let header_data = b"HTTP/1.1 200 OK\r\n\r\n";
 
-        let mut mock_io = Builder::new().write(header_data).build();
+        let mock_io = Builder::new().write(header_data).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
 
         let mut header_writer = HeaderWriter::new();
         header_writer.send_header_task(Bytes::from_static(header_data), true, None);
 
-        let result = header_writer.write_current_header_task(&mut mock_io).await;
+        let result = header_writer
+            .write_current_header_task(&mut flush_mock)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), header_data.len());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "should_flush=true should flush exactly once"
+        );
     }
 
     // Uses start_paused for deterministic timer-based cancellation in select!
