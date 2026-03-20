@@ -1402,7 +1402,7 @@ impl HttpSession {
 
     /// Check if there are pending proxy tasks queued for writing.
     pub fn has_pending_proxy_tasks(&self) -> bool {
-        !self.proxy_task_state.tasks.is_empty()
+        self.proxy_task_state.current_writer.is_some() || !self.proxy_task_state.tasks.is_empty()
     }
 
     /// Write all queued proxy tasks (response `HttpTask`s from `send_proxy_task`)

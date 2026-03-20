@@ -2996,9 +2996,7 @@ mod test_cache {
     // Same as test_caching_when_downstream_stalls but the proxy connects
     // to the origin over H2 (via the x-h2 header).
     //
-    // Ignored until proxy_h2 gets the proxy task API.
     #[tokio::test]
-    #[ignore]
     async fn test_caching_h2_upstream_when_downstream_stalls() {
         use std::net::ToSocketAddrs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
