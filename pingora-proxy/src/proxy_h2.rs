@@ -218,6 +218,9 @@ where
                 // TODO: implement for write timeouts?
                 if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
                     client_body.send_reset(h2::Reason::CANCEL);
+                    // Mark the underlying H2 connection for shutdown so it's not used
+                    // for new streams in case it is hung.
+                    client_session.conn.mark_shutdown();
                 }
                 (false, Some(e))
             }
