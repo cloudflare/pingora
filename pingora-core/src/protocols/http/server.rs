@@ -813,9 +813,21 @@ impl Session {
     }
 
     /// Check if this session supports the cancel-safe proxy task API.
+    ///
+    /// For HTTP/1.x, this can be toggled per-session via
+    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
     pub fn supports_proxy_task_api(&self) -> bool {
-        // only H1 for now
-        matches!(self, Self::H1(_))
+        match self {
+            Self::H1(s) => s.proxy_tasks_enabled(),
+            _ => false,
+        }
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        if let Self::H1(s) = self {
+            s.set_proxy_tasks_enabled(enabled);
+        }
     }
 
     /// Queue a downstream proxy task for cancel-safe writing.
