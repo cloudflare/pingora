@@ -128,6 +128,14 @@ impl ConnectionRef {
         self.0.shutting_down.load(Ordering::Relaxed)
     }
 
+    /// Mark this connection for shutdown.
+    ///
+    /// No new streams will be created on this connection and
+    /// it will be discarded once all active streams are released.
+    pub fn mark_shutdown(&self) {
+        self.0.shutting_down.store(true, Ordering::Relaxed);
+    }
+
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
         // Atomically check if the current_stream is over the limit
@@ -153,7 +161,7 @@ impl ConnectionRef {
                     })
                     .unwrap_or(false)
                 {
-                    self.0.shutting_down.store(true, Ordering::Relaxed);
+                    self.mark_shutdown();
                     Ok(None)
                 } else {
                     Err(e)
@@ -672,6 +680,23 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    #[tokio::test]
+    async fn test_mark_shutdown_prevents_new_streams() {
+        let (client_io, _server_io) = tokio::io::duplex(65536);
+        let (send_req, _connection) = h2::client::handshake(client_io).await.unwrap();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        assert!(conn.more_streams_allowed());
+        assert!(!conn.is_shutting_down());
+
+        conn.mark_shutdown();
+
+        assert!(conn.is_shutting_down());
+        assert!(!conn.more_streams_allowed());
     }
 
     #[cfg(all(feature = "any_tls", unix))]
