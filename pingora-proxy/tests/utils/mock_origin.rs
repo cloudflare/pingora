@@ -59,7 +59,22 @@ fn init() -> bool {
             .output()
             .unwrap();
     });
-    // wait until the server is up
-    thread::sleep(time::Duration::from_secs(2));
-    true
+    // Wait until openresty is accepting connections, then give it a moment
+    // to finish worker initialization.
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    while time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:8000".parse().unwrap(),
+            time::Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            // Port is listening; allow a brief window for workers to finish
+            // initializing before tests start sending real requests.
+            thread::sleep(time::Duration::from_millis(500));
+            return true;
+        }
+        thread::sleep(time::Duration::from_millis(50));
+    }
+    panic!("mock origin (openresty) failed to start within 10s");
 }

@@ -337,14 +337,11 @@ mod test {
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn test_listen_tcp() {
-        let addr1 = "127.0.0.1:7101";
-        let addr2 = "127.0.0.1:7102";
-        let mut listeners = Listeners::tcp(addr1);
-        listeners.add_tcp(addr2);
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.add_tcp("127.0.0.1:0");
 
         let listeners = listeners
             .build(
@@ -355,6 +352,10 @@ mod test {
             .unwrap();
 
         assert_eq!(listeners.len(), 2);
+        let addrs: Vec<_> = listeners
+            .iter()
+            .map(|s| s.l4.local_addr().unwrap())
+            .collect();
         for listener in listeners {
             tokio::spawn(async move {
                 // just try to accept once
@@ -363,11 +364,12 @@ mod test {
             });
         }
 
-        // make sure the above starts before the lines below
-        sleep(Duration::from_millis(10)).await;
-
-        TcpStream::connect(addr1).await.unwrap();
-        TcpStream::connect(addr2).await.unwrap();
+        // The listeners are already bound (port resolved during build()),
+        // so the kernel accepts connections into the backlog immediately.
+        // No readiness wait needed — connect will succeed as soon as the
+        // OS has completed the TCP handshake.
+        TcpStream::connect(addrs[0]).await.unwrap();
+        TcpStream::connect(addrs[1]).await.unwrap();
     }
 
     #[tokio::test]
@@ -400,9 +402,8 @@ mod test {
                 .await
                 .unwrap();
         });
-        // make sure the above starts before the lines below
-        sleep(Duration::from_millis(10)).await;
-
+        // The listener is already bound, so the kernel accepts connections
+        // into the backlog immediately. No readiness wait needed.
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
