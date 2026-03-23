@@ -873,16 +873,28 @@ pub struct PskTlsServer {
 #[cfg(feature = "s2n")]
 impl PskTlsServer {
     pub fn start() -> Self {
-        let server_handle = thread::spawn(|| {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Use a channel to wait for the server to bind its port.
+        // A TCP probe can't be used here because the TLS acceptor would
+        // try to handshake the probe connection, fail, and panic.
+        let (tx, rx) = mpsc::channel();
+        let server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(Self::run_server());
+            rt.block_on(Self::run_server(tx));
         });
+
+        // Wait up to 10s for the server to signal it has bound the port.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("PSK TLS server failed to start within 10s");
+
         PskTlsServer {
             handle: server_handle,
         }
     }
 
-    async fn run_server() {
+    async fn run_server(ready_tx: std::sync::mpsc::Sender<()>) {
         use pingora_core::{protocols::tls::S2NConnectionBuilder, tls::TlsAcceptor};
         use pingora_core::{
             protocols::tls::{Psk, PskConfig, PskType},
@@ -899,6 +911,8 @@ impl PskTlsServer {
 
         let addr: std::net::SocketAddr = "127.0.0.1:6151".parse().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
+        let _ = ready_tx.send(()); // signal: port is bound
+
         let mut config_builder = Config::builder();
         unsafe {
             config_builder.disable_x509_verification();
@@ -915,12 +929,20 @@ impl PskTlsServer {
         let acceptor = TlsAcceptor::new(connection_builder);
 
         loop {
-            use tokio::{io::AsyncWriteExt, net::tcp};
+            use tokio::io::AsyncWriteExt;
             let (tcp_stream, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
+            // Don't panic on handshake failure — a stale connection or probe
+            // shouldn't take down the server for subsequent real connections.
+            let mut stream = match acceptor.clone().accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("PSK TLS server: handshake failed: {e}");
+                    continue;
+                }
+            };
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write_all(response).await.unwrap();
-            stream.shutdown().await;
+            let _ = stream.write_all(response).await;
+            let _ = stream.shutdown().await;
         }
     }
 }

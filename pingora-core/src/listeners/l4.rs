@@ -386,6 +386,15 @@ impl ListenerEndpoint {
         self.listen_addr.as_ref()
     }
 
+    /// Return the local address this endpoint is bound to.
+    ///
+    /// Useful when the listener was bound to port 0 (OS-assigned) to
+    /// discover the actual port.
+    #[cfg(test)]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
     fn apply_stream_settings(&self, stream: &mut Stream) -> Result<()> {
         // settings are applied based on whether the underlying stream supports it
         stream.set_nodelay()?;
@@ -470,17 +479,17 @@ mod test {
 
     #[tokio::test]
     async fn test_listen_tcp() {
-        let addr = "127.0.0.1:7100";
-
         let mut builder = ListenerEndpoint::builder();
 
-        builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
+        builder.listen_addr(ServerAddress::Tcp("127.0.0.1:0".into(), None));
 
         #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
+
+        let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -500,7 +509,7 @@ mod test {
 
         let mut builder = ListenerEndpoint::builder();
 
-        builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
+        builder.listen_addr(ServerAddress::Tcp("[::]:0".into(), sock_opt));
 
         #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
@@ -508,15 +517,17 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
+        let port = listener.local_addr().unwrap().port();
+
         tokio::spawn(async move {
             // just try to accept twice
             listener.accept().await.unwrap();
             listener.accept().await.unwrap();
         });
-        tokio::net::TcpStream::connect("127.0.0.1:7101")
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect_err("cannot connect to v4 addr");
-        tokio::net::TcpStream::connect("[::1]:7101")
+        tokio::net::TcpStream::connect(format!("[::1]:{port}"))
             .await
             .expect("can connect to v6 addr");
     }

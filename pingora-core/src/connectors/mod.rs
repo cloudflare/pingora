@@ -482,14 +482,13 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 #[cfg(feature = "any_tls")]
 mod tests {
+    use std::time::Duration;
+
     use pingora_error::ErrorType;
     use tls::Connector;
 
     use super::*;
     use crate::upstreams::peer::BasicPeer;
-
-    // 192.0.2.1 is effectively a black hole
-    const BLACK_HOLE: &str = "192.0.2.1:79";
 
     #[tokio::test]
     async fn test_connect() {
@@ -547,15 +546,23 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
+    // dropped on Linux, producing ConnectTimedout. On macOS the kernel
+    // may instead return ENETUNREACH (ConnectNoRoute).
+    const BLACKHOLE: &str = "192.0.2.1:79";
+
     async fn do_test_conn_timeout(conf: Option<ConnectorOptions>) {
         let connector = TransportConnector::new(conf);
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1));
-        let stream = connector.new_stream(&peer).await;
-        match stream {
-            Ok(_) => panic!("should throw an error"),
-            Err(e) => assert_eq!(e.etype(), &ConnectTimedout),
-        }
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
+        let Err(e) = connector.new_stream(&peer).await else {
+            panic!("should throw an error");
+        };
+        assert!(
+            e.etype() == &ConnectTimedout || e.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            e.etype()
+        );
     }
 
     #[tokio::test]
@@ -585,8 +592,8 @@ mod tests {
     }
 
     /// Helper function for testing error handling in the `do_connect` function.
-    /// This assumes that the connection will fail to on the peer and returns
-    /// the decomposed error type and message
+    /// This assumes that the connection will fail on the peer and returns
+    /// the decomposed error type and message.
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
         let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
@@ -604,26 +611,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_connect_with_total_timeout() {
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.total_connection_timeout = Some(std::time::Duration::from_millis(1));
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.total_connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
-        assert_eq!(etype, ConnectTimedout);
-        assert!(context.contains("total-connection timeout"));
+        assert!(
+            etype == ConnectTimedout || etype == ConnectNoRoute,
+            "unexpected error type: {etype:?}"
+        );
+        if etype == ConnectTimedout {
+            assert!(context.contains("total-connection timeout"));
+        }
     }
 
     #[tokio::test]
     async fn test_tls_connect_timeout_supersedes_total() {
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.total_connection_timeout = Some(std::time::Duration::from_millis(10));
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1));
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.total_connection_timeout = Some(Duration::from_millis(10));
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
-        assert_eq!(etype, ConnectTimedout);
-        assert!(!context.contains("total-connection timeout"));
+        assert!(
+            etype == ConnectTimedout || etype == ConnectNoRoute,
+            "unexpected error type: {etype:?}"
+        );
+        if etype == ConnectTimedout {
+            assert!(!context.contains("total-connection timeout"));
+        }
     }
 
     #[tokio::test]
     async fn test_do_connect_without_total_timeout() {
-        let peer = BasicPeer::new(BLACK_HOLE);
+        let peer = BasicPeer::new(BLACKHOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
     }

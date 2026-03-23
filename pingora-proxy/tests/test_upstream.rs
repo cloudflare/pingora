@@ -482,8 +482,9 @@ async fn test_h2_upstream_no_end_stream_read_timeout() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // The listener was bound before the spawn (line 426), so the kernel
+    // is already accepting connections into the backlog. No readiness
+    // wait needed.
     let client = reqwest::Client::new();
     let url = "http://127.0.0.1:6147/test";
 
@@ -1379,35 +1380,37 @@ mod test_cache {
 
         // set up a one-off mock server
         // (warp / hyper don't have custom 1xx sending capabilities yet)
-        async fn mock_1xx_server(port: u16, cc_header: &str) {
-            use tokio::io::AsyncWriteExt;
+        // One-shot mock server that sends a 103 Early Hints then a final 200.
+        // Binds to port 0 (OS-assigned) and returns the actual port via a
+        // oneshot channel once the listener is ready.
+        fn spawn_mock_1xx_server(cc_header: &'static str) -> tokio::sync::oneshot::Receiver<u16> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
 
-            let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
-            if let Ok((mut stream, _addr)) = listener.accept().await {
-                stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: <https://foo.bar>; rel=preconnect\r\n\r\n").await.unwrap();
-                // wait a bit so that the client can read
-                sleep(Duration::from_millis(100)).await;
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nCache-Control: {}\r\n\r\nhello", cc_header).as_bytes()).await.unwrap();
-                sleep(Duration::from_millis(100)).await;
-            }
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let _ = tx.send(port); // signal: port is bound
+                if let Ok((mut stream, _addr)) = listener.accept().await {
+                    stream.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: <https://foo.bar>; rel=preconnect\r\n\r\n").await.unwrap();
+                    sleep(Duration::from_millis(100)).await;
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nCache-Control: {}\r\n\r\nhello", cc_header).as_bytes()).await.unwrap();
+                    sleep(Duration::from_millis(100)).await;
+                }
+            });
+            rx
         }
 
         init();
 
         let url = "http://127.0.0.1:6148/unique/test_1xx_caching";
 
-        tokio::spawn(async {
-            mock_1xx_server(6151, "max-age=5").await;
-        });
-        // wait for server to start
-        sleep(Duration::from_millis(100)).await;
+        let port = spawn_mock_1xx_server("max-age=5").await.unwrap();
 
         let client = reqwest::Client::new();
         let res = client
             .get(url)
-            .header("x-port", "6151")
+            .header("x-port", port.to_string())
             .send()
             .await
             .unwrap();
@@ -1416,9 +1419,10 @@ mod test_cache {
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "hello");
 
+        // Second request to the same URL should be a cache hit (no server needed)
         let res = client
             .get(url)
-            .header("x-port", "6151")
+            .header("x-port", port.to_string())
             .send()
             .await
             .unwrap();
@@ -1430,15 +1434,11 @@ mod test_cache {
         // 1xx shouldn't interfere with bypass
         let url = "http://127.0.0.1:6148/unique/test_1xx_bypass";
 
-        tokio::spawn(async {
-            mock_1xx_server(6152, "private, no-store").await;
-        });
-        // wait for server to start
-        sleep(Duration::from_millis(100)).await;
+        let port = spawn_mock_1xx_server("private, no-store").await.unwrap();
 
         let res = client
             .get(url)
-            .header("x-port", "6152")
+            .header("x-port", port.to_string())
             .send()
             .await
             .unwrap();
@@ -1448,16 +1448,11 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello");
 
         // restart the one-off server - still uncacheable
-        sleep(Duration::from_millis(100)).await;
-        tokio::spawn(async {
-            mock_1xx_server(6152, "private, no-store").await;
-        });
-        // wait for server to start
-        sleep(Duration::from_millis(100)).await;
+        let port = spawn_mock_1xx_server("private, no-store").await.unwrap();
 
         let res = client
             .get(url)
-            .header("x-port", "6152")
+            .header("x-port", port.to_string())
             .send()
             .await
             .unwrap();
