@@ -76,7 +76,7 @@ daggy = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
-nix = "~0.24.3"
+nix = { version = "~0.31.1", features = ["socket", "net", "fs", "uio"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
