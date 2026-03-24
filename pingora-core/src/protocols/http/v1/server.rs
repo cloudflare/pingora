@@ -979,6 +979,10 @@ impl HttpSession {
     /// pending so the proxy can finish delivering the upstream response via the write
     /// path (per RFC 9112 Section 9.6). A true disconnect (RST) will be caught later
     /// when the response write fails.
+    ///
+    /// Note that this marks the connection as half-closed if FIN is detected. If this function
+    /// is called after the connection is already marked half-closed and `abort_on_close` is
+    /// **disabled**, then it will pend forever.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
             if self.half_closed {
@@ -1010,6 +1014,8 @@ impl HttpSession {
                     )
                 } else {
                     debug!("downstream closed (FIN), keeping write side open");
+                    // If the connection is fully closed, writing the response side
+                    // will fail.
                     std::future::pending().await
                 }
             } else {
