@@ -44,6 +44,20 @@ use crate::protocols::GetSocketDigest;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
 use crate::server::ListenFds;
+#[cfg(unix)]
+use std::sync::LazyLock;
+
+/// Per-address async lock map for serializing the check-bind-insert sequence
+/// in [`ListenerEndpointBuilder::listen`].
+///
+/// With `ListenFds` using a synchronous `parking_lot::Mutex`, the lock cannot
+/// be held across `bind().await`. This global map ensures that only one task at
+/// a time can be in the process of looking up, binding, and inserting a given
+/// address — preventing two concurrent callers from both seeing "not found" and
+/// racing to bind the same address.
+#[cfg(unix)]
+static BIND_LOCKS: LazyLock<flurry::HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(flurry::HashMap::new);
 
 const TCP_LISTENER_MAX_TRY: usize = 30;
 const TCP_LISTENER_TRY_STEP: Duration = Duration::from_secs(1);
@@ -326,19 +340,38 @@ impl ListenerEndpointBuilder {
         let listener = if let Some(fds_table) = fds {
             let addr_str = listen_addr.as_ref();
 
-            // consider make this mutex std::sync::Mutex or OnceCell
-            let mut table = fds_table.lock().await;
+            // Acquire a per-address async lock so that only one task at a
+            // time can go through the check-bind-insert sequence for a given
+            // address. The flurry guard is dropped before the await so its
+            // !Send pointer does not cross an await point.
+            let addr_lock = {
+                let guard = BIND_LOCKS.pin();
+                match guard.get(addr_str) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let new_lock = Arc::new(tokio::sync::Mutex::new(()));
+                        match guard.try_insert(addr_str.to_string(), new_lock.clone()) {
+                            Ok(inserted) => inserted.clone(),
+                            Err(e) => e.current.clone(),
+                        }
+                    }
+                }
+            };
+            let _guard = addr_lock.lock().await;
 
-            if let Some(fd) = table.get(addr_str) {
-                from_raw_fd(&listen_addr, *fd)?
+            let existing_fd = fds_table.lock().get(addr_str).copied();
+
+            if let Some(fd) = existing_fd {
+                from_raw_fd(&listen_addr, fd)?
             } else {
-                // not found
                 let listener = bind(&listen_addr).await?;
-                table.add(addr_str.to_string(), listener.as_raw_fd());
+                fds_table
+                    .lock()
+                    .add(addr_str.to_string(), listener.as_raw_fd());
                 listener
             }
         } else {
-            // not found, no fd table
+            // no fd table
             bind(&listen_addr).await?
         };
 

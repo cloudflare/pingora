@@ -76,6 +76,7 @@ daggy = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
+flurry = "0.5"
 nix = "~0.24.3"
 
 [target.'cfg(windows)'.dependencies]

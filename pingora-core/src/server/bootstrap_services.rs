@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::broadcast;
 
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -95,7 +95,7 @@ impl Bootstrap {
             upgrade,
             upgrade_sock,
             #[cfg(unix)]
-            listen_fds: Arc::new(TokioMutex::new(Fds::new())),
+            listen_fds: Arc::new(Mutex::new(Fds::new())),
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
             #[cfg(feature = "sentry")]
@@ -191,7 +191,7 @@ impl Bootstrap {
             let mut fds = Fds::new();
             fds.get_from_sock(self.upgrade_sock.as_str())?;
             // Mutate through the existing Arc so all clones held by services see the update.
-            *self.listen_fds.blocking_lock() = fds;
+            *self.listen_fds.lock() = fds;
         }
         Ok(())
     }
