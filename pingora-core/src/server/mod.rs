@@ -36,7 +36,7 @@ use std::thread;
 use std::time::SystemTime;
 #[cfg(unix)]
 use tokio::signal::unix;
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
+use tokio::sync::{broadcast, watch};
 use tokio::time::{sleep, Duration};
 
 use crate::prelude::background_service;
@@ -117,7 +117,7 @@ pub enum ExecutionPhase {
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
 #[cfg(unix)]
-pub type ListenFds = Arc<TokioMutex<Fds>>;
+pub type ListenFds = Arc<Mutex<Fds>>;
 
 /// The type of shutdown process that has been requested.
 #[derive(Debug)]
@@ -272,24 +272,28 @@ impl Server {
                     .send(ExecutionPhase::GracefulUpgradeTransferringFds)
                     .ok();
 
-                let fds = self.listen_fds();
-                let fds = fds.lock().await;
-                if fds.is_empty() {
-                    info!("No socks to send, shutting down.");
-                } else {
-                    info!("Trying to send socks");
-                    // XXX: this is blocking IO
-                    match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
-                        Ok(_) => {
-                            info!("listener sockets sent");
+                let sent_fds = {
+                    let fds = self.listen_fds();
+                    let fds = fds.lock();
+                    if fds.is_empty() {
+                        info!("No socks to send, shutting down.");
+                        false
+                    } else {
+                        info!("Trying to send socks");
+                        match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                            Ok(_) => {
+                                info!("listener sockets sent");
+                            }
+                            Err(e) => {
+                                error!("Unable to send listener sockets to new process: {e}");
+                                #[cfg(all(not(debug_assertions), feature = "sentry"))]
+                                sentry::capture_error(&e);
+                            }
                         }
-                        Err(e) => {
-                            error!("Unable to send listener sockets to new process: {e}");
-                            // sentry log error on fd send failure
-                            #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                            sentry::capture_error(&e);
-                        }
+                        true
                     }
+                };
+                if sent_fds {
                     self.execution_phase_watch
                         .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
                         .ok();
