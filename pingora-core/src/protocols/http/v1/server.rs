@@ -566,7 +566,6 @@ impl HttpSession {
                         .or_err(WriteError, "flushing response header")?;
                 }
                 self.response_written = Some(header);
-                self.body_bytes_sent += write_buf.len();
                 Ok(())
             }
             Err(e) => Error::e_because(WriteError, "writing response header", e),
@@ -2597,6 +2596,30 @@ mod tests_stream {
         assert_eq!(wire_body.len(), n);
         let n = http_stream.finish_body().await.unwrap().unwrap();
         assert_eq!(wire_body.len(), n);
+    }
+
+    #[tokio::test]
+    async fn body_bytes_sent_excludes_response_header() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let wire_body = b"hello";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(wire_body)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Content-Length", "5").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 0);
+        http_stream.write_body(wire_body).await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), wire_body.len());
     }
 
     #[tokio::test]
