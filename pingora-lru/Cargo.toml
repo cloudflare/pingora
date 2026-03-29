@@ -24,6 +24,7 @@ rand = "0.8"
 
 [dev-dependencies]
 lru = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "bench_linked_list"
