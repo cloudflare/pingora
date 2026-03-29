@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use std::sync::Arc;
@@ -20,10 +21,10 @@ use std::thread;
 use std::time::Instant; // used in iter_custom timing
 
 const WEIGHTS: &[usize] = &[
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 100, 100, 100,
-    100, 100, 100, 100, 100, 100, 100,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
 ];
 
 const THREADS: usize = 8;
@@ -68,7 +69,9 @@ fn bench_single_thread(c: &mut Criterion) {
 
     group.bench_function("std_lru_get", |b| {
         b.iter(|| {
-            std_lru.lock().get(&black_box(dist.sample(&mut rng) as u64));
+            std_lru
+                .lock()
+                .get(&black_box(dist.sample(&mut rng) as u64));
         });
     });
 
