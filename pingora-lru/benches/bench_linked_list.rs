@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use pingora_lru::linked_list::LinkedList;
+use std::hint::black_box;
 
 /// Number of items pre-loaded into the list for benchmarks that measure
 /// a single operation against an existing list (promote, search, iter).
