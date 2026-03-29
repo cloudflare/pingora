@@ -25,6 +25,7 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
+use std::num::NonZeroU64;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
@@ -125,6 +126,45 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// When `daemon` is `true`, controls whether the parent process of the daemon fork waits for
+    /// the child to signal readiness before exiting.
+    ///
+    /// When `false` (default), the parent exits immediately after the daemon fork, matching the
+    /// traditional daemonization behavior. Systemd will consider the service started as soon as
+    /// the parent exits, which may be before the child has finished bootstrapping.
+    ///
+    /// When `true`, the parent waits (up to [`Self::daemon_ready_timeout_seconds`]) for the child
+    /// to send `SIGUSR1` after bootstrap completes. This causes systemd to delay any subsequent
+    /// steps (such as sending `SIGQUIT` to the old process) until the new instance is fully ready
+    /// to serve traffic. If the child does not signal in time, the parent exits with a non-zero
+    /// exit code, causing systemd to abort the reload.
+    pub daemon_wait_for_ready: bool,
+    /// Timeout in seconds for the parent process to wait for the child to signal readiness during
+    /// daemonization when [`Self::daemon_wait_for_ready`] is `true`.
+    ///
+    /// If the child does not send `SIGUSR1` within this timeout, the parent exits with a non-zero
+    /// exit code.
+    ///
+    /// Defaults to 600 seconds (10 minutes).
+    pub daemon_ready_timeout_seconds: Option<NonZeroU64>,
+    /// How long the child process will keep retrying `SIGUSR1` to the parent when the signal
+    /// fails with a permission error (`EPERM`) during daemonization.
+    ///
+    /// After the daemon fork, the parent always drops its credentials to the configured user and
+    /// group (see [`Self::user`], [`Self::group`]). Because the privilege drop happens after the
+    /// fork, there is a small window where the child may attempt to signal the parent before the
+    /// parent has finished changing its credentials. During this window the kernel will reject the
+    /// signal with `EPERM` because the child and parent are running as different users. The child
+    /// retries every 100 ms until this timeout elapses.
+    ///
+    /// In practice this window is very small, so the default of 60 seconds is far more than
+    /// enough to account for it.
+    ///
+    /// Only retries on `EPERM`; any other error (e.g. `ESRCH` — parent no longer exists) is
+    /// treated as fatal and logged without retrying.
+    ///
+    /// Defaults to 60 seconds.
+    pub daemon_notify_timeout_seconds: Option<NonZeroU64>,
 }
 
 impl Default for ServerConf {
@@ -155,6 +195,9 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            daemon_ready_timeout_seconds: None,
+            daemon_wait_for_ready: false,
+            daemon_notify_timeout_seconds: None,
         }
     }
 }
@@ -326,6 +369,9 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            daemon_ready_timeout_seconds: None,
+            daemon_wait_for_ready: false,
+            daemon_notify_timeout_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());

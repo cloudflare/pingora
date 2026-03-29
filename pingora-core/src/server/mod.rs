@@ -624,8 +624,13 @@ impl Server {
         if conf.daemon {
             info!("Daemonizing the server");
             fast_timeout::pause_for_fork();
-            daemonize(&self.configuration);
+            let daemonize_result = daemonize(&self.configuration);
             fast_timeout::unpause();
+            // If daemon_wait_for_ready is enabled, pass the parent PID to bootstrap so it
+            // can send SIGUSR1 to the parent after bootstrap completes.
+            if let Some(pid) = daemonize_result.notify_parent_pid {
+                self.bootstrap.lock().set_notify_parent_pid(pid);
+            }
         }
 
         #[cfg(windows)]
