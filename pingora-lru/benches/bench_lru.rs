@@ -69,9 +69,8 @@ fn bench_single_thread(c: &mut Criterion) {
 
     group.bench_function("std_lru_get", |b| {
         b.iter(|| {
-            std_lru
-                .lock()
-                .get(&black_box(dist.sample(&mut rng) as u64));
+            let key = dist.sample(&mut rng) as u64;
+            black_box(std_lru.lock().get(&key).is_some());
         });
     });
 
@@ -115,7 +114,8 @@ fn bench_concurrent(c: &mut Criterion) {
                     let mut rng = thread_rng();
                     let dist = WeightedIndex::new(WEIGHTS).unwrap();
                     for _ in 0..iters {
-                        lru.lock().get(&black_box(dist.sample(&mut rng) as u64));
+                        let key = dist.sample(&mut rng) as u64;
+                        black_box(lru.lock().get(&key).is_some());
                     }
                 }));
             }
