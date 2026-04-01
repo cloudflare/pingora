@@ -27,7 +27,7 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use pingora_runtime::Runtime;
+use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -41,7 +41,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::prelude::background_service;
 use crate::protocols::proxy_protocol;
-use crate::server::bootstrap_services::{Bootstrap, BootstrapService, SentryInitService};
+use crate::server::bootstrap_services::{Bootstrap, BootstrapService};
 use crate::services::{
     DependencyGraph, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch, ServiceWithDependents,
 };
@@ -211,10 +211,6 @@ impl Default for RunArgs {
 /// services (see [crate::services]). The server object handles signals, reading configuration,
 /// zero downtime upgrade and error reporting.
 pub struct Server {
-    // This is a way to add services that have to be run before any others
-    // without requiring dependencies to be set directly
-    init_services: Vec<Box<dyn ServiceWithDependents + 'static>>,
-
     services: HashMap<NodeIndex, ServiceWrapper>,
     shutdown_watch: watch::Sender<bool>,
     // TODO: we many want to drop this copy to let sender call closed()
@@ -392,11 +388,13 @@ impl Server {
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
+        blocking_opts: BlockingPoolOpts,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
-        let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
+        let service_runtime =
+            Server::create_runtime(service.name(), threads, work_stealing, blocking_opts);
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
@@ -461,7 +459,6 @@ impl Server {
 
         Server {
             services: Default::default(),
-            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
             execution_phase_watch,
@@ -511,7 +508,6 @@ impl Server {
 
         Ok(Server {
             services: Default::default(),
-            init_services: Default::default(),
             shutdown_watch: tx,
             shutdown_recv: rx,
             execution_phase_watch,
@@ -520,31 +516,6 @@ impl Server {
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
             bootstrap,
         })
-    }
-
-    /// Add a service that all other services will wait on before starting.
-    fn add_init_service(&mut self, service: impl ServiceWithDependents + 'static) {
-        let boxed_service = Box::new(service);
-        self.init_services.push(boxed_service);
-    }
-
-    /// Add the init services as dependencies for all existing services
-    fn apply_init_service_dependencies(&mut self) {
-        let services = self
-            .services
-            .values()
-            .map(|service| service.service_handle.clone())
-            .collect::<Vec<_>>();
-        let global_deps = self
-            .init_services
-            .drain(..)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|dep| self.add_boxed_service(dep))
-            .collect::<Vec<_>>();
-        for service in services {
-            service.add_dependencies(&global_deps);
-        }
     }
 
     /// Add a service to this server.
@@ -626,19 +597,9 @@ impl Server {
     ///
     /// The created service will handle the zero-downtime upgrade from an older version of the server
     /// to this one. It will try to get all its listening sockets in order to take them over.
-    ///
-    /// Other bootstrapping functionality like sentry initialization will also be handled, but as a
-    /// service that will complete before any other service starts.
     pub fn bootstrap_as_a_service(&mut self) -> ServiceHandle {
         let bootstrap_service =
             background_service("Bootstrap Service", BootstrapService::new(&self.bootstrap));
-
-        let sentry_service = background_service(
-            "Sentry Init Service",
-            SentryInitService::new(&self.bootstrap),
-        );
-
-        self.add_init_service(sentry_service);
 
         self.add_service(bootstrap_service)
     }
@@ -667,8 +628,6 @@ impl Server {
     /// Instead it will either start the daemon process and exit, or panic
     /// if daemonization fails.
     pub fn run(mut self, run_args: RunArgs) {
-        self.apply_init_service_dependencies();
-
         info!("Server starting");
 
         let conf = self.configuration.as_ref();
@@ -685,6 +644,20 @@ impl Server {
         if conf.daemon {
             panic!("Daemonizing under windows is not supported");
         }
+
+        let blocking_opts = BlockingPoolOpts {
+            max_threads: conf.max_blocking_threads,
+            thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
+        };
+
+        // Initialize (or re-initialize) sentry and persist the guard for
+        // the lifetime of the server. When daemonizing, the transport
+        // thread spawned by any earlier `sentry::init` during
+        // `bootstrap()` is lost after `fork()`, so a fresh init in the
+        // child process is required. In non-daemon mode this is the
+        // authoritative initialization that keeps sentry active.
+        #[cfg(feature = "sentry")]
+        self.bootstrap.lock().start_sentry();
 
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
@@ -759,13 +732,14 @@ impl Server {
                 self.configuration.listener_tasks_per_fd,
                 ready_notifier,
                 dependency_watches,
+                blocking_opts.clone(),
             );
             runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
-        let server_runtime = Server::create_runtime("Server", 1, true);
+        let server_runtime = Server::create_runtime("Server", 1, true, BlockingPoolOpts::default());
         #[cfg(unix)]
         let shutdown_type = server_runtime
             .get_handle()
@@ -834,11 +808,15 @@ impl Server {
             .ok();
     }
 
-    fn create_runtime(name: &str, threads: usize, work_steal: bool) -> Runtime {
-        if work_steal {
-            Runtime::new_steal(threads, name)
-        } else {
-            Runtime::new_no_steal(threads, name)
-        }
+    fn create_runtime(
+        name: &str,
+        threads: usize,
+        work_steal: bool,
+        blocking_opts: BlockingPoolOpts,
+    ) -> Runtime {
+        RuntimeBuilder::new(threads, name)
+            .work_steal(work_steal)
+            .blocking_pool_opts(blocking_opts)
+            .build()
     }
 }

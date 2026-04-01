@@ -218,6 +218,9 @@ where
                 // TODO: implement for write timeouts?
                 if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
                     client_body.send_reset(h2::Reason::CANCEL);
+                    // Mark the underlying H2 connection for shutdown so it's not used
+                    // for new streams in case it is hung.
+                    client_session.conn.mark_shutdown();
                 }
                 (false, Some(e))
             }
@@ -806,12 +809,25 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    while let Some(chunk) = client
-        .read_response_body()
-        .await
-        .map_err(|e| e.into_up())
-        .transpose()
-    {
+    // Read body from H2 upstream, racing each read against tx.closed().
+    //
+    // When proxying an H2 upstream response with Content-Length to an H1 downstream,
+    // bidirection_down_to_up() may determine the response is complete (all Content-Length
+    // bytes written) and exit before the H2 stream signals END_STREAM. This drops the
+    // receiving end (rx) of the channel. Without this race, read_response_body() would
+    // block until the H2 stream eventually ends (e.g. via trailers or read_timeout),
+    // while the downstream side (which could be H1) is in theory already done.
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            body = client.read_response_body() => {
+                body.map_err(|e| e.into_up()).transpose()
+            }
+            _ = tx.closed() => None,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let data = match chunk {
             Ok(d) => d,
             Err(e) => {
@@ -834,10 +850,10 @@ pub(crate) async fn pipe_up_to_down_response(
                     .send(HttpTask::Body(Some(data), eos))
                     .await
                     .or_err(InternalError, "sending h2 body to pipe");
-                // If the if the response with content-length is sent to an HTTP1 downstream,
+                // If the response with content-length is sent to an HTTP1 downstream,
                 // bidirection_down_to_up() could decide that the body has finished and exit without
                 // waiting for this function to signal the eos. In this case tx being closed is not
-                // an sign of error. It should happen if the only thing left for the h2 to send is
+                // a sign of error. It should happen if the only thing left for the h2 to send is
                 // an empty data frame with eos set.
                 if sent.is_err() && eos && empty {
                     return Ok(());
@@ -852,12 +868,26 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    // attempt to get trailers
-    let trailers = match client.read_trailers().await {
-        Ok(t) => t,
-        Err(e) => {
-            // Similar to above, push the error to downstream and then quit
-            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+    // If the channel is already closed, downstream is finished
+    // TODO: note that this does skip trailers/done, but downstream
+    // has already finished so no more is in theory necessary to send
+    if tx.is_closed() {
+        return Ok(());
+    }
+
+    // attempt to get trailers, racing against channel close
+    let trailers = tokio::select! {
+        biased;
+        t = client.read_trailers() => {
+            match t {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                    return Ok(());
+                }
+            }
+        }
+        _ = tx.closed() => {
             return Ok(());
         }
     };

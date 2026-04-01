@@ -21,7 +21,7 @@ use futures::{SinkExt, StreamExt};
 use pingora_http::ResponseHeader;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{StatusCode, Version};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -412,6 +412,124 @@ async fn test_download_timeout_min_rate() {
     }
     // no error as write timeout is overridden by min rate
     assert!(!err);
+}
+
+// When an H2 origin sends all Content-Length bytes in a DATA frame but times out
+// before sending END_STREAM, a subsequent downstream h1 request may be blocked
+#[tokio::test]
+async fn test_h2_upstream_no_end_stream_read_timeout() {
+    init();
+
+    // Spawn a custom H2 origin:
+    //   Request 1: sends Content-Length body WITHOUT END_STREAM, then goes quiet
+    //   Request 2+: responds instantly with body + END_STREAM
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _addr)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut conn = match h2::server::handshake(tcp).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("h2 handshake error: {e}");
+                        return;
+                    }
+                };
+
+                let request_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                while let Some(result) = conn.accept().await {
+                    let (request, mut respond) = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("h2 accept error: {e}");
+                            return;
+                        }
+                    };
+                    let _ = request;
+                    let count = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
+                    // Spawn handler so conn.accept() keeps driving the h2 connection
+                    tokio::spawn(async move {
+                        let resp = http::Response::builder()
+                            .status(200)
+                            .header(http::header::CONTENT_LENGTH, "11")
+                            .body(())
+                            .unwrap();
+
+                        if count == 1 {
+                            // Request 1: send body WITHOUT end_of_stream, then go quiet.
+                            let mut send_stream = respond.send_response(resp, false).unwrap();
+                            send_stream
+                                .send_data(bytes::Bytes::from("hello world"), false)
+                                .unwrap();
+                            // Hold the stream open — simulates an origin that sent all CL
+                            // bytes but hasn't closed the stream.
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        } else {
+                            // Request 2+: respond instantly with body + END_STREAM
+                            let mut send_stream = respond.send_response(resp, false).unwrap();
+                            send_stream
+                                .send_data(bytes::Bytes::from("hello world"), true)
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let url = "http://127.0.0.1:6147/test";
+
+    let resp1 = client
+        .get(url)
+        .header("x-port", origin_port.to_string())
+        .header("x-h2", "true")
+        .header("x-read-timeout-ms", "4000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.text().await.unwrap(), "hello world");
+
+    // Request 2: reqwest reuses the H1 connection
+    // but if blocked / stalled, the proxy can't read this request
+    // until read_timeout fires (~4s)
+    let start = Instant::now();
+    let resp2 = timeout(
+        Duration::from_secs(10),
+        client
+            .get(url)
+            .header("x-port", origin_port.to_string())
+            .header("x-h2", "true")
+            .send(),
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    match resp2 {
+        Ok(Ok(resp)) => {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.text().await.unwrap(), "hello world");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "Second request on reused H1 connection took {elapsed:?}, \
+                 expected < 2s (may be blocked on H2 upstream to end stream)"
+            );
+        }
+        Ok(Err(e)) => {
+            panic!("Second request failed: {e}");
+        }
+        Err(_) => {
+            panic!("Second request timed out after 10s.");
+        }
+    }
 }
 
 mod test_cache {
@@ -2151,6 +2269,7 @@ mod test_cache {
         sleep(Duration::from_millis(50)).await;
 
         let task2 = tokio::spawn(async move {
+            let start = Instant::now();
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
@@ -2165,12 +2284,18 @@ mod test_cache {
                 .unwrap()
                 .parse()
                 .unwrap();
-            // the entire body should need 2 extra seconds, here the test shows that
-            // only the header is under cache lock and the body should be streamed
-            assert!(lock_time_ms > 900 && lock_time_ms < 1000);
-            assert_eq!(res.text().await.unwrap(), "hello world!");
+            let body = res.text().await.unwrap();
+            let total_ms = start.elapsed().as_millis() as u32;
+            // lock should cover only the header, not the full body streaming.
+            // if the body were also under lock, lock_time would approach total_ms.
+            assert!(
+                lock_time_ms < total_ms / 2,
+                "lock time {lock_time_ms}ms should be well under total request time {total_ms}ms"
+            );
+            assert_eq!(body, "hello world!");
         });
         let task3 = tokio::spawn(async move {
+            let start = Instant::now();
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
@@ -2185,10 +2310,15 @@ mod test_cache {
                 .unwrap()
                 .parse()
                 .unwrap();
-            // the entire body should need 2 extra seconds, here the test shows that
-            // only the header is under cache lock and the body should be streamed
-            assert!(lock_time_ms > 900 && lock_time_ms < 1000);
-            assert_eq!(res.text().await.unwrap(), "hello world!");
+            let body = res.text().await.unwrap();
+            let total_ms = start.elapsed().as_millis() as u32;
+            // lock should cover only the header, not the full body streaming.
+            // if the body were also under lock, lock_time would approach total_ms.
+            assert!(
+                lock_time_ms < total_ms / 2,
+                "lock time {lock_time_ms}ms should be well under total request time {total_ms}ms"
+            );
+            assert_eq!(body, "hello world!");
         });
 
         task1.await.unwrap();

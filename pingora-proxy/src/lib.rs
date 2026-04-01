@@ -417,7 +417,10 @@ where
 
         if reuse {
             // TODO: log error
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
@@ -785,7 +788,10 @@ where
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+                    if let Some(uc) = self.inner.persist_connection_context(&session, &ctx) {
+                        persistent_settings.set_user_context(uc);
+                    }
                     return session
                         .downstream_session
                         .finish()
@@ -971,7 +977,10 @@ where
         session.downstream_session.on_proxy_failure(e);
 
         if res.can_reuse_downstream {
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
@@ -1135,9 +1144,12 @@ where
 {
     async fn process_new_http(
         self: &Arc<Self>,
-        session: HttpSession,
+        mut session: HttpSession,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
+        // Extract user context from the previous request before the session is moved into the Box
+        let prev_user_ctx = session.take_connection_user_context();
+
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
@@ -1155,7 +1167,14 @@ where
             session.set_keepalive(None);
         }
 
-        let ctx = self.inner.new_ctx();
+        let mut ctx = self.inner.new_ctx();
+
+        // Deliver user context from the previous request on this reused connection
+        if let Some(prev_ctx) = prev_user_ctx {
+            self.inner
+                .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
+        }
+
         self.process_request(session, ctx).await
     }
 

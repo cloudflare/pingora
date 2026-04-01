@@ -70,6 +70,7 @@ openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
 connection_filter = ["pingora-core/connection_filter"]
+prometheus = ["pingora-core/prometheus"]
 
 [[example]]
 name = "connection_filter"

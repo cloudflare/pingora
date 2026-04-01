@@ -27,6 +27,7 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
+use std::any::Any;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -86,6 +87,10 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// User-defined context carried across requests on the same keepalive connection.
+    /// Set by [`HttpPersistentSettings::apply_to_session`](crate::apps::HttpPersistentSettings::apply_to_session),
+    /// consumed by the proxy layer via [`take_connection_user_context`](Self::take_connection_user_context).
+    connection_user_context: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl HttpSession {
@@ -126,6 +131,7 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            connection_user_context: None,
         }
     }
 
@@ -660,6 +666,24 @@ impl HttpSession {
 
     pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
         self.keepalive_reuses_remaining
+    }
+
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// This is typically called by
+    /// [`HttpPersistentSettings::apply_to_session`](crate::apps::HttpPersistentSettings::apply_to_session)
+    /// during the keepalive reuse loop. The proxy layer consumes it via
+    /// [`take_connection_user_context`](Self::take_connection_user_context).
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        self.connection_user_context = ctx;
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` if this is the first request on the connection or if no context was
+    /// persisted by the previous request.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.connection_user_context.take()
     }
 
     /// Return whether the session will be keepalived for connection reuse.
@@ -2699,6 +2723,37 @@ Content-Length: 5\r\n\
 
         let reused = http_stream.reuse().await.unwrap();
         assert!(reused.is_none());
+    }
+
+    #[test]
+    fn test_connection_user_context_set_and_take() {
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        // Initially no context
+        assert!(session.take_connection_user_context().is_none());
+
+        // Set a context
+        session.set_connection_user_context(Some(Box::new(42u64)));
+
+        // Take it back
+        let ctx = session.take_connection_user_context();
+        assert!(ctx.is_some());
+        let val = ctx.unwrap().downcast::<u64>().unwrap();
+        assert_eq!(*val, 42u64);
+
+        // After take, it's gone
+        assert!(session.take_connection_user_context().is_none());
+    }
+
+    #[test]
+    fn test_connection_user_context_set_none_clears() {
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        session.set_connection_user_context(Some(Box::new("hello".to_string())));
+        session.set_connection_user_context(None);
+        assert!(session.take_connection_user_context().is_none());
     }
 }
 

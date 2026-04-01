@@ -128,6 +128,14 @@ impl ConnectionRef {
         self.0.shutting_down.load(Ordering::Relaxed)
     }
 
+    /// Mark this connection for shutdown.
+    ///
+    /// No new streams will be created on this connection and
+    /// it will be discarded once all active streams are released.
+    pub fn mark_shutdown(&self) {
+        self.0.shutting_down.store(true, Ordering::Relaxed);
+    }
+
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
         // Atomically check if the current_stream is over the limit
@@ -153,7 +161,7 @@ impl ConnectionRef {
                     })
                     .unwrap_or(false)
                 {
-                    self.0.shutting_down.store(true, Ordering::Relaxed);
+                    self.mark_shutdown();
                     Ok(None)
                 } else {
                     Err(e)
@@ -175,6 +183,21 @@ impl InUsePool {
         }
     }
 
+    /// Attempt to remove an empty [`PoolNode`] entry from the pools `HashMap`.
+    ///
+    /// Same rationale as [`ConnectionPool::try_remove_empty_node`]: prevents
+    /// unbounded growth when many unique reuse hashes are seen over time.
+    /// The write lock + re-check ensures we never remove a node that was
+    /// concurrently repopulated.
+    fn try_remove_empty_node(&self, reuse_hash: u64) {
+        let mut pools = self.pools.write();
+        if let Some(pool) = pools.get(&reuse_hash) {
+            if pool.is_empty() {
+                pools.remove(&reuse_hash);
+            }
+        }
+    }
+
     pub fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
         {
             let pools = self.pools.read();
@@ -184,9 +207,15 @@ impl InUsePool {
             }
         } // drop read lock
 
+        let mut pools = self.pools.write();
+        // Double-check: another thread may have inserted a node between
+        // dropping the read lock and acquiring this write lock.
+        if let Some(pool) = pools.get(&reuse_hash) {
+            pool.insert(conn.id(), conn);
+            return;
+        }
         let pool = PoolNode::new();
         pool.insert(conn.id(), conn);
-        let mut pools = self.pools.write();
         pools.insert(reuse_hash, pool);
     }
 
@@ -194,19 +223,42 @@ impl InUsePool {
     // the caller should return the conn ref to this pool if there are still
     // capacity left for more streams
     pub fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            match pools.get(&reuse_hash) {
+                Some(pool) => match pool.get_any() {
+                    Some((_, conn)) => (Some(conn), pool.is_empty()),
+                    None => (None, true),
+                },
+                None => (None, false),
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
+        }
+
+        result
     }
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
     pub fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        if let Some(pool) = pools.get(&reuse_hash) {
-            pool.remove(id)
-        } else {
-            None
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            if let Some(pool) = pools.get(&reuse_hash) {
+                let removed = pool.remove(id);
+                (removed, pool.is_empty())
+            } else {
+                (None, false)
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
         }
+
+        result
     }
 }
 
@@ -628,6 +680,23 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    #[tokio::test]
+    async fn test_mark_shutdown_prevents_new_streams() {
+        let (client_io, _server_io) = tokio::io::duplex(65536);
+        let (send_req, _connection) = h2::client::handshake(client_io).await.unwrap();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        assert!(conn.more_streams_allowed());
+        assert!(!conn.is_shutting_down());
+
+        conn.mark_shutdown();
+
+        assert!(conn.is_shutting_down());
+        assert!(!conn.more_streams_allowed());
     }
 
     #[cfg(all(feature = "any_tls", unix))]

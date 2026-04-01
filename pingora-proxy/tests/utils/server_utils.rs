@@ -346,6 +346,15 @@ impl ProxyHttp for ExampleProxyHttp {
             peer.options.set_http_version(2, 2);
         }
 
+        if let Some(ms) = req
+            .headers
+            .get("x-read-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
+        }
+
         Ok(peer)
     }
 
@@ -910,7 +919,7 @@ impl PskTlsServer {
             let (tcp_stream, _) = listener.accept().await.unwrap();
             let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write(response).await.unwrap();
+            stream.write_all(response).await.unwrap();
             stream.shutdown().await;
         }
     }

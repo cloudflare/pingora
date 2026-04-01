@@ -120,6 +120,15 @@ pub struct ServerConf {
     /// The retry interval is 1 second between attempts.
     /// If not set, defaults to 5 retries.
     pub upgrade_sock_connect_accept_max_retries: Option<usize>,
+    /// The maximum number of threads in each runtime's blocking thread pool.
+    ///
+    /// The blocking pool handles [`tokio::task::spawn_blocking`] tasks.
+    /// When not set, the tokio default (512) is used.
+    pub max_blocking_threads: Option<usize>,
+    /// How long, in seconds, idle blocking threads are kept alive before being shut down.
+    ///
+    /// When not set, the tokio default (10 seconds) is used.
+    pub blocking_threads_ttl_seconds: Option<u64>,
 }
 
 impl Default for ServerConf {
@@ -149,6 +158,8 @@ impl Default for ServerConf {
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
             upgrade_sock_connect_accept_max_retries: None,
+            max_blocking_threads: None,
+            blocking_threads_ttl_seconds: None,
         }
     }
 }
@@ -253,7 +264,9 @@ impl ServerConf {
     }
 
     pub fn validate(self) -> Result<Self> {
-        // TODO: do the validation
+        if self.max_blocking_threads == Some(0) {
+            return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
+        }
         Ok(self)
     }
 
@@ -317,6 +330,8 @@ mod tests {
             graceful_shutdown_timeout_seconds: None,
             max_retries: 1,
             upgrade_sock_connect_accept_max_retries: None,
+            max_blocking_threads: None,
+            blocking_threads_ttl_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
@@ -355,5 +370,34 @@ version: 1
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
         assert!(!conf.enable_proxy_protocol);
+    }
+
+    #[test]
+    fn test_zero_max_blocking_threads_is_rejected() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+max_blocking_threads: 0
+        "#;
+        let result = ServerConf::from_yaml(conf_str);
+        assert!(
+            result.is_err(),
+            "max_blocking_threads: 0 should fail validation"
+        );
+    }
+
+    #[test]
+    fn test_valid_max_blocking_threads() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+max_blocking_threads: 64
+blocking_threads_ttl_seconds: 30
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(Some(64), conf.max_blocking_threads);
+        assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
     }
 }

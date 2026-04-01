@@ -36,7 +36,7 @@ use super::connection_filter::ConnectionFilter;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 
-use crate::protocols::l4::ext::{set_dscp, set_tcp_fastopen_backlog};
+use crate::protocols::l4::ext::{set_dscp, set_recv_buf, set_snd_buf, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
 #[cfg(feature = "connection_filter")]
@@ -99,6 +99,12 @@ pub struct TcpSocketOptions {
     /// This is useful for load balancing across multiple worker processes.
     /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
     pub so_reuseport: Option<bool>,
+    /// Set the send buffer size for accepted connections. See
+    /// [SO_SNDBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
+    pub tcp_snd_buf: Option<usize>,
+    /// Set the receive buffer size for accepted connections. See
+    /// [SO_RCVBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
+    pub tcp_recv_buf: Option<usize>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -394,6 +400,18 @@ impl ListenerEndpoint {
             set_dscp(stream.as_raw_fd(), dscp)?;
             #[cfg(windows)]
             set_dscp(stream.as_raw_socket(), dscp)?;
+        }
+        if let Some(snd_buf) = op.tcp_snd_buf {
+            #[cfg(unix)]
+            set_snd_buf(stream.as_raw_fd(), snd_buf)?;
+            #[cfg(windows)]
+            set_snd_buf(stream.as_raw_socket(), snd_buf)?;
+        }
+        if let Some(recv_buf) = op.tcp_recv_buf {
+            #[cfg(unix)]
+            set_recv_buf(stream.as_raw_fd(), recv_buf)?;
+            #[cfg(windows)]
+            set_recv_buf(stream.as_raw_socket(), recv_buf)?;
         }
         Ok(())
     }

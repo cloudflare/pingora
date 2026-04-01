@@ -27,6 +27,7 @@ use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::any::Any;
 use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
@@ -312,6 +313,26 @@ impl Session {
     pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
         if let Self::H1(s) = self {
             s.get_keepalive_reuses_remaining()
+        } else {
+            None
+        }
+    }
+
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        if let Self::H1(s) = self {
+            s.set_connection_user_context(ctx);
+        }
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` for h2, subrequest, and custom sessions, or if no context was persisted.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        if let Self::H1(s) = self {
+            s.take_connection_user_context()
         } else {
             None
         }
