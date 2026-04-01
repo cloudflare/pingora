@@ -20,8 +20,6 @@ use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt;
 use pingora::server::{Server, ShutdownWatch};
 use pingora::services::background::{background_service, BackgroundService};
-#[cfg(feature = "prometheus")]
-use pingora::services::listening::Service as ListeningService;
 use pingora::services::ServiceWithDependents;
 
 use async_trait::async_trait;
@@ -187,9 +185,7 @@ pub fn main() {
         &key_path,
     );
 
-    #[cfg(feature = "prometheus")]
-    let mut prometheus_service_http = ListeningService::prometheus_http_service();
-    #[cfg(feature = "prometheus")]
+    let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
     prometheus_service_http.add_tcp("127.0.0.1:6150");
 
     let background_service = background_service("example", ExampleBackgroundService {});
@@ -199,7 +195,6 @@ pub fn main() {
         Box::new(echo_service_http),
         Box::new(proxy_service),
         Box::new(proxy_service_ssl),
-        #[cfg(feature = "prometheus")]
         Box::new(prometheus_service_http),
         Box::new(background_service),
     ];

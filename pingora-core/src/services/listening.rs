@@ -309,19 +309,3 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         self.threads
     }
 }
-
-#[cfg(feature = "prometheus")]
-use crate::apps::prometheus_http_app::PrometheusServer;
-
-#[cfg(feature = "prometheus")]
-impl Service<PrometheusServer> {
-    /// The Prometheus HTTP server
-    ///
-    /// The HTTP server endpoint that reports Prometheus metrics collected in the entire service
-    pub fn prometheus_http_service() -> Self {
-        Service::new(
-            "Prometheus metric HTTP".to_string(),
-            PrometheusServer::new(),
-        )
-    }
-}
