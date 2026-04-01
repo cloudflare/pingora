@@ -15,8 +15,6 @@
 //! The abstraction and implementation interface for service application logic
 
 pub mod http_app;
-#[cfg(feature = "prometheus")]
-pub mod prometheus_http_app;
 
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;

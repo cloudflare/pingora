@@ -1,29 +1,21 @@
 # Prometheus
 
-Pingora has a built-in prometheus HTTP metric server for scraping.
+The [`pingora-prometheus`](https://docs.rs/pingora-prometheus) crate provides a
+Prometheus HTTP metrics server for scraping.
 
-## Enabling Prometheus Support
+## Adding the Dependency
 
-Prometheus support is an optional feature in Pingora. To use it, you need to enable the `prometheus` feature in your `Cargo.toml`:
+Add `pingora-prometheus` to your `Cargo.toml`:
 
 ```toml
-# If using the main pingora crate
-pingora = { version = "0.8.0", features = ["prometheus"] }
-
-# If using pingora-core directly
-pingora-core = { version = "0.8.0", features = ["prometheus"] }
-
-# If using pingora-proxy crate
-pingora-proxy = { version = "0.8.0", features = ["prometheus"] }
+pingora-prometheus = "0.8.0"
 ```
 
 ## Setting up a Prometheus Metrics Endpoint
 
-Once the feature is enabled, you can set up a Prometheus metrics endpoint like this:
-
 ```rust
     ...
-    let mut prometheus_service_http = Service::prometheus_http_service();
+    let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
     prometheus_service_http.add_tcp("0.0.0.0:1234");
     my_server.add_service(prometheus_service_http);
     my_server.run_forever();
