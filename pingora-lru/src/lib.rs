@@ -128,9 +128,18 @@ impl<T, const N: usize> Lru<T, N> {
 
     /// Promote to the top n of the LRU
     ///
-    /// This function is a bit more efficient in terms of reducing lock contention because it
-    /// will acquire a write lock only if the key is outside top n but only acquires a read lock
-    /// when the key is already in the top n.
+    /// This function acquires a read lock first to check if the key is already
+    /// in the top `n` positions. If so, it returns early without a write lock.
+    /// Otherwise it falls through to a write lock for the actual promotion.
+    ///
+    /// **Performance note**: this optimization only helps when `n` covers a
+    /// significant fraction of the shard. At production scale (~100K+ items
+    /// per shard), hot items are rarely in the top N positions, so the
+    /// read-lock scan is usually wasted work that adds latency without
+    /// reducing contention. Benchmarks (`cargo bench --bench bench_lru`)
+    /// show that plain [`promote()`](Self::promote) is faster at scale.
+    /// Consider using `promote()` directly unless profiling shows a clear
+    /// benefit for your workload.
     ///
     /// Return false if the item doesn't exist
     pub fn promote_top_n(&self, key: u64, top: usize) -> bool {
