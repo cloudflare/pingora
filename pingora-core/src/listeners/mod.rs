@@ -228,12 +228,12 @@ impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer();
 
-        // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
-        if let Some(ref callback) = self.pre_tls_callback {
-            callback.process(&mut self.l4).await?;
-        }
-
         if let Some(tls) = self.tls {
+            // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
+            if let Some(ref callback) = self.pre_tls_callback {
+                callback.process(&mut self.l4).await?;
+            }
+
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
         } else {
