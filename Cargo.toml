@@ -26,6 +26,7 @@ members = [
     "pingora-load-balancing",
     "pingora-memory-cache",
     "pingora-prometheus",
+    "pingora-foundations",
     "tinyufo",
 ]
 

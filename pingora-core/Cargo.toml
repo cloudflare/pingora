@@ -97,7 +97,8 @@ rustls = "0.23"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
-jemallocator = "0.5"
+# Match foundations' allocator so workspace all-features tests link one jemalloc.
+jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 
 [features]
 default = []
