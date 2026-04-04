@@ -111,7 +111,10 @@ mod test {
 
         // Client
         handles.push(tokio::spawn(async move {
-            let conn = crate::connectors::http::v2::handshake(Box::new(client), 500, None)
+            use crate::connectors::http::v2::H2HandshakeSettings;
+            let mut settings = H2HandshakeSettings::new();
+            settings.max_streams = 500;
+            let conn = crate::connectors::http::v2::handshake(Box::new(client), settings)
                 .await
                 .unwrap();
 
