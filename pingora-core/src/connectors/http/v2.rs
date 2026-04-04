@@ -343,8 +343,13 @@ impl Connector {
                 // the caller that the server speaks h2c
             }
         }
-        let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let peer_options = peer.get_peer_options();
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = peer_options.map_or(1, |o| o.max_h2_streams);
+        settings.ping_interval = peer.h2_ping_interval();
+        settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
+        settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
+        let conn = handshake(stream, settings).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -484,17 +489,82 @@ impl Connector {
 // 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
 const H2_WINDOW_SIZE: u32 = 1 << 23;
 
-pub async fn handshake(
-    stream: Stream,
-    max_streams: usize,
-    h2_ping_interval: Option<Duration>,
-) -> Result<ConnectionRef> {
+/// Maximum allowed H2 window size per [RFC 9113 §6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7).
+const H2_MAX_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
+
+/// Settings for HTTP/2 handshake.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use pingora_core::connectors::http::v2::{handshake, H2HandshakeSettings};
+///
+/// // With custom window sizes
+/// let mut settings = H2HandshakeSettings::new();
+/// settings.max_streams = 100;
+/// settings.stream_window_size = Some(1 << 20);  // 1MiB
+/// settings.connection_window_size = Some(1 << 24);  // 16MiB
+/// let conn = handshake(stream, settings).await?;
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct H2HandshakeSettings {
+    /// The maximum number of concurrent streams allowed on this connection.
+    pub max_streams: usize,
+    /// Optional interval for sending H2 ping frames to keep the connection alive.
+    pub ping_interval: Option<Duration>,
+    /// Optional initial per-stream receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub stream_window_size: Option<u32>,
+    /// Optional initial connection-level receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub connection_window_size: Option<u32>,
+}
+
+impl H2HandshakeSettings {
+    /// Create a new `H2HandshakeSettings` with all defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Perform an HTTP/2 handshake on the given stream with the given settings.
+pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
+
+    let max_streams = settings.max_streams;
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
         return Error::e_explain(H2Error, "zero max_stream configured");
+    }
+
+    // Validate window sizes against RFC 9113 §6.9.1 limit
+    // https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7
+    if settings
+        .stream_window_size
+        .is_some_and(|w| w == 0 || w > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(
+            H2Error,
+            format!(
+                "stream_window_size must be between 1 and {} (2^31-1)",
+                H2_MAX_WINDOW_SIZE
+            ),
+        );
+    }
+    if settings
+        .connection_window_size
+        .is_some_and(|w| w == 0 || w > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(
+            H2Error,
+            format!(
+                "connection_window_size must be between 1 and {} (2^31-1)",
+                H2_MAX_WINDOW_SIZE
+            ),
+        );
     }
 
     let id = stream.id();
@@ -507,16 +577,16 @@ pub async fn handshake(
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
-    // TODO: make these configurable
+    let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
+    let conn_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
     let (send_req, connection) = Builder::new()
         .enable_push(false)
         .initial_max_send_streams(max_streams)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
-        .initial_window_size(H2_WINDOW_SIZE)
-        // should this be max_streams * H2_WINDOW_SIZE?
-        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .initial_window_size(stream_window)
+        .initial_connection_window_size(conn_window)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
@@ -538,7 +608,7 @@ pub async fn handshake(
             connection,
             id,
             closed_tx,
-            h2_ping_interval,
+            settings.ping_interval,
             ping_timeout_clone,
         )
         .await;
@@ -558,6 +628,9 @@ pub async fn handshake(
 mod tests {
     use super::*;
     use crate::upstreams::peer::HttpPeer;
+    use bytes::Bytes;
+    use http::{Response, StatusCode};
+    use pingora_http::RequestHeader;
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
@@ -817,5 +890,111 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_handshake_settings_validation() {
+        use super::H2HandshakeSettings;
+
+        // Test zero stream window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(0);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("stream_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for stream_window_size = 0"),
+        }
+
+        // Test zero connection window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.connection_window_size = Some(0);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("connection_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for connection_window_size = 0"),
+        }
+
+        // Test exceeding max stream window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(super::H2_MAX_WINDOW_SIZE + 1);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("stream_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for stream_window_size > max"),
+        }
+
+        // Test exceeding max connection window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.connection_window_size = Some(super::H2_MAX_WINDOW_SIZE + 1);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("connection_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for connection_window_size > max"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h2_handshake_custom_window_sizes() {
+        // Test that valid custom window sizes are accepted and handshake succeeds
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(1 << 20); // 1MiB
+        settings.connection_window_size = Some(1 << 24); // 16MiB
+
+        let (client, server) = tokio::io::duplex(65536);
+
+        // Spawn server side
+        tokio::spawn(async move {
+            let mut server_conn = h2::server::handshake(server).await.unwrap();
+            if let Some(result) = server_conn.accept().await {
+                let (_request, mut respond) = result.unwrap();
+                let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let mut stream = respond.send_response(resp, false).unwrap();
+                stream.send_data(Bytes::from("ok"), true).unwrap();
+                server_conn.graceful_shutdown();
+            }
+            // Drive the server connection until the client closes
+            while let Some(_res) = server_conn.accept().await {}
+        });
+
+        // Client side - should succeed with custom window sizes
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+
+        // Verify we can spawn a stream and complete a request/response cycle
+        let mut stream = conn.spawn_stream().await.unwrap().unwrap();
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        stream
+            .write_request_header(Box::new(request), true)
+            .unwrap();
+
+        stream.read_response_header().await.unwrap();
+        assert_eq!(stream.response_header().unwrap().status, 200);
     }
 }
