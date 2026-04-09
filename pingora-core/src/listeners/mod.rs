@@ -93,13 +93,27 @@ pub use l4::{ServerAddress, TcpSocketOptions};
 /// The APIs to customize things like certificate during TLS server side handshake
 #[async_trait]
 pub trait TlsAccept {
-    // TODO: return error?
     /// This function is called in the middle of a TLS handshake. Structs who
     /// implement this function should provide tls certificate and key to the
     /// [TlsRef] via `ssl_use_certificate` and `ssl_use_private_key`.
     /// Note. This is only supported for openssl and boringssl
-    async fn certificate_callback(&self, _ssl: &mut TlsRef) -> () {
+    async fn certificate_callback(&self, _ssl: &mut TlsRef) {
         // does nothing by default
+    }
+
+    /// Preferred variant of [`Self::certificate_callback`] for implementations
+    /// that need to reject certificate selection with an explicit error.
+    ///
+    /// Returning an error will abort the handshake with a diagnostic message
+    /// derived from the error. By default this preserves backwards compatibility
+    /// by delegating to [`Self::certificate_callback`].
+    ///
+    /// If both methods are implemented, this method is authoritative. Call
+    /// [`Self::certificate_callback`] from this method if you want to reuse the
+    /// legacy mutation logic before returning a structured result.
+    async fn certificate_callback_result(&self, ssl: &mut TlsRef) -> Result<()> {
+        self.certificate_callback(ssl).await;
+        Ok(())
     }
 
     /// This function is called after the TLS handshake is complete.
