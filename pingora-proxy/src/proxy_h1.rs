@@ -488,6 +488,13 @@ where
                             continue;
                         }
 
+                        // Give body filter a chance to inject for bodyless responses (204/304)
+                        self.maybe_synthesize_body_filter_call(
+                            session,
+                            &mut filtered_tasks,
+                            ctx,
+                        ).await?;
+
                         // set to downstream
                         let upgraded = session.was_upgraded();
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
@@ -759,6 +766,69 @@ where
             }
         }
         res
+    }
+
+    /// Invoke `response_body_filter` once with `body=None, end_of_stream=true`
+    /// for bodyless upstream responses (204/304), so users can inject a
+    /// synthesized body — typically after mutating the status in
+    /// `response_filter`. Without this call, the body filter is unreachable
+    /// for these responses because the upstream client emits no `HttpTask::Body`.
+    ///
+    /// If the filter returns non-empty bytes, the header's framing is updated
+    /// and a `HttpTask::Body` is appended.
+    pub(crate) async fn maybe_synthesize_body_filter_call(
+        &self,
+        session: &mut Session,
+        filtered_tasks: &mut Vec<HttpTask>,
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        // Fire only when the batch is a Header(end=true) with no Body task.
+        // Anything with a Body goes through the existing body filter call.
+        let mut has_header_end = false;
+        let mut has_body = false;
+        for t in filtered_tasks.iter() {
+            match t {
+                HttpTask::Header(_, true) => has_header_end = true,
+                HttpTask::Body(_, _) => has_body = true,
+                _ => {}
+            }
+        }
+        if !has_header_end || has_body {
+            return Ok(());
+        }
+
+        let mut synthetic_body: Option<Bytes> = None;
+        if let Some(duration) =
+            self.inner
+                .response_body_filter(session, &mut synthetic_body, true, ctx)?
+        {
+            trace!("delaying downstream response for {:?}", duration);
+            time::sleep(duration).await;
+        }
+
+        let Some(injected) = synthetic_body else {
+            return Ok(());
+        };
+        if injected.is_empty() {
+            return Ok(());
+        }
+
+        // Rewrite framing — body filter is the source of truth for length.
+        for t in filtered_tasks.iter_mut() {
+            if let HttpTask::Header(header, end) = t {
+                *end = false;
+                header.remove_header(&header::TRANSFER_ENCODING);
+                header.remove_header(&header::CONTENT_LENGTH);
+                header.insert_header(header::CONTENT_LENGTH, injected.len().to_string())?;
+                break;
+            }
+        }
+        filtered_tasks.push(HttpTask::Body(Some(injected), true));
+        Ok(())
     }
 
     // TODO:: use this function to replace send_body_to2
