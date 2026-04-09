@@ -236,7 +236,10 @@ mod tests {
                 &self,
                 _ssl: &mut TlsRef,
             ) -> pingora_error::Result<()> {
-                Error::e_explain(ErrorType::InternalError, "dynamic cert rejected by callback")
+                Error::e_explain(
+                    ErrorType::InternalError,
+                    "dynamic cert rejected by callback",
+                )
             }
         }
 
