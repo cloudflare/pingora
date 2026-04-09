@@ -303,9 +303,18 @@ impl ResponseCompressionCtx {
                     Action::Compress(algorithm) => {
                         let idx = algorithm.index();
                         let compressor = match algorithm {
-                            Algorithm::Dcz => dictionary.as_ref().and_then(|d| {
-                                algorithm.maybe_compressor_with_dictionary(levels[idx], d)
-                            }),
+                            Algorithm::Dcz => {
+                                // RFC 9842: dictionary-compressed responses vary on
+                                // Available-Dictionary so caches don't serve this variant
+                                // to clients with a different or missing dictionary.
+                                let enc = dictionary.as_ref().and_then(|d| {
+                                    algorithm.maybe_compressor_with_dictionary(levels[idx], d)
+                                });
+                                if enc.is_some() {
+                                    add_vary_header(resp, &AVAILABLE_DICTIONARY);
+                                }
+                                enc
+                            }
                             _ => algorithm.compressor(levels[idx]),
                         };
                         (compressor, preserve_etag[idx])
@@ -780,6 +789,13 @@ fn compressible(resp: &ResponseHeader) -> bool {
     }
 }
 
+/// Header name for the Available-Dictionary request header ([RFC 9842]).
+/// TODO: Replace with http::header when available.
+///
+/// [RFC 9842]: https://datatracker.ietf.org/doc/html/rfc9842
+static AVAILABLE_DICTIONARY: http::HeaderName =
+    http::HeaderName::from_static("available-dictionary");
+
 // add Vary header with the specified value or extend an existing Vary header value
 fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) {
     use http::header::{HeaderValue, VARY};
@@ -1055,6 +1071,11 @@ mod tests_dictionary_compression {
             resp.headers.get("content-encoding").unwrap().as_bytes(),
             b"dcz"
         );
+        // RFC 9842: DCZ responses must vary on Available-Dictionary.
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
 
         let input = Bytes::from_static(b"The quick brown fox jumps over the lazy dog again.");
         let compressed = ctx.response_body_filter(Some(&input), true).unwrap();
@@ -1080,6 +1101,11 @@ mod tests_dictionary_compression {
 
         // no dictionary set, no compression applied
         assert!(resp.headers.get("content-encoding").is_none());
+        // No compression → no Vary: available-dictionary.
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
     }
 
     #[test]
@@ -1099,6 +1125,11 @@ mod tests_dictionary_compression {
 
         // dcz first but no dictionary, no automatic fallback
         assert!(resp.headers.get("content-encoding").is_none());
+        // No compression → no Vary: available-dictionary.
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
     }
 
     #[test]
@@ -1152,6 +1183,11 @@ mod tests_dictionary_compression {
             resp.headers.get("transfer-encoding").unwrap().as_bytes(),
             b"chunked"
         );
+        // RFC 9842: DCZ responses must vary on Available-Dictionary.
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
 
         let chunk1 = Bytes::from_static(b"First chunk. ");
         let output1 = ctx.response_body_filter(Some(&chunk1), false);
@@ -1165,5 +1201,34 @@ mod tests_dictionary_compression {
         assert_eq!(name, "dcz");
         assert_eq!(total_in, chunk1.len() + chunk2.len());
         assert!(total_out > 0);
+    }
+
+    #[test]
+    fn regular_compression_no_available_dictionary_vary() {
+        // Gzip compression should produce Vary: Accept-Encoding but NOT
+        // Vary: available-dictionary.
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/page.html", None).unwrap();
+        req.insert_header("accept-encoding", "gzip").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "text/html").unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"gzip"
+        );
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))));
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
     }
 }
