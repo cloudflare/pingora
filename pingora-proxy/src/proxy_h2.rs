@@ -444,6 +444,13 @@ where
                             continue;
                         }
 
+                        // Give body filter a chance to inject for bodyless responses (204/304)
+                        self.maybe_synthesize_body_filter_call(
+                            session,
+                            &mut filtered_tasks,
+                            ctx,
+                        ).await?;
+
                         let response_done = session.write_response_tasks(filtered_tasks).await?;
                         if session.was_upgraded() {
                             // it is very weird if the downstream session decides to upgrade
