@@ -309,12 +309,14 @@ where
                 // skip downstream filtering entirely as the 304 will not be sent
                 break;
             }
-            #[cfg(feature = "adjust_upstream_modules")]
+            #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
                 self.inner
                     .adjust_upstream_modules(session, header, *end_of_stream, ctx)
                     .await?;
             }
+            #[cfg(feature = "upstream_modules")]
+            session.upstream_modules_filter_task(&mut t).await?;
             session.upstream_compression.response_filter(&mut t);
             let task = self
                 .h1_response_filter(session, t, ctx, serve_from_cache, range_body_filter, false)

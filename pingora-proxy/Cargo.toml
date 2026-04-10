@@ -70,7 +70,7 @@ s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
-adjust_upstream_modules = []
+upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]
 
