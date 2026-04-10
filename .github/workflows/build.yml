@@ -38,12 +38,17 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: Run cargo check
+        run: cargo check --workspace
+
       - name: Run cargo test
+        if: matrix.toolchain != '1.84.0'
         run: cargo test --verbose --lib --bins --tests --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
+        if: matrix.toolchain != '1.84.0'
         run: cargo test --verbose --doc
 
       - name: Run cargo clippy
