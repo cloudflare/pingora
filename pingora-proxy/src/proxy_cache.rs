@@ -160,11 +160,23 @@ where
                         // cache miss
                         if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
-                            let lock_status = session.cache.cache_lock_wait().await;
-                            if self.handle_lock_status(session, ctx, lock_status) {
-                                continue;
+                            // Race the cache lock wait against client disconnect detection
+                            let lock_status =
+                                Self::cache_lock_wait_or_disconnect(session, ctx).await;
+                            if let Some(status) = lock_status {
+                                if self.handle_lock_status(session, ctx, status) {
+                                    continue;
+                                } else {
+                                    break None;
+                                }
                             } else {
-                                break None;
+                                // Client disconnected while waiting for cache lock
+                                debug!(
+                                    "Client disconnected during cache lock wait, {}",
+                                    self.inner.request_summary(session, ctx)
+                                );
+                                // Return with downstream not reusable
+                                break Some((false, None));
                             }
                         } else {
                             self.inner.cache_miss(session, ctx);
@@ -194,11 +206,22 @@ where
                             let will_serve_stale = session.cache.can_serve_stale_updating()
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if !will_serve_stale {
-                                let lock_status = session.cache.cache_lock_wait().await;
-                                if self.handle_lock_status(session, ctx, lock_status) {
-                                    continue;
+                                // Race the cache lock wait against client disconnect detection
+                                let lock_status =
+                                    Self::cache_lock_wait_or_disconnect(session, ctx).await;
+                                if let Some(status) = lock_status {
+                                    if self.handle_lock_status(session, ctx, status) {
+                                        continue;
+                                    } else {
+                                        break None;
+                                    }
                                 } else {
-                                    break None;
+                                    // Client disconnected while waiting for cache lock
+                                    debug!(
+                                        "Client disconnected during cache lock wait (stale), {}",
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                    break Some((false, None));
                                 }
                             }
                             // else continue to serve stale
@@ -947,6 +970,71 @@ where
             LockStatus::AgeTimeout => true,
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+        }
+    }
+
+    /// Wait for a cache lock while also detecting client disconnection.
+    ///
+    /// This function races the cache lock wait against monitoring for client disconnect.
+    /// If the client disconnects while waiting for the cache lock, this function returns
+    /// `None` to signal that the request should be aborted.
+    ///
+    /// Returns:
+    /// - `Some(LockStatus)` if the cache lock completes (writer released the lock)
+    /// - `None` if the client disconnected while waiting
+    async fn cache_lock_wait_or_disconnect(
+        session: &mut Session,
+        _ctx: &SV::CTX,
+    ) -> Option<LockStatus>
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        SV::CTX: Send + Sync,
+    {
+        // Check if we should try to detect client disconnect.
+        // For subrequests (background cache fills), there's no real downstream client,
+        // so we skip disconnect detection.
+        if session.subrequest_ctx.is_some() {
+            // This is a subrequest - no downstream client to monitor
+            return Some(session.cache.cache_lock_wait().await);
+        }
+
+        // Determine if we can safely wait for idle (client disconnect).
+        // We can only call read_body_or_idle(true) if:
+        // 1. The request body is done/empty (common for GET requests)
+        // 2. We haven't started streaming the body yet
+        let body_done = session.as_mut().is_body_done();
+
+        if !body_done {
+            // Request body is still being sent - we can't safely monitor for disconnect
+            // without potentially interfering with body reading.
+            // Fall back to the regular cache lock wait.
+            return Some(session.cache.cache_lock_wait().await);
+        }
+
+        // Race cache lock wait against client disconnect detection.
+        tokio::select! {
+            biased;
+
+            // Prefer completing the cache lock wait if both are ready
+            lock_status = session.cache.cache_lock_wait() => {
+                Some(lock_status)
+            }
+
+            // Monitor for client disconnect
+            disconnect_result = session.downstream_session.read_body_or_idle(true) => {
+                // read_body_or_idle(true) returns an error when client disconnects
+                match disconnect_result {
+                    Ok(_) => {
+                        // This shouldn't happen with true flag when body is done,
+                        // but treat it as disconnect
+                        None
+                    }
+                    Err(_) => {
+                        // Client disconnected
+                        None
+                    }
+                }
+            }
         }
     }
 }
