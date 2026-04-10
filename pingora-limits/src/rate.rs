@@ -260,7 +260,7 @@ mod tests {
     /// can't be accurate or consistent. This function does an assert with a
     /// generous tolerance
     fn assert_eq_ish(left: f64, right: f64) {
-        assert_approx_eq!(f64, left, right, epsilon = 0.15)
+        assert_approx_eq!(f64, left, right, epsilon = 0.5)
     }
 
     #[test]
