@@ -209,7 +209,11 @@ impl SslDigest {
             None => (Vec::new(), None, None),
         };
 
-        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest)
+        let sni = ssl
+            .servername(ssl::NameType::HOST_NAME)
+            .map(ToOwned::to_owned);
+
+        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest, sni)
     }
 }
 
