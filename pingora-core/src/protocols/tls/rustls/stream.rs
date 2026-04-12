@@ -395,7 +395,14 @@ impl SslDigest {
             _ => None,
         };
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest, sni)
+        SslDigest::new(
+            cipher,
+            version,
+            organization,
+            serial_number,
+            cert_digest,
+            sni,
+        )
     }
 }
 
