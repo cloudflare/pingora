@@ -101,17 +101,17 @@ pub struct CertKey {
     certificates: Vec<WrappedX509>,
 }
 
-#[self_referencing]
+#[self_referencing(pub_extras)]
 #[derive(Debug)]
 pub struct WrappedX509 {
-    raw_cert: Vec<u8>,
+    pub raw_cert: Vec<u8>,
 
     #[borrows(raw_cert)]
     #[covariant]
-    cert: X509Certificate<'this>,
+    pub cert: X509Certificate<'this>,
 }
 
-fn parse_x509<C>(raw_cert: &C) -> X509Certificate<'_>
+pub fn parse_x509<C>(raw_cert: &C) -> X509Certificate<'_>
 where
     C: AsRef<[u8]>,
 {
