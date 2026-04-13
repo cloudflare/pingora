@@ -33,6 +33,7 @@ use pingora_error::{
 };
 #[cfg(feature = "s2n")]
 use pingora_s2n::S2NPolicy;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -447,16 +448,16 @@ pub struct PeerOptions {
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
-    // The list of curve the tls connection should advertise
-    // if `None`, the default curves will be used
-    pub curves: Option<&'static str>,
-    // see ssl_use_second_key_share
+    /// The list of curves the tls connection should advertise
+    /// if `None`, the default curves will be used
+    pub curves: Option<Cow<'static, str>>,
+    /// see ssl_use_second_key_share
     pub second_keyshare: bool,
-    // whether to enable TCP fast open
+    /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
-    // use Arc because Clone is required but not allowed in trait object
+    /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
-    // A custom L4 connector to use to establish new L4 connections
+    /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
