@@ -89,7 +89,7 @@ where
     {
         let mut req = session.req_header().clone();
 
-        if req.version != Version::HTTP_2 {
+        if req.version != Version::HTTP_2 || session.downstream_session.is_custom() {
             /* remove H1 specific headers */
             // https://github.com/hyperium/h2/blob/d3b9f1e36aadc1a7a6804e2f8e86d3fe4a244b4f/src/proto/streams/send.rs#L72
             req.remove_header(&http::header::TRANSFER_ENCODING);
