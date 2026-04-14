@@ -53,16 +53,25 @@ pub struct PipeSubrequestState {
     /// The spawned subrequest task handle. Always set after spawn. Caller is
     /// responsible for awaiting/inspecting state.
     pub join_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The receiving half of the pipe channel. When the coordinator exits
+    /// `pipe_subrequest` before the subrequest task finishes writing, this
+    /// receiver must be kept alive and drained alongside the join handle;
+    /// otherwise dropping it breaks the pipe and prevents the writer from
+    /// completing its cache-write lifecycle.
+    pub pipe_rx: Option<mpsc::Receiver<HttpTask>>,
 }
 
 impl PipeSubrequestState {
     /// Creates a snapshot for error reporting, excluding the join handle.
+    /// Moves `pipe_rx` into the snapshot so the receiver stays alive through
+    /// the error path and is not dropped when `self` is cleaned up.
     /// Used by [`map_pipe_err`] to capture state at the point of failure.
-    pub fn snapshot_for_error(&self) -> Self {
+    pub fn snapshot_for_error(&mut self) -> Self {
         PipeSubrequestState {
             saved_body: self.saved_body.clone(),
             header_received: self.header_received,
             join_handle: None,
+            pipe_rx: self.pipe_rx.take(),
         }
     }
 }
@@ -91,7 +100,7 @@ impl PipeSubrequestError {
 fn map_pipe_err<T, E: Into<Box<Error>>>(
     result: Result<T, E>,
     from_subreq: bool,
-    state: &PipeSubrequestState,
+    state: &mut PipeSubrequestState,
 ) -> Result<T, PipeSubrequestError> {
     result.map_err(|e| PipeSubrequestError::new(e, from_subreq, state.snapshot_for_error()))
 }
@@ -212,7 +221,10 @@ where
     });
     state.join_handle = Some(join_handle);
     let tx = subrequest_handle.tx;
-    let mut rx = subrequest_handle.rx;
+    // Move rx into state immediately so it survives all exit paths (early `?`
+    // returns, errors, and the normal success path). The select loop borrows it
+    // back via `state.pipe_rx.as_mut().expect(...)`.
+    state.pipe_rx = Some(subrequest_handle.rx);
 
     let mut wants_body = false;
     let mut wants_body_rx_err = false;
@@ -229,7 +241,7 @@ where
             .or_err(InternalError, "try_reserve() body pipe for subrequest");
 
         tokio::select! {
-            task = rx.recv(), if !response_state.upstream_done() => {
+            task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_done() => {
                 debug!("upstream event: {:?}", task);
                 if let Some(t) = task {
                     // Did the subrequest get headers?
@@ -239,17 +251,17 @@ where
                     // pull as many tasks as we can
                     const TASK_BUFFER_SIZE: usize = 4;
                     let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                    let task = map_pipe_err(task_filter(t), false, &state)?;
+                    let task = map_pipe_err(task_filter(t), false, &mut state)?;
                     if let Some(filtered) = task {
                         tasks.push(filtered);
                     }
                     // tokio::task::unconstrained because now_or_never may yield None when the future is ready
-                    while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
+                    while let Some(maybe_task) = tokio::task::unconstrained(state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv()).now_or_never() {
                         if let Some(t) = maybe_task {
                             if matches!(&t, HttpTask::Header(..)) {
                                 state.header_received = true;
                             }
-                            let task = map_pipe_err(task_filter(t), false, &state)?;
+                            let task = map_pipe_err(task_filter(t), false, &mut state)?;
                             if let Some(filtered) = task {
                                 tasks.push(filtered);
                             }
@@ -259,7 +271,7 @@ where
                     }
                     // FIXME: if one of these tasks is Failed(e), the session will return that
                     // error; in this case, the error is actually from the subreq
-                    let response_done = map_pipe_err(session.write_response_tasks(tasks).await, false, &state)?;
+                    let response_done = map_pipe_err(session.write_response_tasks(tasks).await, false, &mut state)?;
 
                     // NOTE: technically it is the downstream whose response state has finished here
                     // we consider the subrequest's work done however
@@ -309,7 +321,7 @@ where
                 // this is the first subrequest
                 // send the body
                 debug!("downstream event: main body for subrequest");
-                let body = map_pipe_err(body.map_err(|e| e.into_down()), false, &state)?;
+                let body = map_pipe_err(body.map_err(|e| e.into_down()), false, &mut state)?;
 
                 // If the request is websocket, `None` body means the request is closed.
                 // Set the response to be done as well so that the request completes normally.
@@ -325,7 +337,7 @@ where
                     state.saved_body.as_mut(),
                     send_permit.expect("checked is_ok()"),
                 )
-                .await, false, &state)?;
+                .await, false, &mut state)?;
 
                 downstream_state.maybe_finished(request_done);
 
@@ -346,7 +358,7 @@ where
                     is_body_done,
                     None,
                     send_permit.expect("checked is_ok()"),
-                ), false, &state)?;
+                ), false, &mut state)?;
                 downstream_state.maybe_finished(request_done);
 
             },
