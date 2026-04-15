@@ -559,7 +559,9 @@ where
                                 return Err(e);
                             }
                         }
-                        if response_state.cached_done() {
+                        // A storage error can disable cache between cached_done
+                        // being set and here; see the same guard in proxy_h1.rs.
+                        if response_state.cached_done() && session.cache.enabled() {
                             if let Err(e) = session.cache.finish_hit_handler().await {
                                 warn!("Error during finish_hit_handler: {}", e);
                             }
@@ -583,7 +585,9 @@ where
                             match write_result {
                                 Ok(end) => {
                                     response_state.maybe_set_cache_done(end);
-                                    if response_state.cached_done() {
+                                    // See disabled() guard comment above.
+                                    // See enabled() guard comment above.
+                                    if response_state.cached_done() && session.cache.enabled() {
                                         if let Err(e) = session.cache.finish_hit_handler().await {
                                             warn!("Error during finish_hit_handler: {}", e);
                                         }

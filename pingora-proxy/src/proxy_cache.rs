@@ -487,6 +487,7 @@ where
             }
         }
 
+        // No enabled() guard: no concurrent upstream can disable cache here.
         if let Err(e) = session.cache.finish_hit_handler().await {
             warn!("Error during finish_hit_handler: {}", e);
         }
