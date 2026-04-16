@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest, http::HeaderValue as WsHeaderValue, Message,
+};
 
 #[tokio::test]
 async fn test_ip_binding() {
@@ -144,7 +146,7 @@ async fn test_ws_server_ends_conn() {
 
     let mut req = "ws://127.0.0.1:6147".into_client_request().unwrap();
     req.headers_mut()
-        .insert("x-port", HeaderValue::from_static("9283"));
+        .insert("x-port", WsHeaderValue::from_static("9283"));
 
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     // gracefully close connection
@@ -161,7 +163,7 @@ async fn test_ws_server_ends_conn() {
 
     let mut req = "ws://127.0.0.1:6147".into_client_request().unwrap();
     req.headers_mut()
-        .insert("x-port", HeaderValue::from_static("9283"));
+        .insert("x-port", WsHeaderValue::from_static("9283"));
 
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     // abrupt close connection
@@ -173,7 +175,7 @@ async fn test_ws_server_ends_conn() {
 
     let mut req = "ws://127.0.0.1:6147".into_client_request().unwrap();
     req.headers_mut()
-        .insert("x-port", HeaderValue::from_static("9283"));
+        .insert("x-port", WsHeaderValue::from_static("9283"));
 
     let (mut ws_stream, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws_stream.send("test".into()).await.unwrap();
@@ -374,7 +376,7 @@ async fn test_download_timeout() {
         .body(hyper::Body::empty())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
@@ -401,7 +403,7 @@ async fn test_download_timeout_min_rate() {
         .body(hyper::Body::empty())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
