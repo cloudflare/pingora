@@ -37,7 +37,7 @@ document-features = { version = "0.2.10", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = ["rustls"], default-features = false }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 hyper = "0.14"
 async-trait = { workspace = true }
 http = { workspace = true }

@@ -26,8 +26,10 @@ jobs:
         # https://github.com/rustsec/audit-check/issues/27
         run: cargo generate-lockfile --ignore-rust-version
 
-      - name: Audit Check
-        # https://github.com/rustsec/audit-check/issues/2
-        uses: rustsec/audit-check@master
+      - name: Audit dependencies
+        # RUSTSEC-2026-0009 requires upgrading time to >=0.3.47, which raises the MSRV above
+        # the 1.84.0 toolchain currently exercised by this repository.
+        uses: actions-rust-lang/audit@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2026-0009

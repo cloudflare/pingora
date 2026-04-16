@@ -57,7 +57,9 @@ jobs:
 
       - name: Run cargo audit
         run: |
-          [[ ${{ matrix.toolchain }} != 1.91.1 ]] || (cargo install --locked cargo-audit && cargo generate-lockfile --ignore-rust-version && cargo audit)
+          # RUSTSEC-2026-0009 requires upgrading time to >=0.3.47, which raises the MSRV above
+          # the 1.84.0 toolchain currently exercised by this repository.
+          [[ ${{ matrix.toolchain }} != 1.91.1 ]] || (cargo install --locked cargo-audit && cargo generate-lockfile --ignore-rust-version && cargo audit --ignore RUSTSEC-2026-0009)
 
       - name: Run cargo machete
         run: |
