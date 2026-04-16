@@ -86,7 +86,7 @@ windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.12", features = [
     "rustls-tls",
 ], default-features = false }
 hyper = "0.14"

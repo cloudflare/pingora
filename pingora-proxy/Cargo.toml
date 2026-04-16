@@ -36,14 +36,14 @@ regex = "1"
 rand = "0.8"
 
 [dev-dependencies]
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.12", features = [
     "gzip",
     "rustls-tls",
 ], default-features = false }
 httparse = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
-hyper = "0.14"
+hyper = { version = "0.14", features = ["http2"] }
 tokio-tungstenite = "0.20.1"
 pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
 pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }

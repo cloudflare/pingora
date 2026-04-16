@@ -172,8 +172,8 @@ async fn test_h2c_to_h2c() {
     req.headers_mut()
         .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
+    assert_eq!(res.version(), hyper::Version::HTTP_2);
 
     let body = res.into_body().data().await.unwrap().unwrap();
     assert_eq!(body.as_ref(), b"Hello World!\n");
@@ -194,8 +194,8 @@ async fn test_h1_on_h2c_port() {
     req.headers_mut()
         .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
+    assert_eq!(res.version(), hyper::Version::HTTP_11);
 
     let body = res.into_body().data().await.unwrap().unwrap();
     assert_eq!(body.as_ref(), b"Hello World!\n");
@@ -307,11 +307,11 @@ async fn test_simple_proxy_uds() {
 
     let res = client.get(url).await.unwrap();
 
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
     let (resp, body) = res.into_parts();
 
     let headers = &resp.headers;
-    assert_eq!(headers[header::CONTENT_LENGTH], "13");
+    assert_eq!(headers[hyper::header::CONTENT_LENGTH], "13");
     assert_eq!(headers["x-server-addr"], "/tmp/pingora_proxy.sock");
     assert_eq!(headers["x-client-addr"], "unset"); // unnamed UDS
 

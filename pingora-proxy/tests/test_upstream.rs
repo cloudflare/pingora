@@ -18,8 +18,9 @@ use utils::server_utils::init;
 use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
 use futures::{SinkExt, StreamExt};
+use hyper::header::HeaderValue;
 use pingora_http::ResponseHeader;
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::{HeaderName, HeaderValue as ReqwestHeaderValue};
 use reqwest::{StatusCode, Version};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -374,7 +375,7 @@ async fn test_download_timeout() {
         .body(hyper::Body::empty())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
@@ -401,7 +402,7 @@ async fn test_download_timeout_min_rate() {
         .body(hyper::Body::empty())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), hyper::StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
@@ -2924,7 +2925,7 @@ mod test_cache {
             .map(|(name, value)| {
                 (
                     HeaderName::from_str(name).unwrap(),
-                    HeaderValue::from_str(value).unwrap(),
+                    ReqwestHeaderValue::from_str(value).unwrap(),
                 )
             })
             .collect();
