@@ -67,7 +67,6 @@ use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
-use pingora_core::protocols::http::ServerSession as HttpSession;
 use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
@@ -89,6 +88,7 @@ pub mod subrequest;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
+pub use pingora_core::protocols::http::ServerSession as HttpSession;
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp};
@@ -234,7 +234,12 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {e}");
+                if !self
+                    .inner
+                    .suppress_pre_request_error_log(&downstream_session, &e)
+                {
+                    error!("Fail to proxy: {e}");
+                }
                 if matches!(e.etype, InvalidHTTPHeader) {
                     downstream_session
                         .respond_error(400)

@@ -506,6 +506,15 @@ pub trait ProxyHttp {
     }
 
     /// A value of true means that the log message will be suppressed. The default value is false.
+    ///
+    /// This callback is invoked for downstream request read or parse failures, before
+    /// [`Self::early_request_filter`] and before [`Self::CTX`] is created, so
+    /// implementations should not assume `session.req_header()` is available.
+    fn suppress_pre_request_error_log(&self, _session: &HttpSession, _error: &Error) -> bool {
+        false
+    }
+
+    /// A value of true means that the log message will be suppressed. The default value is false.
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
         false
     }
