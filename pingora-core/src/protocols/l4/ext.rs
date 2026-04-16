@@ -502,9 +502,9 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
                 debug!("MPTCP connect to {addr} failed, retrying over TCP: {e}");
                 return connect_with_bind_retry(addr, bind_to, false, set_socket)
                     .await
-                    .or_else(|mut fallback_error| {
+                    .map_err(|mut fallback_error| {
                         fallback_error.set_cause(e);
-                        Err(fallback_error)
+                        fallback_error
                     });
             }
         }
