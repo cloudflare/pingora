@@ -255,6 +255,20 @@ pub trait Peer: Display + Clone {
             .unwrap_or_default()
     }
 
+    /// Whether upstream sockets should be opened with MPTCP when supported.
+    fn tcp_mptcp(&self) -> bool {
+        self.get_peer_options()
+            .map(|o| o.tcp_mptcp)
+            .unwrap_or_default()
+    }
+
+    /// Whether an MPTCP socket creation or connect failure should retry over plain TCP.
+    fn tcp_mptcp_fallback(&self) -> bool {
+        self.get_peer_options()
+            .map(|o| o.tcp_mptcp_fallback)
+            .unwrap_or(true)
+    }
+
     #[cfg(unix)]
     fn matches_fd<V: AsRawFd>(&self, fd: V) -> bool {
         self.address().check_fd_match(fd)
@@ -448,6 +462,14 @@ pub struct PeerOptions {
     pub second_keyshare: bool,
     // whether to enable TCP fast open
     pub tcp_fast_open: bool,
+    /// Whether to create upstream sockets with `IPPROTO_MPTCP` when supported.
+    ///
+    /// MPTCP sockets are currently only supported on Linux. When enabled on other platforms, the
+    /// connection will fail unless `tcp_mptcp_fallback` is also enabled.
+    pub tcp_mptcp: bool,
+    /// Whether to retry the upstream connection with a plain TCP socket when the initial MPTCP
+    /// attempt fails.
+    pub tcp_mptcp_fallback: bool,
     // use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
     // A custom L4 connector to use to establish new L4 connections
@@ -499,6 +521,8 @@ impl PeerOptions {
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
             tcp_fast_open: false,
+            tcp_mptcp: false,
+            tcp_mptcp_fallback: true,
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
@@ -537,6 +561,12 @@ impl Display for PeerOptions {
         }
         if let Some(cn) = &self.alternative_cn {
             write!(f, "alt_cn: {},", cn)?;
+        }
+        if self.tcp_mptcp {
+            write!(f, "tcp_mptcp: true,")?;
+            if self.tcp_mptcp_fallback {
+                write!(f, "tcp_mptcp_fallback: true,")?;
+            }
         }
         write!(f, "alpn: {},", self.alpn)?;
         if let Some(cas) = &self.ca {
@@ -781,5 +811,17 @@ impl Display for Proxy {
             self.host,
             self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerOptions;
+
+    #[test]
+    fn peer_options_disable_mptcp_by_default() {
+        let options = PeerOptions::new();
+        assert!(!options.tcp_mptcp);
+        assert!(options.tcp_mptcp_fallback);
     }
 }
