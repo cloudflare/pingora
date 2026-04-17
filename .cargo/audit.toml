@@ -1,0 +1,3 @@
+[advisories]
+# Temp before internal sync applies dependency bumps
+ignore = ["RUSTSEC-2026-0097", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
