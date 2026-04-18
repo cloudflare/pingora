@@ -16,7 +16,7 @@
 
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::rustls::TlsStream;
-use crate::protocols::IO;
+use crate::protocols::{Ssl, IO};
 use crate::{listeners::tls::Acceptor, protocols::Shutdown};
 use async_trait::async_trait;
 use log::warn;
@@ -80,13 +80,13 @@ pub async fn handshake_with_callback<S: IO>(
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     }
-    {
-        // Build TlsRef with connection state for the callback
-        let tls_ref = tls_stream.build_tls_ref();
-        if let Some(extension) = callbacks.handshake_complete_callback(&tls_ref).await {
-            if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
-                digest_mut.extension.set(extension);
-            }
+    let extension = match tls_stream.get_ssl() {
+        Some(tls_ref) => callbacks.handshake_complete_callback(tls_ref).await,
+        None => None,
+    };
+    if let Some(extension) = extension {
+        if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
+            digest_mut.extension.set(extension);
         }
     }
     Ok(tls_stream)
