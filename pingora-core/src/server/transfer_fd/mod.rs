@@ -50,6 +50,10 @@ impl Fds {
         self.map.get(bind)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn serialize(&self) -> (Vec<String>, Vec<RawFd>) {
         self.map.iter().map(|(key, val)| (key.clone(), val)).unzip()
     }

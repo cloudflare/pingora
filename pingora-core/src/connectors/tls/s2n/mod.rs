@@ -83,11 +83,11 @@ impl TlsConnector {
         if self.config_cache.is_some() {
             let config_hash = config_options.config_hash();
             if let Some(config) = self.load_config_from_cache(config_hash) {
-                return Ok(config);
+                Ok(config)
             } else {
                 let config = create_s2n_config(&self.options, config_options)?;
                 self.put_config_in_cache(config_hash, config.clone());
-                return Ok(config);
+                Ok(config)
             }
         } else {
             create_s2n_config(&self.options, config_options)
@@ -116,14 +116,14 @@ impl TlsConnector {
         let mut cache_size = DEFAULT_CONFIG_CACHE_SIZE;
         if let Some(opts) = options {
             if let Some(cache_size_config) = opts.s2n_config_cache_size {
-                if cache_size_config <= 0 {
+                if cache_size_config == 0 {
                     return None;
                 } else {
                     cache_size = NonZero::new(cache_size_config).unwrap();
                 }
             }
         }
-        return Some(Arc::new(Mutex::new(LruCache::new(cache_size))));
+        Some(Arc::new(Mutex::new(LruCache::new(cache_size))))
     }
 }
 
@@ -145,7 +145,7 @@ where
     let config = tls_ctx.load_config(config_options)?;
 
     let connection_builder = S2NConnectionBuilder {
-        config: config,
+        config,
         psk_config: peer.get_psk().cloned(),
         security_policy: Some(security_policy.clone()),
     };
@@ -178,7 +178,7 @@ fn create_s2n_config(
 
     if let Some(conf) = connector_options.as_ref() {
         if let Some(ca_file_path) = conf.ca_file.as_ref() {
-            let ca_pem = load_pem_file(&ca_file_path)?;
+            let ca_pem = load_pem_file(ca_file_path)?;
             builder
                 .trust_pem(&ca_pem)
                 .or_err(InternalError, "failed to load ca cert")?;
@@ -210,7 +210,7 @@ fn create_s2n_config(
 
     if let Some(client_cert_key) = config_options.client_cert_key {
         builder
-            .load_pem(&client_cert_key.raw_pem(), &client_cert_key.key())
+            .load_pem(client_cert_key.raw_pem(), client_cert_key.key())
             .or_err(InternalError, "invalid peer client cert or key")?;
     }
 
@@ -243,9 +243,9 @@ fn create_s2n_config(
         )?;
     }
 
-    Ok(builder
+    builder
         .build()
-        .or_err(InternalError, "failed to build s2n config")?)
+        .or_err(InternalError, "failed to build s2n config")
 }
 
 #[derive(Clone)]

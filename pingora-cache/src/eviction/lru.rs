@@ -85,6 +85,15 @@ impl<const N: usize> Manager<N> {
         (u64key(key) % N as u64) as usize
     }
 
+    /// Peek at the least-recently-used key in the given shard without evicting it.
+    ///
+    /// Returns the cache key at the LRU tail of the shard, or `None` if empty.
+    /// Useful for reporting the eviction frontier (the age of the next item
+    /// that would be evicted).
+    pub fn peek_lru(&self, shard: usize) -> Option<CompactCacheKey> {
+        self.0.peek_lru(shard).map(|(key, _weight)| key)
+    }
+
     /// Serialize the given shard
     pub fn serialize_shard(&self, shard: usize) -> Result<Vec<u8>> {
         use rmp_serde::encode::Serializer;
@@ -613,5 +622,43 @@ mod test {
 
         // Cleanup test directory
         std::fs::remove_dir_all(dir_path).unwrap();
+    }
+
+    #[test]
+    fn test_peek_lru() {
+        let lru = Manager::<1>::with_capacity(20, 20);
+        let until = SystemTime::now();
+
+        // empty shard returns None
+        assert!(lru.peek_lru(0).is_none());
+
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        lru.admit(key1.clone(), 1, until);
+        // single item: it's both the head and the tail
+        assert_eq!(lru.peek_lru(0).unwrap(), key1);
+
+        // admit more keys to push key1 to the tail
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        lru.admit(key2.clone(), 1, until);
+        for i in 0..5 {
+            lru.admit(
+                CacheKey::new("", format!("f{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        // key1 is the LRU tail (admitted first)
+        assert_eq!(lru.peek_lru(0).unwrap(), key1);
+
+        // promote key1 — now key2 becomes the tail
+        lru.access(&key1, 1, until);
+        assert_eq!(lru.peek_lru(0).unwrap(), key2);
+
+        // peek_lru should not remove the item
+        assert_eq!(lru.peek_lru(0).unwrap(), key2);
+        assert!(lru.peek(&key2));
+
+        // out-of-bounds shard returns None
+        assert!(lru.peek_lru(999).is_none());
     }
 }

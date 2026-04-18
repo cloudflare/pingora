@@ -19,6 +19,7 @@ use pingora_cache::{
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
+use std::any::Any;
 use std::time::Duration;
 
 /// The interface to control the HTTP proxy
@@ -292,6 +293,39 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Adjust upstream modules before they process the response header.
+    ///
+    /// This filter is called when the upstream response header arrives, before upstream modules
+    /// (such as `upstream_compression`) run their response header filter. Use this to configure
+    /// module behavior based on the response, e.g. setting a dictionary for dictionary-based
+    /// content encoding.
+    ///
+    /// This filter may be called more than once per request if the upstream sends informational
+    /// (1xx) response headers before the final response. Implementations can check
+    /// [`upstream_response.status.is_informational()`](http::StatusCode::is_informational) to
+    /// distinguish informational headers from the final response if needed.
+    ///
+    /// `end_of_stream` indicates whether the response header is also the end of the response
+    /// (e.g. for HEAD responses or 304s with no body).
+    ///
+    /// The response header is provided as an immutable reference. To modify the response header
+    /// itself, use [`Self::upstream_response_filter()`] instead.
+    ///
+    /// This filter requires the `adjust_upstream_modules` feature to be enabled.
+    #[cfg(feature = "adjust_upstream_modules")]
+    async fn adjust_upstream_modules(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// Modify the response header from the upstream
     ///
     /// The modification is before caching, so any change here will be stored in the cache if enabled.
@@ -436,6 +470,39 @@ pub trait ProxyHttp {
     where
         Self::CTX: Send + Sync,
     {
+    }
+
+    /// Called after [`Self::logging`] when the downstream connection will be reused for another
+    /// HTTP/1.x keepalive request. The returned value, if any, will be carried to the next
+    /// request on this connection and delivered via [`Self::on_connection_reuse`].
+    ///
+    /// Use this to persist debugging or timing information across keepalive requests.
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is also called on error paths when the downstream connection is eligible for reuse.
+    ///
+    /// The default implementation returns `None` (no context persisted).
+    fn persist_connection_context(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// Called at the start of a new request on a reused HTTP/1.x keepalive connection,
+    /// before [`Self::early_request_filter`]. The `prev_ctx` argument is the value returned
+    /// by [`Self::persist_connection_context`] from the previous request on this connection.
+    ///
+    /// This is only called for HTTP/1.x keepalive connections, not for HTTP/2.
+    /// It is not called when `persist_connection_context` returned `None` on the previous request.
+    ///
+    /// Use this to transfer state from the previous request into the new request's context.
+    fn on_connection_reuse(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _prev_ctx: Box<dyn Any + Send + Sync>,
+    ) {
     }
 
     /// A value of true means that the log message will be suppressed. The default value is false.

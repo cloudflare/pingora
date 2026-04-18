@@ -128,9 +128,18 @@ impl<T, const N: usize> Lru<T, N> {
 
     /// Promote to the top n of the LRU
     ///
-    /// This function is a bit more efficient in terms of reducing lock contention because it
-    /// will acquire a write lock only if the key is outside top n but only acquires a read lock
-    /// when the key is already in the top n.
+    /// This function acquires a read lock first to check if the key is already
+    /// in the top `n` positions. If so, it returns early without a write lock.
+    /// Otherwise it falls through to a write lock for the actual promotion.
+    ///
+    /// **Performance note**: this optimization only helps when `n` covers a
+    /// significant fraction of the shard. At production scale (~100K+ items
+    /// per shard), hot items are rarely in the top N positions, so the
+    /// read-lock scan is usually wasted work that adds latency without
+    /// reducing contention. Benchmarks (`cargo bench --bench bench_lru`)
+    /// show that plain [`promote()`](Self::promote) is faster at scale.
+    /// Consider using `promote()` directly unless profiling shows a clear
+    /// benefit for your workload.
     ///
     /// Return false if the item doesn't exist
     pub fn promote_top_n(&self, key: u64, top: usize) -> bool {
@@ -224,6 +233,21 @@ impl<T, const N: usize> Lru<T, N> {
     /// Check the weight of a key without changing the order in LRU.
     pub fn peek_weight(&self, key: u64) -> Option<usize> {
         self.units[get_shard(key, N)].read().peek_weight(key)
+    }
+
+    /// Peek at the least-recently-used item in the given shard without removing it.
+    ///
+    /// Returns a clone of the data and the weight, or `None` if the shard is empty
+    /// or `shard >= N`.
+    pub fn peek_lru(&self, shard: usize) -> Option<(T, usize)>
+    where
+        T: Clone,
+    {
+        self.units
+            .get(shard)?
+            .read()
+            .peek_lru()
+            .map(|(data, weight)| (data.clone(), weight))
     }
 
     /// Return the current total weight.
@@ -374,6 +398,19 @@ impl<T> LruUnit<T> {
             (node.data, node.weight)
         })
     }
+
+    /// Peek at the least-recently-used item without removing it.
+    ///
+    /// Returns a reference to the data and weight of the tail item, or `None`
+    /// if empty.
+    pub fn peek_lru(&self) -> Option<(&T, usize)> {
+        self.order
+            .tail()
+            .and_then(|idx| self.order.peek(idx))
+            .and_then(|key| self.lookup_table.get(&key))
+            .map(|node| (&node.data, node.weight))
+    }
+
     // TODO: scan the tail up to K elements to decide which ones to evict
 
     pub fn remove(&mut self, key: u64) -> Option<(T, usize)> {
@@ -696,6 +733,29 @@ mod test_lru {
         assert_eq!(evicted.len(), 2);
         assert_eq!(lru.evicted_len(), 2);
     }
+
+    #[test]
+    fn test_peek_lru() {
+        let lru = Lru::<u32, 1>::with_capacity(10, 10);
+
+        // empty shard
+        assert!(lru.peek_lru(0).is_none());
+
+        lru.admit(1, 10, 1);
+        assert_eq!(lru.peek_lru(0).unwrap(), (10, 1));
+
+        lru.admit(2, 20, 2);
+        // key 1 is LRU tail
+        assert_eq!(lru.peek_lru(0).unwrap(), (10, 1));
+
+        // promote key 1
+        lru.promote(1);
+        // key 2 is now LRU tail
+        assert_eq!(lru.peek_lru(0).unwrap(), (20, 2));
+
+        // out-of-bounds returns None
+        assert!(lru.peek_lru(999).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -864,5 +924,34 @@ mod test_lru_unit {
         assert!(lru.insert_tail(5, 5, 5));
         assert_eq!(lru.used_weight(), 1 + 3 + 4 + 5);
         assert_lru(&lru, &[2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_peek_lru() {
+        let mut lru = LruUnit::with_capacity(10);
+
+        // empty returns None
+        assert!(lru.peek_lru().is_none());
+
+        // single item is both head and tail
+        lru.admit(1, 10, 1);
+        let (data, weight) = lru.peek_lru().unwrap();
+        assert_eq!(*data, 10);
+        assert_eq!(weight, 1);
+
+        // second admission pushes first to tail
+        lru.admit(2, 20, 2);
+        let (data, _) = lru.peek_lru().unwrap();
+        assert_eq!(*data, 10); // key 1 is LRU tail
+
+        // promote key 1 — now key 2 is tail
+        lru.access(1);
+        let (data, _) = lru.peek_lru().unwrap();
+        assert_eq!(*data, 20); // key 2 is now LRU tail
+
+        // peek doesn't remove
+        assert!(lru.peek_lru().is_some());
+        assert!(lru.peek(1).is_some());
+        assert!(lru.peek(2).is_some());
     }
 }

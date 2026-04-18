@@ -47,6 +47,7 @@ hyper = "0.14"
 tokio-tungstenite = "0.20.1"
 pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
 pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
+pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -69,7 +70,9 @@ s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+adjust_upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
+trace = ["pingora-cache/trace"]
 
 [[example]]
 name = "connection_filter"

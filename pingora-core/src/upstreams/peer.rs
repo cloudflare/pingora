@@ -431,8 +431,14 @@ pub struct PeerOptions {
     pub s2n_security_policy: Option<S2NPolicy>,
     #[cfg(feature = "s2n")]
     pub max_blinding_delay: Option<u32>,
-    // how many concurrent h2 stream are allowed in the same connection
+    /// How many concurrent h2 streams are allowed in the same connection.
     pub max_h2_streams: usize,
+    /// Initial per-stream H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_stream_window_size: Option<u32>,
+    /// Initial connection-level H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_connection_window_size: Option<u32>,
     /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
     /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
@@ -494,6 +500,8 @@ impl PeerOptions {
             #[cfg(feature = "s2n")]
             max_blinding_delay: None,
             max_h2_streams: 1,
+            h2_stream_window_size: None,
+            h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
@@ -685,6 +693,10 @@ impl Hash for HttpPeer {
         self.group_key.hash(state);
         // max h2 stream settings
         self.options.max_h2_streams.hash(state);
+        // h2_stream_window_size and h2_connection_window_size are intentionally excluded
+        // from the reuse hash for now. These are per-connection settings applied at handshake
+        // time and may be revisited alongside other h2 settings that could be dynamically
+        // adjusted over the lifetime of a connection.
     }
 }
 

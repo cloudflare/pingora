@@ -46,7 +46,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -203,6 +203,17 @@ where
             process_custom_session: on_custom,
             h2_options: None,
         }
+    }
+
+    /// Return the number of times a pooled upstream connection was found to contain
+    /// unexpected data from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.client_upstream.unexpected_data_connection_count()
+    }
+
+    /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.client_upstream.unexpected_data_connection_counter()
     }
 
     /// Initialize the downstream modules for this proxy.
@@ -432,7 +443,10 @@ where
 
         if reuse {
             // TODO: log error
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
@@ -599,57 +613,115 @@ impl Session {
             .await
     }
 
-    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        let mut seen_upgraded = self.was_upgraded();
-        for task in tasks.iter_mut() {
-            match task {
-                HttpTask::Header(resp, end) => {
-                    self.downstream_modules_ctx
-                        .response_header_filter(resp, *end)
-                        .await?;
-                }
-                HttpTask::Body(data, end) => {
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::UpgradedBody(data, end) => {
-                    seen_upgraded = true;
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::Trailer(trailers) => {
-                    if let Some(buf) = self
-                        .downstream_modules_ctx
-                        .response_trailer_filter(trailers)?
-                    {
-                        // Write the trailers into the body if the filter
-                        // returns a buffer.
-                        //
-                        // Note, this will not work if end of stream has already
-                        // been seen or we've written content-length bytes.
-                        // (Trailers should never come after upgraded body)
-                        *task = HttpTask::Body(Some(buf), true);
-                    }
-                }
-                HttpTask::Done => {
-                    // `Done` can be sent in certain response paths to mark end
-                    // of response if not already done via trailers or body with
-                    // end flag set.
-                    // If the filter returns body bytes on Done,
-                    // write them into the response.
+    // Run downstream module response filters on a single task, updating
+    // `seen_upgraded` to track whether an upgrade has been seen. Used by both
+    // `send_downstream_proxy_task` and `write_response_tasks`.
+    async fn downstream_response_task_filter(
+        &mut self,
+        task: &mut HttpTask,
+        seen_upgraded: &mut bool,
+    ) -> Result<()> {
+        match task {
+            HttpTask::Header(resp, end) => {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+            }
+            HttpTask::Body(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::UpgradedBody(data, end) => {
+                *seen_upgraded = true;
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .downstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    // Write the trailers into the body if the filter
+                    // returns a buffer.
                     //
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
-                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        if seen_upgraded {
-                            *task = HttpTask::UpgradedBody(Some(buf), true);
-                        } else {
-                            *task = HttpTask::Body(Some(buf), true);
-                        }
+                    // (Trailers should never come after upgraded body)
+                    *task = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                // `Done` can be sent in certain response paths to mark end
+                // of response if not already done via trailers or body with
+                // end flag set.
+                // If the filter returns body bytes on Done,
+                // write them into the response.
+                //
+                // Note, this will not work if end of stream has already
+                // been seen or we've written content-length bytes.
+                if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                    if *seen_upgraded {
+                        *task = HttpTask::UpgradedBody(Some(buf), true);
+                    } else {
+                        *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Failed */ }
             }
+            _ => { /* Failed */ }
+        }
+        Ok(())
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing after running
+    /// downstream module filters. This allows decoupling cache writes from
+    /// downstream writes.
+    ///
+    /// Only works with sessions that support the proxy task API (currently H1).
+    ///
+    /// # Panics
+    /// Panics if the session doesn't support the proxy task API.
+    /// Use `write_response_tasks()` for sessions that don't support the proxy task API.
+    pub async fn send_downstream_proxy_task(&mut self, mut task: HttpTask) -> Result<()> {
+        let mut seen_upgraded = self.was_upgraded();
+        self.downstream_response_task_filter(&mut task, &mut seen_upgraded)
+            .await?;
+        self.downstream_session.send_downstream_proxy_task(task);
+        Ok(())
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    ///
+    /// When disabled, the proxy falls back to the blocking `write_response_tasks`
+    /// path. This can be called from request filters to opt out on a per-request
+    /// basis.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.downstream_session.set_proxy_tasks_enabled(enabled);
+    }
+
+    /// Check if there are pending downstream tasks queued for writing.
+    /// Used for backpressure - don't queue more cache tasks if we have pending writes.
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_tasks(&self) -> bool {
+        self.downstream_session.supports_proxy_task_api()
+            && self.downstream_session.has_pending_downstream_proxy_tasks()
+    }
+
+    /// Write all queued downstream proxy tasks. This is cancel-safe and can be called
+    /// in a select! loop while waiting for upstream tasks.
+    /// For sessions that don't support the proxy task API, this is a no-op.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        if self.downstream_session.supports_proxy_task_api() {
+            self.downstream_session.write_downstream_proxy_tasks().await
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
+        for task in tasks.iter_mut() {
+            self.downstream_response_task_filter(task, &mut seen_upgraded)
+                .await?;
         }
         self.downstream_session.response_duplex_vec(tasks).await
     }
@@ -800,7 +872,10 @@ where
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+                    if let Some(uc) = self.inner.persist_connection_context(&session, &ctx) {
+                        persistent_settings.set_user_context(uc);
+                    }
                     return session
                         .downstream_session
                         .finish()
@@ -986,7 +1061,10 @@ where
         session.downstream_session.on_proxy_failure(e);
 
         if res.can_reuse_downstream {
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
@@ -1150,9 +1228,12 @@ where
 {
     async fn process_new_http(
         self: &Arc<Self>,
-        session: HttpSession,
+        mut session: HttpSession,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
+        // Extract user context from the previous request before the session is moved into the Box
+        let prev_user_ctx = session.take_connection_user_context();
+
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
@@ -1170,7 +1251,14 @@ where
             session.set_keepalive(None);
         }
 
-        let ctx = self.inner.new_ctx();
+        let mut ctx = self.inner.new_ctx();
+
+        // Deliver user context from the previous request on this reused connection
+        if let Some(prev_ctx) = prev_user_ctx {
+            self.inner
+                .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
+        }
+
         self.process_request(session, ctx).await
     }
 

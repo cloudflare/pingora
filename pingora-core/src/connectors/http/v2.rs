@@ -27,6 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,6 +129,14 @@ impl ConnectionRef {
         self.0.shutting_down.load(Ordering::Relaxed)
     }
 
+    /// Mark this connection for shutdown.
+    ///
+    /// No new streams will be created on this connection and
+    /// it will be discarded once all active streams are released.
+    pub fn mark_shutdown(&self) {
+        self.0.shutting_down.store(true, Ordering::Relaxed);
+    }
+
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
         // Atomically check if the current_stream is over the limit
@@ -144,16 +153,24 @@ impl ConnectionRef {
             Err(e) => {
                 // fail to create the stream, reset the counter
                 self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
-                // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
-                // accepts new streams. We can still try to create new connection.
-                if e.root_cause()
+
+                // Check for graceful shutdown conditions where we can retry with a new connection
+                let is_graceful_shutdown = e
+                    .root_cause()
                     .downcast_ref::<h2::Error>()
                     .map(|e| {
-                        e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR)
+                        // Remote sends GOAWAY(NO_ERROR): graceful shutdown
+                        (e.is_go_away() && e.is_remote() && e.reason() == Some(h2::Reason::NO_ERROR))
+                        // Or broken pipe wrapped inside an h2::Error: stream closed unexpectedly
+                        || (e.is_io()
+                            && e.get_io()
+                                .map(|io| io.kind() == ErrorKind::BrokenPipe)
+                                .unwrap_or(false))
                     })
-                    .unwrap_or(false)
-                {
-                    self.0.shutting_down.store(true, Ordering::Relaxed);
+                    .unwrap_or(false);
+
+                if is_graceful_shutdown {
+                    self.mark_shutdown();
                     Ok(None)
                 } else {
                     Err(e)
@@ -175,6 +192,21 @@ impl InUsePool {
         }
     }
 
+    /// Attempt to remove an empty [`PoolNode`] entry from the pools `HashMap`.
+    ///
+    /// Same rationale as [`ConnectionPool::try_remove_empty_node`]: prevents
+    /// unbounded growth when many unique reuse hashes are seen over time.
+    /// The write lock + re-check ensures we never remove a node that was
+    /// concurrently repopulated.
+    fn try_remove_empty_node(&self, reuse_hash: u64) {
+        let mut pools = self.pools.write();
+        if let Some(pool) = pools.get(&reuse_hash) {
+            if pool.is_empty() {
+                pools.remove(&reuse_hash);
+            }
+        }
+    }
+
     pub fn insert(&self, reuse_hash: u64, conn: ConnectionRef) {
         {
             let pools = self.pools.read();
@@ -184,9 +216,15 @@ impl InUsePool {
             }
         } // drop read lock
 
+        let mut pools = self.pools.write();
+        // Double-check: another thread may have inserted a node between
+        // dropping the read lock and acquiring this write lock.
+        if let Some(pool) = pools.get(&reuse_hash) {
+            pool.insert(conn.id(), conn);
+            return;
+        }
         let pool = PoolNode::new();
         pool.insert(conn.id(), conn);
-        let mut pools = self.pools.write();
         pools.insert(reuse_hash, pool);
     }
 
@@ -194,19 +232,42 @@ impl InUsePool {
     // the caller should return the conn ref to this pool if there are still
     // capacity left for more streams
     pub fn get(&self, reuse_hash: u64) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        pools.get(&reuse_hash)?.get_any().map(|v| v.1)
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            match pools.get(&reuse_hash) {
+                Some(pool) => match pool.get_any() {
+                    Some((_, conn)) => (Some(conn), pool.is_empty()),
+                    None => (None, true),
+                },
+                None => (None, false),
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
+        }
+
+        result
     }
 
     // release a h2_stream, this functional will cause an ConnectionRef to be returned (if exist)
     // the caller should update the ref and then decide where to put it (in use pool or idle)
     pub fn release(&self, reuse_hash: u64, id: UniqueIDType) -> Option<ConnectionRef> {
-        let pools = self.pools.read();
-        if let Some(pool) = pools.get(&reuse_hash) {
-            pool.remove(id)
-        } else {
-            None
+        let (result, maybe_empty) = {
+            let pools = self.pools.read();
+            if let Some(pool) = pools.get(&reuse_hash) {
+                let removed = pool.remove(id);
+                (removed, pool.is_empty())
+            } else {
+                (None, false)
+            }
+        }; // read lock released here
+
+        if maybe_empty {
+            self.try_remove_empty_node(reuse_hash);
         }
+
+        result
     }
 }
 
@@ -282,8 +343,13 @@ impl Connector {
                 // the caller that the server speaks h2c
             }
         }
-        let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let peer_options = peer.get_peer_options();
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = peer_options.map_or(1, |o| o.max_h2_streams);
+        settings.ping_interval = peer.h2_ping_interval();
+        settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
+        settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
+        let conn = handshake(stream, settings).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -423,17 +489,82 @@ impl Connector {
 // 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
 const H2_WINDOW_SIZE: u32 = 1 << 23;
 
-pub async fn handshake(
-    stream: Stream,
-    max_streams: usize,
-    h2_ping_interval: Option<Duration>,
-) -> Result<ConnectionRef> {
+/// Maximum allowed H2 window size per [RFC 9113 §6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7).
+const H2_MAX_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
+
+/// Settings for HTTP/2 handshake.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use pingora_core::connectors::http::v2::{handshake, H2HandshakeSettings};
+///
+/// // With custom window sizes
+/// let mut settings = H2HandshakeSettings::new();
+/// settings.max_streams = 100;
+/// settings.stream_window_size = Some(1 << 20);  // 1MiB
+/// settings.connection_window_size = Some(1 << 24);  // 16MiB
+/// let conn = handshake(stream, settings).await?;
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct H2HandshakeSettings {
+    /// The maximum number of concurrent streams allowed on this connection.
+    pub max_streams: usize,
+    /// Optional interval for sending H2 ping frames to keep the connection alive.
+    pub ping_interval: Option<Duration>,
+    /// Optional initial per-stream receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub stream_window_size: Option<u32>,
+    /// Optional initial connection-level receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub connection_window_size: Option<u32>,
+}
+
+impl H2HandshakeSettings {
+    /// Create a new `H2HandshakeSettings` with all defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Perform an HTTP/2 handshake on the given stream with the given settings.
+pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
+
+    let max_streams = settings.max_streams;
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
     if max_streams == 0 {
         return Error::e_explain(H2Error, "zero max_stream configured");
+    }
+
+    // Validate window sizes against RFC 9113 §6.9.1 limit
+    // https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7
+    if settings
+        .stream_window_size
+        .is_some_and(|w| w == 0 || w > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(
+            H2Error,
+            format!(
+                "stream_window_size must be between 1 and {} (2^31-1)",
+                H2_MAX_WINDOW_SIZE
+            ),
+        );
+    }
+    if settings
+        .connection_window_size
+        .is_some_and(|w| w == 0 || w > H2_MAX_WINDOW_SIZE)
+    {
+        return Error::e_explain(
+            H2Error,
+            format!(
+                "connection_window_size must be between 1 and {} (2^31-1)",
+                H2_MAX_WINDOW_SIZE
+            ),
+        );
     }
 
     let id = stream.id();
@@ -446,16 +577,16 @@ pub async fn handshake(
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
-    // TODO: make these configurable
+    let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
+    let conn_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
     let (send_req, connection) = Builder::new()
         .enable_push(false)
         .initial_max_send_streams(max_streams)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
-        .initial_window_size(H2_WINDOW_SIZE)
-        // should this be max_streams * H2_WINDOW_SIZE?
-        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .initial_window_size(stream_window)
+        .initial_connection_window_size(conn_window)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
@@ -477,7 +608,7 @@ pub async fn handshake(
             connection,
             id,
             closed_tx,
-            h2_ping_interval,
+            settings.ping_interval,
             ping_timeout_clone,
         )
         .await;
@@ -497,6 +628,9 @@ pub async fn handshake(
 mod tests {
     use super::*;
     use crate::upstreams::peer::HttpPeer;
+    use bytes::Bytes;
+    use http::{Response, StatusCode};
+    use pingora_http::RequestHeader;
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
@@ -630,6 +764,63 @@ mod tests {
         assert_eq!(id, h2_5.conn.id());
     }
 
+    /// `spawn_stream` must return `Ok(None)` and mark the connection as shutting
+    /// down when the underlying I/O channel is closed (BrokenPipe).  This
+    /// exercises the BrokenPipe branch of `spawn_stream` directly without going
+    /// through the full proxy stack.
+    #[tokio::test]
+    async fn test_spawn_stream_broken_pipe_marks_shutdown() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        // Drive the H2 client connection task in the background.
+        // When the connection terminates it will signal via closed_tx.
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+            // Signal that the connection task has finished.
+            let _ = closed_tx.send(true);
+        });
+
+        // Complete the server-side H2 handshake, then drop the server connection.
+        // Dropping server_conn closes the write end of the duplex, so the client
+        // connection task will read EOF and terminate with BrokenPipe.
+        let server_conn = h2::server::handshake(server_io).await.unwrap();
+        drop(server_conn);
+
+        // Wait until the client connection task has fully processed the EOF.
+        conn_handle.await.unwrap();
+
+        // spawn_stream must detect BrokenPipe, mark shutdown, and return Ok(None)
+        // so the caller can retry on a fresh connection rather than propagating the error.
+        let result = conn.spawn_stream().await;
+        assert!(result.is_ok(), "expected Ok(None), got Err");
+        assert!(result.unwrap().is_none(), "expected None stream");
+        assert!(
+            conn.is_shutting_down(),
+            "connection should be marked as shutting down"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_shutdown_prevents_new_streams() {
+        let (client_io, _server_io) = tokio::io::duplex(65536);
+        let (send_req, _connection) = h2::client::handshake(client_io).await.unwrap();
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        assert!(conn.more_streams_allowed());
+        assert!(!conn.is_shutting_down());
+
+        conn.mark_shutdown();
+
+        assert!(conn.is_shutting_down());
+        assert!(!conn.more_streams_allowed());
+    }
+
     #[cfg(all(feature = "any_tls", unix))]
     #[tokio::test]
     async fn test_h2_reuse_rejects_fd_mismatch() {
@@ -699,5 +890,111 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_handshake_settings_validation() {
+        use super::H2HandshakeSettings;
+
+        // Test zero stream window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(0);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("stream_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for stream_window_size = 0"),
+        }
+
+        // Test zero connection window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.connection_window_size = Some(0);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("connection_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for connection_window_size = 0"),
+        }
+
+        // Test exceeding max stream window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(super::H2_MAX_WINDOW_SIZE + 1);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("stream_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for stream_window_size > max"),
+        }
+
+        // Test exceeding max connection window size is rejected
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.connection_window_size = Some(super::H2_MAX_WINDOW_SIZE + 1);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("connection_window_size must be between 1"),
+                "Unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error for connection_window_size > max"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_h2_handshake_custom_window_sizes() {
+        // Test that valid custom window sizes are accepted and handshake succeeds
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.stream_window_size = Some(1 << 20); // 1MiB
+        settings.connection_window_size = Some(1 << 24); // 16MiB
+
+        let (client, server) = tokio::io::duplex(65536);
+
+        // Spawn server side
+        tokio::spawn(async move {
+            let mut server_conn = h2::server::handshake(server).await.unwrap();
+            if let Some(result) = server_conn.accept().await {
+                let (_request, mut respond) = result.unwrap();
+                let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                let mut stream = respond.send_response(resp, false).unwrap();
+                stream.send_data(Bytes::from("ok"), true).unwrap();
+                server_conn.graceful_shutdown();
+            }
+            // Drive the server connection until the client closes
+            while let Some(_res) = server_conn.accept().await {}
+        });
+
+        // Client side - should succeed with custom window sizes
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+
+        // Verify we can spawn a stream and complete a request/response cycle
+        let mut stream = conn.spawn_stream().await.unwrap().unwrap();
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        stream
+            .write_request_header(Box::new(request), true)
+            .unwrap();
+
+        stream.read_response_header().await.unwrap();
+        assert_eq!(stream.response_header().unwrap().status, 200);
     }
 }

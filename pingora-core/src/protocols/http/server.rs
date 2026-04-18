@@ -27,6 +27,7 @@ use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::any::Any;
 use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
@@ -317,6 +318,26 @@ impl Session {
         }
     }
 
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        if let Self::H1(s) = self {
+            s.set_connection_user_context(ctx);
+        }
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` for h2, subrequest, and custom sessions, or if no context was persisted.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        if let Self::H1(s) = self {
+            s.take_connection_user_context()
+        } else {
+            None
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
@@ -433,6 +454,22 @@ impl Session {
             Self::H2(_) => {}         // always ignored
             Self::Subrequest(_) => {} // always ignored
             Self::Custom(_) => {}     // always ignored
+        }
+    }
+
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
+    /// stays pending so the proxy can finish delivering the upstream response.
+    ///
+    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        match self {
+            Self::H1(s) => s.set_abort_on_close(abort),
+            Self::H2(_) => {}
+            Self::Subrequest(_) => {}
+            Self::Custom(_) => {}
         }
     }
 
@@ -772,6 +809,69 @@ impl Session {
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
             Self::Custom(_) => None,
+        }
+    }
+
+    /// Check if this session supports the cancel-safe proxy task API.
+    ///
+    /// For HTTP/1.x, this can be toggled per-session via
+    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    pub fn supports_proxy_task_api(&self) -> bool {
+        match self {
+            Self::H1(s) => s.proxy_tasks_enabled(),
+            _ => false,
+        }
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        if let Self::H1(s) = self {
+            s.set_proxy_tasks_enabled(enabled);
+        }
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
+        match self {
+            Self::H1(s) => s.send_proxy_task(task),
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
+
+    /// Check if there are pending downstream proxy tasks queued for writing.
+    ///
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
+        match self {
+            Self::H1(s) => s.has_pending_proxy_tasks(),
+            Self::H2(_) => false,         // TODO: implement for H2
+            Self::Subrequest(_) => false, // TODO: implement for subrequests
+            Self::Custom(_) => false,     // TODO: implement for custom
+        }
+    }
+
+    /// Write all queued downstream proxy tasks in a cancel-safe manner.
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.write_proxy_tasks().await,
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
 }

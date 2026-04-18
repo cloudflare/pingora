@@ -814,14 +814,67 @@ pub mod async_write_vec {
 
         fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let me = &mut *self;
-            while me.buf.has_remaining() {
-                let n = ready!(Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf))?;
-                if n == 0 {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-            }
-            Poll::Ready(Ok(()))
+            poll_write_vec_all_buf(ctx, Pin::new(&mut *me.writer), me.buf)
         }
+    }
+
+    /// Primitive poll function to write ALL bytes from a buffer using vectored writes.
+    /// Keeps polling `poll_write_vec` until the entire buffer is written.
+    /// The buffer is advanced as bytes are written.
+    ///
+    /// Returns Poll::Ready(Ok(())) when all bytes are written.
+    /// Returns WriteZero error if poll_write_vec returns 0.
+    ///
+    /// This is essentially a polling form of tokio's
+    /// [`write_all_buf`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWriteExt.html#method.write_all_buf).
+    // TODO: we should be able to switch over to polling the future from tokio AsyncWriteExt directly,
+    // for now we continue to use the old trait.
+    pub fn poll_write_vec_all_buf<W, B>(
+        ctx: &mut Context<'_>,
+        mut writer: Pin<&mut W>,
+        buf: &mut B,
+    ) -> Poll<io::Result<()>>
+    where
+        W: AsyncWriteVec + ?Sized,
+        B: Buf,
+    {
+        while buf.has_remaining() {
+            let n = ready!(writer.as_mut().poll_write_vec(ctx, buf))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Primitive poll function to write ALL bytes from a buffer using regular writes.
+    /// Keeps polling `poll_write` until the entire buffer is written.
+    /// The buffer is advanced as bytes are written.
+    ///
+    /// Returns Poll::Ready(Ok(())) when all bytes are written.
+    /// Returns WriteZero error if poll_write returns 0.
+    ///
+    /// This is essentially a polling form of tokio's
+    /// [`write_all_buf`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWriteExt.html#method.write_all_buf)
+    /// though we explicitly use non-vectored writes in this case for strict parity with the
+    /// original `write_all` method.
+    pub fn poll_write_all_buf<W, B>(
+        ctx: &mut Context<'_>,
+        mut writer: Pin<&mut W>,
+        buf: &mut B,
+    ) -> Poll<io::Result<()>>
+    where
+        W: AsyncWrite + ?Sized,
+        B: Buf,
+    {
+        while buf.has_remaining() {
+            let n = ready!(writer.as_mut().poll_write(ctx, buf.chunk()))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            buf.advance(n);
+        }
+        Poll::Ready(Ok(()))
     }
 
     /* from https://github.com/tokio-rs/tokio/blob/master/tokio-util/src/lib.rs#L177 */

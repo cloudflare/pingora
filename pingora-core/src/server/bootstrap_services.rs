@@ -18,13 +18,17 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::broadcast;
 
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 
 #[cfg(unix)]
+use crate::server::daemon::notify_parent_ready_for_fds;
+#[cfg(unix)]
 use crate::server::ListenFds;
+#[cfg(unix)]
+use std::time::Duration;
 
 use crate::{
     prelude::Opt,
@@ -32,30 +36,19 @@ use crate::{
     services::{background::BackgroundService, ServiceReadyNotifier},
 };
 
+/// Default timeout for retrying `SIGUSR1` to the parent when it fails with `EPERM`.
+#[cfg(unix)]
+const DEFAULT_DAEMON_NOTIFY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Service that allows the bootstrap process to be delayed until after
 /// dependencies are ready
 pub struct BootstrapService {
     inner: Arc<Mutex<Bootstrap>>,
 }
 
-/// Sentry is typically started as part of the bootstrap process, but if the
-/// bootstrap service is used, we want to initialize Sentry before anything else
-/// to make sure errors are captured.
-pub struct SentryInitService {
-    inner: Arc<Mutex<Bootstrap>>,
-}
-
 impl BootstrapService {
     pub fn new(inner: &Arc<Mutex<Bootstrap>>) -> Self {
         BootstrapService {
-            inner: Arc::clone(inner),
-        }
-    }
-}
-
-impl SentryInitService {
-    pub fn new(inner: &Arc<Mutex<Bootstrap>>) -> Self {
-        SentryInitService {
             inner: Arc::clone(inner),
         }
     }
@@ -73,7 +66,17 @@ pub struct Bootstrap {
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
     #[cfg(unix)]
-    listen_fds: Option<ListenFds>,
+    listen_fds: ListenFds,
+
+    /// PID of the original parent process to notify via `SIGUSR1` after bootstrap completes.
+    /// Set when [`ServerConf::daemon_wait_for_ready`] is `true`.
+    #[cfg(unix)]
+    notify_parent_pid: Option<u32>,
+
+    /// How long to keep retrying `SIGUSR1` to the parent when it fails with `EPERM`.
+    /// See [`ServerConf::daemon_notify_timeout_seconds`].
+    #[cfg(unix)]
+    daemon_notify_timeout: std::time::Duration,
 
     #[cfg(feature = "sentry")]
     #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
@@ -82,6 +85,14 @@ pub struct Bootstrap {
     /// Panics and other events sentry captures will be sent to this DSN **only
     /// in release mode**
     pub sentry: Option<ClientOptions>,
+
+    /// The Sentry [`ClientInitGuard`](sentry::ClientInitGuard) returned by
+    /// [`sentry::init`].
+    ///
+    /// This guard must be kept alive for the lifetime of the server, because
+    /// dropping it flushes and disables the Sentry client.
+    #[cfg(all(not(debug_assertions), feature = "sentry"))]
+    sentry_guard: Option<sentry::ClientInitGuard>,
 }
 
 impl Bootstrap {
@@ -102,11 +113,20 @@ impl Bootstrap {
             upgrade,
             upgrade_sock,
             #[cfg(unix)]
-            listen_fds: None,
+            listen_fds: Arc::new(Mutex::new(Fds::new())),
+            #[cfg(unix)]
+            notify_parent_pid: None,
+            #[cfg(unix)]
+            daemon_notify_timeout: conf
+                .daemon_notify_timeout_seconds
+                .map(|n| Duration::from_secs(n.get()))
+                .unwrap_or(DEFAULT_DAEMON_NOTIFY_TIMEOUT),
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
             #[cfg(feature = "sentry")]
             sentry: None,
+            #[cfg(all(not(debug_assertions), feature = "sentry"))]
+            sentry_guard: None,
         }
     }
 
@@ -115,13 +135,33 @@ impl Bootstrap {
         self.sentry = sentry_config;
     }
 
-    /// Start sentry based on the configured options. To prevent multiple
-    /// initializations, this function will consume the sentry configuration
-    /// stored in the bootstrap
-    fn start_sentry(&mut self) {
-        // Only init sentry in release builds
-        #[cfg(all(not(debug_assertions), feature = "sentry"))]
-        let _guard = self.sentry.take().map(|opts| sentry::init(opts));
+    /// Store the parent process PID to notify via `SIGUSR1` after bootstrap completes.
+    /// Only relevant when [`ServerConf::daemon_wait_for_ready`] is `true`.
+    #[cfg(unix)]
+    pub fn set_notify_parent_pid(&mut self, pid: u32) {
+        self.notify_parent_pid = Some(pid);
+    }
+
+    /// Initialize the Sentry client from the configured [`ClientOptions`] and
+    /// store the resulting guard.
+    ///
+    /// The [`ClientOptions`] are preserved (not consumed) so that sentry can be
+    /// re-initialized after daemonization, when the transport thread spawned by
+    /// the previous [`sentry::init`] call is lost due to `fork()`.
+    ///
+    /// The resulting [`sentry::ClientInitGuard`] is stored in `self` so that it
+    /// lives as long as the [`Bootstrap`] (and therefore the
+    /// [`Server`](super::Server)), keeping the Sentry client active for the
+    /// lifetime of the process.
+    ///
+    /// Sentry is only initialized in release builds; in debug builds this is a
+    /// no-op.
+    #[cfg(feature = "sentry")]
+    pub(super) fn start_sentry(&mut self) {
+        #[cfg(not(debug_assertions))]
+        {
+            self.sentry_guard = self.sentry.as_ref().map(|opts| sentry::init(opts.clone()));
+        }
     }
 
     pub fn bootstrap(&mut self) {
@@ -136,14 +176,34 @@ impl Bootstrap {
             .send(ExecutionPhase::Bootstrap)
             .ok();
 
-        self.start_sentry();
+        // Temporarily initialize sentry if it isn't already active, so that
+        // errors during fd loading are captured. If sentry was already
+        // initialized with a persistent guard by `Server::run()` (as in
+        // the `bootstrap_as_a_service` path), we skip this to avoid
+        // clobbering the persistent guard.
+        #[cfg(all(not(debug_assertions), feature = "sentry"))]
+        let _guard = if self.sentry_guard.is_none() {
+            self.sentry.as_ref().map(|opts| sentry::init(opts.clone()))
+        } else {
+            None
+        };
 
         if self.test {
             info!("Server Test passed, exiting");
             std::process::exit(0);
         }
 
-        // load fds
+        // Notify the parent process that it can exit. It might seem like we should load the file
+        // descriptors from the old process first, but the purpose of this notification is to
+        // release the parent so that the process managing it (e.g. systemd) can continue and send
+        // a quit signal to the old process. That quit signal is required before the old process
+        // will start trying to send its file descriptors to us — so if we called load_fds first,
+        // we would be guaranteeing a timeout.
+        #[cfg(unix)]
+        if let Some(pid) = self.notify_parent_pid {
+            notify_parent_ready_for_fds(pid, self.daemon_notify_timeout);
+        }
+
         #[cfg(unix)]
         match self.load_fds(self.upgrade) {
             Ok(_) => {
@@ -168,17 +228,18 @@ impl Bootstrap {
 
     #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        let mut fds = Fds::new();
         if upgrade {
             debug!("Trying to receive socks");
-            fds.get_from_sock(self.upgrade_sock.as_str())?
+            let mut fds = Fds::new();
+            fds.get_from_sock(self.upgrade_sock.as_str())?;
+            // Mutate through the existing Arc so all clones held by services see the update.
+            *self.listen_fds.lock() = fds;
         }
-        self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
         Ok(())
     }
 
     #[cfg(unix)]
-    pub fn get_fds(&self) -> Option<ListenFds> {
+    pub fn get_fds(&self) -> ListenFds {
         self.listen_fds.clone()
     }
 }
@@ -191,18 +252,6 @@ impl BackgroundService for BootstrapService {
         notifier: ServiceReadyNotifier,
     ) {
         self.inner.lock().bootstrap();
-        notifier.notify_ready();
-    }
-}
-
-#[async_trait]
-impl BackgroundService for SentryInitService {
-    async fn start_with_ready_notifier(
-        &self,
-        _shutdown: ShutdownWatch,
-        notifier: ServiceReadyNotifier,
-    ) {
-        self.inner.lock().start_sentry();
         notifier.notify_ready();
     }
 }

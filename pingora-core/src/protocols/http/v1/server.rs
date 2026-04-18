@@ -27,14 +27,48 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
+use std::any::Any;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
+use super::header::HeaderWriter;
 use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
+
+/// Tracks which writer is currently processing a task.
+///
+/// This enables resuming writes after cancellation. Each variant stores the
+/// minimal data needed for cleanup after write completes.
+#[derive(Debug)]
+enum ProxyTaskWriter {
+    /// Currently writing a header task.
+    /// Stores: (header for `response_written`, end_stream flag)
+    WritingHeader(Box<ResponseHeader>, bool),
+    /// Currently writing a body task (`Body` or `UpgradedBody`).
+    /// Stores: (end_stream flag)
+    WritingBody(bool),
+    /// Currently finishing the body (writing last chunk + flush).
+    FinishingBody,
+}
+
+/// State for the cancel-safe proxy task write API.
+#[derive(Default)]
+struct ProxyTaskState {
+    /// Lazily initialized — `HeaderWriter::new()` heap-allocates.
+    header_writer: Option<HeaderWriter>,
+    tasks: VecDeque<HttpTask>,
+    current_writer: Option<ProxyTaskWriter>,
+}
+
+impl ProxyTaskState {
+    fn header_writer(&mut self) -> &mut HeaderWriter {
+        self.header_writer.get_or_insert_with(HeaderWriter::new)
+    }
+}
 
 /// The HTTP 1.x server session
 pub struct HttpSession {
@@ -51,6 +85,8 @@ pub struct HttpSession {
     body_reader: BodyReader,
     /// A state machine to track how to write the response body
     body_writer: BodyWriter,
+    /// Cancel-safe proxy task state.
+    proxy_task_state: ProxyTaskState,
     /// An internal buffer to buf multiple body writes to reduce the underlying syscalls
     body_write_buf: BytesMut,
     /// Track how many application (not on the wire) body bytes already sent
@@ -86,6 +122,20 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// User-defined context carried across requests on the same keepalive connection.
+    /// Set by [`HttpPersistentSettings::apply_to_session`](crate::apps::HttpPersistentSettings::apply_to_session),
+    /// consumed by the proxy layer via [`take_connection_user_context`](Self::take_connection_user_context).
+    connection_user_context: Option<Box<dyn Any + Send + Sync>>,
+    /// Whether the client has closed the TCP connection (sent FIN / read returned 0).
+    half_closed: bool,
+    /// When true (default), a client close after the request body is surfaced as a
+    /// `ConnectionClosed` error so the proxy aborts immediately. When false, the
+    /// close is tolerated and `read_body_or_idle` stays pending so the proxy can
+    /// finish delivering the upstream response (RFC 9112 Section 9.6).
+    abort_on_close: bool,
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    /// Defaults to false. Can be enabled via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    proxy_tasks_enabled: bool,
 }
 
 impl HttpSession {
@@ -108,6 +158,7 @@ impl HttpSession {
             preread_body: None,
             body_reader: BodyReader::new(false),
             body_writer: BodyWriter::new(),
+            proxy_task_state: ProxyTaskState::default(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             update_resp_headers: true,
@@ -126,6 +177,10 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            connection_user_context: None,
+            half_closed: false,
+            abort_on_close: true,
+            proxy_tasks_enabled: false,
         }
     }
 
@@ -495,101 +550,12 @@ impl HttpSession {
     /// Write the response header to the client.
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
-        if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
-            debug!("ignoring informational headers");
+        // Prepare header (handle upgrades, set headers, initialize body writer, serialize to bytes)
+        let Some((write_buf, flush)) = self.prepare_response_header(&mut header)? else {
+            // Header already sent or should be ignored
             return Ok(());
-        }
+        };
 
-        if let Some(resp) = self.response_written.as_ref() {
-            if !resp.status.is_informational() || self.upgraded {
-                warn!("Respond header is already sent, cannot send again");
-                return Ok(());
-            }
-        }
-
-        // if body unfinished, or request header was not finished reading
-        if self.close_on_response_before_downstream_finish
-            && (self.request_header.is_none() || !self.is_body_done())
-        {
-            debug!("set connection close before downstream finish");
-            self.set_keepalive(None);
-        }
-
-        // no need to add these headers to 1xx responses
-        if !header.status.is_informational() && self.update_resp_headers {
-            /* update headers */
-            header.insert_header(header::DATE, date::get_cached_date())?;
-
-            // TODO: make these lazy static
-            let connection_value = if self.will_keepalive() {
-                "keep-alive"
-            } else {
-                "close"
-            };
-            header.insert_header(header::CONNECTION, connection_value)?;
-        }
-
-        if header.status == 101 {
-            // make sure the connection is closed at the end when 101/upgrade is used
-            self.set_keepalive(None);
-        }
-
-        // Allow informational header (excluding 101) to pass through without affecting the state
-        // of the request
-        if header.status == 101 || !header.status.is_informational() {
-            // reset request body to done for incomplete upgrade handshakes
-            if let Some(upgrade_ok) = self.is_upgrade(&header) {
-                if upgrade_ok {
-                    debug!("ok upgrade handshake");
-                    // For ws we use HTTP1_0 do_read_body_until_closed
-                    //
-                    // On ws close the initiator sends a close frame and
-                    // then waits for a response from the peer, once it receives
-                    // a response it closes the conn. After receiving a
-                    // control frame indicating the connection should be closed,
-                    // a peer discards any further data received.
-                    // https://www.rfc-editor.org/rfc/rfc6455#section-1.4
-                    self.upgraded = true;
-                    // Now that the upgrade was successful, we need to change
-                    // how we interpret the rest of the body as pass-through.
-                    if self.body_reader.need_init() {
-                        self.init_body_reader();
-                    } else {
-                        // already initialized
-                        // immediately start reading the rest of the body as upgraded
-                        // (in practice most upgraded requests shouldn't have any body)
-                        //
-                        // TODO: https://datatracker.ietf.org/doc/html/rfc9110#name-upgrade
-                        // the most spec-compliant behavior is to switch interpretation
-                        // after sending the former body,
-                        // we immediately switch interpretation to match nginx
-                        self.body_reader.convert_to_close_delimited();
-                    }
-                } else {
-                    // this was a request that requested Upgrade,
-                    // but upstream did not comply
-                    debug!("bad upgrade handshake!");
-                    // continue to read body as-is, this is now just a regular request
-                }
-            }
-            self.init_body_writer(&header);
-        }
-
-        // Defense-in-depth: if response body is close-delimited, mark session
-        // as un-reusable
-        if self.body_writer.is_close_delimited() {
-            self.set_keepalive(None);
-        }
-
-        // Don't have to flush response with content length because it is less
-        // likely to be real time communication. So do flush when
-        // 1.1xx response: client needs to see it before the rest of response
-        // 2.No content length: the response could be generated in real time
-        let flush = header.status.is_informational()
-            || header.headers.get(header::CONTENT_LENGTH).is_none();
-
-        let mut write_buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
-        http_resp_header_to_buf(&header, &mut write_buf).unwrap();
         match self.underlying_stream.write_all(&write_buf).await {
             Ok(()) => {
                 // flush the stream if 1xx header or there is no response body
@@ -600,7 +566,6 @@ impl HttpSession {
                         .or_err(WriteError, "flushing response header")?;
                 }
                 self.response_written = Some(header);
-                self.body_bytes_sent += write_buf.len();
                 Ok(())
             }
             Err(e) => Error::e_because(WriteError, "writing response header", e),
@@ -660,6 +625,24 @@ impl HttpSession {
 
     pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
         self.keepalive_reuses_remaining
+    }
+
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// This is typically called by
+    /// [`HttpPersistentSettings::apply_to_session`](crate::apps::HttpPersistentSettings::apply_to_session)
+    /// during the keepalive reuse loop. The proxy layer consumes it via
+    /// [`take_connection_user_context`](Self::take_connection_user_context).
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        self.connection_user_context = ctx;
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` if this is the first request on the connection or if no context was
+    /// persisted by the previous request.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.connection_user_context.take()
     }
 
     /// Return whether the session will be keepalived for connection reuse.
@@ -726,6 +709,117 @@ impl HttpSession {
         }
     }
 
+    /// Prepare response header for writing: handle upgrades, set headers, initialize body writer.
+    /// This contains all the synchronous logic that should happen before writing the header.
+    /// Returns Ok(Some((bytes, should_flush))) if the header should be written, Ok(None) if should skip.
+    fn prepare_response_header(
+        &mut self,
+        header: &mut ResponseHeader,
+    ) -> Result<Option<(Bytes, bool)>> {
+        // Check if we should ignore informational responses
+        if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
+            debug!("ignoring informational headers");
+            return Ok(None);
+        }
+
+        // Check if we already sent a response header
+        if let Some(ref resp) = self.response_written {
+            if !resp.status.is_informational() || self.upgraded {
+                warn!("Respond header is already sent, cannot send again");
+                return Ok(None);
+            }
+        }
+
+        // if body unfinished, or request header was not finished reading
+        if self.close_on_response_before_downstream_finish
+            && (self.request_header.is_none() || !self.is_body_done())
+        {
+            debug!("set connection close before downstream finish");
+            self.set_keepalive(None);
+        }
+
+        // no need to add these headers to 1xx responses
+        if !header.status.is_informational() && self.update_resp_headers {
+            /* update headers */
+            header.insert_header(header::DATE, date::get_cached_date())?;
+
+            // TODO: make these lazy static
+            let connection_value = if self.will_keepalive() {
+                "keep-alive"
+            } else {
+                "close"
+            };
+            header.insert_header(header::CONNECTION, connection_value)?;
+        }
+
+        if header.status == 101 {
+            // make sure the connection is closed at the end when 101/upgrade is used
+            self.set_keepalive(None);
+        }
+
+        // Allow informational header (excluding 101) to pass through without affecting the state
+        // of the request
+        if header.status == 101 || !header.status.is_informational() {
+            // reset request body to done for incomplete upgrade handshakes
+            if let Some(upgrade_ok) = self.is_upgrade(header) {
+                if upgrade_ok {
+                    debug!("ok upgrade handshake");
+                    // For ws we use HTTP1_0 do_read_body_until_closed
+                    //
+                    // On ws close the initiator sends a close frame and
+                    // then waits for a response from the peer, once it receives
+                    // a response it closes the conn. After receiving a
+                    // control frame indicating the connection should be closed,
+                    // a peer discards any further data received.
+                    // https://www.rfc-editor.org/rfc/rfc6455#section-1.4
+                    self.upgraded = true;
+                    // Now that the upgrade was successful, we need to change
+                    // how we interpret the rest of the body as pass-through.
+                    if self.body_reader.need_init() {
+                        self.init_body_reader();
+                    } else {
+                        // already initialized
+                        // immediately start reading the rest of the body as upgraded
+                        // (in practice most upgraded requests shouldn't have any body)
+                        //
+                        // TODO: https://datatracker.ietf.org/doc/html/rfc9110#name-upgrade
+                        // the most spec-compliant behavior is to switch interpretation
+                        // after sending the former body,
+                        // we immediately switch interpretation to match nginx
+                        self.body_reader.convert_to_close_delimited();
+                    }
+                } else {
+                    // this was a request that requested Upgrade,
+                    // but upstream did not comply
+                    debug!("bad upgrade handshake!");
+                    // continue to read body as-is, this is now just a regular request
+                }
+            }
+            self.init_body_writer(header);
+        }
+
+        // Defense-in-depth: if response body is close-delimited, mark session
+        // as un-reusable
+        if self.body_writer.is_close_delimited() {
+            self.set_keepalive(None);
+        }
+
+        // Serialize header to bytes
+        let mut write_buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
+        http_resp_header_to_buf(header, &mut write_buf)
+            .map_err(|_| Error::explain(WriteError, "serializing response header"))?;
+
+        // Determine if we should flush
+        // Don't have to flush response with content length because it is less
+        // likely to be real time communication. So do flush when
+        // 1. 1xx response: client needs to see it before the rest of response
+        // 2. No content length: the response could be generated in real time
+        let should_flush = header.status.is_informational()
+            || header.headers.get(header::CONTENT_LENGTH).is_none();
+
+        Ok(Some((write_buf.freeze(), should_flush)))
+    }
+
     fn init_body_writer(&mut self, header: &ResponseHeader) {
         use http::StatusCode;
         /* the following responses don't have body 204, 304, and HEAD */
@@ -779,6 +873,16 @@ impl HttpSession {
             },
             None => self.do_write_body(buf).await,
         }
+    }
+
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    pub fn proxy_tasks_enabled(&self) -> bool {
+        self.proxy_tasks_enabled
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.proxy_tasks_enabled = enabled;
     }
 
     async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
@@ -937,25 +1041,65 @@ impl HttpSession {
     /// This function will return body bytes (same as [`Self::read_body_bytes()`]), but after
     /// the client body finishes (`Ok(None)` is returned), calling this function again will block
     /// forever, same as [`Self::idle()`].
+    ///
+    /// By default (`abort_on_close = true`), if the client closes the connection
+    /// (sends TCP FIN, i.e. `read == 0`) after the request body is complete, a
+    /// `ConnectionClosed` error is returned.
+    ///
+    /// When `abort_on_close` is **disabled**, the close is tolerated: the future stays
+    /// pending so the proxy can finish delivering the upstream response via the write
+    /// path (per RFC 9112 Section 9.6). A true disconnect (RST) will be caught later
+    /// when the response write fails.
+    ///
+    /// Note that this marks the connection as half-closed if FIN is detected. If this function
+    /// is called after the connection is already marked half-closed and `abort_on_close` is
+    /// **disabled**, then it will pend forever.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
+            if self.half_closed {
+                if self.abort_on_close {
+                    return Error::e_explain(
+                        ConnectionClosed,
+                        if self.response_written.is_none() {
+                            "Prematurely before response header is sent"
+                        } else {
+                            "Prematurely before response body is complete"
+                        },
+                    );
+                }
+                return std::future::pending().await;
+            }
             // XXX: account for upgraded body reader change, if the read half split from the write half
             let read = self.idle().await?;
             if read == 0 {
-                Error::e_explain(
-                    ConnectionClosed,
-                    if self.response_written.is_none() {
-                        "Prematurely before response header is sent"
-                    } else {
-                        "Prematurely before response body is complete"
-                    },
-                )
+                self.half_closed = true;
+                self.set_keepalive(None);
+                if self.abort_on_close {
+                    Error::e_explain(
+                        ConnectionClosed,
+                        if self.response_written.is_none() {
+                            "Prematurely before response header is sent"
+                        } else {
+                            "Prematurely before response body is complete"
+                        },
+                    )
+                } else {
+                    debug!("downstream closed (FIN), keeping write side open");
+                    // If the connection is fully closed, writing the response side
+                    // will fail.
+                    std::future::pending().await
+                }
             } else {
                 Error::e_explain(ConnectError, "Sent data after end of body")
             }
         } else {
             self.read_body_bytes().await
         }
+    }
+
+    /// Whether the client has half-closed the TCP connection.
+    pub fn is_half_closed(&self) -> bool {
+        self.half_closed
     }
 
     /// Return the raw bytes of the request header.
@@ -1053,6 +1197,18 @@ impl HttpSession {
     /// This may be set to avoid draining downstream if the body is no longer necessary.
     pub fn set_close_on_response_before_downstream_finish(&mut self, close: bool) {
         self.close_on_response_before_downstream_finish = close;
+    }
+
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately.
+    ///
+    /// When **disabled**, `read_body_or_idle` stays pending on a client close so the
+    /// proxy can finish delivering the upstream response (RFC 9112 Section 9.6). A true
+    /// disconnect (RST) will surface later when the response write fails.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        self.abort_on_close = abort;
     }
 
     /// Return the [Digest] of the connection.
@@ -1232,6 +1388,152 @@ impl HttpSession {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
         }
+        Ok(end_stream || self.body_writer.finished())
+    }
+
+    /// Queue a proxy task for cancel-safe writing with the current write_timeout.
+    /// The task will be written when `write_proxy_tasks()` is called.
+    ///
+    /// A write canceled mid-operation can be resumed via `write_proxy_tasks()`.
+    pub fn send_proxy_task(&mut self, task: HttpTask) {
+        self.proxy_task_state.tasks.push_back(task);
+    }
+
+    /// Check if there are pending proxy tasks queued for writing.
+    pub fn has_pending_proxy_tasks(&self) -> bool {
+        self.proxy_task_state.current_writer.is_some() || !self.proxy_task_state.tasks.is_empty()
+    }
+
+    /// Write all queued proxy tasks (response `HttpTask`s from `send_proxy_task`)
+    /// in a cancel-safe manner.
+    ///
+    /// If cancelled mid-write, the next call will resume the in-progress write.
+    ///
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    // Leverages the cancel-safe `HeaderWriter` and `BodyWriter` primitives.
+    // TODO: we can do the same for the non-cancel-safe APIs.
+    pub async fn write_proxy_tasks(&mut self) -> Result<bool> {
+        let mut end_stream = false;
+
+        // TODO: buffer body data like response_duplex_vec
+        loop {
+            // - Resume any in-progress write
+            if let Some(ref writer_state) = self.proxy_task_state.current_writer {
+                match writer_state {
+                    ProxyTaskWriter::WritingHeader(_, _) => {
+                        let _bytes_written = self
+                            .proxy_task_state
+                            .header_writer()
+                            .write_current_header_task(&mut self.underlying_stream)
+                            .await
+                            .map_err(|e| e.into_down())?;
+                    }
+                    ProxyTaskWriter::WritingBody(_) => {
+                        let written = self
+                            .body_writer
+                            .write_current_body_task(&mut self.underlying_stream)
+                            .await
+                            .map_err(|e| e.into_down())?;
+                        if let Some(n) = written {
+                            self.body_bytes_sent += n;
+                        }
+                    }
+                    ProxyTaskWriter::FinishingBody => {
+                        self.body_writer
+                            .write_current_finish_task(&mut self.underlying_stream)
+                            .await
+                            .map_err(|e| e.into_down())?;
+                    }
+                }
+
+                match self
+                    .proxy_task_state
+                    .current_writer
+                    .take()
+                    .expect("writer state present")
+                {
+                    ProxyTaskWriter::WritingHeader(header, end) => {
+                        self.response_written = Some(header);
+                        end_stream = end;
+                    }
+                    ProxyTaskWriter::WritingBody(end) => {
+                        end_stream = end;
+                    }
+                    ProxyTaskWriter::FinishingBody => {
+                        end_stream = true;
+                        self.maybe_force_close_body_reader();
+                        break; // fine to break after finish, no tasks should be queued after
+                    }
+                }
+                continue;
+            }
+
+            // - Send tasks, set state.
+            // Pop next task
+            let Some(task) = self.proxy_task_state.tasks.pop_front() else {
+                if end_stream {
+                    self.body_writer.send_finish_task();
+                    self.proxy_task_state.current_writer = Some(ProxyTaskWriter::FinishingBody);
+                    continue;
+                }
+                break;
+            };
+
+            match task {
+                HttpTask::Header(mut header, end) => {
+                    let Some((write_buf, should_flush)) =
+                        self.prepare_response_header(&mut header)?
+                    else {
+                        end_stream = end;
+                        continue;
+                    };
+                    // header only responses will want to flush
+                    let flush = should_flush || self.body_writer.finished();
+                    self.proxy_task_state
+                        .header_writer()
+                        .send_header_task(write_buf, flush, None);
+                    self.proxy_task_state.current_writer =
+                        Some(ProxyTaskWriter::WritingHeader(header, end));
+                }
+                HttpTask::Body(ref data, end) => {
+                    if self.upgraded {
+                        panic!("Unexpected Body task received on upgraded downstream session");
+                    }
+                    if let Some(d) = data.as_ref() {
+                        if !d.is_empty() {
+                            let body_timeout = self.write_timeout(d.len());
+                            self.body_writer.send_body_task(d.clone(), body_timeout);
+                            self.proxy_task_state.current_writer =
+                                Some(ProxyTaskWriter::WritingBody(end));
+                            continue;
+                        }
+                    }
+                    end_stream = end;
+                }
+                HttpTask::UpgradedBody(ref data, end) => {
+                    if !self.upgraded {
+                        panic!("Unexpected UpgradedBody task received on un-upgraded downstream session");
+                    }
+                    if let Some(d) = data.as_ref() {
+                        if !d.is_empty() {
+                            let body_timeout = self.write_timeout(d.len());
+                            self.body_writer.send_body_task(d.clone(), body_timeout);
+                            self.proxy_task_state.current_writer =
+                                Some(ProxyTaskWriter::WritingBody(end));
+                            continue;
+                        }
+                    }
+                    end_stream = end;
+                }
+                HttpTask::Trailer(_) | HttpTask::Done => {
+                    end_stream = true;
+                }
+                HttpTask::Failed(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
         Ok(end_stream || self.body_writer.finished())
     }
 
@@ -2297,6 +2599,30 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn body_bytes_sent_excludes_response_header() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let wire_body = b"hello";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(wire_body)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        new_response.append_header("Content-Length", "5").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header(Box::new(new_response))
+            .await
+            .unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 0);
+        http_stream.write_body(wire_body).await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), wire_body.len());
+    }
+
+    #[tokio::test]
     async fn write_body_http10() {
         let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
@@ -2700,6 +3026,37 @@ Content-Length: 5\r\n\
         let reused = http_stream.reuse().await.unwrap();
         assert!(reused.is_none());
     }
+
+    #[test]
+    fn test_connection_user_context_set_and_take() {
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        // Initially no context
+        assert!(session.take_connection_user_context().is_none());
+
+        // Set a context
+        session.set_connection_user_context(Some(Box::new(42u64)));
+
+        // Take it back
+        let ctx = session.take_connection_user_context();
+        assert!(ctx.is_some());
+        let val = ctx.unwrap().downcast::<u64>().unwrap();
+        assert_eq!(*val, 42u64);
+
+        // After take, it's gone
+        assert!(session.take_connection_user_context().is_none());
+    }
+
+    #[test]
+    fn test_connection_user_context_set_none_clears() {
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        session.set_connection_user_context(Some(Box::new("hello".to_string())));
+        session.set_connection_user_context(None);
+        assert!(session.take_connection_user_context().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2736,25 +3093,30 @@ mod test_sync {
 }
 
 #[cfg(test)]
-mod test_timeouts {
+mod test_proxy_tasks {
     use super::*;
+    use http::StatusCode;
     use std::future::IntoFuture;
     use tokio_test::io::{Builder, Mock};
 
-    /// An upper limit for any read within any test to prevent tests from hanging forever if
-    /// an internal read call never returns, etc.
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    // An upper limit for any read within any test to prevent tests from hanging forever if
+    // an internal read call never returns, etc.
     const TEST_MAX_WAIT_FOR_READ: Duration = Duration::from_secs(3);
 
-    /// The duration of 600 seconds is chosen to be "effectively forever" for the purpose of testing
+    // The duration of 600 seconds is chosen to be "effectively forever" for the purpose of testing
     const TEST_FOREVER_DURATION: Duration = Duration::from_secs(600);
 
-    /// The read_timeout to use, when we want to test that a read operation times out
+    // The read_timeout to use, when we want to test that a read operation times out
     const TEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
     #[derive(Debug)]
     struct ReadBlockedForeverError;
 
-    /// Returns a client stream that will "never" send any bytes / return from a read operation
+    // Returns a client stream that will "never" send any bytes / return from a read operation
     fn mocked_blocking_headers_forever_stream() -> Box<Mock> {
         Box::new(Builder::new().wait(TEST_FOREVER_DURATION).build())
     }
@@ -2771,8 +3133,8 @@ mod test_timeouts {
         )
     }
 
-    /// Helper function to test a read operation with a tokio timeout
-    /// to prevent tests from hanging forever in case of a bug
+    // Helper function to test a read operation with a tokio timeout
+    // to prevent tests from hanging forever in case of a bug
     async fn test_read_with_tokio_timeout<F, T>(
         read_future: F,
     ) -> Result<Result<T, Box<Error>>, ReadBlockedForeverError>
@@ -2815,6 +3177,352 @@ mod test_timeouts {
         let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+    }
+
+    #[tokio::test]
+    async fn test_send_proxy_task_and_write() {
+        init_log();
+
+        // We need to know exact bytes that will be written
+        // "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let expected_body = b"hello";
+
+        let mock_io = Builder::new()
+            .write(expected_header)
+            .write(expected_body)
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false; // Disable automatic headers
+
+        // Queue header task
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
+        header.insert_header("Content-Length", "5").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+
+        // Queue body task
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
+
+        // Write all tasks
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        assert!(end_stream);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_task_with_timeout() {
+        init_log();
+
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let expected_body = b"hello";
+
+        let mock_io = Builder::new()
+            .write(expected_header)
+            .write(expected_body)
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.write_timeout = Some(Duration::from_secs(1)); // Set write timeout
+
+        // Queue tasks
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
+        header.insert_header("Content-Length", "5").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
+
+        // Verify initial state
+        assert_eq!(
+            http_stream.body_bytes_sent(),
+            0,
+            "Should start with 0 bytes sent"
+        );
+
+        // Write all tasks with timeout
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        assert!(end_stream);
+
+        // Verify body bytes were counted correctly (not double counted)
+        assert_eq!(
+            http_stream.body_bytes_sent(),
+            5,
+            "Should count exactly 5 bytes (application level), not double counted"
+        );
+    }
+
+    // Test that write_proxy_tasks is cancel-safe: if the future is dropped mid-execution,
+    // unwritten tasks should remain in the queue.
+    #[tokio::test]
+    async fn test_proxy_task_cancel_safety() {
+        init_log();
+
+        let expected_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // First chunk: "5\r\nhello\r\n"
+        let expected_chunk1 = b"5\r\nhello\r\n";
+
+        // Create a mock IO that will write the header and first chunk,
+        // but will block indefinitely on the second chunk
+        let mock_io = Builder::new()
+            .write(expected_header)
+            .write(expected_chunk1)
+            .wait(Duration::from_secs(999)) // This will cause timeout
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.write_timeout = Some(Duration::from_millis(100));
+
+        // Queue 3 tasks: header + 2 body chunks
+        let mut header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        header
+            .insert_header("Transfer-Encoding", "chunked")
+            .unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), false));
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("world")), true));
+
+        // Verify we have 3 tasks queued
+        assert_eq!(http_stream.proxy_task_state.tasks.len(), 3);
+
+        // Try to write all tasks - this should timeout while writing the second body chunk
+        let result = http_stream.write_proxy_tasks().await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().etype(), &WriteTimedout);
+
+        // With the refactored cancel-safe design:
+        // - First task (header) was written successfully and removed from queue
+        // - Second task (first body "hello") was removed and sent to BodyWriter, write succeeded, state cleared
+        // - Third task (second body "world") was removed and sent to BodyWriter, timed out mid-write
+        // - The in-progress write state is tracked in current_writer, NOT in the queue
+        assert_eq!(
+            http_stream.proxy_task_state.tasks.len(),
+            0,
+            "Queue should be empty - tasks are owned by writers once sent"
+        );
+
+        // The task being written should be tracked in current_writer
+        assert!(
+            matches!(
+                http_stream.proxy_task_state.current_writer,
+                Some(ProxyTaskWriter::WritingBody(_))
+            ),
+            "Should be mid-write of body task - writer owns the 'world' task state"
+        );
+
+        // Verify body_bytes_sent only counts the successfully written "hello" (5 bytes)
+        // not the timed-out "world"
+        assert_eq!(
+            http_stream.body_bytes_sent(),
+            5,
+            "Should only count the 5 bytes from 'hello', not the incomplete 'world' write"
+        );
+
+        // On next call to write_proxy_tasks(), Step 1 will resume the "world" write
+    }
+
+    use crate::protocols::http::v1::test_util::FlushTrackingMock;
+
+    // Test that write_continue_response can be called before write_proxy_tasks
+    // and both work correctly together.
+    #[tokio::test]
+    async fn test_continue_response_before_proxy_tasks() {
+        init_log();
+
+        // Expected bytes written:
+        // 1. 100 Continue response
+        // 2. 200 OK response header
+        // 3. Body data
+        let expected_continue = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let expected_body = b"hello";
+
+        let mock_io = Builder::new()
+            .write(expected_continue)
+            .write(expected_header)
+            .write(expected_body)
+            .build();
+
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false; // Disable automatic headers
+
+        // First, write the 100 Continue response
+        http_stream.write_continue_response().await.unwrap();
+
+        // Verify that 100 Continue was recorded
+        assert!(
+            http_stream.response_written().is_some(),
+            "100 Continue should be recorded in response_written"
+        );
+        assert_eq!(
+            http_stream.response_written().unwrap().status,
+            StatusCode::CONTINUE,
+            "Should have recorded 100 Continue"
+        );
+
+        // Now queue the actual response using proxy tasks
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
+        header.insert_header("Content-Length", "5").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
+
+        // Write all proxy tasks
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        assert!(end_stream, "Should indicate end of stream");
+
+        // Verify final response is 200 OK, not 100 Continue
+        assert_eq!(
+            http_stream.response_written().unwrap().status,
+            StatusCode::OK,
+            "Final response should be 200 OK, overwriting 100 Continue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_response_with_content_length_flushes() {
+        init_log();
+
+        // HEAD request line + headers
+        let request = b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new().read(request).write(expected_header).build();
+        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+        let mut http_stream = HttpSession::new(Box::new(flush_mock));
+        http_stream.update_resp_headers = false;
+
+        // Read the HEAD request
+        http_stream.read_request().await.unwrap();
+        assert_eq!(http_stream.get_method(), Some(&Method::HEAD));
+
+        // Queue header with Content-Length (body will be empty for HEAD)
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(2)).unwrap();
+        header.insert_header("Content-Length", "100").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), true));
+
+        let flush_before = FlushTrackingMock::flush_count(&flush_count);
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        let flush_after = FlushTrackingMock::flush_count(&flush_count);
+
+        assert!(end_stream, "HEAD response should be end of stream");
+        assert!(
+            flush_after > flush_before,
+            "Should flush after writing HEAD response header with Content-Length \
+             (body_writer.finished() is true). Got flush_before={flush_before}, \
+             flush_after={flush_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_204_response_with_content_length_flushes() {
+        init_log();
+
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let expected_header = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+
+        let mock_io = Builder::new().read(request).write(expected_header).build();
+        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+        let mut http_stream = HttpSession::new(Box::new(flush_mock));
+        http_stream.update_resp_headers = false;
+
+        http_stream.read_request().await.unwrap();
+
+        let mut header = ResponseHeader::build(StatusCode::NO_CONTENT, Some(2)).unwrap();
+        header.insert_header("Content-Length", "0").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), true));
+
+        let flush_before = FlushTrackingMock::flush_count(&flush_count);
+        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
+        let flush_after = FlushTrackingMock::flush_count(&flush_count);
+
+        assert!(end_stream, "204 response should be end of stream");
+        assert!(
+            flush_after > flush_before,
+            "Should flush after writing 204 response header with Content-Length \
+             (body_writer.finished() is true). Got flush_before={flush_before}, \
+             flush_after={flush_after}"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "Unexpected UpgradedBody task received on un-upgraded downstream session"
+    )]
+    async fn test_upgraded_body_on_non_upgraded_session_panics() {
+        init_log();
+
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // UpgradedBody on a non-upgraded session should panic before writing,
+        // but if the bug exists, BodyWriter would encode it as a chunk:
+        let expected_chunk = b"5\r\nhello\r\n";
+        let expected_finish = b"0\r\n\r\n";
+
+        let mock_io = Builder::new()
+            .read(request)
+            .write(expected_header)
+            // If the panic check is missing, the body gets written as a chunk
+            .write(expected_chunk)
+            .write(expected_finish)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+
+        http_stream.read_request().await.unwrap();
+        assert!(
+            !http_stream.was_upgraded(),
+            "Session should NOT be upgraded"
+        );
+
+        // Queue a normal header
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(2)).unwrap();
+        header
+            .insert_header("Transfer-Encoding", "chunked")
+            .unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+
+        // Queue an UpgradedBody task on a non-upgraded session — should panic
+        http_stream.send_proxy_task(HttpTask::UpgradedBody(Some(Bytes::from("hello")), true));
+
+        // This should panic before/during the body write
+        let _ = http_stream.write_proxy_tasks().await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Unexpected Body task received on upgraded downstream session")]
+    async fn test_body_on_upgraded_session_panics() {
+        init_log();
+
+        // Upgrade request
+        let request =
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        // 101 Switching Protocols response
+        let expected_header =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        // If the panic check is missing, Body data would be written raw (close-delimited)
+        let expected_body = b"hello";
+
+        let mock_io = Builder::new()
+            .read(request)
+            .write(expected_header)
+            .write(expected_body)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+
+        http_stream.read_request().await.unwrap();
+
+        // Queue 101 header to complete the upgrade
+        let mut header = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, Some(3)).unwrap();
+        header.insert_header("Upgrade", "websocket").unwrap();
+        header.insert_header("Connection", "Upgrade").unwrap();
+        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
+
+        // Queue a regular Body task on what will be an upgraded session — should panic
+        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
+
+        // This should panic (after writing the header, session becomes upgraded,
+        // then the Body task should be rejected)
+        let _ = http_stream.write_proxy_tasks().await;
     }
 }
 
@@ -2923,5 +3631,118 @@ mod test_overread {
 
         let reused = http_stream.reuse().await.unwrap();
         assert!(reused.is_none());
+    }
+}
+
+#[cfg(test)]
+mod test_abort_on_close {
+    use super::*;
+    use pingora_error::ErrorType;
+    use tokio_test::io::Builder;
+
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    /// Helper: create an HttpSession whose request has been read and body is done,
+    /// with the mock stream returning EOF on the next read (simulating client FIN).
+    async fn session_with_eof() -> HttpSession {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn default_abort_on_close_returns_error() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.abort_on_close);
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        assert_eq!(*err.etype(), ErrorType::ConnectionClosed);
+        assert!(s.is_half_closed());
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_false_stays_pending() {
+        init_log();
+        let mut s = session_with_eof().await;
+        s.set_abort_on_close(false);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            s.read_body_or_idle(true),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected timeout (pending), got a result");
+        assert!(s.is_half_closed());
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_error_message_before_response() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.response_written().is_none());
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response header is sent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_close_error_message_after_response_header() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        // Simulate that a response header has already been sent.
+        let resp = ResponseHeader::build(200, None).unwrap();
+        s.response_written = Some(Box::new(resp));
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response body is complete"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_body_expected_false_reads_body_then_idles() {
+        init_log();
+        let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\n";
+        let mock_io = Builder::new().read(&request[..]).read(b"abc").build();
+        let mut s = HttpSession::new(Box::new(mock_io));
+        s.read_request().await.unwrap();
+
+        // 1) no_body_expected = false should still read request body while not done.
+        let body = s.read_body_or_idle(false).await.unwrap().unwrap();
+        assert_eq!(body.as_ref(), b"abc");
+        assert!(s.is_body_done());
+
+        // 2) Once body is naturally done, it transitions to idle behavior on the next call.
+        let err = s.read_body_or_idle(false).await.unwrap_err();
+        assert_eq!(*err.etype(), ErrorType::ConnectionClosed);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Prematurely before response header is sent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_abort_on_close_toggles() {
+        init_log();
+        let mut s = session_with_eof().await;
+
+        assert!(s.abort_on_close);
+        s.set_abort_on_close(false);
+        assert!(!s.abort_on_close);
+        s.set_abort_on_close(true);
+        assert!(s.abort_on_close);
     }
 }
