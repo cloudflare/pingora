@@ -18,7 +18,7 @@ use log::debug;
 use pingora_error::{
     Error,
     ErrorType::{ConnectTimedout, InvalidCert},
-    OrErr, Result,
+    OkOrErr, OrErr, Result,
 };
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
@@ -110,13 +110,17 @@ impl TlsConnector {
 
             match certs_key {
                 Some((certs, key)) => {
-                    // Use with_client_cert_resolver() instead of with_client_auth_cert()
-                    // to avoid webpki validation of the client certificate chain.
+                    // Bypass with_client_auth_cert() to skip webpki on the client chain,
+                    // but still verify the key matches the leaf cert.
                     let provider = builder.crypto_provider().clone();
                     let signing_key = provider
                         .key_provider
                         .load_private_key(key)
                         .or_err(InvalidCert, "Failed to load client private key")?;
+                    let leaf = certs
+                        .first()
+                        .or_err(InvalidCert, "client cert chain is empty")?;
+                    crate::protocols::tls::verify_cert_key_match(leaf, signing_key.as_ref())?;
                     let certified_key =
                         Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
                     builder.with_client_cert_resolver(Arc::new(SingleCertClientResolver(
@@ -222,7 +226,7 @@ where
                 key_arc.key().as_slice().to_owned().try_into().unwrap();
 
             if let Some(ref verifier) = tls_ctx.custom_verifier {
-                // Custom verifier path: bypass webpki for both server cert and client cert
+                // Custom verifier path: bypass webpki for both server and client certs.
                 let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
                     &version::TLS12,
                     &version::TLS13,
@@ -235,10 +239,13 @@ where
                     .key_provider
                     .load_private_key(private_key)
                     .or_err(InvalidCert, "Failed to load peer client private key")?;
+                let leaf = certs
+                    .first()
+                    .or_err(InvalidCert, "peer client cert chain is empty")?;
+                crate::protocols::tls::verify_cert_key_match(leaf, signing_key.as_ref())?;
                 let certified_key =
                     Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
 
-                debug!("added client cert via resolver (custom verifier)");
                 let mut updated_config = builder
                     .with_client_cert_resolver(Arc::new(SingleCertClientResolver(certified_key)));
                 updated_config.key_log = Arc::clone(&config.key_log);

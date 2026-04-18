@@ -19,9 +19,34 @@ mod stream;
 pub use stream::*;
 
 use crate::utils::tls::WrappedX509;
+use pingora_error::{Error, ErrorType::InvalidCert, Result};
+use pingora_rustls::sign::SigningKey;
 use pingora_rustls::CertificateDer;
 
 pub type CaType = [WrappedX509];
+
+/// Verify the leaf certificate's public key matches the given signing key.
+/// Stands in for rustls's `with_single_cert` consistency check, which we
+/// bypass to skip webpki policy validation on our own cert chain.
+pub(crate) fn verify_cert_key_match(
+    cert: &CertificateDer<'_>,
+    signing_key: &dyn SigningKey,
+) -> Result<()> {
+    let Some(key_spki) = signing_key.public_key() else {
+        return Ok(());
+    };
+
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+        .map_err(|_| Error::explain(InvalidCert, "Failed to parse certificate for key match"))?;
+
+    if parsed.tbs_certificate.subject_pki.raw != key_spki.as_ref() {
+        return Error::e_explain(
+            InvalidCert,
+            "Certificate public key does not match private key",
+        );
+    }
+    Ok(())
+}
 
 /// TLS connection state exposed to post-handshake callbacks.
 ///

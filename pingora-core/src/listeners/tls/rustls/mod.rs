@@ -15,9 +15,11 @@
 use std::sync::Arc;
 
 use crate::listeners::TlsAcceptCallbacks;
-use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
+use crate::protocols::tls::{
+    server::handshake, server::handshake_with_callback, verify_cert_key_match, TlsStream,
+};
 use log::debug;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::InvalidCert, Result};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
@@ -72,14 +74,17 @@ impl TlsSettings {
             builder.with_no_client_auth()
         };
 
-        // Use CertifiedKey::new() + with_cert_resolver() instead of with_single_cert()
-        // to match the OpenSSL backend behavior: load cert+key without upfront validation.
-        // with_single_cert() runs webpki validation on the server's own cert chain, which
-        // rejects certificates with unrecognized critical extensions.
+        // Bypass with_single_cert() because its webpki policy validation rejects
+        // certificates with unrecognized critical extensions; keep the key match check.
         let signing_key = provider
             .key_provider
             .load_private_key(key)
             .expect("Failed to load server private key");
+        let leaf = certs
+            .first()
+            .expect("load_certs_and_key_files returned an empty cert chain");
+        verify_cert_key_match(leaf, signing_key.as_ref())
+            .expect("Server certificate and private key do not match");
         let certified_key = Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
 
         use pingora_rustls::ResolvesServerCert;
@@ -122,13 +127,31 @@ impl TlsSettings {
     }
 
     /// Set the path to the certificate chain file (PEM format).
-    pub fn set_certificate_chain_file(&mut self, path: &str) {
-        self.cert_path = path.to_string();
+    ///
+    /// Returns an error if the file cannot be opened or contains no X.509
+    /// certificate, matching the OpenSSL backend's behavior.
+    pub fn set_certificate_chain_file(&mut self, path: &str) -> Result<()> {
+        let path_str = path.to_string();
+        let bytes = pingora_rustls::load_pem_file_ca(&path_str)?;
+        if bytes.is_empty() {
+            return Error::e_explain(InvalidCert, format!("No X.509 certificate found in {path}"));
+        }
+        self.cert_path = path_str;
+        Ok(())
     }
 
     /// Set the path to the private key file (PEM format).
-    pub fn set_private_key_file(&mut self, path: &str) {
-        self.key_path = path.to_string();
+    ///
+    /// Returns an error if the file cannot be opened or contains no private
+    /// key, matching the OpenSSL backend's behavior.
+    pub fn set_private_key_file(&mut self, path: &str) -> Result<()> {
+        let path_str = path.to_string();
+        let bytes = pingora_rustls::load_pem_file_private_key(&path_str)?;
+        if bytes.is_empty() {
+            return Error::e_explain(InvalidCert, format!("No private key found in {path}"));
+        }
+        self.key_path = path_str;
+        Ok(())
     }
 
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self>
