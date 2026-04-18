@@ -22,6 +22,7 @@ use log::debug;
 use pingora_error::{Error, ErrorType::InvalidCert, Result};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
+use pingora_rustls::ResolvesServerCert;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -32,6 +33,7 @@ pub struct TlsSettings {
     alpn_protocols: Option<Vec<Vec<u8>>>,
     cert_path: String,
     key_path: String,
+    cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
     callbacks: Option<TlsAcceptCallbacks>,
 }
@@ -50,21 +52,6 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        assert!(
-            !self.cert_path.is_empty() && !self.key_path.is_empty(),
-            "Certificate and key paths must be set before calling build(). \
-             When using with_callbacks(), call set_certificate_chain_file() \
-             and set_private_key_file() first."
-        );
-
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
-        };
-
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
         let provider = builder.crypto_provider().clone();
@@ -74,32 +61,54 @@ impl TlsSettings {
             builder.with_no_client_auth()
         };
 
-        // Bypass with_single_cert() because its webpki policy validation rejects
-        // certificates with unrecognized critical extensions; keep the key match check.
-        let signing_key = provider
-            .key_provider
-            .load_private_key(key)
-            .expect("Failed to load server private key");
-        let leaf = certs
-            .first()
-            .expect("load_certs_and_key_files returned an empty cert chain");
-        verify_cert_key_match(leaf, signing_key.as_ref())
-            .expect("Server certificate and private key do not match");
-        let certified_key = Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+        let resolver: Arc<dyn ResolvesServerCert> = match self.cert_resolver {
+            Some(r) => r,
+            None => {
+                assert!(
+                    !self.cert_path.is_empty() && !self.key_path.is_empty(),
+                    "Either set_cert_resolver() or both set_certificate_chain_file() and \
+                     set_private_key_file() must be called before build()."
+                );
 
-        use pingora_rustls::ResolvesServerCert;
-        #[derive(Debug)]
-        struct SingleCert(Arc<pingora_rustls::sign::CertifiedKey>);
-        impl ResolvesServerCert for SingleCert {
-            fn resolve(
-                &self,
-                _client_hello: pingora_rustls::ClientHello<'_>,
-            ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
-                Some(Arc::clone(&self.0))
+                let Ok(Some((certs, key))) =
+                    load_certs_and_key_files(&self.cert_path, &self.key_path)
+                else {
+                    panic!(
+                        "Failed to load provided certificates \"{}\" or key \"{}\".",
+                        self.cert_path, self.key_path
+                    )
+                };
+
+                // Bypass with_single_cert() because its webpki policy validation rejects
+                // certificates with unrecognized critical extensions; keep the key match check.
+                let signing_key = provider
+                    .key_provider
+                    .load_private_key(key)
+                    .expect("Failed to load server private key");
+                let leaf = certs
+                    .first()
+                    .expect("load_certs_and_key_files returned an empty cert chain");
+                verify_cert_key_match(leaf, signing_key.as_ref())
+                    .expect("Server certificate and private key do not match");
+                let certified_key =
+                    Arc::new(pingora_rustls::sign::CertifiedKey::new(certs, signing_key));
+
+                #[derive(Debug)]
+                struct SingleCert(Arc<pingora_rustls::sign::CertifiedKey>);
+                impl ResolvesServerCert for SingleCert {
+                    fn resolve(
+                        &self,
+                        _client_hello: pingora_rustls::ClientHello<'_>,
+                    ) -> Option<Arc<pingora_rustls::sign::CertifiedKey>> {
+                        Some(Arc::clone(&self.0))
+                    }
+                }
+
+                Arc::new(SingleCert(certified_key))
             }
-        }
+        };
 
-        let mut config = builder.with_cert_resolver(Arc::new(SingleCert(certified_key)));
+        let mut config = builder.with_cert_resolver(resolver);
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -124,6 +133,15 @@ impl TlsSettings {
     /// Configure mTLS by providing a rustls client certificate verifier.
     pub fn set_client_cert_verifier(&mut self, verifier: Arc<dyn ClientCertVerifier>) {
         self.client_cert_verifier = Some(verifier);
+    }
+
+    /// Install a user-provided server certificate resolver.
+    ///
+    /// When set, any certificate/key paths are ignored at `build()`. Useful for
+    /// dynamic SNI-based selection, where the cert cannot be chosen ahead of the
+    /// handshake.
+    pub fn set_cert_resolver(&mut self, resolver: Arc<dyn ResolvesServerCert>) {
+        self.cert_resolver = Some(resolver);
     }
 
     /// Set the path to the certificate chain file (PEM format).
@@ -162,6 +180,7 @@ impl TlsSettings {
             alpn_protocols: None,
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
+            cert_resolver: None,
             client_cert_verifier: None,
             callbacks: None,
         })
@@ -169,12 +188,9 @@ impl TlsSettings {
 
     /// Create a new [`TlsSettings`] with post-handshake callbacks.
     ///
-    /// The provided callbacks will be invoked after TLS handshake completes.
-    /// The [`TlsRef`](crate::protocols::tls::TlsRef) passed to the callback
-    /// provides access to the peer certificate chain and negotiated cipher suite.
-    ///
-    /// Certificate and key files must be set separately via the builder methods
-    /// on the returned `TlsSettings`.
+    /// Before calling `build()`, supply either a cert/key pair via
+    /// `set_certificate_chain_file` + `set_private_key_file`, or a custom
+    /// resolver via `set_cert_resolver`.
     pub fn with_callbacks(callbacks: TlsAcceptCallbacks) -> Result<Self>
     where
         Self: Sized,
@@ -183,6 +199,7 @@ impl TlsSettings {
             alpn_protocols: None,
             cert_path: String::new(),
             key_path: String::new(),
+            cert_resolver: None,
             client_cert_verifier: None,
             callbacks: Some(callbacks),
         })
