@@ -322,12 +322,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
     }
 
     pub(crate) fn tls_ref(&self) -> Option<TlsRef> {
-        let (_io, session) = self.stream.as_ref()?.get_ref();
+        let stream = self.stream.as_ref()?;
+        let (_io, session) = stream.get_ref();
         let peer_certs = session.peer_certificates().map(|certs| certs.to_vec());
         let cipher = session
             .negotiated_cipher_suite()
             .and_then(|suite| suite.suite().as_str());
-        Some(TlsRef { peer_certs, cipher })
+        let version = session.protocol_version().and_then(|v| v.as_str());
+        let server_name = match stream {
+            RusTlsStream::Server(s) => s.get_ref().1.server_name().map(|n| n.to_string()),
+            RusTlsStream::Client(_) => None,
+        };
+        Some(TlsRef {
+            peer_certs,
+            cipher,
+            version,
+            server_name,
+        })
     }
 }
 

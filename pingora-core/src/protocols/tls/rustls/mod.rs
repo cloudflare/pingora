@@ -55,10 +55,10 @@ pub(crate) fn verify_cert_key_match(
 /// the OpenSSL `SslRef` that is used as `TlsRef` in the boringssl/openssl path.
 #[derive(Debug)]
 pub struct TlsRef {
-    /// Peer certificate chain (DER-encoded). The first entry is the leaf certificate.
     pub(super) peer_certs: Option<Vec<CertificateDer<'static>>>,
-    /// Negotiated cipher suite name (e.g. "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
     pub(super) cipher: Option<&'static str>,
+    pub(super) version: Option<&'static str>,
+    pub(super) server_name: Option<String>,
 }
 
 impl TlsRef {
@@ -79,5 +79,16 @@ impl TlsRef {
     /// Returns the negotiated cipher suite name, if available.
     pub fn current_cipher_name(&self) -> Option<&'static str> {
         self.cipher
+    }
+
+    /// Returns the negotiated TLS protocol version (e.g. "TLSv1.3"), if available.
+    pub fn version(&self) -> Option<&'static str> {
+        self.version
+    }
+
+    /// Returns the SNI hostname sent by the peer, if any. Only populated on
+    /// server-side connections; always `None` on client streams.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
     }
 }
