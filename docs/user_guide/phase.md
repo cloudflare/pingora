@@ -130,6 +130,13 @@ Every error that reaches `fail_to_proxy()` will be automatically logged in the e
 
 This callback returns a string which allows users to customize what info to dump in the error log to help track and debug the failures.
 
+### `suppress_pre_request_error_log()`
+This is also not a phase, but another callback.
+
+This callback is similar to `suppress_error_log()`, but it is invoked for downstream request read and parse failures before the per-request `CTX` is created. Because the request may not have been parsed successfully yet, it receives the downstream HTTP session directly instead of `Session` and `CTX`.
+
+Return `true` to suppress the error log.
+
 ### `suppress_error_log()`
 This is also not a phase, but another callback.
 
