@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
+use crate::protocols::tls::TlsRef;
 use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
@@ -46,6 +47,7 @@ pub struct InnerStream<T> {
 pub struct TlsStream<T> {
     tls: InnerStream<T>,
     digest: Option<Arc<SslDigest>>,
+    ssl: Option<TlsRef>,
     timing: TimingDigest,
 }
 
@@ -69,6 +71,7 @@ where
         Ok(TlsStream {
             tls,
             digest: None,
+            ssl: None,
             timing: Default::default(),
         })
     }
@@ -85,6 +88,7 @@ where
         Ok(TlsStream {
             tls,
             digest: None,
+            ssl: None,
             timing: Default::default(),
         })
     }
@@ -141,32 +145,6 @@ impl<T> TlsStream<T> {
     }
 }
 
-impl<T> TlsStream<T> {
-    /// Build a [`TlsRef`] from the current connection state.
-    ///
-    /// Extracts peer certificates and negotiated cipher suite from the underlying
-    /// rustls session so they can be passed to a [`TlsAcceptCallbacks`] implementation.
-    pub(crate) fn build_tls_ref(&self) -> crate::protocols::tls::TlsRef {
-        use crate::protocols::tls::TlsRef;
-
-        let stream = self.tls.stream.as_ref();
-        match stream {
-            Some(s) => {
-                let (_io, session) = s.get_ref();
-                let peer_certs = session.peer_certificates().map(|certs| certs.to_vec());
-                let cipher = session
-                    .negotiated_cipher_suite()
-                    .and_then(|suite| suite.suite().as_str());
-                TlsRef { peer_certs, cipher }
-            }
-            None => TlsRef {
-                peer_certs: None,
-                cipher: None,
-            },
-        }
-    }
-}
-
 impl<T> Deref for TlsStream<T> {
     type Target = InnerStream<T>;
 
@@ -190,6 +168,7 @@ where
         self.tls.connect().await?;
         self.timing.established_ts = SystemTime::now();
         self.digest = self.tls.digest();
+        self.ssl = self.tls.tls_ref();
         Ok(())
     }
 
@@ -198,6 +177,7 @@ where
         self.tls.accept().await?;
         self.timing.established_ts = SystemTime::now();
         self.digest = self.tls.digest();
+        self.ssl = self.tls.tls_ref();
         Ok(())
     }
 }
@@ -254,6 +234,10 @@ where
 }
 
 impl<T> Ssl for TlsStream<T> {
+    fn get_ssl(&self) -> Option<&TlsRef> {
+        self.ssl.as_ref()
+    }
+
     fn get_ssl_digest(&self) -> Option<Arc<SslDigest>> {
         self.ssl_digest()
     }
@@ -335,6 +319,15 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
 
     pub(crate) fn digest(&mut self) -> Option<Arc<SslDigest>> {
         Some(Arc::new(SslDigest::from_stream(&self.stream)))
+    }
+
+    pub(crate) fn tls_ref(&self) -> Option<TlsRef> {
+        let (_io, session) = self.stream.as_ref()?.get_ref();
+        let peer_certs = session.peer_certificates().map(|certs| certs.to_vec());
+        let cipher = session
+            .negotiated_cipher_suite()
+            .and_then(|suite| suite.suite().as_str());
+        Some(TlsRef { peer_certs, cipher })
     }
 }
 

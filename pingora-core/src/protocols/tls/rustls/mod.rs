@@ -53,11 +53,12 @@ pub(crate) fn verify_cert_key_match(
 /// Provides access to peer certificates and negotiated cipher suite
 /// after a TLS handshake completes. This is the rustls equivalent of
 /// the OpenSSL `SslRef` that is used as `TlsRef` in the boringssl/openssl path.
+#[derive(Debug)]
 pub struct TlsRef {
     /// Peer certificate chain (DER-encoded). The first entry is the leaf certificate.
-    peer_certs: Option<Vec<CertificateDer<'static>>>,
+    pub(super) peer_certs: Option<Vec<CertificateDer<'static>>>,
     /// Negotiated cipher suite name (e.g. "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
-    cipher: Option<&'static str>,
+    pub(super) cipher: Option<&'static str>,
 }
 
 impl TlsRef {
