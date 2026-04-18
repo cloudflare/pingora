@@ -191,8 +191,8 @@ mod tests {
         let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
 
         let mut settings = TlsSettings::with_callbacks(Box::new(Callback)).unwrap();
-        settings.set_certificate_chain_file(&cert);
-        settings.set_private_key_file(&key);
+        settings.set_certificate_chain_file(&cert).unwrap();
+        settings.set_private_key_file(&key).unwrap();
         let acceptor = settings.build();
 
         let (client, server) = tokio::io::duplex(4096);
