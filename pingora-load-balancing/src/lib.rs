@@ -485,6 +485,41 @@ where
     }
 }
 
+impl LoadBalancer<selection::LeastConnections> {
+    /// Select a backend and return an RAII lease that tracks the inflight request.
+    pub fn select_with_lease(
+        &self,
+        key: &[u8],
+        max_iterations: usize,
+    ) -> Option<(Backend, selection::LeastConnLease)> {
+        self.select_with_lease_with(key, max_iterations, |_, health| health)
+    }
+
+    /// Like [`Self::select_with_lease`] but with a custom `accept` predicate.
+    ///
+    /// See [`Self::select_with`] for `accept` semantics.
+    pub fn select_with_lease_with<F>(
+        &self,
+        key: &[u8],
+        max_iterations: usize,
+        accept: F,
+    ) -> Option<(Backend, selection::LeastConnLease)>
+    where
+        F: Fn(&Backend, bool) -> bool,
+    {
+        let selection = self.selector.load();
+        let mut iter = UniqueIterator::new(selection.iter(key), max_iterations);
+        while let Some(b) = iter.get_next() {
+            if accept(&b, self.backends.ready(&b)) {
+                if let Some(lease) = selection.acquire_lease(&b) {
+                    return Some((b, lease));
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
