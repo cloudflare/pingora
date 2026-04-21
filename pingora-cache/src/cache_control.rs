@@ -92,6 +92,51 @@ impl DirectiveValue {
             }
         }
     }
+
+    /// Parse the [DirectiveValue] as delta seconds, permitting a fractional component.
+    ///
+    /// Values with a fractional part are rounded down (floored) to the nearest
+    /// non-negative integer: e.g. `1.9` -> `1`, `0.5` -> `0`. This is useful
+    /// for compatibility with upstreams that emit fractional ttls (which
+    /// RFC 9111 strict integer parsing rejects).
+    ///
+    /// Integer parsing is attempted first, so strictly-numeric values (including
+    /// overflow-capped values and quoted integers) behave identically to
+    /// [Self::parse_as_delta_seconds]. Negative, non-finite, or non-numeric
+    /// values still return an error.
+    ///
+    /// `"`s are ignored. The value is capped to [DELTA_SECONDS_OVERFLOW_VALUE].
+    pub fn parse_as_delta_seconds_floor(&self) -> Result<u32> {
+        // UTF-8 validate once; on non-UTF8 input, propagate the same error as
+        // [Self::parse_as_delta_seconds].
+        let s = self.parse_as_str()?;
+        match s.parse::<u32>() {
+            Ok(value) => Ok(value),
+            Err(e) if e.kind() == &IntErrorKind::PosOverflow => Ok(DELTA_SECONDS_OVERFLOW_VALUE),
+            Err(int_err) => {
+                // Fall back to parsing as a non-negative finite float and floor.
+                // On any failure, return an error equivalent to the strict
+                // [Self::parse_as_delta_seconds] u32-parse error.
+                match s.parse::<f64>() {
+                    Ok(f) if f.is_finite() && f >= 0.0 => {
+                        if f >= DELTA_SECONDS_OVERFLOW_VALUE as f64 {
+                            Ok(DELTA_SECONDS_OVERFLOW_VALUE)
+                        } else {
+                            // Safe cast: `f` is finite, non-negative, and strictly
+                            // less than `DELTA_SECONDS_OVERFLOW_VALUE` (i32::MAX),
+                            // which fits in `u32` after flooring.
+                            Ok(f.floor() as u32)
+                        }
+                    }
+                    _ => Error::e_because(
+                        ErrorType::InternalError,
+                        "could not parse value as u32",
+                        int_err,
+                    ),
+                }
+            }
+        }
+    }
 }
 
 /// An ordered map to store cache control key value pairs.
@@ -102,6 +147,15 @@ pub type DirectiveMap = IndexMap<DirectiveKey, Option<DirectiveValue>>;
 pub struct CacheControl {
     /// The parsed directives
     pub directives: DirectiveMap,
+    /// When set, delta-seconds directives (`max-age`, `s-maxage`,
+    /// `stale-while-revalidate`, `stale-if-error`) accept fractional values
+    /// and round them down to the nearest non-negative integer.
+    ///
+    /// Defaults to `false`, matching RFC 9111 strict integer parsing. Enable
+    /// via [CacheControl::with_float_seconds] (or by assigning the field
+    /// directly) for contexts that need to interoperate with upstreams that
+    /// emit fractional ttls.
+    pub allow_float_seconds: bool,
 }
 
 /// Cacheability calculated from cache control.
@@ -198,7 +252,20 @@ impl CacheControl {
                 directives.insert(key.unwrap(), value);
             }
         }
-        Some(CacheControl { directives })
+        Some(CacheControl {
+            directives,
+            allow_float_seconds: false,
+        })
+    }
+
+    /// Builder setter: enable fractional delta-seconds parsing.
+    ///
+    /// See [CacheControl::allow_float_seconds] for semantics. Returns `self`
+    /// so it can be chained onto a parser call, e.g.
+    /// `CacheControl::from_resp_headers(&resp).map(|cc| cc.with_float_seconds())`.
+    pub fn with_float_seconds(mut self) -> Self {
+        self.allow_float_seconds = true;
+        self
     }
 
     /// Parse from the given header name in `headers`
@@ -282,7 +349,12 @@ impl CacheControl {
 
     fn parse_delta_seconds(&self, key: &str) -> Result<Option<u32>> {
         if let Some(Some(dir_value)) = self.directives.get(key) {
-            Ok(Some(dir_value.parse_as_delta_seconds()?))
+            let value = if self.allow_float_seconds {
+                dir_value.parse_as_delta_seconds_floor()?
+            } else {
+                dir_value.parse_as_delta_seconds()?
+            };
+            Ok(Some(value))
         } else {
             Ok(None)
         }
@@ -868,5 +940,169 @@ mod tests {
         let req = build_request(CACHE_CONTROL, "only-if-cached=1");
         let cc = CacheControl::from_req_headers(&req).unwrap();
         assert!(cc.only_if_cached())
+    }
+
+    #[test]
+    fn test_parse_as_delta_seconds_floor() {
+        // Integer values behave identically to the strict parser
+        let v = DirectiveValue(b"10".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 10);
+
+        let v = DirectiveValue(b"\"10\"".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 10);
+
+        // Quoted fractional values are unwrapped by parse_as_str and floored.
+        let v = DirectiveValue(b"\"1.5\"".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 1);
+
+        let v = DirectiveValue(b"0".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 0);
+
+        // Integer positive overflow is still capped
+        let v = DirectiveValue(b"99999999999999999999".to_vec());
+        assert_eq!(
+            v.parse_as_delta_seconds_floor().unwrap(),
+            DELTA_SECONDS_OVERFLOW_VALUE
+        );
+
+        // Floats are floored
+        let v = DirectiveValue(b"1.5".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 1);
+
+        let v = DirectiveValue(b"1.9".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 1);
+
+        let v = DirectiveValue(b"0.5".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 0);
+
+        let v = DirectiveValue(b"3600.0".to_vec());
+        assert_eq!(v.parse_as_delta_seconds_floor().unwrap(), 3600);
+
+        // Float positive overflow is capped
+        let v = DirectiveValue(b"99999999999.5".to_vec());
+        assert_eq!(
+            v.parse_as_delta_seconds_floor().unwrap(),
+            DELTA_SECONDS_OVERFLOW_VALUE
+        );
+
+        // Negative values are rejected (matches strict behavior)
+        assert!(DirectiveValue(b"-1".to_vec())
+            .parse_as_delta_seconds_floor()
+            .is_err());
+        assert!(DirectiveValue(b"-1.5".to_vec())
+            .parse_as_delta_seconds_floor()
+            .is_err());
+
+        // Non-finite / non-numeric values are rejected
+        assert!(DirectiveValue(b"NaN".to_vec())
+            .parse_as_delta_seconds_floor()
+            .is_err());
+        assert!(DirectiveValue(b"inf".to_vec())
+            .parse_as_delta_seconds_floor()
+            .is_err());
+        assert!(DirectiveValue(b"abc".to_vec())
+            .parse_as_delta_seconds_floor()
+            .is_err());
+
+        // Non-UTF8 bytes are rejected with the same utf-8 error as the strict parser.
+        let v = DirectiveValue(b"ba\xFFr".to_vec());
+        assert_eq!(
+            v.parse_as_delta_seconds_floor()
+                .unwrap_err()
+                .context
+                .unwrap()
+                .to_string(),
+            "could not parse value as utf8",
+        );
+    }
+
+    #[test]
+    fn test_cache_control_allow_float_seconds_non_utf8_value() {
+        // Non-UTF8 bytes inside `max-age` should still produce the utf-8 error
+        // when the float-permitting flag is on, matching the strict parser.
+        let mut resp = response::Builder::new().body(()).unwrap();
+        resp.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_bytes(b"max-age=ba\xFFr").unwrap(),
+        );
+        let (parts, _) = resp.into_parts();
+        let cc = CacheControl::from_resp_headers(&parts)
+            .unwrap()
+            .with_float_seconds();
+        assert_eq!(
+            cc.max_age().unwrap_err().context.unwrap().to_string(),
+            "could not parse value as utf8",
+        );
+    }
+
+    #[test]
+    fn test_cache_control_allow_float_seconds_default_off() {
+        // Default (strict) parsing: fractional values produce an error, and
+        // [InterpretCacheControl::fresh_duration] returns None, matching the
+        // pre-existing behavior.
+        let resp = build_response(CACHE_CONTROL, "max-age=10.7");
+        let cc = CacheControl::from_resp_headers(&resp).unwrap();
+        assert!(!cc.allow_float_seconds);
+        assert!(cc.max_age().is_err());
+        assert!(cc.fresh_duration().is_none());
+    }
+
+    #[test]
+    fn test_cache_control_with_float_seconds() {
+        // `max-age` with a fractional value is floored when the flag is on.
+        let resp = build_response(CACHE_CONTROL, "max-age=10.7");
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert!(cc.allow_float_seconds);
+        assert_eq!(cc.max_age().unwrap().unwrap(), 10);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(10));
+
+        // `s-maxage` still wins over `max-age` and is also floored.
+        let resp = build_response(CACHE_CONTROL, "s-maxage=3600.99, max-age=1800");
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert_eq!(cc.s_maxage().unwrap().unwrap(), 3600);
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(3600));
+
+        // `stale-while-revalidate` and `stale-if-error` also pick up flooring.
+        let resp = build_response(
+            CACHE_CONTROL,
+            "max-age=10, stale-while-revalidate=60.5, stale-if-error=30.9",
+        );
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert_eq!(cc.stale_while_revalidate().unwrap().unwrap(), 60);
+        assert_eq!(cc.stale_if_error().unwrap().unwrap(), 30);
+        assert_eq!(
+            cc.serve_stale_while_revalidate_duration().unwrap(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            cc.serve_stale_if_error_duration().unwrap(),
+            Duration::from_secs(30)
+        );
+
+        // Integer values are unaffected when the flag is on.
+        let resp = build_response(CACHE_CONTROL, "max-age=12345");
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert_eq!(cc.fresh_duration().unwrap(), Duration::from_secs(12345));
+
+        // Invalid (non-numeric, negative) values still fail to parse under the flag.
+        let resp = build_response(CACHE_CONTROL, "max-age=abc");
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert!(cc.max_age().is_err());
+
+        let resp = build_response(CACHE_CONTROL, "max-age=-1.5");
+        let cc = CacheControl::from_resp_headers(&resp)
+            .unwrap()
+            .with_float_seconds();
+        assert!(cc.max_age().is_err());
     }
 }
