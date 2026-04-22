@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+**🚀 Features**
+
+* Add `Session::h1_set_same_connection_followup` for following an HTTP/1.1 redirect on a single pooled upstream connection; disables cache for the skipped intermediate hop when caching is enabled.
+
+**📚 Documentation**
+
+* `ProxyHttp::response_filter`: point to the new follow-up API for same-connection redirect handling.
+
 ## [0.8.0](https://github.com/cloudflare/pingora/compare/0.7.0...0.8.0) - 2026-03-02
 
 

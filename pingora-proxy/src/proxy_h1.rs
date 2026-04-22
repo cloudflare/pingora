@@ -167,14 +167,28 @@ where
             return (false, false, Some(e));
         }
 
-        let (server_session_reuse, client_session_reuse, error) =
-            self.proxy_1to1(session, client_session, peer, ctx).await;
+        let mut server_session_reuse;
+        let mut client_session_reuse;
+        let mut error: Option<Box<Error>>;
 
-        // Record upstream response body bytes received (payload only) for logging consumers.
+        loop {
+            if let Some(next_req) = session.h1_same_connection_followup.take() {
+                *session.req_header_mut() = next_req;
+                session.h1_skip_downstream_response = false;
+            }
+
+            (server_session_reuse, client_session_reuse, error) =
+                self.proxy_1to1(session, client_session, peer, ctx).await;
+
+            if error.is_none() && session.h1_same_connection_followup.is_some() {
+                continue;
+            }
+            break;
+        }
+
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
-        // Record upstream write pending time for this session only (delta from baseline).
         let current_write_pending = client_session.stream().get_write_pending_time();
         let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);
         session.set_upstream_write_pending_time(upstream_write_pending);
@@ -324,7 +338,9 @@ where
             }
             // check error and abort
             // otherwise the error is surfaced via write_response_tasks()
-            if !serve_from_cache.should_send_to_downstream() {
+            if !serve_from_cache.should_send_to_downstream()
+                || session.h1_skip_downstream_for_upstream_response()
+            {
                 if let HttpTask::Failed(e) = task {
                     return Err(e);
                 }
@@ -332,7 +348,9 @@ where
             filtered_tasks.push(task);
         }
 
-        if !serve_from_cache.should_send_to_downstream() {
+        if !serve_from_cache.should_send_to_downstream()
+            || session.h1_skip_downstream_for_upstream_response()
+        {
             // TODO: need to derive response_done from filtered_tasks in case downstream failed already
             return Ok(None);
         }

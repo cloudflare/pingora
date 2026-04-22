@@ -349,6 +349,9 @@ pub trait ProxyHttp {
     ///
     /// The modification is after caching. This filter is called for all responses including
     /// responses served from cache.
+    ///
+    /// To follow a redirect on the same HTTP/1.1 upstream connection (without using the outer
+    /// proxy retry path), use [`crate::Session::h1_set_same_connection_followup`].
     async fn response_filter(
         &self,
         _session: &mut Session,

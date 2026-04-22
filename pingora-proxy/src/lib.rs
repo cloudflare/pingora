@@ -480,6 +480,8 @@ pub struct Session {
     upstream_body_bytes_received: usize,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    h1_skip_downstream_response: bool,
+    h1_same_connection_followup: Option<RequestHeader>,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -502,6 +504,8 @@ impl Session {
             downstream_modules_ctx: downstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
+            h1_skip_downstream_response: false,
+            h1_same_connection_followup: None,
             shutdown_flag,
         }
     }
@@ -740,6 +744,23 @@ impl Session {
     /// Set the upstream write pending time. Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_write_pending_time(&mut self, d: Duration) {
         self.upstream_write_pending_time = d;
+    }
+
+    /// Queue a follow-up request on the same HTTP/1.1 upstream connection after the current
+    /// response body is consumed, without sending that response downstream. Use from
+    /// `response_filter` (e.g. after a 3xx with a same-origin `Location`). Disables caching for
+    /// the skipped hop when cache is enabled.
+    pub fn h1_set_same_connection_followup(&mut self, request: RequestHeader) {
+        if self.cache.enabled() {
+            self.cache
+                .disable(NoCacheReason::Custom("H1SameConnectionRedirect"));
+        }
+        self.h1_skip_downstream_response = true;
+        self.h1_same_connection_followup = Some(request);
+    }
+
+    pub(crate) fn h1_skip_downstream_for_upstream_response(&self) -> bool {
+        self.h1_skip_downstream_response
     }
 
     /// Is the proxy process in the process of shutting down (e.g. due to graceful upgrade)?
@@ -1481,5 +1502,23 @@ where
 
         proxy.handle_init_modules();
         Service::new(name, proxy)
+    }
+}
+
+#[cfg(test)]
+mod h1_same_connection_tests {
+    use super::{RequestHeader, Session};
+    use http::Method;
+    use pingora_core::protocols::Stream;
+
+    #[tokio::test]
+    async fn followup_skips_intermediate_response_downstream() {
+        let input = b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n";
+        let io = tokio_test::io::Builder::new().read(&input[..]).build();
+        let mut session = Session::new_h1(Box::new(io) as Stream);
+        assert!(session.read_request().await.unwrap());
+        let next = RequestHeader::build(Method::GET, b"/b", None).unwrap();
+        session.h1_set_same_connection_followup(next);
+        assert!(session.h1_skip_downstream_for_upstream_response());
     }
 }
