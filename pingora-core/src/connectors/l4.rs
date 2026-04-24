@@ -412,7 +412,7 @@ mod tests {
         let move_flag = Arc::clone(&flag);
 
         peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |_| {
-            move_flag.fetch_xor(true, Ordering::SeqCst);
+            move_flag.fetch_not(Ordering::SeqCst);
             Ok(())
         }));
 
