@@ -48,6 +48,9 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
+        // rustls 0.23+ requires an explicit CryptoProvider.
+        pingora_rustls::install_default_crypto_provider();
+
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
             panic!(

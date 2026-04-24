@@ -18,7 +18,7 @@ path = "src/lib.rs"
 log = "0.4.21"
 pingora-error = { version = "0.8.0", path = "../pingora-error"}
 ring = "0.17.12"
-rustls = "0.23.12"
+rustls = { version = "0.23.12", features = ["ring"] }
 rustls-native-certs = "0.7.1"
 rustls-pemfile = "2.1.2"
 rustls-pki-types = "1.7.0"

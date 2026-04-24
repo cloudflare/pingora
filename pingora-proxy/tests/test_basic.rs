@@ -17,7 +17,8 @@ mod utils;
 use bytes::Bytes;
 use h2::client;
 use http::Request;
-use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
+use http_body_util::BodyExt;
+use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
@@ -161,21 +162,21 @@ async fn test_h2_to_h2() {
 async fn test_h2c_to_h2c() {
     init();
 
-    let client = hyper::client::Client::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .http2_only(true)
-        .build_http();
+        .build_http::<http_body_util::Empty<Bytes>>();
 
-    let mut req = hyper::Request::builder()
+    let mut req = http::Request::builder()
         .uri("http://127.0.0.1:6146")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     req.headers_mut()
-        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+        .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_2);
 
-    let body = res.into_body().data().await.unwrap().unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
@@ -183,21 +184,21 @@ async fn test_h2c_to_h2c() {
 async fn test_h1_on_h2c_port() {
     init();
 
-    let client = hyper::client::Client::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .http2_only(false)
-        .build_http();
+        .build_http::<http_body_util::Empty<Bytes>>();
 
-    let mut req = hyper::Request::builder()
+    let mut req = http::Request::builder()
         .uri("http://127.0.0.1:6146")
-        .body(Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     req.headers_mut()
-        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+        .insert("x-h2", http::HeaderValue::from_bytes(b"true").unwrap());
     let res = client.request(req).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 
-    let body = res.into_body().data().await.unwrap().unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 
@@ -303,7 +304,7 @@ async fn test_h2_head() {
 async fn test_simple_proxy_uds() {
     init();
     let url = Uri::new("/tmp/pingora_proxy.sock", "/").into();
-    let client = Client::unix();
+    let client: Client<hyperlocal::UnixConnector, http_body_util::Empty<Bytes>> = Client::unix();
 
     let res = client.get(url).await.unwrap();
 
@@ -324,7 +325,10 @@ async fn test_simple_proxy_uds() {
     assert_eq!(sockaddr.ip().to_string(), "127.0.0.2");
     assert!(is_specified_port(sockaddr.port()));
 
-    let body = hyper::body::to_bytes(body).await.unwrap();
+    let body = http_body_util::BodyExt::collect(body)
+        .await
+        .unwrap()
+        .to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
 }
 

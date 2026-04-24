@@ -28,9 +28,19 @@ use pingora_error::{Error, ErrorType, OrErr, Result};
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
 pub use rustls::{
-    client::WebPkiServerVerifier, version, CertificateError, ClientConfig, DigitallySignedStruct,
-    Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream,
+    client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
+    DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
+    SignatureScheme, Stream,
 };
+
+/// Install the default `ring` CryptoProvider for rustls.
+///
+/// rustls 0.23+ requires an explicit provider. This function installs `ring`
+/// as the process-level default. Safe to call multiple times — subsequent
+/// calls are no-ops.
+pub fn install_default_crypto_provider() {
+    let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
