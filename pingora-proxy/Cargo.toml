@@ -36,15 +36,18 @@ regex = "1"
 rand = "0.8"
 
 [dev-dependencies]
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.12", features = [
     "gzip",
     "rustls-tls",
+    "http2",
 ], default-features = false }
 httparse = { workspace = true }
 tokio-test = "0.4"
 env_logger = "0.11"
-hyper = "0.14"
-tokio-tungstenite = "0.20.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.26"
 pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
 pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
 pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
@@ -55,7 +58,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 
 [target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
+hyperlocal = "0.9"
 
 [features]
 default = []
