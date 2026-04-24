@@ -1159,6 +1159,12 @@ impl HttpSession {
             }
             HttpTask::UpgradedBody(data, end_stream) => {
                 self.write_non_empty_body(data, true).await?;
+                if !end_stream {
+                    self.underlying_stream
+                        .flush()
+                        .await
+                        .or_err(WriteError, "flushing upgraded body")?;
+                }
                 end_stream
             }
             HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
@@ -1231,6 +1237,11 @@ impl HttpSession {
         if end_stream {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
+        } else if self.upgraded {
+            self.underlying_stream
+                .flush()
+                .await
+                .or_err(WriteError, "flushing upgraded body")?;
         }
         Ok(end_stream || self.body_writer.finished())
     }
