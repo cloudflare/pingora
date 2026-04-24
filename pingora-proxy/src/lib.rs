@@ -76,6 +76,13 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
+fn is_benign_upstream_retry_log(e: &Error) -> bool {
+    matches!(&e.etype, HTTPStatus(code) if (300..400).contains(code))
+        && e.context
+            .as_ref()
+            .is_some_and(|c| c.as_str().starts_with("redirect_follow_hop:"))
+}
+
 const TASK_BUFFER_SIZE: usize = 4;
 
 mod proxy_cache;
@@ -977,13 +984,23 @@ where
                         break;
                     }
                     // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
-                        proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
+                    if is_benign_upstream_retry_log(proxy_error.as_ref().unwrap()) {
+                        debug!(
+                            "Redirect follow: {}, tries: {}, retry: {}, {}",
+                            proxy_error.as_ref().unwrap(),
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    } else {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            proxy_error.as_ref().unwrap(),
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                 }
                 None => {
                     proxy_error = None;
