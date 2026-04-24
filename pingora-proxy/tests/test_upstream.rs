@@ -2914,7 +2914,6 @@ mod test_cache {
     }
 
     #[tokio::test]
-    #[ignore = "flaky in CI due to timing/resource contention"]
     async fn test_caching_when_downstream_stalls() {
         use std::net::ToSocketAddrs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2998,7 +2997,6 @@ mod test_cache {
     // to the origin over H2 (via the x-h2 header).
     //
     #[tokio::test]
-    #[ignore = "flaky in CI due to timing/resource contention"]
     async fn test_caching_h2_upstream_when_downstream_stalls() {
         use std::net::ToSocketAddrs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

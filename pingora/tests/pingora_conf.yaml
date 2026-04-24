@@ -1,5 +1,0 @@
----
-version: 1
-client_bind_to_ipv4:
-    - 127.0.0.2
-ca_file: tests/keys/server.crt
