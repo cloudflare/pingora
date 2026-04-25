@@ -366,6 +366,10 @@ impl Peer for BasicPeer {
     fn reuse_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self._address.hash(&mut hasher);
+        // If TLS is used, the SNI must be part of the reuse key to avoid
+        // cross-host connection reuse (different SNI/hostname on same IP:port).
+        // When SNI is empty (non-TLS), this keeps the historical behavior.
+        self.sni.hash(&mut hasher);
         hasher.finish()
     }
 
