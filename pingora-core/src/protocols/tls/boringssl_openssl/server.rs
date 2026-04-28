@@ -59,7 +59,12 @@ pub async fn handshake_with_callback<S: IO>(
     if !done {
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
-        callbacks.certificate_callback(ssl_mut).await;
+        callbacks
+            .certificate_callback_result(ssl_mut)
+            .await
+            .explain_err(TLSHandshakeFailure, |e| {
+                format!("certificate callback failed: {e}")
+            })?;
         Pin::new(&mut tls_stream)
             .resume_accept()
             .await
@@ -145,9 +150,11 @@ mod tests {
     use crate::protocols::tls::TlsRef;
     use crate::tls::ext;
     use crate::tls::ssl;
+    use pingora_error::{Error, ErrorType};
 
     use async_trait::async_trait;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::io::DuplexStream;
 
@@ -165,6 +172,17 @@ mod tests {
         let _ = stream.read(&mut buf).await;
     }
 
+    async fn best_effort_client_task(client: DuplexStream) {
+        let ssl_context = ssl::SslContext::builder(ssl::SslMethod::tls())
+            .unwrap()
+            .build();
+        let mut ssl = ssl::Ssl::new(&ssl_context).unwrap();
+        ssl.set_hostname("pingora.org").unwrap();
+        ssl.set_verify(ssl::SslVerifyMode::NONE); // we don have a valid cert
+        let mut stream = SslStream::new(ssl, client).unwrap();
+        let _ = Pin::new(&mut stream).connect().await;
+    }
+
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_async_cert() {
@@ -175,7 +193,7 @@ mod tests {
         struct Callback;
         #[async_trait]
         impl TlsAccept for Callback {
-            async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
+            async fn certificate_callback(&self, ssl: &mut TlsRef) {
                 assert_eq!(
                     ssl.servername(ssl::NameType::HOST_NAME).unwrap(),
                     "pingora.org"
@@ -202,6 +220,99 @@ mod tests {
         handshake_with_callback(&acceptor, server, &cb)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_async_cert_error() {
+        let acceptor = ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls())
+            .unwrap()
+            .build();
+
+        struct Callback;
+        #[async_trait]
+        impl TlsAccept for Callback {
+            async fn certificate_callback_result(
+                &self,
+                _ssl: &mut TlsRef,
+            ) -> pingora_error::Result<()> {
+                Error::e_explain(
+                    ErrorType::InternalError,
+                    "dynamic cert rejected by callback",
+                )
+            }
+        }
+
+        let cb: TlsAcceptCallbacks = Box::new(Callback);
+
+        let (client, server) = tokio::io::duplex(1024);
+
+        tokio::spawn(best_effort_client_task(client));
+
+        let err = handshake_with_callback(&acceptor, server, &cb)
+            .await
+            .unwrap_err();
+        let err_str = err.to_string();
+        assert!(err_str.contains("certificate callback failed:"));
+        assert!(err_str.contains("dynamic cert rejected by callback"));
+        assert_eq!(err.etype(), &ErrorType::TLSHandshakeFailure);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_async_cert_result_is_authoritative() {
+        let acceptor = ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls())
+            .unwrap()
+            .build();
+
+        struct Callback {
+            legacy_called: Arc<AtomicBool>,
+            result_called: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl TlsAccept for Callback {
+            async fn certificate_callback(&self, _ssl: &mut TlsRef) {
+                self.legacy_called.store(true, Ordering::SeqCst);
+            }
+
+            async fn certificate_callback_result(
+                &self,
+                ssl: &mut TlsRef,
+            ) -> pingora_error::Result<()> {
+                self.result_called.store(true, Ordering::SeqCst);
+
+                let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+                let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+
+                let cert_bytes = std::fs::read(cert).unwrap();
+                let cert = crate::tls::x509::X509::from_pem(&cert_bytes).unwrap();
+
+                let key_bytes = std::fs::read(key).unwrap();
+                let key = crate::tls::pkey::PKey::private_key_from_pem(&key_bytes).unwrap();
+                ext::ssl_use_certificate(ssl, &cert).unwrap();
+                ext::ssl_use_private_key(ssl, &key).unwrap();
+                Ok(())
+            }
+        }
+
+        let legacy_called = Arc::new(AtomicBool::new(false));
+        let result_called = Arc::new(AtomicBool::new(false));
+        let cb: TlsAcceptCallbacks = Box::new(Callback {
+            legacy_called: legacy_called.clone(),
+            result_called: result_called.clone(),
+        });
+
+        let (client, server) = tokio::io::duplex(1024);
+
+        tokio::spawn(client_task(client));
+
+        handshake_with_callback(&acceptor, server, &cb)
+            .await
+            .unwrap();
+
+        assert!(result_called.load(Ordering::SeqCst));
+        assert!(!legacy_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
