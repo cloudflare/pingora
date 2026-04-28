@@ -17,9 +17,11 @@ mod utils;
 use utils::server_utils::init;
 use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use http::header::{HeaderName, HeaderValue};
+use http_body_util::BodyExt;
 use pingora_http::ResponseHeader;
-use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{StatusCode, Version};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -181,7 +183,7 @@ async fn test_ws_server_ends_conn() {
     ws_stream.close(None).await.unwrap();
     let msg = ws_stream.next().await.unwrap().unwrap();
     // assert echo
-    assert_eq!("test", msg.into_text().unwrap());
+    assert_eq!(msg.into_text().unwrap(), "test");
     let msg = ws_stream.next().await.unwrap().unwrap();
     // assert graceful close
     assert!(matches!(msg, Message::Close(None)));
@@ -363,22 +365,22 @@ async fn test_upgrade_body_after_101() {
 #[tokio::test]
 async fn test_download_timeout() {
     init();
-    use hyper::body::HttpBody;
     use tokio::time::sleep;
 
-    let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
-    let req = hyper::Request::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Empty<Bytes>>();
+    let uri: http::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
+    let req = http::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
-        .body(hyper::Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
-    while let Some(chunk) = res.body_mut().data().await {
+    while let Some(chunk) = res.body_mut().frame().await {
         if chunk.is_err() {
             err = true;
         }
@@ -389,28 +391,27 @@ async fn test_download_timeout() {
 #[tokio::test]
 async fn test_download_timeout_min_rate() {
     init();
-    use hyper::body::HttpBody;
     use tokio::time::sleep;
 
-    let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
-    let req = hyper::Request::builder()
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<http_body_util::Empty<Bytes>>();
+    let uri: http::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = http::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
         .header("x-min-rate", "10000")
-        .body(hyper::Body::empty())
+        .body(http_body_util::Empty::<Bytes>::new())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
-    while let Some(chunk) = res.body_mut().data().await {
+    while let Some(chunk) = res.body_mut().frame().await {
         if chunk.is_err() {
             err = true;
         }
     }
-    // no error as write timeout is overridden by min rate
     assert!(!err);
 }
 
@@ -2914,7 +2915,6 @@ mod test_cache {
     }
 
     #[tokio::test]
-    #[ignore = "flaky in CI due to timing/resource contention"]
     async fn test_caching_when_downstream_stalls() {
         use std::net::ToSocketAddrs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2998,7 +2998,6 @@ mod test_cache {
     // to the origin over H2 (via the x-h2 header).
     //
     #[tokio::test]
-    #[ignore = "flaky in CI due to timing/resource contention"]
     async fn test_caching_h2_upstream_when_downstream_stalls() {
         use std::net::ToSocketAddrs;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

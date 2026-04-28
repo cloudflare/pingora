@@ -57,6 +57,23 @@ pub trait ProxyHttp {
         modules.add_module(ResponseCompressionBuilder::enable(0));
     }
 
+    /// Set up upstream modules.
+    ///
+    /// In this phase, users can add [HttpModules] that will process upstream responses
+    /// **before** `upstream_compression`. This is the correct place to register modules
+    /// that need to observe the raw (pre-compression) upstream response body, such as
+    /// a dictionary store for shared dictionary compression.
+    ///
+    /// Upstream modules are ordered by [`HttpModuleBuilder::order()`]: higher values run
+    /// first. They are invoked on each upstream response task (header, body, trailers)
+    /// before `upstream_compression` processes the task.
+    ///
+    /// By default this method does nothing.
+    ///
+    /// This method requires the `upstream_modules` feature to be enabled.
+    #[cfg(feature = "upstream_modules")]
+    fn init_upstream_modules(&self, _modules: &mut HttpModules) {}
+
     /// Handle the incoming request.
     ///
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
@@ -311,8 +328,8 @@ pub trait ProxyHttp {
     /// The response header is provided as an immutable reference. To modify the response header
     /// itself, use [`Self::upstream_response_filter()`] instead.
     ///
-    /// This filter requires the `adjust_upstream_modules` feature to be enabled.
-    #[cfg(feature = "adjust_upstream_modules")]
+    /// This filter requires the `upstream_modules` feature to be enabled.
+    #[cfg(feature = "upstream_modules")]
     async fn adjust_upstream_modules(
         &self,
         _session: &mut Session,

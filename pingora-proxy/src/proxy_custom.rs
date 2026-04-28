@@ -293,12 +293,14 @@ where
                 // skip downstream filtering entirely as the 304 will not be sent
                 break;
             }
-            #[cfg(feature = "adjust_upstream_modules")]
+            #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
                 self.inner
                     .adjust_upstream_modules(session, header, *end_of_stream, ctx)
                     .await?;
             }
+            #[cfg(feature = "upstream_modules")]
+            session.upstream_modules_filter_task(&mut t).await?;
             session.upstream_compression.response_filter(&mut t);
             // check error and abort
             // otherwise the error is surfaced via write_response_tasks()
@@ -526,7 +528,9 @@ where
                                 return Err(e);
                             }
                         }
-                        if response_state.cached_done() {
+                        // A storage error can disable cache between cached_done
+                        // being set and here; see the same guard in proxy_h1.rs.
+                        if response_state.cached_done() && session.cache.enabled() {
                             if let Err(e) = session.cache.finish_hit_handler().await {
                                 warn!("Error during finish_hit_handler: {}", e);
                             }
@@ -550,7 +554,8 @@ where
                             match write_result {
                                 Ok(end) => {
                                     response_state.maybe_set_cache_done(end);
-                                    if response_state.cached_done() {
+                                    // See enabled() guard comment above.
+                                    if response_state.cached_done() && session.cache.enabled() {
                                         if let Err(e) = session.cache.finish_hit_handler().await {
                                             warn!("Error during finish_hit_handler: {}", e);
                                         }

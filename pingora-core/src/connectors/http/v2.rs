@@ -24,7 +24,7 @@ use bytes::Bytes;
 use h2::client::SendRequest;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
-use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use pingora_error::{Error, ErrorType::*, OkOrErr, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -350,10 +350,10 @@ impl Connector {
         settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
         settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
         let conn = handshake(stream, settings).await?;
-        let h2_stream = conn
-            .spawn_stream()
-            .await?
-            .expect("newly created connections should have at least one free stream");
+        let h2_stream = conn.spawn_stream().await?.or_err(
+            H2Error,
+            "newly created connection has no free streams (server may have sent GOAWAY)",
+        )?;
         if conn.more_streams_allowed() {
             self.in_use_pool.insert(peer.reuse_hash(), conn);
         }
@@ -996,5 +996,37 @@ mod tests {
 
         stream.read_response_header().await.unwrap();
         assert_eq!(stream.response_header().unwrap().status, 200);
+    }
+
+    /// `spawn_stream()` must return `Ok(None)` when the server sends
+    /// GOAWAY(NO_ERROR) before any streams are opened.
+    #[tokio::test]
+    async fn test_spawn_stream_goaway_no_error_returns_none() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+
+        let mut server_conn = h2::server::handshake(server_io).await.unwrap();
+        server_conn.graceful_shutdown();
+        let _ = server_conn.accept().await;
+        drop(server_conn);
+
+        conn_handle.await.unwrap();
+
+        let result = conn.spawn_stream().await;
+        assert!(
+            result.is_ok(),
+            "expected Ok(None), got Err: {:?}",
+            result.as_ref().err()
+        );
+        assert!(result.unwrap().is_none());
+        assert!(conn.is_shutting_down());
     }
 }
