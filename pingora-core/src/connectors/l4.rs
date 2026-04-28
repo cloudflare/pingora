@@ -105,33 +105,39 @@ where
         } else {
             match peer_addr {
                 SocketAddr::Inet(addr) => {
-                    let connect_future = tcp_connect(addr, bind_to.as_ref(), |socket| {
-                        #[cfg(unix)]
-                        let raw = socket.as_raw_fd();
-                        #[cfg(windows)]
-                        let raw = socket.as_raw_socket();
+                    let connect_future = tcp_connect(
+                        addr,
+                        bind_to.as_ref(),
+                        peer.tcp_mptcp(),
+                        peer.tcp_mptcp_fallback(),
+                        |socket| {
+                            #[cfg(unix)]
+                            let raw = socket.as_raw_fd();
+                            #[cfg(windows)]
+                            let raw = socket.as_raw_socket();
 
-                        if peer.tcp_fast_open() {
-                            set_tcp_fastopen_connect(raw)?;
-                        }
-                        if let Some(recv_buf) = peer.tcp_recv_buf() {
-                            debug!("Setting recv buf size");
-                            set_recv_buf(raw, recv_buf)?;
-                        }
-                        if let Some(dscp) = peer.dscp() {
-                            debug!("Setting dscp");
-                            set_dscp(raw, dscp)?;
-                        }
+                            if peer.tcp_fast_open() {
+                                set_tcp_fastopen_connect(raw)?;
+                            }
+                            if let Some(recv_buf) = peer.tcp_recv_buf() {
+                                debug!("Setting recv buf size");
+                                set_recv_buf(raw, recv_buf)?;
+                            }
+                            if let Some(dscp) = peer.dscp() {
+                                debug!("Setting dscp");
+                                set_dscp(raw, dscp)?;
+                            }
 
-                        if let Some(tweak_hook) = peer
-                            .get_peer_options()
-                            .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
-                        {
-                            tweak_hook(socket)?;
-                        }
+                            if let Some(tweak_hook) = peer
+                                .get_peer_options()
+                                .and_then(|o| o.upstream_tcp_sock_tweak_hook.clone())
+                            {
+                                tweak_hook(socket)?;
+                            }
 
-                        Ok(())
-                    });
+                            Ok(())
+                        },
+                    );
                     let conn_res = match peer.connection_timeout() {
                         Some(t) => pingora_timeout::timeout(t, connect_future)
                             .await

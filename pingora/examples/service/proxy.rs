@@ -19,6 +19,8 @@ use pingora_core::upstreams::peer::BasicPeer;
 
 pub fn proxy_service(addr: &str, proxy_addr: &str) -> Service<ProxyApp> {
     let proxy_to = BasicPeer::new(proxy_addr);
+    // On Linux, prefer MPTCP for upstream connects with:
+    // proxy_to.options.tcp_mptcp = true;
 
     Service::with_listeners(
         "Proxy Service".to_string(),
@@ -37,6 +39,8 @@ pub fn proxy_service_tls(
     let mut proxy_to = BasicPeer::new(proxy_addr);
     // set SNI to enable TLS
     proxy_to.sni = proxy_sni.into();
+    // On Linux, prefer MPTCP for upstream connects with:
+    // proxy_to.options.tcp_mptcp = true;
     Service::with_listeners(
         "Proxy Service TLS".to_string(),
         Listeners::tls(addr, cert_path, key_path).unwrap(),

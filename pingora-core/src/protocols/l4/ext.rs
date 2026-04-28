@@ -20,7 +20,10 @@
 use libc::socklen_t;
 #[cfg(target_os = "linux")]
 use libc::{c_int, c_ulonglong, c_void};
+use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+#[cfg(target_os = "linux")]
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, ErrorKind};
 use std::mem;
 use std::net::SocketAddr;
@@ -485,38 +488,67 @@ pub fn get_original_dest(_sock: RawSocket) -> Result<Option<SocketAddr>> {
 pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
     addr: &SocketAddr,
     bind_to: Option<&BindTo>,
+    tcp_mptcp: bool,
+    tcp_mptcp_fallback: bool,
+    set_socket: F,
+) -> Result<TcpStream> {
+    let connect_result =
+        connect_with_bind_retry(addr, bind_to, tcp_mptcp, set_socket.clone()).await;
+
+    if tcp_mptcp && tcp_mptcp_fallback {
+        match connect_result {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                debug!("MPTCP connect to {addr} failed, retrying over TCP: {e}");
+                return connect_with_bind_retry(addr, bind_to, false, set_socket)
+                    .await
+                    .map_err(|mut fallback_error| {
+                        fallback_error.set_cause(e);
+                        fallback_error
+                    });
+            }
+        }
+    }
+
+    connect_result
+}
+
+async fn connect_with_bind_retry<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
+    addr: &SocketAddr,
+    bind_to: Option<&BindTo>,
+    tcp_mptcp: bool,
     set_socket: F,
 ) -> Result<TcpStream> {
     if bind_to.as_ref().is_some_and(|b| b.will_fallback()) {
         // if we see an EADDRNOTAVAIL error clear the port range and try again
-        let connect_result = inner_connect_with(addr, bind_to, set_socket.clone()).await;
+        let connect_result = inner_connect_with(addr, bind_to, tcp_mptcp, set_socket.clone()).await;
         if let Err(e) = connect_result.as_ref() {
             if matches!(e.etype(), BindError) {
                 let mut new_bind_to = BindTo::default();
                 new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
                 // reset the port range
                 new_bind_to.set_port_range(None).unwrap();
-                return inner_connect_with(addr, Some(&new_bind_to), set_socket).await;
+                return inner_connect_with(addr, Some(&new_bind_to), tcp_mptcp, set_socket).await;
             }
         }
         connect_result
     } else {
         // not retryable
-        inner_connect_with(addr, bind_to, set_socket).await
+        inner_connect_with(addr, bind_to, tcp_mptcp, set_socket).await
     }
 }
 
 async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     addr: &SocketAddr,
     bind_to: Option<&BindTo>,
+    tcp_mptcp: bool,
     set_socket: F,
 ) -> Result<TcpStream> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()
+    let socket = if tcp_mptcp {
+        new_mptcp_socket(addr)
     } else {
-        TcpSocket::new_v6()
-    }
-    .or_err(SocketError, "failed to create socket")?;
+        new_tcp_socket(addr)
+    }?;
 
     #[cfg(unix)]
     {
@@ -562,7 +594,45 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
 /// `IP_BIND_ADDRESS_NO_PORT` is used
 /// `IP_LOCAL_PORT_RANGE` is used if a port range is set on [`BindTo`].
 pub async fn connect(addr: &SocketAddr, bind_to: Option<&BindTo>) -> Result<TcpStream> {
-    connect_with(addr, bind_to, |_| Ok(())).await
+    connect_with(addr, bind_to, false, false, |_| Ok(())).await
+}
+
+fn new_tcp_socket(addr: &SocketAddr) -> Result<TcpSocket> {
+    if addr.is_ipv4() {
+        TcpSocket::new_v4()
+    } else {
+        TcpSocket::new_v6()
+    }
+    .or_err(SocketError, "failed to create socket")
+}
+
+#[cfg(target_os = "linux")]
+fn new_mptcp_socket(addr: &SocketAddr) -> Result<TcpSocket> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(
+        domain,
+        Type::STREAM,
+        Some(Protocol::from(libc::IPPROTO_MPTCP)),
+    )
+    .or_err(SocketError, "failed to create MPTCP socket")?;
+    socket
+        .set_nonblocking(true)
+        .or_err(SocketError, "failed to set MPTCP socket nonblocking")?;
+
+    Ok(TcpSocket::from_std_stream(socket.into()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn new_mptcp_socket(_addr: &SocketAddr) -> Result<TcpSocket> {
+    Error::e_explain(
+        SocketError,
+        "MPTCP upstream sockets are only supported on Linux",
+    )
 }
 
 /// connect() to the given Unix domain socket
@@ -660,16 +730,24 @@ mod test {
         use std::time::Instant;
 
         // connect once to make sure their is a SYN cookie to use for TFO
-        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
-            set_tcp_fastopen_connect(socket.as_raw_fd())
-        })
+        connect_with(
+            &"1.1.1.1:80".parse().unwrap(),
+            None,
+            false,
+            false,
+            |socket| set_tcp_fastopen_connect(socket.as_raw_fd()),
+        )
         .await
         .unwrap();
 
         let start = Instant::now();
-        connect_with(&"1.1.1.1:80".parse().unwrap(), None, |socket| {
-            set_tcp_fastopen_connect(socket.as_raw_fd())
-        })
+        connect_with(
+            &"1.1.1.1:80".parse().unwrap(),
+            None,
+            false,
+            false,
+            |socket| set_tcp_fastopen_connect(socket.as_raw_fd()),
+        )
         .await
         .unwrap();
         let connection_time = start.elapsed();
