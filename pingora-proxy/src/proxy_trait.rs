@@ -345,6 +345,39 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Inspect the upstream response headers as they arrive and
+    /// optionally abort the response.
+    ///
+    /// Returning `Some(err)` causes the upstream response to be
+    /// discarded before any bytes reach the downstream client. If
+    /// `err.retry()` is `true` (set via `err.set_retry(true)`),
+    /// Pingora drops the upstream connection and re-runs
+    /// [`Self::upstream_peer()`] just like a connect-time retry.
+    /// Reuse of a buffered request body is gated by the existing
+    /// retry-buffer mechanism, so retries are only attempted when the
+    /// request can be replayed safely.
+    ///
+    /// This hook is the right place to implement status-code-driven
+    /// upstream retries (for example, retry on `502`/`503`/`504` during
+    /// a rolling restart). Headers have not yet been forwarded to the
+    /// downstream when this fires, so aborting the response is well
+    /// defined; once response bytes have started flowing to the client
+    /// no proxy can retry safely.
+    ///
+    /// The default returns `None` (every upstream response passes
+    /// through), preserving existing behaviour.
+    async fn upstream_response_decision(
+        &self,
+        _session: &mut Session,
+        _upstream_response: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Option<Box<Error>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        None
+    }
+
     /// Modify the response header before it is send to the downstream
     ///
     /// The modification is after caching. This filter is called for all responses including

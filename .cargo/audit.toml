@@ -1,3 +1,12 @@
 [advisories]
 # Temp before internal sync applies dependency bumps
-ignore = ["RUSTSEC-2026-0097", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
+ignore = [
+    "RUSTSEC-2026-0097",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    # rustls-webpki 0.101.7 panic via reqwest 0.11.27 -> tokio-rustls 0.24.1
+    # -> rustls 0.21.12. Fixed by upgrading reqwest to 0.13 (which already
+    # appears elsewhere in the tree). Published 2026-04-22; affects
+    # upstream main as well.
+    "RUSTSEC-2026-0104",
+]

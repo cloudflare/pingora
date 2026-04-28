@@ -388,6 +388,21 @@ where
                 self.inner
                     .upstream_response_filter(session, header, ctx)
                     .await?;
+                // Give the user a chance to abort the response
+                // before any bytes flow downstream. Returning an
+                // error here joins the existing retry path: if the
+                // user sets `err.set_retry(true)`, the proxy will
+                // re-run upstream_peer() just like a connect-time
+                // retry. Reuse of the buffered request body is gated
+                // by the existing retry-buffer mechanism via
+                // `error_while_proxy`.
+                if let Some(err) = self
+                    .inner
+                    .upstream_response_decision(session, header, ctx)
+                    .await
+                {
+                    return Err(err);
+                }
                 None
             }
             HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
