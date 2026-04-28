@@ -174,8 +174,23 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
-        let client_upstream =
-            Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
+        let opts = ConnectorOptions::from_server_conf(&conf);
+        Self::new_custom_with_options(inner, conf, connector, on_custom, server_options, opts)
+    }
+
+    fn new_custom_with_options(
+        inner: SV,
+        conf: Arc<ServerConf>,
+        connector: C,
+        on_custom: Option<ProcessCustomSession<SV, C>>,
+        server_options: Option<HttpServerOptions>,
+        connector_options: ConnectorOptions,
+    ) -> Self
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        SV::CTX: Send + Sync,
+    {
+        let client_upstream = Connector::new_custom(Some(connector_options), connector);
 
         HttpProxy {
             inner,
@@ -1383,6 +1398,7 @@ where
     connector: C,
     custom: Option<ProcessCustomSession<SV, C>>,
     server_options: Option<HttpServerOptions>,
+    connector_options: Option<ConnectorOptions>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, ()>
@@ -1407,6 +1423,7 @@ where
             connector: (),
             custom: None,
             server_options: None,
+            connector_options: None,
         }
     }
 }
@@ -1441,6 +1458,7 @@ where
             inner,
             name,
             server_options,
+            connector_options,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1450,6 +1468,7 @@ where
             connector,
             custom: Some(on_custom),
             server_options,
+            connector_options,
         }
     }
 
@@ -1458,6 +1477,15 @@ where
     /// Returns a new [ProxyServiceBuilder] with the server options set.
     pub fn server_options(mut self, options: HttpServerOptions) -> Self {
         self.server_options = Some(options);
+        self
+    }
+
+    /// Override the default [ConnectorOptions] derived from [ServerConf].
+    ///
+    /// This allows setting custom options such as a custom server certificate verifier
+    /// for the upstream TLS connector.
+    pub fn connector_options(mut self, options: ConnectorOptions) -> Self {
+        self.connector_options = Some(options);
         self
     }
 
@@ -1475,9 +1503,18 @@ where
             connector,
             custom,
             server_options,
+            connector_options,
         } = self;
 
-        let mut proxy = HttpProxy::new_custom(inner, conf, connector, custom, server_options);
+        let opts = connector_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
+        let mut proxy = HttpProxy::new_custom_with_options(
+            inner,
+            conf,
+            connector,
+            custom,
+            server_options,
+            opts,
+        );
 
         proxy.handle_init_modules();
         Service::new(name, proxy)
