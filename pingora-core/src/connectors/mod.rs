@@ -613,8 +613,16 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
-        assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
+        // The exact error varies by platform: Linux may return ConnectError,
+        // some systems time out (ConnectTimedout), and macOS/others may
+        // return ConnectNoRoute (ENETUNREACH) for unreachable addresses.
+        assert!(
+            error.etype() == &ConnectError
+                || error.etype() == &ConnectTimedout
+                || error.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            error.etype()
+        )
     }
 
     /// Helper function for testing error handling in the `do_connect` function.
