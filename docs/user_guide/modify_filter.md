@@ -35,6 +35,22 @@ impl ProxyHttp for MyGateway {
 ```
 
 
+## Accessing request headers
+
+Request headers can be accessed through `session.req_header()`. For HTTP/1.1 and HTTP/2 requests, the API provides a unified interface for header access.
+
+### Host header
+
+To get the request host, use the standard `HOST` header. For HTTP/2 requests, Pingora automatically maps the `:authority` pseudo-header to the `HOST` header for compatibility.
+
+```Rust
+use http::header::HOST;
+
+let host = session.req_header().headers.get(HOST);
+```
+
+For HTTP/1.1 requests, this returns the `Host` header value. For HTTP/2 requests, this returns the `:authority` pseudo-header value.
+
 ## Modifying headers
 
 Both request and response headers can be added, removed or modified in their corresponding phases. In the following example, we add logic to the `response_filter` phase to update the `Server` header and remove the `alt-svc` header.
