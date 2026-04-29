@@ -181,6 +181,11 @@ pub struct WrappedX509 {
 }
 
 impl WrappedX509 {
+    /// Parse DER-encoded certificate bytes into a [`WrappedX509`].
+    pub fn parse(raw_cert: Vec<u8>) -> Self {
+        Self::new(raw_cert, parse_x509)
+    }
+
     pub fn not_after(&self) -> String {
         self.borrow_cert().validity.not_after.to_string()
     }
