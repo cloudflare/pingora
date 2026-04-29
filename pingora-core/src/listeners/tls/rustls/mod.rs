@@ -32,6 +32,7 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    custom_config: Option<Arc<ServerConfig>>,
 }
 
 pub struct Acceptor {
@@ -48,34 +49,40 @@ impl TlsSettings {
     ///
     /// Todo: Return a result instead of panicking XD
     pub fn build(self) -> Acceptor {
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
-        };
-
-        let builder =
-            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
-        let builder = if let Some(verifier) = self.client_cert_verifier {
-            builder.with_client_cert_verifier(verifier)
+        let config = if let Some(custom_config) = self.custom_config {
+            custom_config
         } else {
-            builder.with_no_client_auth()
-        };
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| {
-                format!("Failed to create server listener config: {e}")
-            })
-            .unwrap();
+            let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
+            else {
+                panic!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\".",
+                    self.cert_path, self.key_path
+                )
+            };
 
-        if let Some(alpn_protocols) = self.alpn_protocols {
-            config.alpn_protocols = alpn_protocols;
-        }
+            let builder =
+                ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
+            let builder = if let Some(verifier) = self.client_cert_verifier {
+                builder.with_client_cert_verifier(verifier)
+            } else {
+                builder.with_no_client_auth()
+            };
+            let mut config = builder
+                .with_single_cert(certs, key)
+                .explain_err(InternalError, |e| {
+                    format!("Failed to create server listener config: {e}")
+                })
+                .unwrap();
+
+            if let Some(alpn_protocols) = self.alpn_protocols {
+                config.alpn_protocols = alpn_protocols;
+            }
+
+            Arc::new(config)
+        };
 
         Acceptor {
-            acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            acceptor: RusTlsAcceptor::from(config),
             callbacks: None,
         }
     }
@@ -104,6 +111,24 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            custom_config: None,
+        })
+    }
+
+    /// Create a new TlsSettings with a custom ServerConfig.
+    ///
+    /// This allows for full control over the rustls ServerConfig,
+    /// including 0-RTT, session resumption, and custom certificate resolvers.
+    pub fn with_server_config(config: Arc<ServerConfig>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            custom_config: Some(config),
         })
     }
 

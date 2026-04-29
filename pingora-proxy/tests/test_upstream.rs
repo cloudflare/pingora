@@ -181,7 +181,7 @@ async fn test_ws_server_ends_conn() {
     ws_stream.close(None).await.unwrap();
     let msg = ws_stream.next().await.unwrap().unwrap();
     // assert echo
-    assert_eq!("test", msg.into_text().unwrap());
+    assert_eq!(msg.into_text().unwrap(), "test");
     let msg = ws_stream.next().await.unwrap().unwrap();
     // assert graceful close
     assert!(matches!(msg, Message::Close(None)));
@@ -363,23 +363,24 @@ async fn test_upgrade_body_after_101() {
 #[tokio::test]
 async fn test_download_timeout() {
     init();
-    use hyper::body::HttpBody;
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use tokio::time::sleep;
 
-    let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
-    let req = hyper::Request::builder()
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    let uri: http::Uri = "http://127.0.0.1:6147/download_large/".parse().unwrap();
+    let req = http::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
-        .body(hyper::Body::empty())
+        .body(Empty::<bytes::Bytes>::new())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
-    while let Some(chunk) = res.body_mut().data().await {
-        if chunk.is_err() {
+    while let Some(frame) = res.body_mut().frame().await {
+        if frame.is_err() {
             err = true;
         }
     }
@@ -389,24 +390,25 @@ async fn test_download_timeout() {
 #[tokio::test]
 async fn test_download_timeout_min_rate() {
     init();
-    use hyper::body::HttpBody;
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use tokio::time::sleep;
 
-    let client = hyper::Client::new();
-    let uri: hyper::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
-    let req = hyper::Request::builder()
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    let uri: http::Uri = "http://127.0.0.1:6147/download/".parse().unwrap();
+    let req = http::Request::builder()
         .uri(uri)
         .header("x-write-timeout", "1")
         .header("x-min-rate", "10000")
-        .body(hyper::Body::empty())
+        .body(Empty::<bytes::Bytes>::new())
         .unwrap();
     let mut res = client.request(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let mut err = false;
     sleep(Duration::from_secs(2)).await;
-    while let Some(chunk) = res.body_mut().data().await {
-        if chunk.is_err() {
+    while let Some(frame) = res.body_mut().frame().await {
+        if frame.is_err() {
             err = true;
         }
     }
