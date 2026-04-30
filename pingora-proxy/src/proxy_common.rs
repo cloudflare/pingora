@@ -19,6 +19,8 @@ pub(crate) enum DownstreamStateMachine {
     Reading,
     /// no more data to read
     ReadingFinished,
+    /// body was pre-buffered before upstream connection, skip all downstream polling
+    PreBuffered,
     /// downstream is already errored or closed
     Errored,
 }
@@ -33,9 +35,10 @@ impl DownstreamStateMachine {
         }
     }
 
-    // Can call read() to read more data or wait on closing
+    // Can call read() to read more data or wait on closing.
+    // PreBuffered skips polling since we already have the complete body.
     pub fn can_poll(&self) -> bool {
-        !matches!(self, Self::Errored)
+        !matches!(self, Self::Errored | Self::PreBuffered)
     }
 
     pub fn is_reading(&self) -> bool {
