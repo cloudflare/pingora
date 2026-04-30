@@ -25,11 +25,16 @@ use linked_list::{LinkedList, LinkedListIter};
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
+use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The LRU with `N` shards
 pub struct Lru<T, const N: usize> {
     units: [RwLock<LruUnit<T>>; N],
+    /// Lock-free `Relaxed` shadow of each shard's item count, backing
+    /// [`Lru::shard_len`] and the P2C selection in [`Lru::evict_to_limit`].
+    /// Maintained alongside [`Lru::len`] at every count-mutating site.
+    shard_lens: [AtomicUsize; N],
     weight: AtomicUsize,
     weight_limit: usize,
     len_watermark: Option<usize>,
@@ -59,11 +64,16 @@ impl<T, const N: usize> Lru<T, N> {
     ) -> Self {
         // use the unsafe code from ArrayVec just to init the array
         let mut units = arrayvec::ArrayVec::<_, N>::new();
+        let mut shard_lens = arrayvec::ArrayVec::<_, N>::new();
         for _ in 0..N {
             units.push(RwLock::new(LruUnit::with_capacity(capacity)));
+            shard_lens.push(AtomicUsize::new(0));
         }
         Lru {
             units: units.into_inner().map_err(|_| "").unwrap(),
+            shard_lens: shard_lens
+                .into_inner()
+                .expect("shard_lens ArrayVec filled with exactly N elements"),
             weight: AtomicUsize::new(0),
             weight_limit,
             len_watermark,
@@ -71,6 +81,23 @@ impl<T, const N: usize> Lru<T, N> {
             evicted_weight: AtomicUsize::new(0),
             evicted_len: AtomicUsize::new(0),
         }
+    }
+
+    /// Increment item-count bookkeeping for `shard`. Both atomics use
+    /// `Relaxed`; called while holding the shard write lock so that
+    /// `len` and `shard_lens[shard]` advance in lockstep.
+    #[inline]
+    fn incr_count(&self, shard: usize) {
+        self.len.fetch_add(1, Ordering::Relaxed);
+        self.shard_lens[shard].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement item-count bookkeeping for `shard`. See
+    /// [`Self::incr_count`].
+    #[inline]
+    fn decr_count(&self, shard: usize) {
+        self.len.fetch_sub(1, Ordering::Relaxed);
+        self.shard_lens[shard].fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Admit the key value to the [Lru]
@@ -91,7 +118,7 @@ impl<T, const N: usize> Lru<T, N> {
                 self.weight.fetch_sub(old_weight, Ordering::Relaxed);
             } else {
                 // Assume old_weight == 0 means a new item is admitted
-                self.len.fetch_add(1, Ordering::Relaxed);
+                self.incr_count(shard);
             }
         }
         shard
@@ -150,14 +177,23 @@ impl<T, const N: usize> Lru<T, N> {
         unit.write().access(key)
     }
 
-    /// Evict at most one item from the given shard
+    /// Evict at most one item from the given shard, identified by the
+    /// hash-like `shard` seed (mapped into `0..N` via `% N`).
     ///
-    /// Return the evicted asset and its size if there is anything to evict
+    /// Return the evicted asset and its size if there is anything to evict.
     pub fn evict_shard(&self, shard: u64) -> Option<(T, usize)> {
-        let evicted = self.units[get_shard(shard, N)].write().evict();
+        self.evict_shard_at(get_shard(shard, N))
+    }
+
+    /// Evict at most one item from the shard at index `shard` (in `0..N`).
+    /// Internal entry point that skips the `% N` round-trip in
+    /// [`Self::evict_shard`].
+    fn evict_shard_at(&self, shard: usize) -> Option<(T, usize)> {
+        assert!(shard < N);
+        let evicted = self.units[shard].write().evict();
         if let Some((_, weight)) = evicted.as_ref() {
             self.weight.fetch_sub(*weight, Ordering::Relaxed);
-            self.len.fetch_sub(1, Ordering::Relaxed);
+            self.decr_count(shard);
             self.evicted_weight.fetch_add(*weight, Ordering::Relaxed);
             self.evicted_len.fetch_add(1, Ordering::Relaxed);
         }
@@ -168,43 +204,92 @@ impl<T, const N: usize> Lru<T, N> {
     ///
     /// Return a list of evicted items.
     ///
-    /// The evicted items are randomly selected from all the shards.
+    /// Each iteration selects the shard to evict from using the "power of two
+    /// choices" strategy: two shards are picked uniformly at random and the
+    /// one with more items is chosen (see
+    /// <https://brooker.co.za/blog/2012/01/17/two-random.html>). This biases
+    /// eviction toward longer shards and drives [`Self::shard_len`] toward a
+    /// uniform distribution, which keeps per-shard serialization cost (e.g.
+    /// `pingora_cache::eviction::lru::Manager::serialize_shard`) bounded.
+    ///
+    /// Selection is by item count, not weight, even when eviction is
+    /// triggered by `weight_limit`. With heavily skewed item weights this
+    /// may evict more items than a weight-biased policy to reach the same
+    /// total weight — the tradeoff is intentional in favor of bounded
+    /// per-shard serialization cost.
+    ///
+    /// O(1) per iteration in the common case. If the chosen shard is
+    /// empty when we acquire its write lock (the Relaxed shadow may
+    /// not always reflect actual emptiness, and P2C may tie-break to
+    /// an empty shard when all shadow lengths are equal), we linearly
+    /// probe successive shard indices until one yields an item or we
+    /// wrap back to the starting shard — at which point every shard
+    /// was observed empty and we exit. Bounded by at most N probes
+    /// per outer iteration.
     pub fn evict_to_limit(&self) -> Vec<(T, usize)> {
+        self.evict_to_limit_with_rng(&mut rand::thread_rng())
+    }
+
+    /// Internal entry point for [`Self::evict_to_limit`] that lets tests
+    /// inject a seeded RNG for deterministic P2C selection.
+    fn evict_to_limit_with_rng<R: Rng>(&self, rng: &mut R) -> Vec<(T, usize)> {
         let mut evicted = vec![];
         let mut initial_weight = self.weight();
         let mut initial_len = self.len();
-        let mut shard_seed = rand::random(); // start from a random shard
-        let mut empty_shard = 0;
 
-        // Entries can be admitted or removed from the LRU by others during the loop below
-        // Track initial size not to over evict due to entries admitted after the loop starts
-        // self.weight() / self.len() is also used not to over evict
-        // due to entries already removed by others
-        while ((initial_weight > self.weight_limit && self.weight() > self.weight_limit)
+        // Transient over-limit weight can persist until the next
+        // admit/increment_weight call, which is acceptable because the
+        // next admission will re-trigger eviction.
+        while (initial_weight > self.weight_limit && self.weight() > self.weight_limit)
             || self
                 .len_watermark
-                .is_some_and(|w| initial_len > w && self.len() > w))
-            && empty_shard < N
+                .is_some_and(|w| initial_len > w && self.len() > w)
         {
-            if let Some(i) = self.evict_shard(shard_seed) {
-                initial_weight -= i.1;
-                initial_len = initial_len.saturating_sub(1);
-                evicted.push(i)
+            // Power of two choices: pick the longer of two random shards.
+            // N == 1 short-circuits the redundant second roll.
+            let start = if N <= 1 {
+                0
             } else {
-                empty_shard += 1;
+                let a = rng.gen_range(0..N);
+                let b = rng.gen_range(0..N);
+                if self.shard_len(a) >= self.shard_len(b) {
+                    a
+                } else {
+                    b
+                }
+            };
+            // Try the chosen shard first; on a miss (empty or raced),
+            // linearly probe successive indices. Wrapping back to
+            // `start` means every shard was observed empty, so we exit.
+            let mut shard = start;
+            let evicted_one = loop {
+                if let Some(item) = self.evict_shard_at(shard) {
+                    break Some(item);
+                }
+                shard = (shard + 1) % N;
+                if shard == start {
+                    break None;
+                }
+            };
+            match evicted_one {
+                Some(i) => {
+                    initial_weight = initial_weight.saturating_sub(i.1);
+                    initial_len = initial_len.saturating_sub(1);
+                    evicted.push(i);
+                }
+                None => break,
             }
-            // move on to the next shard
-            shard_seed += 1;
         }
         evicted
     }
 
     /// Remove the given asset.
     pub fn remove(&self, key: u64) -> Option<(T, usize)> {
-        let removed = self.units[get_shard(key, N)].write().remove(key);
+        let shard = get_shard(key, N);
+        let removed = self.units[shard].write().remove(key);
         if let Some((_, weight)) = removed.as_ref() {
             self.weight.fetch_sub(*weight, Ordering::Relaxed);
-            self.len.fetch_sub(1, Ordering::Relaxed);
+            self.decr_count(shard);
         }
         removed
     }
@@ -213,12 +298,10 @@ impl<T, const N: usize> Lru<T, N> {
     ///
     /// Useful to recreate an LRU in most-to-least order
     pub fn insert_tail(&self, key: u64, data: T, weight: usize) -> bool {
-        if self.units[get_shard(key, N)]
-            .write()
-            .insert_tail(key, data, weight)
-        {
+        let shard = get_shard(key, N);
+        if self.units[shard].write().insert_tail(key, data, weight) {
             self.weight.fetch_add(weight, Ordering::Relaxed);
-            self.len.fetch_add(1, Ordering::Relaxed);
+            self.incr_count(shard);
             true
         } else {
             false
@@ -251,6 +334,9 @@ impl<T, const N: usize> Lru<T, N> {
     }
 
     /// Return the current total weight.
+    ///
+    /// Lock-free `Relaxed` load. Best-effort: not synchronized with
+    /// concurrent admissions or evictions on other threads.
     pub fn weight(&self) -> usize {
         self.weight.load(Ordering::Relaxed)
     }
@@ -285,9 +371,15 @@ impl<T, const N: usize> Lru<T, N> {
         N
     }
 
-    /// Get the number of items inside a shard
+    /// Get the number of items inside a shard.
+    ///
+    /// Lock-free `Relaxed` load from a per-shard atomic shadow. Best-effort:
+    /// there is no cross-thread ordering between this and [`Self::len`], and
+    /// `Σ shard_len(i)` is not guaranteed to equal [`Self::len`] at any
+    /// given instant. Suitable for eviction-balance heuristics and
+    /// observability; not suitable for synchronization.
     pub fn shard_len(&self, shard: usize) -> usize {
-        self.units[shard].read().len()
+        self.shard_lens[shard].load(Ordering::Relaxed)
     }
 
     /// Get the weight (total size) inside a shard
@@ -437,6 +529,7 @@ impl<T> LruUnit<T> {
         true
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         assert_eq!(self.lookup_table.len(), self.order.len());
         self.lookup_table.len()
@@ -620,7 +713,6 @@ mod test_lru {
         assert_eq!(lru.len(), 6);
 
         let evicted = lru.evict_to_limit();
-        // NOTE: there is a low chance this test would fail see the TODO in evict_to_limit
         assert_eq!(lru.weight(), 6);
         assert_eq!(lru.len(), 3);
         assert_eq!(lru.evicted_weight(), 6);
@@ -713,6 +805,119 @@ mod test_lru {
 
         // ignore existing ones
         assert!(!lru.insert_tail(6, 6, 7));
+    }
+
+    #[test]
+    fn test_evict_to_limit_p2c_bias() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        // Shard 0 starts with 50 items, shard 1 with 10 (all weight 1).
+        // weight_limit=30 forces 30 evictions. P2C-by-length should pick
+        // shard 0 (the longer one) most of the time, driving toward
+        // balance. Expected share from shard 0: P2C ≈ 0.75 (P(shard 0)
+        // = 3/4 per pick while it stays longer), uniform ≈ 0.50,
+        // always-shortest ≈ 0.67 (capped by shard 1's 10 items),
+        // always-longest ≈ 1.0. The (0.65..0.95) window distinguishes
+        // P2C from uniform; the upper bound catches a degenerate
+        // always-longest regression.
+        const TRIALS: u64 = 50;
+        let mut total_from_shard0 = 0usize;
+        let mut total_evicted = 0usize;
+
+        for seed in 0..TRIALS {
+            let lru = Lru::<u64, 2>::with_capacity(30, 64);
+            for k in 0..50u64 {
+                // even keys → shard 0
+                lru.admit(k * 2, k * 2, 1);
+            }
+            for k in 0..10u64 {
+                // odd keys → shard 1
+                lru.admit(k * 2 + 1, k * 2 + 1, 1);
+            }
+            assert_eq!(lru.weight(), 60);
+
+            let mut rng = StdRng::seed_from_u64(seed);
+            let evicted = lru.evict_to_limit_with_rng(&mut rng);
+            assert!(
+                lru.weight() <= 30,
+                "post-eviction weight {} exceeds limit",
+                lru.weight()
+            );
+            total_from_shard0 += evicted.iter().filter(|(k, _)| k % 2 == 0).count();
+            total_evicted += evicted.len();
+        }
+
+        assert!(total_evicted > 1000, "too few evictions: {total_evicted}");
+        let share = total_from_shard0 as f64 / total_evicted as f64;
+        assert!(
+            (0.65..0.95).contains(&share),
+            "expected shard-0 eviction share in 0.65..0.95 (P2C ≈ 0.75); got {share}"
+        );
+    }
+
+    #[test]
+    fn test_evict_to_limit_break_on_empty_shards_over_limit() {
+        // Force `weight` above the limit while every shard is empty
+        // (simulating bookkeeping skew). The linear probe must wrap
+        // around all N shards and exit cleanly.
+        let lru = Lru::<u64, 4>::with_capacity(10, 16);
+        lru.weight.fetch_add(100, Ordering::Relaxed);
+        assert_eq!(lru.evict_to_limit().len(), 0);
+    }
+
+    #[test]
+    fn test_watermark_eviction_with_zero_weight_items() {
+        // All items have weight 0 so the weight-limit guard never fires;
+        // only the length watermark drives eviction. P2C-by-length should
+        // still reach the watermark regardless of weight values.
+        let lru = Lru::<u64, 2>::with_capacity_and_watermark(usize::MAX / 2, 10, Some(2));
+        for k in 0..6u64 {
+            lru.insert_tail(k, k, 0);
+        }
+        assert_eq!(lru.len(), 6);
+        assert_eq!(lru.weight(), 0);
+        let evicted = lru.evict_to_limit();
+        assert_eq!(lru.len(), 2);
+        assert_eq!(evicted.len(), 4);
+    }
+
+    #[test]
+    fn test_evict_to_limit_with_mostly_empty_shards() {
+        // 7/8 shards empty: both random rolls land on empty shards ~77%
+        // of the time, exercising the linear-probe fallback heavily.
+        let lru = Lru::<u64, 8>::with_capacity(2, 16);
+        for k in 0..8u64 {
+            // multiples of 8 hash to shard 0
+            lru.admit(k * 8, k * 8, 1);
+        }
+        assert_eq!(lru.weight(), 8);
+
+        let evicted = lru.evict_to_limit();
+        assert_eq!(lru.weight(), 2);
+        assert_eq!(evicted.len(), 6);
+        assert!(evicted.iter().all(|(k, _)| k % 8 == 0));
+    }
+
+    #[test]
+    fn test_evict_to_limit_below_limit_returns_immediately() {
+        // Smoke test: outer guard short-circuits when already under limit.
+        let lru = Lru::<u64, 4>::with_capacity(0, 16);
+        assert_eq!(lru.evict_to_limit().len(), 0);
+    }
+
+    #[test]
+    fn test_evict_to_limit_n1() {
+        // N=1 is a trivial special case in the selection logic; ensure
+        // basic eviction still works.
+        let lru = Lru::<u64, 1>::with_capacity(2, 16);
+        for k in 0..5u64 {
+            lru.admit(k, k, 1);
+        }
+        assert_eq!(lru.weight(), 5);
+        let evicted = lru.evict_to_limit();
+        assert_eq!(lru.weight(), 2);
+        assert_eq!(evicted.len(), 3);
     }
 
     #[test]

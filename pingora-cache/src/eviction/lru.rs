@@ -72,7 +72,9 @@ impl<const N: usize> Manager<N> {
         self.0.shard_weight(shard)
     }
 
-    /// Get the number of items in a specific shard
+    /// Get the number of items in a specific shard. Best-effort
+    /// lock-free read; see [`pingora_lru::Lru::shard_len`] for the
+    /// consistency semantics.
     pub fn shard_len(&self, shard: usize) -> usize {
         self.0.shard_len(shard)
     }
