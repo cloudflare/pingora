@@ -698,6 +698,8 @@ impl Hash for HttpPeer {
         // from the reuse hash for now. These are per-connection settings applied at handshake
         // time and may be revisited alongside other h2 settings that could be dynamically
         // adjusted over the lifetime of a connection.
+        self.options.curves.hash(state);
+        self.options.second_keyshare.hash(state);
     }
 }
 
