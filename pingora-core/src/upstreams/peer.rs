@@ -127,6 +127,14 @@ pub trait Peer: Display + Clone {
             None => false,
         }
     }
+    /// Whether certificate verification should accept chains anchored at an intermediate CA in
+    /// the configured trust store.
+    fn verify_cert_partial_chain(&self) -> bool {
+        match self.get_peer_options() {
+            Some(opt) => opt.verify_cert_partial_chain,
+            None => false,
+        }
+    }
     /// Whether the system trust store should be loaded and used when verifying certificates
     #[cfg(feature = "s2n")]
     fn use_system_certs(&self) -> bool {
@@ -415,6 +423,8 @@ pub struct PeerOptions {
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
     pub verify_hostname: bool,
+    /// Accept chains that terminate at an intermediate CA present in the trust store.
+    pub verify_cert_partial_chain: bool,
     #[cfg(feature = "s2n")]
     pub use_system_certs: bool,
     /* accept the cert if it's CN matches the SNI or this name */
@@ -484,6 +494,7 @@ impl PeerOptions {
             write_timeout: None,
             verify_cert: true,
             verify_hostname: true,
+            verify_cert_partial_chain: false,
             #[cfg(feature = "s2n")]
             use_system_certs: true,
             alternative_cn: None,
@@ -538,6 +549,9 @@ impl Display for PeerOptions {
         }
         if self.verify_hostname {
             write!(f, "verify_hostname: true,")?;
+        }
+        if self.verify_cert_partial_chain {
+            write!(f, "verify_cert_partial_chain: true,")?;
         }
         #[cfg(feature = "s2n")]
         if self.use_system_certs {
@@ -687,6 +701,7 @@ impl Hash for HttpPeer {
         // origin server cert verification
         self.verify_cert().hash(state);
         self.verify_hostname().hash(state);
+        self.verify_cert_partial_chain().hash(state);
         self.alternative_cn().hash(state);
         #[cfg(feature = "s2n")]
         self.get_psk().hash(state);
