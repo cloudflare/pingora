@@ -93,13 +93,14 @@ mod test {
     use h2::frame::*;
     use http::{HeaderMap, Method, Uri};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::sync::{oneshot, watch};
     use tokio_stream::StreamExt;
 
     use pingora_http::{RequestHeader, ResponseHeader};
     use pingora_timeout::sleep;
 
     use crate::protocols::{
-        http::v2::server::{handshake, HttpSession},
+        http::v2::server::{self, handshake, HttpSession},
         Digest,
     };
 
@@ -273,5 +274,351 @@ mod test {
             // ensure no panics
             assert!(handle.await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_processes_inflight_stream() {
+        // HEADERS arrive on the server after the shutdown signal
+        // fires, but before the client has observed GOAWAY.
+        let (mut client, server) = duplex(65536);
+        // Use channels for deterministic timing.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (write_headers_tx, write_headers_rx) = oneshot::channel::<()>();
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            // Wait until the test has triggered shutdown on the server before
+            // sending HEADERS. See the function-level comment for why.
+            write_headers_rx.await.unwrap();
+
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            codec.send(headers.into()).await.unwrap();
+
+            let mut saw_response = false;
+            let mut saw_goaway = false;
+            let _ = pingora_timeout::timeout(Duration::from_secs(5), async {
+                while let Some(frame) = codec.next().await {
+                    match frame.unwrap() {
+                        h2::frame::Frame::Headers(_) => {
+                            saw_response = true;
+                        }
+                        h2::frame::Frame::GoAway(_) => {
+                            saw_goaway = true;
+                        }
+                        _ => {}
+                    }
+                    if saw_response && saw_goaway {
+                        break;
+                    }
+                }
+            })
+            .await;
+
+            assert!(saw_response, "expected response for stream 1");
+            assert!(saw_goaway, "expected at least one GOAWAY frame");
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let trigger = tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            shutdown_tx.send(true).unwrap();
+            // Wait long enough that the server task is guaranteed to have
+            // observed the shutdown signal and committed to its post-shutdown
+            // path before putting anything on the wire.
+            sleep(Duration::from_millis(50)).await;
+            write_headers_tx.send(()).unwrap();
+        });
+
+        let mut session_handles = vec![];
+        server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
+            session_handles.push(tokio::spawn(async move {
+                let req = session.req_header();
+                assert_eq!(req.method, Method::GET);
+                let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                session.write_response_header(resp, true).unwrap();
+            }));
+        })
+        .await;
+
+        trigger.await.unwrap();
+        assert_eq!(
+            session_handles.len(),
+            1,
+            "expected stream 1 to be surfaced after shutdown_initiated"
+        );
+        for h in session_handles {
+            h.await.unwrap();
+        }
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_processes_post_goaway_stream() {
+        // Client opens stream 1 after it has observed the
+        // server's GOAWAY frame. Stream 1 is below the GOAWAY(MAX)
+        // last_stream_id, so per RFC 9113 §6.8 the server must still process
+        // it.
+        let (mut client, server) = duplex(65536);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            // Block until the server's GOAWAY is observed. HEADERS for
+            // stream 1 are sent strictly after this point.
+            let mut saw_goaway_before_headers = false;
+            while let Some(frame) = codec.next().await {
+                if matches!(frame.unwrap(), h2::frame::Frame::GoAway(_)) {
+                    saw_goaway_before_headers = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_goaway_before_headers,
+                "expected GOAWAY before sending HEADERS for stream 1"
+            );
+
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            codec.send(headers.into()).await.unwrap();
+
+            let mut saw_response_for_stream_1 = false;
+            let _ = pingora_timeout::timeout(Duration::from_secs(5), async {
+                while let Some(frame) = codec.next().await {
+                    if let Ok(h2::frame::Frame::Headers(h)) = frame {
+                        if h.stream_id() == 1u32 {
+                            saw_response_for_stream_1 = true;
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(
+                saw_response_for_stream_1,
+                "expected response on stream 1 after GOAWAY",
+            );
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let trigger = tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            shutdown_tx.send(true).unwrap();
+        });
+
+        let mut session_handles = vec![];
+        server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
+            session_handles.push(tokio::spawn(async move {
+                let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                session.write_response_header(resp, true).unwrap();
+            }));
+        })
+        .await;
+
+        trigger.await.unwrap();
+        assert_eq!(
+            session_handles.len(),
+            1,
+            "expected exactly one stream surfaced after GOAWAY"
+        );
+        for h in session_handles {
+            h.await.unwrap();
+        }
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_idle_connection_exits_promptly() {
+        let (mut client, server) = duplex(65536);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            // Wait for the server's GOAWAY, then drop the codec to close the
+            // connection so the accept loop can exit.
+            let mut saw_goaway = false;
+            let _ = pingora_timeout::timeout(Duration::from_secs(3), async {
+                while let Some(frame) = codec.next().await {
+                    if matches!(frame.unwrap(), h2::frame::Frame::GoAway(_)) {
+                        saw_goaway = true;
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(saw_goaway, "expected GOAWAY");
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let trigger = tokio::spawn(async move {
+            sleep(Duration::from_millis(20)).await;
+            shutdown_tx.send(true).unwrap();
+        });
+
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(2),
+            server::accept_downstream_sessions(connection, digest, shutdown_rx, |_session| {
+                panic!("did not expect any sessions on an idle connection");
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "accept loop hung after shutdown");
+
+        trigger.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_refuses_stream_above_last_stream_id() {
+        // After the server commits to a final last_stream_id and emits the
+        // closing GOAWAY, any stream the client tries to open above that id
+        // must be refused. The accept loop must not surface it and must exit
+        // cleanly via the `Ok(None)` arm of `from_h2_conn`.
+        let (mut client, server) = duplex(65536);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            // Open stream 1 so the server will commit last_stream_id >= 1
+            // when it eventually emits its closing GOAWAY.
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            codec.send(headers.into()).await.unwrap();
+
+            // Drain frames from the server. Break once we've seen the
+            // response and at least one GOAWAY so the test doesn't race
+            // its own outer timeout while waiting on a quiet codec.
+            let mut saw_response = false;
+            let mut saw_goaway = false;
+            let _ = pingora_timeout::timeout(Duration::from_secs(3), async {
+                while let Some(frame) = codec.next().await {
+                    match frame {
+                        Ok(h2::frame::Frame::Headers(h)) if h.stream_id() == 1 => {
+                            saw_response = true;
+                        }
+                        Ok(h2::frame::Frame::GoAway(_)) => {
+                            saw_goaway = true;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    if saw_response && saw_goaway {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(saw_response, "expected response for stream 1");
+            assert!(saw_goaway, "expected at least one GOAWAY frame");
+
+            // Try to open stream 3 (above last_stream_id). The send may
+            // succeed locally (duplex buffer) or fail (peer half closed);
+            // either way the server-side codec must not surface the stream.
+            let mut headers = Headers::new(
+                3.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            let _ = codec.send(headers.into()).await;
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let trigger = tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            shutdown_tx.send(true).unwrap();
+        });
+
+        let mut session_handles = vec![];
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(5),
+            server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
+                session_handles.push(tokio::spawn(async move {
+                    let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                    session.write_response_header(resp, true).unwrap();
+                }));
+            }),
+        )
+        .await;
+        assert!(result.is_ok(), "accept loop hung after shutdown");
+        assert_eq!(
+            session_handles.len(),
+            1,
+            "only stream 1 may be surfaced; streams above last_stream_id must be refused"
+        );
+
+        trigger.await.unwrap();
+        for h in session_handles {
+            h.await.unwrap();
+        }
+        client_handle.await.unwrap();
     }
 }

@@ -20,7 +20,6 @@ use crate::server::ShutdownWatch;
 use async_trait::async_trait;
 use log::{debug, error};
 use std::any::Any;
-use std::future::poll_fn;
 use std::sync::Arc;
 
 use crate::protocols::http::v2::server;
@@ -250,8 +249,7 @@ where
             });
 
             let h2_options = self.h2_options();
-            let h2_conn = server::handshake(stream, h2_options).await;
-            let mut h2_conn = match h2_conn {
+            let h2_conn = match server::handshake(stream, h2_options).await {
                 Err(e) => {
                     error!("H2 handshake error {e}");
                     return None;
@@ -259,36 +257,21 @@ where
                 Ok(c) => c,
             };
 
-            let mut shutdown = shutdown.clone();
-            loop {
-                // this loop ends when the client decides to close the h2 conn
-                // TODO: add a timeout?
-                let h2_stream = tokio::select! {
-                    _ = shutdown.changed() => {
-                        h2_conn.graceful_shutdown();
-                        let _ = poll_fn(|cx| h2_conn.poll_closed(cx))
-                            .await.map_err(|e| error!("H2 error waiting for shutdown {e}"));
-                        return None;
-                    }
-                    h2_stream = server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream
-                };
-                let h2_stream = match h2_stream {
-                    Err(e) => {
-                        // It is common for the client to just disconnect TCP without properly
-                        // closing H2. So we don't log the errors here
-                        debug!("H2 error when accepting new stream {e}");
-                        return None;
-                    }
-                    Ok(s) => s?, // None means the connection is ready to be closed
-                };
-                let app = self.clone();
-                let shutdown = shutdown.clone();
+            // The accept-loop body — including the graceful-shutdown state
+            // machine — lives in `server::accept_downstream_sessions` so that
+            // the same code path is exercised by tests in `protocols::http::v2`.
+            let app = self.clone();
+            let shutdown_for_session = shutdown.clone();
+            server::accept_downstream_sessions(h2_conn, digest, shutdown.clone(), |h2_stream| {
+                let app = app.clone();
+                let shutdown = shutdown_for_session.clone();
                 pingora_runtime::current_handle().spawn(async move {
                     // Note, `PersistentSettings` not currently relevant for h2
                     app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
                         .await;
                 });
-            }
+            })
+            .await;
         } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
             return self.clone().process_custom_session(stream, shutdown).await;
         } else {
