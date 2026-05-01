@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,9 +25,11 @@ use log::warn;
 pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 
+pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
 pub use rustls::{
     client::WebPkiServerVerifier, version, CertificateError, ClientConfig, DigitallySignedStruct,
-    Error as RusTlsError, RootCertStore, ServerConfig, SignatureScheme, Stream,
+    Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream,
 };
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;

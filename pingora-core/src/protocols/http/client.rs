@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -163,7 +163,7 @@ impl<S: Session> HttpSession<S> {
         match self {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
-            Self::Custom(c) => c.shutdown(1, "shutdown").await,
+            Self::Custom(c) => c.shutdown(0, "shutdown").await,
         }
     }
 

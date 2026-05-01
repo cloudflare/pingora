@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 //! Cache lock
 
+use crate::trace::{Span, Tag};
 use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey};
-use crate::{Span, Tag};
 
 use http::Extensions;
 use pingora_timeout::timeout;
@@ -44,6 +44,13 @@ pub trait CacheKeyLock {
     fn trace_lock_wait(&self, span: &mut Span, _read_lock: &ReadLock, lock_status: LockStatus) {
         let tag_value: &'static str = lock_status.into();
         span.set_tag(|| Tag::new("status", tag_value));
+    }
+
+    /// Set a lock status for a custom `NoCacheReason`.
+    fn custom_lock_status(&self, _custom_no_cache: &'static str) -> LockStatus {
+        // treat custom no cache reasons as GiveUp by default
+        // (like OriginNotCache)
+        LockStatus::GiveUp
     }
 }
 

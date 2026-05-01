@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,8 +23,8 @@ use pingora_error::{
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
     version, CertificateDer, CertificateError, ClientConfig as RusTlsClientConfig,
-    DigitallySignedStruct, PrivateKeyDer, RootCertStore, RusTlsError, ServerName, SignatureScheme,
-    TlsConnector as RusTlsConnector, UnixTime, WebPkiServerVerifier,
+    DigitallySignedStruct, KeyLogFile, PrivateKeyDer, RootCertStore, RusTlsError, ServerName,
+    SignatureScheme, TlsConnector as RusTlsConnector, UnixTime, WebPkiServerVerifier,
 };
 
 // Uses custom certificate verification from rustls's 'danger' module.
@@ -81,7 +81,6 @@ impl TlsConnector {
                 if let Some((cert, key)) = conf.cert_key_file.as_ref() {
                     certs_key = load_certs_and_key_files(cert, key)?;
                 }
-                // TODO: support SSLKEYLOGFILE
             } else {
                 load_platform_certs_incl_env_into_store(&mut ca_certs)?;
             }
@@ -94,7 +93,7 @@ impl TlsConnector {
             RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
                 .with_root_certificates(ca_certs.clone());
 
-        let config = match certs_key {
+        let mut config = match certs_key {
             Some((certs, key)) => {
                 match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
                     Ok(config) => config,
@@ -107,6 +106,13 @@ impl TlsConnector {
             }
             None => builder.with_no_client_auth(),
         };
+
+        // Enable SSLKEYLOGFILE support for debugging TLS traffic
+        if let Some(options) = options.as_ref() {
+            if options.debug_ssl_keylog {
+                config.key_log = Arc::new(KeyLogFile::new());
+            }
+        }
 
         Ok(Connector {
             ctx: Arc::new(TlsConnector {
@@ -129,9 +135,28 @@ where
 {
     let config = &tls_ctx.config;
 
-    // TODO: setup CA/verify cert store from peer
-    // peer.get_ca() returns None by default. It must be replaced by the
-    // implementation of `peer`
+    // Build per-peer CA store if provided
+    let peer_ca_store: Option<Arc<RootCertStore>> = if let Some(ca_list) = peer.get_ca() {
+        if ca_list.is_empty() {
+            return Error::e_explain(InvalidCert, "per-peer CA list is empty");
+        }
+        let mut ca_store = RootCertStore::empty();
+        for ca_cert in &**ca_list {
+            let cert_der = CertificateDer::from(ca_cert);
+            ca_store.add(cert_der).or_err(
+                InvalidCert,
+                "Failed to add per-peer CA certificate to root store",
+            )?;
+        }
+
+        Some(Arc::new(ca_store))
+    } else {
+        None
+    };
+
+    // Determine effective CA store for this connection
+    let effective_ca_store = peer_ca_store.as_ref().unwrap_or(&tls_ctx.ca_certs);
+
     let key_pair = peer.get_client_cert_key();
     let mut updated_config_opt: Option<RusTlsClientConfig> = match key_pair {
         None => None,
@@ -158,16 +183,29 @@ where
                 &version::TLS12,
                 &version::TLS13,
             ])
-            .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
+            .with_root_certificates(Arc::clone(effective_ca_store));
             debug!("added root ca certificates");
 
-            let updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
+            let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
                 InvalidCert,
                 "Failed to use peer cert/key to update Rustls config",
             )?;
+            // Preserve keylog setting from original config
+            updated_config.key_log = Arc::clone(&config.key_log);
             Some(updated_config)
         }
     };
+
+    // Ensure config is updated if per-peer CA is set but no client cert
+    if peer_ca_store.is_some() && updated_config_opt.is_none() {
+        let mut updated_config =
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_root_certificates(Arc::clone(effective_ca_store))
+                .with_no_client_auth();
+
+        updated_config.key_log = Arc::clone(&config.key_log);
+        updated_config_opt = Some(updated_config);
+    }
 
     if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
         let alpn_protocols = alpn.to_wire_protocols();
@@ -204,7 +242,7 @@ where
 
         // Builds the custom_verifier when verification_mode is set.
         if let Some(mode) = verification_mode {
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(&tls_ctx.ca_certs))
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
                 .build()
                 .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
 
@@ -252,8 +290,9 @@ where
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
-enum VerificationMode {
+pub enum VerificationMode {
     SkipHostname,
     SkipAll,
     Full,

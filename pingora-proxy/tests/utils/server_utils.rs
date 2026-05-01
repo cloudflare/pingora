@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
-    set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
-    RespCacheable,
+    set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
+    NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
     CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
@@ -38,7 +38,7 @@ use pingora_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
 use pingora_core::server::configuration::Opt;
-use pingora_core::services::Service;
+use pingora_core::services::{Service, ServiceWithDependents};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
@@ -47,7 +47,7 @@ use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub struct ExampleProxyHttps {}
 
@@ -253,8 +253,19 @@ impl ProxyHttp for ExampleProxyHttp {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let req = session.req_header();
-        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        let proxy_tasks_enabled = session
+            .req_header()
+            .headers
+            .get("x-proxy-tasks-enabled")
+            .is_some();
+        if proxy_tasks_enabled {
+            session.downstream_session.set_proxy_tasks_enabled(true);
+        }
+        let downstream_compression = session
+            .req_header()
+            .headers
+            .get("x-downstream-compression")
+            .is_some();
         if downstream_compression {
             session
                 .downstream_modules_ctx
@@ -344,6 +355,15 @@ impl ProxyHttp for ExampleProxyHttp {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+        }
+
+        if let Some(ms) = req
+            .headers
+            .get("x-read-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
         }
 
         Ok(peer)
@@ -489,6 +509,35 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    /// Reference `cache_key_callback` implementation for integration tests.
+    ///
+    /// Builds the primary key as `{host}{path_and_query}` from the request.
+    /// This is **not production ready**: it does not account for `Vary`, custom
+    /// request filters, or scheme differences. See the rustdoc on
+    /// [`ProxyHttp::cache_key_callback`] for details.
+    fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let req_header = session.req_header();
+
+        let host = req_header
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req_header.uri.authority().map(|a| a.as_str()))
+            .unwrap_or("");
+
+        let path_and_query = req_header
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        Ok(CacheKey::new(
+            String::new(),
+            format!("{host}{path_and_query}"),
+            String::new(),
+        ))
+    }
+
     async fn cache_hit_filter(
         &self,
         session: &mut Session,
@@ -574,10 +623,26 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<RespCacheable> {
+        // Allow testing the unlikely case of caching a 101 response
+        if resp.status == 101
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-cache-websocket")
+        {
+            return Ok(RespCacheable::Cacheable(CacheMeta::new(
+                SystemTime::now() + Duration::from_secs(5),
+                SystemTime::now(),
+                0,
+                0,
+                resp.clone(),
+            )));
+        }
+
         let cc = CacheControl::from_resp_headers(resp);
         Ok(resp_cacheable(
             cc.as_ref(),
@@ -603,6 +668,12 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.set_version(http::Version::HTTP_10);
             upstream_response.remove_header(&CONTENT_LENGTH);
             upstream_response.remove_header(&TRANSFER_ENCODING);
+        }
+        // Allow tests to inject Cache-Control into the upstream response
+        if let Some(cc) = session.req_header().headers.get("x-set-cache-control") {
+            upstream_response
+                .insert_header(http::header::CACHE_CONTROL, cc)
+                .unwrap();
         }
         Ok(())
     }
@@ -732,6 +803,14 @@ fn test_main() {
     #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
 
+    let mut proxy_service_http_connect =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+    let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.allow_connect_method_proxying = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_http_connect.add_tcp("0.0.0.0:6160");
+
     let mut proxy_service_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
 
@@ -741,7 +820,7 @@ fn test_main() {
     http_logic.server_options = Some(http_server_options);
     proxy_service_h2c.add_tcp("0.0.0.0:6146");
 
-    let mut proxy_service_https_opt: Option<Box<dyn Service>> = None;
+    let mut proxy_service_https_opt: Option<Box<dyn ServiceWithDependents>> = None;
 
     #[cfg(feature = "any_tls")]
     {
@@ -761,6 +840,15 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    // H2C-enabled cache proxy on port 6154
+    let mut proxy_service_cache_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
+    let cache_h2c_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
+    let mut cache_h2c_options = HttpServerOptions::default();
+    cache_h2c_options.h2c = true;
+    cache_h2c_logic.server_options = Some(cache_h2c_options);
+    proxy_service_cache_h2c.add_tcp("0.0.0.0:6154");
+
     #[cfg(feature = "any_tls")]
     {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -772,10 +860,12 @@ fn test_main() {
         proxy_service_cache.add_tls_with_settings("0.0.0.0:6153", None, tls_settings);
     }
 
-    let mut services: Vec<Box<dyn Service>> = vec![
+    let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
+        Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
+        Box::new(proxy_service_cache_h2c),
     ];
 
     if let Some(proxy_service_https) = proxy_service_https_opt {
@@ -810,16 +900,28 @@ pub struct PskTlsServer {
 #[cfg(feature = "s2n")]
 impl PskTlsServer {
     pub fn start() -> Self {
-        let server_handle = thread::spawn(|| {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Use a channel to wait for the server to bind its port.
+        // A TCP probe can't be used here because the TLS acceptor would
+        // try to handshake the probe connection, fail, and panic.
+        let (tx, rx) = mpsc::channel();
+        let server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(Self::run_server());
+            rt.block_on(Self::run_server(tx));
         });
+
+        // Wait up to 10s for the server to signal it has bound the port.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("PSK TLS server failed to start within 10s");
+
         PskTlsServer {
             handle: server_handle,
         }
     }
 
-    async fn run_server() {
+    async fn run_server(ready_tx: std::sync::mpsc::Sender<()>) {
         use pingora_core::{protocols::tls::S2NConnectionBuilder, tls::TlsAcceptor};
         use pingora_core::{
             protocols::tls::{Psk, PskConfig, PskType},
@@ -836,6 +938,8 @@ impl PskTlsServer {
 
         let addr: std::net::SocketAddr = "127.0.0.1:6151".parse().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
+        let _ = ready_tx.send(()); // signal: port is bound
+
         let mut config_builder = Config::builder();
         unsafe {
             config_builder.disable_x509_verification();
@@ -852,12 +956,20 @@ impl PskTlsServer {
         let acceptor = TlsAcceptor::new(connection_builder);
 
         loop {
-            use tokio::{io::AsyncWriteExt, net::tcp};
+            use tokio::io::AsyncWriteExt;
             let (tcp_stream, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
+            // Don't panic on handshake failure — a stale connection or probe
+            // shouldn't take down the server for subsequent real connections.
+            let mut stream = match acceptor.clone().accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("PSK TLS server: handshake failed: {e}");
+                    continue;
+                }
+            };
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write(response).await.unwrap();
-            stream.shutdown().await;
+            let _ = stream.write_all(response).await;
+            let _ = stream.shutdown().await;
         }
     }
 }

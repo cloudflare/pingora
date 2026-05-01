@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -60,6 +60,8 @@ impl CustomMessageWrite for () {
 pub trait BodyWrite: Send + Sync + Unpin + 'static {
     async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()>;
     async fn finish(&mut self) -> Result<()>;
+    async fn cleanup(&mut self) -> Result<()>;
+    fn upgrade_body_writer(&mut self);
 }
 
 pub async fn drain_custom_messages(

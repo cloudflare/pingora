@@ -1,24 +1,30 @@
+name: Semgrep OSS scan
 on:
   pull_request: {}
+  push:
+    branches: [main, master]
   workflow_dispatch: {}
-  push: 
-    branches:
-      - main
-      - master
   schedule:
-    - cron: '0 0 * * *'
-name: Semgrep config
+    - cron: '0 0 15 * *'
+concurrency:
+  group: semgrep-${{ github.event_name }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+permissions:
+  contents: read
 jobs:
   semgrep:
-    name: semgrep/ci
-    runs-on: ubuntu-latest
-    env:
-      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-      SEMGREP_URL: https://cloudflare.semgrep.dev
-      SEMGREP_APP_URL: https://cloudflare.semgrep.dev
-      SEMGREP_VERSION_CHECK_URL: https://cloudflare.semgrep.dev/api/check-version
-    container:
-      image: returntocorp/semgrep
+    name: semgrep-oss
+    runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v4
-      - run: semgrep ci
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - id: cache-semgrep
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: semgrep-1.160.0-${{ runner.os }}
+      - if: steps.cache-semgrep.outputs.cache-hit != 'true'
+        run: pip install --user semgrep==1.160.0
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: semgrep scan --config=auto

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -144,6 +144,20 @@ pub fn ssl_use_second_key_share(_ssl: &mut SslRef, _enabled: bool) {}
 /// the caller to clear the error stack before performing SSL calls to avoid this issue.
 pub fn clear_error_stack() {
     let _ = ErrorStack::get();
+}
+
+/// Export keying material from a TLS connection
+///
+/// Derives keying material for application use in accordance with RFC 5705.
+///
+/// See [SSL_export_keying_material](https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_export_keying_material).
+pub fn ssl_export_keying_material(
+    ssl: &SslRef,
+    out: &mut [u8],
+    label: &str,
+    context: Option<&[u8]>,
+) -> Result<(), ErrorStack> {
+    ssl.export_keying_material(out, label, context)
 }
 
 /// Create a new [Ssl] from &[SslAcceptor]

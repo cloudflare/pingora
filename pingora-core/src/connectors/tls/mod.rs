@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ pub use rustls::*;
 ///    > characters only letters, digits, and hyphen.  There are also some
 ///    > restrictions on the length.  Labels must be 63 characters or less.
 ///    - https://datatracker.ietf.org/doc/html/rfc1034#section-3.5
-#[cfg(feature = "any_tls")]
+#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
 pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     // wildcard is only leftmost label
     if let Some((leftmost, rest)) = sni.split_once('.') {
@@ -56,7 +56,7 @@ pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     None
 }
 
-#[cfg(feature = "any_tls")]
+#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
 #[cfg(test)]
 mod tests {
     use super::*;

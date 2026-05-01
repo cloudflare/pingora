@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -111,7 +111,10 @@ mod test {
 
         // Client
         handles.push(tokio::spawn(async move {
-            let conn = crate::connectors::http::v2::handshake(Box::new(client), 500, None)
+            use crate::connectors::http::v2::H2HandshakeSettings;
+            let mut settings = H2HandshakeSettings::new();
+            settings.max_streams = 500;
+            let conn = crate::connectors::http::v2::handshake(Box::new(client), settings)
                 .await
                 .unwrap();
 

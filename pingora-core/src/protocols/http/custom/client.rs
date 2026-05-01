@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,6 +47,8 @@ pub trait Session: Send + Sync + Unpin + 'static {
     async fn shutdown(&mut self, code: u32, ctx: &str);
 
     fn response_header(&self) -> Option<&ResponseHeader>;
+
+    fn was_upgraded(&self) -> bool;
 
     fn digest(&self) -> Option<&Digest>;
 
@@ -116,6 +118,10 @@ impl Session for () {
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         unreachable!("client session: response_header")
+    }
+
+    fn was_upgraded(&self) -> bool {
+        unreachable!("client session: was upgraded")
     }
 
     fn digest(&self) -> Option<&Digest> {

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -98,9 +98,28 @@ pub trait Session: Send + Sync + Unpin + 'static {
         &mut self,
     ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>>;
 
+    fn restore_custom_message_reader(
+        &mut self,
+        reader: Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+    ) -> Result<()>;
+
     fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>>;
 
     fn restore_custom_message_writer(&mut self, writer: Box<dyn CustomMessageWrite>) -> Result<()>;
+
+    /// Whether this request is for upgrade (e.g., websocket).
+    ///
+    /// Returns `true` if the request has HTTP/1.1 version and contains an Upgrade header.
+    fn is_upgrade_req(&self) -> bool {
+        false
+    }
+
+    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    ///
+    /// Returns `true` if the request was an upgrade request and a 101 response was sent.
+    fn was_upgraded(&self) -> bool {
+        false
+    }
 }
 
 #[doc(hidden)]
@@ -252,6 +271,13 @@ impl Session for () {
         unreachable!("server session: get_custom_message_reader")
     }
 
+    fn restore_custom_message_reader(
+        &mut self,
+        _reader: Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+    ) -> Result<()> {
+        unreachable!("server session: get_custom_message_reader")
+    }
+
     fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
         unreachable!("server session: get_custom_message_writer")
     }
@@ -261,5 +287,13 @@ impl Session for () {
         _writer: Box<dyn CustomMessageWrite>,
     ) -> Result<()> {
         unreachable!("server session: restore_custom_message_writer")
+    }
+
+    fn is_upgrade_req(&self) -> bool {
+        unreachable!("server session: is_upgrade_req")
+    }
+
+    fn was_upgraded(&self) -> bool {
+        unreachable!("server session: was_upgraded")
     }
 }

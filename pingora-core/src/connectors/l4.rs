@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -313,17 +313,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::io::AsyncWriteExt;
-    #[cfg(unix)]
-    use tokio::net::UnixListener;
     use tokio::time::sleep;
 
-    /// Some of the tests below are flaky when making new connections to mock
-    /// servers. The servers are simple tokio listeners, so failures there are
-    /// not indicative of real errors. This function will retry the peer/server
-    /// in increasing intervals until it either succeeds in connecting or a long
-    /// timeout expires (max 10sec)
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
@@ -396,11 +388,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_timeout() {
-        // 192.0.2.1 is effectively a blackhole
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
+        // dropped on Linux, producing ConnectTimedout. On macOS the kernel
+        // may instead return ENETUNREACH (ConnectNoRoute).
         let mut peer = BasicPeer::new("192.0.2.1:79");
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1)); //1ms
-        let new_session = connect(&peer, None).await;
-        assert_eq!(new_session.unwrap_err().etype(), &ConnectTimedout)
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
+        let err = connect(&peer, None).await.unwrap_err();
+        assert!(
+            err.etype() == &ConnectTimedout || err.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            err.etype()
+        );
     }
 
     #[tokio::test]
@@ -465,31 +463,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const MOCK_UDS_PATH: &str = "/tmp/test_unix_connect_proxy.sock";
-
-    // one-off mock server
-    #[cfg(unix)]
-    async fn mock_connect_server() {
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-        let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
-        if let Ok((mut stream, _addr)) = listener.accept().await {
-            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
-            // wait a bit so that the client can read
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_proxy_work() {
-        tokio::spawn(async {
-            mock_connect_server().await;
-        });
-        // wait for the server to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        use crate::connectors::test_utils;
+
+        let socket_path = test_utils::unique_uds_path("connect_proxy_work");
+        let (ready_rx, shutdown_tx, server_handle) =
+            test_utils::spawn_mock_uds_server(socket_path.clone(), b"HTTP/1.1 200 OK\r\n\r\n");
+
+        // Wait for the server to be ready
+        ready_rx.await.unwrap();
+
         let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
         let mut path = PathBuf::new();
-        path.push(MOCK_UDS_PATH);
+        path.push(&socket_path);
         peer.proxy = Some(Proxy {
             next_hop: path.into(),
             host: "1.1.1.1".into(),
@@ -498,35 +485,27 @@ mod tests {
         });
         let new_session = connect(&peer, None).await;
         assert!(new_session.is_ok());
-    }
 
-    #[cfg(unix)]
-    const MOCK_BAD_UDS_PATH: &str = "/tmp/test_unix_bad_connect_proxy.sock";
-
-    // one-off mock bad proxy
-    // closes connection upon accepting
-    #[cfg(unix)]
-    async fn mock_connect_bad_server() {
-        let _ = std::fs::remove_file(MOCK_BAD_UDS_PATH);
-        let listener = UnixListener::bind(MOCK_BAD_UDS_PATH).unwrap();
-        if let Ok((mut stream, _addr)) = listener.accept().await {
-            stream.shutdown().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = std::fs::remove_file(MOCK_BAD_UDS_PATH);
+        // Clean up
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect_proxy_conn_closed() {
-        tokio::spawn(async {
-            mock_connect_bad_server().await;
-        });
-        // wait for the server to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        use crate::connectors::test_utils;
+
+        let socket_path = test_utils::unique_uds_path("connect_proxy_conn_closed");
+        let (ready_rx, shutdown_tx, server_handle) =
+            test_utils::spawn_mock_uds_server_close_immediate(socket_path.clone());
+
+        // Wait for the server to be ready
+        ready_rx.await.unwrap();
+
         let mut peer = HttpPeer::new("1.1.1.1:80".to_string(), false, "".to_string());
         let mut path = PathBuf::new();
-        path.push(MOCK_BAD_UDS_PATH);
+        path.push(&socket_path);
         peer.proxy = Some(Proxy {
             next_hop: path.into(),
             host: "1.1.1.1".into(),
@@ -537,6 +516,10 @@ mod tests {
         let err = new_session.unwrap_err();
         assert_eq!(err.etype(), &ConnectionClosed);
         assert!(!err.retry());
+
+        // Clean up
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -554,6 +537,7 @@ mod tests {
 
         // one-off mock server
         async fn mock_inet_connect_server() -> u16 {
+            use tokio::io::AsyncWriteExt;
             use tokio::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 

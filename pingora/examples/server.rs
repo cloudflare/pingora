@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use pingora::protocols::TcpKeepalive;
 use pingora::server::configuration::Opt;
 use pingora::server::{Server, ShutdownWatch};
 use pingora::services::background::{background_service, BackgroundService};
-use pingora::services::{listening::Service as ListeningService, Service};
+use pingora::services::ServiceWithDependents;
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -185,12 +185,12 @@ pub fn main() {
         &key_path,
     );
 
-    let mut prometheus_service_http = ListeningService::prometheus_http_service();
+    let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
     prometheus_service_http.add_tcp("127.0.0.1:6150");
 
     let background_service = background_service("example", ExampleBackgroundService {});
 
-    let services: Vec<Box<dyn Service>> = vec![
+    let services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(echo_service),
         Box::new(echo_service_http),
         Box::new(proxy_service),

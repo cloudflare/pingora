@@ -1,4 +1,4 @@
-//! Provides [`VirtualStream`].
+//! Provides [`VirtualSocketStream`].
 
 use std::{
     pin::Pin,

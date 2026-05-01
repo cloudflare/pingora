@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@
 //! The abstraction and implementation interface for service application logic
 
 pub mod http_app;
-pub mod prometheus_http_app;
 
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
 use log::{debug, error};
+use std::any::Any;
 use std::future::poll_fn;
 use std::sync::Arc;
 
@@ -61,27 +61,80 @@ pub trait ServerApp {
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
-    /// Use HTTP/2 for plaintext.
+    /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
+
+    /// Allow proxying CONNECT requests when handling HTTP traffic.
+    ///
+    /// When disabled, CONNECT requests are rejected with 405 by proxy services.
+    pub allow_connect_method_proxying: bool,
 
     #[doc(hidden)]
     pub force_custom: bool,
+
+    /// Maximum number of requests that this connection will handle. This is
+    /// equivalent to [Nginx's keepalive requests](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive_requests)
+    /// which says:
+    ///
+    /// > Closing connections periodically is necessary to free per-connection
+    /// > memory allocations. Therefore, using too high maximum number of
+    /// > requests could result in excessive memory usage and not recommended.
+    ///
+    /// Unlike nginx, the default behavior here is _no limit_.
+    pub keepalive_request_limit: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+/// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
+///
+/// In addition to framework-managed keepalive parameters, this struct can carry an optional
+/// user-defined context via [`set_user_context`](Self::set_user_context). The proxy layer
+/// populates this through `ProxyHttp::persist_connection_context`
+/// and delivers it to the next request through `ProxyHttp::on_connection_reuse`.
+#[derive(Debug)]
 pub struct HttpPersistentSettings {
     keepalive_timeout: Option<u64>,
+    keepalive_reuses_remaining: Option<u32>,
+    /// User-defined context to carry to the next request on this connection.
+    user_context: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl HttpPersistentSettings {
     pub fn for_session(session: &ServerSession) -> Self {
         HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
+            keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
+            user_context: None,
         }
     }
 
-    pub fn apply_to_session(&self, session: &mut ServerSession) {
-        session.set_keepalive(self.keepalive_timeout);
+    /// Set a user-defined context to be carried to the next request on this connection.
+    pub fn set_user_context(&mut self, ctx: Box<dyn Any + Send + Sync>) {
+        self.user_context = Some(ctx);
+    }
+
+    /// Take the user-defined context, if any.
+    pub fn take_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.user_context.take()
+    }
+
+    pub fn apply_to_session(self, session: &mut ServerSession) {
+        let Self {
+            keepalive_timeout,
+            mut keepalive_reuses_remaining,
+            user_context,
+        } = self;
+
+        // Reduce the number of times the connection for this session can be
+        // reused by one. A session with reuse count of zero won't be reused
+        if let Some(reuses) = keepalive_reuses_remaining.as_mut() {
+            *reuses = reuses.saturating_sub(1);
+        }
+
+        session.set_keepalive(keepalive_timeout);
+        session.set_keepalive_reuses_remaining(keepalive_reuses_remaining);
+
+        // Carry user context into the session for the proxy layer to consume
+        session.set_connection_user_context(user_context);
     }
 }
 
@@ -163,8 +216,13 @@ where
             .as_ref()
             .map_or(false, |o| o.force_custom);
 
+        // h2c is for cleartext connections; on TLS, ALPN handles protocol negotiation.
+        // Otherwise, h2c stays true on TLS streams, forcing HTTP/1.1 clients into HTTP/2
+        if stream.get_ssl_digest().is_some() {
+            h2c = false;
+        }
         // try to read h2 preface
-        if h2c && !custom {
+        else if h2c && !custom {
             let mut buf = [0u8; H2_PREFACE.len()];
             let peeked = stream
                 .try_peek(&mut buf)
@@ -243,6 +301,10 @@ where
                 // default 60s
                 session.set_keepalive(Some(60));
             }
+            session.set_keepalive_reuses_remaining(
+                self.server_options()
+                    .and_then(|opts| opts.keepalive_request_limit),
+            );
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
@@ -259,5 +321,58 @@ where
 
     async fn cleanup(&self) {
         self.http_cleanup().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_test::io::Builder;
+
+    #[test]
+    fn test_persistent_settings_user_context_roundtrip() {
+        // Create a mock H1 session
+        let mock_io = Builder::new().build();
+        let mut session = ServerSession::new_http1(Box::new(mock_io));
+        session.set_keepalive(Some(60));
+
+        // Snapshot settings (no user context yet)
+        let mut settings = HttpPersistentSettings::for_session(&session);
+        assert!(settings.take_user_context().is_none());
+
+        // Set user context
+        settings.set_user_context(Box::new(123u64));
+
+        // Apply to a fresh session -- user context should transfer
+        let mock_io2 = Builder::new().build();
+        let mut session2 = ServerSession::new_http1(Box::new(mock_io2));
+        settings.apply_to_session(&mut session2);
+
+        // The user context should now be on the session
+        let ctx = session2.take_connection_user_context();
+        assert!(ctx.is_some());
+        let val = ctx.unwrap().downcast::<u64>().unwrap();
+        assert_eq!(*val, 123u64);
+
+        // Keepalive should also have been applied
+        assert_eq!(session2.get_keepalive(), Some(60));
+    }
+
+    #[test]
+    fn test_persistent_settings_no_user_context_by_default() {
+        let mock_io = Builder::new().build();
+        let mut session = ServerSession::new_http1(Box::new(mock_io));
+        session.set_keepalive(Some(30));
+
+        let settings = HttpPersistentSettings::for_session(&session);
+
+        let mock_io2 = Builder::new().build();
+        let mut session2 = ServerSession::new_http1(Box::new(mock_io2));
+        settings.apply_to_session(&mut session2);
+
+        // No user context should be present
+        assert!(session2.take_connection_user_context().is_none());
+        // Keepalive should still work
+        assert_eq!(session2.get_keepalive(), Some(30));
     }
 }

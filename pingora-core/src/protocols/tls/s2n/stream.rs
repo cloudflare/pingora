@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -123,8 +123,9 @@ where
     T: AsyncRead + AsyncWrite + std::marker::Unpin,
 {
     pub fn from_s2n_stream(stream: S2NTlsStream<AutoFlushableStream<T>>) -> TlsStream<T> {
-        let mut timing: TimingDigest = Default::default();
-        timing.established_ts = SystemTime::now();
+        let timing = TimingDigest {
+            established_ts: SystemTime::now(),
+        };
         let digest = Some(Arc::new(SslDigest::from_stream(Some(&stream))));
         TlsStream {
             stream,

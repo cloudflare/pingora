@@ -14,7 +14,8 @@ Pingora proxy phases without caching
     upstream_request_filter --> request_body_filter;
     request_body_filter --> SendReq{{IO: send request to upstream}};
     SendReq-->RecvResp{{IO: read response from upstream}};
-    RecvResp-->upstream_response_filter-->response_filter-->upstream_response_body_filter-->response_body_filter-->logging-->endreq("request done");
+    RecvResp-.feature: adjust_upstream_modules.->adjust_upstream_modules;
+    adjust_upstream_modules-->upstream_response_filter-->response_filter-->upstream_response_body_filter-->response_body_filter-->logging-->endreq("request done");
 
     fail_to_connect --can retry-->upstream_peer;
     fail_to_connect --can't retry-->fail_to_proxy--send error response-->logging;

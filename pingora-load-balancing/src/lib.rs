@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Result as IoResult;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod background;
 pub mod discovery;
@@ -303,14 +303,34 @@ impl Backends {
     }
 }
 
+/// Timing information from the most recent [`LoadBalancer::update`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct UpdateTimings {
+    /// Time spent in [`ServiceDiscovery::discover`].
+    pub discovery_duration: Duration,
+    /// Time spent building the selection algorithm and storing the updated backends.
+    pub build_duration: Duration,
+}
+
 /// A [LoadBalancer] instance contains the service discovery, health check and backend selection
 /// all together.
 ///
 /// In order to run service discovery and health check at the designated frequencies, the [LoadBalancer]
 /// needs to be run as a [pingora_core::services::background::BackgroundService].
-pub struct LoadBalancer<S> {
+pub struct LoadBalancer<S>
+where
+    S: BackendSelection,
+{
     backends: Backends,
     selector: ArcSwap<S>,
+
+    config: Option<S::Config>,
+
+    /// Timing information from the most recent [`update`](Self::update) call.
+    ///
+    /// `None` until the first successful update completes.
+    last_update_timing: ArcSwap<Option<UpdateTimings>>,
+
     /// How frequent the health check logic (if set) should run.
     ///
     /// If `None`, the health check logic will only run once at the beginning.
@@ -347,15 +367,20 @@ where
     }
 
     /// Build a [LoadBalancer] with the given [Backends] and the config.
-    pub fn from_backends_with_config(backends: Backends, config: &S::Config) -> Self {
-        let selector = ArcSwap::new(Arc::new(S::build_with_config(
-            &backends.get_backend(),
-            config,
-        )));
+    pub fn from_backends_with_config(backends: Backends, config_opt: Option<S::Config>) -> Self {
+        let selector_raw = if let Some(config) = config_opt.as_ref() {
+            S::build_with_config(&backends.get_backend(), config)
+        } else {
+            S::build(&backends.get_backend())
+        };
+
+        let selector = ArcSwap::new(Arc::new(selector_raw));
 
         LoadBalancer {
             backends,
             selector,
+            config: config_opt,
+            last_update_timing: ArcSwap::new(Arc::new(None)),
             health_check_frequency: None,
             update_frequency: None,
             parallel_health_check: false,
@@ -364,24 +389,44 @@ where
 
     /// Build a [LoadBalancer] with the given [Backends].
     pub fn from_backends(backends: Backends) -> Self {
-        let selector = ArcSwap::new(Arc::new(S::build(&backends.get_backend())));
-        LoadBalancer {
-            backends,
-            selector,
-            health_check_frequency: None,
-            update_frequency: None,
-            parallel_health_check: false,
-        }
+        Self::from_backends_with_config(backends, None)
     }
 
     /// Run the service discovery and update the selection algorithm.
     ///
     /// This function will be called every `update_frequency` if this [LoadBalancer] instance
     /// is running as a background service.
+    ///
+    /// On success, the timing information from this call is stored and can be
+    /// retrieved via [`last_update_timing`](Self::last_update_timing).
     pub async fn update(&self) -> Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        let build_nanos = AtomicU64::new(0);
+        let total_start = Instant::now();
+
         self.backends
-            .update(|backends| self.selector.store(Arc::new(S::build(&backends))))
-            .await
+            .update(|backends| {
+                let build_start = Instant::now();
+                let selector = if let Some(config) = &self.config {
+                    S::build_with_config(&backends, config)
+                } else {
+                    S::build(&backends)
+                };
+                self.selector.store(Arc::new(selector));
+                build_nanos.store(build_start.elapsed().as_nanos() as u64, Relaxed);
+            })
+            .await?;
+
+        let total = total_start.elapsed();
+        let build = Duration::from_nanos(build_nanos.load(Relaxed));
+
+        self.last_update_timing.store(Arc::new(Some(UpdateTimings {
+            discovery_duration: total.saturating_sub(build),
+            build_duration: build,
+        })));
+
+        Ok(())
     }
 
     /// Return the first healthy [Backend] according to the selection algorithm and the
@@ -430,6 +475,13 @@ where
     /// Access the [Backends] of this [LoadBalancer]
     pub fn backends(&self) -> &Backends {
         &self.backends
+    }
+
+    /// Return the timing information from the most recent successful [`update`](Self::update) call.
+    ///
+    /// Returns `None` if [`update`](Self::update) has never completed successfully.
+    pub fn last_update_timing(&self) -> Option<UpdateTimings> {
+        **self.last_update_timing.load()
     }
 }
 
@@ -589,6 +641,39 @@ mod test {
         assert!(backends.ready(&good1));
         assert!(backends.ready(&good2));
         assert!(!backends.ready(&bad));
+    }
+
+    #[tokio::test]
+    async fn test_lb_update_stores_timing() {
+        let discovery = discovery::Static::default();
+        let b1 = Backend::new("1.1.1.1:80").unwrap();
+        let b2 = Backend::new("1.0.0.1:80").unwrap();
+        discovery.add(b1.clone());
+        discovery.add(b2.clone());
+
+        let lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(Box::new(
+            discovery,
+        )));
+
+        // Before first update, timing should be None
+        assert!(lb.last_update_timing().is_none());
+
+        lb.update().await.unwrap();
+
+        // After update, timing should be populated
+        let timing = lb
+            .last_update_timing()
+            .expect("timing should be Some after update");
+        assert!(timing.discovery_duration > Duration::ZERO);
+        assert!(timing.build_duration > Duration::ZERO);
+
+        // Backends should be populated
+        let backend = lb.backends().get_backend();
+        assert!(backend.contains(&b1));
+        assert!(backend.contains(&b2));
+
+        // Selection should work
+        assert!(lb.select(b"test", 10).is_some());
     }
 
     mod thread_safety {

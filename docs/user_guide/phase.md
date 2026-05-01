@@ -29,7 +29,8 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
     upstream_request_filter --> request_body_filter;
     request_body_filter --> SendReq{{IO: send request to upstream}};
     SendReq-->RecvResp{{IO: read response from upstream}};
-    RecvResp-->upstream_response_filter-->response_filter-->upstream_response_body_filter-->response_body_filter-->logging-->endreq("request done");
+    RecvResp-.feature: adjust_upstream_modules.->adjust_upstream_modules;
+    adjust_upstream_modules-->upstream_response_filter-->response_filter-->upstream_response_body_filter-->response_body_filter-->logging-->endreq("request done");
 
     fail_to_connect --can retry-->upstream_peer;
     fail_to_connect --can't retry-->fail_to_proxy--send error response-->logging;
@@ -91,6 +92,11 @@ If the error is not retry-able, the request will end.
 
 ### `upstream_request_filter()`
 This phase is to modify requests before sending to upstream.
+
+### `adjust_upstream_modules()` _(feature: `adjust_upstream_modules`)_
+This phase is triggered when the upstream response header arrives, before upstream modules (such as `upstream_compression`) process it.
+
+Use this to configure upstream module behavior based on the response header, e.g. setting a dictionary for dictionary-based content encoding. The response header is provided as an immutable reference; to modify the response header itself, use `upstream_response_filter()` instead.
 
 ### `upstream_response_filter()/upstream_response_body_filter()/upstream_response_trailer_filter()`
 This phase is triggered after an upstream response header/body/trailer is received.

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ impl<A> Service<A> {
     /// let mut service = MyService::new();
     /// let filter = Arc::new(AcceptAllFilter);
     /// service.set_connection_filter(filter);
-    /// ```   
+    /// ```
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
         self.connection_filter = filter.clone();
@@ -307,19 +307,5 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
     fn threads(&self) -> Option<usize> {
         self.threads
-    }
-}
-
-use crate::apps::prometheus_http_app::PrometheusServer;
-
-impl Service<PrometheusServer> {
-    /// The Prometheus HTTP server
-    ///
-    /// The HTTP server endpoint that reports Prometheus metrics collected in the entire service
-    pub fn prometheus_http_service() -> Self {
-        Service::new(
-            "Prometheus metric HTTP".to_string(),
-            PrometheusServer::new(),
-        )
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,8 +25,9 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::Result;
+use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::any::Any;
 use std::time::Duration;
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
@@ -252,6 +253,21 @@ impl Session {
         }
     }
 
+    /// Callback for cleanup logic on downstream specifically when we fail to proxy the session
+    /// other than cleanup via finish().
+    ///
+    /// If caching the downstream failure may be independent of (and precede) an upstream error in
+    /// which case this function may be called more than once.
+    pub fn on_proxy_failure(&mut self, e: Box<Error>) {
+        match self {
+            Self::H1(_) | Self::H2(_) | Self::Custom(_) => {
+                // all cleanup logic handled in finish(),
+                // stream and resources dropped when session dropped
+            }
+            Self::Subrequest(ref mut s) => s.on_proxy_failure(e),
+        }
+    }
+
     pub async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         match self {
             Self::H1(s) => s.response_duplex_vec(tasks).await,
@@ -280,6 +296,45 @@ impl Session {
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
             Self::Custom(_) => None,
+        }
+    }
+
+    /// Set the number of times the upstream connection connection for this
+    /// session can be reused via keepalive. Noop for h2 and subrequest
+    pub fn set_keepalive_reuses_remaining(&mut self, reuses: Option<u32>) {
+        if let Self::H1(s) = self {
+            s.set_keepalive_reuses_remaining(reuses);
+        }
+    }
+
+    /// Get the number of times the upstream connection connection for this
+    /// session can be reused via keepalive. Not applicable for h2 or
+    /// subrequest
+    pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
+        if let Self::H1(s) = self {
+            s.get_keepalive_reuses_remaining()
+        } else {
+            None
+        }
+    }
+
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        if let Self::H1(s) = self {
+            s.set_connection_user_context(ctx);
+        }
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` for h2, subrequest, and custom sessions, or if no context was persisted.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        if let Self::H1(s) = self {
+            s.take_connection_user_context()
+        } else {
+            None
         }
     }
 
@@ -402,6 +457,22 @@ impl Session {
         }
     }
 
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
+    /// stays pending so the proxy can finish delivering the upstream response.
+    ///
+    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        match self {
+            Self::H1(s) => s.set_abort_on_close(abort),
+            Self::H2(_) => {}
+            Self::Subrequest(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {
@@ -433,7 +504,7 @@ impl Session {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
-            Self::Custom(s) => s.shutdown(1, "shutdown").await,
+            Self::Custom(s) => s.shutdown(0, "shutdown").await,
         }
     }
 
@@ -648,13 +719,23 @@ impl Session {
         }
     }
 
-    /// Whether this request is for upgrade (e.g., websocket)
+    /// Whether this request is for upgrade (e.g., websocket).
     pub fn is_upgrade_req(&self) -> bool {
         match self {
             Self::H1(s) => s.is_upgrade_req(),
             Self::H2(_) => false,
             Self::Subrequest(s) => s.is_upgrade_req(),
-            Self::Custom(_) => false,
+            Self::Custom(s) => s.is_upgrade_req(),
+        }
+    }
+
+    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    pub fn was_upgraded(&self) -> bool {
+        match self {
+            Self::H1(s) => s.was_upgraded(),
+            Self::H2(_) => false,
+            Self::Subrequest(s) => s.was_upgraded(),
+            Self::Custom(s) => s.was_upgraded(),
         }
     }
 
@@ -728,6 +809,69 @@ impl Session {
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
             Self::Custom(_) => None,
+        }
+    }
+
+    /// Check if this session supports the cancel-safe proxy task API.
+    ///
+    /// For HTTP/1.x, this can be toggled per-session via
+    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    pub fn supports_proxy_task_api(&self) -> bool {
+        match self {
+            Self::H1(s) => s.proxy_tasks_enabled(),
+            _ => false,
+        }
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        if let Self::H1(s) = self {
+            s.set_proxy_tasks_enabled(enabled);
+        }
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
+        match self {
+            Self::H1(s) => s.send_proxy_task(task),
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
+
+    /// Check if there are pending downstream proxy tasks queued for writing.
+    ///
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
+        match self {
+            Self::H1(s) => s.has_pending_proxy_tasks(),
+            Self::H2(_) => false,         // TODO: implement for H2
+            Self::Subrequest(_) => false, // TODO: implement for subrequests
+            Self::Custom(_) => false,     // TODO: implement for custom
+        }
+    }
+
+    /// Write all queued downstream proxy tasks in a cancel-safe manner.
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.write_proxy_tasks().await,
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
 }

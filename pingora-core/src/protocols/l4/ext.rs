@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -299,6 +299,23 @@ pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
 
 #[cfg(windows)]
 pub fn set_recv_buf(_sock: RawSocket, _: usize) -> Result<()> {
+    Ok(())
+}
+
+/// Set the TCP send buffer size. See SO_SNDBUF.
+#[cfg(target_os = "linux")]
+pub fn set_snd_buf(fd: RawFd, val: usize) -> Result<()> {
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, val as c_int)
+        .or_err(ConnectError, "failed to set SO_SNDBUF")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn set_snd_buf(_fd: RawFd, _: usize) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_snd_buf(_sock: RawSocket, _: usize) -> Result<()> {
     Ok(())
 }
 
