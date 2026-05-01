@@ -57,7 +57,7 @@ pub trait ServerApp {
     async fn cleanup(&self) {}
 }
 #[non_exhaustive]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
     /// Allow HTTP/2 for plaintext.
