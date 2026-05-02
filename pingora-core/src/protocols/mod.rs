@@ -17,6 +17,8 @@
 mod digest;
 pub mod http;
 pub mod l4;
+#[cfg(feature = "proxy_protocol")]
+pub mod proxy_protocol;
 pub mod raw_connect;
 pub mod tls;
 #[cfg(windows)]

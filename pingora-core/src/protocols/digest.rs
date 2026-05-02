@@ -24,6 +24,9 @@ use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
 
+#[cfg(feature = "proxy_protocol")]
+use super::proxy_protocol::ProxyProtocolHeader;
+
 /// The information can be extracted from a connection
 #[derive(Clone, Debug, Default)]
 pub struct Digest {
@@ -72,6 +75,9 @@ pub struct SocketDigest {
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
     pub original_dst: OnceCell<Option<SocketAddr>>,
+    /// Proxy Protocol header
+    #[cfg(feature = "proxy_protocol")]
+    pub proxy_protocol: OnceCell<Option<ProxyProtocolHeader>>,
 }
 
 impl SocketDigest {
@@ -82,6 +88,8 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            #[cfg(feature = "proxy_protocol")]
+            proxy_protocol: OnceCell::new(),
         }
     }
 
@@ -92,6 +100,8 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            #[cfg(feature = "proxy_protocol")]
+            proxy_protocol: OnceCell::new(),
         }
     }
 
@@ -203,6 +213,11 @@ impl SocketDigest {
                     .map(SocketAddr::Inet)
             })
             .as_ref()
+    }
+
+    #[cfg(feature = "proxy_protocol")]
+    pub fn proxy_protocol(&self) -> Option<&ProxyProtocolHeader> {
+        self.proxy_protocol.get_or_init(|| None).as_ref()
     }
 }
 
