@@ -814,19 +814,24 @@ impl Session {
 
     /// Check if this session supports the cancel-safe proxy task API.
     ///
-    /// For HTTP/1.x, this can be toggled per-session via
-    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    /// Currently supported by HTTP/1.x and Subrequest server sessions;
+    /// toggled per-session via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
     pub fn supports_proxy_task_api(&self) -> bool {
         match self {
             Self::H1(s) => s.proxy_tasks_enabled(),
-            _ => false,
+            Self::Subrequest(s) => s.proxy_tasks_enabled(),
+            Self::H2(_) => false,
+            Self::Custom(_) => false,
         }
     }
 
     /// Enable or disable the cancel-safe proxy task API for this session.
     pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
-        if let Self::H1(s) = self {
-            s.set_proxy_tasks_enabled(enabled);
+        match self {
+            Self::H1(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::Subrequest(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::H2(_) => {}
+            Self::Custom(_) => {}
         }
     }
 
@@ -841,7 +846,7 @@ impl Session {
         match self {
             Self::H1(s) => s.send_proxy_task(task),
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
-            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.send_proxy_task(task),
             Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
@@ -852,9 +857,9 @@ impl Session {
     pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
         match self {
             Self::H1(s) => s.has_pending_proxy_tasks(),
-            Self::H2(_) => false,         // TODO: implement for H2
-            Self::Subrequest(_) => false, // TODO: implement for subrequests
-            Self::Custom(_) => false,     // TODO: implement for custom
+            Self::H2(_) => false, // TODO: implement for H2
+            Self::Subrequest(s) => s.has_pending_proxy_tasks(),
+            Self::Custom(_) => false, // TODO: implement for custom
         }
     }
 
@@ -870,7 +875,7 @@ impl Session {
         match self {
             Self::H1(s) => s.write_proxy_tasks().await,
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
-            Self::Subrequest(_) => panic!("Subrequest proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.write_proxy_tasks().await,
             Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
