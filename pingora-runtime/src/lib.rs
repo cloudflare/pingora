@@ -25,6 +25,7 @@
 
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -48,6 +49,32 @@ pub struct BlockingPoolOpts {
     pub thread_keep_alive: Option<Duration>,
 }
 
+/// Configuration options for runtime metrics collection.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMetricsOpts {
+    /// Enable Tokio's poll-time histogram on the runtime.
+    ///
+    /// This must be configured before the runtime is built. Enabling it adds
+    /// two timestamp reads to every task poll.
+    pub poll_time_histogram: bool,
+    /// Histogram bucket scale for Tokio's poll-time histogram.
+    pub poll_time_histogram_scale: Option<RuntimeMetricsPollTimeHistogramScale>,
+    /// Width of the first histogram bucket.
+    pub poll_time_histogram_resolution: Option<Duration>,
+    /// Number of histogram buckets. Memory usage scales with runtimes × workers × buckets.
+    pub poll_time_histogram_buckets: Option<usize>,
+}
+
+/// Bucket scale for Tokio's poll-time histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMetricsPollTimeHistogramScale {
+    /// Equal-width buckets.
+    Linear,
+    /// Buckets double in width at each step.
+    Log,
+}
+
 /// Pingora async multi-threaded runtime
 ///
 /// The `Steal` flavor is effectively tokio multi-threaded runtime.
@@ -66,6 +93,43 @@ fn apply_blocking_opts(builder: &mut Builder, opts: &BlockingPoolOpts) {
     if let Some(ttl) = opts.thread_keep_alive {
         builder.thread_keep_alive(ttl);
     }
+}
+
+/// Apply [`RuntimeMetricsOpts`] to a tokio [`Builder`].
+// The replacement `metrics_poll_time_histogram_configuration` API is not used
+// here so this crate can continue to compile against older Tokio 1.x versions
+// selected by downstream applications while still honoring these knobs in
+// tokio-unstable builds.
+#[allow(deprecated)]
+fn apply_metrics_opts(builder: &mut Builder, opts: &RuntimeMetricsOpts) {
+    #[cfg(tokio_unstable)]
+    if opts.poll_time_histogram {
+        builder.enable_metrics_poll_time_histogram();
+
+        if let Some(scale) = opts.poll_time_histogram_scale {
+            builder.metrics_poll_count_histogram_scale(match scale {
+                RuntimeMetricsPollTimeHistogramScale::Linear => {
+                    tokio::runtime::HistogramScale::Linear
+                }
+                RuntimeMetricsPollTimeHistogramScale::Log => tokio::runtime::HistogramScale::Log,
+            });
+        }
+        if let Some(resolution) = opts
+            .poll_time_histogram_resolution
+            .filter(|resolution| !resolution.is_zero())
+        {
+            builder.metrics_poll_count_histogram_resolution(resolution);
+        }
+        if let Some(buckets) = opts
+            .poll_time_histogram_buckets
+            .filter(|buckets| *buckets > 0)
+        {
+            builder.metrics_poll_count_histogram_buckets(buckets);
+        }
+    }
+
+    #[cfg(not(tokio_unstable))]
+    let _ = (builder, opts);
 }
 
 /// Builder for constructing a [`Runtime`].
@@ -88,6 +152,7 @@ pub struct RuntimeBuilder {
     name: String,
     work_steal: bool,
     blocking_pool_opts: BlockingPoolOpts,
+    metrics_opts: RuntimeMetricsOpts,
 }
 
 impl RuntimeBuilder {
@@ -100,6 +165,7 @@ impl RuntimeBuilder {
             name: name.to_string(),
             work_steal: true,
             blocking_pool_opts: BlockingPoolOpts::default(),
+            metrics_opts: RuntimeMetricsOpts::default(),
         }
     }
 
@@ -118,6 +184,12 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the [`RuntimeMetricsOpts`] for the runtime.
+    pub fn metrics_opts(mut self, opts: RuntimeMetricsOpts) -> Self {
+        self.metrics_opts = opts;
+        self
+    }
+
     /// Build the [`Runtime`].
     pub fn build(self) -> Runtime {
         if self.work_steal {
@@ -127,12 +199,18 @@ impl RuntimeBuilder {
                 .worker_threads(self.threads)
                 .thread_name(&self.name);
             apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
-            Runtime::Steal(builder.build().unwrap())
+            apply_metrics_opts(&mut builder, &self.metrics_opts);
+            Runtime::Steal(
+                builder
+                    .build()
+                    .expect("failed to build work-stealing Tokio runtime"),
+            )
         } else {
             Runtime::NoSteal(NoStealRuntime::new(
                 self.threads,
                 &self.name,
                 self.blocking_pool_opts,
+                self.metrics_opts,
             ))
         }
     }
@@ -199,6 +277,7 @@ pub struct NoStealRuntime {
     threads: usize,
     name: String,
     blocking_opts: BlockingPoolOpts,
+    metrics_opts: RuntimeMetricsOpts,
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
@@ -207,12 +286,18 @@ pub struct NoStealRuntime {
 
 impl NoStealRuntime {
     /// Create a new [`NoStealRuntime`] with blocking pool options. Panic if `threads` is 0.
-    pub fn new(threads: usize, name: &str, blocking_opts: BlockingPoolOpts) -> Self {
+    pub fn new(
+        threads: usize,
+        name: &str,
+        blocking_opts: BlockingPoolOpts,
+        metrics_opts: RuntimeMetricsOpts,
+    ) -> Self {
         assert!(threads != 0);
         NoStealRuntime {
             threads,
             name: name.to_string(),
             blocking_opts,
+            metrics_opts,
             pools: Arc::new(OnceCell::new()),
             controls: OnceCell::new(),
         }
@@ -225,7 +310,10 @@ impl NoStealRuntime {
             let mut builder = Builder::new_current_thread();
             builder.enable_all();
             apply_blocking_opts(&mut builder, &self.blocking_opts);
-            let rt = builder.build().unwrap();
+            apply_metrics_opts(&mut builder, &self.metrics_opts);
+            let rt = builder
+                .build()
+                .expect("failed to build no-steal Tokio runtime worker");
             let handler = rt.handle().clone();
             let (tx, rx) = channel::<Duration>();
             let pools_ref = self.pools.clone();

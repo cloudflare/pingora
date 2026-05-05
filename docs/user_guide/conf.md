@@ -29,6 +29,10 @@ group: webusers
 | ca_file | The path to the root CA file | string |
 | s2n_config_cache_size | The maximum number of unique s2n configs to cache. A value of 0 disables the cache. Default: 10 (s2n-tls only) | number |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
+| runtime_metrics_poll_time_histogram | Enable Tokio poll-time histograms on service runtimes. Requires building with `--cfg tokio_unstable`; adds two timestamp reads to every task poll. Default: `false` | bool |
+| runtime_metrics_poll_time_histogram_scale | Bucket scale for Tokio poll-time histograms. Valid values: `linear`, `log`. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | string |
+| runtime_metrics_poll_time_histogram_resolution_micros | Width of the first Tokio poll-time histogram bucket in microseconds. Must be greater than 0. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | number |
+| runtime_metrics_poll_time_histogram_buckets | Number of Tokio poll-time histogram buckets. Must be greater than 0 and at most 1024. Memory usage scales with runtimes × workers × buckets. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | number |
 | upstream_keepalive_pool_size | The number of total connections to keep in the connection pool | number |
 | daemon_wait_for_ready | When `true` and `daemon` is `true`, the parent process waits for the daemon to signal readiness (via `SIGUSR1`) before exiting. This causes systemd to delay sending `SIGQUIT` to the old process until the new instance is fully bootstrapped. Default: `false` | bool |
 | daemon_ready_timeout_seconds | How long (in seconds) the parent waits for the daemon to signal readiness when `daemon_wait_for_ready` is `true`. If the daemon does not signal in time the parent exits with a non-zero code, causing systemd to abort the reload. Default: `600` | number |

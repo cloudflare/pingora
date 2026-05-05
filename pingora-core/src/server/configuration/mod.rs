@@ -22,6 +22,7 @@
 use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+pub use pingora_runtime::RuntimeMetricsPollTimeHistogramScale;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
@@ -30,6 +31,7 @@ use std::path::PathBuf;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
+const MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS: usize = 1024;
 
 /// The configuration file
 ///
@@ -132,6 +134,25 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Enable Tokio's poll-time histogram on runtimes created by this server.
+    ///
+    /// This adds two timestamp reads to every task poll, so it should be
+    /// enabled deliberately when investigating runtime latency. Requires
+    /// building with `--cfg tokio_unstable`.
+    pub runtime_metrics_poll_time_histogram: bool,
+    /// Bucket scale for Tokio's poll-time histogram.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled.
+    pub runtime_metrics_poll_time_histogram_scale: Option<RuntimeMetricsPollTimeHistogramScale>,
+    /// Width of the first Tokio poll-time histogram bucket in microseconds.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled.
+    pub runtime_metrics_poll_time_histogram_resolution_micros: Option<u64>,
+    /// Number of Tokio poll-time histogram buckets.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled. Memory usage
+    /// scales with runtimes × workers × buckets, so values above 1024 are rejected.
+    pub runtime_metrics_poll_time_histogram_buckets: Option<usize>,
     /// When `daemon` is `true`, controls whether the parent process of the daemon fork waits for
     /// the child to signal readiness before exiting.
     ///
@@ -202,6 +223,10 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            runtime_metrics_poll_time_histogram: false,
+            runtime_metrics_poll_time_histogram_scale: None,
+            runtime_metrics_poll_time_histogram_resolution_micros: None,
+            runtime_metrics_poll_time_histogram_buckets: None,
             daemon_ready_timeout_seconds: None,
             daemon_wait_for_ready: false,
             daemon_notify_timeout_seconds: None,
@@ -312,6 +337,29 @@ impl ServerConf {
         if self.max_blocking_threads == Some(0) {
             return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
         }
+        if self.runtime_metrics_poll_time_histogram_resolution_micros == Some(0) {
+            return Error::e_explain(
+                ReadError,
+                "runtime_metrics_poll_time_histogram_resolution_micros must be greater than zero",
+            );
+        }
+        if self.runtime_metrics_poll_time_histogram_buckets == Some(0) {
+            return Error::e_explain(
+                ReadError,
+                "runtime_metrics_poll_time_histogram_buckets must be greater than zero",
+            );
+        }
+        if self
+            .runtime_metrics_poll_time_histogram_buckets
+            .is_some_and(|buckets| buckets > MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS)
+        {
+            return Error::e_explain(
+                ReadError,
+                format!(
+                    "runtime_metrics_poll_time_histogram_buckets must be at most {MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS}"
+                ),
+            );
+        }
         Ok(self)
     }
 
@@ -377,6 +425,10 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            runtime_metrics_poll_time_histogram: false,
+            runtime_metrics_poll_time_histogram_scale: None,
+            runtime_metrics_poll_time_histogram_resolution_micros: None,
+            runtime_metrics_poll_time_histogram_buckets: None,
             daemon_ready_timeout_seconds: None,
             daemon_wait_for_ready: false,
             daemon_notify_timeout_seconds: None,
@@ -469,5 +521,50 @@ blocking_threads_ttl_seconds: 30
         let conf = ServerConf::from_yaml(conf_str).unwrap();
         assert_eq!(Some(64), conf.max_blocking_threads);
         assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
+    }
+
+    #[test]
+    fn test_runtime_poll_time_histogram_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_scale: log
+runtime_metrics_poll_time_histogram_resolution_micros: 20
+runtime_metrics_poll_time_histogram_buckets: 16
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert!(conf.runtime_metrics_poll_time_histogram);
+        assert_eq!(
+            Some(RuntimeMetricsPollTimeHistogramScale::Log),
+            conf.runtime_metrics_poll_time_histogram_scale
+        );
+        assert_eq!(
+            Some(20),
+            conf.runtime_metrics_poll_time_histogram_resolution_micros
+        );
+        assert_eq!(Some(16), conf.runtime_metrics_poll_time_histogram_buckets);
+    }
+
+    #[test]
+    fn test_runtime_poll_time_histogram_bucket_limit() {
+        init_log();
+        let conf_str = format!(
+            r#"
+---
+version: 1
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_buckets: {}
+        "#,
+            MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS + 1
+        );
+
+        let result = ServerConf::from_yaml(&conf_str);
+        assert!(
+            result.is_err(),
+            "excessive runtime_metrics_poll_time_histogram_buckets should fail validation"
+        );
     }
 }

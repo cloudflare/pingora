@@ -27,7 +27,7 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
+use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder, RuntimeMetricsOpts};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -379,12 +379,18 @@ impl Server {
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
         blocking_opts: BlockingPoolOpts,
+        metrics_opts: RuntimeMetricsOpts,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
-        let service_runtime =
-            Server::create_runtime(service.name(), threads, work_stealing, blocking_opts);
+        let service_runtime = Server::create_runtime(
+            service.name(),
+            threads,
+            work_stealing,
+            blocking_opts,
+            metrics_opts,
+        );
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
@@ -642,6 +648,14 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
+        let metrics_opts = RuntimeMetricsOpts {
+            poll_time_histogram: conf.runtime_metrics_poll_time_histogram,
+            poll_time_histogram_scale: conf.runtime_metrics_poll_time_histogram_scale,
+            poll_time_histogram_resolution: conf
+                .runtime_metrics_poll_time_histogram_resolution_micros
+                .map(Duration::from_micros),
+            poll_time_histogram_buckets: conf.runtime_metrics_poll_time_histogram_buckets,
+        };
 
         // Initialize (or re-initialize) sentry and persist the guard for
         // the lifetime of the server. When daemonizing, the transport
@@ -726,13 +740,20 @@ impl Server {
                 ready_notifier,
                 dependency_watches,
                 blocking_opts.clone(),
+                metrics_opts.clone(),
             );
             runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
-        let server_runtime = Server::create_runtime("Server", 1, true, BlockingPoolOpts::default());
+        let server_runtime = Server::create_runtime(
+            "Server",
+            1,
+            true,
+            BlockingPoolOpts::default(),
+            RuntimeMetricsOpts::default(),
+        );
         #[cfg(unix)]
         let shutdown_type = server_runtime
             .get_handle()
@@ -806,10 +827,12 @@ impl Server {
         threads: usize,
         work_steal: bool,
         blocking_opts: BlockingPoolOpts,
+        metrics_opts: RuntimeMetricsOpts,
     ) -> Runtime {
         RuntimeBuilder::new(threads, name)
             .work_steal(work_steal)
             .blocking_pool_opts(blocking_opts)
+            .metrics_opts(metrics_opts)
             .build()
     }
 }
