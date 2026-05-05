@@ -354,14 +354,69 @@ impl AsRawSocket for RawStreamWrapper {
     }
 }
 
-// Large read buffering helps reducing syscalls with little trade-off
-// Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
-const BUF_READ_SIZE: usize = 64 * 1024;
-// Small write buf to match MSS. Too large write buf delays real time communication.
-// This buffering effectively implements something similar to Nagle's algorithm.
-// The benefit is that user space can control when to flush, where Nagle's can't be controlled.
-// And userspace buffering reduce both syscalls and small packets.
-const BUF_WRITE_SIZE: usize = 1460;
+/// The default L4 read buffer size.
+///
+/// Large read buffering helps reducing syscalls with little trade-off. The SSL
+/// layer always does "small" reads in 16k chunks (TLS record size), so L4 read
+/// buffering helps a lot.
+pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// The default L4 write buffer size.
+///
+/// Small write buffering matches a typical MSS. Too large a write buffer delays
+/// real-time communication. This buffering effectively implements something
+/// similar to Nagle's algorithm, but user space can control when to flush.
+pub const DEFAULT_L4_WRITE_BUFFER_SIZE: usize = 1460;
+
+/// L4 [`BufStream`] buffer sizing.
+///
+/// Leaving either side as `None` preserves Pingora's default for that side.
+/// Setting either side to `Some(0)` disables `BufStream` buffering for that
+/// direction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct L4BufferSettings {
+    /// Read buffer size in bytes. `None` uses [`DEFAULT_L4_READ_BUFFER_SIZE`].
+    pub read: Option<usize>,
+    /// Write buffer size in bytes. `None` uses [`DEFAULT_L4_WRITE_BUFFER_SIZE`].
+    pub write: Option<usize>,
+}
+
+impl L4BufferSettings {
+    /// Create settings with both read and write buffer sizes set explicitly.
+    pub fn new(read: usize, write: usize) -> Self {
+        Self {
+            read: Some(read),
+            write: Some(write),
+        }
+    }
+
+    /// Create settings that disable both read and write `BufStream` buffering.
+    pub fn unbuffered() -> Self {
+        Self::new(0, 0)
+    }
+
+    /// Set the read buffer size.
+    pub fn read(mut self, read: usize) -> Self {
+        self.read = Some(read);
+        self
+    }
+
+    /// Set the write buffer size.
+    pub fn write(mut self, write: usize) -> Self {
+        self.write = Some(write);
+        self
+    }
+
+    /// Resolved read buffer size after applying defaults.
+    pub fn read_capacity(&self) -> usize {
+        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE)
+    }
+
+    /// Resolved write buffer size after applying defaults.
+    pub fn write_capacity(&self) -> usize {
+        self.write.unwrap_or(DEFAULT_L4_WRITE_BUFFER_SIZE)
+    }
+}
 
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
@@ -456,13 +511,18 @@ impl Stream {
 
     /// Set the buffer of BufStream
     /// It is only set later because of the malloc overhead in critical accept() path
-    pub(crate) fn set_buffer(&mut self) {
+    pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
         // Since BufStream doesn't provide an API to adjust the buf directly,
         // we take the raw stream out of it and put it in a new BufStream with the size we want
         let stream = mem::take(&mut self.stream);
-        let stream =
-            stream.map(|s| BufStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
+        let stream = stream.map(|s| {
+            BufStream::with_capacity(
+                buffer.read_capacity(),
+                buffer.write_capacity(),
+                s.into_inner(),
+            )
+        });
         let _ = mem::replace(&mut self.stream, stream);
     }
 }

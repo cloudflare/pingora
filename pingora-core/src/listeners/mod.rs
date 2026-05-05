@@ -86,6 +86,9 @@ use std::{any::Any, fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
+pub use crate::protocols::l4::stream::{
+    L4BufferSettings, DEFAULT_L4_READ_BUFFER_SIZE, DEFAULT_L4_WRITE_BUFFER_SIZE,
+};
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
@@ -121,6 +124,7 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    l4_buffer: L4BufferSettings,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
@@ -148,7 +152,86 @@ impl TransportStackBuilder {
         Ok(TransportStack {
             l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            l4_buffer: self.l4_buffer,
         })
+    }
+}
+
+/// Configuration for one listening endpoint.
+///
+/// This configures the endpoint address and endpoint-specific transport
+/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4
+/// [`BufStream`](tokio::io::BufStream) buffer sizes.
+pub struct ListenerConfig {
+    l4: ServerAddress,
+    tls: Option<TlsSettings>,
+    l4_buffer: L4BufferSettings,
+}
+
+impl ListenerConfig {
+    /// Create a TCP listening endpoint config.
+    pub fn tcp(addr: impl Into<String>) -> Self {
+        Self {
+            l4: ServerAddress::Tcp(addr.into(), None),
+            tls: None,
+            l4_buffer: L4BufferSettings::default(),
+        }
+    }
+
+    /// Create a Unix domain socket listening endpoint config.
+    #[cfg(unix)]
+    pub fn uds(addr: impl Into<String>) -> Self {
+        Self {
+            l4: ServerAddress::Uds(addr.into(), None),
+            tls: None,
+            l4_buffer: L4BufferSettings::default(),
+        }
+    }
+
+    /// Set TCP socket options for this endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this endpoint is not TCP.
+    #[track_caller]
+    pub fn tcp_socket_options(mut self, options: TcpSocketOptions) -> Self {
+        match &mut self.l4 {
+            ServerAddress::Tcp(_, opt) => *opt = Some(options),
+            #[cfg(unix)]
+            ServerAddress::Uds(_, _) => {
+                panic!("TCP socket options can only be set on TCP endpoints")
+            }
+        }
+        self
+    }
+
+    /// Set Unix domain socket permissions for this endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this endpoint is not a Unix domain socket.
+    #[cfg(unix)]
+    #[track_caller]
+    pub fn permissions(mut self, permissions: Permissions) -> Self {
+        match &mut self.l4 {
+            ServerAddress::Uds(_, perm) => *perm = Some(permissions),
+            ServerAddress::Tcp(_, _) => {
+                panic!("Unix domain socket permissions can only be set on UDS endpoints")
+            }
+        }
+        self
+    }
+
+    /// Set TLS settings for this endpoint.
+    pub fn tls(mut self, settings: TlsSettings) -> Self {
+        self.tls = Some(settings);
+        self
+    }
+
+    /// Set L4 `BufStream` buffer sizes for this endpoint.
+    pub fn l4_buffer(mut self, settings: L4BufferSettings) -> Self {
+        self.l4_buffer = settings;
+        self
     }
 }
 
@@ -156,6 +239,7 @@ impl TransportStackBuilder {
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
+    l4_buffer: L4BufferSettings,
 }
 
 impl TransportStack {
@@ -168,6 +252,7 @@ impl TransportStack {
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
+            l4_buffer: self.l4_buffer,
         })
     }
 
@@ -179,11 +264,12 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    l4_buffer: L4BufferSettings,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
-        self.l4.set_buffer();
+        self.l4.set_buffer(self.l4_buffer);
         if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
@@ -243,18 +329,22 @@ impl Listeners {
 
     /// Add a TCP endpoint to `self`.
     pub fn add_tcp(&mut self, addr: &str) {
-        self.add_address(ServerAddress::Tcp(addr.into(), None));
+        self.add_listener(ListenerConfig::tcp(addr));
     }
 
     /// Add a TCP endpoint to `self`, with the given [`TcpSocketOptions`].
     pub fn add_tcp_with_settings(&mut self, addr: &str, sock_opt: TcpSocketOptions) {
-        self.add_address(ServerAddress::Tcp(addr.into(), Some(sock_opt)));
+        self.add_listener(ListenerConfig::tcp(addr).tcp_socket_options(sock_opt));
     }
 
     /// Add a Unix domain socket endpoint to `self`.
     #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
-        self.add_address(ServerAddress::Uds(addr.into(), perm));
+        let endpoint = perm.map_or_else(
+            || ListenerConfig::uds(addr),
+            |perm| ListenerConfig::uds(addr).permissions(perm),
+        );
+        self.add_listener(endpoint);
     }
 
     /// Add a TLS endpoint to `self` with the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29)
@@ -272,7 +362,11 @@ impl Listeners {
         sock_opt: Option<TcpSocketOptions>,
         settings: TlsSettings,
     ) {
-        self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings));
+        let mut endpoint = ListenerConfig::tcp(addr).tls(settings);
+        if let Some(sock_opt) = sock_opt {
+            endpoint = endpoint.tcp_socket_options(sock_opt);
+        }
+        self.add_listener(endpoint);
     }
 
     /// Add the given [`ServerAddress`] to `self`.
@@ -294,11 +388,24 @@ impl Listeners {
         }
     }
 
-    /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
+    /// Add the given listener endpoint to `self`.
+    pub fn add_listener(&mut self, endpoint: ListenerConfig) {
+        let ListenerConfig { l4, tls, l4_buffer } = endpoint;
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            l4_buffer,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: self.connection_filter.clone(),
+        });
+    }
+
+    /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided.
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
+            l4_buffer: L4BufferSettings::default(),
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
         })
@@ -370,6 +477,71 @@ mod test {
         // OS has completed the TCP handshake.
         TcpStream::connect(addrs[0]).await.unwrap();
         TcpStream::connect(addrs[1]).await.unwrap();
+    }
+
+    #[test]
+    fn test_add_listener_config_tcp_l4_buffer() {
+        let mut listeners = Listeners::new();
+        let tcp_options = TcpSocketOptions {
+            dscp: Some(10),
+            ..Default::default()
+        };
+        let l4_buffer = L4BufferSettings {
+            read: Some(0),
+            write: None,
+        };
+
+        listeners.add_listener(
+            ListenerConfig::tcp("127.0.0.1:7107")
+                .tcp_socket_options(tcp_options)
+                .l4_buffer(l4_buffer),
+        );
+
+        assert_eq!(listeners.stacks.len(), 1);
+        assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        assert_eq!(
+            listeners.stacks[0].l4_buffer.write_capacity(),
+            DEFAULT_L4_WRITE_BUFFER_SIZE
+        );
+
+        match &listeners.stacks[0].l4 {
+            ServerAddress::Tcp(addr, Some(options)) => {
+                assert_eq!(addr, "127.0.0.1:7107");
+                assert_eq!(options.dscp, Some(10));
+            }
+            other => panic!("unexpected listener address: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_add_listener_config_uds_l4_buffer() {
+        let mut listeners = Listeners::new();
+        let l4_buffer = L4BufferSettings::unbuffered();
+
+        listeners.add_listener(ListenerConfig::uds("/tmp/test_builder_uds").l4_buffer(l4_buffer));
+
+        assert_eq!(listeners.stacks.len(), 1);
+        assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        assert_eq!(listeners.stacks[0].l4_buffer.write_capacity(), 0);
+
+        match &listeners.stacks[0].l4 {
+            ServerAddress::Uds(addr, None) => assert_eq!(addr, "/tmp/test_builder_uds"),
+            other => panic!("unexpected listener address: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_l4_buffer_settings_defaults_per_direction() {
+        let l4_buffer = L4BufferSettings {
+            read: None,
+            write: Some(0),
+        };
+
+        assert_eq!(l4_buffer.read_capacity(), DEFAULT_L4_READ_BUFFER_SIZE);
+        assert_eq!(l4_buffer.write_capacity(), 0);
     }
 
     #[tokio::test]

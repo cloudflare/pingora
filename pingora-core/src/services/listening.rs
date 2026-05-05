@@ -23,7 +23,7 @@ use crate::listeners::tls::TlsSettings;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
-    ConnectionFilter, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
+    ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
 };
 use crate::protocols::Stream;
 #[cfg(unix)]
@@ -121,6 +121,11 @@ impl<A> Service<A> {
     /// Add a TCP listening endpoint with the given address (e.g., `127.0.0.1:8000`).
     pub fn add_tcp(&mut self, addr: &str) {
         self.listeners.add_tcp(addr);
+    }
+
+    /// Add a listening endpoint configured by a [`ListenerConfig`].
+    pub fn add_listener(&mut self, endpoint: ListenerConfig) {
+        self.listeners.add_listener(endpoint);
     }
 
     /// Add a TCP listening endpoint with the given [`TcpSocketOptions`].
