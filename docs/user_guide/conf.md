@@ -23,6 +23,7 @@ group: webusers
 | threads | number of threads per service | number |
 | user | the user the pingora server should be run under after daemonization | string |
 | group | the group the pingora server should be run under after daemonization | string |
+| working_directory | the working directory for the daemonized process | string |
 | client_bind_to_ipv4 | source IPv4 addresses to bind to when connecting to server | list of string |
 | client_bind_to_ipv6 | source IPv6 addresses to bind to when connecting to server| list of string |
 | ca_file | The path to the root CA file | string |

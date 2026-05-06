@@ -385,11 +385,15 @@ fn process_is_running(pid: libc::pid_t) -> bool {
 /// Build a [`Daemonize`] instance configured from `conf`, without calling `start()` or
 /// `execute()`. The caller is responsible for driving execution.
 fn build_daemonize(conf: &ServerConf) -> Daemonize<()> {
-    // TODO: customize working dir
-
     let daemonize = Daemonize::new()
         .umask(0o007) // allow same group to access files but not everyone else
         .pid_file(&conf.pid_file);
+
+    let daemonize = if let Some(working_directory) = conf.working_directory.as_ref() {
+        daemonize.working_directory(working_directory)
+    } else {
+        daemonize
+    };
 
     let daemonize = if let Some(error_log) = conf.error_log.as_ref() {
         let err = OpenOptions::new()

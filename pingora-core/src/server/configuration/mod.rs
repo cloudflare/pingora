@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
@@ -60,6 +61,11 @@ pub struct ServerConf {
     pub user: Option<String>,
     /// Similar to `user`, the group this process should switch to.
     pub group: Option<String>,
+    /// Working directory for the daemonized process.
+    ///
+    /// Only applied when `daemon` is `true`; set this to start the daemon from a known cwd.
+    // TODO: other OS path options should likely be `PathBuf` as well.
+    pub working_directory: Option<PathBuf>,
     /// How many threads **each** service should get. The threads are not shared across services.
     pub threads: usize,
     /// Number of listener tasks to use per fd. This allows for parallel accepts.
@@ -183,6 +189,7 @@ impl Default for ServerConf {
             upgrade_sock: "/tmp/pingora_upgrade.sock".to_string(),
             user: None,
             group: None,
+            working_directory: None,
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
@@ -357,6 +364,7 @@ mod tests {
             upgrade_sock: "".to_string(),
             user: None,
             group: None,
+            working_directory: None,
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
@@ -409,6 +417,29 @@ version: 1
         assert_eq!(1, conf.version);
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
+    }
+
+    #[test]
+    fn test_working_directory_deserializes_from_yaml_string() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+daemon: true
+working_directory: /var/lib/pingora
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(
+            conf.working_directory.as_deref(),
+            Some(std::path::Path::new("/var/lib/pingora"))
+        );
+
+        let yaml = serde_yaml::to_value(&conf).unwrap();
+        assert_eq!(
+            yaml.get("working_directory"),
+            Some(&serde_yaml::Value::String("/var/lib/pingora".to_string()))
+        );
     }
 
     #[test]
