@@ -21,6 +21,7 @@ use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
+use pingora_rustls::ResolvesServerCert;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{version, TlsAcceptor as RusTlsAcceptor};
 
@@ -32,6 +33,7 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    cert_resolver: Option<Arc<dyn ResolvesServerCert>>,
 }
 
 pub struct Acceptor {
@@ -51,14 +53,6 @@ impl TlsSettings {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
-        let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
-        else {
-            panic!(
-                "Failed to load provided certificates \"{}\" or key \"{}\".",
-                self.cert_path, self.key_path
-            )
-        };
-
         let builder =
             ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13]);
         let builder = if let Some(verifier) = self.client_cert_verifier {
@@ -66,12 +60,24 @@ impl TlsSettings {
         } else {
             builder.with_no_client_auth()
         };
-        let mut config = builder
-            .with_single_cert(certs, key)
-            .explain_err(InternalError, |e| {
-                format!("Failed to create server listener config: {e}")
-            })
-            .unwrap();
+        let mut config = if let Some(cert_resolver) = self.cert_resolver {
+            builder.with_cert_resolver(cert_resolver)
+        } else {
+            let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
+            else {
+                panic!(
+                    "Failed to load provided certificates \"{}\" or key \"{}\".",
+                    self.cert_path, self.key_path
+                )
+            };
+
+            builder
+                .with_single_cert(certs, key)
+                .explain_err(InternalError, |e| {
+                    format!("Failed to create server listener config: {e}")
+                })
+                .unwrap()
+        };
 
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
@@ -107,6 +113,24 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            cert_resolver: None,
+        })
+    }
+
+    /// Create a Rustls acceptor with a custom server certificate resolver.
+    ///
+    /// This allows applications to select the downstream certificate during the
+    /// TLS handshake, for example based on SNI.
+    pub fn with_cert_resolver(cert_resolver: Arc<dyn ResolvesServerCert>) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(TlsSettings {
+            alpn_protocols: None,
+            cert_path: String::new(),
+            key_path: String::new(),
+            client_cert_verifier: None,
+            cert_resolver: Some(cert_resolver),
         })
     }
 
@@ -131,5 +155,31 @@ impl Acceptor {
         } else {
             handshake(self, stream).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct EmptyCertResolver;
+
+    impl ResolvesServerCert for EmptyCertResolver {
+        fn resolve(
+            &self,
+            _client_hello: pingora_rustls::ClientHello<'_>,
+        ) -> Option<Arc<pingora_rustls::CertifiedKey>> {
+            None
+        }
+    }
+
+    #[test]
+    fn cert_resolver_settings_build_without_cert_paths() {
+        let mut settings = TlsSettings::with_cert_resolver(Arc::new(EmptyCertResolver)).unwrap();
+        settings.enable_h2();
+
+        let _acceptor = settings.build();
     }
 }
