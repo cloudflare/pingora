@@ -135,6 +135,13 @@ This is also not a phase, but another callback.
 
 `fail_to_proxy()` errors are automatically logged in the error log, but users may not be interested in every error. For example, downstream errors are logged if the client disconnects early, but these errors can become noisy if users are mainly interested in observing upstream issues. This callback can inspect the error and returns true or false. If true, the error will not be written to the log.
 
+### `suppress_proxy_warn_log()`
+This is also not a phase, but another callback.
+
+This experimental callback can suppress proxy warning logs that do not reach `fail_to_proxy()`, such as retryable proxy upstream failures and downstream errors ignored while cache fill continues. The callback receives a `ProxyWarnLogContext` so users can distinguish these warning contexts. Final proxy errors are still handled by `suppress_error_log()`.
+
+This API may change or be removed until indicated otherwise. Suppressing retry warning logs can remove the only per-retry audit record, so users should provide alternative observability, such as metrics or logs from this hook.
+
 ### Cache filters
 
 To be documented

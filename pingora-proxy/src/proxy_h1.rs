@@ -467,11 +467,18 @@ where
                             if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
-                                warn!(
-                                    "Downstream Error ignored during caching: {}, {}",
-                                    e,
-                                    self.inner.request_summary(session, ctx)
-                                );
+                                if !self.inner.suppress_proxy_warn_log(
+                                    session,
+                                    ctx,
+                                    &e,
+                                    ProxyWarnLogContext::DownstreamCache,
+                                ) {
+                                    warn!(
+                                        "Downstream Error ignored during caching: {}, {}",
+                                        e,
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                }
                                 // This will not be treated as a final error, but we should signal to
                                 // downstream session regardless
                                 session.downstream_session.on_proxy_failure(e);
@@ -588,11 +595,18 @@ where
                                 // give up writing to downstream but wait for upstream cache write to finish
                                 downstream_state.to_errored();
                                 response_state.maybe_set_cache_done(true);
-                                warn!(
-                                    "Downstream Error ignored during caching: {}, {}",
-                                    e,
-                                    self.inner.request_summary(session, ctx)
-                                );
+                                if !self.inner.suppress_proxy_warn_log(
+                                    session,
+                                    ctx,
+                                    &e,
+                                    ProxyWarnLogContext::DownstreamCache,
+                                ) {
+                                    warn!(
+                                        "Downstream Error ignored during caching: {}, {}",
+                                        e,
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                }
                                 // This will not be treated as a final error, but we should signal to
                                 // downstream session regardless
                                 session.downstream_session.on_proxy_failure(e);
@@ -639,11 +653,18 @@ where
                                     // give up writing to downstream but wait for upstream cache write to finish
                                     downstream_state.to_errored();
                                     response_state.maybe_set_cache_done(true);
-                                    warn!(
-                                        "Downstream write error ignored during caching: {}, {}",
-                                        e,
-                                        self.inner.request_summary(session, ctx)
-                                    );
+                                    if !self.inner.suppress_proxy_warn_log(
+                                        session,
+                                        ctx,
+                                        &e,
+                                        ProxyWarnLogContext::DownstreamCache,
+                                    ) {
+                                        warn!(
+                                            "Downstream write error ignored during caching: {}, {}",
+                                            e,
+                                            self.inner.request_summary(session, ctx)
+                                        );
+                                    }
                                     // This will not be treated as a final error, but we should signal to
                                     // downstream session regardless
                                     session.downstream_session.on_proxy_failure(e);

@@ -91,10 +91,10 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp};
+pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
+    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -1005,18 +1005,27 @@ where
             match e {
                 Some(error) => {
                     let retry = error.retry();
+                    // only log error that will be retried here, the final error will be logged below
+                    if retry
+                        && !self.inner.suppress_proxy_warn_log(
+                            &session,
+                            &ctx,
+                            &error,
+                            ProxyWarnLogContext::UpstreamRetry,
+                        )
+                    {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            error,
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                     proxy_error = Some(error);
                     if !retry {
                         break;
                     }
-                    // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
-                        proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
                 }
                 None => {
                     proxy_error = None;
@@ -1060,7 +1069,7 @@ where
             if !self.inner.suppress_error_log(&session, &ctx, e) {
                 error!(
                     "Fail to proxy: {}, status: {}, tries: {}, retry: {}, {}",
-                    final_error.as_ref().unwrap(),
+                    e,
                     res.error_code,
                     retries,
                     false, // we never retry here

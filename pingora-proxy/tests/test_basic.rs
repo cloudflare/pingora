@@ -25,7 +25,9 @@ use reqwest::{header, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use utils::server_utils::init;
+use utils::server_utils::{
+    init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+};
 
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
@@ -384,15 +386,18 @@ async fn test_dropped_conn_get() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    reset_suppress_proxy_warn_log_calls();
     let res = client
         .get("http://127.0.0.1:6147/bad_lb")
         .header("x-port", port)
+        .header("x-test-suppress-proxy-warn-log", "true")
         .send()
         .await
         .unwrap();
 
     // retry gives 200
     assert_eq!(res.status(), StatusCode::OK);
+    assert!(suppress_proxy_warn_log_calls() > 0);
     let body = res.text().await.unwrap();
     assert_eq!(body, "dog!\n");
 }
