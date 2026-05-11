@@ -18,7 +18,7 @@ use bytes::Bytes;
 use h2::client;
 use http::header::HeaderValue;
 use http::Request;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
@@ -179,6 +179,38 @@ async fn test_h2c_to_h2c() {
 
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
+#[ignore = "requires slow-path validation of >BODY_BUF_LIMIT pre-consumed H2 body replay"]
+async fn test_h2c_preconsumed_body_replayed_on_terminal_callback() {
+    init();
+
+    let client = Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build_http();
+
+    // Intentionally larger than BODY_BUF_LIMIT so the test proves this
+    // path does not depend on retry-buffer replay.
+    let payload = Bytes::from(vec![b'a'; 128 * 1024 + 17]);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("http://127.0.0.1:6146/echo")
+        .body(Full::new(payload.clone()))
+        .unwrap();
+    req.headers_mut()
+        .insert("x-h2", HeaderValue::from_bytes(b"true").unwrap());
+    req.headers_mut().insert(
+        "x-pre-consume-body",
+        HeaderValue::from_bytes(b"true").unwrap(),
+    );
+
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.version(), http::Version::HTTP_2);
+
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, payload);
 }
 
 #[tokio::test]

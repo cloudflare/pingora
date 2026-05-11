@@ -380,9 +380,18 @@ where
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         let buffer = session.as_ref().get_retry_buffer();
+        let body_empty = session.as_mut().is_body_empty();
 
-        // retry, send buffer if it exists or body empty
-        if buffer.is_some() || session.as_mut().is_body_empty() {
+        // Enter the initial body-send path when:
+        // - a retry buffer exists (normal retry replay), or
+        // - the body is empty (send END_STREAM / empty DATA), or
+        // - the downstream body was already consumed before forwarding
+        //   (e.g. a ProxyHttp implementation that pre-reads the body for
+        //   inspection). In that case request_body_filter() needs one
+        //   terminal callback so the implementation can emit its
+        //   buffered body to upstream.
+        let body_already_consumed = downstream_state.is_done() && !body_empty;
+        if buffer.is_some() || body_empty || body_already_consumed {
             let send_permit = tx
                 .reserve()
                 .await

@@ -15,6 +15,7 @@
 #[cfg(feature = "any_tls")]
 use super::cert;
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
@@ -60,6 +61,7 @@ pub struct CTX {
     conn_reused: bool,
     upstream_client_addr: Option<SocketAddr>,
     upstream_server_addr: Option<SocketAddr>,
+    pre_consumed_body: Option<Bytes>,
 }
 
 // Common logic for both ProxyHttp(s) types
@@ -279,8 +281,9 @@ impl ProxyHttp for ExampleProxyHttp {
         Ok(())
     }
 
-    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
+        let pre_consume_body = req.headers.get("x-pre-consume-body").is_some();
 
         let write_timeout = req
             .headers
@@ -315,7 +318,34 @@ impl ProxyHttp for ExampleProxyHttp {
             close_on_response_before_downstream_finish,
         );
 
+        if pre_consume_body {
+            let mut body = BytesMut::new();
+            while let Some(chunk) = session.downstream_session.read_request_body().await? {
+                body.extend_from_slice(&chunk);
+            }
+            ctx.pre_consumed_body = Some(body.freeze());
+        }
+
         Ok(false)
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if end_of_stream && body.is_none() {
+            if let Some(pre_consumed_body) = ctx.pre_consumed_body.take() {
+                *body = Some(pre_consumed_body);
+            }
+        }
+
+        Ok(())
     }
 
     async fn response_filter(
