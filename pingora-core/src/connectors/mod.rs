@@ -39,8 +39,32 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tls::TlsConnector;
 use tokio::sync::Mutex;
+
+#[derive(Clone, Debug)]
+pub(crate) struct IdleConnection {
+    connection: ConnectionMeta,
+    idle_since: Instant,
+}
+
+impl IdleConnection {
+    pub(crate) fn new(connection: ConnectionMeta) -> Self {
+        Self {
+            connection,
+            idle_since: Instant::now(),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.idle_since.elapsed()
+    }
+}
+
+/// Callback invoked when an idle upstream connection leaves the keep-alive pool
+/// without being reused.
+pub type PoolCallback = Arc<dyn Fn(Duration) + Send + Sync>;
 
 /// The options to configure a [TransportConnector]
 #[derive(Clone)]
@@ -80,6 +104,9 @@ pub struct ConnectorOptions {
     pub bind_to_v4: Vec<SocketAddr>,
     /// Bind to any of the given source IPv4 addresses
     pub bind_to_v6: Vec<SocketAddr>,
+    /// Optional callback for observing how long upstream connections stayed idle
+    /// before leaving the keep-alive pool without reuse.
+    pub keepalive_pool_callback: Option<PoolCallback>,
 }
 
 impl ConnectorOptions {
@@ -120,6 +147,7 @@ impl ConnectorOptions {
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
+            keepalive_pool_callback: None,
         }
     }
 
@@ -135,6 +163,7 @@ impl ConnectorOptions {
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
+            keepalive_pool_callback: None,
         }
     }
 }
@@ -150,6 +179,7 @@ pub struct TransportConnector {
     /// Wrapped in `Arc` so external consumers (e.g. proxy services) can clone a reference
     /// for periodic metric reporting without needing access to the connector itself.
     unexpected_data_conn_count: Arc<AtomicU64>,
+    keepalive_pool_callback: Option<PoolCallback>,
 }
 
 const DEFAULT_POOL_SIZE: usize = 128;
@@ -169,6 +199,9 @@ impl TransportConnector {
         let bind_to_v6 = options
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
+        let keepalive_pool_callback = options
+            .as_ref()
+            .and_then(|o| o.keepalive_pool_callback.clone());
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
@@ -177,6 +210,7 @@ impl TransportConnector {
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),
             unexpected_data_conn_count: Arc::new(AtomicU64::new(0)),
+            keepalive_pool_callback,
         }
     }
 
@@ -269,7 +303,7 @@ impl TransportConnector {
         &self,
         mut stream: Stream,
         key: u64, // usually peer.reuse_hash()
-        idle_timeout: Option<std::time::Duration>,
+        idle_timeout: Option<Duration>,
     ) {
         if !test_reusable_stream(&mut stream, &self.unexpected_data_conn_count) {
             return;
@@ -280,11 +314,25 @@ impl TransportConnector {
         let stream = Arc::new(Mutex::new(stream));
         let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
         let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
+        let idle_meta = IdleConnection::new(meta);
         let pool = self.connection_pool.clone(); //clone the arc
+        let keepalive_pool_callback = self.keepalive_pool_callback.clone();
         let rt = pingora_runtime::current_handle();
         rt.spawn(async move {
-            pool.idle_poll(locked_stream, &meta, idle_timeout, notify_close, watch_use)
-                .await;
+            if pool
+                .idle_poll(
+                    locked_stream,
+                    &idle_meta.connection,
+                    idle_timeout,
+                    notify_close,
+                    watch_use,
+                )
+                .await
+            {
+                if let Some(callback) = keepalive_pool_callback {
+                    callback(idle_meta.elapsed());
+                }
+            }
         });
     }
 

@@ -173,13 +173,15 @@ where
         connector: C,
         on_custom: Option<ProcessCustomSession<SV, C>>,
         server_options: Option<HttpServerOptions>,
+        client_options: Option<ConnectorOptions>,
     ) -> Self
     where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
-        let client_upstream =
-            Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
+        let client_options =
+            client_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
+        let client_upstream = Connector::new_custom(Some(client_options), connector);
 
         HttpProxy {
             inner,
@@ -1427,7 +1429,8 @@ where
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
-    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None);
+    let mut proxy =
+        HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
     Service::new(name.to_string(), proxy)
@@ -1450,6 +1453,7 @@ where
     connector: C,
     custom: Option<ProcessCustomSession<SV, C>>,
     server_options: Option<HttpServerOptions>,
+    client_options: Option<ConnectorOptions>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, ()>
@@ -1474,6 +1478,7 @@ where
             connector: (),
             custom: None,
             server_options: None,
+            client_options: None,
         }
     }
 }
@@ -1508,6 +1513,7 @@ where
             inner,
             name,
             server_options,
+            client_options,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1517,7 +1523,16 @@ where
             connector,
             custom: Some(on_custom),
             server_options,
+            client_options,
         }
+    }
+
+    /// Set the upstream client connector options for the [ProxyServiceBuilder].
+    ///
+    /// Returns a new [ProxyServiceBuilder] with the upstream client connector options set.
+    pub fn client_options(mut self, options: ConnectorOptions) -> Self {
+        self.client_options = Some(options);
+        self
     }
 
     /// Set the server options for the [ProxyServiceBuilder].
@@ -1542,9 +1557,17 @@ where
             connector,
             custom,
             server_options,
+            client_options,
         } = self;
 
-        let mut proxy = HttpProxy::new_custom(inner, conf, connector, custom, server_options);
+        let mut proxy = HttpProxy::new_custom(
+            inner,
+            conf,
+            connector,
+            custom,
+            server_options,
+            client_options,
+        );
 
         proxy.handle_init_modules();
         Service::new(name, proxy)
