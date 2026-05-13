@@ -448,7 +448,7 @@ where
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
@@ -923,7 +923,7 @@ where
                         .await
                         .ok()
                         .flatten()
-                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
+                        .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings));
                 }
                 /* else continue */
             }
@@ -1121,7 +1121,7 @@ where
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
