@@ -1,0 +1,23 @@
+pingora-cache/src/eviction/lru.rs
+  36f5f49c1efeb656 739-741
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "d71928e7e98fa07d16ef450280c71f49ed57f84c",
+  "prompts": {
+    "36f5f49c1efeb656": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1ddfb11ccffemOyg14a85azdmd",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "ewang",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 5,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}
