@@ -25,7 +25,7 @@ use std::future::poll_fn;
 use std::sync::Arc;
 
 use crate::protocols::http::v2::server;
-use crate::protocols::http::{ReusedHttpConnection, ServerSession};
+use crate::protocols::http::{ReusableHttpStream, ServerSession};
 use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
@@ -190,11 +190,11 @@ impl ReusedHttpStream {
 
     /// Build a reusable HTTP stream from a finished session, preserving any
     /// pipelined prefix bytes in the persistent settings for the next request.
-    pub fn from_reused_connection(
-        reused: ReusedHttpConnection,
+    pub fn from_reusable_stream(
+        reusable: ReusableHttpStream,
         mut persistent_settings: HttpPersistentSettings,
     ) -> Self {
-        let (stream, pipelined_prefix) = reused.into_parts();
+        let (stream, pipelined_prefix) = reusable.into_parts();
         if let Some(prefix) = pipelined_prefix {
             persistent_settings.set_pipelined_prefix(prefix);
         }
@@ -211,7 +211,7 @@ impl ReusedHttpStream {
 pub trait HttpServerApp {
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
-    /// After successful processing, [`ServerSession::finish_reuse()`] can be
+    /// After successful processing, [`ServerSession::finish()`] can be
     /// called to return an optionally reusable connection back to the service.
     /// The caller needs to make sure that the connection is in a reusable state
     /// i.e., no error or incomplete read or write headers or bodies. Otherwise

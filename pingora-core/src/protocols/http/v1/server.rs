@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusedHttpConnection};
+use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusableHttpStream};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -150,7 +150,7 @@ pub struct HttpSession {
     /// reader's overread surface. Further idle polls on the same request
     /// return pending instead of re-reading the stream, so the body-pump
     /// `tokio::select!` loop can exit via its other branches while the
-    /// stashed bytes travel through `reuse_pipelined()` +
+    /// stashed bytes travel through `reuse()` +
     /// [`super::super::HttpPersistentSettings`] into the next session.
     /// Scoped narrowly so it cannot affect FIN / `abort_on_close` semantics.
     pipelined_idle_bytes_stashed: bool,
@@ -290,9 +290,7 @@ impl HttpSession {
             .take()
             .filter(|prefix| !prefix.is_empty())
         {
-            if buf.capacity() < prefix.len() {
-                buf.reserve(prefix.len() - buf.capacity());
-            }
+            buf.reserve(prefix.len());
             buf.extend_from_slice(&prefix);
             already_read = prefix.len();
             skip_next_read = true;
@@ -1230,7 +1228,7 @@ impl HttpSession {
                 // §9.3.2). Stash them on the body reader's overread
                 // surface so the existing `take_body_overread` +
                 // `HttpPersistentSettings` extraction path picks them
-                // up at `reuse_pipelined()` time and feeds them to the next
+                // up at `reuse()` time and feeds them to the next
                 // session via `set_pipelined_prefix`.
                 //
                 // Returning pending (rather than `Ok(None)` or an
@@ -1238,11 +1236,11 @@ impl HttpSession {
                 // that the downstream has no more body work to do on
                 // this request — the loop exits naturally via the
                 // upstream-response-done / response-write-done
-                // branches, and `finish_reuse()` runs its standard
-                // pipelining extraction. Crucially, we do NOT touch
-                // `half_closed` or `abort_on_close`; those control TCP FIN
-                // handling and must still abort immediately when the client
-                // disconnects.
+                // branches, and `finish()` runs its standard pipelining
+                // extraction. The read == 0 FIN path above is unchanged; this
+                // branch only handles a non-zero idle read that belongs to the
+                // next pipelined request, so it leaves `half_closed` and
+                // `abort_on_close` untouched.
                 // Keep the stash and flag update adjacent and synchronous.
                 // Once the prefix byte is handed to the overread path, the
                 // flag prevents later idle polls for this request from
@@ -1399,22 +1397,6 @@ impl HttpSession {
             .map(|d| d.local_addr())?
     }
 
-    /// Consume `self` and return the underlying stream if the connection can be reused.
-    ///
-    /// This is the compatibility path: it preserves the pre-pipelining
-    /// stream-only signature and discards any captured pipelined prefix bytes.
-    /// Callers that enable HTTP/1.1 pipelining with
-    /// [`Self::set_pipelining_enabled`] should use [`Self::reuse_pipelined`]
-    /// instead so the prefix is carried to the next request on the connection.
-    pub async fn reuse(self) -> Result<Option<Stream>> {
-        self.reuse_pipelined().await.map(|opt| {
-            opt.map(|reused| {
-                let (stream, _pipelined_prefix) = reused.into_parts();
-                stream
-            })
-        })
-    }
-
     /// Consume `self`, if the connection can be reused, the underlying stream and any pipelined
     /// prefix bytes will be returned to be fed to the next [`Self::new()`]. This drains any
     /// remaining request body if it hasn't yet been read and the stream is reusable.
@@ -1424,7 +1406,7 @@ impl HttpSession {
     /// If the connection cannot be reused, the underlying stream will be closed and `None` will be
     /// returned. If there was an error while draining any remaining request body that error will
     /// be returned.
-    pub async fn reuse_pipelined(mut self) -> Result<Option<ReusedHttpConnection>> {
+    pub async fn reuse(mut self) -> Result<Option<ReusableHttpStream>> {
         if !self.will_keepalive() {
             debug!("HTTP shutdown connection");
             self.shutdown().await;
@@ -1440,7 +1422,7 @@ impl HttpSession {
                     .then(|| self.take_body_overread())
                     .flatten()
                     .filter(|prefix| !prefix.is_empty());
-                Ok(Some(ReusedHttpConnection::new(
+                Ok(Some(ReusableHttpStream::new(
                     self.underlying_stream,
                     pipelined_prefix,
                 )))
@@ -4013,11 +3995,7 @@ mod test_pipelining {
         let _ = s.read_body_bytes().await.unwrap();
         assert!(s.body_reader.has_bytes_overread());
 
-        let reused = s
-            .reuse_pipelined()
-            .await
-            .unwrap()
-            .expect("connection reusable");
+        let reused = s.reuse().await.unwrap().expect("connection reusable");
         let (_stream, prefix) = reused.into_parts();
         let prefix = prefix.expect("overread must be returned as pipelined prefix");
         assert_eq!(prefix.as_ref(), b"pipelined_next");
@@ -4039,11 +4017,7 @@ mod test_pipelining {
         a.read_request().await.unwrap();
         assert_eq!(a.req_header().uri.path(), "/one");
 
-        let reused = a
-            .reuse_pipelined()
-            .await
-            .unwrap()
-            .expect("connection reusable");
+        let reused = a.reuse().await.unwrap().expect("connection reusable");
         let (stream, prefix) = reused.into_parts();
         let prefix = prefix.expect("pipelined prefix must be extracted during reuse");
         assert_eq!(prefix.as_ref(), req2);
@@ -4074,11 +4048,7 @@ mod test_pipelining {
         a.read_request().await.unwrap();
         assert_eq!(a.req_header().uri.path(), "/one");
 
-        let reused = a
-            .reuse_pipelined()
-            .await
-            .unwrap()
-            .expect("connection reusable");
+        let reused = a.reuse().await.unwrap().expect("connection reusable");
         let (_stream, prefix) = reused.into_parts();
         let prefix = prefix.expect("pipelined prefix must be extracted during reuse");
         assert_eq!(prefix.as_ref(), req2);
@@ -4139,13 +4109,13 @@ mod test_pipelining {
     ///
     /// This covers the two-segment pipelining case: request 2's bytes
     /// arrive during the proxy's idle poll, not during request 1's body
-    /// read. The reuse_pipelined() overread path (already covered by the tests
+    /// read. The reuse() overread path (already covered by the tests
     /// above) never fires because request 2's bytes were never in
     /// `body_buf_overread` to begin with.
     ///
     /// When pipelining is enabled on the session, this branch must
     /// NOT raise `ConnectError`. Instead, the byte(s) read by
-    /// `idle()` must be stashed so the reuse_pipelined() path can hand them
+    /// `idle()` must be stashed so the reuse() path can hand them
     /// to the next session via the standard `take_body_overread`
     /// extractor. `idle()` uses a 1-byte probe buffer, so the
     /// overread surface will typically hold 1 byte per idle poll —
@@ -4236,7 +4206,7 @@ mod test_pipelining {
         }
 
         // The byte must be extractable as overread, so the
-        // standard reuse_pipelined() + HttpPersistentSettings pipeline can
+        // standard reuse() + HttpPersistentSettings pipeline can
         // hand it to the next session.
         let overread = s
             .take_body_overread()

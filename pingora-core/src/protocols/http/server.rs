@@ -30,14 +30,14 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::time::Duration;
 
-/// A reusable HTTP/1.x connection and bytes already read for the next request.
+/// A reusable HTTP/1.x stream and bytes already read for the next request.
 #[derive(Debug)]
-pub struct ReusedHttpConnection {
+pub struct ReusableHttpStream {
     stream: Stream,
     pipelined_prefix: Option<BytesMut>,
 }
 
-impl ReusedHttpConnection {
+impl ReusableHttpStream {
     pub(crate) fn new(stream: Stream, pipelined_prefix: Option<BytesMut>) -> Self {
         Self {
             stream,
@@ -251,33 +251,16 @@ impl Session {
 
     /// Finish the life of this request and return a reusable stream, if any.
     ///
-    /// This is the compatibility path: it preserves the pre-pipelining
-    /// stream-only signature and discards any captured pipelined prefix bytes.
-    /// Callers that enable HTTP/1.1 pipelining with
-    /// [`Self::set_pipelining_enabled`] should use [`Self::finish_reuse`]
-    /// instead so the prefix is carried to the next request on the connection.
-    pub async fn finish(self) -> Result<Option<Stream>> {
-        self.finish_reuse().await.map(|opt| {
-            opt.map(|reused| {
-                let (stream, _pipelined_prefix) = reused.into_parts();
-                stream
-            })
-        })
-    }
-
-    /// Finish the life of this request and return pipelining-aware reuse
-    /// metadata, if the connection can be reused.
-    ///
-    /// For H1, if connection reuse is supported, a reusable connection will be returned,
+    /// For H1, if connection reuse is supported, a reusable stream will be returned,
     /// otherwise None.
     /// For H2, always return None because H2 stream is not reusable.
     /// For subrequests, there is no true underlying stream to return.
-    pub async fn finish_reuse(self) -> Result<Option<ReusedHttpConnection>> {
+    pub async fn finish(self) -> Result<Option<ReusableHttpStream>> {
         match self {
             Self::H1(mut s) => {
                 // need to flush body due to buffering
                 s.finish_body().await?;
-                s.reuse_pipelined().await
+                s.reuse().await
             }
             Self::H2(mut s) => {
                 s.finish()?;
