@@ -339,7 +339,7 @@ impl<S> ConnectionPool<S> {
     ///
     /// If the connection is reused via [Self::get()] or being evicted, this function will just exit.
     ///
-    /// Returns `true` if the connection was removed from the pool, and `false` if it was reused.
+    /// Returns `true` if the connection was evicted from the pool, and `false` otherwise.
     pub async fn idle_poll<Stream>(
         &self,
         connection: OwnedMutexGuard<Stream>,
@@ -380,7 +380,7 @@ impl<S> ConnectionPool<S> {
         };
         // connection terminated from either peer or timer
         self.pop_closed(meta);
-        true
+        false
     }
 
     /// Passively wait to close the connection after the timeout
@@ -388,7 +388,7 @@ impl<S> ConnectionPool<S> {
     /// If this connection is not being picked up or evicted before the timeout is reach, this
     /// function will remove it from the pool and close the connection.
     ///
-    /// Returns `true` if the connection was removed from the pool, and `false` if it was reused.
+    /// Returns `true` if the connection was evicted from the pool, and `false` otherwise.
     pub async fn idle_timeout(
         &self,
         meta: &ConnectionMeta,
@@ -401,24 +401,26 @@ impl<S> ConnectionPool<S> {
             biased;
             _ = watch_use => {
                 debug!("idle connection is being picked up");
-                return false
+                false
             },
             _ = notify_evicted.notified() => {
                 debug!("idle connection is being evicted");
                 // TODO: gracefully close the connection?
+                true
             }
             _ = notify_closed.changed() => {
                 // assume always changed from false to true
                 debug!("idle connection is being closed");
                 self.pop_closed(meta);
+                false
             }
             // async expression is evaluated if timeout is None but it's never polled, set it to MAX
             _ = sleep(timeout.unwrap_or(Duration::MAX)), if timeout.is_some() => {
                 debug!("idle connection is being evicted");
                 self.pop_closed(meta);
+                false
             }
         }
-        true
     }
 }
 
@@ -621,7 +623,7 @@ mod tests {
         let (notify_evicted, watch_use) = cp.put(&meta1, mock_io1.clone());
         notify_evicted.notify_one();
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io1.try_lock_owned().unwrap(),
                 &meta1,
@@ -631,11 +633,11 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "notify_evicted should report removal");
+        assert!(evicted, "notify_evicted should report eviction");
     }
 
     #[tokio::test]
-    async fn test_idle_poll_reports_reuse_not_removed() {
+    async fn test_idle_poll_reports_reuse_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(
             Builder::new().wait(Duration::from_secs(99)).build(),
@@ -645,7 +647,7 @@ mod tests {
         let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
         assert!(cp.get(&meta.key).is_some());
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io.try_lock_owned().unwrap(),
                 &meta,
@@ -655,18 +657,18 @@ mod tests {
             )
             .await;
 
-        assert!(!removed, "reused connection should not report removal");
+        assert!(!evicted, "reused connection should not report eviction");
     }
 
     #[tokio::test]
-    async fn test_idle_poll_reports_peer_close_removed() {
+    async fn test_idle_poll_reports_peer_close_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(Builder::new().read(b"").build()));
         let cp: ConnectionPool<Arc<AsyncMutex<Mock>>> = ConnectionPool::new(1);
 
         let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io.try_lock_owned().unwrap(),
                 &meta,
@@ -676,19 +678,19 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "peer close should report removal");
+        assert!(!evicted, "peer close should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
     #[tokio::test]
-    async fn test_idle_poll_reports_unexpected_data_removed() {
+    async fn test_idle_poll_reports_unexpected_data_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(Builder::new().read(b"x").build()));
         let cp: ConnectionPool<Arc<AsyncMutex<Mock>>> = ConnectionPool::new(1);
 
         let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io.try_lock_owned().unwrap(),
                 &meta,
@@ -698,12 +700,12 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "unexpected data should report removal");
+        assert!(!evicted, "unexpected data should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
     #[tokio::test]
-    async fn test_idle_poll_reports_read_error_removed() {
+    async fn test_idle_poll_reports_read_error_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(
             Builder::new()
@@ -714,7 +716,7 @@ mod tests {
 
         let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io.try_lock_owned().unwrap(),
                 &meta,
@@ -724,12 +726,12 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "read error should report removal");
+        assert!(!evicted, "read error should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
     #[tokio::test]
-    async fn test_idle_poll_reports_timeout_removed() {
+    async fn test_idle_poll_reports_timeout_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(
             Builder::new().wait(Duration::from_secs(99)).build(),
@@ -738,7 +740,7 @@ mod tests {
 
         let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
 
-        let removed = cp
+        let evicted = cp
             .idle_poll(
                 mock_io.try_lock_owned().unwrap(),
                 &meta,
@@ -748,18 +750,18 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "idle poll timeout should report removal");
+        assert!(!evicted, "idle poll timeout should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
     #[tokio::test]
-    async fn test_idle_timeout_reports_timeout_eviction() {
+    async fn test_idle_timeout_reports_timeout_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let cp: ConnectionPool<String> = ConnectionPool::new(1);
         let (notify_evicted, watch_use) = cp.put(&meta, "v1".to_string());
         let (_notify_closed, notify_closed_rx) = watch::channel(false);
 
-        let removed = cp
+        let evicted = cp
             .idle_timeout(
                 &meta,
                 Some(Duration::from_millis(10)),
@@ -769,12 +771,12 @@ mod tests {
             )
             .await;
 
-        assert!(removed, "idle timeout should report removal");
+        assert!(!evicted, "idle timeout should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
     #[tokio::test]
-    async fn test_idle_timeout_reports_reuse_not_removed() {
+    async fn test_idle_timeout_reports_reuse_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let cp: ConnectionPool<String> = ConnectionPool::new(1);
         let (notify_evicted, watch_use) = cp.put(&meta, "v1".to_string());
@@ -782,11 +784,11 @@ mod tests {
 
         assert_eq!(cp.get(&meta.key), Some("v1".to_string()));
 
-        let removed = cp
+        let evicted = cp
             .idle_timeout(&meta, None, notify_evicted, notify_closed_rx, watch_use)
             .await;
 
-        assert!(!removed, "reused connection should not report removal");
+        assert!(!evicted, "reused connection should not report eviction");
     }
 
     #[tokio::test]
@@ -798,15 +800,15 @@ mod tests {
 
         notify_evicted.notify_one();
 
-        let removed = cp
+        let evicted = cp
             .idle_timeout(&meta, None, notify_evicted, notify_closed_rx, watch_use)
             .await;
 
-        assert!(removed, "notify_evicted should report removal");
+        assert!(evicted, "notify_evicted should report eviction");
     }
 
     #[tokio::test]
-    async fn test_idle_timeout_reports_notify_closed() {
+    async fn test_idle_timeout_reports_notify_closed_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let cp: ConnectionPool<String> = ConnectionPool::new(1);
         let (notify_evicted, watch_use) = cp.put(&meta, "v1".to_string());
@@ -814,11 +816,11 @@ mod tests {
 
         notify_closed.send(true).unwrap();
 
-        let removed = cp
+        let evicted = cp
             .idle_timeout(&meta, None, notify_evicted, notify_closed_rx, watch_use)
             .await;
 
-        assert!(removed, "notify_closed should report removal");
+        assert!(!evicted, "notify_closed should not report eviction");
         assert!(cp.get(&meta.key).is_none());
     }
 
