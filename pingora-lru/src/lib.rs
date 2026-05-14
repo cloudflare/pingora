@@ -36,7 +36,7 @@ pub struct Lru<T, const N: usize> {
     /// Maintained alongside [`Lru::len`] at every count-mutating site.
     shard_lens: [AtomicUsize; N],
     weight: AtomicUsize,
-    weight_limit: usize,
+    weight_limit: AtomicUsize,
     len_watermark: Option<usize>,
     len: AtomicUsize,
     evicted_weight: AtomicUsize,
@@ -75,12 +75,22 @@ impl<T, const N: usize> Lru<T, N> {
                 .into_inner()
                 .expect("shard_lens ArrayVec filled with exactly N elements"),
             weight: AtomicUsize::new(0),
-            weight_limit,
+            weight_limit: AtomicUsize::new(weight_limit),
             len_watermark,
             len: AtomicUsize::new(0),
             evicted_weight: AtomicUsize::new(0),
             evicted_len: AtomicUsize::new(0),
         }
+    }
+
+    /// Return the current total weight limit.
+    pub fn weight_limit(&self) -> usize {
+        self.weight_limit.load(Ordering::Relaxed)
+    }
+
+    /// Set the total weight limit used by [`Self::evict_to_limit`].
+    pub fn set_weight_limit(&self, weight_limit: usize) {
+        self.weight_limit.store(weight_limit, Ordering::Relaxed);
     }
 
     /// Increment item-count bookkeeping for `shard`. Both atomics use
@@ -240,7 +250,8 @@ impl<T, const N: usize> Lru<T, N> {
         // Transient over-limit weight can persist until the next
         // admit/increment_weight call, which is acceptable because the
         // next admission will re-trigger eviction.
-        while (initial_weight > self.weight_limit && self.weight() > self.weight_limit)
+        let weight_limit = self.weight_limit();
+        while (initial_weight > weight_limit && self.weight() > weight_limit)
             || self
                 .len_watermark
                 .is_some_and(|w| initial_len > w && self.len() > w)
@@ -918,6 +929,25 @@ mod test_lru {
         let evicted = lru.evict_to_limit();
         assert_eq!(lru.weight(), 2);
         assert_eq!(evicted.len(), 3);
+    }
+
+    #[test]
+    fn test_set_weight_limit_affects_eviction() {
+        let lru = Lru::<u64, 1>::with_capacity(10, 16);
+        for k in 0..5u64 {
+            lru.admit(k, k, 2);
+        }
+        assert_eq!(lru.weight(), 10);
+        assert_eq!(lru.weight_limit(), 10);
+
+        lru.set_weight_limit(4);
+        assert_eq!(lru.weight_limit(), 4);
+        let evicted = lru.evict_to_limit();
+        assert_eq!(lru.weight(), 4);
+        assert_eq!(evicted.len(), 3);
+
+        lru.set_weight_limit(20);
+        assert_eq!(lru.evict_to_limit().len(), 0);
     }
 
     #[test]

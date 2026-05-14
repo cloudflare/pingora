@@ -62,6 +62,16 @@ impl<const N: usize> Manager<N> {
         Manager(Lru::with_capacity_and_watermark(limit, capacity, watermark))
     }
 
+    /// Return the current total cache weight limit.
+    pub fn weight_limit(&self) -> usize {
+        self.0.weight_limit()
+    }
+
+    /// Set the total cache weight limit used by future eviction decisions.
+    pub fn set_weight_limit(&self, limit: usize) {
+        self.0.set_weight_limit(limit);
+    }
+
     /// Get the number of shards
     pub fn shards(&self) -> usize {
         self.0.shards()
@@ -488,6 +498,26 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_set_weight_limit() {
+        let lru = Manager::<1>::with_capacity(4, 10);
+        let until = SystemTime::now();
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key3 = CacheKey::new("", "c", "1").to_compact();
+        assert_eq!(lru.weight_limit(), 4);
+        assert!(lru.admit(key1.clone(), 1, until).is_empty());
+        assert!(lru.admit(key2.clone(), 1, until).is_empty());
+
+        lru.set_weight_limit(1);
+        assert_eq!(lru.weight_limit(), 1);
+        let evicted = lru.admit(key3, 1, until);
+        assert_eq!(evicted, vec![key1, key2]);
+
+        lru.set_weight_limit(10);
+        assert_eq!(lru.weight_limit(), 10);
     }
 
     #[test]
