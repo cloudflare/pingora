@@ -18,12 +18,13 @@ pub mod http_app;
 
 use crate::server::ShutdownWatch;
 use async_trait::async_trait;
+use bytes::BytesMut;
 use log::{debug, error};
 use std::any::Any;
 use std::sync::Arc;
 
 use crate::protocols::http::v2::server;
-use crate::protocols::http::ServerSession;
+use crate::protocols::http::{ReusableHttpStream, ServerSession};
 use crate::protocols::Digest;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
@@ -89,12 +90,26 @@ pub struct HttpServerOptions {
 /// user-defined context via [`set_user_context`](Self::set_user_context). The proxy layer
 /// populates this through `ProxyHttp::persist_connection_context`
 /// and delivers it to the next request through `ProxyHttp::on_connection_reuse`.
+///
+/// Also carries pipelined-prefix bytes when the caller has opted into HTTP/1.1
+/// pipelining on the previous session. See
+/// [`Self::set_pipelined_prefix`] and the
+/// [`HttpSession::set_pipelining_enabled`](crate::protocols::http::v1::server::HttpSession::set_pipelining_enabled)
+/// docs for the RFC 9112 §9.3.2 semantics.
 #[derive(Debug)]
 pub struct HttpPersistentSettings {
     keepalive_timeout: Option<u64>,
     keepalive_reuses_remaining: Option<u32>,
     /// User-defined context to carry to the next request on this connection.
     user_context: Option<Box<dyn Any + Send + Sync>>,
+    /// Bytes read past the end of the previous request's body, to be parsed
+    /// as the next pipelined request on the reused connection.
+    pipelined_prefix: Option<BytesMut>,
+    /// Whether HTTP/1.1 pipelining was enabled on the previous session;
+    /// propagates to the next session so the proxy-level opt-in sticks
+    /// across keepalive reuses without the adopter having to re-enable
+    /// it on every request.
+    pipelining_enabled: bool,
 }
 
 impl HttpPersistentSettings {
@@ -103,6 +118,8 @@ impl HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
             keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
             user_context: None,
+            pipelined_prefix: None,
+            pipelining_enabled: session.pipelining_enabled(),
         }
     }
 
@@ -116,11 +133,21 @@ impl HttpPersistentSettings {
         self.user_context.take()
     }
 
+    /// Set pipelined-prefix bytes to be fed to the next session on this
+    /// connection. Called by the proxy layer when HTTP/1.1 pipelining is
+    /// enabled on the current session and overread bytes were present at
+    /// reuse time.
+    pub fn set_pipelined_prefix(&mut self, prefix: BytesMut) {
+        self.pipelined_prefix = Some(prefix);
+    }
+
     pub fn apply_to_session(self, session: &mut ServerSession) {
         let Self {
             keepalive_timeout,
             mut keepalive_reuses_remaining,
             user_context,
+            pipelined_prefix,
+            pipelining_enabled,
         } = self;
 
         // Reduce the number of times the connection for this session can be
@@ -134,6 +161,15 @@ impl HttpPersistentSettings {
 
         // Carry user context into the session for the proxy layer to consume
         session.set_connection_user_context(user_context);
+
+        // Replay pipelining opt-in so it stays on across keepalive reuses.
+        session.set_pipelining_enabled(pipelining_enabled);
+
+        // Feed any pipelined prefix bytes to the new session's request parser
+        // so they are treated as the start of the next request.
+        if let Some(prefix) = pipelined_prefix {
+            session.set_pipelined_prefix(prefix);
+        }
     }
 }
 
@@ -151,6 +187,19 @@ impl ReusedHttpStream {
         }
     }
 
+    /// Build a reusable HTTP stream from a finished session, preserving any
+    /// pipelined prefix bytes in the persistent settings for the next request.
+    pub fn from_reusable_stream(
+        reusable: ReusableHttpStream,
+        mut persistent_settings: HttpPersistentSettings,
+    ) -> Self {
+        let (stream, pipelined_prefix) = reusable.into_parts();
+        if let Some(prefix) = pipelined_prefix {
+            persistent_settings.set_pipelined_prefix(prefix);
+        }
+        Self::new(stream, Some(persistent_settings))
+    }
+
     pub fn consume(self) -> (Stream, Option<HttpPersistentSettings>) {
         (self.stream, self.persistent_settings)
     }
@@ -161,9 +210,11 @@ impl ReusedHttpStream {
 pub trait HttpServerApp {
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
-    /// After successful processing, [`ServerSession::finish()`] can be called to return an optionally reusable
-    /// connection back to the service. The caller needs to make sure that the connection is in a reusable state
-    /// i.e., no error or incomplete read or write headers or bodies. Otherwise a `None` should be returned.
+    /// After successful processing, [`ServerSession::finish()`] can be
+    /// called to return an optionally reusable connection back to the service.
+    /// The caller needs to make sure that the connection is in a reusable state
+    /// i.e., no error or incomplete read or write headers or bodies. Otherwise
+    /// a `None` should be returned.
     async fn process_new_http(
         self: &Arc<Self>,
         mut session: ServerSession,

@@ -254,6 +254,47 @@ impl BodyReader {
         self.get_body_overread().is_some_and(|b| !b.is_empty())
     }
 
+    /// Take ownership of the overread bytes, leaving `None` in their place.
+    ///
+    /// Overread bytes are bytes that were read from the stream but are beyond the
+    /// end of the current request's body — i.e. they belong to a pipelined next
+    /// request on the same connection. Callers that support HTTP/1.1 pipelining
+    /// extract these bytes here and feed them to the next session's request
+    /// parser via [`HttpSession::set_pipelined_prefix`](super::server::HttpSession::set_pipelined_prefix).
+    pub fn take_body_overread(&mut self) -> Option<BytesMut> {
+        self.body_buf_overread.take()
+    }
+
+    /// Append bytes to the overread buffer from outside the body-parsing path.
+    ///
+    /// The body reader's overread buffer is normally populated by
+    /// [`Self::init_content_length`] (for zero-length bodies) and
+    /// [`Self::finish_body_buf`] (for sized bodies) when the stream read
+    /// that completed the current request also pulled in bytes from the
+    /// next pipelined request. That path covers the "both requests in one
+    /// read" shape.
+    ///
+    /// The "second request arrives in a separate read after the first
+    /// request's body is already done" shape is different: the body
+    /// reader never sees those bytes — they land on the idle-branch read
+    /// in [`super::server::HttpSession::read_body_or_idle`]. When
+    /// pipelining is enabled, that caller stashes the idle read here so
+    /// a single downstream overread surface covers both shapes and
+    /// [`Self::take_body_overread`] returns them uniformly.
+    pub fn push_body_overread(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.body_buf_overread.as_mut() {
+            Some(buf) => buf.extend_from_slice(bytes),
+            None => {
+                let mut buf = BytesMut::with_capacity(bytes.len());
+                buf.extend_from_slice(bytes);
+                self.body_buf_overread = Some(buf);
+            }
+        }
+    }
+
     pub fn body_done(&self) -> bool {
         matches!(self.body_state, PS::Complete(_) | PS::Done(_))
     }
