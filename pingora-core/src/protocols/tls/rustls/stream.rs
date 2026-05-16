@@ -390,7 +390,10 @@ impl SslDigest {
             .map(|(organization, serial)| (organization, Some(serial)))
             .unwrap_or_default();
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest)
+        // SNI extraction not yet implemented for rustls
+        let sni = None;
+
+        SslDigest::new(cipher, version, organization, serial_number, cert_digest, sni)
     }
 }
 
