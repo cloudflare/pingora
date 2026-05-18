@@ -139,6 +139,13 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Timeout durations greater than this threshold use Tokio's native timeout instead of
+    /// Pingora's fast timeout.
+    ///
+    /// This avoids retaining long-duration cancelled timers in Pingora's shared timer map until
+    /// their original deadline. When not set, defaults to 900 seconds (15 minutes). Set to `null`
+    /// to disable the Tokio fallback.
+    pub fast_timeout_to_tokio_threshold_seconds: Option<u64>,
     /// Enable Tokio's poll-time histogram on runtimes created by this server.
     ///
     /// This adds two timestamp reads to every task poll, so it should be
@@ -229,6 +236,9 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(
+                pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
+            ),
             runtime_metrics_poll_time_histogram: false,
             runtime_metrics_poll_time_histogram_scale: None,
             runtime_metrics_poll_time_histogram_resolution_micros: None,
@@ -432,6 +442,9 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(
+                pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
+            ),
             runtime_metrics_poll_time_histogram: false,
             runtime_metrics_poll_time_histogram_scale: None,
             runtime_metrics_poll_time_histogram_resolution_micros: None,
@@ -476,6 +489,10 @@ version: 1
         assert_eq!(1, conf.version);
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
+        assert_eq!(
+            Some(pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs()),
+            conf.fast_timeout_to_tokio_threshold_seconds
+        );
     }
 
     #[test]
@@ -541,6 +558,30 @@ blocking_threads_ttl_seconds: 30
         let conf = ServerConf::from_yaml(conf_str).unwrap();
         assert_eq!(Some(64), conf.max_blocking_threads);
         assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
+    }
+
+    #[test]
+    fn test_fast_timeout_to_tokio_threshold_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+fast_timeout_to_tokio_threshold_seconds: 120
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(Some(120), conf.fast_timeout_to_tokio_threshold_seconds);
+    }
+
+    #[test]
+    fn test_fast_timeout_to_tokio_threshold_can_be_disabled() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+fast_timeout_to_tokio_threshold_seconds:
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(None, conf.fast_timeout_to_tokio_threshold_seconds);
     }
 
     #[test]

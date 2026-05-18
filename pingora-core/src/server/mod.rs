@@ -662,6 +662,12 @@ impl Server {
         if conf.runtime_enable_alt_timer && !conf.work_stealing {
             warn!("runtime_enable_alt_timer is ignored when work_stealing is disabled");
         }
+        // This global timeout threshold is intended to be configured once during server startup,
+        // before service runtimes begin creating timeout futures.
+        fast_timeout::set_fast_timeout_to_tokio_threshold(
+            conf.fast_timeout_to_tokio_threshold_seconds
+                .map(Duration::from_secs),
+        );
 
         // Initialize (or re-initialize) sentry and persist the guard for
         // the lifetime of the server. When daemonizing, the transport
