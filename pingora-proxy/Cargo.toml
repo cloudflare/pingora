@@ -76,10 +76,15 @@ sentry = ["pingora-core/sentry"]
 upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]
+early_body_buffer = []
 
 [[example]]
 name = "connection_filter"
 required-features = ["connection_filter"]
+
+[[example]]
+name = "body_routing"
+required-features = ["early_body_buffer"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

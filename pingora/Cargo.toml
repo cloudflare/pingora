@@ -143,6 +143,10 @@ connection_filter = [
     "pingora-proxy?/connection_filter",
 ]
 
+## Enable buffering the full request body before `upstream_peer`, via the
+## `early_request_body_buffer_limit` and `early_request_body_filter` trait hooks.
+early_body_buffer = ["pingora-proxy?/early_body_buffer"]
+
 
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
@@ -155,6 +159,7 @@ document-features = [
     "cache",
     "time",
     "sentry",
-    "connection_filter"
+    "connection_filter",
+    "early_body_buffer"
 ]
 trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]
