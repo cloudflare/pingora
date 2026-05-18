@@ -101,6 +101,10 @@ jemallocator = "0.5"
 
 [features]
 default = []
+# Requires building with `--cfg tokio_unstable`.
+dial9 = ["pingora-runtime/dial9"]
+dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]
+dial9-cpu-profiling = ["dial9", "pingora-runtime/dial9-cpu-profiling"]
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]

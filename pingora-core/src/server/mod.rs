@@ -27,7 +27,14 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder, RuntimeMetricsOpts, RuntimeOpts};
+#[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
+pub use pingora_runtime::Dial9S3UploadOpts;
+use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
+#[cfg(feature = "dial9")]
+pub use pingora_runtime::{
+    Dial9RuntimeOpts, DEFAULT_DIAL9_MAX_FILE_SIZE, DEFAULT_DIAL9_MAX_TOTAL_SIZE,
+};
+pub use pingora_runtime::{RuntimeMetricsOpts, RuntimeOpts};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -648,17 +655,7 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
-        let runtime_opts = RuntimeOpts {
-            metrics: RuntimeMetricsOpts {
-                poll_time_histogram: conf.runtime_metrics_poll_time_histogram,
-                poll_time_histogram_scale: conf.runtime_metrics_poll_time_histogram_scale,
-                poll_time_histogram_resolution: conf
-                    .runtime_metrics_poll_time_histogram_resolution_micros
-                    .map(Duration::from_micros),
-                poll_time_histogram_buckets: conf.runtime_metrics_poll_time_histogram_buckets,
-            },
-            enable_alt_timer: conf.runtime_enable_alt_timer,
-        };
+        let runtime_opts = conf.runtime_opts();
         if conf.runtime_enable_alt_timer && !conf.work_stealing {
             warn!("runtime_enable_alt_timer is ignored when work_stealing is disabled");
         }
@@ -712,6 +709,10 @@ impl Server {
 
             let threads = wrapper.service.threads().unwrap_or(conf.threads);
             let name = wrapper.service.name().to_string();
+            let service_runtime_opts = wrapper
+                .service
+                .runtime_opts_override(&runtime_opts)
+                .unwrap_or_else(|| runtime_opts.clone());
 
             // Extract dependency watches from the ServiceHandle
             let dependencies = self
@@ -752,7 +753,7 @@ impl Server {
                 ready_notifier,
                 dependency_watches,
                 blocking_opts.clone(),
-                runtime_opts.clone(),
+                service_runtime_opts,
             );
             runtimes.push((runtime, name));
         }

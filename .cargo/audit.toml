@@ -1,3 +1,12 @@
+# Advisories against rustls-webpki 0.101.7, pulled in transitively by
+# aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
+# dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
+# our usage because this is TLS client use only and does not parse CRLs.
+# Remove once the upstream aws-s3-transfer-manager-rs fix ships.
+
 [advisories]
-# Temp before internal sync applies dependency bumps
-ignore = ["RUSTSEC-2026-0097", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
+ignore = [
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+]

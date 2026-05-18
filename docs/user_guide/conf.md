@@ -40,5 +40,74 @@ group: webusers
 | daemon_ready_timeout_seconds | How long (in seconds) the parent waits for the daemon to signal readiness when `daemon_wait_for_ready` is `true`. If the daemon does not signal in time the parent exits with a non-zero code, causing systemd to abort the reload. Default: `600` | number |
 | daemon_notify_timeout_seconds | How long (in seconds) the daemon retries sending `SIGUSR1` to the parent when the attempt fails with a permission error. This covers the brief window after the fork where the parent has not yet dropped its UID to match the daemon. Default: `60` | number |
 
+## dial9
+
+dial9 Tokio runtime telemetry is configured programmatically, not through
+the YAML configuration file. This avoids applying experimental telemetry to
+every service runtime and lets services provide non-serializable options such
+as a pre-built S3 client.
+
+dial9 is only available when Pingora is built with the `dial9` feature and
+`--cfg tokio_unstable`. Services can override the global runtime options with
+`runtime_opts_override()`:
+
+```rust
+use pingora::server::{Dial9RuntimeOpts, RuntimeOpts};
+use pingora::services::Service;
+
+struct MyService;
+
+impl Service for MyService {
+    fn name(&self) -> &str {
+        "my-service"
+    }
+
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        let mut opts = global.clone();
+        opts.dial9 = Some(
+            Dial9RuntimeOpts::new("/var/lib/pingora/dial9/my-service/trace.bin")
+                .with_max_file_size(100 * 1024 * 1024)
+                .with_max_total_size(512 * 1024 * 1024),
+        );
+        Some(opts)
+    }
+}
+```
+
+When built with the `dial9-worker-s3` feature, sealed trace segments can also
+be uploaded to an S3-compatible bucket:
+
+```rust
+use pingora::server::{Dial9RuntimeOpts, Dial9S3UploadOpts, RuntimeOpts};
+use pingora::services::Service;
+
+struct MyService {
+    s3_client: aws_sdk_s3::Client,
+}
+
+impl Service for MyService {
+    fn name(&self) -> &str {
+        "my-service"
+    }
+
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        let mut opts = global.clone();
+        opts.dial9 = Some(
+            Dial9RuntimeOpts::new("/var/lib/pingora/dial9/my-service/trace.bin")
+                .with_s3_upload(
+                    Dial9S3UploadOpts::new("my-trace-bucket", "my-service")
+                        .with_prefix("traces/my-service")
+                        .with_region("us-east-1")
+                        .with_client(self.s3_client.clone()),
+                ),
+        );
+        Some(opts)
+    }
+}
+```
+
+The S3 client is optional. When omitted, dial9 uses the AWS SDK default
+configuration chain and its bucket-region detection.
+
 ## Extension
 Any unknown settings will be ignored. This allows extending the conf file to add and pass user defined settings. See User defined configuration section.

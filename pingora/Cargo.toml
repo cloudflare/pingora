@@ -130,6 +130,17 @@ time = []
 ## Enable sentry for error notifications
 sentry = ["pingora-core/sentry"]
 
+## Enable dial9 Tokio runtime telemetry configuration.
+##
+## Requires building with `--cfg tokio_unstable`.
+dial9 = ["pingora-core/dial9"]
+
+## Enable dial9 S3-compatible trace segment upload support.
+dial9-worker-s3 = ["dial9", "pingora-core/dial9-worker-s3"]
+
+## Enable dial9 CPU profiling support.
+dial9-cpu-profiling = ["dial9", "pingora-core/dial9-cpu-profiling"]
+
 ## Enable upstream modules: the `adjust_upstream_modules` callback, the
 ## `upstream_modules_ctx` on Session, and `init_upstream_modules` on ProxyHttp.
 ##
@@ -155,6 +166,9 @@ document-features = [
     "cache",
     "time",
     "sentry",
+    "dial9",
+    "dial9-worker-s3",
+    "dial9-cpu-profiling",
     "connection_filter"
 ]
 trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]

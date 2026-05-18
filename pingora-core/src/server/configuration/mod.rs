@@ -23,11 +23,13 @@ use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 pub use pingora_runtime::RuntimeMetricsPollTimeHistogramScale;
+use pingora_runtime::{RuntimeMetricsOpts, RuntimeOpts};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
@@ -379,6 +381,23 @@ impl ServerConf {
         Ok(self)
     }
 
+    /// Build the default runtime options derived from this server configuration.
+    pub fn runtime_opts(&self) -> RuntimeOpts {
+        RuntimeOpts {
+            metrics: RuntimeMetricsOpts {
+                poll_time_histogram: self.runtime_metrics_poll_time_histogram,
+                poll_time_histogram_scale: self.runtime_metrics_poll_time_histogram_scale,
+                poll_time_histogram_resolution: self
+                    .runtime_metrics_poll_time_histogram_resolution_micros
+                    .map(Duration::from_micros),
+                poll_time_histogram_buckets: self.runtime_metrics_poll_time_histogram_buckets,
+            },
+            enable_alt_timer: self.runtime_enable_alt_timer,
+            #[cfg(feature = "dial9")]
+            dial9: None,
+        }
+    }
+
     pub fn merge_with_opt(&mut self, opt: &Opt) {
         if opt.daemon {
             self.daemon = true;
@@ -506,6 +525,36 @@ runtime_enable_alt_timer: true
 
         let conf = ServerConf::from_yaml(conf_str).unwrap();
         assert!(conf.runtime_enable_alt_timer);
+    }
+
+    #[test]
+    fn test_runtime_opts_from_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_enable_alt_timer: true
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_scale: log
+runtime_metrics_poll_time_histogram_resolution_micros: 20
+runtime_metrics_poll_time_histogram_buckets: 16
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        let opts = conf.runtime_opts();
+        assert!(opts.enable_alt_timer);
+        assert!(opts.metrics.poll_time_histogram);
+        assert_eq!(
+            Some(RuntimeMetricsPollTimeHistogramScale::Log),
+            opts.metrics.poll_time_histogram_scale
+        );
+        assert_eq!(
+            Some(Duration::from_micros(20)),
+            opts.metrics.poll_time_histogram_resolution
+        );
+        assert_eq!(Some(16), opts.metrics.poll_time_histogram_buckets);
+        #[cfg(feature = "dial9")]
+        assert!(opts.dial9.is_none());
     }
 
     #[test]

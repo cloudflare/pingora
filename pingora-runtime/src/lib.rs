@@ -26,12 +26,21 @@
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "dial9")]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
+
+/// Default maximum size of a dial9 trace segment file.
+#[cfg(feature = "dial9")]
+pub const DEFAULT_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
+/// Default maximum bytes retained locally by dial9.
+#[cfg(feature = "dial9")]
+pub const DEFAULT_DIAL9_MAX_TOTAL_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Configuration options for the blocking thread pool used by the runtime.
 ///
@@ -75,6 +84,123 @@ pub struct RuntimeOpts {
     /// This requires building with `--cfg tokio_unstable` and only applies to
     /// Tokio's multi-threaded runtime.
     pub enable_alt_timer: bool,
+    /// Options for dial9 Tokio telemetry.
+    #[cfg(feature = "dial9")]
+    pub dial9: Option<Dial9RuntimeOpts>,
+}
+
+/// Configuration options for dial9 Tokio telemetry.
+#[cfg(feature = "dial9")]
+#[derive(Debug, Clone)]
+pub struct Dial9RuntimeOpts {
+    /// Trace output path after server configuration defaults are applied.
+    pub trace_path: PathBuf,
+    /// Rotate trace segments after this many bytes.
+    pub max_file_size: u64,
+    /// Maximum bytes retained on local disk.
+    pub max_total_size: u64,
+    /// Wall-clock trace rotation period.
+    pub rotation_period: Option<Duration>,
+    /// Enable dial9 task spawn/terminate tracking.
+    pub task_tracking: bool,
+    /// Upload sealed trace segments to S3-compatible storage.
+    #[cfg(feature = "dial9-worker-s3")]
+    pub s3_upload: Option<Dial9S3UploadOpts>,
+}
+
+#[cfg(feature = "dial9")]
+impl Dial9RuntimeOpts {
+    /// Create dial9 runtime options using Pingora's dial9 defaults.
+    pub fn new(trace_path: impl Into<PathBuf>) -> Self {
+        Self {
+            trace_path: trace_path.into(),
+            max_file_size: DEFAULT_DIAL9_MAX_FILE_SIZE,
+            max_total_size: DEFAULT_DIAL9_MAX_TOTAL_SIZE,
+            rotation_period: None,
+            task_tracking: true,
+            #[cfg(feature = "dial9-worker-s3")]
+            s3_upload: None,
+        }
+    }
+
+    /// Set the maximum size of each trace segment file.
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
+    }
+
+    /// Set the maximum bytes retained on local disk.
+    pub fn with_max_total_size(mut self, max_total_size: u64) -> Self {
+        self.max_total_size = max_total_size;
+        self
+    }
+
+    /// Set the wall-clock trace rotation period.
+    pub fn with_rotation_period(mut self, rotation_period: Duration) -> Self {
+        self.rotation_period = Some(rotation_period);
+        self
+    }
+
+    /// Enable or disable dial9 task spawn/terminate tracking.
+    pub fn with_task_tracking(mut self, task_tracking: bool) -> Self {
+        self.task_tracking = task_tracking;
+        self
+    }
+
+    /// Set S3-compatible upload options for sealed trace segments.
+    #[cfg(feature = "dial9-worker-s3")]
+    pub fn with_s3_upload(mut self, s3_upload: Dial9S3UploadOpts) -> Self {
+        self.s3_upload = Some(s3_upload);
+        self
+    }
+}
+
+/// Configuration options for dial9 S3-compatible trace uploads.
+#[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
+#[derive(Debug, Clone)]
+pub struct Dial9S3UploadOpts {
+    /// S3 bucket that receives sealed trace segments.
+    pub bucket: String,
+    /// Service name included in uploaded object keys.
+    pub service_name: String,
+    /// Optional key prefix.
+    pub prefix: Option<String>,
+    /// Optional region override.
+    pub region: Option<String>,
+    /// Optional pre-built S3 client for custom credentials or endpoints.
+    pub client: Option<aws_sdk_s3::Client>,
+}
+
+#[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
+impl Dial9S3UploadOpts {
+    /// Create S3-compatible upload options.
+    pub fn new(bucket: impl Into<String>, service_name: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            service_name: service_name.into(),
+            prefix: None,
+            region: None,
+            client: None,
+        }
+    }
+
+    /// Set the object key prefix.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Set the AWS region override.
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    /// Set a pre-built S3 client for custom credentials or endpoints.
+    pub fn with_client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
 }
 
 /// Bucket scale for Tokio's poll-time histogram.
@@ -93,7 +219,11 @@ pub enum RuntimeMetricsPollTimeHistogramScale {
 ///
 /// The `NoSteal` flavor is backed by multiple tokio single-threaded runtime.
 pub enum Runtime {
-    Steal(tokio::runtime::Runtime),
+    Steal {
+        runtime: tokio::runtime::Runtime,
+        #[cfg(feature = "dial9")]
+        dial9_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
+    },
     NoSteal(NoStealRuntime),
 }
 
@@ -153,6 +283,84 @@ fn apply_timer_opts(builder: &mut Builder, opts: &RuntimeOpts) {
 
     #[cfg(not(tokio_unstable))]
     let _ = (builder, opts);
+}
+
+#[cfg(feature = "dial9")]
+fn build_dial9_runtime(
+    builder: Builder,
+    runtime_name: &str,
+    opts: &Dial9RuntimeOpts,
+) -> std::io::Result<(
+    tokio::runtime::Runtime,
+    dial9_tokio_telemetry::telemetry::TelemetryGuard,
+)> {
+    use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
+    use std::io::{Error, ErrorKind};
+
+    if opts.max_file_size == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "dial9 max_file_size must be greater than zero",
+        ));
+    }
+    if opts.max_total_size == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "dial9 max_total_size must be greater than zero",
+        ));
+    }
+    if opts.max_file_size > opts.max_total_size {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "dial9 max_file_size must be less than or equal to max_total_size",
+        ));
+    }
+
+    if let Some(parent) = opts.trace_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let writer = RotatingWriter::builder()
+        .base_path(opts.trace_path.clone())
+        .max_file_size(opts.max_file_size)
+        .max_total_size(opts.max_total_size)
+        .maybe_rotation_period(opts.rotation_period)
+        .build()?;
+
+    let traced = TracedRuntime::builder()
+        .with_trace_path(opts.trace_path.clone())
+        .with_runtime_name(runtime_name)
+        .with_task_tracking(opts.task_tracking);
+
+    #[cfg(feature = "dial9-worker-s3")]
+    if let Some(s3_upload) = &opts.s3_upload {
+        if s3_upload.bucket.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dial9 s3 bucket must not be empty",
+            ));
+        }
+        if s3_upload.service_name.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "dial9 s3 service_name must not be empty",
+            ));
+        }
+        let s3_config = dial9_tokio_telemetry::background_task::s3::S3Config::builder()
+            .bucket(s3_upload.bucket.clone())
+            .service_name(s3_upload.service_name.clone())
+            .maybe_prefix(s3_upload.prefix.clone())
+            .maybe_region(s3_upload.region.clone());
+        let traced = traced.with_s3_uploader(s3_config.build());
+        if let Some(client) = s3_upload.client.clone() {
+            return traced
+                .with_s3_client(client)
+                .build_and_start(builder, writer);
+        }
+        return traced.build_and_start(builder, writer);
+    }
+
+    traced.build_and_start(builder, writer)
 }
 
 /// Builder for constructing a [`Runtime`].
@@ -228,23 +436,56 @@ impl RuntimeBuilder {
         self
     }
 
+    fn build_work_stealing_tokio_builder(&self) -> Builder {
+        let mut builder = Builder::new_multi_thread();
+        builder
+            .enable_all()
+            .worker_threads(self.threads)
+            .thread_name(&self.name);
+        apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
+        apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
+        apply_timer_opts(&mut builder, &self.runtime_opts);
+        builder
+    }
+
     /// Build the [`Runtime`].
     pub fn build(self) -> Runtime {
         if self.work_steal {
-            let mut builder = Builder::new_multi_thread();
-            builder
-                .enable_all()
-                .worker_threads(self.threads)
-                .thread_name(&self.name);
-            apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
-            apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
-            apply_timer_opts(&mut builder, &self.runtime_opts);
-            Runtime::Steal(
-                builder
-                    .build()
-                    .expect("failed to build work-stealing Tokio runtime"),
-            )
+            let mut builder = self.build_work_stealing_tokio_builder();
+            #[cfg(feature = "dial9")]
+            let dial9_guard = if let Some(dial9_opts) = &self.runtime_opts.dial9 {
+                let runtime_name = self.name.clone();
+                match build_dial9_runtime(builder, &runtime_name, dial9_opts) {
+                    Ok((runtime, guard)) => {
+                        return Runtime::Steal {
+                            runtime,
+                            dial9_guard: Some(guard),
+                        };
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "failed to initialize dial9 runtime telemetry for {runtime_name}: {e}"
+                        );
+                        builder = self.build_work_stealing_tokio_builder();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let runtime = builder
+                .build()
+                .expect("failed to build work-stealing Tokio runtime");
+            Runtime::Steal {
+                runtime,
+                #[cfg(feature = "dial9")]
+                dial9_guard,
+            }
         } else {
+            #[cfg(feature = "dial9")]
+            if self.runtime_opts.dial9.is_some() {
+                log::warn!("dial9 runtime telemetry is ignored when work stealing is disabled");
+            }
             Runtime::NoSteal(NoStealRuntime::new(
                 self.threads,
                 &self.name,
@@ -273,7 +514,7 @@ impl Runtime {
     /// for each async task.
     pub fn get_handle(&self) -> &Handle {
         match self {
-            Self::Steal(r) => r.handle(),
+            Self::Steal { runtime, .. } => runtime.handle(),
             Self::NoSteal(r) => r.get_runtime(),
         }
     }
@@ -282,7 +523,15 @@ impl Runtime {
     /// all runtimes exit.
     pub fn shutdown_timeout(self, timeout: Duration) {
         match self {
-            Self::Steal(r) => r.shutdown_timeout(timeout),
+            Self::Steal {
+                runtime,
+                #[cfg(feature = "dial9")]
+                dial9_guard,
+            } => {
+                #[cfg(feature = "dial9")]
+                drop(dial9_guard);
+                runtime.shutdown_timeout(timeout);
+            }
             Self::NoSteal(r) => r.shutdown_timeout(timeout),
         }
     }
