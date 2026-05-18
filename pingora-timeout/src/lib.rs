@@ -49,7 +49,9 @@ use tokio::time::{sleep as tokio_sleep, Duration};
 ///
 /// Users don't need to interact with this trait
 pub trait ToTimeout {
-    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+    type Fut: Future<Output = ()> + Send + Sync;
+
+    fn timeout(&self) -> Self::Fut;
     fn create(d: Duration) -> Self;
 }
 
@@ -59,8 +61,10 @@ pub trait ToTimeout {
 pub struct TokioTimeout(Duration);
 
 impl ToTimeout for TokioTimeout {
-    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
-        Box::pin(tokio_sleep(self.0))
+    type Fut = tokio::time::Sleep;
+
+    fn timeout(&self) -> Self::Fut {
+        tokio_sleep(self.0)
     }
 
     fn create(d: Duration) -> Self {
@@ -95,11 +99,11 @@ where
 pin_project! {
     /// The timeout future returned by the timeout functions
     #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct Timeout<T, F> {
+    pub struct Timeout<T, F: ToTimeout> {
         #[pin]
         value: T,
         #[pin]
-        delay: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
+        delay: Option<F::Fut>,
         callback: F, // callback to create the timer
     }
 }
@@ -132,11 +136,12 @@ where
             return Poll::Ready(Ok(v));
         }
 
-        let delay = me
-            .delay
-            .get_or_insert_with(|| Box::pin(me.callback.timeout()));
+        if me.delay.is_none() {
+            me.delay.as_mut().set(Some(me.callback.timeout()));
+        }
 
-        match delay.as_mut().poll(cx) {
+        // safe: delay is Some after init
+        match me.delay.as_pin_mut().unwrap().poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(()) => Poll::Ready(Err(Elapsed {})),
         }
