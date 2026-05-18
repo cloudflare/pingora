@@ -16,6 +16,7 @@
 
 pub mod algorithms;
 pub mod consistent;
+pub mod least;
 pub mod weighted;
 
 use super::Backend;
@@ -82,7 +83,12 @@ pub type RoundRobin = Weighted<algorithms::RoundRobin>;
 /// Consistent Ketama hashing on weighted backends
 pub type Consistent = consistent::KetamaHashing;
 
-// TODO: least conn
+/// Least connections selection on weighted backends
+pub type LeastConnections = least::LeastConnections;
+/// Configuration for [`LeastConnections`] selection
+pub type LeastConnectionsConfig = least::LeastConnectionsConfig;
+/// RAII lease for least connections selection
+pub type LeastConnLease = least::LeastConnLease;
 
 /// An iterator which wraps another iterator and yields unique items. It optionally takes a max
 /// number of iterations if the wrapped iterator never returns.
