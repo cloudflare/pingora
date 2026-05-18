@@ -54,8 +54,9 @@ fn init() -> bool {
         .unwrap()
         .wait();
     let _origin = thread::spawn(|| {
+        let prefix = format!("{}/origin", super::conf_dir());
         process::Command::new("openresty")
-            .args(["-p", &format!("{}/origin", super::conf_dir())])
+            .args(["-p", &prefix, "-c", &format!("{}/conf/nginx.conf", prefix)])
             .output()
             .unwrap();
     });
