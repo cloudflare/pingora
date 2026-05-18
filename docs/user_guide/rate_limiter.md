@@ -19,7 +19,7 @@ Pingora provides a crate `pingora-limits` which provides a simple and easy to us
 ## Example
 ```rust
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use pingora::prelude::*;
 use pingora_limits::rate::Rate;
 use std::sync::Arc;
@@ -66,7 +66,7 @@ impl LB {
 }
 
 // Rate limiter
-static RATE_LIMITER: Lazy<Rate> = Lazy::new(|| Rate::new(Duration::from_secs(1)));
+static RATE_LIMITER: LazyLock<Rate> = LazyLock::new(|| Rate::new(Duration::from_secs(1)));
 
 // max request per second per client
 static MAX_REQ_PER_SEC: isize = 1;

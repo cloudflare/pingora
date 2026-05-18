@@ -204,7 +204,7 @@ where
     digest
         .peer_addr
         .set(Some(peer_addr.clone()))
-        .expect("newly created OnceCell must be empty");
+        .expect("newly created OnceLock must be empty");
     stream.set_socket_digest(digest);
 
     Ok(stream)
