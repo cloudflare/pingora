@@ -61,9 +61,9 @@ use pingora_core::services::listening::Service;
 ///
 /// ```rust,ignore
 /// use pingora_prometheus::prometheus::{self, register_int_counter, IntCounter};
-/// use once_cell::sync::Lazy;
+/// use std::sync::LazyLock;
 ///
-/// static REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
+/// static REQUESTS: LazyLock<IntCounter> = LazyLock::new(|| {
 ///     register_int_counter!("requests_total", "Total requests").unwrap()
 /// });
 /// ```
