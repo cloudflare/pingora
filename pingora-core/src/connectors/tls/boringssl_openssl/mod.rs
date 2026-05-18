@@ -30,6 +30,7 @@ use crate::tls::ext::{
 use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
+use crate::tls::x509::verify::X509VerifyFlags;
 use crate::upstreams::peer::{Peer, ALPN};
 
 pub type TlsConnector = SslConnector;
@@ -210,6 +211,12 @@ where
         consistent with nginx's behavior */
         ssl_conf.set_verify(SslVerifyMode::NONE);
     } else if peer.verify_cert() {
+        if peer.verify_cert_partial_chain() {
+            ssl_conf
+                .param_mut()
+                .set_flags(X509VerifyFlags::PARTIAL_CHAIN)
+                .or_err(InternalError, "failed to set verify flags")?;
+        }
         if peer.verify_hostname() {
             let verify_param = ssl_conf.param_mut();
             add_host(verify_param, peer.sni()).or_err(InternalError, "failed to add host")?;
