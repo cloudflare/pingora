@@ -233,7 +233,7 @@ robin again in within 1 second.
 ### Command line options
 
 The pingora `Server` type provides a lot of built-in functionality that we can
-take advantage of with single-line change. 
+take advantage of with a single-line change. 
 
 ```rust
 fn main() {
@@ -261,7 +261,7 @@ Passing the parameter `-d` or `--daemon` will tell the program to run in the bac
 cargo run -- -d
 ```
 
-To stop this service, you can send `SIGTERM` signal to it for a graceful shutdown, in which the service will stop accepting new request but try to finish all ongoing requests before exiting.
+To stop this service, you can send the `SIGTERM` signal to it for a graceful shutdown, in which the service will stop accepting new requests but try to finish all ongoing requests before exiting.
 ```
 pkill -SIGTERM load_balancer
 ```
@@ -301,14 +301,14 @@ Let's say we changed the code of the load balancer and recompiled the binary. No
 
 If we simply stop the old service, then start the new one, some request arriving in between could be lost. Fortunately, Pingora provides a graceful way to upgrade the service.
 
-This is done by, first, send `SIGQUIT` signal to the running server, and then start the new server with the parameter `-u` \ `--upgrade`.
+This is done by, first, sending the `SIGQUIT` signal to the running server, and then starting the new server with the parameter `-u` \ `--upgrade`.
 
 ```
 pkill -SIGQUIT load_balancer &&\
 RUST_LOG=INFO cargo run -- -c conf.yaml -d -u
 ```
 
-In this process, The old running server will wait and hand over its listening sockets to the new server. Then the old server runs until all its ongoing requests finish.
+In this process, the old running server will wait and hand over its listening sockets to the new server. Then the old server runs until all its ongoing requests finish.
 
 From a client's perspective, the service is always running because the listening socket is never closed.
 
