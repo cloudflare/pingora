@@ -74,6 +74,11 @@ pub struct ServerConf {
     pub listener_tasks_per_fd: usize,
     /// Allow work stealing between threads of the same service. Default `true`.
     pub work_stealing: bool,
+    /// Enable Tokio's experimental alternative timer on work-stealing service runtimes.
+    ///
+    /// Requires building with `--cfg tokio_unstable`. Ignored when
+    /// [`Self::work_stealing`] is disabled.
+    pub runtime_enable_alt_timer: bool,
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
@@ -214,6 +219,7 @@ impl Default for ServerConf {
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
+            runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
@@ -416,6 +422,7 @@ mod tests {
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
+            runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
@@ -469,6 +476,19 @@ version: 1
         assert_eq!(1, conf.version);
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
+    }
+
+    #[test]
+    fn test_runtime_enable_alt_timer_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_enable_alt_timer: true
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert!(conf.runtime_enable_alt_timer);
     }
 
     #[test]

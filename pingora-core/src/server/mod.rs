@@ -27,7 +27,7 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder, RuntimeMetricsOpts};
+use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder, RuntimeMetricsOpts, RuntimeOpts};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -379,7 +379,7 @@ impl Server {
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
         blocking_opts: BlockingPoolOpts,
-        metrics_opts: RuntimeMetricsOpts,
+        runtime_opts: RuntimeOpts,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
@@ -389,7 +389,7 @@ impl Server {
             threads,
             work_stealing,
             blocking_opts,
-            metrics_opts,
+            runtime_opts,
         );
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
@@ -648,14 +648,20 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
-        let metrics_opts = RuntimeMetricsOpts {
-            poll_time_histogram: conf.runtime_metrics_poll_time_histogram,
-            poll_time_histogram_scale: conf.runtime_metrics_poll_time_histogram_scale,
-            poll_time_histogram_resolution: conf
-                .runtime_metrics_poll_time_histogram_resolution_micros
-                .map(Duration::from_micros),
-            poll_time_histogram_buckets: conf.runtime_metrics_poll_time_histogram_buckets,
+        let runtime_opts = RuntimeOpts {
+            metrics: RuntimeMetricsOpts {
+                poll_time_histogram: conf.runtime_metrics_poll_time_histogram,
+                poll_time_histogram_scale: conf.runtime_metrics_poll_time_histogram_scale,
+                poll_time_histogram_resolution: conf
+                    .runtime_metrics_poll_time_histogram_resolution_micros
+                    .map(Duration::from_micros),
+                poll_time_histogram_buckets: conf.runtime_metrics_poll_time_histogram_buckets,
+            },
+            enable_alt_timer: conf.runtime_enable_alt_timer,
         };
+        if conf.runtime_enable_alt_timer && !conf.work_stealing {
+            warn!("runtime_enable_alt_timer is ignored when work_stealing is disabled");
+        }
 
         // Initialize (or re-initialize) sentry and persist the guard for
         // the lifetime of the server. When daemonizing, the transport
@@ -740,7 +746,7 @@ impl Server {
                 ready_notifier,
                 dependency_watches,
                 blocking_opts.clone(),
-                metrics_opts.clone(),
+                runtime_opts.clone(),
             );
             runtimes.push((runtime, name));
         }
@@ -752,7 +758,7 @@ impl Server {
             1,
             true,
             BlockingPoolOpts::default(),
-            RuntimeMetricsOpts::default(),
+            RuntimeOpts::default(),
         );
         #[cfg(unix)]
         let shutdown_type = server_runtime
@@ -827,12 +833,12 @@ impl Server {
         threads: usize,
         work_steal: bool,
         blocking_opts: BlockingPoolOpts,
-        metrics_opts: RuntimeMetricsOpts,
+        runtime_opts: RuntimeOpts,
     ) -> Runtime {
         RuntimeBuilder::new(threads, name)
             .work_steal(work_steal)
             .blocking_pool_opts(blocking_opts)
-            .metrics_opts(metrics_opts)
+            .runtime_opts(runtime_opts)
             .build()
     }
 }

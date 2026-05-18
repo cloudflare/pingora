@@ -29,6 +29,7 @@ group: webusers
 | ca_file | The path to the root CA file | string |
 | s2n_config_cache_size | The maximum number of unique s2n configs to cache. A value of 0 disables the cache. Default: 10 (s2n-tls only) | number |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
+| runtime_enable_alt_timer | Enable Tokio's experimental alternative timer on work-stealing service runtimes. Requires building with `--cfg tokio_unstable`. Ignored when `work_stealing` is disabled. Default: `false` | bool |
 | runtime_metrics_poll_time_histogram | Enable Tokio poll-time histograms on service runtimes. Requires building with `--cfg tokio_unstable`; adds two timestamp reads to every task poll. Default: `false` | bool |
 | runtime_metrics_poll_time_histogram_scale | Bucket scale for Tokio poll-time histograms. Valid values: `linear`, `log`. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | string |
 | runtime_metrics_poll_time_histogram_resolution_micros | Width of the first Tokio poll-time histogram bucket in microseconds. Must be greater than 0. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | number |

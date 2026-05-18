@@ -65,6 +65,18 @@ pub struct RuntimeMetricsOpts {
     pub poll_time_histogram_buckets: Option<usize>,
 }
 
+/// Configuration options for a Tokio runtime.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOpts {
+    /// Options for runtime metrics collection.
+    pub metrics: RuntimeMetricsOpts,
+    /// Enable Tokio's experimental alternative timer.
+    ///
+    /// This requires building with `--cfg tokio_unstable` and only applies to
+    /// Tokio's multi-threaded runtime.
+    pub enable_alt_timer: bool,
+}
+
 /// Bucket scale for Tokio's poll-time histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,6 +144,17 @@ fn apply_metrics_opts(builder: &mut Builder, opts: &RuntimeMetricsOpts) {
     let _ = (builder, opts);
 }
 
+/// Apply timer options from [`RuntimeOpts`] to a tokio [`Builder`].
+fn apply_timer_opts(builder: &mut Builder, opts: &RuntimeOpts) {
+    #[cfg(tokio_unstable)]
+    if opts.enable_alt_timer {
+        builder.enable_alt_timer();
+    }
+
+    #[cfg(not(tokio_unstable))]
+    let _ = (builder, opts);
+}
+
 /// Builder for constructing a [`Runtime`].
 ///
 /// # Example
@@ -152,7 +175,7 @@ pub struct RuntimeBuilder {
     name: String,
     work_steal: bool,
     blocking_pool_opts: BlockingPoolOpts,
-    metrics_opts: RuntimeMetricsOpts,
+    runtime_opts: RuntimeOpts,
 }
 
 impl RuntimeBuilder {
@@ -165,7 +188,7 @@ impl RuntimeBuilder {
             name: name.to_string(),
             work_steal: true,
             blocking_pool_opts: BlockingPoolOpts::default(),
-            metrics_opts: RuntimeMetricsOpts::default(),
+            runtime_opts: RuntimeOpts::default(),
         }
     }
 
@@ -186,7 +209,22 @@ impl RuntimeBuilder {
 
     /// Set the [`RuntimeMetricsOpts`] for the runtime.
     pub fn metrics_opts(mut self, opts: RuntimeMetricsOpts) -> Self {
-        self.metrics_opts = opts;
+        self.runtime_opts.metrics = opts;
+        self
+    }
+
+    /// Set the [`RuntimeOpts`] for the runtime.
+    pub fn runtime_opts(mut self, opts: RuntimeOpts) -> Self {
+        self.runtime_opts = opts;
+        self
+    }
+
+    /// Set whether Tokio's experimental alternative timer is enabled.
+    ///
+    /// This requires building with `--cfg tokio_unstable` and only applies to
+    /// work-stealing runtimes.
+    pub fn enable_alt_timer(mut self, enabled: bool) -> Self {
+        self.runtime_opts.enable_alt_timer = enabled;
         self
     }
 
@@ -199,7 +237,8 @@ impl RuntimeBuilder {
                 .worker_threads(self.threads)
                 .thread_name(&self.name);
             apply_blocking_opts(&mut builder, &self.blocking_pool_opts);
-            apply_metrics_opts(&mut builder, &self.metrics_opts);
+            apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
+            apply_timer_opts(&mut builder, &self.runtime_opts);
             Runtime::Steal(
                 builder
                     .build()
@@ -210,7 +249,7 @@ impl RuntimeBuilder {
                 self.threads,
                 &self.name,
                 self.blocking_pool_opts,
-                self.metrics_opts,
+                self.runtime_opts,
             ))
         }
     }
@@ -277,7 +316,7 @@ pub struct NoStealRuntime {
     threads: usize,
     name: String,
     blocking_opts: BlockingPoolOpts,
-    metrics_opts: RuntimeMetricsOpts,
+    runtime_opts: RuntimeOpts,
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
@@ -290,14 +329,14 @@ impl NoStealRuntime {
         threads: usize,
         name: &str,
         blocking_opts: BlockingPoolOpts,
-        metrics_opts: RuntimeMetricsOpts,
+        runtime_opts: RuntimeOpts,
     ) -> Self {
         assert!(threads != 0);
         NoStealRuntime {
             threads,
             name: name.to_string(),
             blocking_opts,
-            metrics_opts,
+            runtime_opts,
             pools: Arc::new(OnceCell::new()),
             controls: OnceCell::new(),
         }
@@ -310,7 +349,7 @@ impl NoStealRuntime {
             let mut builder = Builder::new_current_thread();
             builder.enable_all();
             apply_blocking_opts(&mut builder, &self.blocking_opts);
-            apply_metrics_opts(&mut builder, &self.metrics_opts);
+            apply_metrics_opts(&mut builder, &self.runtime_opts.metrics);
             let rt = builder
                 .build()
                 .expect("failed to build no-steal Tokio runtime worker");
