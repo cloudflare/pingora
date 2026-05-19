@@ -1,0 +1,23 @@
+pingora-core/src/protocols/http/v1/write_buf.rs
+  1f7e06a3dd12b828 96-319
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "bc7811e100a04fa258169eb15a2a62cf49a1fb15",
+  "prompts": {
+    "1f7e06a3dd12b828": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1c37511c1ffexsGFif3iXNzJKU",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "Fei Deng",
+      "messages": [],
+      "total_additions": 224,
+      "total_deletions": 0,
+      "accepted_lines": 224,
+      "overriden_lines": 0
+    }
+  }
+}
