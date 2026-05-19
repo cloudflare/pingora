@@ -20,14 +20,11 @@ use pingora_error::{
     OrErr, Result,
 };
 use std::fmt::Debug;
-use std::pin::Pin;
+use std::future::Future;
+use std::pin::{pin, Pin};
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocols::l4::stream::{
-    async_write_vec::{poll_write_all_buf, poll_write_vec_all_buf},
-    AsyncWriteVec,
-};
 use crate::utils::BufRef;
 
 // TODO: make this dynamically adjusted
@@ -1198,7 +1195,7 @@ impl BodyWriter {
                 let chuck_size_buf = format!("{:X}\r\n", chunk_size);
                 let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
                 stream
-                    .write_vec_all(&mut output_buf)
+                    .write_all_buf(&mut output_buf)
                     .await
                     .or_err(WriteError, "while writing body")?;
                 stream.flush().await.or_err(WriteError, "flushing body")?;
@@ -1516,8 +1513,9 @@ impl BodyWriter {
                     self.send_finish_state = FinishWriteState::WritingLastChunk(buf);
                 }
                 FinishWriteState::WritingLastChunk(buf) => {
-                    // Poll write_vec_all - write until all bytes are written
-                    ready!(poll_write_vec_all_buf(cx, stream.as_mut(), buf))
+                    // Re-create tokio's stateless `write_all_buf` future per
+                    // poll; progress is carried by `buf`.
+                    ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx))
                         .map_err(|e| Error::because(WriteError, "while writing last chunk", e))?;
 
                     // All bytes written, move to flushing state
@@ -1616,8 +1614,9 @@ impl BodyWriter {
         if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
             let bytes_written = *size;
 
-            // Attempt write
-            match ready!(poll_write_all_buf(cx, stream.as_mut(), buf)) {
+            // Attempt write. Re-create tokio's stateless `write_all_buf`
+            // future per poll; progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
                 Ok(()) => {
                     // Write completed - update body_mode to track bytes written
                     let (total, written) = self.body_mode.expect_content_length();
@@ -1703,8 +1702,11 @@ impl BodyWriter {
         if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
             let bytes_written = *size;
 
-            // Attempt vectored write for chained buffer (chunk size + data + CRLF)
-            match ready!(poll_write_vec_all_buf(cx, stream.as_mut(), buf)) {
+            // Attempt vectored write for chained buffer (chunk size + data + CRLF).
+            // Re-create tokio's stateless `write_all_buf` future per poll; it
+            // opportunistically uses vectored writes when the stream supports
+            // them. Progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
                 Ok(()) => {
                     // Write completed - update body_mode with application bytes (not wire bytes)
                     let written = self.body_mode.expect_chunked();
@@ -1777,8 +1779,9 @@ impl BodyWriter {
         if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
             let bytes_written = *size;
 
-            // Attempt write
-            match ready!(poll_write_all_buf(cx, stream.as_mut(), buf)) {
+            // Attempt write. Re-create tokio's stateless `write_all_buf`
+            // future per poll; progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
                 Ok(()) => {
                     // Write completed - update body_mode to track bytes written
                     let written = self.body_mode.expect_until_close();
@@ -3848,5 +3851,225 @@ mod test_body_task_api {
             "finish_task should succeed when all content-length bytes written"
         );
         assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+    }
+}
+
+#[cfg(test)]
+mod test_poll_body_writer {
+    //! Tests that drive the cancel-safe poll-based body writers directly
+    //! via [`futures::task::noop_waker`] and an in-memory [`AsyncWrite`]
+    //! mock — no tokio runtime required.
+    //!
+    //! These exercise the `write_all_buf` call sites in
+    //! [`BodyWriter::poll_write_current_body_task`] and
+    //! [`BodyWriter::poll_write_current_finish_task`]: re-creating tokio's
+    //! stateless future on each poll and verifying that progress carried
+    //! by the caller-owned [`Buf`](bytes::Buf) is preserved across
+    //! [`Poll::Pending`] returns.
+    use super::*;
+    use bytes::Bytes;
+    use futures::task::noop_waker;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    /// Programmable in-memory [`AsyncWrite`]. Each scripted entry dictates
+    /// the outcome of one `poll_write` / `poll_write_vectored` call.
+    struct MockWriter {
+        written: Vec<u8>,
+        next: VecDeque<Poll<io::Result<usize>>>,
+        vectored: bool,
+    }
+
+    impl MockWriter {
+        fn new(vectored: bool, results: Vec<Poll<io::Result<usize>>>) -> Self {
+            Self {
+                written: Vec::new(),
+                next: results.into(),
+                vectored,
+            }
+        }
+    }
+
+    impl AsyncWrite for MockWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let r = self
+                .next
+                .pop_front()
+                .expect("MockWriter::poll_write: out of scripted results");
+            if let Poll::Ready(Ok(n)) = &r {
+                self.written.extend_from_slice(&buf[..*n]);
+            }
+            r
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let r = self
+                .next
+                .pop_front()
+                .expect("MockWriter::poll_write_vectored: out of scripted results");
+            if let Poll::Ready(Ok(n)) = &r {
+                let mut remaining = *n;
+                for slice in bufs {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = slice.len().min(remaining);
+                    self.written.extend_from_slice(&slice[..take]);
+                    remaining -= take;
+                }
+            }
+            r
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Drive a poll closure to completion under a [`noop_waker`] context.
+    ///
+    /// Panics after [`MAX_POLLS`] iterations to avoid silently hanging the
+    /// test runner when a mock is misconfigured and never returns
+    /// [`Poll::Ready`].
+    fn drive<R>(mut poll_fn: impl FnMut(&mut Context<'_>) -> Poll<R>) -> R {
+        const MAX_POLLS: usize = 1024;
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..MAX_POLLS {
+            if let Poll::Ready(v) = poll_fn(&mut cx) {
+                return v;
+            }
+        }
+        panic!("drive(): poll closure did not complete after {MAX_POLLS} iterations");
+    }
+
+    #[test]
+    fn content_length_write_completes() {
+        let data = b"hello";
+        let mut mock = MockWriter::new(false, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+        assert!(matches!(bw.body_mode, BodyMode::ContentLength(5, 5)));
+    }
+
+    #[test]
+    fn content_length_write_resumes_after_pending_and_short_write() {
+        // Pending once, then 2-byte short write, then the remaining 3 bytes.
+        // Exercises the per-poll re-creation of tokio's WriteAllBuf future
+        // with progress carried by the BodyWriter-owned buffer.
+        let data = b"hello";
+        let mut mock = MockWriter::new(
+            false,
+            vec![Poll::Pending, Poll::Ready(Ok(2)), Poll::Ready(Ok(3))],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+    }
+
+    #[test]
+    fn chunked_write_uses_vectored_path() {
+        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-chunk
+        // WriteBuf::Chained. Note: the WriteBuf type uses the default
+        // Buf::chunks_vectored impl, which only ever populates one IoSlice,
+        // so tokio's write_all_buf issues 3 separate single-slice
+        // poll_write_vectored calls (one per inner Bytes chunk).
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(3)), // "5\r\n"
+                Poll::Ready(Ok(5)), // "hello"
+                Poll::Ready(Ok(2)), // "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5)))); // application bytes
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn chunked_write_resumes_on_short_write() {
+        // Exercise the restart path: short-write on the first chunk
+        // (Ok(2) for "5\r\n"), then completion (Ok(1) for "\n"), then the
+        // remaining two inner chunks.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(2)), // partial "5\r"
+                Poll::Ready(Ok(1)), // remaining "\n"
+                Poll::Ready(Ok(5)), // "hello"
+                Poll::Ready(Ok(2)), // "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn until_close_write_completes() {
+        let data = b"abcdef";
+        let mut mock = MockWriter::new(false, vec![Poll::Ready(Ok(6))]);
+        let mut bw = BodyWriter::new();
+        bw.init_close_delimited();
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(6))));
+        assert_eq!(mock.written, data);
+    }
+
+    #[test]
+    fn finish_chunked_writes_terminator() {
+        // After a chunked body, finish() must emit the "0\r\n\r\n" terminator.
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        // Pretend we already wrote 5 application bytes.
+        bw.body_mode = BodyMode::ChunkedEncoding(5);
+        bw.send_finish_task();
+
+        let res = drive(|cx| bw.poll_write_current_finish_task(cx, Pin::new(&mut mock)));
+        assert!(res.is_ok());
+        assert_eq!(mock.written, b"0\r\n\r\n");
+        assert!(matches!(bw.body_mode, BodyMode::Complete(5)));
     }
 }
