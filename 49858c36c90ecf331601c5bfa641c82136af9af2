@@ -1,0 +1,25 @@
+ci/Dockerfile
+  1f7e06a3dd12b828 58-66,69,73,84-85,92-103,105-106
+Makefile
+  1f7e06a3dd12b828 32-37,46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "49858c36c90ecf331601c5bfa641c82136af9af2",
+  "prompts": {
+    "1f7e06a3dd12b828": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1c37511c1ffexsGFif3iXNzJKU",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "Fei Deng",
+      "messages": [],
+      "total_additions": 34,
+      "total_deletions": 19,
+      "accepted_lines": 34,
+      "overriden_lines": 0
+    }
+  }
+}
