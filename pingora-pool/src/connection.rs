@@ -25,6 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{oneshot, watch, Notify, OwnedMutexGuard};
 
 use super::lru::Lru;
+use futures::FutureExt;
 
 type GroupKey = u64;
 #[cfg(unix)]
@@ -314,7 +315,7 @@ impl<S> ConnectionPool<S> {
 
     /// Release a connection to this pool for reuse
     ///
-    /// - The returned [`Arc<Notify>`] will notify any listen when the connection is evicted from the pool.
+    /// - The returned [`Arc<Notify>`] will notify any listener when the connection is evicted from the pool.
     /// - The returned [`oneshot::Receiver<bool>`] will notify when the connection is being picked up by [Self::get()].
     pub fn put(
         &self,
@@ -351,17 +352,34 @@ impl<S> ConnectionPool<S> {
     where
         Stream: AsyncRead + Unpin + Send,
     {
+        // Reuse this same Notified future in the watch_use branch: notify_one()
+        // may deliver the wakeup to an already-polled future, so creating a new
+        // notified() future after watch_use resolves could miss the eviction.
+        let evicted = notify_evicted.notified();
+        tokio::pin!(evicted);
+
         let read_result = tokio::select! {
             biased;
-            _ = watch_use => {
-                debug!("idle connection is being picked up");
-                return false
+            event = watch_use => {
+                return match event {
+                    Ok(_) => {
+                        debug!("idle connection is being picked up");
+                        false
+                    }
+                    // `watch_use` also resolves when the sender is dropped.
+                    // During LRU eviction, pop_evicted() removes the
+                    // PoolConnection, dropping the sender after notify_evicted
+                    // has been signaled. Keep this biased branch first for the
+                    // common reuse path, but confirm the eviction signal before
+                    // classifying sender drop as eviction.
+                    Err(_) => evicted.now_or_never().is_some(),
+                };
             },
-            _ = notify_evicted.notified() => {
+            _ = &mut evicted => {
                 debug!("idle connection is being evicted");
                 // TODO: gracefully close the connection?
                 return true
-            }
+            },
             read_result = read_with_timeout(connection , timeout) => read_result
         };
 
@@ -397,17 +415,34 @@ impl<S> ConnectionPool<S> {
         mut notify_closed: watch::Receiver<bool>,
         watch_use: oneshot::Receiver<bool>,
     ) -> bool {
+        // Reuse this same Notified future in the watch_use branch: notify_one()
+        // may deliver the wakeup to an already-polled future, so creating a new
+        // notified() future after watch_use resolves could miss the eviction.
+        let evicted = notify_evicted.notified();
+        tokio::pin!(evicted);
+
         tokio::select! {
             biased;
-            _ = watch_use => {
-                debug!("idle connection is being picked up");
-                false
+            event = watch_use => {
+                match event {
+                    Ok(_) => {
+                        debug!("idle connection is being picked up");
+                        false
+                    }
+                    // `watch_use` also resolves when the sender is dropped.
+                    // During LRU eviction, pop_evicted() removes the
+                    // PoolConnection, dropping the sender after notify_evicted
+                    // has been signaled. Keep this biased branch first for the
+                    // common reuse path, but confirm the eviction signal before
+                    // classifying sender drop as eviction.
+                    Err(_) => evicted.now_or_never().is_some(),
+                }
             },
-            _ = notify_evicted.notified() => {
+            _ = &mut evicted => {
                 debug!("idle connection is being evicted");
                 // TODO: gracefully close the connection?
                 true
-            }
+            },
             _ = notify_closed.changed() => {
                 // assume always changed from false to true
                 debug!("idle connection is being closed");
@@ -637,6 +672,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_idle_poll_reports_lru_eviction_after_pool_remove() {
+        let meta1 = ConnectionMeta::new(101, 1);
+        let mock_io1 = Arc::new(AsyncMutex::new(
+            Builder::new().wait(Duration::from_secs(99)).build(),
+        ));
+        let meta2 = ConnectionMeta::new(202, 2);
+        let mock_io2 = Arc::new(AsyncMutex::new(
+            Builder::new().wait(Duration::from_secs(99)).build(),
+        ));
+        let cp: ConnectionPool<Arc<AsyncMutex<Mock>>> = ConnectionPool::new(1);
+
+        let (notify_evicted, watch_use) = cp.put(&meta1, mock_io1.clone());
+        cp.put(&meta2, mock_io2);
+
+        let evicted = cp
+            .idle_poll(
+                mock_io1.try_lock_owned().unwrap(),
+                &meta1,
+                None,
+                notify_evicted,
+                watch_use,
+            )
+            .await;
+
+        assert!(evicted, "LRU eviction should report eviction");
+    }
+
+    #[tokio::test]
+    async fn test_idle_poll_reports_sender_drop_without_notify_not_evicted() {
+        let meta = ConnectionMeta::new(101, 1);
+        let mock_io = Arc::new(AsyncMutex::new(
+            Builder::new().wait(Duration::from_secs(99)).build(),
+        ));
+        let cp: ConnectionPool<Arc<AsyncMutex<Mock>>> = ConnectionPool::new(1);
+
+        let (notify_evicted, watch_use) = cp.put(&meta, mock_io.clone());
+        cp.pop_closed(&meta);
+
+        let evicted = cp
+            .idle_poll(
+                mock_io.try_lock_owned().unwrap(),
+                &meta,
+                None,
+                notify_evicted,
+                watch_use,
+            )
+            .await;
+
+        assert!(
+            !evicted,
+            "sender drop without notify should not report eviction"
+        );
+    }
+
+    #[tokio::test]
     async fn test_idle_poll_reports_reuse_not_evicted() {
         let meta = ConnectionMeta::new(101, 1);
         let mock_io = Arc::new(AsyncMutex::new(
@@ -805,6 +895,73 @@ mod tests {
             .await;
 
         assert!(evicted, "notify_evicted should report eviction");
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_reports_lru_eviction_after_pool_remove() {
+        let meta1 = ConnectionMeta::new(101, 1);
+        let meta2 = ConnectionMeta::new(202, 2);
+        let cp: ConnectionPool<String> = ConnectionPool::new(1);
+        let (notify_evicted, watch_use) = cp.put(&meta1, "v1".to_string());
+        let (_notify_closed, notify_closed_rx) = watch::channel(false);
+
+        cp.put(&meta2, "v2".to_string());
+
+        let evicted = cp
+            .idle_timeout(&meta1, None, notify_evicted, notify_closed_rx, watch_use)
+            .await;
+
+        assert!(evicted, "LRU eviction should report eviction");
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_reports_lru_eviction_after_notify_registered() {
+        let meta1 = ConnectionMeta::new(101, 1);
+        let meta2 = ConnectionMeta::new(202, 2);
+        let cp = Arc::new(ConnectionPool::new(1));
+        let (notify_evicted, watch_use) = cp.put(&meta1, "v1".to_string());
+        let (_notify_closed, notify_closed_rx) = watch::channel(false);
+
+        let idle_cp = cp.clone();
+        let idle_meta = meta1.clone();
+        let idle_task = tokio::spawn(async move {
+            idle_cp
+                .idle_timeout(
+                    &idle_meta,
+                    None,
+                    notify_evicted,
+                    notify_closed_rx,
+                    watch_use,
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        cp.put(&meta2, "v2".to_string());
+
+        assert!(
+            idle_task.await.unwrap(),
+            "LRU eviction should report eviction after notify future was registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_reports_sender_drop_without_notify_not_evicted() {
+        let meta = ConnectionMeta::new(101, 1);
+        let cp: ConnectionPool<String> = ConnectionPool::new(1);
+        let (notify_evicted, watch_use) = cp.put(&meta, "v1".to_string());
+        let (_notify_closed, notify_closed_rx) = watch::channel(false);
+
+        cp.pop_closed(&meta);
+
+        let evicted = cp
+            .idle_timeout(&meta, None, notify_evicted, notify_closed_rx, watch_use)
+            .await;
+
+        assert!(
+            !evicted,
+            "sender drop without notify should not report eviction"
+        );
     }
 
     #[tokio::test]

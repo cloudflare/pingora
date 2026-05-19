@@ -23,6 +23,7 @@ lru = { workspace = true }
 log = { workspace = true }
 parking_lot = "0.12"
 crossbeam-queue = "0.3"
+futures = { workspace = true }
 pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
 
 [dev-dependencies]

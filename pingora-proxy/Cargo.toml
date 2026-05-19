@@ -25,7 +25,7 @@ pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.8.0", path = "../pingora-http" }
 http = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 log = { workspace = true }
