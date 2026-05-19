@@ -14,7 +14,7 @@ pub struct MyCtx {
     beta_user: bool,
 }
 
-fn check_beta_user(req: &pingora_http::RequestHeader) -> bool {
+fn check_beta_user(req: &pingora::http::RequestHeader) -> bool {
     // some simple logic to check if user is beta
     req.headers.get("beta-flag").is_some()
 }
