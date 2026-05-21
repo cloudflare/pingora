@@ -72,7 +72,7 @@ use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
 use pingora_core::server::configuration::ServerConf;
-use pingora_core::server::ShutdownWatch;
+use pingora_core::server::{RuntimeOpts, ShutdownWatch};
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
@@ -1347,7 +1347,7 @@ where
     // TODO implement h2_options
 }
 
-use pingora_core::services::listening::Service;
+use pingora_core::services::listening::{RuntimeOptsOverride, Service};
 
 /// Create an [`HttpProxy`] without wrapping it in a [`Service`].
 ///
@@ -1454,6 +1454,7 @@ where
     custom: Option<ProcessCustomSession<SV, C>>,
     server_options: Option<HttpServerOptions>,
     client_options: Option<ConnectorOptions>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, ()>
@@ -1479,6 +1480,7 @@ where
             custom: None,
             server_options: None,
             client_options: None,
+            runtime_opts_override: None,
         }
     }
 }
@@ -1514,6 +1516,7 @@ where
             name,
             server_options,
             client_options,
+            runtime_opts_override,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1524,6 +1527,7 @@ where
             custom: Some(on_custom),
             server_options,
             client_options,
+            runtime_opts_override,
         }
     }
 
@@ -1543,6 +1547,17 @@ where
         self
     }
 
+    /// Set a runtime options override for the [Service] built by this builder.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn runtime_opts_override<F>(mut self, override_fn: F) -> Self
+    where
+        F: Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync + 'static,
+    {
+        self.runtime_opts_override = Some(Arc::new(override_fn));
+        self
+    }
+
     /// Builds a new [Service] from the [ProxyServiceBuilder].
     ///
     /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
@@ -1558,6 +1573,7 @@ where
             custom,
             server_options,
             client_options,
+            runtime_opts_override,
         } = self;
 
         let mut proxy = HttpProxy::new_custom(
@@ -1570,6 +1586,10 @@ where
         );
 
         proxy.handle_init_modules();
-        Service::new(name, proxy)
+        let mut service = Service::new(name, proxy);
+        if let Some(runtime_opts_override) = runtime_opts_override {
+            service.set_runtime_opts_override(runtime_opts_override);
+        }
+        service
     }
 }
