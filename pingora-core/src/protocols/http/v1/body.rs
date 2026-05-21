@@ -1010,6 +1010,19 @@ impl<C: Buf> Buf for WriteBuf<C> {
             WriteBuf::Chained(c) => c.advance(cnt),
         }
     }
+
+    // Forward to the inner buffer so callers (e.g. tokio's `write_all_buf`)
+    // see every constituent slice. The default [`Buf::chunks_vectored`]
+    // impl only populates one slot, which collapses a multi-piece chained
+    // buffer (such as a chunked-encoding frame's size + payload + CRLF)
+    // into a single-slice vectored write — issuing one syscall per inner
+    // piece instead of one `writev` covering the whole frame.
+    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
+        match self {
+            WriteBuf::Simple(b) => b.chunks_vectored(dst),
+            WriteBuf::Chained(c) => c.chunks_vectored(dst),
+        }
+    }
 }
 
 enum WriteState {
@@ -4038,20 +4051,13 @@ mod test_poll_body_writer {
 
     #[test]
     fn chunked_write_uses_vectored_path() {
-        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-chunk
-        // WriteBuf::Chained. Note: the WriteBuf type uses the default
-        // Buf::chunks_vectored impl, which only ever populates one IoSlice,
-        // so tokio's write_all_buf issues 3 separate single-slice
-        // poll_write_vectored calls (one per inner Bytes chunk).
+        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-piece
+        // WriteBuf::Chained (size header + payload + trailing CRLF).
+        // The `WriteBuf::chunks_vectored` override forwards to the inner
+        // chain so tokio's `write_all_buf` sees all 3 IoSlices and issues
+        // a single `poll_write_vectored` covering the whole frame.
         let payload = b"hello";
-        let mut mock = MockWriter::new(
-            true,
-            vec![
-                Poll::Ready(Ok(3)), // "5\r\n"
-                Poll::Ready(Ok(5)), // "hello"
-                Poll::Ready(Ok(2)), // "\r\n"
-            ],
-        );
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(10))]);
         let mut bw = BodyWriter::new();
         bw.init_chunked();
         bw.send_body_task(Bytes::from_static(payload), None);
@@ -4059,21 +4065,23 @@ mod test_poll_body_writer {
         let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
         assert!(matches!(res, Ok(Some(5)))); // application bytes
         assert_eq!(mock.written, b"5\r\nhello\r\n");
+        // Exactly one vectored call — no leftover scripted results.
+        assert!(mock.next.is_empty());
     }
 
     #[test]
     fn chunked_write_resumes_on_short_write() {
-        // Exercise the restart path: short-write on the first chunk
-        // (Ok(2) for "5\r\n"), then completion (Ok(1) for "\n"), then the
-        // remaining two inner chunks.
+        // Exercise the restart path under the vectored fast-path: first
+        // `poll_write_vectored` covers all 3 IoSlices but only reports
+        // Ok(2) (the kernel accepted "5\r"); after advancing 2 bytes the
+        // buffer still has 8 bytes ("\n" + "hello" + "\r\n") and the next
+        // call covers them in one vectored write.
         let payload = b"hello";
         let mut mock = MockWriter::new(
             true,
             vec![
                 Poll::Ready(Ok(2)), // partial "5\r"
-                Poll::Ready(Ok(1)), // remaining "\n"
-                Poll::Ready(Ok(5)), // "hello"
-                Poll::Ready(Ok(2)), // "\r\n"
+                Poll::Ready(Ok(8)), // remaining "\n" + "hello" + "\r\n"
             ],
         );
         let mut bw = BodyWriter::new();
@@ -4083,6 +4091,7 @@ mod test_poll_body_writer {
         let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
         assert!(matches!(res, Ok(Some(5))));
         assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
     }
 
     #[test]
@@ -4112,5 +4121,104 @@ mod test_poll_body_writer {
         assert!(res.is_ok());
         assert_eq!(mock.written, b"0\r\n\r\n");
         assert!(matches!(bw.body_mode, BodyMode::Complete(5)));
+    }
+
+    #[test]
+    fn chunked_write_non_vectored_writer() {
+        // When the underlying writer does not support vectored I/O,
+        // `write_all_buf` walks the buffer one `Buf::chunk()` at a time —
+        // i.e. one `poll_write` per inner piece of the 3-piece chained
+        // frame. The `chunks_vectored` override does not participate in
+        // this path; this test pins the existing non-vectored behavior so
+        // a future refactor cannot silently break it.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            false,
+            vec![
+                Poll::Ready(Ok(3)), // "5\r\n"
+                Poll::Ready(Ok(5)), // "hello"
+                Poll::Ready(Ok(2)), // "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_resumes_after_pending() {
+        // Vectored fast-path Pending-then-resume: an initial `Poll::Pending`
+        // must not lose buffer progress, and the next iteration must still
+        // present all 3 IoSlices in one `poll_write_vectored` call. This is
+        // the chunked counterpart to
+        // `content_length_write_resumes_after_pending_and_short_write`.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Pending,
+                Poll::Ready(Ok(10)), // full frame in one vectored call
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_two_frames_in_sequence() {
+        // Two consecutive `send_body_task` calls must each be served by
+        // their own freshly-constructed `WriteBuf::Chained`. Catches state-
+        // machine bugs where the second frame inherits stale buffer state
+        // (or where the vectored fast-path leaks slices across frames).
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(10)), // "5\r\nhello\r\n"
+                Poll::Ready(Ok(10)), // "5\r\nworld\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+
+        bw.send_body_task(Bytes::from_static(b"hello"), None);
+        let res1 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res1, Ok(Some(5))));
+
+        bw.send_body_task(Bytes::from_static(b"world"), None);
+        let res2 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res2, Ok(Some(5))));
+
+        assert_eq!(mock.written, b"5\r\nhello\r\n5\r\nworld\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn content_length_write_uses_vectored_path() {
+        // Content-Length writes go through `WriteBuf::Simple` (a single
+        // contiguous `Bytes`). Exercises the `Simple` arm of the
+        // `chunks_vectored` override: a single-piece buffer reports one
+        // IoSlice, so tokio issues one `poll_write_vectored` for the
+        // whole payload.
+        let data = b"hello";
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+        assert!(mock.next.is_empty());
     }
 }
