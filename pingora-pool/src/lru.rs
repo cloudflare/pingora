@@ -145,10 +145,9 @@ where
         }
 
         value.order = self.order.fetch_add(1, Relaxed);
-        let replaced = self.shard(&key).lock().put(key, value);
-        if let Some(replaced) = replaced {
-            replaced.notify_close();
-            return vec![replaced.meta];
+        if self.shard(&key).lock().put(key, value).is_some() {
+            // replaced
+            return Vec::new();
         }
         if self.len.fetch_add(1, Relaxed) + 1 > self.size {
             return self.evict_lru();
@@ -188,6 +187,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use log::debug;
 
     #[tokio::test]
@@ -222,14 +222,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_replaced_node_notifies_and_returns_displaced_meta() {
+    async fn test_replaced_node_is_not_treated_as_eviction() {
         let pool: Lru<i32, i32> = Lru::new(2);
         let (replaced_notifier, evicted) = pool.add(1, 10);
         assert!(evicted.is_empty());
 
         let (_, evicted) = pool.add(1, 20);
-        assert_eq!(evicted, vec![10]);
-        replaced_notifier.notified().await;
+        assert!(evicted.is_empty());
+        assert_eq!(pool.pop(&1).unwrap().meta, 20);
+
+        assert!(
+            replaced_notifier.notified().now_or_never().is_none(),
+            "replaced node should not notify close"
+        );
     }
 
     #[tokio::test]
