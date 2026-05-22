@@ -18,7 +18,17 @@ use std::time::{Duration, Instant};
 
 use super::{BackendIter, BackendSelection, HealthCheckService, LoadBalancer, LoadBalancerGroup};
 use async_trait::async_trait;
-use pingora_core::services::{background::BackgroundService, ServiceReadyNotifier};
+use pingora_core::{
+    server::ShutdownWatch,
+    services::{background::BackgroundService, ServiceReadyNotifier},
+};
+
+async fn shutdown_changed(shutdown: &mut ShutdownWatch) -> bool {
+    match shutdown.changed().await {
+        Ok(()) => *shutdown.borrow(),
+        Err(_) => true,
+    }
+}
 
 /// Timing state shared by update and health-check loops.
 struct TaskSchedule {
@@ -129,7 +139,7 @@ where
 {
     pub async fn run(
         &self,
-        shutdown: pingora_core::server::ShutdownWatch,
+        mut shutdown: ShutdownWatch,
         mut ready_opt: Option<ServiceReadyNotifier>,
     ) -> () {
         let mut now = Instant::now();
@@ -149,8 +159,19 @@ where
 
             if schedule.update_is_due(now) {
                 // TODO: log err
-                let _ = self.update().await;
-                schedule.update_finished_at(now);
+                tokio::select! {
+                    biased;
+                    is_shutdown = shutdown_changed(&mut shutdown) => {
+                        if is_shutdown {
+                            return;
+                        }
+                        continue;
+                    }
+                    update = self.update() => {
+                        let _ = update;
+                        schedule.update_finished_at(now);
+                    }
+                }
             }
 
             // After the first update, discovery and selection setup will be
@@ -160,17 +181,33 @@ where
             }
 
             if schedule.health_check_is_due(now) {
-                self.backends
-                    .run_health_check(self.parallel_health_check)
-                    .await;
-                schedule.health_check_finished_at(now);
+                tokio::select! {
+                    biased;
+                    is_shutdown = shutdown_changed(&mut shutdown) => {
+                        if is_shutdown {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ = self.backends.run_health_check(self.parallel_health_check) => {
+                        schedule.health_check_finished_at(now);
+                    }
+                }
             }
 
             if schedule.is_idle() {
                 return;
             }
             let to_wake = schedule.next(now);
-            tokio::time::sleep_until(to_wake.into()).await;
+            tokio::select! {
+                biased;
+                is_shutdown = shutdown_changed(&mut shutdown) => {
+                    if is_shutdown {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(to_wake.into()) => {}
+            }
             now = Instant::now();
         }
     }
@@ -227,22 +264,33 @@ where
             }
 
             if schedule.update_is_due(now) {
-                match self.update().await {
-                    Ok(()) => {
-                        // Until readiness is signaled, always target the latest
-                        // backend generation. Pinning to the first successful
-                        // update would let a burst of updates satisfy readiness
-                        // with selectors that are already stale relative to the
-                        // current membership.
-                        if ready_opt.is_some() {
-                            ready_generation = Some(self.backend_generation());
+                tokio::select! {
+                    biased;
+                    is_shutdown = shutdown_changed(&mut shutdown) => {
+                        if is_shutdown {
+                            return;
                         }
+                        continue;
                     }
-                    Err(error) => {
-                        log::error!("load balancer group update failed: {error}");
+                    update = self.update() => {
+                        match update {
+                            Ok(()) => {
+                                // Until readiness is signaled, always target the latest
+                                // backend generation. Pinning to the first successful
+                                // update would let a burst of updates satisfy readiness
+                                // with selectors that are already stale relative to the
+                                // current membership.
+                                if ready_opt.is_some() {
+                                    ready_generation = Some(self.backend_generation());
+                                }
+                            }
+                            Err(error) => {
+                                log::error!("load balancer group update failed: {error}");
+                            }
+                        }
+                        schedule.update_finished_at(now);
                     }
                 }
-                schedule.update_finished_at(now);
             }
 
             if ready_generation.is_some_and(|generation| self.selectors_ready_for(generation)) {
@@ -254,10 +302,18 @@ where
             }
 
             if schedule.health_check_is_due(now) {
-                self.backends()
-                    .run_health_check(self.parallel_health_check)
-                    .await;
-                schedule.health_check_finished_at(now);
+                tokio::select! {
+                    biased;
+                    is_shutdown = shutdown_changed(&mut shutdown) => {
+                        if is_shutdown {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ = self.backends().run_health_check(self.parallel_health_check) => {
+                        schedule.health_check_finished_at(now);
+                    }
+                }
             }
 
             // Discovery and health checks have independent schedules. One-shot
@@ -341,15 +397,23 @@ impl HealthCheckService {
                 }
             }
 
-            self.registry
-                .run_health_check(self.parallel_health_check)
-                .await;
-            if let Some(ready) = ready_opt.take() {
-                // The initial health pass completed, so services depending on
-                // this registry can start receiving traffic.
-                ServiceReadyNotifier::notify_ready(ready);
+            tokio::select! {
+                biased;
+                is_shutdown = shutdown_changed(&mut shutdown) => {
+                    if is_shutdown {
+                        return;
+                    }
+                    continue;
+                }
+                _ = self.registry.run_health_check(self.parallel_health_check) => {
+                    if let Some(ready) = ready_opt.take() {
+                        // The initial health pass completed, so services depending on
+                        // this registry can start receiving traffic.
+                        ServiceReadyNotifier::notify_ready(ready);
+                    }
+                    schedule.health_check_finished_at(Instant::now());
+                }
             }
-            schedule.health_check_finished_at(Instant::now());
 
             let Some(next_health_check) = schedule.next_health_check() else {
                 // no more checks
@@ -385,7 +449,19 @@ impl BackgroundService for HealthCheckService {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
+    use std::future;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use pingora_error::Result;
+    use tokio::sync::{watch, Notify};
+
     use super::*;
+    use crate::discovery::{ServiceDiscovery, Static};
+    use crate::health_check::HealthCheck;
+    use crate::selection;
+    use crate::{Backend, Backends, HealthRegistry};
 
     #[test]
     fn schedule_without_tasks_is_idle() {
@@ -461,5 +537,219 @@ mod tests {
         assert!(!schedule.update_is_due(now + health_check_frequency));
         assert!(schedule.health_check_is_due(now + health_check_frequency));
         assert!(schedule.update_is_due(now + update_frequency));
+    }
+
+    struct NotifyingDiscovery {
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceDiscovery for NotifyingDiscovery {
+        async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+            self.notify.notify_one();
+            Ok((BTreeSet::new(), HashMap::new()))
+        }
+    }
+
+    struct PendingDiscovery {
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ServiceDiscovery for PendingDiscovery {
+        async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+            self.notify.notify_one();
+            future::pending().await
+        }
+    }
+
+    struct PendingHealthCheck {
+        notify: Arc<Notify>,
+        drop_notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl HealthCheck for PendingHealthCheck {
+        async fn check(&self, _target: &Backend) -> Result<()> {
+            struct NotifyOnDrop(Arc<Notify>);
+
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+
+            let _notify_on_drop = NotifyOnDrop(self.drop_notify.clone());
+            self.notify.notify_one();
+            future::pending().await
+        }
+
+        fn health_threshold(&self, _success: bool) -> usize {
+            1
+        }
+    }
+
+    async fn assert_run_exits_on_shutdown(
+        lb: LoadBalancer<selection::RoundRobin>,
+        notify: Arc<Notify>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            lb.run(shutdown_rx, None).await;
+        });
+
+        notify.notified().await;
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("background service should observe shutdown promptly")
+            .expect("background service task should not panic");
+    }
+
+    #[tokio::test]
+    async fn run_returns_when_shutdown_while_sleeping() {
+        let notify = Arc::new(Notify::new());
+        let discovery = NotifyingDiscovery {
+            notify: notify.clone(),
+        };
+        let mut lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(Box::new(
+            discovery,
+        )));
+        lb.update_frequency = Some(Duration::from_secs(60));
+
+        assert_run_exits_on_shutdown(lb, notify).await;
+    }
+
+    #[tokio::test]
+    async fn run_returns_when_shutdown_while_updating() {
+        let notify = Arc::new(Notify::new());
+        let discovery = PendingDiscovery {
+            notify: notify.clone(),
+        };
+        let lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(Box::new(
+            discovery,
+        )));
+
+        assert_run_exits_on_shutdown(lb, notify).await;
+    }
+
+    #[tokio::test]
+    async fn run_returns_when_shutdown_while_health_checking() {
+        let notify = Arc::new(Notify::new());
+        let drop_notify = Arc::new(Notify::new());
+        let mut lb =
+            LoadBalancer::<selection::RoundRobin>::try_from_iter(["127.0.0.1:80"]).unwrap();
+        lb.set_health_check(Box::new(PendingHealthCheck {
+            notify: notify.clone(),
+            drop_notify: drop_notify.clone(),
+        }));
+
+        assert_run_exits_on_shutdown(lb, notify).await;
+        tokio::time::timeout(Duration::from_secs(1), drop_notify.notified())
+            .await
+            .expect("pending health check should be cancelled");
+    }
+
+    #[tokio::test]
+    async fn run_aborts_parallel_health_check_on_shutdown() {
+        let notify = Arc::new(Notify::new());
+        let drop_notify = Arc::new(Notify::new());
+        let mut lb =
+            LoadBalancer::<selection::RoundRobin>::try_from_iter(["127.0.0.1:80"]).unwrap();
+        lb.parallel_health_check = true;
+        lb.set_health_check(Box::new(PendingHealthCheck {
+            notify: notify.clone(),
+            drop_notify: drop_notify.clone(),
+        }));
+
+        assert_run_exits_on_shutdown(lb, notify).await;
+        tokio::time::timeout(Duration::from_secs(1), drop_notify.notified())
+            .await
+            .expect("parallel health check task should be aborted");
+    }
+
+    async fn assert_group_run_exits_on_shutdown(
+        group: LoadBalancerGroup<selection::RoundRobin>,
+        notify: Arc<Notify>,
+    ) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            group.run(shutdown_rx, None).await;
+        });
+
+        notify.notified().await;
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("background service should observe shutdown promptly")
+            .expect("background service task should not panic");
+    }
+
+    #[tokio::test]
+    async fn group_run_returns_when_shutdown_while_updating() {
+        let notify = Arc::new(Notify::new());
+        let discovery = PendingDiscovery {
+            notify: notify.clone(),
+        };
+        let group = LoadBalancerGroup::<selection::RoundRobin>::from_backends_with_configs(
+            Backends::new(Box::new(discovery)),
+            [None],
+        );
+
+        assert_group_run_exits_on_shutdown(group, notify).await;
+    }
+
+    #[tokio::test]
+    async fn group_run_returns_when_shutdown_while_health_checking() {
+        let notify = Arc::new(Notify::new());
+        let drop_notify = Arc::new(Notify::new());
+        let mut backends = Backends::new(Static::try_from_iter(["127.0.0.1:80"]).unwrap());
+        backends.set_health_check(Box::new(PendingHealthCheck {
+            notify: notify.clone(),
+            drop_notify: drop_notify.clone(),
+        }));
+        let group = LoadBalancerGroup::<selection::RoundRobin>::from_backends_with_configs(
+            backends,
+            [None],
+        );
+
+        assert_group_run_exits_on_shutdown(group, notify).await;
+        tokio::time::timeout(Duration::from_secs(1), drop_notify.notified())
+            .await
+            .expect("pending health check should be cancelled");
+    }
+
+    #[tokio::test]
+    async fn health_check_service_run_returns_when_shutdown_while_health_checking() {
+        let notify = Arc::new(Notify::new());
+        let drop_notify = Arc::new(Notify::new());
+        let registry = Arc::new(HealthRegistry::new());
+        registry.set_health_check(Box::new(PendingHealthCheck {
+            notify: notify.clone(),
+            drop_notify: drop_notify.clone(),
+        }));
+        // The view must outlive the service so its targets stay registered.
+        let view = Backends::new_with_health_registry(
+            Static::try_from_iter(["127.0.0.1:80"]).unwrap(),
+            Arc::clone(&registry),
+        );
+        view.update(|_| {}).await.unwrap();
+
+        let service = HealthCheckService::new(registry);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { service.run(shutdown_rx, None).await });
+
+        notify.notified().await;
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("health check service should observe shutdown promptly")
+            .expect("health check service task should not panic");
+        tokio::time::timeout(Duration::from_secs(1), drop_notify.notified())
+            .await
+            .expect("pending health check should be cancelled");
     }
 }

@@ -456,6 +456,17 @@ impl HealthRegistry {
         use crate::health_check::HealthCheck;
         use log::{info, warn};
         use pingora_runtime::current_handle;
+        use tokio::task::AbortHandle;
+
+        struct AbortOnDrop(Vec<AbortHandle>);
+
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                for handle in &self.0 {
+                    handle.abort();
+                }
+            }
+        }
 
         async fn check_and_report(
             backend: &Backend,
@@ -496,6 +507,8 @@ impl HealthRegistry {
                     }
                 })
             });
+            let jobs = Vec::from_iter(jobs);
+            let _abort_on_drop = AbortOnDrop(jobs.iter().map(|job| job.abort_handle()).collect());
             futures::future::join_all(jobs).await;
         } else {
             for backend in state.targets.iter() {
