@@ -87,6 +87,7 @@ impl ProxyHttp for MyGateway {
         }
         Ok(false)
     }
+}
 ```
 ## Logging
 
@@ -120,6 +121,7 @@ impl ProxyHttp for MyGateway {
 
         self.req_metric.inc();
     }
+}
 
 fn main() {
    ...
