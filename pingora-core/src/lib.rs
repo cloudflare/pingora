@@ -112,7 +112,7 @@ pub use pingora_boringssl as tls;
 #[cfg(feature = "openssl")]
 pub use pingora_openssl as tls;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 pub use pingora_rustls as tls;
 
 #[cfg(feature = "s2n")]

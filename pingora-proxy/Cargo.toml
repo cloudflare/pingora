@@ -69,6 +69,7 @@ boringssl = [
     "openssl_derived",
 ]
 rustls = ["pingora-core/rustls", "pingora-cache/rustls", "any_tls"]
+rustls-base = ["pingora-core/rustls-base", "pingora-cache/rustls-base", "any_tls"]
 s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
