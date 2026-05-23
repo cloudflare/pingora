@@ -120,7 +120,7 @@ pub trait TlsAccept {
 }
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
-#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+#[cfg(any(feature = "openssl_derived", feature = "rustls_derived"))]
 pub(crate) type SharedTlsAcceptCallbacks = Arc<dyn TlsAccept + Send + Sync>;
 
 /// Callback for processing raw bytes before TLS handshake.
