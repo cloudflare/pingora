@@ -24,10 +24,10 @@ mod s2n;
 #[cfg(feature = "s2n")]
 pub use s2n::*;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 mod rustls;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 pub use rustls::*;
 
 ///    OpenSSL considers underscores in hostnames non-compliant.
@@ -41,7 +41,7 @@ pub use rustls::*;
 ///    > characters only letters, digits, and hyphen.  There are also some
 ///    > restrictions on the length.  Labels must be 63 characters or less.
 ///    - https://datatracker.ietf.org/doc/html/rfc1034#section-3.5
-#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+#[cfg(any(feature = "openssl_derived", feature = "rustls_derived"))]
 pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     // wildcard is only leftmost label
     if let Some((leftmost, rest)) = sni.split_once('.') {
@@ -56,7 +56,7 @@ pub fn replace_leftmost_underscore(sni: &str) -> Option<String> {
     None
 }
 
-#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+#[cfg(any(feature = "openssl_derived", feature = "rustls_derived"))]
 #[cfg(test)]
 mod tests {
     use super::*;

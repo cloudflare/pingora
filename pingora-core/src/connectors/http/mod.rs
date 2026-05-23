@@ -369,12 +369,12 @@ mod tests {
     // Creates a test connector for integration/unit tests.
     // For rustls, only ConnectorOptions are used here; the actual dangerous verifier is patched in the TLS connector.
     fn create_test_connector() -> Connector<MockConnector> {
-        #[cfg(feature = "rustls")]
+        #[cfg(feature = "rustls_derived")]
         let custom_transport = {
             let options = ConnectorOptions::new(1);
             TransportConnector::new(Some(options))
         };
-        #[cfg(not(feature = "rustls"))]
+        #[cfg(not(feature = "rustls_derived"))]
         let custom_transport = TransportConnector::new(None);
         Connector {
             h1: v1::Connector::new(None),
@@ -490,7 +490,7 @@ mod tests {
     // Both client and server are using custom protocols, but different ones - we should create H1 sessions as fallback.
     // For RusTLS if there is no agreed protocol, the handshake directly fails, so this won't work
     // TODO: If no ALPN is matched, rustls should return None instead of failing the handshake.
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(not(feature = "rustls_derived"))]
     #[tokio::test]
     async fn test_incompatible_custom_client_custom_upstream() {
         let port = get_available_port().await;
@@ -569,7 +569,7 @@ mod tests {
 }
 
 // Used for disabling certificate/hostname verification in rustls for tests and custom ALPN/self-signed scenarios.
-#[cfg(all(test, feature = "rustls"))]
+#[cfg(all(test, feature = "rustls_derived"))]
 pub mod rustls_no_verify {
     use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName};
