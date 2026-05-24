@@ -23,8 +23,8 @@ use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
 use pingora_rustls::{
-    version, CryptoProvider, ResolvesServerCert, SupportedCipherSuite, SupportedKxGroup,
-    SupportedProtocolVersion, TlsAcceptor as RusTlsAcceptor,
+    version, CertificateHashProvider, CryptoProvider, ResolvesServerCert, SupportedCipherSuite,
+    SupportedKxGroup, SupportedProtocolVersion, TlsAcceptor as RusTlsAcceptor,
 };
 
 use crate::protocols::{ALPN, IO};
@@ -46,6 +46,7 @@ pub struct TlsSettings {
 
 pub struct Acceptor {
     pub acceptor: RusTlsAcceptor,
+    pub(crate) cert_digest_hash: Option<&'static CertificateHashProvider>,
     callbacks: Option<TlsAcceptCallbacks>,
 }
 
@@ -107,6 +108,8 @@ impl TlsSettings {
         if let Some(alpn_protocols) = self.alpn_protocols {
             config.alpn_protocols = alpn_protocols;
         }
+        let cert_digest_hash =
+            pingora_rustls::sha256_hash_provider(config.crypto_provider().as_ref());
         if self.require_fips && !config.fips() {
             return Error::e_explain(
                 InternalError,
@@ -116,9 +119,16 @@ impl TlsSettings {
                 ),
             );
         }
+        if self.require_fips && cert_digest_hash.is_none() {
+            return Error::e_explain(
+                InternalError,
+                "Rustls listener configuration does not provide a SHA-256 hash provider for certificate digests.",
+            );
+        }
 
         Ok(Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
+            cert_digest_hash,
             callbacks: None,
         })
     }

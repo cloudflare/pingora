@@ -194,3 +194,24 @@ pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
     let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
 }
+
+pub type CertificateHashProvider = dyn rustls::crypto::hash::Hash;
+
+pub fn sha256_hash_provider(provider: &CryptoProvider) -> Option<&'static CertificateHashProvider> {
+    provider.cipher_suites.iter().find_map(|suite| {
+        let hash_provider = match suite {
+            SupportedCipherSuite::Tls12(suite) => suite.common.hash_provider,
+            SupportedCipherSuite::Tls13(suite) => suite.common.hash_provider,
+        };
+
+        (hash_provider.algorithm() == rustls::crypto::hash::HashAlgorithm::SHA256)
+            .then_some(hash_provider)
+    })
+}
+
+pub fn hash_certificate_with_provider(
+    cert: &CertificateDer,
+    hash_provider: &CertificateHashProvider,
+) -> Vec<u8> {
+    hash_provider.hash(cert.as_ref()).as_ref().to_vec()
+}
