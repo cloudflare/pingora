@@ -99,6 +99,10 @@ impl TlsSettings {
         }
     }
 
+    pub fn try_build(self) -> Result<Acceptor> {
+        Ok(self.build())
+    }
+
     /// Enable HTTP/2 support for this endpoint, which is default off.
     /// This effectively sets the ALPN to prefer HTTP/2 with HTTP/1.1 allowed
     pub fn enable_h2(&mut self) {

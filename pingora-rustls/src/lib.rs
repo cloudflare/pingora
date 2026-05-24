@@ -26,11 +26,14 @@ pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+pub use rustls::server::ResolvesServerCert;
 pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
 pub use rustls::{
-    client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
-    DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
-    SignatureScheme, Stream,
+    client::WebPkiServerVerifier,
+    crypto::{CryptoProvider, SupportedKxGroup},
+    version, CertificateError, ClientConfig, DigitallySignedStruct, Error as RusTlsError,
+    KeyLogFile, RootCertStore, ServerConfig, SignatureScheme, Stream, SupportedCipherSuite,
+    SupportedProtocolVersion,
 };
 
 /// Install the default `ring` CryptoProvider for rustls.
@@ -40,6 +43,11 @@ pub use rustls::{
 /// calls are no-ops.
 pub fn install_default_crypto_provider() {
     let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+}
+
+/// Return rustls' default `ring` CryptoProvider.
+pub fn ring_default_crypto_provider() -> CryptoProvider {
+    rustls::crypto::ring::default_provider()
 }
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
@@ -185,4 +193,25 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
     let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
     hash.as_ref().to_vec()
+}
+
+pub type CertificateHashProvider = dyn rustls::crypto::hash::Hash;
+
+pub fn sha256_hash_provider(provider: &CryptoProvider) -> Option<&'static CertificateHashProvider> {
+    provider.cipher_suites.iter().find_map(|suite| {
+        let hash_provider = match suite {
+            SupportedCipherSuite::Tls12(suite) => suite.common.hash_provider,
+            SupportedCipherSuite::Tls13(suite) => suite.common.hash_provider,
+        };
+
+        (hash_provider.algorithm() == rustls::crypto::hash::HashAlgorithm::SHA256)
+            .then_some(hash_provider)
+    })
+}
+
+pub fn hash_certificate_with_provider(
+    cert: &CertificateDer,
+    hash_provider: &CertificateHashProvider,
+) -> Vec<u8> {
+    hash_provider.hash(cert.as_ref()).as_ref().to_vec()
 }
