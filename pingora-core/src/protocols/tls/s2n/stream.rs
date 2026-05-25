@@ -307,12 +307,16 @@ impl SslDigest {
             }
         }
 
+        // SNI extraction not yet implemented for s2n
+        let sni = None;
+
         SslDigest::new(
             cipher,
             version,
             organization,
             serial_number,
             cert_digest.unwrap_or_default(),
+            sni,
         )
     }
 }
