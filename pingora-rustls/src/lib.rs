@@ -33,13 +33,19 @@ pub use rustls::{
     SignatureScheme, Stream,
 };
 
-/// Install the default `ring` CryptoProvider for rustls.
+/// Install the default CryptoProvider for rustls.
 ///
-/// rustls 0.23+ requires an explicit provider. This function installs `ring`
-/// as the process-level default. Safe to call multiple times — subsequent
-/// calls are no-ops.
+/// rustls 0.23+ requires an explicit provider. The `ring` feature is enabled
+/// by default and this function installs `ring` as the process-level default.
+/// When `ring` is disabled (e.g. via `rustls-base`), this is a no-op and the
+/// consumer must install their own [`CryptoProvider`] before any TLS use.
+///
+/// Safe to call multiple times — subsequent calls are no-ops.
 pub fn install_default_crypto_provider() {
-    let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    #[cfg(feature = "ring")]
+    {
+        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    }
 }
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
@@ -182,7 +188,25 @@ pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
         .unwrap_or_default())
 }
 
+/// SHA-256 fingerprint of a DER-encoded certificate, using the installed
+/// [`CryptoProvider`].
 pub fn hash_certificate(cert: &CertificateDer) -> Vec<u8> {
-    let hash = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
-    hash.as_ref().to_vec()
+    use rustls::crypto::hash::HashAlgorithm;
+    use rustls::SupportedCipherSuite;
+
+    let provider = CryptoProvider::get_default()
+        .expect("no CryptoProvider installed — call CryptoProvider::install_default() before use");
+    let hash = provider
+        .cipher_suites
+        .iter()
+        .find_map(|cs| {
+            let common = match cs {
+                SupportedCipherSuite::Tls13(cs) => &cs.common,
+                SupportedCipherSuite::Tls12(cs) => &cs.common,
+            };
+            (common.hash_provider.algorithm() == HashAlgorithm::SHA256)
+                .then_some(common.hash_provider)
+        })
+        .expect("installed CryptoProvider has no SHA-256 cipher suite");
+    hash.hash(cert.as_ref()).as_ref().to_vec()
 }

@@ -107,6 +107,20 @@ rustls = [
     "any_tls",
 ]
 
+## Use [rustls](https://crates.io/crates/rustls) for tls without a bundled crypto provider
+##
+## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
+##
+## The consumer must install their own [`CryptoProvider`] before any TLS use.
+## See `rustls` feature for the default ring-based variant.
+rustls-base = [
+    "pingora-core/rustls-base",
+    "pingora-proxy?/rustls-base",
+    "pingora-cache?/rustls-base",
+    "pingora-load-balancing?/rustls-base",
+    "any_tls",
+]
+
 #! ### Pingora extensions
 
 ## Include the [proxy](crate::proxy) module
