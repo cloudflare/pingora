@@ -25,3 +25,20 @@ Upon receiving SIGTERM, the server will notify all its services to shutdown, wai
 
 ### SIGQUIT: graceful upgrade
 Similar to SIGTERM, but the server will also transfer all its listening sockets to a new Pingora server so that there is no downtime during the upgrade. See the [graceful upgrade](graceful.md) section for more details.
+
+## Execution Phases 
+
+A Pingora server broadcasts [ExecutionPhase](../../pingora-core/src/server/mod.rs#L60) messages when transitioning between running states. Users can
+subscribe to receive updates by calling `Server::watch_execution_phase(&self)`.
+
+Note that Pingora internally manages the creation and shutdown of the tokio Runtime, which is only started as
+part of the `Server::run_forever()` method. For transition states where the internal runtime is active, a
+runtime handle is passed along with the phase, allowing you to spawn tasks or interact with the async 
+runtime. These states are:
+
+- `ExecutionPhase::Running`
+- `ExecutionPhase::GracefulUpgradeTransferringFds`
+- `ExecutionPhase::GracefulUpgradeCloseTimeout`
+- `ExecutionPhase::GracefulTerminate`
+
+A [simple example](../../pingora/examples/execution_phases.rs) of usage.
