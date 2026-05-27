@@ -102,13 +102,18 @@ impl Manager {
         }
     }
 
-    fn increase_weight(&self, key: u64, delta: usize) {
+    fn increase_weight(&self, key: u64, delta: usize, max_weight: Option<usize>) -> bool {
         let mut lru = self.lru.write();
         let Some(node) = lru.get_key_value_mut(&key) else {
-            return;
+            return false;
         };
-        node.1.size += delta;
-        self.used.fetch_add(delta, Ordering::Relaxed);
+        let incremented = node.1.size.saturating_add(delta);
+        let new_size = max_weight.map_or(incremented, |m| incremented.min(m).max(node.1.size));
+        debug_assert!(new_size >= node.1.size);
+        self.used
+            .fetch_add(new_size - node.1.size, Ordering::Relaxed);
+        node.1.size = new_size;
+        true
     }
 
     #[inline]
@@ -239,10 +244,17 @@ impl EvictionManager for Manager {
         &self,
         item: &CompactCacheKey,
         delta: usize,
-        _max_weight: Option<usize>,
+        max_weight: Option<usize>,
     ) -> Vec<CompactCacheKey> {
         let key = u64key(item);
-        self.increase_weight(key, delta);
+        if !self.increase_weight(key, delta, max_weight) {
+            self.insert(
+                key,
+                item.clone(),
+                max_weight.map_or(delta, |m| delta.min(m)).max(1),
+                false,
+            );
+        }
         self.evict()
     }
 
@@ -418,6 +430,39 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_increment_weight_adds_missing_item() {
+        let lru = Manager::new(4);
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 2, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 2);
+        assert_eq!(lru.total_items(), 1);
+
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let evicted = lru.increment_weight(&key2, 100, Some(3));
+        assert_eq!(evicted, vec![key1]);
+        assert!(lru.peek(&key2));
+        assert_eq!(lru.total_size(), 3);
+        assert_eq!(lru.total_items(), 1);
+    }
+
+    #[test]
+    fn test_increment_weight_admits_zero_and_does_not_shrink() {
+        let lru = Manager::new(10);
+
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 0, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 1);
+
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        assert!(lru.increment_weight(&key2, 3, None).is_empty());
+        assert!(lru.increment_weight(&key2, 100, Some(2)).is_empty());
+        assert_eq!(lru.total_size(), 4);
+        assert_eq!(lru.total_items(), 2);
     }
 
     #[test]

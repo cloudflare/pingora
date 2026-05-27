@@ -135,25 +135,37 @@ impl<T, const N: usize> Lru<T, N> {
     }
 
     /// Increment the weight associated with a given key, up to an optional max weight.
-    /// If a `max_weight` is provided, the weight cannot exceed this max weight. If the current
-    /// weight is higher than the max, it will be capped to the max.
     ///
-    /// Return the total new weight. 0 indicates the key did not exist.
-    pub fn increment_weight(&self, key: u64, delta: usize, max_weight: Option<usize>) -> usize {
+    /// If the key does not exist, it is admitted with data from `admit_data` and a weight
+    /// equal to `delta`, capped to `max_weight` when provided, and floored to 1. The
+    /// admission data is only constructed for missing keys; existing entries keep their
+    /// stored data unchanged.
+    ///
+    /// If a `max_weight` is provided, the weight cannot grow beyond this max weight. If the
+    /// current weight is higher than the max, the current weight is retained.
+    ///
+    /// Return the total new weight.
+    pub fn increment_weight<F>(
+        &self,
+        key: u64,
+        admit_data: F,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> usize
+    where
+        F: FnOnce() -> T,
+    {
         let shard = get_shard(key, N);
         let unit = &mut self.units[shard].write();
-        if let Some((old_weight, new_weight)) = unit.increment_weight(key, delta, max_weight) {
-            if new_weight >= old_weight {
-                self.weight
-                    .fetch_add(new_weight - old_weight, Ordering::Relaxed);
-            } else {
-                self.weight
-                    .fetch_sub(old_weight - new_weight, Ordering::Relaxed);
-            }
-            new_weight
-        } else {
-            0
+        let (old_weight, new_weight, admitted) =
+            unit.increment_weight(key, admit_data, delta, max_weight);
+        debug_assert!(new_weight >= old_weight);
+        self.weight
+            .fetch_add(new_weight - old_weight, Ordering::Relaxed);
+        if admitted {
+            self.incr_count(shard);
         }
+        new_weight
     }
 
     /// Promote the key to the head of the LRU
@@ -454,25 +466,44 @@ impl<T> LruUnit<T> {
         0
     }
 
-    /// Increase the weight of an existing key. Returns the new weight or 0 if the key did not
-    /// exist, along with the new weight (or 0).
+    /// Increase the weight of a key, admitting it if needed.
     ///
-    /// If a `max_weight` is provided, the weight cannot exceed this max weight. If the current
-    /// weight is higher than the max, it will be capped to the max.
-    pub fn increment_weight(
+    /// `admit_data` is only called when the key is not already tracked. Existing entries
+    /// keep their stored data unchanged.
+    ///
+    /// If a `max_weight` is provided, the weight cannot grow beyond this max weight. If the
+    /// current weight is higher than the max, the current weight is retained.
+    ///
+    /// Returns `(old_weight, new_weight, admitted)`, where `admitted` is true when a new
+    /// entry was inserted.
+    pub fn increment_weight<F>(
         &mut self,
         key: u64,
+        admit_data: F,
         delta: usize,
         max_weight: Option<usize>,
-    ) -> Option<(usize, usize)> {
+    ) -> (usize, usize, bool)
+    where
+        F: FnOnce() -> T,
+    {
         if let Some(node) = self.lookup_table.get_mut(&key) {
+            let incremented = node.weight.saturating_add(delta);
             let new_weight =
-                max_weight.map_or(node.weight + delta, |m| (node.weight + delta).min(m));
+                max_weight.map_or(incremented, |m| incremented.min(m).max(node.weight));
             let old_weight = Self::adjust_weight(node, &mut self.used_weight, new_weight);
             self.order.promote(node.list_index);
-            return Some((old_weight, new_weight));
+            return (old_weight, new_weight, false);
         }
-        None
+        let weight = max_weight.map_or(delta, |m| delta.min(m)).max(1);
+        self.used_weight += weight;
+        let list_index = self.order.push_head(key);
+        let node = Box::new(LruNode {
+            data: admit_data(),
+            list_index,
+            weight,
+        });
+        self.lookup_table.insert(key, node);
+        (0, weight, true)
     }
 
     pub fn access(&mut self, key: u64) -> bool {
@@ -735,18 +766,25 @@ mod test_lru {
     fn test_increment_weight() {
         let lru = Lru::<_, 2>::with_capacity(6, 10);
         lru.admit(1, 1, 1);
-        lru.increment_weight(1, 1, None);
+        assert_eq!(lru.increment_weight(1, || 1, 1, None), 2);
         assert_eq!(lru.weight(), 1 + 1);
+        assert_eq!(lru.len(), 1);
 
-        lru.increment_weight(0, 1000, None);
-        assert_eq!(lru.weight(), 1 + 1);
+        assert_eq!(lru.increment_weight(0, || 0, 1000, Some(3)), 3);
+        assert_eq!(lru.weight(), 1 + 1 + 3);
+        assert_eq!(lru.len(), 2);
+        assert_lru(&lru, &[0], 0);
+
+        assert_eq!(lru.increment_weight(4, || 4, 0, None), 1);
+        assert_eq!(lru.weight(), 1 + 1 + 3 + 1);
+        assert_eq!(lru.len(), 3);
 
         lru.admit(2, 2, 2);
-        lru.increment_weight(2, 2, None);
-        assert_eq!(lru.weight(), 1 + 1 + 2 + 2);
+        assert_eq!(lru.increment_weight(2, || 2, 2, None), 4);
+        assert_eq!(lru.weight(), 1 + 1 + 3 + 1 + 2 + 2);
 
-        lru.increment_weight(2, 2, Some(3));
-        assert_eq!(lru.weight(), 1 + 1 + 3);
+        assert_eq!(lru.increment_weight(2, || 2, 2, Some(3)), 4);
+        assert_eq!(lru.weight(), 1 + 1 + 3 + 1 + 4);
     }
 
     #[test]
@@ -1083,22 +1121,26 @@ mod test_lru_unit {
     fn test_increment_weight() {
         let mut lru = LruUnit::with_capacity(10);
         lru.admit(1, 1, 1);
-        lru.increment_weight(1, 1, None);
+        assert_eq!(lru.increment_weight(1, || 1, 1, None), (1, 2, false));
         assert_eq!(lru.used_weight(), 1 + 1);
 
-        lru.increment_weight(0, 1000, None);
-        assert_eq!(lru.used_weight(), 1 + 1);
+        assert_eq!(lru.increment_weight(0, || 0, 1000, Some(3)), (0, 3, true));
+        assert_eq!(lru.used_weight(), 1 + 1 + 3);
+        assert_lru(&lru, &[0, 1]);
+
+        assert_eq!(lru.increment_weight(4, || 4, 0, None), (0, 1, true));
+        assert_eq!(lru.used_weight(), 1 + 1 + 3 + 1);
 
         lru.admit(2, 2, 2);
-        lru.increment_weight(2, 2, None);
-        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2);
+        assert_eq!(lru.increment_weight(2, || 2, 2, None), (2, 4, false));
+        assert_eq!(lru.used_weight(), 1 + 1 + 3 + 1 + 2 + 2);
 
         lru.admit(3, 3, 3);
-        lru.increment_weight(3, 3, Some(5));
-        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2 + 3 + 2);
+        assert_eq!(lru.increment_weight(3, || 3, 3, Some(5)), (3, 5, false));
+        assert_eq!(lru.used_weight(), 1 + 1 + 3 + 1 + 2 + 2 + 3 + 2);
 
-        lru.increment_weight(3, 3, Some(3));
-        assert_eq!(lru.used_weight(), 1 + 1 + 2 + 2 + 3);
+        assert_eq!(lru.increment_weight(3, || 3, 3, Some(3)), (5, 5, false));
+        assert_eq!(lru.used_weight(), 1 + 1 + 3 + 1 + 2 + 2 + 3 + 2);
     }
 
     #[test]

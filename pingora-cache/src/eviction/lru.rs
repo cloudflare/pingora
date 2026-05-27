@@ -228,7 +228,8 @@ impl<const N: usize> EvictionManager for Manager<N> {
         max_weight: Option<usize>,
     ) -> Vec<CompactCacheKey> {
         let key = u64key(item);
-        self.0.increment_weight(key, delta, max_weight);
+        self.0
+            .increment_weight(key, || item.clone(), delta, max_weight);
         self.0
             .evict_to_limit()
             .into_iter()
@@ -588,6 +589,40 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_increment_weight_adds_missing_item() {
+        let lru = Manager::<1>::with_capacity(4, 10);
+
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 2, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 2);
+        assert_eq!(lru.total_items(), 1);
+
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let evicted = lru.increment_weight(&key2, 100, Some(3));
+        assert_eq!(evicted, vec![key1]);
+        assert!(lru.peek(&key2));
+        assert_eq!(lru.total_size(), 3);
+        assert_eq!(lru.total_items(), 1);
+    }
+
+    #[test]
+    fn test_increment_weight_admits_zero_and_does_not_shrink() {
+        let lru = Manager::<1>::with_capacity(10, 10);
+
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 0, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 1);
+
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        assert!(lru.increment_weight(&key2, 3, None).is_empty());
+        assert!(lru.increment_weight(&key2, 100, Some(2)).is_empty());
+        assert_eq!(lru.total_size(), 4);
+        assert_eq!(lru.total_items(), 2);
     }
 
     #[test]
