@@ -144,6 +144,12 @@ pub enum NoCacheReason {
     /// This request waited too long for the writer of the cache lock to finish, so this request will
     /// fetch from the origin without caching
     CacheLockTimeout,
+    /// This request retried cache lookup too many times after waiting behind cache locks, so this
+    /// request will fetch from the origin without caching.
+    CacheLockRetryLimit,
+    /// This request waited behind a cache lock, but the subsequent lookup still found a stale or
+    /// nearly expired asset, so this request will fetch from the origin without caching.
+    CacheLockIneffectiveRetry,
     /// Other custom defined reasons
     Custom(&'static str),
 }
@@ -164,6 +170,8 @@ impl NoCacheReason {
             UpstreamError => "UpstreamError",
             CacheLockGiveUp => "CacheLockGiveUp",
             CacheLockTimeout => "CacheLockTimeout",
+            CacheLockRetryLimit => "CacheLockRetryLimit",
+            CacheLockIneffectiveRetry => "CacheLockIneffectiveRetry",
             Custom(s) => s,
         }
     }
@@ -400,7 +408,10 @@ impl HttpCache {
                         Custom(reason) => lock_ctx.cache_lock.custom_lock_status(reason),
                         // should never happen, NeverEnabled shouldn't hold a lock
                         NeverEnabled => panic!("NeverEnabled holds a write lock"),
-                        CacheLockGiveUp | CacheLockTimeout => {
+                        CacheLockGiveUp
+                        | CacheLockTimeout
+                        | CacheLockRetryLimit
+                        | CacheLockIneffectiveRetry => {
                             panic!("CacheLock* are for cache lock readers only")
                         }
                     };

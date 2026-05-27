@@ -1802,6 +1802,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1816,6 +1817,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1834,6 +1836,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1863,6 +1866,10 @@ mod test_cache {
         let res = reqwest::Client::new()
             .get(url)
             .header("x-no-stale-revalidate", "true")
+            .header(
+                "x-set-cache-control",
+                "public, max-age=1, stale-while-revalidate=0",
+            )
             .send()
             .await
             .unwrap();
@@ -1878,6 +1885,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1893,6 +1904,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1906,6 +1921,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -2133,6 +2152,168 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_lock_ineffective_retry() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_ineffective_retry.txt";
+        let cache_control = "public, max-age=0, stale-while-revalidate=0";
+        let client = reqwest::Client::new();
+
+        let res = client
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0")
+            .header("x-set-cache-control", cache_control)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        const N_REQUESTS: usize = 6;
+        let mut handles = vec![];
+        for _ in 0..N_REQUESTS {
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                let res = client
+                    .get(url)
+                    .header("x-lock", "true")
+                    .header("x-set-sleep", "0.1")
+                    .header("x-set-cache-control", cache_control)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                let headers = res.headers();
+                let status = headers["x-cache-status"].to_str().unwrap().to_owned();
+                let lock_time_ms = headers
+                    .get("x-cache-lock-time-ms")
+                    .and_then(|ms| ms.to_str().ok().and_then(|s| s.parse::<u64>().ok()));
+                assert_eq!(res.text().await.unwrap(), "hello world");
+                (status, lock_time_ms)
+            }));
+        }
+
+        let mut waited_count = 0;
+        let mut ineffective_retry_count = 0;
+        for handle in handles {
+            let (status, lock_time_ms) = handle.await.unwrap();
+            if lock_time_ms.is_some() {
+                waited_count += 1;
+            }
+            if status == "no-cache" {
+                ineffective_retry_count += 1;
+            }
+        }
+
+        assert!(waited_count > 0, "at least one reader waited");
+        assert!(
+            ineffective_retry_count > 0,
+            "at least one reader should stop retrying and fetch without caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_retry_respects_force_fresh() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_retry_respects_force_fresh.txt";
+        let cache_control = "public, max-age=0, stale-while-revalidate=0";
+
+        let writer = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "0.2")
+                .header("x-set-cache-control", cache_control)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0.2")
+            .header("x-set-cache-control", cache_control)
+            .header("x-force-fresh", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert!(headers.get("x-cache-lock-time-ms").is_some());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_retry_respects_force_miss() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_retry_respects_force_miss.txt";
+        let cache_control = "public, max-age=60";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0")
+            .header("x-set-cache-control", cache_control)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let writer = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "0.2")
+                .header("x-set-cache-control", cache_control)
+                .header("x-force-miss", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(headers["x-upstream-status"], "200");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0.2")
+            .header("x-set-cache-control", cache_control)
+            .header("x-force-miss", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert!(headers.get("x-cache-lock-time-ms").is_some());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_cache_serve_stale_network_error() {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_cache_serve_stale_network_error.txt";
@@ -2340,6 +2521,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2356,6 +2538,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2382,6 +2565,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2800,6 +2984,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2814,6 +2999,7 @@ mod test_cache {
         let res = reqwest::Client::new()
             .get(url)
             .header("x-lock", "true")
+            .header("x-set-cache-control", "public, max-age=60")
             .send()
             .await
             .unwrap();

@@ -18,12 +18,15 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
+use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+const MAX_CACHE_LOCK_RETRIES: usize = 2;
+const CACHE_LOCK_NEAR_EXPIRY_WINDOW: Duration = Duration::from_secs(1);
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -81,8 +84,9 @@ where
         }
 
         // cache lookup logic
+        let mut cache_lock_retries = 0;
+        let mut retried_cache_lock = false;
         loop {
-            // for cache lock, TODO: cap the max number of loops
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
@@ -118,7 +122,8 @@ where
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        let now = SystemTime::now();
+                        let is_fresh = meta.is_fresh(now);
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
@@ -147,10 +152,19 @@ where
                                 HitStatus::ForceExpired
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
-                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
                         };
 
                         hit_status_opt = Some(hit_status);
+
+                        if retried_cache_lock
+                            && !hit_status.is_treated_as_miss()
+                            && self.cache_lock_retry_found_ineffective_asset(
+                                session, ctx, &meta, now, hit_status,
+                            )
+                        {
+                            break None;
+                        }
 
                         // init cache for hit / stale
                         session.cache.cache_found(meta, handler, hit_status);
@@ -162,6 +176,14 @@ where
                             // Another request is filling the cache; try waiting til that's done and retry.
                             let lock_status = session.cache.cache_lock_wait().await;
                             if self.handle_lock_status(session, ctx, lock_status) {
+                                if self.cache_lock_retry_limit_exceeded(
+                                    session,
+                                    ctx,
+                                    &mut cache_lock_retries,
+                                ) {
+                                    break None;
+                                }
+                                retried_cache_lock = true;
                                 continue;
                             } else {
                                 break None;
@@ -196,6 +218,14 @@ where
                             if !will_serve_stale {
                                 let lock_status = session.cache.cache_lock_wait().await;
                                 if self.handle_lock_status(session, ctx, lock_status) {
+                                    if self.cache_lock_retry_limit_exceeded(
+                                        session,
+                                        ctx,
+                                        &mut cache_lock_retries,
+                                    ) {
+                                        break None;
+                                    }
+                                    retried_cache_lock = true;
                                     continue;
                                 } else {
                                     break None;
@@ -949,6 +979,59 @@ where
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
         }
+    }
+
+    fn cache_lock_retry_limit_exceeded(
+        &self,
+        session: &mut Session,
+        ctx: &SV::CTX,
+        cache_lock_retries: &mut usize,
+    ) -> bool
+    where
+        SV: ProxyHttp,
+    {
+        *cache_lock_retries += 1;
+        if *cache_lock_retries <= MAX_CACHE_LOCK_RETRIES {
+            return false;
+        }
+
+        warn!(
+            "Cache lock retry limit exceeded, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session.cache.disable(NoCacheReason::CacheLockRetryLimit);
+        true
+    }
+
+    fn cache_lock_retry_found_ineffective_asset(
+        &self,
+        session: &mut Session,
+        ctx: &mut SV::CTX,
+        meta: &CacheMeta,
+        now: SystemTime,
+        hit_status: HitStatus,
+    ) -> bool
+    where
+        SV: ProxyHttp,
+    {
+        let stale_without_stale_while_revalidate = !(hit_status.is_fresh()
+            || meta.serve_stale_while_revalidate(now)
+                && self.inner.should_serve_stale(session, ctx, None));
+        let near_expired = matches!(hit_status, HitStatus::Fresh)
+            && meta.fresh_until() <= now + CACHE_LOCK_NEAR_EXPIRY_WINDOW;
+
+        if !stale_without_stale_while_revalidate && !near_expired {
+            return false;
+        }
+
+        debug!(
+            "Cache lock retry found stale or near-expired asset, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session
+            .cache
+            .disable(NoCacheReason::CacheLockIneffectiveRetry);
+        true
     }
 }
 
