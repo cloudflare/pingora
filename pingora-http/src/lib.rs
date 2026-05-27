@@ -784,34 +784,7 @@ fn normalize_field_value(raw: bytes::Bytes) -> bytes::Bytes {
         return bytes::Bytes::from(replaced);
     };
 
-    // `[u8]` has no stable `trim`. Trim all ASCII whitespace at segment
-    // boundaries so the trailing `\r` of each CRLF (we split on `\n`) is
-    // absorbed into the obs-fold collapse along with the fold's SP/HTAB run.
-    fn trim_start(mut s: &[u8]) -> &[u8] {
-        while let [first, rest @ ..] = s {
-            if first.is_ascii_whitespace() {
-                s = rest;
-            } else {
-                break;
-            }
-        }
-        s
-    }
-    fn trim_end(mut s: &[u8]) -> &[u8] {
-        while let [rest @ .., last] = s {
-            if last.is_ascii_whitespace() {
-                s = rest;
-            } else {
-                break;
-            }
-        }
-        s
-    }
-    fn trim(s: &[u8]) -> &[u8] {
-        trim_start(trim_end(s))
-    }
-
-    // Mid-segment CRs (and NULs) — which the trim helpers can't reach because
+    // Mid-segment CRs (and NULs) — which boundary trimming can't reach because
     // they're not at a segment boundary — are replaced with SP at copy time
     // per RFC 9110 section 5.5. Empty continuations contribute no SP, so
     // leading/trailing newlines don't introduce spurious whitespace.
@@ -822,11 +795,14 @@ fn normalize_field_value(raw: bytes::Bytes) -> bytes::Bytes {
         );
     }
 
-    let head = trim_end(&raw[..first_nl]);
+    // Trim ASCII whitespace at segment boundaries (we split on `\n`) so the
+    // trailing `\r` of each CRLF is absorbed into the obs-fold collapse along
+    // with the fold's SP/HTAB run.
+    let head = raw[..first_nl].trim_ascii_end();
     let mut unfolded = Vec::with_capacity(raw.len());
     push_with_replacement(&mut unfolded, head);
     for line in raw[first_nl + 1..].split(|b| *b == b'\n') {
-        let line = trim(line);
+        let line = line.trim_ascii();
         if line.is_empty() {
             continue;
         }
