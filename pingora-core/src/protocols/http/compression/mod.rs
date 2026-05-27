@@ -804,24 +804,7 @@ fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) 
         existing
             .as_bytes()
             .split(|b| *b == b',')
-            .map(|mut v| {
-                // This is equivalent to slice.trim_ascii() which is unstable
-                while let [first, rest @ ..] = v {
-                    if first.is_ascii_whitespace() {
-                        v = rest;
-                    } else {
-                        break;
-                    }
-                }
-                while let [rest @ .., last] = v {
-                    if last.is_ascii_whitespace() {
-                        v = rest;
-                    } else {
-                        break;
-                    }
-                }
-                v
-            })
+            .map(|v| v.trim_ascii())
             .any(|v| v == b"*" || v.eq_ignore_ascii_case(value.as_ref()))
     });
 
