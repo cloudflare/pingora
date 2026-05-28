@@ -147,9 +147,6 @@ pub enum NoCacheReason {
     /// This request retried cache lookup too many times after waiting behind cache locks, so this
     /// request will fetch from the origin without caching.
     CacheLockRetryLimit,
-    /// This request waited behind a cache lock, but the subsequent lookup still found a stale or
-    /// nearly expired asset, so this request will fetch from the origin without caching.
-    CacheLockIneffectiveRetry,
     /// Other custom defined reasons
     Custom(&'static str),
 }
@@ -171,7 +168,6 @@ impl NoCacheReason {
             CacheLockGiveUp => "CacheLockGiveUp",
             CacheLockTimeout => "CacheLockTimeout",
             CacheLockRetryLimit => "CacheLockRetryLimit",
-            CacheLockIneffectiveRetry => "CacheLockIneffectiveRetry",
             Custom(s) => s,
         }
     }
@@ -294,6 +290,7 @@ pub struct LockCtx {
     pub lock: Option<Locked>,
     pub cache_lock: &'static CacheKeyLockImpl,
     pub wait_timeout: Option<Duration>,
+    pub max_retries: Option<usize>,
 }
 
 // Fields like storage handlers that are needed only when cache is enabled (or bypassing).
@@ -323,7 +320,10 @@ struct HttpCacheInner {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct CacheOptionOverrides {
+    /// How long a cache lock reader should wait before giving up.
     pub wait_timeout: Option<Duration>,
+    /// How many times a cache lock reader should retry lookup after waiting on a lock.
+    pub max_lock_retries: Option<usize>,
 }
 
 impl HttpCache {
@@ -408,10 +408,7 @@ impl HttpCache {
                         Custom(reason) => lock_ctx.cache_lock.custom_lock_status(reason),
                         // should never happen, NeverEnabled shouldn't hold a lock
                         NeverEnabled => panic!("NeverEnabled holds a write lock"),
-                        CacheLockGiveUp
-                        | CacheLockTimeout
-                        | CacheLockRetryLimit
-                        | CacheLockIneffectiveRetry => {
+                        CacheLockGiveUp | CacheLockTimeout | CacheLockRetryLimit => {
                             panic!("CacheLock* are for cache lock readers only")
                         }
                     };
@@ -505,12 +502,17 @@ impl HttpCache {
             CachePhase::Disabled(_) => {
                 self.phase = CachePhase::Uninit;
 
+                let wait_timeout = option_overrides
+                    .as_ref()
+                    .and_then(|overrides| overrides.wait_timeout);
+                let max_retries = option_overrides
+                    .as_ref()
+                    .and_then(|overrides| overrides.max_lock_retries);
                 let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                     cache_lock,
                     lock: None,
-                    wait_timeout: option_overrides
-                        .as_ref()
-                        .and_then(|overrides| overrides.wait_timeout),
+                    wait_timeout,
+                    max_retries,
                 });
 
                 self.inner = Some(Box::new(HttpCacheInner {
@@ -555,10 +557,17 @@ impl HttpCache {
                 {
                     panic!("lock already set when resetting cache lock")
                 } else {
+                    let wait_timeout = option_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.wait_timeout);
+                    let max_retries = option_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.max_lock_retries);
                     let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                         cache_lock,
                         lock: None,
-                        wait_timeout: option_overrides.and_then(|overrides| overrides.wait_timeout),
+                        wait_timeout,
+                        max_retries,
                     });
                     inner_enabled.lock_ctx = lock_ctx;
                 }
@@ -1401,6 +1410,14 @@ impl HttpCache {
                 .and_then(|l| l.lock.as_ref()),
             Some(Locked::Write(_))
         )
+    }
+
+    /// Maximum number of cache lock retries configured for this request.
+    pub fn cache_lock_max_retries(&self) -> Option<usize> {
+        self.inner_enabled()
+            .lock_ctx
+            .as_ref()
+            .and_then(|l| l.max_retries)
     }
 
     /// Take the write lock from this request to transfer it to another one.

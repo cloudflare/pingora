@@ -18,15 +18,14 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{CacheMeta, ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
+use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-const MAX_CACHE_LOCK_RETRIES: usize = 2;
-const CACHE_LOCK_NEAR_EXPIRY_WINDOW: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -85,7 +84,6 @@ where
 
         // cache lookup logic
         let mut cache_lock_retries = 0;
-        let mut retried_cache_lock = false;
         loop {
             match session.cache.cache_lookup().await {
                 Ok(res) => {
@@ -157,15 +155,6 @@ where
 
                         hit_status_opt = Some(hit_status);
 
-                        if retried_cache_lock
-                            && !hit_status.is_treated_as_miss()
-                            && self.cache_lock_retry_found_ineffective_asset(
-                                session, ctx, &meta, now, hit_status,
-                            )
-                        {
-                            break None;
-                        }
-
                         // init cache for hit / stale
                         session.cache.cache_found(meta, handler, hit_status);
                     }
@@ -183,7 +172,6 @@ where
                                 ) {
                                     break None;
                                 }
-                                retried_cache_lock = true;
                                 continue;
                             } else {
                                 break None;
@@ -225,7 +213,6 @@ where
                                     ) {
                                         break None;
                                     }
-                                    retried_cache_lock = true;
                                     continue;
                                 } else {
                                     break None;
@@ -991,7 +978,11 @@ where
         SV: ProxyHttp,
     {
         *cache_lock_retries += 1;
-        if *cache_lock_retries <= MAX_CACHE_LOCK_RETRIES {
+        let max_retries = session
+            .cache
+            .cache_lock_max_retries()
+            .unwrap_or(DEFAULT_MAX_CACHE_LOCK_RETRIES);
+        if *cache_lock_retries <= max_retries {
             return false;
         }
 
@@ -1000,37 +991,6 @@ where
             self.inner.request_summary(session, ctx)
         );
         session.cache.disable(NoCacheReason::CacheLockRetryLimit);
-        true
-    }
-
-    fn cache_lock_retry_found_ineffective_asset(
-        &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
-        meta: &CacheMeta,
-        now: SystemTime,
-        hit_status: HitStatus,
-    ) -> bool
-    where
-        SV: ProxyHttp,
-    {
-        let stale_without_stale_while_revalidate = !(hit_status.is_fresh()
-            || meta.serve_stale_while_revalidate(now)
-                && self.inner.should_serve_stale(session, ctx, None));
-        let near_expired = matches!(hit_status, HitStatus::Fresh)
-            && meta.fresh_until() <= now + CACHE_LOCK_NEAR_EXPIRY_WINDOW;
-
-        if !stale_without_stale_while_revalidate && !near_expired {
-            return false;
-        }
-
-        debug!(
-            "Cache lock retry found stale or near-expired asset, {}",
-            self.inner.request_summary(session, ctx)
-        );
-        session
-            .cache
-            .disable(NoCacheReason::CacheLockIneffectiveRetry);
         true
     }
 }

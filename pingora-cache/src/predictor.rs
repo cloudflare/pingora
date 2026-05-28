@@ -126,7 +126,6 @@ where
             | CacheLockGiveUp
             | CacheLockTimeout
             | CacheLockRetryLimit
-            | CacheLockIneffectiveRetry
             | DeclinedToUpstream
             | UpstreamError
             | PredictedResponseTooLarge => {
