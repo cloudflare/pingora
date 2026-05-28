@@ -121,8 +121,11 @@ impl<const N: usize> Manager<N> {
             nodes.push(SerdeHelperNode(node.clone(), size));
         });
         let mut ser = Serializer::new(vec![]);
+        // Use the captured snapshot length for the MessagePack array header.
+        // Re-reading shard_len() here can race with concurrent mutations and
+        // emit a length that does not match the serialized nodes.
         let mut seq = ser
-            .serialize_seq(Some(self.0.shard_len(shard)))
+            .serialize_seq(Some(nodes.len()))
             .or_err(InternalError, "fail to serialize node")?;
         for node in nodes {
             seq.serialize_element(&node).unwrap(); // write to vec, safe
