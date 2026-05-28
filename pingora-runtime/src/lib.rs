@@ -167,6 +167,8 @@ pub struct Dial9S3UploadOpts {
     pub prefix: Option<String>,
     /// Optional region override.
     pub region: Option<String>,
+    /// Optional instance identifier included in uploaded object keys.
+    pub instance_path: Option<String>,
     /// Optional pre-built S3 client for custom credentials or endpoints.
     pub client: Option<aws_sdk_s3::Client>,
 }
@@ -180,6 +182,7 @@ impl Dial9S3UploadOpts {
             service_name: service_name.into(),
             prefix: None,
             region: None,
+            instance_path: None,
             client: None,
         }
     }
@@ -193,6 +196,12 @@ impl Dial9S3UploadOpts {
     /// Set the AWS region override.
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
+        self
+    }
+
+    /// Set the instance identifier included in uploaded object keys.
+    pub fn with_instance_path(mut self, instance_path: impl Into<String>) -> Self {
+        self.instance_path = Some(instance_path.into());
         self
     }
 
@@ -350,7 +359,8 @@ fn build_dial9_runtime(
             .bucket(s3_upload.bucket.clone())
             .service_name(s3_upload.service_name.clone())
             .maybe_prefix(s3_upload.prefix.clone())
-            .maybe_region(s3_upload.region.clone());
+            .maybe_region(s3_upload.region.clone())
+            .maybe_instance_path(s3_upload.instance_path.clone());
         let traced = traced.with_s3_uploader(s3_config.build());
         if let Some(client) = s3_upload.client.clone() {
             return traced
