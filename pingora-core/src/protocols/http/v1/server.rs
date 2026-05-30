@@ -1556,7 +1556,13 @@ static REQUEST_LINE_REGEX: Lazy<Regex> =
 
 // the chars httparse considers illegal in URL
 // Almost https://url.spec.whatwg.org/#query-percent-encode-set + {}
-const URI_ESC_CHARSET: &AsciiSet = &CONTROLS.add(b' ').add(b'<').add(b'>').add(b'"');
+const URI_ESC_CHARSET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'<')
+    .add(b'>')
+    .add(b'"')
+    .add(b'[')
+    .add(b']');
 
 fn escape_illegal_request_line(buf: &BytesMut) -> Option<BytesMut> {
     if let Some(captures) = REQUEST_LINE_REGEX.captures(buf) {
@@ -2711,6 +2717,16 @@ mod tests_stream {
         assert_eq!(
             &output,
             &b"GET /a?q=%3C%22b%20c%22%3E HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]
+        );
+
+        // legacy clients can send JSON array query values with bare brackets
+        let input = BytesMut::from(
+            &b"GET /a?ids=[\"123\"]&fields=[\"id\",\"name\"] HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..],
+        );
+        let output = escape_illegal_request_line(&input).unwrap();
+        assert_eq!(
+            &output,
+            &b"GET /a?ids=%5B%22123%22%5D&fields=%5B%22id%22,%22name%22%5D HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]
         );
 
         // in path
