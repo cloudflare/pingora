@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::hash::Hash;
+use core::hash::{Hash, Hasher};
 use lru::LruCache;
-use parking_lot::RwLock;
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use parking_lot::Mutex;
+use std::collections::hash_map::DefaultHasher;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
-use thread_local::ThreadLocal;
 use tokio::sync::Notify;
 
 pub struct Node<T> {
     pub close_notifier: Arc<Notify>,
     pub meta: T,
+    order: u64,
 }
 
 impl<T> Node<T> {
@@ -31,6 +31,7 @@ impl<T> Node<T> {
         Node {
             close_notifier: Arc::new(Notify::new()),
             meta,
+            order: 0,
         }
     }
 
@@ -39,12 +40,28 @@ impl<T> Node<T> {
     }
 }
 
+/// Number of independent LRU shards. Independent of the `N_SHARDS` constant
+/// in `crate::connection`. `pub` only so the in-crate benchmark can use it.
+pub const N_SHARDS: usize = 16;
+
+/// Bounded, key-sharded LRU used to age out idle connections.
+///
+/// Each key is hashed into one of [`N_SHARDS`] shards, so the same key
+/// always lands in the same shard. `put` and `pop` each take one shard
+/// lock on the fast path. When occupancy exceeds `size`, one caller drains
+/// the overflow globally in a single batch.
 pub struct Lru<K, T>
 where
     K: Send,
     T: Send,
 {
-    lru: RwLock<ThreadLocal<RefCell<LruCache<K, Node<T>>>>>,
+    /// Per-shard caches. Individually unbounded; global cap enforced via `len`.
+    lrus: [Mutex<LruCache<K, Node<T>>>; N_SHARDS],
+    /// Total live entries across shards. Lower `order` = older entry.
+    len: AtomicUsize,
+    /// Monotonic stamp assigned at insert; used to compare age across shards.
+    order: AtomicU64,
+    /// Global capacity. Eviction runs when `len` exceeds this.
     size: usize,
     drain: AtomicBool,
 }
@@ -56,75 +73,121 @@ where
 {
     pub fn new(size: usize) -> Self {
         Lru {
-            lru: RwLock::new(ThreadLocal::new()),
+            lrus: std::array::from_fn(|_| Mutex::new(LruCache::unbounded())),
+            len: AtomicUsize::new(0),
+            order: AtomicU64::new(0),
             size,
             drain: AtomicBool::new(false),
         }
     }
 
-    // put a node in and return the meta of the replaced node
-    pub fn put(&self, key: K, value: Node<T>) -> Option<T> {
-        if self.drain.load(Relaxed) {
-            value.notify_close(); // sort of hack to simulate being evicted right away
-            return None;
-        }
-        let lru = self.lru.read(); /* read lock */
-        let lru_cache = &mut *(lru
-            .get_or(|| RefCell::new(LruCache::unbounded()))
-            .borrow_mut());
-        lru_cache.put(key, value);
-        if lru_cache.len() > self.size {
-            match lru_cache.pop_lru() {
-                Some((_, v)) => {
-                    // TODO: drop the lock here?
-                    v.notify_close();
-                    return Some(v.meta);
-                }
-                None => return None,
-            }
-        }
-        None
-        /* read lock dropped */
+    #[inline]
+    fn shard(&self, key: &K) -> &Mutex<LruCache<K, Node<T>>> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.lrus[(hasher.finish() as usize) % N_SHARDS]
     }
 
-    pub fn add(&self, key: K, meta: T) -> (Arc<Notify>, Option<T>) {
+    /// Drain to `size - headroom` by globally oldest `order`.
+    ///
+    /// Holds every shard lock for the duration to serialize concurrent
+    /// evictors and prevent victim-selection races. Returns the metas of
+    /// evicted nodes; `notify_close` has fired on each before return.
+    fn evict_lru(&self) -> Vec<T> {
+        // Fast path: another evictor may have already drained the overflow.
+        if self.len.load(Relaxed) <= self.size {
+            return Vec::new();
+        }
+
+        let headroom = self.evict_headroom();
+        let drain_target = self.size.saturating_sub(headroom);
+        let mut lrus: Vec<_> = self.lrus.iter().map(|lru| lru.lock()).collect();
+        // A single over-capacity insert usually drains headroom + 1 entries.
+        // Concurrent inserts can grow the batch further, so this is only a hint.
+        let mut evicted_metas = Vec::with_capacity(headroom + 1);
+        while self.len.load(Relaxed) > drain_target {
+            let mut oldest = None;
+            for (index, lru) in lrus.iter().enumerate() {
+                if let Some((_, node)) = lru.peek_lru() {
+                    if oldest.is_none_or(|(_, order)| node.order < order) {
+                        oldest = Some((index, node.order));
+                    }
+                }
+            }
+
+            let Some((index, _)) = oldest else { break };
+            let Some((_, evicted)) = lrus[index].pop_lru() else {
+                break;
+            };
+            self.len.fetch_sub(1, Relaxed);
+            evicted.notify_close();
+            evicted_metas.push(evicted.meta);
+        }
+        evicted_metas
+    }
+
+    /// Headroom below `size`. Amortizes the all-shards-lock cost over
+    /// several subsequent over-capacity inserts. Capped at [`N_SHARDS`]
+    /// and `size / 4` so tiny pools keep tight semantics.
+    #[inline]
+    fn evict_headroom(&self) -> usize {
+        N_SHARDS.min(self.size / 4)
+    }
+
+    /// Insert `value` for `key`. Returns evicted metas, oldest first.
+    ///
+    /// `len` is only incremented on new inserts (not replacements), so
+    /// over-capacity eviction tracks live entries.
+    pub fn put(&self, key: K, mut value: Node<T>) -> Vec<T> {
+        if self.drain.load(Relaxed) {
+            value.notify_close(); // sort of hack to simulate being evicted right away
+            return Vec::new();
+        }
+
+        value.order = self.order.fetch_add(1, Relaxed);
+        if self.shard(&key).lock().put(key, value).is_some() {
+            // replaced
+            return Vec::new();
+        }
+        if self.len.fetch_add(1, Relaxed) + 1 > self.size {
+            return self.evict_lru();
+        }
+        Vec::new()
+    }
+
+    pub fn add(&self, key: K, meta: T) -> (Arc<Notify>, Vec<T>) {
         let node = Node::new(meta);
         let notifier = node.close_notifier.clone();
-        // TODO: check if the key is already in it
         (notifier, self.put(key, node))
     }
 
     pub fn pop(&self, key: &K) -> Option<Node<T>> {
-        let lru = self.lru.read(); /* read lock */
-        let lru_cache = &mut *(lru
-            .get_or(|| RefCell::new(LruCache::unbounded()))
-            .borrow_mut());
-        lru_cache.pop(key)
-        /* read lock dropped */
+        let popped = self.shard(key).lock().pop(key);
+        if popped.is_some() {
+            self.len.fetch_sub(1, Relaxed);
+        }
+        popped
     }
 
     #[allow(dead_code)]
     pub fn drain(&self) {
         self.drain.store(true, Relaxed);
 
-        /* drain need to go through all the local lru cache objects
-         * acquire an exclusive write lock to make it safe */
-        let mut lru = self.lru.write(); /* write lock */
-        let lru_cache_iter = lru.iter_mut();
-        for lru_cache_rc in lru_cache_iter {
-            let mut lru_cache = lru_cache_rc.borrow_mut();
+        for lru in &self.lrus {
+            let mut lru_cache = lru.lock();
             for (_, item) in lru_cache.iter() {
                 item.notify_close();
             }
             lru_cache.clear();
         }
-        /* write lock dropped */
+        self.len.store(0, Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use log::debug;
 
     #[tokio::test]
@@ -156,6 +219,22 @@ mod tests {
             _ = notifier4.notified() => {debug!("notifier4"); 4},
         };
         assert_eq!(closed_item, 2);
+    }
+
+    #[tokio::test]
+    async fn test_replaced_node_is_not_treated_as_eviction() {
+        let pool: Lru<i32, i32> = Lru::new(2);
+        let (replaced_notifier, evicted) = pool.add(1, 10);
+        assert!(evicted.is_empty());
+
+        let (_, evicted) = pool.add(1, 20);
+        assert!(evicted.is_empty());
+        assert_eq!(pool.pop(&1).unwrap().meta, 20);
+
+        assert!(
+            replaced_notifier.notified().now_or_never().is_none(),
+            "replaced node should not notify close"
+        );
     }
 
     #[tokio::test]

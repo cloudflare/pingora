@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::HttpSession;
-use crate::connectors::{ConnectorOptions, TransportConnector};
+use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, TransportConnector};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
@@ -281,6 +281,7 @@ pub struct Connector {
     idle_pool: Arc<ConnectionPool<ConnectionRef>>,
     // the pool of h2 connections that have ongoing streams
     in_use_pool: InUsePool,
+    pool_callback: Option<PoolCallback>,
 }
 
 impl Connector {
@@ -289,11 +290,15 @@ impl Connector {
         let pool_size = options
             .as_ref()
             .map_or(DEFAULT_POOL_SIZE, |o| o.keepalive_pool_size);
+        let pool_callback = options
+            .as_ref()
+            .and_then(|o| o.keepalive_pool_callback.clone());
         // connection offload is handled by the [TransportConnector]
         Connector {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
+            pool_callback,
         }
     }
 
@@ -456,11 +461,25 @@ impl Connector {
             };
             let closed = conn.0.closed.clone();
             let (notify_evicted, watch_use) = self.idle_pool.put(&meta, conn);
+            let idle_meta = IdleConnection::new(meta);
             let pool = self.idle_pool.clone(); //clone the arc
+            let keepalive_pool_callback = self.pool_callback.clone();
             let rt = pingora_runtime::current_handle();
             rt.spawn(async move {
-                pool.idle_timeout(&meta, idle_timeout, notify_evicted, closed, watch_use)
-                    .await;
+                if pool
+                    .idle_timeout(
+                        &idle_meta.connection,
+                        idle_timeout,
+                        notify_evicted,
+                        closed,
+                        watch_use,
+                    )
+                    .await
+                {
+                    if let Some(callback) = keepalive_pool_callback {
+                        callback(idle_meta.elapsed());
+                    }
+                }
             });
         } else {
             self.in_use_pool.insert(reuse_hash, conn);

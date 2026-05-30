@@ -25,7 +25,7 @@ pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.8.0", path = "../pingora-http" }
 http = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 log = { workspace = true }
@@ -73,6 +73,7 @@ s2n = ["pingora-core/s2n", "pingora-cache/s2n", "any_tls"]
 openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["pingora-core/sentry"]
+patched_http1 = ["pingora-core/patched_http1"]
 upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]

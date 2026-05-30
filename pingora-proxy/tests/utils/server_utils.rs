@@ -43,9 +43,12 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -241,6 +244,16 @@ impl ProxyHttp for ExampleProxyHttps {
 
 pub struct ExampleProxyHttp {}
 
+static SUPPRESS_PROXY_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reset_suppress_proxy_warn_log_calls() {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.store(0, Ordering::Relaxed);
+}
+
+pub fn suppress_proxy_warn_log_calls() -> usize {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
+
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
@@ -380,6 +393,23 @@ impl ProxyHttp for ExampleProxyHttp {
         ctx: &mut CTX,
     ) -> Result<()> {
         connected_to_upstream_common(reused, digest, ctx)
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if session.get_header_bytes("x-test-suppress-proxy-warn-log") == b"true"
+            && context == ProxyWarnLogContext::UpstreamRetry
+        {
+            SUPPRESS_PROXY_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 }
 

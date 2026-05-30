@@ -22,14 +22,18 @@
 use clap::Parser;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+pub use pingora_runtime::RuntimeMetricsPollTimeHistogramScale;
+use pingora_runtime::{RuntimeMetricsOpts, RuntimeOpts};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::time::Duration;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
+const MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS: usize = 1024;
 
 /// The configuration file
 ///
@@ -72,6 +76,11 @@ pub struct ServerConf {
     pub listener_tasks_per_fd: usize,
     /// Allow work stealing between threads of the same service. Default `true`.
     pub work_stealing: bool,
+    /// Enable Tokio's experimental alternative timer on work-stealing service runtimes.
+    ///
+    /// Requires building with `--cfg tokio_unstable`. Ignored when
+    /// [`Self::work_stealing`] is disabled.
+    pub runtime_enable_alt_timer: bool,
     /// The path to CA file the SSL library should use. If empty, the default trust store location
     /// defined by the SSL library will be used.
     pub ca_file: Option<String>,
@@ -132,6 +141,32 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// Timeout durations greater than this threshold use Tokio's native timeout instead of
+    /// Pingora's fast timeout.
+    ///
+    /// This avoids retaining long-duration cancelled timers in Pingora's shared timer map until
+    /// their original deadline. When not set, defaults to 900 seconds (15 minutes). Set to `null`
+    /// to disable the Tokio fallback.
+    pub fast_timeout_to_tokio_threshold_seconds: Option<u64>,
+    /// Enable Tokio's poll-time histogram on runtimes created by this server.
+    ///
+    /// This adds two timestamp reads to every task poll, so it should be
+    /// enabled deliberately when investigating runtime latency. Requires
+    /// building with `--cfg tokio_unstable`.
+    pub runtime_metrics_poll_time_histogram: bool,
+    /// Bucket scale for Tokio's poll-time histogram.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled.
+    pub runtime_metrics_poll_time_histogram_scale: Option<RuntimeMetricsPollTimeHistogramScale>,
+    /// Width of the first Tokio poll-time histogram bucket in microseconds.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled.
+    pub runtime_metrics_poll_time_histogram_resolution_micros: Option<u64>,
+    /// Number of Tokio poll-time histogram buckets.
+    ///
+    /// Ignored unless [`Self::runtime_metrics_poll_time_histogram`] is enabled. Memory usage
+    /// scales with runtimes × workers × buckets, so values above 1024 are rejected.
+    pub runtime_metrics_poll_time_histogram_buckets: Option<usize>,
     /// When `daemon` is `true`, controls whether the parent process of the daemon fork waits for
     /// the child to signal readiness before exiting.
     ///
@@ -193,6 +228,7 @@ impl Default for ServerConf {
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
+            runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
@@ -202,6 +238,13 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(
+                pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
+            ),
+            runtime_metrics_poll_time_histogram: false,
+            runtime_metrics_poll_time_histogram_scale: None,
+            runtime_metrics_poll_time_histogram_resolution_micros: None,
+            runtime_metrics_poll_time_histogram_buckets: None,
             daemon_ready_timeout_seconds: None,
             daemon_wait_for_ready: false,
             daemon_notify_timeout_seconds: None,
@@ -312,7 +355,47 @@ impl ServerConf {
         if self.max_blocking_threads == Some(0) {
             return Error::e_explain(ReadError, "max_blocking_threads must be greater than zero");
         }
+        if self.runtime_metrics_poll_time_histogram_resolution_micros == Some(0) {
+            return Error::e_explain(
+                ReadError,
+                "runtime_metrics_poll_time_histogram_resolution_micros must be greater than zero",
+            );
+        }
+        if self.runtime_metrics_poll_time_histogram_buckets == Some(0) {
+            return Error::e_explain(
+                ReadError,
+                "runtime_metrics_poll_time_histogram_buckets must be greater than zero",
+            );
+        }
+        if self
+            .runtime_metrics_poll_time_histogram_buckets
+            .is_some_and(|buckets| buckets > MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS)
+        {
+            return Error::e_explain(
+                ReadError,
+                format!(
+                    "runtime_metrics_poll_time_histogram_buckets must be at most {MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS}"
+                ),
+            );
+        }
         Ok(self)
+    }
+
+    /// Build the default runtime options derived from this server configuration.
+    pub fn runtime_opts(&self) -> RuntimeOpts {
+        RuntimeOpts {
+            metrics: RuntimeMetricsOpts {
+                poll_time_histogram: self.runtime_metrics_poll_time_histogram,
+                poll_time_histogram_scale: self.runtime_metrics_poll_time_histogram_scale,
+                poll_time_histogram_resolution: self
+                    .runtime_metrics_poll_time_histogram_resolution_micros
+                    .map(Duration::from_micros),
+                poll_time_histogram_buckets: self.runtime_metrics_poll_time_histogram_buckets,
+            },
+            enable_alt_timer: self.runtime_enable_alt_timer,
+            #[cfg(feature = "dial9")]
+            dial9: None,
+        }
     }
 
     pub fn merge_with_opt(&mut self, opt: &Opt) {
@@ -368,6 +451,7 @@ mod tests {
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
+            runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
@@ -377,6 +461,13 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            fast_timeout_to_tokio_threshold_seconds: Some(
+                pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs(),
+            ),
+            runtime_metrics_poll_time_histogram: false,
+            runtime_metrics_poll_time_histogram_scale: None,
+            runtime_metrics_poll_time_histogram_resolution_micros: None,
+            runtime_metrics_poll_time_histogram_buckets: None,
             daemon_ready_timeout_seconds: None,
             daemon_wait_for_ready: false,
             daemon_notify_timeout_seconds: None,
@@ -417,6 +508,53 @@ version: 1
         assert_eq!(1, conf.version);
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
+        assert_eq!(
+            Some(pingora_timeout::fast_timeout::DEFAULT_FAST_TIMEOUT_TO_TOKIO_THRESHOLD.as_secs()),
+            conf.fast_timeout_to_tokio_threshold_seconds
+        );
+    }
+
+    #[test]
+    fn test_runtime_enable_alt_timer_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_enable_alt_timer: true
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert!(conf.runtime_enable_alt_timer);
+    }
+
+    #[test]
+    fn test_runtime_opts_from_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_enable_alt_timer: true
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_scale: log
+runtime_metrics_poll_time_histogram_resolution_micros: 20
+runtime_metrics_poll_time_histogram_buckets: 16
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        let opts = conf.runtime_opts();
+        assert!(opts.enable_alt_timer);
+        assert!(opts.metrics.poll_time_histogram);
+        assert_eq!(
+            Some(RuntimeMetricsPollTimeHistogramScale::Log),
+            opts.metrics.poll_time_histogram_scale
+        );
+        assert_eq!(
+            Some(Duration::from_micros(20)),
+            opts.metrics.poll_time_histogram_resolution
+        );
+        assert_eq!(Some(16), opts.metrics.poll_time_histogram_buckets);
+        #[cfg(feature = "dial9")]
+        assert!(opts.dial9.is_none());
     }
 
     #[test]
@@ -469,5 +607,74 @@ blocking_threads_ttl_seconds: 30
         let conf = ServerConf::from_yaml(conf_str).unwrap();
         assert_eq!(Some(64), conf.max_blocking_threads);
         assert_eq!(Some(30), conf.blocking_threads_ttl_seconds);
+    }
+
+    #[test]
+    fn test_fast_timeout_to_tokio_threshold_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+fast_timeout_to_tokio_threshold_seconds: 120
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(Some(120), conf.fast_timeout_to_tokio_threshold_seconds);
+    }
+
+    #[test]
+    fn test_fast_timeout_to_tokio_threshold_can_be_disabled() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+fast_timeout_to_tokio_threshold_seconds:
+        "#;
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(None, conf.fast_timeout_to_tokio_threshold_seconds);
+    }
+
+    #[test]
+    fn test_runtime_poll_time_histogram_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_scale: log
+runtime_metrics_poll_time_histogram_resolution_micros: 20
+runtime_metrics_poll_time_histogram_buckets: 16
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert!(conf.runtime_metrics_poll_time_histogram);
+        assert_eq!(
+            Some(RuntimeMetricsPollTimeHistogramScale::Log),
+            conf.runtime_metrics_poll_time_histogram_scale
+        );
+        assert_eq!(
+            Some(20),
+            conf.runtime_metrics_poll_time_histogram_resolution_micros
+        );
+        assert_eq!(Some(16), conf.runtime_metrics_poll_time_histogram_buckets);
+    }
+
+    #[test]
+    fn test_runtime_poll_time_histogram_bucket_limit() {
+        init_log();
+        let conf_str = format!(
+            r#"
+---
+version: 1
+runtime_metrics_poll_time_histogram: true
+runtime_metrics_poll_time_histogram_buckets: {}
+        "#,
+            MAX_RUNTIME_METRICS_POLL_TIME_HISTOGRAM_BUCKETS + 1
+        );
+
+        let result = ServerConf::from_yaml(&conf_str);
+        assert!(
+            result.is_err(),
+            "excessive runtime_metrics_poll_time_histogram_buckets should fail validation"
+        );
     }
 }

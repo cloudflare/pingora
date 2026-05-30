@@ -16,11 +16,10 @@
 
 use bytes::Bytes;
 use pingora_error::{Error, ErrorType::*, Result};
-use std::pin::Pin;
+use std::future::Future;
+use std::pin::{pin, Pin};
 use std::task::{ready, Context, Poll};
-use tokio::io::AsyncWrite;
-
-use crate::protocols::l4::stream::async_write_vec::poll_write_all_buf;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 enum HeaderWriteState {
     /// No write in progress
@@ -258,7 +257,9 @@ impl HeaderWriter {
             self.send_header_state.write_state
         {
             let size = original_size;
-            ready!(poll_write_all_buf(cx, stream.as_mut(), buf))
+            // Re-create tokio's stateless `write_all_buf` future per poll;
+            // progress is carried by `buf` (the caller-owned `Bytes`).
+            ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx))
                 .map_err(|e| Error::because(WriteError, "writing response header", e))?;
 
             // Write complete - transition to next state

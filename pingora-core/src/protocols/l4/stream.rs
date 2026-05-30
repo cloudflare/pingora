@@ -179,7 +179,7 @@ impl RawStreamWrapper {
             #[cfg(target_os = "linux")]
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
-            reusable_cmsg_space: nix::cmsg_space!(nix::sys::time::TimeSpec),
+            reusable_cmsg_space: nix::cmsg_space!(nix::sys::socket::Timestamps),
         }
     }
 
@@ -242,7 +242,8 @@ impl AsyncRead for RawStreamWrapper {
                             as *mut [u8])
                     };
                     let mut iov = [IoSliceMut::new(b)];
-                    rs_wrapper.reusable_cmsg_space.clear();
+
+                    rs_wrapper.reusable_cmsg_space.fill(0);
 
                     match s.try_io(Interest::READABLE, || {
                         recvmsg::<SockaddrStorage>(
@@ -255,7 +256,7 @@ impl AsyncRead for RawStreamWrapper {
                     }) {
                         Ok(r) => {
                             if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) = r
-                                .cmsgs()
+                                .cmsgs()?
                                 .find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_)))
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
@@ -489,7 +490,7 @@ impl Stream {
         if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             let timestamp_options = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
                 | TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE;
-            setsockopt(s.as_raw_fd(), sockopt::Timestamping, &timestamp_options)
+            setsockopt(&s, sockopt::Timestamping, &timestamp_options)
                 .or_err(InternalError, "failed to set SOF_TIMESTAMPING_RX_SOFTWARE")?;
             self.stream_mut().get_mut().enable_rx_ts(true);
         }
@@ -502,8 +503,11 @@ impl Stream {
         Ok(())
     }
 
-    /// Put Some data back to the head of the stream to be read again
-    pub(crate) fn rewind(&mut self, data: &[u8]) {
+    /// Put some data back to the head of the stream to be read again.
+    ///
+    /// This is useful when you've read data to detect a protocol (e.g., PROXY protocol)
+    /// but the data wasn't what you expected, so you need to "unread" it.
+    pub fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
             self.rewind_read_buf.push(data.to_vec());
         }
@@ -793,182 +797,6 @@ impl AsyncWrite for Stream {
         }
     }
 }
-
-pub mod async_write_vec {
-    use bytes::Buf;
-    use futures::ready;
-    use std::future::Future;
-    use std::io::IoSlice;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io;
-    use tokio::io::AsyncWrite;
-
-    /*
-        the missing write_buf https://github.com/tokio-rs/tokio/pull/3156#issuecomment-738207409
-        https://github.com/tokio-rs/tokio/issues/2610
-        In general vectored write is lost when accessing the trait object: Box<S: AsyncWrite>
-    */
-
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct WriteVec<'a, W, B> {
-        writer: &'a mut W,
-        buf: &'a mut B,
-    }
-
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct WriteVecAll<'a, W, B> {
-        writer: &'a mut W,
-        buf: &'a mut B,
-    }
-
-    pub trait AsyncWriteVec {
-        fn poll_write_vec<B: Buf>(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut B,
-        ) -> Poll<io::Result<usize>>;
-
-        fn write_vec<'a, B>(&'a mut self, src: &'a mut B) -> WriteVec<'a, Self, B>
-        where
-            Self: Sized,
-            B: Buf,
-        {
-            WriteVec {
-                writer: self,
-                buf: src,
-            }
-        }
-
-        fn write_vec_all<'a, B>(&'a mut self, src: &'a mut B) -> WriteVecAll<'a, Self, B>
-        where
-            Self: Sized,
-            B: Buf,
-        {
-            WriteVecAll {
-                writer: self,
-                buf: src,
-            }
-        }
-    }
-
-    impl<W, B> Future for WriteVec<'_, W, B>
-    where
-        W: AsyncWriteVec + Unpin,
-        B: Buf,
-    {
-        type Output = io::Result<usize>;
-
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-            let me = &mut *self;
-            Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf)
-        }
-    }
-
-    impl<W, B> Future for WriteVecAll<'_, W, B>
-    where
-        W: AsyncWriteVec + Unpin,
-        B: Buf,
-    {
-        type Output = io::Result<()>;
-
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            let me = &mut *self;
-            poll_write_vec_all_buf(ctx, Pin::new(&mut *me.writer), me.buf)
-        }
-    }
-
-    /// Primitive poll function to write ALL bytes from a buffer using vectored writes.
-    /// Keeps polling `poll_write_vec` until the entire buffer is written.
-    /// The buffer is advanced as bytes are written.
-    ///
-    /// Returns Poll::Ready(Ok(())) when all bytes are written.
-    /// Returns WriteZero error if poll_write_vec returns 0.
-    ///
-    /// This is essentially a polling form of tokio's
-    /// [`write_all_buf`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWriteExt.html#method.write_all_buf).
-    // TODO: we should be able to switch over to polling the future from tokio AsyncWriteExt directly,
-    // for now we continue to use the old trait.
-    pub fn poll_write_vec_all_buf<W, B>(
-        ctx: &mut Context<'_>,
-        mut writer: Pin<&mut W>,
-        buf: &mut B,
-    ) -> Poll<io::Result<()>>
-    where
-        W: AsyncWriteVec + ?Sized,
-        B: Buf,
-    {
-        while buf.has_remaining() {
-            let n = ready!(writer.as_mut().poll_write_vec(ctx, buf))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-
-    /// Primitive poll function to write ALL bytes from a buffer using regular writes.
-    /// Keeps polling `poll_write` until the entire buffer is written.
-    /// The buffer is advanced as bytes are written.
-    ///
-    /// Returns Poll::Ready(Ok(())) when all bytes are written.
-    /// Returns WriteZero error if poll_write returns 0.
-    ///
-    /// This is essentially a polling form of tokio's
-    /// [`write_all_buf`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncWriteExt.html#method.write_all_buf)
-    /// though we explicitly use non-vectored writes in this case for strict parity with the
-    /// original `write_all` method.
-    pub fn poll_write_all_buf<W, B>(
-        ctx: &mut Context<'_>,
-        mut writer: Pin<&mut W>,
-        buf: &mut B,
-    ) -> Poll<io::Result<()>>
-    where
-        W: AsyncWrite + ?Sized,
-        B: Buf,
-    {
-        while buf.has_remaining() {
-            let n = ready!(writer.as_mut().poll_write(ctx, buf.chunk()))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            buf.advance(n);
-        }
-        Poll::Ready(Ok(()))
-    }
-
-    /* from https://github.com/tokio-rs/tokio/blob/master/tokio-util/src/lib.rs#L177 */
-    impl<T> AsyncWriteVec for T
-    where
-        T: AsyncWrite,
-    {
-        fn poll_write_vec<B: Buf>(
-            self: Pin<&mut Self>,
-            ctx: &mut Context,
-            buf: &mut B,
-        ) -> Poll<io::Result<usize>> {
-            const MAX_BUFS: usize = 64;
-
-            if !buf.has_remaining() {
-                return Poll::Ready(Ok(0));
-            }
-
-            let n = if self.is_write_vectored() {
-                let mut slices = [IoSlice::new(&[]); MAX_BUFS];
-                let cnt = buf.chunks_vectored(&mut slices);
-                ready!(self.poll_write_vectored(ctx, &slices[..cnt]))?
-            } else {
-                ready!(self.poll_write(ctx, buf.chunk()))?
-            };
-
-            buf.advance(n);
-
-            Poll::Ready(Ok(n))
-        }
-    }
-}
-
-pub use async_write_vec::AsyncWriteVec;
 
 #[derive(Debug)]
 struct AccumulatedDuration {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use daemonize::{Daemonize, Outcome, Stdio};
+use daemonix::{Daemonize, Outcome, Stdio};
 use log::{debug, error, info};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use std::ffi::CString;

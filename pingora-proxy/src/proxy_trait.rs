@@ -22,6 +22,22 @@ use proxy_cache::range_filter::{self};
 use std::any::Any;
 use std::time::Duration;
 
+/// Context for proxy warning logs that can be suppressed by
+/// [`ProxyHttp::suppress_proxy_warn_log`].
+///
+/// These contexts are distinct from final proxy errors, which are handled by
+/// [`ProxyHttp::suppress_error_log`].
+///
+/// Experimental: this API may change or be removed until indicated otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProxyWarnLogContext {
+    /// A proxy upstream attempt failed with a retryable error.
+    UpstreamRetry,
+    /// A downstream error was ignored so cache fill could continue.
+    DownstreamCache,
+}
+
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
@@ -523,7 +539,33 @@ pub trait ProxyHttp {
     }
 
     /// A value of true means that the log message will be suppressed. The default value is false.
+    ///
+    /// See also: [`Self::suppress_proxy_warn_log`].
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, _error: &Error) -> bool {
+        false
+    }
+
+    /// A value of true means that the proxy warning log message will be suppressed.
+    /// The default value is false.
+    ///
+    /// This hook currently applies to retryable proxy upstream failures and downstream errors
+    /// ignored while cache fill continues. Final proxy errors are still handled by
+    /// [`Self::suppress_error_log`].
+    ///
+    /// Suppressing retry warning logs can remove the only per-retry audit record. Callers that
+    /// suppress these logs should provide alternative observability, such as metrics or logs in
+    /// their implementation of this hook.
+    ///
+    /// This hook runs inline on retry and cache-error paths, so implementations should be cheap.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        _context: ProxyWarnLogContext,
+    ) -> bool {
         false
     }
 

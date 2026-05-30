@@ -22,10 +22,15 @@ use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
+#[cfg(feature = "patched_http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "patched_http1")]
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
-use utils::server_utils::init;
+use utils::server_utils::{
+    init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+};
 
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
@@ -384,15 +389,18 @@ async fn test_dropped_conn_get() {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    reset_suppress_proxy_warn_log_calls();
     let res = client
         .get("http://127.0.0.1:6147/bad_lb")
         .header("x-port", port)
+        .header("x-test-suppress-proxy-warn-log", "true")
         .send()
         .await
         .unwrap();
 
     // retry gives 200
     assert_eq!(res.status(), StatusCode::OK);
+    assert!(suppress_proxy_warn_log_calls() > 0);
     let body = res.text().await.unwrap();
     assert_eq!(body, "dog!\n");
 }
@@ -750,6 +758,9 @@ async fn test_connect_close() {
     assert_eq!(body, "Hello World!\n");
 }
 
+// Authority-form CONNECT request targets require patched HTTP/1 parsing until
+// general request-target form support is available.
+#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_disallowed_h1() {
     init();
@@ -788,6 +799,7 @@ async fn test_connect_proxying_disallowed_h2() {
     }
 }
 
+#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_allowed_h1() {
     init();

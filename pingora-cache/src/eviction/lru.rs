@@ -19,7 +19,7 @@ use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
 use log::{info, warn};
-use pingora_error::{BError, ErrorType::*, OrErr, Result};
+use pingora_error::{BError, Error, ErrorType::*, OrErr, Result};
 use pingora_lru::Lru;
 use rand::Rng;
 use serde::de::SeqAccess;
@@ -60,6 +60,16 @@ impl<const N: usize> Manager<N> {
         watermark: Option<usize>,
     ) -> Self {
         Manager(Lru::with_capacity_and_watermark(limit, capacity, watermark))
+    }
+
+    /// Return the current total cache weight limit.
+    pub fn weight_limit(&self) -> usize {
+        self.0.weight_limit()
+    }
+
+    /// Set the total cache weight limit used by future eviction decisions.
+    pub fn set_weight_limit(&self, limit: usize) {
+        self.0.set_weight_limit(limit);
     }
 
     /// Get the number of shards
@@ -257,10 +267,21 @@ impl<const N: usize> EvictionManager for Manager<N> {
         .await
         .or_err(InternalError, "async blocking IO failure")??;
 
+        // Per-shard errors are isolated so a single failing shard does not abort
+        // the entire save and leave the remaining shards stale on disk.
+        let mut saved_shards = 0usize;
+        let mut failed_shards = 0usize;
         for i in 0..N {
-            let data = self.serialize_shard(i)?;
+            let data = match self.serialize_shard(i) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Failed to serialize shard {i}: {e}. Skipping shard.");
+                    failed_shards += 1;
+                    continue;
+                }
+            };
             let dir_path = dir_path.to_owned();
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 let dir_path = Path::new(&dir_path);
                 let final_path = dir_path.join(format!("{}.{i}", FILE_NAME));
                 // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
@@ -283,47 +304,104 @@ impl<const N: usize> EvictionManager for Manager<N> {
                     )
                 })
             })
-            .await
-            .or_err(InternalError, "async blocking IO failure")??;
+            .await;
+
+            match result {
+                Ok(Ok(())) => saved_shards += 1,
+                Ok(Err(e)) => {
+                    warn!("Failed to save shard {i}: {e}. Skipping shard.");
+                    failed_shards += 1;
+                }
+                Err(join_err) => {
+                    warn!(
+                        "Failed to save shard {i}: async blocking IO failure {join_err}. Skipping shard."
+                    );
+                    failed_shards += 1;
+                }
+            }
         }
-        Ok(())
+
+        if failed_shards == 0 {
+            info!("Successfully saved {saved_shards}/{N} shards.");
+            Ok(())
+        } else if failed_shards == N {
+            Error::e_explain(
+                InternalError,
+                format!("All {N} shards failed to save; see prior warnings for per-shard causes."),
+            )
+        } else {
+            warn!(
+                "Saved {saved_shards}/{N} shards; {failed_shards} shards failed. Persisted cache state may be incomplete."
+            );
+            Ok(())
+        }
     }
 
     async fn load(&self, dir_path: &str) -> Result<()> {
-        // TODO: check the saved shards so that we load all the save files
-        let mut loaded_shards = 0;
+        // Per-shard errors are isolated so a single failing shard does not abort
+        // the entire load. A missing shard file is treated as an empty shard.
+        let mut loaded_shards = 0usize;
+        let mut missing_shards = 0usize;
+        let mut error_shards = 0usize;
         for i in 0..N {
             let dir_path = dir_path.to_owned();
 
-            let data = tokio::task::spawn_blocking(move || {
+            let read_result = tokio::task::spawn_blocking(move || {
                 let file_path = Path::new(&dir_path).join(format!("{}.{i}", FILE_NAME));
-                let mut file = File::open(&file_path)
-                    .or_err_with(InternalError, || err_str_path("fail to open", &file_path))?;
+                let mut file = match File::open(&file_path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(e).or_err_with(InternalError, || {
+                            err_str_path("fail to open", &file_path)
+                        });
+                    }
+                };
                 let mut buffer = Vec::with_capacity(8192);
                 file.read_to_end(&mut buffer)
                     .or_err_with(InternalError, || {
                         err_str_path("fail to read from", &file_path)
                     })?;
-                Ok::<Vec<u8>, BError>(buffer)
+                Ok::<Option<Vec<u8>>, BError>(Some(buffer))
             })
-            .await
-            .or_err(InternalError, "async blocking IO failure")??;
+            .await;
+
+            let data = match read_result {
+                Ok(Ok(Some(buf))) => buf,
+                Ok(Ok(None)) => {
+                    missing_shards += 1;
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    warn!("Failed to load shard {i}: {e}. Skipping shard.");
+                    error_shards += 1;
+                    continue;
+                }
+                Err(join_err) => {
+                    warn!(
+                        "Failed to load shard {i}: async blocking IO failure {join_err}. Skipping shard."
+                    );
+                    error_shards += 1;
+                    continue;
+                }
+            };
 
             if let Err(e) = self.deserialize_shard(&data) {
-                warn!("Failed to deserialize shard {}: {}. Skipping shard.", i, e);
-                continue; // Skip shard and move onto the next one
+                warn!("Failed to deserialize shard {i}: {e}. Skipping shard.");
+                error_shards += 1;
+                continue;
             }
             loaded_shards += 1;
         }
 
-        // Log how many shards were successfully loaded
-        if loaded_shards < N {
-            warn!(
-                "Only loaded {}/{} shards. Cache may be incomplete.",
-                loaded_shards, N
-            )
+        if loaded_shards == N {
+            info!("Successfully loaded {loaded_shards}/{N} shards.");
+        } else if loaded_shards == 0 && error_shards == 0 {
+            info!("No persisted LRU shards found. Cache will start empty.");
         } else {
-            info!("Successfully loaded {}/{} shards.", loaded_shards, N)
+            warn!(
+                "Loaded {loaded_shards}/{N} shards (missing: {missing_shards}, errored: {error_shards}). Cache may be incomplete."
+            );
         }
 
         cleanup_temp_files(dir_path);
@@ -420,6 +498,26 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_set_weight_limit() {
+        let lru = Manager::<1>::with_capacity(4, 10);
+        let until = SystemTime::now();
+        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key3 = CacheKey::new("", "c", "1").to_compact();
+        assert_eq!(lru.weight_limit(), 4);
+        assert!(lru.admit(key1.clone(), 1, until).is_empty());
+        assert!(lru.admit(key2.clone(), 1, until).is_empty());
+
+        lru.set_weight_limit(1);
+        assert_eq!(lru.weight_limit(), 1);
+        let evicted = lru.admit(key3, 1, until);
+        assert_eq!(evicted, vec![key1, key2]);
+
+        lru.set_weight_limit(10);
+        assert_eq!(lru.weight_limit(), 10);
     }
 
     #[test]
@@ -588,6 +686,215 @@ mod test {
 
         assert_eq!(ser0, lru2.serialize_shard(0).unwrap());
         assert_eq!(ser1, lru2.serialize_shard(1).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_load_no_shards() {
+        // Loading from an empty directory should succeed with an empty LRU.
+        let test_dir = "/tmp/test_lru_no_shards";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let lru = Manager::<4>::with_capacity(10, 10);
+        lru.load(test_dir).await.unwrap();
+        assert_eq!(lru.total_items(), 0);
+        assert_eq!(lru.total_size(), 0);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_partial_shards() {
+        // A subset of shard files is missing on disk. Load should succeed and
+        // populate the LRU from only the shards that exist; missing shards are
+        // treated as empty rather than aborting the load.
+        let test_dir = "/tmp/test_lru_partial_shards";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        for i in 0..16 {
+            src.admit(
+                CacheKey::new("", format!("k{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        src.save(test_dir).await.unwrap();
+        let baseline = src.total_items();
+        assert!(baseline > 0);
+
+        // Remove half the shard files.
+        std::fs::remove_file(format!("{test_dir}/lru.data.1")).unwrap();
+        std::fs::remove_file(format!("{test_dir}/lru.data.3")).unwrap();
+
+        let dst = Manager::<4>::with_capacity(100, 100);
+        dst.load(test_dir).await.unwrap();
+        // Some entries loaded, but fewer than the baseline.
+        assert!(dst.total_items() > 0);
+        assert!(dst.total_items() < baseline);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_save_partial_failure_continues() {
+        // A per-shard rename failure must not abort the whole save. We simulate
+        // by pre-creating a directory at one shard's final path so that shard's
+        // atomic rename fails while the others succeed.
+        let test_dir = "/tmp/test_lru_save_partial_fail";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+        std::fs::create_dir(format!("{test_dir}/lru.data.1")).unwrap();
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        for i in 0..16 {
+            src.admit(
+                CacheKey::new("", format!("k{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        src.save(test_dir).await.unwrap();
+
+        // Shards 0, 2, 3 should be regular files; shard 1 is still a directory.
+        for i in [0, 2, 3] {
+            let p = format!("{test_dir}/lru.data.{i}");
+            let meta = std::fs::metadata(&p).unwrap();
+            assert!(meta.is_file(), "shard {i} should be a regular file");
+            assert!(meta.len() > 0, "shard {i} should be non-empty");
+        }
+        assert!(std::fs::metadata(format!("{test_dir}/lru.data.1"))
+            .unwrap()
+            .is_dir());
+
+        std::fs::remove_dir(format!("{test_dir}/lru.data.1")).unwrap();
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_save_total_failure_returns_err() {
+        // If every shard fails to save, the function must return Err so callers
+        // can alarm on the catastrophic case.
+        let test_dir = "/tmp/test_lru_save_total_fail";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+        for i in 0..4 {
+            std::fs::create_dir(format!("{test_dir}/lru.data.{i}")).unwrap();
+        }
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        src.admit(CacheKey::new("", "k", "1").to_compact(), 1, until);
+
+        let err = src.save(test_dir).await.unwrap_err();
+        assert!(
+            err.to_string().contains("All 4 shards failed to save"),
+            "unexpected error message: {err}"
+        );
+
+        for i in 0..4 {
+            std::fs::remove_dir(format!("{test_dir}/lru.data.{i}")).unwrap();
+        }
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_unreadable_shard_continues() {
+        // A shard path that opens successfully but fails to read (here a
+        // directory at the shard path) should not abort load of other shards.
+        let test_dir = "/tmp/test_lru_unreadable_shard";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        for i in 0..16 {
+            src.admit(
+                CacheKey::new("", format!("k{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        src.save(test_dir).await.unwrap();
+
+        // Replace one shard with a directory so File::open succeeds but
+        // read_to_end returns an error.
+        std::fs::remove_file(format!("{test_dir}/lru.data.2")).unwrap();
+        std::fs::create_dir(format!("{test_dir}/lru.data.2")).unwrap();
+
+        let dst = Manager::<4>::with_capacity(100, 100);
+        dst.load(test_dir).await.unwrap();
+        // Entries from the other 3 shards still loaded.
+        assert!(dst.total_items() > 0);
+
+        std::fs::remove_dir(format!("{test_dir}/lru.data.2")).unwrap();
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_load_corrupt_shard_continues() {
+        // A corrupt shard file should not abort load of the remaining shards.
+        let test_dir = "/tmp/test_lru_corrupt_shard";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        for i in 0..16 {
+            src.admit(
+                CacheKey::new("", format!("k{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        src.save(test_dir).await.unwrap();
+
+        // Truncate one shard to non-empty garbage so deserialize fails.
+        std::fs::write(format!("{test_dir}/lru.data.2"), b"not valid msgpack").unwrap();
+
+        let dst = Manager::<4>::with_capacity(100, 100);
+        dst.load(test_dir).await.unwrap();
+        // We should have loaded entries from the other 3 shards.
+        assert!(dst.total_items() > 0);
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_save_then_load_roundtrip_with_remove() {
+        // After load with missing shards, a subsequent save must persist every
+        // shard file again so the next load is complete.
+        let test_dir = "/tmp/test_lru_save_after_partial_load";
+        let _ = std::fs::remove_dir_all(test_dir);
+        std::fs::create_dir_all(test_dir).unwrap();
+
+        let until = SystemTime::now();
+        let src = Manager::<4>::with_capacity(100, 100);
+        for i in 0..16 {
+            src.admit(
+                CacheKey::new("", format!("k{i}"), "1").to_compact(),
+                1,
+                until,
+            );
+        }
+        src.save(test_dir).await.unwrap();
+        std::fs::remove_file(format!("{test_dir}/lru.data.1")).unwrap();
+
+        let dst = Manager::<4>::with_capacity(100, 100);
+        dst.load(test_dir).await.unwrap();
+        dst.save(test_dir).await.unwrap();
+
+        for i in 0..4 {
+            assert!(
+                Path::new(&format!("{test_dir}/lru.data.{i}")).exists(),
+                "shard {i} should exist after save"
+            );
+        }
+
+        std::fs::remove_dir_all(test_dir).unwrap();
     }
 
     #[tokio::test]

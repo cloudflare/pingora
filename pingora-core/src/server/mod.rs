@@ -27,7 +27,14 @@ use daemon::daemonize;
 use daggy::NodeIndex;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
+#[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
+pub use pingora_runtime::Dial9S3UploadOpts;
 use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
+#[cfg(feature = "dial9")]
+pub use pingora_runtime::{
+    Dial9RuntimeOpts, DEFAULT_DIAL9_MAX_FILE_SIZE, DEFAULT_DIAL9_MAX_TOTAL_SIZE,
+};
+pub use pingora_runtime::{RuntimeMetricsOpts, RuntimeOpts};
 use pingora_timeout::fast_timeout;
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
@@ -379,12 +386,18 @@ impl Server {
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
         blocking_opts: BlockingPoolOpts,
+        runtime_opts: RuntimeOpts,
     ) -> Runtime
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
-        let service_runtime =
-            Server::create_runtime(service.name(), threads, work_stealing, blocking_opts);
+        let service_runtime = Server::create_runtime(
+            service.name(),
+            threads,
+            work_stealing,
+            blocking_opts,
+            runtime_opts,
+        );
         let service_name = service.name().to_string();
         service_runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
@@ -642,6 +655,16 @@ impl Server {
             max_threads: conf.max_blocking_threads,
             thread_keep_alive: conf.blocking_threads_ttl_seconds.map(Duration::from_secs),
         };
+        let runtime_opts = conf.runtime_opts();
+        if conf.runtime_enable_alt_timer && !conf.work_stealing {
+            warn!("runtime_enable_alt_timer is ignored when work_stealing is disabled");
+        }
+        // This global timeout threshold is intended to be configured once during server startup,
+        // before service runtimes begin creating timeout futures.
+        fast_timeout::set_fast_timeout_to_tokio_threshold(
+            conf.fast_timeout_to_tokio_threshold_seconds
+                .map(Duration::from_secs),
+        );
 
         // Initialize (or re-initialize) sentry and persist the guard for
         // the lifetime of the server. When daemonizing, the transport
@@ -686,6 +709,10 @@ impl Server {
 
             let threads = wrapper.service.threads().unwrap_or(conf.threads);
             let name = wrapper.service.name().to_string();
+            let service_runtime_opts = wrapper
+                .service
+                .runtime_opts_override(&runtime_opts)
+                .unwrap_or_else(|| runtime_opts.clone());
 
             // Extract dependency watches from the ServiceHandle
             let dependencies = self
@@ -726,13 +753,20 @@ impl Server {
                 ready_notifier,
                 dependency_watches,
                 blocking_opts.clone(),
+                service_runtime_opts,
             );
             runtimes.push((runtime, name));
         }
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
-        let server_runtime = Server::create_runtime("Server", 1, true, BlockingPoolOpts::default());
+        let server_runtime = Server::create_runtime(
+            "Server",
+            1,
+            true,
+            BlockingPoolOpts::default(),
+            RuntimeOpts::default(),
+        );
         #[cfg(unix)]
         let shutdown_type = server_runtime
             .get_handle()
@@ -806,10 +840,12 @@ impl Server {
         threads: usize,
         work_steal: bool,
         blocking_opts: BlockingPoolOpts,
+        runtime_opts: RuntimeOpts,
     ) -> Runtime {
         RuntimeBuilder::new(threads, name)
             .work_steal(work_steal)
             .blocking_pool_opts(blocking_opts)
+            .runtime_opts(runtime_opts)
             .build()
     }
 }

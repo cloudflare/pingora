@@ -31,7 +31,7 @@ pingora-s2n = { version = "0.8.0", path = "../pingora-s2n", optional = true }
 bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 async-trait = { workspace = true }
 httparse = { workspace = true }
 bytes = { workspace = true }
@@ -74,9 +74,9 @@ lru = { workspace = true, optional = true }
 daggy = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5.0"
 flurry = "0.5"
-nix = "~0.24.3"
+daemonix = "0.1.0"
+nix = { version = "~0.31.1", features = ["socket", "net", "fs", "uio"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
@@ -101,6 +101,10 @@ jemallocator = "0.5"
 
 [features]
 default = []
+# Requires building with `--cfg tokio_unstable`.
+dial9 = ["pingora-runtime/dial9"]
+dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]
+dial9-cpu-profiling = ["dial9", "pingora-runtime/dial9-cpu-profiling"]
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]

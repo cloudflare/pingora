@@ -289,15 +289,16 @@ where
         let session = self.connector.get_http_session(&peer).await?;
 
         let mut session = session.0;
+
+        session.set_write_timeout(peer.options.write_timeout);
+
         let req = Box::new(self.req.clone());
         session.write_request_header(req).await?;
         session.finish_request_body().await?;
 
         custom_session!(session.finish_custom().await?);
 
-        if let Some(read_timeout) = peer.options.read_timeout {
-            session.set_read_timeout(Some(read_timeout));
-        }
+        session.set_read_timeout(peer.options.read_timeout);
 
         session.read_response_header().await?;
 

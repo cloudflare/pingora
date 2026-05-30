@@ -72,7 +72,7 @@ use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
 use pingora_core::server::configuration::ServerConf;
-use pingora_core::server::ShutdownWatch;
+use pingora_core::server::{RuntimeOpts, ShutdownWatch};
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
@@ -91,10 +91,10 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp};
+pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
+    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -173,13 +173,15 @@ where
         connector: C,
         on_custom: Option<ProcessCustomSession<SV, C>>,
         server_options: Option<HttpServerOptions>,
+        client_options: Option<ConnectorOptions>,
     ) -> Self
     where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
-        let client_upstream =
-            Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
+        let client_options =
+            client_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
+        let client_upstream = Connector::new_custom(Some(client_options), connector);
 
         HttpProxy {
             inner,
@@ -446,7 +448,7 @@ where
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
@@ -921,7 +923,7 @@ where
                         .await
                         .ok()
                         .flatten()
-                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
+                        .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings));
                 }
                 /* else continue */
             }
@@ -1005,18 +1007,27 @@ where
             match e {
                 Some(error) => {
                     let retry = error.retry();
+                    // only log error that will be retried here, the final error will be logged below
+                    if retry
+                        && !self.inner.suppress_proxy_warn_log(
+                            &session,
+                            &ctx,
+                            &error,
+                            ProxyWarnLogContext::UpstreamRetry,
+                        )
+                    {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            error,
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                     proxy_error = Some(error);
                     if !retry {
                         break;
                     }
-                    // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
-                        proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
                 }
                 None => {
                     proxy_error = None;
@@ -1060,7 +1071,7 @@ where
             if !self.inner.suppress_error_log(&session, &ctx, e) {
                 error!(
                     "Fail to proxy: {}, status: {}, tries: {}, retry: {}, {}",
-                    final_error.as_ref().unwrap(),
+                    e,
                     res.error_code,
                     retries,
                     false, // we never retry here
@@ -1110,7 +1121,7 @@ where
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
@@ -1336,7 +1347,7 @@ where
     // TODO implement h2_options
 }
 
-use pingora_core::services::listening::Service;
+use pingora_core::services::listening::{RuntimeOptsOverride, Service};
 
 /// Create an [`HttpProxy`] without wrapping it in a [`Service`].
 ///
@@ -1418,7 +1429,8 @@ where
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
-    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None);
+    let mut proxy =
+        HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
     Service::new(name.to_string(), proxy)
@@ -1441,6 +1453,8 @@ where
     connector: C,
     custom: Option<ProcessCustomSession<SV, C>>,
     server_options: Option<HttpServerOptions>,
+    client_options: Option<ConnectorOptions>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, ()>
@@ -1465,6 +1479,8 @@ where
             connector: (),
             custom: None,
             server_options: None,
+            client_options: None,
+            runtime_opts_override: None,
         }
     }
 }
@@ -1499,6 +1515,8 @@ where
             inner,
             name,
             server_options,
+            client_options,
+            runtime_opts_override,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1508,7 +1526,17 @@ where
             connector,
             custom: Some(on_custom),
             server_options,
+            client_options,
+            runtime_opts_override,
         }
+    }
+
+    /// Set the upstream client connector options for the [ProxyServiceBuilder].
+    ///
+    /// Returns a new [ProxyServiceBuilder] with the upstream client connector options set.
+    pub fn client_options(mut self, options: ConnectorOptions) -> Self {
+        self.client_options = Some(options);
+        self
     }
 
     /// Set the server options for the [ProxyServiceBuilder].
@@ -1516,6 +1544,17 @@ where
     /// Returns a new [ProxyServiceBuilder] with the server options set.
     pub fn server_options(mut self, options: HttpServerOptions) -> Self {
         self.server_options = Some(options);
+        self
+    }
+
+    /// Set a runtime options override for the [Service] built by this builder.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn runtime_opts_override<F>(mut self, override_fn: F) -> Self
+    where
+        F: Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync + 'static,
+    {
+        self.runtime_opts_override = Some(Arc::new(override_fn));
         self
     }
 
@@ -1533,11 +1572,24 @@ where
             connector,
             custom,
             server_options,
+            client_options,
+            runtime_opts_override,
         } = self;
 
-        let mut proxy = HttpProxy::new_custom(inner, conf, connector, custom, server_options);
+        let mut proxy = HttpProxy::new_custom(
+            inner,
+            conf,
+            connector,
+            custom,
+            server_options,
+            client_options,
+        );
 
         proxy.handle_init_modules();
-        Service::new(name, proxy)
+        let mut service = Service::new(name, proxy);
+        if let Some(runtime_opts_override) = runtime_opts_override {
+            service.set_runtime_opts_override(runtime_opts_override);
+        }
+        service
     }
 }
