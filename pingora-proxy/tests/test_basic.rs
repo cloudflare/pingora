@@ -22,8 +22,11 @@ use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
+#[cfg(feature = "patched_http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "patched_http1")]
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 use utils::server_utils::{
     init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
@@ -755,6 +758,9 @@ async fn test_connect_close() {
     assert_eq!(body, "Hello World!\n");
 }
 
+// Authority-form CONNECT request targets require patched HTTP/1 parsing until
+// general request-target form support is available.
+#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_disallowed_h1() {
     init();
@@ -793,6 +799,7 @@ async fn test_connect_proxying_disallowed_h2() {
     }
 }
 
+#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_allowed_h1() {
     init();

@@ -158,7 +158,7 @@ connection_filter = [
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
 any_tls = []
-patched_http1 = ["pingora-core/patched_http1"]
+patched_http1 = ["pingora-core/patched_http1", "pingora-proxy?/patched_http1"]
 document-features = [
     "dep:document-features",
     "proxy",
