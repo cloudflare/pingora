@@ -15,7 +15,7 @@ In this guide, we will cover the most used features, operations and settings of 
 ## Building HTTP proxies
 * [Life of a request: `pingora-proxy` phases and filters](phase.md)
 * [`Peer`: how to connect to upstream](peer.md)
-* [Sharing state across phases with `CTX`](ctx.md)
+* [Sharing state across phases and connections with `CTX`](ctx.md) (including tracking active connection counts)
 * [How to return errors](errors.md)
 * [Examples: take control of the request](modify_filter.md)
 * [Connection pooling and reuse](pooling.md)
