@@ -65,6 +65,9 @@ impl DatabaseService {
         }
     }
 
+    // Exposes a shared handle to the connection string. Dependents such as
+    // ApiService receive this handle and can read it once DatabaseService
+    // signals ready.
     fn get_connection_string(&self) -> Arc<Mutex<Option<String>>> {
         self.connection_string.clone()
     }
@@ -84,7 +87,7 @@ impl ServiceWithDependents for DatabaseService {
         // Simulate database connection setup
         sleep(Duration::from_secs(2)).await;
 
-        // Store the connection string
+        // Store the connection string so dependents can read it once we are ready
         {
             let mut conn = self.connection_string.lock().await;
             *conn = Some("postgresql://localhost:5432/mydb".to_string());
@@ -92,7 +95,8 @@ impl ServiceWithDependents for DatabaseService {
 
         info!("DatabaseService: Initialization complete, signaling ready");
 
-        // Signal that the service is ready
+        // Signal readiness only after initialization completes; dependents are
+        // released to start once this fires.
         ready_notifier.notify_ready();
 
         // Keep running until shutdown
@@ -150,6 +154,8 @@ pub struct ApiService {
 }
 
 impl ApiService {
+    // Dependency wiring: the database connection handle is shared in from
+    // DatabaseService so this service can use it once that dependency is ready.
     fn new(db_connection: Arc<Mutex<Option<String>>>) -> Self {
         Self { db_connection }
     }
