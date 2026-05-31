@@ -76,6 +76,9 @@ libraries that must be satisfied in order to build them:
 [Clang]:https://clang.llvm.org/
 [Perl 5]:https://www.perl.org/
 
+# Security
+Please see our [security policy](./SECURITY.md) for how to report security vulnerabilities.
+
 # Contributing
 Please see our [contribution guidelines](./.github/CONTRIBUTING.md).
 
