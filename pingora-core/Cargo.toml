@@ -72,6 +72,7 @@ x509-parser = { version = "0.16.0", optional = true }
 ouroboros = { version = "0.18.4", optional = true }
 lru = { workspace = true, optional = true }
 daggy = "0.8"
+arc-swap = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
@@ -103,7 +104,13 @@ jemallocator = "0.5"
 default = []
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
-rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
+rustls = [
+    "pingora-rustls",
+    "any_tls",
+    "dep:x509-parser",
+    "ouroboros",
+    "arc-swap",
+]
 s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]
 patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
