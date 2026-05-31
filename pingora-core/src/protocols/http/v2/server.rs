@@ -25,6 +25,7 @@ use http::{header, HeaderMap, Response, StatusCode};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
@@ -117,25 +118,31 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 ///      - the codec is driven to completion so the final GOAWAY can be
 ///        flushed and the connection closed cleanly.
 ///
-/// `on_session` is invoked once per accepted stream. Typical callers spawn a
-/// task to process the session so the accept loop is not blocked.
+/// `on_session` is invoked once per accepted stream, together with a
+/// [`StreamGuard`]. Typical callers spawn a task to process the session so the
+/// accept loop is not blocked, and move the guard into that task so its lifetime
+/// matches the session.
 ///
-/// Note: this function does not impose its own per-connection drain timeout.
-/// The runtime-level `graceful_shutdown_timeout_seconds` is the only ceiling,
-/// so a slow client can keep this future alive up to that bound.
+/// Note: this function does not impose its own per-connection drain timeout
+/// (after a shutdown signal). The runtime-level `graceful_shutdown_timeout_seconds`
+/// is the only ceiling there, so a slow client can keep this future alive up to
+/// that bound during drain.
 // TODO: add a per-connection drain timeout to bound how long a single
 // misbehaving client can keep this task alive after GOAWAY.
 pub(crate) async fn accept_downstream_sessions<F>(
     mut conn: H2Connection<Stream>,
     digest: Arc<Digest>,
     mut shutdown: ShutdownWatch,
+    idle_timeout: Option<Duration>,
     mut on_session: F,
 ) where
-    F: FnMut(HttpSession),
+    F: FnMut(HttpSession, StreamGuard),
 {
     let mut shutdown_initiated = false;
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
+    // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
+    let active = Arc::new(AtomicUsize::new(0));
     loop {
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
@@ -160,6 +167,16 @@ pub(crate) async fn accept_downstream_sessions<F>(
                     digest.clone(),
                     &mut malformed_streams,
                 ) => h2_stream,
+                // Idle timeout: re-armed each iteration, so any accepted stream resets it
+                _ = pingora_timeout::sleep(idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                    if active.load(Ordering::Relaxed) == 0 {
+                        // Idle with nothing in flight: drop `conn` to close the
+                        // socket now (no graceful GOAWAY wait that could hang on
+                        // a dead peer).
+                        return;
+                    }
+                    continue;
+                }
             }
         };
         match h2_stream {
@@ -174,8 +191,24 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // The offending stream was already answered or reset; keep the
             // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
-            Ok(Some(H2Accept::Session(session))) => on_session(session),
+            Ok(Some(H2Accept::Session(session))) => {
+                active.fetch_add(1, Ordering::Relaxed);
+                on_session(session, StreamGuard(active.clone()));
+            }
         }
+    }
+}
+
+/// Tracks one in-flight downstream H2 session for [`accept_downstream_sessions`].
+/// `on_session` receives it alongside each session; keep it alive for as long as
+/// the session is being processed (e.g. move it into the spawned task) so the
+/// accept loop's idle timeout can tell a busy connection from an idle one. It
+/// decrements the in-flight counter when dropped.
+pub(crate) struct StreamGuard(Arc<AtomicUsize>);
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
