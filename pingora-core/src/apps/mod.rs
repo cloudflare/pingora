@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use log::{debug, error};
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::protocols::http::v2::server;
 use crate::protocols::http::ServerSession;
@@ -81,6 +82,12 @@ pub struct HttpServerOptions {
     ///
     /// Unlike nginx, the default behavior here is _no limit_.
     pub keepalive_request_limit: Option<u32>,
+
+    /// If set, close a downstream HTTP/2 connection that has been idle
+    /// for this duration.
+    ///
+    /// Default: `None`
+    pub h2_idle_timeout: Option<Duration>,
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -262,15 +269,25 @@ where
             // the same code path is exercised by tests in `protocols::http::v2`.
             let app = self.clone();
             let shutdown_for_session = shutdown.clone();
-            server::accept_downstream_sessions(h2_conn, digest, shutdown.clone(), |h2_stream| {
-                let app = app.clone();
-                let shutdown = shutdown_for_session.clone();
-                pingora_runtime::current_handle().spawn(async move {
-                    // Note, `PersistentSettings` not currently relevant for h2
-                    app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
-                        .await;
-                });
-            })
+            let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
+            server::accept_downstream_sessions(
+                h2_conn,
+                digest,
+                shutdown.clone(),
+                h2_idle_timeout,
+                |h2_stream, guard| {
+                    let app = app.clone();
+                    let shutdown = shutdown_for_session.clone();
+                    pingora_runtime::current_handle().spawn(async move {
+                        // hold `guard` for the session's lifetime so the accept
+                        // loop's idle timeout sees this connection as busy.
+                        let _guard = guard;
+                        // Note, `PersistentSettings` not currently relevant for h2
+                        app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
+                            .await;
+                    });
+                },
+            )
             .await;
         } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
             return self.clone().process_custom_session(stream, shutdown).await;

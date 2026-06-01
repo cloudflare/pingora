@@ -349,14 +349,20 @@ mod test {
         });
 
         let mut session_handles = vec![];
-        server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
-            session_handles.push(tokio::spawn(async move {
-                let req = session.req_header();
-                assert_eq!(req.method, Method::GET);
-                let resp = Box::new(ResponseHeader::build(200, None).unwrap());
-                session.write_response_header(resp, true).unwrap();
-            }));
-        })
+        server::accept_downstream_sessions(
+            connection,
+            digest,
+            shutdown_rx,
+            None,
+            |mut session, _guard| {
+                session_handles.push(tokio::spawn(async move {
+                    let req = session.req_header();
+                    assert_eq!(req.method, Method::GET);
+                    let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                    session.write_response_header(resp, true).unwrap();
+                }));
+            },
+        )
         .await;
 
         trigger.await.unwrap();
@@ -443,12 +449,18 @@ mod test {
         });
 
         let mut session_handles = vec![];
-        server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
-            session_handles.push(tokio::spawn(async move {
-                let resp = Box::new(ResponseHeader::build(200, None).unwrap());
-                session.write_response_header(resp, true).unwrap();
-            }));
-        })
+        server::accept_downstream_sessions(
+            connection,
+            digest,
+            shutdown_rx,
+            None,
+            |mut session, _guard| {
+                session_handles.push(tokio::spawn(async move {
+                    let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                    session.write_response_header(resp, true).unwrap();
+                }));
+            },
+        )
         .await;
 
         trigger.await.unwrap();
@@ -502,14 +514,63 @@ mod test {
 
         let result = pingora_timeout::timeout(
             Duration::from_secs(2),
-            server::accept_downstream_sessions(connection, digest, shutdown_rx, |_session| {
-                panic!("did not expect any sessions on an idle connection");
-            }),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                None,
+                |_session, _guard| {
+                    panic!("did not expect any sessions on an idle connection");
+                },
+            ),
         )
         .await;
         assert!(result.is_ok(), "accept loop hung after shutdown");
 
         trigger.await.unwrap();
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_h2_idle_timeout_closes_idle_connection() {
+        let (mut client, server) = duplex(65536);
+        // Keep the sender alive so `shutdown.changed()` stays pending — the only
+        // thing that should end the accept loop is the idle timeout.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+            // Open no streams; stay connected and drain frames until the server
+            // drops the connection on idle timeout (codec returns None on EOF).
+            while let Some(frame) = codec.next().await {
+                let _ = frame;
+            }
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        // No shutdown is signaled and no stream is opened; a short idle timeout
+        // must make the accept loop return on its own.
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(2),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                Some(Duration::from_millis(100)),
+                |_session, _guard| panic!("did not expect any sessions on an idle connection"),
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "idle timeout did not close the connection");
+
         client_handle.await.unwrap();
     }
 
@@ -600,12 +661,18 @@ mod test {
         let mut session_handles = vec![];
         let result = pingora_timeout::timeout(
             Duration::from_secs(5),
-            server::accept_downstream_sessions(connection, digest, shutdown_rx, |mut session| {
-                session_handles.push(tokio::spawn(async move {
-                    let resp = Box::new(ResponseHeader::build(200, None).unwrap());
-                    session.write_response_header(resp, true).unwrap();
-                }));
-            }),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                None,
+                |mut session, _guard| {
+                    session_handles.push(tokio::spawn(async move {
+                        let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                        session.write_response_header(resp, true).unwrap();
+                    }));
+                },
+            ),
         )
         .await;
         assert!(result.is_ok(), "accept loop hung after shutdown");
