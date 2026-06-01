@@ -323,28 +323,7 @@ impl HttpSession {
                         let header_name = header.get_name_bytes(&buf);
                         let header_name = header_name.into_case_header_name();
                         let value_bytes = header.get_value_bytes(&buf);
-                        let header_value = if cfg!(debug_assertions) {
-                            // from_maybe_shared_unchecked() in debug mode still checks whether
-                            // the header value is valid, which breaks the _obsolete_multiline
-                            // support. To work around this, in debug mode, we replace CRLF with
-                            // whitespace
-                            if let Some(p) = value_bytes.windows(CRLF.len()).position(|w| w == CRLF)
-                            {
-                                let mut new_header = Vec::from_iter(value_bytes);
-                                new_header[p] = b' ';
-                                new_header[p + 1] = b' ';
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(new_header)
-                                }
-                            } else {
-                                unsafe {
-                                    http::HeaderValue::from_maybe_shared_unchecked(value_bytes)
-                                }
-                            }
-                        } else {
-                            // safe because this is from what we parsed
-                            unsafe { http::HeaderValue::from_maybe_shared_unchecked(value_bytes) }
-                        };
+                        let header_value = pingora_http::header_value_from_raw(value_bytes);
                         response_header
                             .append_header(header_name, header_value)
                             .or_err(InvalidHTTPHeader, "while parsing request header")?;
@@ -1844,9 +1823,9 @@ mod tests_stream {
         }
     }
 
-    // Note: in debug mode, due to from_maybe_shared_unchecked() still tries to validate headers
-    // values, so the code has to replace CRLF with whitespaces. In release mode, the CRLF is
-    // reserved
+    // Each obs-fold (CRLF + at least one SP/HTAB) in a received header
+    // value is replaced with a single SP before the value is interpreted,
+    // via `pingora_http::header_value_from_raw`.
     #[tokio::test]
     async fn read_obsolete_multiline_headers() {
         init_log();
@@ -1859,7 +1838,7 @@ mod tests_stream {
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(
             http_stream.get_header("Server").unwrap(),
-            "pingora   Foo: Bar"
+            "pingora Foo: Bar"
         );
 
         let input = b"HTTP/1.1 200 OK\r\nServer : pingora\r\n\t  Fizz: Buzz\r\n\r\n";
@@ -1870,7 +1849,7 @@ mod tests_stream {
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(
             http_stream.get_header("Server").unwrap(),
-            "pingora  \t  Fizz: Buzz"
+            "pingora Fizz: Buzz"
         );
     }
 

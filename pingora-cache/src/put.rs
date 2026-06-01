@@ -521,7 +521,8 @@ mod parse_response {
             for header in resp.headers {
                 // TODO: consider hold a Bytes and all header values can be Bytes referencing the
                 // original buffer without reallocation
-                response.append_header(header.name.to_owned(), header.value.to_owned())?;
+                let header_value = pingora_http::header_value_from_slice(header.value);
+                response.append_header(header.name.to_owned(), header_value)?;
             }
             // TODO: see above, we can make header value `Bytes` referencing header_bytes
             let header_bytes = self.buf.split_to(split_to).freeze();

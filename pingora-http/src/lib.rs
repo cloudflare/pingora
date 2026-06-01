@@ -717,6 +717,127 @@ where
     removed
 }
 
+/// Build a [`HeaderValue`] from owned bytes, normalizing the value per RFC
+/// 9110 section 5.5 and RFC 9112 section 5.2: obs-fold continuations
+/// collapse to a single SP, and any stray CR / LF / NUL is replaced with SP.
+/// Zero-copy when the input contains no CR/LF/NUL.
+///
+/// # Precondition
+///
+/// Input must come from a conformant HTTP/1.1 parser: bytes must satisfy
+/// the `field-content` grammar (SP, HTAB, `%x21-7E`, `obs-text` `%x80-FF`),
+/// with CR/LF/NUL only appearing as part of an obs-fold or as invalid bytes
+/// that this function will replace with SP. All workspace callers satisfy
+/// this via httparse.
+///
+/// # Panics
+///
+/// Debug builds panic on precondition violation via the sanity check in
+/// [`HeaderValue::from_maybe_shared_unchecked`]. Release builds skip the
+/// check; invalid input is undefined behavior per the `http` crate.
+pub fn header_value_from_raw(raw: impl Into<bytes::Bytes>) -> HeaderValue {
+    let normalized = normalize_field_value(raw.into());
+    // SAFETY: `normalize_field_value` replaces all CR/LF/NUL with SP; by
+    // precondition the remaining bytes pass the `http` crate's `is_valid`
+    // byte-set check (other controls except HTAB are not expected here). The
+    // crate's documented safety contract names "valid UTF-8", but its
+    // internal use of the bytes never relies on UTF-8 in release. Matches
+    // long-standing precedent.
+    unsafe { HeaderValue::from_maybe_shared_unchecked(normalized) }
+}
+
+/// Build a [`HeaderValue`] from a borrowed slice, normalizing obs-fold per
+/// RFC 9112 section 5.2. The slice is copied into an owned buffer.
+///
+/// Precondition and panic behavior are the same as [`header_value_from_raw`].
+pub fn header_value_from_slice(raw: &[u8]) -> HeaderValue {
+    header_value_from_raw(bytes::Bytes::copy_from_slice(raw))
+}
+
+/// Normalize a header field value per RFC 9110 section 5.5 and RFC 9112
+/// section 5.2:
+///
+/// - Each CRLF + WSP obs-fold continuation collapses to a single SP
+///   ([RFC 9112 section 5.2]).
+/// - Any standalone CR, LF, or NUL (not part of an obs-fold being collapsed)
+///   is replaced with a single SP ([RFC 9110 section 5.5]).
+/// - Other CTL characters are retained, as RFC 9110 section 5.5 permits.
+///
+/// Zero-copy when the input contains no CR, LF, or NUL.
+/// Example: `b"obs\r\n fold\r\n\t line"` becomes `b"obs fold line"`.
+///
+/// [RFC 9112 section 5.2]: https://datatracker.ietf.org/doc/html/rfc9112#section-5.2
+/// [RFC 9110 section 5.5]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.5
+fn normalize_field_value(raw: bytes::Bytes) -> bytes::Bytes {
+    // Fast path: no CR/LF/NUL, nothing to do.
+    if !raw.iter().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+        return raw;
+    }
+
+    // No LF means no obs-fold (which requires CRLF). Replace each stray CR
+    // or NUL with SP per RFC 9110 section 5.5.
+    let Some(first_nl) = raw.iter().position(|b| *b == b'\n') else {
+        let replaced: Vec<u8> = raw
+            .iter()
+            .map(|&b| if matches!(b, b'\r' | b'\0') { b' ' } else { b })
+            .collect();
+        return bytes::Bytes::from(replaced);
+    };
+
+    // `[u8]` has no stable `trim`. Trim all ASCII whitespace at segment
+    // boundaries so the trailing `\r` of each CRLF (we split on `\n`) is
+    // absorbed into the obs-fold collapse along with the fold's SP/HTAB run.
+    fn trim_start(mut s: &[u8]) -> &[u8] {
+        while let [first, rest @ ..] = s {
+            if first.is_ascii_whitespace() {
+                s = rest;
+            } else {
+                break;
+            }
+        }
+        s
+    }
+    fn trim_end(mut s: &[u8]) -> &[u8] {
+        while let [rest @ .., last] = s {
+            if last.is_ascii_whitespace() {
+                s = rest;
+            } else {
+                break;
+            }
+        }
+        s
+    }
+    fn trim(s: &[u8]) -> &[u8] {
+        trim_start(trim_end(s))
+    }
+
+    // Mid-segment CRs (and NULs) — which the trim helpers can't reach because
+    // they're not at a segment boundary — are replaced with SP at copy time
+    // per RFC 9110 section 5.5. Empty continuations contribute no SP, so
+    // leading/trailing newlines don't introduce spurious whitespace.
+    fn push_with_replacement(dst: &mut Vec<u8>, src: &[u8]) {
+        dst.extend(
+            src.iter()
+                .map(|&b| if matches!(b, b'\r' | b'\0') { b' ' } else { b }),
+        );
+    }
+
+    let head = trim_end(&raw[..first_nl]);
+    let mut unfolded = Vec::with_capacity(raw.len());
+    push_with_replacement(&mut unfolded, head);
+    for line in raw[first_nl + 1..].split(|b| *b == b'\n') {
+        let line = trim(line);
+        if line.is_empty() {
+            continue;
+        }
+        if !unfolded.is_empty() {
+            unfolded.push(b' ');
+        }
+        push_with_replacement(&mut unfolded, line);
+    }
+    bytes::Bytes::from(unfolded)
+}
+
 #[inline]
 fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl BufMut) {
     const CRLF: &[u8; 2] = b"\r\n";
@@ -983,5 +1104,192 @@ mod tests {
                 .map(|d| d.as_bytes())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn normalize_field_value_no_fold_is_zero_copy() {
+        // The value has no newline at all -> the input `Bytes` must be
+        // returned untouched (same allocation). We assert pointer/length
+        // identity via `Bytes::ptr_eq` semantics: cloning a `Bytes` shares
+        // the same underlying buffer, so comparing byte content + length
+        // is sufficient to confirm no allocation happened.
+        let input = bytes::Bytes::from_static(b"text/html; charset=utf-8");
+        let out = normalize_field_value(input.clone());
+        assert_eq!(out, input);
+        assert_eq!(out.as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn normalize_field_value_single_fold() {
+        // CRLF + SP continuation collapses to a single SP.
+        let input = bytes::Bytes::from_static(b"obs\r\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold");
+    }
+
+    #[test]
+    fn normalize_field_value_multiple_folds_mixed_ws() {
+        // "obs\r\n fold\r\n\t line" -> "obs fold line". Each fold becomes
+        // exactly one SP regardless of how many SP/HTAB chars the
+        // continuation indented with.
+        let input = bytes::Bytes::from_static(b"obs\r\n fold\r\n\t line");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold line");
+    }
+
+    #[test]
+    fn normalize_field_value_collapses_long_indent() {
+        // Real-world CSP-style values often indent continuations with many
+        // spaces. All of that indent collapses to a single SP.
+        let input =
+            bytes::Bytes::from_static(b"default-src 'self';\r\n        script-src 'self' blob:");
+        assert_eq!(
+            &normalize_field_value(input)[..],
+            b"default-src 'self'; script-src 'self' blob:"
+        );
+    }
+
+    #[test]
+    fn normalize_field_value_removes_all_cr_and_lf() {
+        // After normalization no CR or LF byte may survive in the value
+        // (each obs-fold collapses to a single SP).
+        let input = bytes::Bytes::from_static(b"a\r\n b\r\n c\r\n d");
+        let out = normalize_field_value(input);
+        assert!(!out.contains(&b'\r'));
+        assert!(!out.contains(&b'\n'));
+        assert_eq!(&out[..], b"a b c d");
+    }
+
+    #[test]
+    fn normalize_field_value_bare_lf() {
+        // Defensive: bare LF (no preceding CR) is also treated as a fold,
+        // since the implementation splits on `\n` alone.
+        let input = bytes::Bytes::from_static(b"obs\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold");
+    }
+
+    #[test]
+    fn normalize_field_value_empty() {
+        let input = bytes::Bytes::new();
+        let out = normalize_field_value(input.clone());
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn header_value_from_raw_round_trip() {
+        // End-to-end: a folded value parses into a HeaderValue whose bytes
+        // contain no CR/LF and equal the normalized form.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(
+            b"default-src 'self';\r\n script-src 'self'",
+        ));
+        assert_eq!(hv.as_bytes(), b"default-src 'self'; script-src 'self'");
+    }
+
+    #[test]
+    fn header_value_from_raw_passthrough() {
+        // No fold -> bytes preserved exactly.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(b"application/json"));
+        assert_eq!(hv.as_bytes(), b"application/json");
+    }
+
+    // The remaining tests pin down the contract on edge-case inputs.
+    // `header_value_from_raw` is `pub`, so any caller (not just our own
+    // httparse-driven paths) can pass arbitrary bytes; these cases
+    // document what they will get back.
+
+    #[test]
+    fn normalize_field_value_leading_newline_no_spurious_space() {
+        // A value starting with a fold collapses to just the continuation,
+        // with no spurious leading SP.
+        let input = bytes::Bytes::from_static(b"\r\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"fold");
+    }
+
+    #[test]
+    fn normalize_field_value_trailing_newline_no_spurious_space() {
+        // A trailing CRLF (or CRLF + WSP that ends the value) is dropped
+        // without leaving a trailing SP.
+        let input = bytes::Bytes::from_static(b"foo\r\n");
+        assert_eq!(&normalize_field_value(input)[..], b"foo");
+
+        let input = bytes::Bytes::from_static(b"a\r\n b\r\n");
+        assert_eq!(&normalize_field_value(input)[..], b"a b");
+    }
+
+    #[test]
+    fn normalize_field_value_only_newlines() {
+        // Pathological input made entirely of newlines collapses to empty.
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\r\n"))[..],
+            b""
+        );
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\n"))[..],
+            b""
+        );
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\r\n\r\n"))[..],
+            b""
+        );
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_bare_cr_with_sp() {
+        // Per RFC 9110 section 5.5, stray CR / LF / NUL within a field
+        // value MUST be replaced with SP (not stripped, not left in place).
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"foo\rbar", b"foo bar"),
+            (b"foo\r", b"foo "),
+            (b"\rfoo", b" foo"),
+            (b"\r", b" "),
+            (b"\r\r\r", b"   "),
+        ];
+        for (input, expected) in cases {
+            let out = normalize_field_value(bytes::Bytes::copy_from_slice(input));
+            assert_eq!(&out[..], *expected, "input = {input:?}");
+            assert!(!out.contains(&b'\r'));
+            assert!(!out.contains(&b'\n'));
+            assert!(!out.contains(&b'\0'));
+        }
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_cr_mid_segment_with_sp() {
+        // Mid-segment CR (sits inside a segment, not at a boundary the
+        // trim helpers reach) is replaced with SP per RFC 9110 section 5.5.
+        let input = bytes::Bytes::from_static(b"foo\rbar\r\n baz");
+        assert_eq!(&normalize_field_value(input)[..], b"foo bar baz");
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_nul_with_sp() {
+        // NUL within a field value MUST be replaced with SP per RFC 9110
+        // section 5.5. Covers NUL standalone, between CR and LF, and after
+        // CRLF.
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"foo\0bar", b"foo bar"),
+            (b"\0\0\0", b"   "),
+            (b"foo\0", b"foo "),
+            // NUL between CR and LF: each is a stray byte -> three SPs.
+            (b"foo\r\0\nbar", b"foo   bar"),
+            // NUL after CRLF: CRLF treated as a fold boundary (one SP),
+            // NUL replaced with one SP -> two SPs total.
+            (b"foo\r\n\0bar", b"foo  bar"),
+        ];
+        for (input, expected) in cases {
+            let out = normalize_field_value(bytes::Bytes::copy_from_slice(input));
+            assert_eq!(&out[..], *expected, "input = {input:?}");
+            assert!(!out.contains(&b'\r'));
+            assert!(!out.contains(&b'\n'));
+            assert!(!out.contains(&b'\0'));
+        }
+    }
+
+    #[test]
+    fn header_value_from_raw_handles_invalid_bytes() {
+        // Bare CR and NUL aren't valid `field-content`, but
+        // `normalize_field_value` replaces them with SP before the
+        // unchecked constructor sees them, so no invalid byte ever reaches
+        // `HeaderValue`.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(b"foo\rbar\0baz"));
+        assert_eq!(hv.as_bytes(), b"foo bar baz");
     }
 }
