@@ -1321,6 +1321,10 @@ impl HttpCache {
                 self.digest.add_lookup_duration(now.elapsed());
                 let result = result.and_then(|(meta, header)| {
                     if let Some(ts) = inner_enabled.valid_after {
+                        // `created` (not `provenance`) is the right field to compare on
+                        // the variant side: we are asking "was this specific variant
+                        // admitted before the primary's tombstone?" -- a fact about the
+                        // variant entry itself.
                         if meta.created() < ts {
                             span.set_tag(|| trace::Tag::new("not valid", true));
                             return None;
@@ -1354,12 +1358,12 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 // make sure that all variances found are fresher than this asset
                 // this is because when purging all the variance, only the primary slot is deleted
-                // the created TS of the primary is the tombstone of all the variances
+                // the provenance timestamp of the primary is the tombstone of all the variances
                 inner
                     .enabled_ctx
                     .as_mut()
                     .expect("cache enabled")
-                    .valid_after = Some(meta.created());
+                    .valid_after = Some(meta.provenance());
 
                 // update vary
                 let key = inner.key.as_mut().unwrap();
