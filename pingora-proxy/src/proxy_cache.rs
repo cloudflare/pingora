@@ -384,7 +384,7 @@ where
             if !range_filter.is_multipart_range() || !hit_handler.can_seek_multipart() {
                 return Ok(false);
             }
-            let r = range_filter.next_cache_multipart_range();
+            let r = range_filter.next_cache_multipart_range()?;
             hit_handler.seek_multipart(r.start, Some(r.end))?;
             // we still need RangeBodyFilter's help to transform the byte
             // range into a multipart response.
@@ -1861,23 +1861,43 @@ pub mod range_filter {
         }
 
         /// Returns the next multipart range to seek for the cache body reader.
-        pub fn next_cache_multipart_range(&mut self) -> Range<usize> {
-            match &self.range {
-                RangeType::Multi(multipart_info) => {
-                    match self.cache_multipart_idx.as_mut() {
-                        Some(v) => *v += 1,
-                        None => self.cache_multipart_idx = Some(0),
-                    }
-                    let cache_multipart_idx = self.cache_multipart_idx.expect("set above");
-                    let multipart_idx = self.multipart_idx.expect("must be set on multirange");
-                    // NOTE: currently this assumes once we start seeking multipart from the hit
-                    // handler, it will continue to return can_seek_multipart true.
-                    assert_eq!(multipart_idx, cache_multipart_idx,
-                        "cache multipart idx should match multipart idx, or there is a hit handler bug");
-                    multipart_info.ranges[cache_multipart_idx].clone()
-                }
-                _ => panic!("tried to advance multipart idx on non-multipart range"),
+        ///
+        /// The body filter and seekable cache reader must advance through each
+        /// part together. If they diverge, the response body cannot be served
+        /// correctly; report an internal error rather than panic.
+        pub fn next_cache_multipart_range(&mut self) -> Result<Range<usize>> {
+            let RangeType::Multi(multipart_info) = &self.range else {
+                return Error::e_explain(
+                    InternalError,
+                    "tried to advance cache multipart range on a non-multipart response",
+                );
+            };
+
+            let cache_multipart_idx = self.cache_multipart_idx.map_or(0, |idx| idx + 1);
+            let Some(multipart_idx) = self.multipart_idx else {
+                return Error::e_explain(
+                    InternalError,
+                    "multipart response is missing body filter progress state",
+                );
+            };
+            if multipart_idx != cache_multipart_idx {
+                return Error::e_explain(
+                    InternalError,
+                    format!(
+                        "cache multipart progress mismatch: body_filter_idx={multipart_idx}, cache_reader_idx={cache_multipart_idx}, ranges={}",
+                        multipart_info.ranges.len(),
+                    ),
+                );
             }
+
+            let Some(range) = multipart_info.ranges.get(cache_multipart_idx).cloned() else {
+                return Error::e_explain(
+                    InternalError,
+                    "cache multipart reader advanced past the final requested range",
+                );
+            };
+            self.cache_multipart_idx = Some(cache_multipart_idx);
+            Ok(range)
         }
 
         pub fn set_current_cursor(&mut self, current: usize) {
@@ -2251,6 +2271,51 @@ pub mod range_filter {
             "Missing final boundary"
         );
     }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_ends_part_early() {
+        let ranges = vec![0..10, 20..30];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..10);
+        body_filter.set_current_cursor(first.start);
+
+        // The cache reader yielded only a prefix of the selected part before
+        // reporting EOF. The filter therefore has not advanced past part 0.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"01234")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=0, cache_reader_idx=1"));
+    }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_overreads_part() {
+        let ranges = vec![0..2, 4..6, 8..10];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..2);
+        body_filter.set_current_cursor(first.start);
+
+        // A seekable reader is expected to stop at the selected part's end.
+        // This chunk spans all requested parts and advances the filter beyond
+        // what the reader's seek state records.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"0123456789")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=3, cache_reader_idx=1"));
+    }
 }
 
 // a state machine for proxy logic to tell when to use cache in the case of
@@ -2446,7 +2511,7 @@ impl ServeFromCache {
             RangeType::Multi(_info) => {
                 // safety: called only if the async_body_reader exists
                 if cache.miss_body_reader().unwrap().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
+                    let range = range_filter.next_cache_multipart_range()?;
                     cache
                         .miss_body_reader()
                         .unwrap()
@@ -2483,7 +2548,7 @@ impl ServeFromCache {
             }
             RangeType::Multi(_info) => {
                 if cache.hit_handler().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
+                    let range = range_filter.next_cache_multipart_range()?;
                     cache
                         .hit_handler()
                         .seek_multipart(range.start, Some(range.end))
