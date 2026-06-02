@@ -740,6 +740,27 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_miss_finish_error_does_not_break_response() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_miss_finish_error/now";
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(url)
+            .header("x-cache-fail-finish", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_purge() {
         init();
         let res = reqwest::get("http://127.0.0.1:6148/unique/test_purge/test2")

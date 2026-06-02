@@ -558,6 +558,19 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
+    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    where
+        SV: ProxyHttp,
+    {
+        if let Err(e) = session.cache.finish_miss_handler().await {
+            warn!(
+                "Failed to finish cache miss admission: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+            session.cache.disable(NoCacheReason::StorageError);
+        }
+    }
+
     pub(crate) async fn cache_http_task(
         &self,
         session: &mut Session,
@@ -666,7 +679,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
@@ -712,13 +725,13 @@ where
 
                             miss_handler.write_body(d.clone(), *end_stream).await?;
                             if *end_stream {
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
                     None => {
                         if session.cache.enabled() && *end_stream {
-                            session.cache.finish_miss_handler().await?;
+                            self.finish_miss_handler_best_effort(session, ctx).await;
                         }
                     }
                 }
@@ -726,7 +739,7 @@ where
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    session.cache.finish_miss_handler().await?;
+                    self.finish_miss_handler_best_effort(session, ctx).await;
                 }
             }
             HttpTask::Failed(_) => {

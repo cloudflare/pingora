@@ -22,8 +22,9 @@ use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
-use pingora_cache::key::HashBinary;
+use pingora_cache::key::{CompactCacheKey, HashBinary};
 use pingora_cache::lock::CacheKeyLockImpl;
+use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
@@ -436,6 +437,7 @@ impl ProxyHttp for ExampleProxyHttp {
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_FINISH_FAIL_BACKEND: FinishFailCache = FinishFailCache;
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
@@ -445,6 +447,63 @@ static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
+
+struct FinishFailCache;
+
+#[async_trait]
+impl Storage for FinishFailCache {
+    async fn lookup(
+        &'static self,
+        _key: &CacheKey,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        Ok(None)
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        Ok(Box::new(FinishFailMissHandler))
+    }
+
+    async fn purge(
+        &'static self,
+        _key: &CompactCacheKey,
+        _purge_type: PurgeType,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn update_meta(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct FinishFailMissHandler;
+
+#[async_trait]
+impl HandleMiss for FinishFailMissHandler {
+    async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        Error::e_explain(FileWriteError, "cache miss finalization failed")
+    }
+}
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -537,8 +596,18 @@ impl ProxyHttp for ExampleProxyCache {
             .map(|_| CACHE_LOCK.as_ref());
         let mut overrides = CacheOptionOverrides::default();
         overrides.wait_timeout = Some(Duration::from_secs(2));
+        let storage = if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-finish")
+        {
+            &CACHE_FINISH_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else {
+            &*CACHE_BACKEND as &'static (dyn Storage + Sync)
+        };
+
         session.cache.enable(
-            &*CACHE_BACKEND,
+            storage,
             eviction,
             Some(&*CACHE_PREDICTOR),
             lock,

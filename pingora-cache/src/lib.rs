@@ -980,7 +980,7 @@ impl HttpCache {
                     return Ok(());
                 }
                 let miss_handler = inner_enabled.miss_handler.take().unwrap();
-                let size = miss_handler.finish().await?;
+                let finish_result = miss_handler.finish().await;
                 let key = inner
                     .key
                     .as_ref()
@@ -990,9 +990,21 @@ impl HttpCache {
                     if let Some(Locked::Write(permit)) = lock {
                         // no need to call r.unlock() because release() will call it
                         // r is a guard to make sure the lock is unlocked when this request is dropped
-                        lock_ctx.cache_lock.release(key, permit, LockStatus::Done);
+                        let lock_status = if finish_result.is_ok() {
+                            LockStatus::Done
+                        } else {
+                            LockStatus::TransientError
+                        };
+                        lock_ctx.cache_lock.release(key, permit, lock_status);
                     }
                 }
+                let size = match finish_result {
+                    Ok(size) => size,
+                    Err(e) => {
+                        inner_enabled.traces.finish_miss_span();
+                        return Err(e);
+                    }
+                };
                 if let Some(eviction) = inner_enabled.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner_enabled.meta.as_ref().unwrap();
