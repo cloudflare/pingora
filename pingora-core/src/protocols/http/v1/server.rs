@@ -128,6 +128,8 @@ pub struct HttpSession {
     connection_user_context: Option<Box<dyn Any + Send + Sync>>,
     /// Whether the client has closed the TCP connection (sent FIN / read returned 0).
     half_closed: bool,
+    /// Whether this session is on a reused keepalive connection.
+    is_reused: bool,
     /// When true (default), a client close after the request body is surfaced as a
     /// `ConnectionClosed` error so the proxy aborts immediately. When false, the
     /// close is tolerated and `read_body_or_idle` stays pending so the proxy can
@@ -179,6 +181,7 @@ impl HttpSession {
             keepalive_reuses_remaining: None,
             connection_user_context: None,
             half_closed: false,
+            is_reused: false,
             abort_on_close: true,
             proxy_tasks_enabled: false,
         }
@@ -1100,6 +1103,16 @@ impl HttpSession {
     /// Whether the client has half-closed the TCP connection.
     pub fn is_half_closed(&self) -> bool {
         self.half_closed
+    }
+
+    /// Set whether this session is on a reused keepalive connection.
+    pub fn set_reused(&mut self, reused: bool) {
+        self.is_reused = reused;
+    }
+
+    /// Whether this session is on a reused keepalive connection.
+    pub fn is_reused(&self) -> bool {
+        self.is_reused
     }
 
     /// Return the raw bytes of the request header.

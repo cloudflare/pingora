@@ -318,6 +318,22 @@ impl Session {
         }
     }
 
+    /// Set whether this session is on a reused keepalive connection.
+    pub fn set_reused(&mut self, reused: bool) {
+        if let Self::H1(s) = self {
+            s.set_reused(reused);
+        }
+    }
+
+    /// Whether this session is on a reused keepalive connection.
+    pub fn is_reused(&self) -> bool {
+        if let Self::H1(s) = self {
+            s.is_reused()
+        } else {
+            false
+        }
+    }
+
     /// Set user-defined context to carry across requests on the same keepalive connection.
     ///
     /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
