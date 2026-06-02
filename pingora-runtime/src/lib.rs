@@ -103,6 +103,8 @@ pub struct Dial9RuntimeOpts {
     pub rotation_period: Option<Duration>,
     /// Enable dial9 task spawn/terminate tracking.
     pub task_tracking: bool,
+    /// How often the background worker checks for sealed trace segments.
+    pub worker_poll_interval: Option<Duration>,
     /// Upload sealed trace segments to S3-compatible storage.
     #[cfg(feature = "dial9-worker-s3")]
     pub s3_upload: Option<Dial9S3UploadOpts>,
@@ -118,6 +120,7 @@ impl Dial9RuntimeOpts {
             max_total_size: DEFAULT_DIAL9_MAX_TOTAL_SIZE,
             rotation_period: None,
             task_tracking: true,
+            worker_poll_interval: None,
             #[cfg(feature = "dial9-worker-s3")]
             s3_upload: None,
         }
@@ -144,6 +147,12 @@ impl Dial9RuntimeOpts {
     /// Enable or disable dial9 task spawn/terminate tracking.
     pub fn with_task_tracking(mut self, task_tracking: bool) -> Self {
         self.task_tracking = task_tracking;
+        self
+    }
+
+    /// Set how often the background worker checks for sealed trace segments.
+    pub fn with_worker_poll_interval(mut self, worker_poll_interval: Duration) -> Self {
+        self.worker_poll_interval = Some(worker_poll_interval);
         self
     }
 
@@ -324,6 +333,12 @@ fn build_dial9_runtime(
             "dial9 max_file_size must be less than or equal to max_total_size",
         ));
     }
+    if opts.worker_poll_interval == Some(Duration::ZERO) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "dial9 worker_poll_interval must be greater than zero",
+        ));
+    }
 
     if let Some(parent) = opts.trace_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -336,10 +351,13 @@ fn build_dial9_runtime(
         .maybe_rotation_period(opts.rotation_period)
         .build()?;
 
-    let traced = TracedRuntime::builder()
+    let mut traced = TracedRuntime::builder()
         .with_trace_path(opts.trace_path.clone())
         .with_runtime_name(runtime_name)
         .with_task_tracking(opts.task_tracking);
+    if let Some(worker_poll_interval) = opts.worker_poll_interval {
+        traced = traced.with_worker_poll_interval(worker_poll_interval);
+    }
 
     #[cfg(feature = "dial9-worker-s3")]
     if let Some(s3_upload) = &opts.s3_upload {
@@ -744,4 +762,21 @@ fn test_no_steal_shutdown() {
     assert_eq!(ret, 1);
 
     rt.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[cfg(feature = "dial9")]
+#[test]
+fn test_dial9_zero_worker_poll_interval_is_rejected() {
+    let mut opts = Dial9RuntimeOpts::new("trace");
+    opts.worker_poll_interval = Some(Duration::ZERO);
+    let err = match build_dial9_runtime(Builder::new_multi_thread(), "test", &opts) {
+        Ok(_) => panic!("zero worker poll interval should be rejected"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        "dial9 worker_poll_interval must be greater than zero"
+    );
 }
