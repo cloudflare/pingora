@@ -395,7 +395,14 @@ impl SslDigest {
             RusTlsStream::Client(_) => None,
         };
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest, server_name)
+        SslDigest::new(
+            cipher,
+            version,
+            organization,
+            serial_number,
+            cert_digest,
+            server_name,
+        )
     }
 }
 
