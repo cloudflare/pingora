@@ -1266,9 +1266,11 @@ impl HttpCache {
     /// Return the [CacheMeta] of this asset if any
     ///
     /// Different from [Self::cache_meta()], this function is allowed to be called in
-    /// [CachePhase::Miss] phase where the cache meta maybe set.
-    /// # Panic
-    /// Panic in phases that shouldn't have cache meta.
+    /// any phase and will not panic due to a wrong phase. It returns the cache meta in
+    /// the phases where one may be set ([CachePhase::Miss], [CachePhase::Stale],
+    /// [CachePhase::StaleUpdating], [CachePhase::Expired], [CachePhase::Hit],
+    /// [CachePhase::Revalidated], and [CachePhase::RevalidatedNoCache]); in all other
+    /// phases it returns `None` because no cache meta can exist.
     pub fn maybe_cache_meta(&self) -> Option<&CacheMeta> {
         match self.phase {
             CachePhase::Miss
@@ -1278,7 +1280,7 @@ impl HttpCache {
             | CachePhase::Hit
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => self.inner_enabled().meta.as_ref(),
-            _ => panic!("wrong phase {:?}", self.phase),
+            _ => None,
         }
     }
 
