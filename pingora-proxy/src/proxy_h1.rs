@@ -127,7 +127,9 @@ where
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
+            Ok((downstream_can_reuse, upstream_can_reuse)) => {
+                (downstream_can_reuse, upstream_can_reuse, None)
+            }
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -187,13 +189,14 @@ where
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
         let mut request_done = false;
         let mut response_done = false;
+        let mut upstream_can_reuse = true;
         let mut send_error = None;
         let mut upgraded = false;
 
@@ -225,7 +228,7 @@ where
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
                             if result.is_err() && !client_session.was_upgraded() {
-                                return result;
+                                return result.map(|_| upstream_can_reuse);
                             }
                         },
                         Err(e) => {
@@ -233,7 +236,7 @@ where
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
                             // Downstream should consume all remaining data and handle the error
-                            return Ok(())
+                            return Ok(upstream_can_reuse)
                         }
                     }
                 },
@@ -251,6 +254,13 @@ where
                            warn!("send error, draining read buf: {e}");
                            request_done = true;
 
+                           // Built-in HTTP downstream sessions are expected to reject
+                           // incomplete bodies before reaching this state. A downstream
+                           // session that does not report such an error or an upstream request
+                           // mutation that creates inconsistent framing can still reach it.
+                           // A complete response can be forwarded, but the partially written
+                           // HTTP/1 request makes this connection unsafe to reuse.
+                           upstream_can_reuse = false;
                            send_error = Some(e);
                            continue
                         }
@@ -264,7 +274,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(upstream_can_reuse)
     }
 
     #[allow(clippy::too_many_arguments)]

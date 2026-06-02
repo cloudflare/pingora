@@ -23,6 +23,10 @@ use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use pingora_http::ResponseHeader;
 use reqwest::{StatusCode, Version};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -154,6 +158,82 @@ async fn test_close_on_response_before_downstream_finish() {
     assert_eq!(headers["Connection"], "close");
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 11);
+}
+
+#[tokio::test]
+async fn test_h1_upstream_not_reused_after_request_body_finish_error() {
+    init();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = Arc::clone(&accepted);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let connection_number = server_accepted.fetch_add(1, Ordering::SeqCst);
+
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+
+                if connection_number == 0 {
+                    // Respond before the declared request body is complete. The connection must
+                    // not receive another request after the proxy fails to finish this body.
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let url = "http://127.0.0.1:6147/request-body-finish-error";
+
+    let first = client
+        .post(url)
+        .header("x-port", origin_port.to_string())
+        // The downstream body is valid; the test-only upstream filter deliberately makes its
+        // outbound Content-Length larger in order to exercise defense in depth.
+        .header("x-upstream-content-length", "32")
+        .body("short")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.text().await.unwrap(), "first");
+
+    let second = timeout(
+        Duration::from_secs(2),
+        client
+            .get(url)
+            .header("x-port", origin_port.to_string())
+            .send(),
+    )
+    .await
+    .expect("second request should use a new upstream connection")
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.text().await.unwrap(), "second");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

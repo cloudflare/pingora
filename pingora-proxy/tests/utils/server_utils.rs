@@ -340,6 +340,28 @@ impl ProxyHttp for ExampleProxyHttp {
         response_filter_common(session, upstream_response, ctx)
     }
 
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        req: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Test-only hook: deliberately declare a larger outbound body than the valid
+        // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
+        // a client that directly ended a shorter-than-declared body; this hook lets tests
+        // exercise defense in depth for downstream sessions that do not report incomplete
+        // body errors or upstream request mutations that reach that state.
+        if let Some(content_length) = session
+            .req_header()
+            .headers
+            .get("x-upstream-content-length")
+        {
+            req.insert_header(CONTENT_LENGTH, content_length.clone())?;
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
