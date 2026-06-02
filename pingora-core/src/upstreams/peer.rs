@@ -447,6 +447,15 @@ pub struct PeerOptions {
     /// **Note:** This field is unstable and may be removed or changed in future versions.
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
+    /// Concatenate multiple HTTP/2 `Cookie` headers into a single header when proxying to
+    /// an HTTP/1.1 upstream, as required by RFC 9113 §8.2.3.
+    ///
+    /// When enabled (default), multiple `Cookie` header fields received over HTTP/2 are
+    /// concatenated into a single `Cookie` header using `"; "` as the delimiter before
+    /// forwarding to an HTTP/1.1 upstream.
+    ///
+    /// Set to `false` to preserve the original multiple `Cookie` headers as-is.
+    pub h2_to_h1_concat_cookies: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     /// The list of curves the tls connection should advertise
     /// if `None`, the default curves will be used
@@ -504,6 +513,7 @@ impl PeerOptions {
             h2_stream_window_size: None,
             h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
+            h2_to_h1_concat_cookies: true,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves

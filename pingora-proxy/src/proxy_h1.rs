@@ -12,14 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::BytesMut;
 use futures::future::OptionFuture;
 use futures::StreamExt;
+use http::header::HeaderValue;
 
 use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
+
+/// Concatenate multiple HTTP/2 `Cookie` headers into a single header for HTTP/1.1.
+///
+/// RFC 9113 §8.2.3 requires that multiple `Cookie` header fields received over HTTP/2
+/// MUST be concatenated into a single octet string using `"; "` (0x3B 0x20) as the
+/// delimiter before being passed into a non-HTTP/2 context.
+///
+/// The concatenation preserves the original insertion order of cookie values.
+fn h2_to_h1_concat_cookie_headers(req: &mut RequestHeader) {
+    let cookie_values: Vec<HeaderValue> = req
+        .headers
+        .get_all(header::COOKIE)
+        .into_iter()
+        .cloned()
+        .collect();
+    if cookie_values.len() <= 1 {
+        return;
+    }
+
+    let mut merged = BytesMut::new();
+    for (i, value) in cookie_values.iter().enumerate() {
+        if i > 0 {
+            merged.extend_from_slice(b"; ");
+        }
+        merged.extend_from_slice(value.as_bytes());
+    }
+
+    req.remove_header(&header::COOKIE);
+    let header_value = HeaderValue::from_maybe_shared(merged.freeze())
+        .expect("concatenated cookie value is invalid");
+    req.insert_header(header::COOKIE, header_value).unwrap();
+}
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -59,7 +93,11 @@ where
                 let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
                 req.insert_header(header::HOST, host).unwrap();
             }
-            // TODO: Add keepalive header for connection reuse, but this is not required per RFC
+            // RFC 9113 §8.2.3: Concatenate multiple Cookie headers into a single header
+            // when forwarding to a non-HTTP/2 context.
+            if peer.options.h2_to_h1_concat_cookies {
+                h2_to_h1_concat_cookie_headers(&mut req);
+            }
         }
 
         if session.cache.enabled() {
@@ -1025,5 +1063,85 @@ pub(crate) async fn send_body_to1(
         }
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_request_with_cookies(cookies: &[&str]) -> RequestHeader {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        for cookie in cookies {
+            req.append_header(header::COOKIE, *cookie).unwrap();
+        }
+        req
+    }
+
+    #[test]
+    fn test_concat_multiple_cookies() {
+        let mut req = build_request_with_cookies(&["a=1", "b=2", "c=3"]);
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        let cookie = req.headers.get(header::COOKIE).unwrap();
+        assert_eq!(cookie.as_bytes(), b"a=1; b=2; c=3");
+    }
+
+    #[test]
+    fn test_concat_preserves_order() {
+        let mut req = build_request_with_cookies(&[
+            "preferred_language=ko",
+            "_gitlab_session=abc123",
+            "sidebar=collapsed",
+        ]);
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        let cookie = req.headers.get(header::COOKIE).unwrap();
+        assert_eq!(
+            cookie.as_bytes(),
+            b"preferred_language=ko; _gitlab_session=abc123; sidebar=collapsed"
+        );
+    }
+
+    #[test]
+    fn test_concat_single_cookie_unchanged() {
+        let mut req = build_request_with_cookies(&["session=xyz"]);
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        let values: Vec<_> = req.headers.get_all(header::COOKIE).into_iter().collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].as_bytes(), b"session=xyz");
+    }
+
+    #[test]
+    fn test_concat_no_cookies_is_noop() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        assert!(req.headers.get(header::COOKIE).is_none());
+    }
+
+    #[test]
+    fn test_concat_two_cookies() {
+        let mut req = build_request_with_cookies(&["a=1", "b=2"]);
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        let cookie = req.headers.get(header::COOKIE).unwrap();
+        assert_eq!(cookie.as_bytes(), b"a=1; b=2");
+
+        let count = req.headers.get_all(header::COOKIE).into_iter().count();
+        assert_eq!(
+            count, 1,
+            "should have exactly one Cookie header after concatenation"
+        );
+    }
+
+    #[test]
+    fn test_concat_cookies_with_semicolons() {
+        let mut req = build_request_with_cookies(&["a=1; b=2", "c=3"]);
+        h2_to_h1_concat_cookie_headers(&mut req);
+
+        let cookie = req.headers.get(header::COOKIE).unwrap();
+        assert_eq!(cookie.as_bytes(), b"a=1; b=2; c=3");
     }
 }
