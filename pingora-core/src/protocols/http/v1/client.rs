@@ -119,7 +119,12 @@ impl HttpSession {
         // init body writer
         self.init_req_body_writer(&req);
 
-        let to_wire = http_req_header_to_wire(&req).unwrap();
+        let to_wire = http_req_header_to_wire(&req).ok_or_else(|| {
+            Error::explain(
+                InvalidHTTPHeader,
+                "request-line contains forbidden delimiter bytes or unsupported HTTP version",
+            )
+        })?;
         trace!("Writing request header: {to_wire:?}");
 
         let write_fut = self.underlying_stream.write_all(to_wire.as_ref());
@@ -823,6 +828,13 @@ fn parse_resp_buffer<'buf>(
     }
 }
 
+/// Returns `true` if `path` contains a byte that must never appear in an HTTP/1.1
+/// request target: NUL (`0x00`), LF (`0x0a`), CR (`0x0d`), or SP (`0x20`).
+#[inline]
+fn request_target_has_forbidden_byte(path: &[u8]) -> bool {
+    path.iter().any(|&b| matches!(b, 0x00 | 0x0a | 0x0d | 0x20))
+}
+
 // TODO: change it to to_buf
 #[inline]
 pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
@@ -832,7 +844,12 @@ pub fn http_req_header_to_wire(req: &RequestHeader) -> Option<BytesMut> {
     let method = req.method.as_str().as_bytes();
     buf.put_slice(method);
     buf.put_u8(b' ');
-    buf.put_slice(req.raw_path());
+
+    let path = req.raw_path();
+    if request_target_has_forbidden_byte(path) {
+        return None;
+    }
+    buf.put_slice(path);
     buf.put_u8(b' ');
 
     let version = match req.version {
@@ -2504,5 +2521,26 @@ mod test_sync {
         assert_eq!("/", req.path.unwrap());
         assert_eq!(b"Foo", headers[0].name.as_bytes());
         assert_eq!(b"Bar", headers[0].value);
+    }
+
+    /// Deterministic, parser-independent test of the request-line delimiter
+    /// guard. Testing it through `http_req_header_to_wire`/`RequestHeader` is
+    /// unreliable because whether `set_raw_path` admits a delimiter byte depends
+    /// on the linked `http` crate's URI validation; the predicate itself has no
+    /// such dependency.
+    #[test]
+    fn test_request_target_has_forbidden_byte() {
+        const FORBIDDEN: [u8; 4] = [0x00, 0x0a, 0x0d, 0x20];
+        for b in 0x00u8..=0xff {
+            let expected = FORBIDDEN.contains(&b);
+            assert_eq!(
+                request_target_has_forbidden_byte(&[b]),
+                expected,
+                "byte {b:#04x}: expected forbidden={expected}",
+            );
+        }
+        assert!(!request_target_has_forbidden_byte(b"/normal/path?a=b"));
+        assert!(request_target_has_forbidden_byte(b"/x HTTP/1.1")); // SP
+        assert!(request_target_has_forbidden_byte(b"/a\r\nb")); // CR/LF
     }
 }
