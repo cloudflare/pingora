@@ -31,7 +31,9 @@ use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 ///
 /// The concatenation preserves the original insertion order of cookie values.
 fn h2_to_h1_concat_cookie_headers(req: &mut RequestHeader) {
-    let cookie_values: Vec<HeaderValue> = req.headers.get_all(header::COOKIE)
+    let cookie_values: Vec<HeaderValue> = req
+        .headers
+        .get_all(header::COOKIE)
         .into_iter()
         .cloned()
         .collect();
@@ -50,8 +52,7 @@ fn h2_to_h1_concat_cookie_headers(req: &mut RequestHeader) {
     req.remove_header(&header::COOKIE);
     let header_value = HeaderValue::from_maybe_shared(merged.freeze())
         .expect("concatenated cookie value is invalid");
-    req.insert_header(header::COOKIE, header_value)
-        .unwrap();
+    req.insert_header(header::COOKIE, header_value).unwrap();
 }
 
 impl<SV, C> HttpProxy<SV, C>
@@ -1129,7 +1130,10 @@ mod tests {
         assert_eq!(cookie.as_bytes(), b"a=1; b=2");
 
         let count = req.headers.get_all(header::COOKIE).into_iter().count();
-        assert_eq!(count, 1, "should have exactly one Cookie header after concatenation");
+        assert_eq!(
+            count, 1,
+            "should have exactly one Cookie header after concatenation"
+        );
     }
 
     #[test]
