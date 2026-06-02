@@ -103,3 +103,22 @@ async fn test_h2c_tcp_still_works() {
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }
+
+#[cfg(feature = "any_tls")]
+#[tokio::test]
+async fn test_sni_digest_extraction() {
+    utils::init();
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve_to_addrs("myapp.example.com", &[std::net::SocketAddr::from(([127, 0, 0, 1], 6146))])
+        .build()
+        .unwrap();
+
+    let res = client.get("https://myapp.example.com:6146").send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        res.headers().get("x-sni").unwrap().to_str().unwrap(),
+        "myapp.example.com"
+    );
+}

@@ -209,7 +209,11 @@ impl SslDigest {
             None => (Vec::new(), None, None),
         };
 
-        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest)
+        let server_name = ssl
+            .servername(ssl::NameType::HOST_NAME)
+            .map(|s| s.to_string());
+
+        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest, server_name)
     }
 }
 
