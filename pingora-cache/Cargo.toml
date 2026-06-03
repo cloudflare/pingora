@@ -47,6 +47,7 @@ hex = "0.4"
 httparse = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
 rand = "0.8"
+arrayvec = "0"
 
 [dev-dependencies]
 cf-rustracing = "1.0"
