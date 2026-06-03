@@ -16,7 +16,7 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
+use http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE, VARY};
 use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
@@ -40,7 +40,7 @@ use pingora_core::protocols::{
 };
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::{Service, ServiceWithDependents};
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamRequestPolicy};
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -341,6 +341,23 @@ impl ProxyHttp for ExampleProxyHttp {
         response_filter_common(session, upstream_response, ctx)
     }
 
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-discard-body")
+        {
+            *body = None;
+        }
+        Ok(())
+    }
+
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -359,6 +376,22 @@ impl ProxyHttp for ExampleProxyHttp {
         {
             req.insert_header(CONTENT_LENGTH, content_length.clone())?;
             req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-strip-framing")
+        {
+            req.remove_header(&CONTENT_LENGTH);
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-add-upgrade")
+        {
+            req.insert_header(CONNECTION, "Upgrade")?;
+            req.insert_header(UPGRADE, "websocket")?;
         }
         Ok(())
     }
@@ -391,6 +424,19 @@ impl ProxyHttp for ExampleProxyHttp {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+        }
+
+        if req
+            .headers
+            .contains_key("x-preserve-upstream-request-headers")
+        {
+            peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::preserve();
+        } else if req.headers.contains_key("x-preserve-upstream-upgrade") {
+            peer.options.http_upstream_request_policy.h1_upgrade = H1UpgradePolicy::Preserve;
+        } else if req.headers.contains_key("x-preserve-connection-nominated") {
+            peer.options
+                .http_upstream_request_policy
+                .strip_connection_nominated = false;
         }
 
         if let Some(ms) = req

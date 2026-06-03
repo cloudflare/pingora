@@ -401,6 +401,86 @@ impl Scheme {
     }
 }
 
+/// Policy for forwarding request headers to HTTP upstreams.
+///
+/// This policy applies to automatically forwarded downstream request headers. Application code
+/// may deliberately alter the resulting request in its upstream request filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpUpstreamRequestPolicy {
+    /// Strip standard hop-by-hop request fields inherited from the downstream request.
+    ///
+    /// Standard hop-by-hop framing fields are removed. If a non-empty request body is unframed
+    /// after application upstream request filtering, Pingora sends it chunked to an HTTP/1
+    /// upstream.
+    pub strip_hop_by_hop: bool,
+    /// Strip extension fields identified by tokens in the downstream `Connection` header field.
+    ///
+    /// Requests nominating `Host`, forwarding-origin fields, or pseudo-header-shaped fields are
+    /// rejected rather than forwarded with protected metadata removed when this behavior is
+    /// enabled.
+    pub strip_connection_nominated: bool,
+    /// Controls forwarding of HTTP/1 protocol upgrade request fields.
+    pub h1_upgrade: H1UpgradePolicy,
+}
+
+impl HttpUpstreamRequestPolicy {
+    /// Use standards-oriented forwarding with normalized WebSocket upgrade support.
+    pub fn standard() -> Self {
+        Self::default()
+    }
+
+    /// Preserve the previous HTTP/1 upstream request-header passthrough behavior.
+    ///
+    /// This mode is RFC-non-compliant and is provided only for legacy compatibility. Use it at
+    /// your own risk: the application's upstream request filter is solely responsible for
+    /// ensuring valid hop-by-hop header handling.
+    pub fn preserve() -> Self {
+        Self {
+            strip_hop_by_hop: false,
+            strip_connection_nominated: false,
+            h1_upgrade: H1UpgradePolicy::Preserve,
+        }
+    }
+
+    /// Strip hop-by-hop fields and do not forward any HTTP/1 upgrade handshake.
+    pub fn deny_upgrades() -> Self {
+        Self {
+            h1_upgrade: H1UpgradePolicy::Deny,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for HttpUpstreamRequestPolicy {
+    fn default() -> Self {
+        Self {
+            strip_hop_by_hop: true,
+            strip_connection_nominated: true,
+            h1_upgrade: H1UpgradePolicy::WebSocketOnly,
+        }
+    }
+}
+
+/// Policy for forwarding HTTP/1 protocol upgrade request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H1UpgradePolicy {
+    /// Forward normalized upgrade fields only for a valid WebSocket upgrade request.
+    WebSocketOnly,
+    /// Preserve complete request metadata for HTTP/1 requests containing an upgrade field.
+    ///
+    /// This is RFC-non-compliant and is provided only for legacy compatibility. Use it at your
+    /// own risk: the application's upstream request filter is solely responsible for ensuring
+    /// valid hop-by-hop metadata for upgraded requests.
+    ///
+    /// When this is selected, automatic hop-by-hop normalization is skipped for upgrade requests
+    /// because protocol-specific handshakes can depend on any connection-nominated field.
+    /// Protected nomination validation applies only when
+    /// [`HttpUpstreamRequestPolicy::strip_connection_nominated`] is enabled.
+    Preserve,
+    /// Do not forward HTTP/1 upgrade request fields.
+    Deny,
+}
+
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
@@ -447,6 +527,8 @@ pub struct PeerOptions {
     /// **Note:** This field is unstable and may be removed or changed in future versions.
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
+    /// Controls automatically forwarded request headers sent to HTTP upstreams.
+    pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     /// The list of curves the tls connection should advertise
     /// if `None`, the default curves will be used
@@ -504,6 +586,7 @@ impl PeerOptions {
             h2_stream_window_size: None,
             h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
+            http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -796,5 +879,26 @@ impl Display for Proxy {
             self.host,
             self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_http_upstream_request_policy_is_standards_oriented() {
+        let policy = PeerOptions::new().http_upstream_request_policy;
+        assert!(policy.strip_hop_by_hop);
+        assert!(policy.strip_connection_nominated);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
+    }
+
+    #[test]
+    fn preserve_http_upstream_request_policy_is_a_legacy_preset() {
+        let policy = HttpUpstreamRequestPolicy::preserve();
+        assert!(!policy.strip_hop_by_hop);
+        assert!(!policy.strip_connection_nominated);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
     }
 }
