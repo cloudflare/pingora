@@ -43,12 +43,28 @@ type H2Connection<S> = server::Connection<S, Bytes>;
 
 pub use h2::server::Builder as H2Options;
 
+// 64 KiB decoded header-list limit.
+const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Build [`H2Options`] with bounded defaults for received requests.
+///
+/// Use this as the starting point when customizing options to retain the default
+/// decoded header-list and concurrent-stream limits.
+pub fn default_h2_options() -> H2Options {
+    let mut options = H2Options::default();
+    options.max_header_list_size(DEFAULT_MAX_HEADER_LIST_SIZE);
+    options.max_concurrent_streams(DEFAULT_MAX_CONCURRENT_STREAMS);
+    options
+}
+
 /// Perform HTTP/2 connection handshake with an established (TLS) connection.
 ///
 /// The optional `options` allow to adjust certain HTTP/2 parameters and settings.
-/// See [`H2Options`] for more details.
+/// When `options` is [`None`], bounded defaults from [`default_h2_options`] are
+/// used. See [`H2Options`] for more details.
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
-    let options = options.unwrap_or_default();
+    let options = options.unwrap_or_else(default_h2_options);
     let res = options.handshake(io).await;
 
     match res {
@@ -677,8 +693,106 @@ impl HttpSession {
 #[cfg(test)]
 mod test {
     use super::*;
+    use bytes::Bytes;
+    use h2::frame::{Frame, Settings};
     use http::{HeaderValue, Method, Request};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
+    use tokio_stream::StreamExt;
+
+    async fn advertised_settings(options: Option<H2Options>) -> Settings {
+        let (mut client, server) = duplex(65536);
+        let handshake = tokio::spawn(async move { handshake(Box::new(server), options).await });
+
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+        let settings = match codec.next().await.unwrap().unwrap() {
+            Frame::Settings(settings) => settings,
+            frame => panic!("expected SETTINGS frame, received {frame:?}"),
+        };
+
+        let _ = handshake.await.unwrap().unwrap();
+        settings
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_uses_bounded_default_options() {
+        let settings = advertised_settings(None).await;
+
+        assert_eq!(
+            settings.max_header_list_size(),
+            Some(DEFAULT_MAX_HEADER_LIST_SIZE)
+        );
+        assert_eq!(
+            settings.max_concurrent_streams(),
+            Some(DEFAULT_MAX_CONCURRENT_STREAMS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_uses_caller_options() {
+        let mut options = H2Options::default();
+        options.max_header_list_size(1234);
+        options.max_concurrent_streams(42);
+
+        let settings = advertised_settings(Some(options)).await;
+
+        assert_eq!(settings.max_header_list_size(), Some(1234));
+        assert_eq!(settings.max_concurrent_streams(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_rejects_oversized_header_list_by_default() {
+        let (client, server) = duplex(256 * 1024);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            for _ in 0..2000 {
+                request
+                    .headers_mut()
+                    .append("a", HeaderValue::from_static(""));
+            }
+
+            let (response, _) = h2
+                .ready()
+                .await
+                .unwrap()
+                .send_request(request, true)
+                .unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+        });
+
+        let server = tokio::spawn(async move {
+            let mut connection = handshake(Box::new(server), None).await.unwrap();
+            let digest = Arc::new(Digest::default());
+            let accepted = timeout(
+                Duration::from_secs(1),
+                HttpSession::from_h2_conn(&mut connection, digest),
+            )
+            .await;
+            assert!(
+                !matches!(accepted, Ok(Ok(Some(_)))),
+                "oversized request reached the application"
+            );
+        });
+
+        client.await.unwrap();
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_server_handshake_accept_request() {
