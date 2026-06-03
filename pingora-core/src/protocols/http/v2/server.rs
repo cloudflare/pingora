@@ -43,12 +43,38 @@ type H2Connection<S> = server::Connection<S, Bytes>;
 
 pub use h2::server::Builder as H2Options;
 
+// Conservative inbound limits applied when the caller does not provide
+// `H2Options`. h2's own defaults allow a 16 MiB decoded header list and an
+// effectively unbounded number of concurrent inbound streams. A remote client
+// can abuse that to park large decoded-header state across many streams (an
+// HPACK dynamic-table "bomb" combined with a flow-control window stall), a
+// memory-exhaustion denial of service. These floors bound the per-connection
+// footprint without affecting normal traffic; callers that pass their own
+// `H2Options` keep full control and override every value.
+const SAFE_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+const SAFE_MAX_CONCURRENT_STREAMS: u32 = 100;
+const SAFE_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 32;
+
+/// Build [`H2Options`] with safe-by-default inbound limits.
+///
+/// Used when the application passes `None` to [`handshake`]. The decoded
+/// header-list size, concurrent-stream count, and pending reset-stream count
+/// are bounded so an unconfigured HTTP/2 listener is not trivially exhausted.
+pub fn safe_h2_options() -> H2Options {
+    let mut options = H2Options::default();
+    options.max_header_list_size(SAFE_MAX_HEADER_LIST_SIZE);
+    options.max_concurrent_streams(SAFE_MAX_CONCURRENT_STREAMS);
+    options.max_pending_accept_reset_streams(SAFE_MAX_PENDING_ACCEPT_RESET_STREAMS);
+    options
+}
+
 /// Perform HTTP/2 connection handshake with an established (TLS) connection.
 ///
 /// The optional `options` allow to adjust certain HTTP/2 parameters and settings.
-/// See [`H2Options`] for more details.
+/// See [`H2Options`] for more details. When `options` is `None`, conservative
+/// safe-by-default limits are applied (see [`safe_h2_options`]).
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
-    let options = options.unwrap_or_default();
+    let options = options.unwrap_or_else(safe_h2_options);
     let res = options.handshake(io).await;
 
     match res {
