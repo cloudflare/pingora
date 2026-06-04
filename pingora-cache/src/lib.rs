@@ -298,6 +298,9 @@ struct HttpCacheInnerEnabled {
     pub meta: Option<CacheMeta>,
     // when set, even if an asset exists, it would only be considered valid after this timestamp
     pub valid_after: Option<SystemTime>,
+    // Variance from the stale metadata before set_cache_meta() replaces it.
+    // update_variance() uses this to detect Vary family changes and reset provenance.
+    stale_meta_variance: Option<HashBinary>,
     pub miss_handler: Option<MissHandler>,
     pub body_reader: Option<HitHandler>,
     pub storage: &'static (dyn storage::Storage + Sync), // static for now
@@ -519,6 +522,7 @@ impl HttpCache {
                     enabled_ctx: Some(Box::new(HttpCacheInnerEnabled {
                         meta: None,
                         valid_after: None,
+                        stale_meta_variance: None,
                         miss_handler: None,
                         body_reader: None,
                         storage,
@@ -801,8 +805,10 @@ impl HttpCache {
                 // here after not being able to acquire the cache lock, and our item has since
                 // purged or expired. We should be sure that the meta is not set in this case
                 // as there shouldn't be a meta set for cache misses.
-                self.inner_enabled_mut().meta = None;
-                self.inner_enabled_mut().traces.start_miss_span();
+                let inner_enabled = self.inner_enabled_mut();
+                inner_enabled.meta = None;
+                inner_enabled.stale_meta_variance = None;
+                inner_enabled.traces.start_miss_span();
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
@@ -1037,11 +1043,29 @@ impl HttpCache {
     }
 
     /// Set the [CacheMeta] of the cache
-    pub fn set_cache_meta(&mut self, meta: CacheMeta) {
+    ///
+    /// # Panics
+    ///
+    /// Panics unless called in [CachePhase::Miss] or [CachePhase::Stale]. In stale phase, the
+    /// stale metadata must still be present.
+    pub fn set_cache_meta(&mut self, mut meta: CacheMeta) {
         match self.phase {
             // TODO: store the staled meta somewhere else for future use?
-            CachePhase::Stale | CachePhase::Miss => {
+            CachePhase::Stale => {
                 let inner_enabled = self.inner_enabled_mut();
+                let old_meta = inner_enabled
+                    .meta
+                    .as_ref()
+                    .expect("stale phase has cache meta");
+                inner_enabled.stale_meta_variance = old_meta.variance();
+                meta.set_provenance(old_meta.provenance());
+                // TODO: have a separate expired span?
+                inner_enabled.traces.log_meta_in_miss_span(&meta);
+                inner_enabled.meta = Some(meta);
+            }
+            CachePhase::Miss => {
+                let inner_enabled = self.inner_enabled_mut();
+                inner_enabled.stale_meta_variance = None;
                 // TODO: have a separate expired span?
                 inner_enabled.traces.log_meta_in_miss_span(&meta);
                 inner_enabled.meta = Some(meta);
@@ -1071,13 +1095,16 @@ impl HttpCache {
                 // update new meta with old meta's created time
                 let old_meta = inner_enabled.meta.take().unwrap();
                 let created = old_meta.0.internal.created;
+                let provenance = old_meta.provenance();
                 meta.0.internal.created = created;
+                meta.set_provenance(provenance);
                 // meta.internal.updated was already set to new meta's `created`,
                 // no need to set `updated` here
                 // Merge old extensions with new ones. New exts take precedence if they conflict.
                 let mut extensions = old_meta.0.extensions;
                 extensions.extend(meta.0.extensions);
                 meta.0.extensions = extensions;
+                inner_enabled.stale_meta_variance = None;
 
                 inner_enabled.meta.replace(meta);
 
@@ -1194,16 +1221,23 @@ impl HttpCache {
         //
         // **Case 1**: Variance was absent, but caller sets it now.
         // We will just insert it into the meta. The current asset becomes the primary variant.
-        // Because the current location of the asset is already the primary variant, nothing else
-        // needs to be done.
+        // Because the current location of the asset is already the primary variant, the lookup key
+        // does not need to change. If this is an expired response, this is a new Vary family, so
+        // provenance is reset to the refreshed metadata's created timestamp.
         //
         // **Case 2**: Variance was present, but it changed or was removed.
         // We want the current asset to take over the primary slot, in order to invalidate all
-        // other variants derived under the old Vary.
+        // other variants derived under the old Vary. For expired responses, provenance is reset
+        // to the refreshed metadata's created timestamp.
         //
         // **Case 3**: Variance did not change.
         // Nothing needs to happen.
-        let inner = match self.phase {
+        //
+        // These provenance updates do not provide ordering on their own. Writers need a cache lock
+        // to avoid racing each other. A purge can still race with a stale refresh: whichever observes
+        // or writes storage last determines whether old provenance is carried forward or replaced.
+        let phase = self.phase;
+        let inner = match phase {
             CachePhase::Miss | CachePhase::Expired => self.inner_mut(),
             _ => panic!("wrong phase {:?}", self.phase),
         };
@@ -1211,6 +1245,21 @@ impl HttpCache {
             .enabled_ctx
             .as_mut()
             .expect("cache enabled on miss and expired");
+        let old_key_variance = inner.key.as_ref().unwrap().get_variance_key().copied();
+        let stale_meta_variance = if phase == CachePhase::Expired {
+            inner_enabled.stale_meta_variance.take()
+        } else {
+            inner_enabled.stale_meta_variance = None;
+            None
+        };
+        let reset_provenance_to_created = if phase == CachePhase::Expired {
+            match old_key_variance {
+                Some(old_variance) => Some(old_variance) != variance,
+                None => stale_meta_variance != variance,
+            }
+        } else {
+            false
+        };
 
         // Update the variance in the meta
         if let Some(variance_hash) = variance.as_ref() {
@@ -1222,13 +1271,20 @@ impl HttpCache {
         } else {
             inner_enabled.meta.as_mut().unwrap().remove_variance();
         }
+        if reset_provenance_to_created {
+            inner_enabled
+                .meta
+                .as_mut()
+                .unwrap()
+                .reset_provenance_to_created();
+        }
 
         // Change the lookup `key` if necessary, in order to admit asset into the primary slot
         // instead of the secondary slot.
         let key = inner.key.as_ref().unwrap();
-        if let Some(old_variance) = key.get_variance_key().as_ref() {
+        if let Some(old_variance) = old_key_variance {
             // This is a secondary variant slot.
-            if Some(*old_variance) != variance.as_ref() {
+            if Some(old_variance) != variance {
                 // This new variance does not match the variance in the cache key we used to look
                 // up this asset.
                 // Drop the cache lock to avoid leaving a dangling lock
@@ -1638,5 +1694,343 @@ impl HttpCache {
             .traces
             .cache_span
             .set_tag(|| Tag::new("is_subrequest", true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use http::StatusCode;
+    use std::any::Any;
+    use std::sync::Mutex;
+
+    struct UpdateOkStorage;
+    struct OneShotLookupStorage {
+        entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
+    }
+    struct EmptyHitHandler;
+
+    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
+    // Only one test uses this storage. Keep it that way unless the tests also isolate their keys
+    // and clear any entries they push.
+    static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
+        entries: Mutex::new(Vec::new()),
+    };
+
+    #[async_trait]
+    impl storage::HandleHit for EmptyHitHandler {
+        async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+
+        async fn finish(
+            self: Box<Self>,
+            _storage: &'static (dyn Storage + Sync),
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for UpdateOkStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _key: &CompactCacheKey,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for OneShotLookupStorage {
+        async fn lookup(
+            &'static self,
+            key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            let compact_key = key.to_compact();
+            let mut entries = self.entries.lock().unwrap();
+            let Some(pos) = entries
+                .iter()
+                .position(|(entry_key, _)| entry_key == &compact_key)
+            else {
+                return Ok(None);
+            };
+            let (_, meta) = entries.remove(pos);
+            Ok(Some((meta, Box::new(EmptyHitHandler))))
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _key: &CompactCacheKey,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    fn test_meta(created: SystemTime) -> CacheMeta {
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        CacheMeta::new(created + Duration::from_secs(60), created, 30, 30, header)
+    }
+
+    fn cache_with_stale_meta(meta: CacheMeta, key: CacheKey) -> HttpCache {
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(key);
+        cache.phase = CachePhase::Stale;
+        cache.inner_enabled_mut().meta = Some(meta);
+        cache
+    }
+
+    fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
+        let mut cache = HttpCache::new();
+        cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
+        cache.set_cache_key(key);
+        cache
+    }
+
+    #[test]
+    fn test_set_cache_meta_preserves_stale_provenance() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "preserve", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+
+        assert_eq!(cache.phase(), CachePhase::Expired);
+        assert_eq!(cache.cache_meta().created(), refresh);
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.inner_enabled().stale_meta_variance, Some(variance));
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_cache_meta_preserves_created_and_provenance() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let revalidated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "revalidate", ""));
+
+        cache
+            .revalidate_cache_meta(test_meta(revalidated_at))
+            .await
+            .unwrap();
+
+        assert_eq!(cache.phase(), CachePhase::Revalidated);
+        assert_eq!(cache.cache_meta().created(), created);
+        assert_eq!(cache.cache_meta().updated(), revalidated_at);
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+    }
+
+    #[test]
+    fn test_update_variance_preserves_provenance_when_primary_variance_unchanged() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "same-vary", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_primary_variance_changes() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let old_variance = [1; 16];
+        let new_variance = [2; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(old_variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "changed-vary", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(new_variance));
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert_eq!(cache.cache_meta().variance(), Some(new_variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_primary_variance_appears() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("", "vary-appears", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_secondary_takes_primary_slot() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let old_variance = [1; 16];
+        let mut key = CacheKey::new("", "secondary-takeover", "");
+        key.set_variance_key(old_variance);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(old_variance);
+        let mut cache = cache_with_stale_meta(old_meta, key);
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(None);
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert!(cache.cache_meta().variance().is_none());
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_preserves_provenance_when_secondary_variance_unchanged() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+        let mut key = CacheKey::new("", "secondary-same-vary", "");
+        key.set_variance_key(variance);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, key);
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert_eq!(cache.cache_key().get_variance_key(), Some(&variance));
+    }
+
+    #[tokio::test]
+    async fn test_cache_vary_lookup_uses_provenance_for_valid_after() {
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let secondary_created = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let primary_refreshed = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let primary_variance = [1; 16];
+        let secondary_variance = [2; 16];
+
+        let mut primary_meta = test_meta(primary_refreshed);
+        primary_meta.set_provenance(family_start);
+        primary_meta.set_variance_key(primary_variance);
+
+        let mut secondary_meta = test_meta(secondary_created);
+        secondary_meta.set_provenance(family_start);
+        secondary_meta.set_variance_key(secondary_variance);
+
+        let mut cache = cache_with_lookup_storage(CacheKey::new("", "valid-after-provenance", ""));
+        assert!(!cache.cache_vary_lookup(secondary_variance, &primary_meta));
+        assert_eq!(
+            cache.inner_enabled().valid_after,
+            Some(primary_meta.provenance())
+        );
+
+        let secondary_key = cache.cache_key().to_compact();
+        ONE_SHOT_LOOKUP_STORAGE
+            .entries
+            .lock()
+            .unwrap()
+            .push((secondary_key, secondary_meta));
+
+        assert!(cache.cache_lookup().await.unwrap().is_some());
     }
 }

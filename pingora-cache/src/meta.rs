@@ -561,6 +561,27 @@ mod internal_meta {
             assert_eq!(decoded.epoch_override, Some(now));
         }
 
+        // Entries written with provenance = Some(...) require a reader that supports the
+        // provenance field. The previous test pins the compatible None encoding.
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_provenance_some_needs_field_support() {
+            let now = SystemTime::now();
+            let current = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: Some(now),
+                provenance: Some(now),
+                ..Default::default()
+            };
+            let binary = current.serialize().unwrap();
+
+            assert!(InternalMetaV2BeforeProvenance::deserialize(&binary).is_err());
+            let decoded = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(decoded.provenance, Some(now));
+        }
+
         // Round-trip a Some(provenance): preservation across encode/decode cycles is
         // what the cache_vary_lookup tombstone relies on for SWR-refreshed entries.
         #[test]
@@ -613,6 +634,7 @@ impl CacheMeta {
                 updated: created, // created == updated for new meta
                 stale_while_revalidate_sec,
                 stale_if_error_sec,
+                provenance: Some(created),
                 ..Default::default()
             },
             header,
@@ -645,11 +667,20 @@ impl CacheMeta {
             .unwrap_or(self.0.internal.created)
     }
 
+    /// Set the cache-object provenance timestamp.
+    pub(crate) fn set_provenance(&mut self, provenance: SystemTime) {
+        self.0.internal.provenance = Some(provenance);
+    }
+
+    /// Reset provenance to this metadata record's creation time.
+    pub(crate) fn reset_provenance_to_created(&mut self) {
+        self.0.internal.provenance = Some(self.0.internal.created);
+    }
+
     /// The raw provenance value, exposing whether the field was explicitly set
     /// (`Some`) vs derived via the [`Self::created`] fallback (`None`).
     ///
-    /// Test-only inspection helper for the reader-prep phase, where we need to
-    /// assert normal write paths still leave the field absent.
+    /// Test-only inspection helper for compatibility coverage.
     #[cfg(test)]
     pub(crate) fn provenance_raw(&self) -> Option<SystemTime> {
         self.0.internal.provenance
@@ -1029,30 +1060,41 @@ mod tests {
         assert_eq!(meta.fresh_sec(), 100); // back to normal calculation
     }
 
-    // CacheMeta::new intentionally does not stamp provenance in this reader-prep
-    // phase, so newly written entries remain decodable by pre-provenance readers.
     #[test]
-    fn test_cache_meta_new_leaves_provenance_absent() {
+    fn test_cache_meta_new_stamps_provenance() {
         let now = SystemTime::now();
         let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
         let meta = CacheMeta::new(now + Duration::from_secs(60), now, 0, 0, header);
 
         assert_eq!(meta.created(), now);
         assert_eq!(meta.provenance(), now);
-        assert!(meta.provenance_raw().is_none());
+        assert_eq!(meta.provenance_raw(), Some(now));
     }
 
-    // The provenance() accessor falls back to created() when the field is absent
-    // (the only value written in this reader-prep phase).
     #[test]
     fn test_cache_meta_provenance_fallback_for_absent_field() {
         let admission = SystemTime::now();
         let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        let meta = CacheMeta::new(admission + Duration::from_secs(60), admission, 0, 0, header);
+        let mut meta = CacheMeta::new(admission + Duration::from_secs(60), admission, 0, 0, header);
+        meta.0.internal.provenance = None;
 
         assert_eq!(meta.created(), admission);
         assert!(meta.provenance_raw().is_none());
         // Fallback path: provenance() returns created().
         assert_eq!(meta.provenance(), admission);
+    }
+
+    #[test]
+    fn test_cache_meta_set_provenance() {
+        let admission = SystemTime::now();
+        let provenance = admission - Duration::from_secs(30);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(admission + Duration::from_secs(60), admission, 0, 0, header);
+
+        meta.set_provenance(provenance);
+
+        assert_eq!(meta.created(), admission);
+        assert_eq!(meta.provenance(), provenance);
+        assert_eq!(meta.provenance_raw(), Some(provenance));
     }
 }
