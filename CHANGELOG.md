@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1](https://github.com/cloudflare/pingora/compare/0.8.0...0.8.1) - 2026-06-04
+
+
+**🔒 Security**
+
+* Bound default HTTP/2 server limits to mitigate memory exhaustion.
+* Upgrade Rustls-related dev-dependencies to address `rustls-webpki` security advisories.
+
+**⚙️ Miscellaneous Tasks**
+
+* Pin tracing dependencies to preserve Rust 1.84 compatibility.
+* Use `cargo check` for MSRV verification instead of compiling dev-dependencies during tests.
+* Update the Semgrep OSS scanning workflow.
+* Use valid paths in header serialization tests.
+* Gate HTTP/1 CONNECT tests on patched HTTP/1 support.
+
 ## [0.8.0](https://github.com/cloudflare/pingora/compare/0.7.0...0.8.0) - 2026-03-02
 
 
