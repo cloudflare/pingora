@@ -96,12 +96,6 @@ impl<V, const N: usize> Default for ConcurrentHashTable<V, N> {
 
 #[doc(hidden)] // not need in public API
 pub struct LruShard<V>(RwLock<LruCache<u128, V>>);
-impl<V> Default for LruShard<V> {
-    fn default() -> Self {
-        // help satisfy default construction of arrays
-        LruShard(RwLock::new(LruCache::unbounded()))
-    }
-}
 
 /// Sharded concurrent data structure for LruCache
 pub struct ConcurrentLruCache<V, const N: usize> {

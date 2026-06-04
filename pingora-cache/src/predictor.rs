@@ -14,7 +14,7 @@
 
 //! Cacheability Predictor
 
-use crate::hashtable::{ConcurrentLruCache, LruShard};
+use crate::hashtable::ConcurrentLruCache;
 
 pub type CustomReasonPredicate = fn(&'static str) -> bool;
 
@@ -53,14 +53,7 @@ pub trait CacheablePredictor {
     fn mark_uncacheable(&self, key: &CacheKey, reason: NoCacheReason) -> Option<bool>;
 }
 
-// This particular bit of `where [LruShard...; N]: Default` nonsense arises from
-// ConcurrentLruCache needing this trait bound, which in turns arises from the Rust
-// compiler not being able to guarantee that all array sizes N implement `Default`.
-// See https://github.com/rust-lang/rust/issues/61415
-impl<const N_SHARDS: usize> Predictor<N_SHARDS>
-where
-    [LruShard<()>; N_SHARDS]: Default,
-{
+impl<const N_SHARDS: usize> Predictor<N_SHARDS> {
     /// Create a new Predictor with `N_SHARDS * shard_capacity` total capacity for
     /// uncacheable cache keys.
     ///
@@ -80,10 +73,7 @@ where
     }
 }
 
-impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS>
-where
-    [LruShard<()>; N_SHARDS]: Default,
-{
+impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS> {
     fn cacheable_prediction(&self, key: &CacheKey) -> bool {
         // variance key is ignored because this check happens before cache lookup
         let hash = key.primary_bin();
@@ -232,5 +222,21 @@ mod tests {
         assert!(predictor.cacheable_prediction(&key2));
         assert!(!predictor.cacheable_prediction(&key3));
         assert!(!predictor.cacheable_prediction(&key4));
+    }
+
+    #[test]
+    fn test_shard_count_above_32() {
+        // The stdlib only auto-derives `Default` for arrays up to N=32, which
+        // previously capped the shard count. This exercises a shard count well
+        // above 32 to ensure the `arrayvec`-based construction supports any N.
+        let predictor = Predictor::<64>::new(10, None);
+        let key = CacheKey::new("a", "b", "c");
+        assert!(predictor.cacheable_prediction(&key));
+
+        predictor.mark_uncacheable(&key, NoCacheReason::OriginNotCache);
+        assert!(!predictor.cacheable_prediction(&key));
+
+        predictor.mark_cacheable(&key);
+        assert!(predictor.cacheable_prediction(&key));
     }
 }
