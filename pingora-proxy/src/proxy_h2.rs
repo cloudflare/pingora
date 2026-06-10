@@ -241,14 +241,21 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                let upstream_read_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let downstream_error = e.esource == ErrorSource::Downstream;
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out
+                // we know we have not received END_STREAM at this point since we read timed out.
+                // Also cancel the upstream stream when downstream goes away/resets so the
+                // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
-                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
-                    // Mark the underlying H2 connection for shutdown so it's not used
-                    // for new streams in case it is hung.
-                    client_session.conn.mark_shutdown();
+                    if upstream_read_timeout {
+                        // Mark the underlying H2 connection for shutdown so it's not used
+                        // for new streams in case it is hung.
+                        client_session.conn.mark_shutdown();
+                    }
                 }
                 (false, Some(e))
             }
@@ -504,6 +511,35 @@ where
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
+                        },
+                        Err(e) if e.esource == ErrorSource::Downstream => {
+                            // Downstream reset/errored while the upstream write was blocked
+                            // (e.g. on upstream flow control). Same policy as the read error
+                            // handling above: ignore the downstream error if the upstream
+                            // response is being admitted to cache, otherwise fail so the
+                            // downstream stream handles are dropped promptly.
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if !wait_for_cache_fill {
+                                return Err(e);
+                            }
+                            // ignore downstream error so that upstream can continue to write cache
+                            downstream_state.to_errored();
+                            if !self.inner.suppress_proxy_warn_log(
+                                session,
+                                ctx,
+                                &e,
+                                ProxyWarnLogContext::DownstreamCache,
+                            ) {
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                            }
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session anyway.
+                            session.downstream_session.on_proxy_failure(e);
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
@@ -931,15 +967,42 @@ where
             return Ok(false);
         }
 
-        if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+        let (data, end) = match data {
+            Some(data) => {
+                debug!("Write {} bytes body to h2 upstream", data.len());
+                (data, end_of_body)
+            }
+            None => {
+                debug!("Read downstream body done");
+                /* send a standalone END_STREAM flag */
+                (Bytes::new(), true)
+            }
+        };
+
+        /* For H2 downstreams, race the upstream write against downstream stream
+         * closure. A write blocked on upstream flow control would otherwise keep the
+         * downstream stream handles referenced while a downstream RST_STREAM goes
+         * unobserved, pinning the downstream connection window credit until the
+         * write completes. */
+        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+            tokio::select! {
+                biased;
+                res = write_body(client_body, data, end, write_timeout) => {
+                    res.map_err(|e| e.into_up())?;
+                }
+                close_result = stream_close => {
+                    return match close_result {
+                        Ok(reason) => Error::e_explain(
+                            H2Error,
+                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+                        ),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| e.into_down());
+                }
+            }
         } else {
-            debug!("Read downstream body done");
-            /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true, write_timeout)
+            write_body(client_body, data, end, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
