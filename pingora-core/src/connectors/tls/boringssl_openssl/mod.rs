@@ -26,8 +26,6 @@ use crate::tls::ext::{
     ssl_set_renegotiate_mode_freely, ssl_set_verify_cert_store, ssl_use_certificate,
     ssl_use_private_key, ssl_use_second_key_share,
 };
-#[cfg(feature = "boringssl")]
-use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
@@ -52,17 +50,21 @@ const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
 /**
  * Enabled signature algorithms for signing/verification (ECDSA).
  * As of 4/10/2023, the only addition to boringssl's defaults is ECDSA_SECP521R1_SHA512.
+ *
+ * N.B. BoringSSL 5.x uses case-sensitive parsing for signature algorithm names,
+ * so these must be in lowercase wire format.
  */
-const SIGALG_LIST: &str = "ECDSA_SECP256R1_SHA256\
-    :RSA_PSS_RSAE_SHA256\
-    :RSA_PKCS1_SHA256\
-    :ECDSA_SECP384R1_SHA384\
-    :RSA_PSS_RSAE_SHA384\
-    :RSA_PKCS1_SHA384\
-    :RSA_PSS_RSAE_SHA512\
-    :RSA_PKCS1_SHA512\
-    :RSA_PKCS1_SHA1\
-    :ECDSA_SECP521R1_SHA512";
+const SIGALG_LIST: &str = "ecdsa_secp256r1_sha256\
+    :rsa_pss_rsae_sha256\
+    :rsa_pkcs1_sha256\
+    :ecdsa_secp384r1_sha384\
+    :rsa_pss_rsae_sha384\
+    :rsa_pkcs1_sha384\
+    :rsa_pss_rsae_sha512\
+    :rsa_pkcs1_sha512\
+    :rsa_pkcs1_sha1\
+    :ecdsa_secp521r1_sha512";
+
 /**
  * Enabled curves for ECDHE (signature key exchange).
  * As of 4/10/2023, the only addition to boringssl's defaults is SECP521R1.
@@ -72,12 +74,7 @@ const SIGALG_LIST: &str = "ECDSA_SECP256R1_SHA256\
  * that are both computationally cheaper and more supported.
  */
 #[cfg(feature = "boringssl")]
-const BORINGSSL_CURVE_LIST: &[SslCurve] = &[
-    SslCurve::X25519,
-    SslCurve::SECP256R1,
-    SslCurve::SECP384R1,
-    SslCurve::SECP521R1,
-];
+const BORINGSSL_CURVES_LIST: &str = "X25519:P-256:P-384:P-521";
 
 static INIT_CA_ENV: Once = Once::new();
 fn init_ssl_cert_env_vars() {
@@ -100,11 +97,9 @@ impl Connector {
         // Set supported ciphers.
         builder.set_cipher_list(CIPHER_LIST).unwrap();
         // Set supported signature algorithms and ECDH (key exchange) curves.
-        builder
-            .set_sigalgs_list(&SIGALG_LIST.to_lowercase())
-            .unwrap();
+        builder.set_sigalgs_list(SIGALG_LIST).unwrap();
         #[cfg(feature = "boringssl")]
-        builder.set_curves(BORINGSSL_CURVE_LIST).unwrap();
+        builder.set_curves_list(BORINGSSL_CURVES_LIST).unwrap();
         builder
             .set_max_proto_version(Some(SslVersion::TLS1_3))
             .unwrap();
