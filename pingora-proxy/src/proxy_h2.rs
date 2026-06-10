@@ -383,19 +383,7 @@ where
                             // downstream reset/errored while the upstream write was blocked
                             // (e.g. on upstream flow control), bail out so the downstream
                             // stream handles are dropped promptly
-                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
-                                || serve_from_cache.is_miss();
-                            if !wait_for_cache_fill {
-                                return Err(e);
-                            }
-                            // ignore downstream error so that upstream can continue to write cache
-                            downstream_state.to_errored();
-                            warn!(
-                                "Downstream Error ignored during caching: {}, {}",
-                                e,
-                                self.inner.request_summary(session, ctx)
-                            );
-                            session.downstream_session.on_proxy_failure(e);
+                            return Err(e);
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
