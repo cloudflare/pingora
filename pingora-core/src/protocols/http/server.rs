@@ -96,6 +96,16 @@ impl Session {
         matches!(self, Self::Custom(_))
     }
 
+    /// Return a stable, human-readable label for this downstream session type.
+    pub fn session_type(&self) -> &'static str {
+        match self {
+            Self::H1(_) => "h1",
+            Self::H2(_) => "h2",
+            Self::Subrequest(_) => "subrequest",
+            Self::Custom(_) => "custom",
+        }
+    }
+
     /// Read the request header. This method is required to be called first before doing anything
     /// else with the session.
     /// - `Ok(true)`: successful
