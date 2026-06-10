@@ -608,6 +608,18 @@ impl Session {
         }
     }
 
+    /// Wait for the client to abort this stream without reading any body data.
+    ///
+    /// For HTTP/2 this resolves when the client resets the stream (RST_STREAM) or the
+    /// stream errors. Other protocols have no out-of-band abort signal (detecting a
+    /// close would require consuming reads), so this future is pending forever for them.
+    pub async fn watch_h2_stream_reset(&mut self) -> Result<h2::Reason> {
+        match self {
+            Self::H2(s) => s.idle().await,
+            Self::H1(_) | Self::Subrequest(_) | Self::Custom(_) => std::future::pending().await,
+        }
+    }
+
     pub fn as_http1(&self) -> Option<&SessionV1> {
         match self {
             Self::H1(s) => Some(s),
