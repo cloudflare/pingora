@@ -648,10 +648,14 @@ where
                 // "Gate" branch: ready(()) resolves immediately, so the guard controls
                 // whether we enter. This is not a busy-loop because every path through
                 // the inner select either (a) drains all pending tasks via
-                // write_downstream_proxy_tasks (making the guard false), (b) stores an
-                // upstream task in next_upstream_task (making the guard false), or
-                // (c) blocks on real I/O inside the nested select.
-                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
                     tokio::select! {
                         // Try to write downstream proxy tasks (cancel-safe)
                         write_result = session.write_downstream_proxy_tasks() => {
