@@ -95,6 +95,15 @@ impl SocketDigest {
         }
     }
 
+    /// Return the kernel socket cookie for this connection.
+    ///
+    /// This is backed by Linux's `SO_COOKIE` socket option. On other Unix
+    /// platforms this returns `Ok(0)`.
+    #[cfg(unix)]
+    pub fn socket_cookie(&self) -> std::io::Result<u64> {
+        super::l4::ext::get_socket_cookie(self.raw_fd)
+    }
+
     #[cfg(unix)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
         self.peer_addr
@@ -228,4 +237,34 @@ pub trait GetProxyDigest {
 pub trait GetSocketDigest {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>>;
     fn set_socket_digest(&mut self, _socket_digest: SocketDigest) {}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::SocketDigest;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn socket_cookie_returns_cookie_for_tcp_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let client_digest = SocketDigest::from_raw_fd(client.as_raw_fd());
+        let server_digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+
+        assert_ne!(client_digest.socket_cookie().unwrap(), 0);
+        assert_ne!(server_digest.socket_cookie().unwrap(), 0);
+    }
+
+    #[test]
+    fn socket_cookie_returns_cookie_for_unix_socket() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let client_digest = SocketDigest::from_raw_fd(client.as_raw_fd());
+        let server_digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+
+        assert_ne!(client_digest.socket_cookie().unwrap(), 0);
+        assert_ne!(server_digest.socket_cookie().unwrap(), 0);
+    }
 }
