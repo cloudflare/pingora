@@ -1116,3 +1116,101 @@ async fn test_103_die() {
     let res = reqwest::get("http://127.0.0.1:6147/103-die").await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
+
+// A downstream RST_STREAM must be observed even while the proxy is blocked writing the
+// request body to the upstream (parked on h2 flow control). Otherwise the stream is held
+// open as a zombie: its handles stay referenced and the downstream connection-window
+// credit is never released. On catching the RST the proxy should also cancel the
+// upstream stream promptly.
+#[tokio::test]
+async fn test_h2_downstream_rst_while_upstream_write_blocked() {
+    use std::future::poll_fn;
+    use std::time::Duration;
+
+    init();
+
+    // An h2c upstream that accepts one request but never reads its body and never
+    // sends window updates, so the proxy's upstream write blocks on flow control.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = listener.local_addr().unwrap().port();
+    let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<h2::Reason>();
+
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::Builder::new()
+            // tiny stream window so the proxy's write parks quickly
+            .initial_window_size(1024)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let (req, mut send_response) = conn.accept().await.unwrap().unwrap();
+        // hold the body reader without reading it: no window updates are granted
+        let _body = req.into_body();
+
+        // keep driving the connection in the background
+        tokio::spawn(async move {
+            while let Some(res) = conn.accept().await {
+                if res.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // wait for the proxy to reset our stream
+        let reason = poll_fn(|cx| send_response.poll_reset(cx)).await.unwrap();
+        let _ = reset_tx.send(reason);
+    });
+
+    // h2c downstream client to the proxy
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, conn) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        // ignore errors: the proxy may tear the connection down after the RST
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("http://127.0.0.1:6146/")
+        .header("x-h2", "true")
+        .header("x-port", upstream_port.to_string())
+        .body(())
+        .unwrap();
+
+    let (_response, mut req_body) = client.send_request(req, false).unwrap();
+
+    // Push body until the proxy stops granting capacity, meaning it is no longer
+    // reading the downstream body because its upstream write is parked on flow control.
+    let mut sent = 0usize;
+    while sent < 512 * 1024 {
+        req_body.reserve_capacity(16 * 1024);
+        let granted = match tokio::time::timeout(
+            Duration::from_millis(500),
+            poll_fn(|cx| req_body.poll_capacity(cx)),
+        )
+        .await
+        {
+            Ok(Some(Ok(n))) => n,
+            Ok(other) => panic!("downstream send capacity error: {other:?}"),
+            // no new capacity for a while: the proxy is parked on the upstream write
+            Err(_) => break,
+        };
+        req_body
+            .send_data(Bytes::from(vec![0u8; granted]), false)
+            .unwrap();
+        sent += granted;
+    }
+    // we must have at least filled the upstream stream window for the write to park
+    assert!(sent >= 1024, "only sent {sent} bytes");
+
+    // reset the stream while the proxy is blocked writing upstream
+    req_body.send_reset(h2::Reason::CANCEL);
+
+    // the proxy should catch the RST promptly (not hang on the blocked write)
+    // and cancel the upstream stream
+    let reason = tokio::time::timeout(Duration::from_secs(5), reset_rx)
+        .await
+        .expect("proxy did not cancel the upstream stream after the downstream RST")
+        .expect("upstream watcher task died before observing a reset");
+    assert_eq!(reason, h2::Reason::CANCEL);
+}
