@@ -193,7 +193,7 @@ where
         }
     }
 
-    if let Some(curve) = peer.get_peer_options().and_then(|o| o.curves) {
+    if let Some(curve) = peer.get_peer_options().and_then(|o| o.curves.as_deref()) {
         ssl_set_groups_list(&mut ssl_conf, curve).or_err(InternalError, "invalid curves")?;
     }
 

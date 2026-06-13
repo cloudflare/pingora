@@ -84,6 +84,7 @@ impl<C: CachePut> CachePutCtx<C> {
     }
 
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
+        #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut trace = self.trace.child("cache put header", |o| o.start());
         let miss_handler = self
             .storage
@@ -239,7 +240,7 @@ impl<C: CachePut> CachePutCtx<C> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use cf_rustracing::span::Span;
+    use crate::trace::Span;
     use once_cell::sync::Lazy;
 
     struct TestCachePut();

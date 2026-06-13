@@ -33,6 +33,7 @@ use pingora_error::{
 };
 #[cfg(feature = "s2n")]
 use pingora_s2n::S2NPolicy;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -431,8 +432,14 @@ pub struct PeerOptions {
     pub s2n_security_policy: Option<S2NPolicy>,
     #[cfg(feature = "s2n")]
     pub max_blinding_delay: Option<u32>,
-    // how many concurrent h2 stream are allowed in the same connection
+    /// How many concurrent h2 streams are allowed in the same connection.
     pub max_h2_streams: usize,
+    /// Initial per-stream H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_stream_window_size: Option<u32>,
+    /// Initial connection-level H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_connection_window_size: Option<u32>,
     /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
     /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
@@ -441,16 +448,16 @@ pub struct PeerOptions {
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
-    // The list of curve the tls connection should advertise
-    // if `None`, the default curves will be used
-    pub curves: Option<&'static str>,
-    // see ssl_use_second_key_share
+    /// The list of curves the tls connection should advertise
+    /// if `None`, the default curves will be used
+    pub curves: Option<Cow<'static, str>>,
+    /// see ssl_use_second_key_share
     pub second_keyshare: bool,
-    // whether to enable TCP fast open
+    /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
-    // use Arc because Clone is required but not allowed in trait object
+    /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
-    // A custom L4 connector to use to establish new L4 connections
+    /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
@@ -494,6 +501,8 @@ impl PeerOptions {
             #[cfg(feature = "s2n")]
             max_blinding_delay: None,
             max_h2_streams: 1,
+            h2_stream_window_size: None,
+            h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
@@ -685,6 +694,12 @@ impl Hash for HttpPeer {
         self.group_key.hash(state);
         // max h2 stream settings
         self.options.max_h2_streams.hash(state);
+        // h2_stream_window_size and h2_connection_window_size are intentionally excluded
+        // from the reuse hash for now. These are per-connection settings applied at handshake
+        // time and may be revisited alongside other h2 settings that could be dynamically
+        // adjusted over the lifetime of a connection.
+        self.options.curves.hash(state);
+        self.options.second_keyshare.hash(state);
     }
 }
 

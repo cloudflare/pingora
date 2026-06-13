@@ -487,6 +487,7 @@ where
             }
         }
 
+        // No enabled() guard: no concurrent upstream can disable cache here.
         if let Err(e) = session.cache.finish_hit_handler().await {
             warn!("Error during finish_hit_handler: {}", e);
         }
@@ -1276,7 +1277,7 @@ pub mod range_filter {
         pub ranges: Vec<Range<usize>>,
         pub boundary: String,
         total_length: usize,
-        content_type: Option<String>,
+        pub content_type: Option<String>,
     }
 
     impl MultiRangeInfo {

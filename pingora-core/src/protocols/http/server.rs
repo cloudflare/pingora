@@ -22,12 +22,35 @@ use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
 use crate::custom_session;
 use crate::protocols::{Digest, SocketAddr, Stream};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
 use pingora_error::{Error, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use std::any::Any;
 use std::time::Duration;
+
+/// A reusable HTTP/1.x stream and bytes already read for the next request.
+#[derive(Debug)]
+pub struct ReusableHttpStream {
+    stream: Stream,
+    pipelined_prefix: Option<BytesMut>,
+}
+
+impl ReusableHttpStream {
+    pub(crate) fn new(stream: Stream, pipelined_prefix: Option<BytesMut>) -> Self {
+        Self {
+            stream,
+            pipelined_prefix,
+        }
+    }
+
+    /// Split the reusable connection into its underlying stream and optional
+    /// bytes already read for the next pipelined request.
+    pub fn into_parts(self) -> (Stream, Option<BytesMut>) {
+        (self.stream, self.pipelined_prefix)
+    }
+}
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
 pub enum Session {
@@ -226,11 +249,13 @@ impl Session {
         }
     }
 
-    /// Finish the life of this request.
-    /// For H1, if connection reuse is supported, a Some(Stream) will be returned, otherwise None.
+    /// Finish the life of this request and return a reusable stream, if any.
+    ///
+    /// For H1, if connection reuse is supported, a reusable stream will be returned,
+    /// otherwise None.
     /// For H2, always return None because H2 stream is not reusable.
     /// For subrequests, there is no true underlying stream to return.
-    pub async fn finish(self) -> Result<Option<Stream>> {
+    pub async fn finish(self) -> Result<Option<ReusableHttpStream>> {
         match self {
             Self::H1(mut s) => {
                 // need to flush body due to buffering
@@ -312,6 +337,26 @@ impl Session {
     pub fn get_keepalive_reuses_remaining(&self) -> Option<u32> {
         if let Self::H1(s) = self {
             s.get_keepalive_reuses_remaining()
+        } else {
+            None
+        }
+    }
+
+    /// Set user-defined context to carry across requests on the same keepalive connection.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_connection_user_context(&mut self, ctx: Option<Box<dyn Any + Send + Sync>>) {
+        if let Self::H1(s) = self {
+            s.set_connection_user_context(ctx);
+        }
+    }
+
+    /// Take the user-defined context from the previous request on this keepalive connection.
+    ///
+    /// Returns `None` for h2, subrequest, and custom sessions, or if no context was persisted.
+    pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        if let Self::H1(s) = self {
+            s.take_connection_user_context()
         } else {
             None
         }
@@ -436,6 +481,22 @@ impl Session {
         }
     }
 
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
+    /// stays pending so the proxy can finish delivering the upstream response.
+    ///
+    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        match self {
+            Self::H1(s) => s.set_abort_on_close(abort),
+            Self::H2(_) => {}
+            Self::Subrequest(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {
@@ -468,6 +529,19 @@ impl Session {
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
             Self::Custom(s) => s.shutdown(0, "shutdown").await,
+        }
+    }
+
+    /// Give up the H2 stream with a custom reason.
+    ///
+    /// For H2, this sends a `RST_STREAM` frame with the specified reason.
+    /// For H1, subrequests, and custom sessions, this is a no-op since they don't support
+    /// stream reset reasons.
+    ///
+    /// See [`super::v2::server::HttpSession::shutdown_with_reason`] for available reasons.
+    pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
+        if let Self::H2(s) = self {
+            s.shutdown_with_reason(reason);
         }
     }
 
@@ -784,6 +858,108 @@ impl Session {
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
             Self::Custom(_) => None,
+        }
+    }
+
+    /// Check if this session supports the cancel-safe proxy task API.
+    ///
+    /// Currently supported by HTTP/1.x and Subrequest server sessions;
+    /// toggled per-session via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    pub fn supports_proxy_task_api(&self) -> bool {
+        match self {
+            Self::H1(s) => s.proxy_tasks_enabled(),
+            Self::Subrequest(s) => s.proxy_tasks_enabled(),
+            Self::H2(_) => false,
+            Self::Custom(_) => false,
+        }
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::H1(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::Subrequest(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::H2(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
+    /// Whether HTTP/1.1 request pipelining is enabled for this session.
+    ///
+    /// Always false for H2 / Subrequest / Custom (pipelining is an H/1.1-only
+    /// concept). For H1, see
+    /// [`HttpSession::set_pipelining_enabled`](crate::protocols::http::v1::server::HttpSession::set_pipelining_enabled).
+    pub fn pipelining_enabled(&self) -> bool {
+        match self {
+            Self::H1(s) => s.pipelining_enabled(),
+            _ => false,
+        }
+    }
+
+    /// Enable or disable HTTP/1.1 request pipelining on this session.
+    ///
+    /// No-op for H2 / Subrequest / Custom. See
+    /// [`HttpSession::set_pipelining_enabled`](crate::protocols::http::v1::server::HttpSession::set_pipelining_enabled)
+    /// for semantics.
+    pub fn set_pipelining_enabled(&mut self, enabled: bool) {
+        if let Self::H1(s) = self {
+            s.set_pipelining_enabled(enabled);
+        }
+    }
+
+    /// Set pipelined bytes to be parsed as the start of this session's request.
+    ///
+    /// No-op for non-H1 sessions. See
+    /// [`HttpSession::set_pipelined_prefix`](crate::protocols::http::v1::server::HttpSession::set_pipelined_prefix)
+    /// for the lifecycle.
+    pub fn set_pipelined_prefix(&mut self, prefix: BytesMut) {
+        if let Self::H1(s) = self {
+            s.set_pipelined_prefix(prefix);
+        }
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
+        match self {
+            Self::H1(s) => s.send_proxy_task(task),
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.send_proxy_task(task),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
+
+    /// Check if there are pending downstream proxy tasks queued for writing.
+    ///
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
+        match self {
+            Self::H1(s) => s.has_pending_proxy_tasks(),
+            Self::H2(_) => false, // TODO: implement for H2
+            Self::Subrequest(s) => s.has_pending_proxy_tasks(),
+            Self::Custom(_) => false, // TODO: implement for custom
+        }
+    }
+
+    /// Write all queued downstream proxy tasks in a cancel-safe manner.
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.write_proxy_tasks().await,
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.write_proxy_tasks().await,
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
 }

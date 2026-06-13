@@ -23,12 +23,12 @@ use crate::listeners::tls::TlsSettings;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
-    ConnectionFilter, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
+    ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
 };
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
-use crate::server::ShutdownWatch;
+use crate::server::{RuntimeOpts, ShutdownWatch};
 use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
@@ -40,6 +40,9 @@ use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Override the runtime options used to run a listening service.
+pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
+
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
     name: String,
@@ -47,6 +50,7 @@ pub struct Service<A> {
     app_logic: Option<A>,
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -59,6 +63,7 @@ impl<A> Service<A> {
             listeners: Listeners::new(),
             app_logic: Some(app_logic),
             threads: None,
+            runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -72,9 +77,17 @@ impl<A> Service<A> {
             listeners,
             app_logic: Some(app_logic),
             threads: None,
+            runtime_opts_override: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
+    }
+
+    /// Set a runtime options override for this service.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn set_runtime_opts_override(&mut self, override_fn: RuntimeOptsOverride) {
+        self.runtime_opts_override = Some(override_fn);
     }
 
     /// Set a custom connection filter for this service.
@@ -121,6 +134,11 @@ impl<A> Service<A> {
     /// Add a TCP listening endpoint with the given address (e.g., `127.0.0.1:8000`).
     pub fn add_tcp(&mut self, addr: &str) {
         self.listeners.add_tcp(addr);
+    }
+
+    /// Add a listening endpoint configured by a [`ListenerConfig`].
+    pub fn add_listener(&mut self, endpoint: ListenerConfig) {
+        self.listeners.add_listener(endpoint);
     }
 
     /// Add a TCP listening endpoint with the given [`TcpSocketOptions`].
@@ -308,18 +326,10 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
     fn threads(&self) -> Option<usize> {
         self.threads
     }
-}
 
-use crate::apps::prometheus_http_app::PrometheusServer;
-
-impl Service<PrometheusServer> {
-    /// The Prometheus HTTP server
-    ///
-    /// The HTTP server endpoint that reports Prometheus metrics collected in the entire service
-    pub fn prometheus_http_service() -> Self {
-        Service::new(
-            "Prometheus metric HTTP".to_string(),
-            PrometheusServer::new(),
-        )
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        self.runtime_opts_override
+            .as_ref()
+            .and_then(|override_fn| override_fn(global))
     }
 }

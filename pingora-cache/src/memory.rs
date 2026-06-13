@@ -426,7 +426,7 @@ impl Storage for MemCache {
 #[cfg(test)]
 mod test {
     use super::*;
-    use cf_rustracing::span::Span;
+    use crate::trace::Span;
     use once_cell::sync::Lazy;
 
     fn gen_meta() -> CacheMeta {

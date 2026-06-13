@@ -34,6 +34,7 @@ use tokio::sync::watch;
 
 #[cfg(unix)]
 use crate::server::ListenFds;
+use crate::server::RuntimeOpts;
 use crate::server::ShutdownWatch;
 
 pub mod background;
@@ -321,6 +322,15 @@ pub trait ServiceWithDependents: Send + Sync {
         None
     }
 
+    /// Override the runtime options for this service.
+    ///
+    /// Returning [`None`] uses the global runtime options derived from
+    /// [`ServerConf`](crate::server::configuration::ServerConf).
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        let _ = global;
+        None
+    }
+
     /// This is currently called to inform the service about the delay it
     /// experienced from between waiting on its dependencies. Default behavior
     /// is to log the time.
@@ -371,6 +381,10 @@ where
         S::threads(self)
     }
 
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        S::runtime_opts_override(self, global)
+    }
+
     fn on_startup_delay(&self, time_waited: Duration) {
         S::on_startup_delay(self, time_waited)
     }
@@ -409,6 +423,15 @@ pub trait Service: Sync + Send {
     ///
     /// If `None`, the global setting will be used
     fn threads(&self) -> Option<usize> {
+        None
+    }
+
+    /// Override the runtime options for this service.
+    ///
+    /// Returning [`None`] uses the global runtime options derived from
+    /// [`ServerConf`](crate::server::configuration::ServerConf).
+    fn runtime_opts_override(&self, global: &RuntimeOpts) -> Option<RuntimeOpts> {
+        let _ = global;
         None
     }
 

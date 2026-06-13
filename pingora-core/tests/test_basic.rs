@@ -15,6 +15,8 @@
 mod utils;
 
 #[cfg(all(unix, feature = "any_tls"))]
+use hyper_util::client::legacy::Client;
+#[cfg(all(unix, feature = "any_tls"))]
 use hyperlocal::{UnixClientExt, Uri};
 
 #[tokio::test]
@@ -55,8 +57,49 @@ async fn test_https_http2() {
 async fn test_uds() {
     utils::init();
     let url = Uri::new("/tmp/echo.sock", "/").into();
-    let client = hyper::Client::unix();
+    let client: Client<hyperlocal::UnixConnector, http_body_util::Empty<bytes::Bytes>> =
+        Client::unix();
 
     let res = client.get(url).await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
+}
+
+#[cfg(feature = "any_tls")]
+#[tokio::test]
+async fn test_h1_tls_with_h2c_enabled() {
+    utils::init();
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http1_only()
+        .build()
+        .unwrap();
+
+    let res = client.get("https://127.0.0.1:6161").send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+}
+
+#[cfg(feature = "any_tls")]
+#[tokio::test]
+async fn test_h2_tls_with_h2c_enabled() {
+    utils::init();
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    let res = client.get("https://127.0.0.1:6161").send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+}
+
+#[tokio::test]
+async fn test_h2c_tcp_still_works() {
+    utils::init();
+
+    let res = reqwest::get("http://127.0.0.1:6160").await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_11);
 }

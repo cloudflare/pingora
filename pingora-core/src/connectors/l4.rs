@@ -313,15 +313,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
 
-    /// Some of the tests below are flaky when making new connections to mock
-    /// servers. The servers are simple tokio listeners, so failures there are
-    /// not indicative of real errors. This function will retry the peer/server
-    /// in increasing intervals until it either succeeds in connecting or a long
-    /// timeout expires (max 10sec)
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     async fn wait_for_peer<P>(peer: &P)
     where
         P: Peer + Send + Sync,
@@ -394,11 +388,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_conn_timeout() {
-        // 192.0.2.1 is effectively a blackhole
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
+        // dropped on Linux, producing ConnectTimedout. On macOS the kernel
+        // may instead return ENETUNREACH (ConnectNoRoute).
         let mut peer = BasicPeer::new("192.0.2.1:79");
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1)); //1ms
-        let new_session = connect(&peer, None).await;
-        assert_eq!(new_session.unwrap_err().etype(), &ConnectTimedout)
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
+        let err = connect(&peer, None).await.unwrap_err();
+        assert!(
+            err.etype() == &ConnectTimedout || err.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            err.etype()
+        );
     }
 
     #[tokio::test]
@@ -412,7 +412,7 @@ mod tests {
         let move_flag = Arc::clone(&flag);
 
         peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |_| {
-            move_flag.fetch_xor(true, Ordering::SeqCst);
+            move_flag.fetch_not(Ordering::SeqCst);
             Ok(())
         }));
 
@@ -537,6 +537,7 @@ mod tests {
 
         // one-off mock server
         async fn mock_inet_connect_server() -> u16 {
+            use tokio::io::AsyncWriteExt;
             use tokio::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 

@@ -29,6 +29,7 @@ pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing"
 pingora-proxy = { version = "0.8.0", path = "../pingora-proxy", optional = true, default-features = false }
 pingora-cache = { version = "0.8.0", path = "../pingora-cache", optional = true, default-features = false }
 
+
 # Only used for documenting features, but doesn't work in any other dependency 
 # group :(
 document-features = { version = "0.2.10", optional = true }
@@ -37,18 +38,21 @@ document-features = { version = "0.2.10", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = ["rustls"], default-features = false }
-hyper = "0.14"
+reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-prometheus = "0.13"
+pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
+prometheus = "0.14"
 once_cell = { workspace = true }
 bytes = { workspace = true }
 regex = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
+hyperlocal = "0.9"
 jemallocator = "0.5"
 
 [features]
@@ -126,6 +130,24 @@ time = []
 ## Enable sentry for error notifications
 sentry = ["pingora-core/sentry"]
 
+## Enable dial9 Tokio runtime telemetry configuration.
+##
+## Requires building with `--cfg tokio_unstable`.
+dial9 = ["pingora-core/dial9"]
+
+## Enable dial9 S3-compatible trace segment upload support.
+dial9-worker-s3 = ["dial9", "pingora-core/dial9-worker-s3"]
+
+## Enable dial9 CPU profiling support.
+dial9-cpu-profiling = ["dial9", "pingora-core/dial9-cpu-profiling"]
+
+## Enable upstream modules: the `adjust_upstream_modules` callback, the
+## `upstream_modules_ctx` on Session, and `init_upstream_modules` on ProxyHttp.
+##
+## Allows registering custom upstream modules that process response tasks
+## before `upstream_compression`, and configuring them.
+upstream_modules = ["pingora-proxy?/upstream_modules"]
+
 ## Enable pre-TLS connection filtering
 connection_filter = [
     "pingora-core/connection_filter",
@@ -136,7 +158,7 @@ connection_filter = [
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
 any_tls = []
-patched_http1 = ["pingora-core/patched_http1"]
+patched_http1 = ["pingora-core/patched_http1", "pingora-proxy?/patched_http1"]
 document-features = [
     "dep:document-features",
     "proxy",
@@ -144,5 +166,9 @@ document-features = [
     "cache",
     "time",
     "sentry",
+    "dial9",
+    "dial9-worker-s3",
+    "dial9-cpu-profiling",
     "connection_filter"
 ]
+trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]

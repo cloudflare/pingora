@@ -625,13 +625,6 @@ impl HttpSession {
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
             let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
 
-            if let Some(req) = self.request_written.as_ref() {
-                if req.method == http::method::Method::HEAD {
-                    self.body_reader.init_content_length(0, preread_body);
-                    return;
-                }
-            }
-
             let upgraded = if let Some(code) = self.get_status() {
                 match code.as_u16() {
                     101 => self.is_upgrade_req(),
@@ -649,6 +642,13 @@ impl HttpSession {
             } else {
                 false
             };
+
+            if let Some(req) = self.request_written.as_ref() {
+                if req.method == http::method::Method::HEAD {
+                    self.body_reader.init_content_length(0, preread_body);
+                    return;
+                }
+            }
 
             if upgraded {
                 self.body_reader.init_close_delimited(preread_body);
@@ -2223,6 +2223,283 @@ hello";
 
         http_stream.respect_keepalive();
         assert!(!http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn read_informational_head_request() {
+        init_log();
+        // HEAD request that receives 100 Continue followed by 200 OK
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        // Write HEAD request
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob, "100 Continue for HEAD should not signal end of body");
+            }
+            _ => {
+                panic!("task should be informational header")
+            }
+        }
+
+        // Read final 200 OK
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 response should signal end of body");
+            }
+            _ => {
+                panic!("task should be final header")
+            }
+        }
+
+        // Body reader should be Complete(0) for HEAD
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_informational_multiple_head_request() {
+        init_log();
+        // HEAD request that receives 100 Continue, 103 Early Hints, then 200 OK
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // Read 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob, "100 Continue for HEAD should not signal end of body");
+            }
+            _ => {
+                panic!("task should be 100 header")
+            }
+        }
+
+        // Read 103 Early Hints
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 103);
+                assert!(
+                    !eob,
+                    "103 Early Hints for HEAD should not signal end of body"
+                );
+            }
+            _ => {
+                panic!("task should be 103 header")
+            }
+        }
+
+        // Read 200 OK — end of body
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 response should signal end of body");
+            }
+            _ => {
+                panic!("task should be final header")
+            }
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_basic_head() {
+        init_log();
+        // Basic HEAD + 200
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob, "HEAD 200 should be end of body");
+            }
+            _ => {
+                panic!("task should be header")
+            }
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+
+        // Keepalive should work for a properly-framed HEAD response
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn read_head_informational_keepalive() {
+        init_log();
+        // HEAD + 100 Continue + 200 OK, then verify keepalive is preserved.
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .read(&input1[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // 100 Continue
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => panic!("task should be informational header"),
+        }
+
+        // 200 OK
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob);
+            }
+            _ => panic!("task should be final header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+
+        // Keepalive must still work after the 100 + 200 sequence
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn read_head_204() {
+        init_log();
+        // HEAD + 204 No Content
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 204 No Content\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 204);
+                assert!(eob, "HEAD 204 should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_head_304() {
+        init_log();
+        // HEAD + 304 Not Modified
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 304);
+                assert!(eob, "HEAD 304 should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_head_101_non_upgrade() {
+        init_log();
+        // HEAD + 101 where the request is not an upgrade request.
+        // Contrived, but verifies the new code path: 101 check fires first,
+        // is_upgrade_req() returns false, then HEAD check fires.
+        let wire = b"HEAD / HTTP/1.1\r\n\r\n";
+        let input = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("HEAD", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 101);
+                // HEAD without Upgrade headers → not an upgrade, body is "done"
+                assert!(eob, "HEAD 101 (non-upgrade) should be end of body");
+            }
+            _ => panic!("task should be header"),
+        }
+
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
     }
 }
 

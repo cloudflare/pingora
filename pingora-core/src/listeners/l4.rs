@@ -44,6 +44,20 @@ use crate::protocols::GetSocketDigest;
 use crate::protocols::TcpKeepalive;
 #[cfg(unix)]
 use crate::server::ListenFds;
+#[cfg(unix)]
+use std::sync::LazyLock;
+
+/// Per-address async lock map for serializing the check-bind-insert sequence
+/// in [`ListenerEndpointBuilder::listen`].
+///
+/// With `ListenFds` using a synchronous `parking_lot::Mutex`, the lock cannot
+/// be held across `bind().await`. This global map ensures that only one task at
+/// a time can be in the process of looking up, binding, and inserting a given
+/// address — preventing two concurrent callers from both seeing "not found" and
+/// racing to bind the same address.
+#[cfg(unix)]
+static BIND_LOCKS: LazyLock<flurry::HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(flurry::HashMap::new);
 
 const TCP_LISTENER_MAX_TRY: usize = 30;
 const TCP_LISTENER_TRY_STEP: Duration = Duration::from_secs(1);
@@ -326,19 +340,38 @@ impl ListenerEndpointBuilder {
         let listener = if let Some(fds_table) = fds {
             let addr_str = listen_addr.as_ref();
 
-            // consider make this mutex std::sync::Mutex or OnceCell
-            let mut table = fds_table.lock().await;
+            // Acquire a per-address async lock so that only one task at a
+            // time can go through the check-bind-insert sequence for a given
+            // address. The flurry guard is dropped before the await so its
+            // !Send pointer does not cross an await point.
+            let addr_lock = {
+                let guard = BIND_LOCKS.pin();
+                match guard.get(addr_str) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let new_lock = Arc::new(tokio::sync::Mutex::new(()));
+                        match guard.try_insert(addr_str.to_string(), new_lock.clone()) {
+                            Ok(inserted) => inserted.clone(),
+                            Err(e) => e.current.clone(),
+                        }
+                    }
+                }
+            };
+            let _guard = addr_lock.lock().await;
 
-            if let Some(fd) = table.get(addr_str) {
-                from_raw_fd(&listen_addr, *fd)?
+            let existing_fd = fds_table.lock().get(addr_str).copied();
+
+            if let Some(fd) = existing_fd {
+                from_raw_fd(&listen_addr, fd)?
             } else {
-                // not found
                 let listener = bind(&listen_addr).await?;
-                table.add(addr_str.to_string(), listener.as_raw_fd());
+                fds_table
+                    .lock()
+                    .add(addr_str.to_string(), listener.as_raw_fd());
                 listener
             }
         } else {
-            // not found, no fd table
+            // no fd table
             bind(&listen_addr).await?
         };
 
@@ -384,6 +417,15 @@ impl ListenerEndpoint {
 
     pub fn as_str(&self) -> &str {
         self.listen_addr.as_ref()
+    }
+
+    /// Return the local address this endpoint is bound to.
+    ///
+    /// Useful when the listener was bound to port 0 (OS-assigned) to
+    /// discover the actual port.
+    #[cfg(test)]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.listener.local_addr()
     }
 
     fn apply_stream_settings(&self, stream: &mut Stream) -> Result<()> {
@@ -470,17 +512,17 @@ mod test {
 
     #[tokio::test]
     async fn test_listen_tcp() {
-        let addr = "127.0.0.1:7100";
-
         let mut builder = ListenerEndpoint::builder();
 
-        builder.listen_addr(ServerAddress::Tcp(addr.into(), None));
+        builder.listen_addr(ServerAddress::Tcp("127.0.0.1:0".into(), None));
 
         #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
 
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
+
+        let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -500,7 +542,7 @@ mod test {
 
         let mut builder = ListenerEndpoint::builder();
 
-        builder.listen_addr(ServerAddress::Tcp("[::]:7101".into(), sock_opt));
+        builder.listen_addr(ServerAddress::Tcp("[::]:0".into(), sock_opt));
 
         #[cfg(unix)]
         let listener = builder.listen(None).await.unwrap();
@@ -508,15 +550,17 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
+        let port = listener.local_addr().unwrap().port();
+
         tokio::spawn(async move {
             // just try to accept twice
             listener.accept().await.unwrap();
             listener.accept().await.unwrap();
         });
-        tokio::net::TcpStream::connect("127.0.0.1:7101")
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect_err("cannot connect to v4 addr");
-        tokio::net::TcpStream::connect("[::1]:7101")
+        tokio::net::TcpStream::connect(format!("[::1]:{port}"))
             .await
             .expect("can connect to v6 addr");
     }

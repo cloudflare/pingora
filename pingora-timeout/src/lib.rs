@@ -109,10 +109,14 @@ where
     F: ToTimeout,
 {
     pub(crate) fn new_with_delay(value: T, d: Duration) -> Timeout<T, F> {
+        Self::new_with_callback(value, F::create(d))
+    }
+
+    pub(crate) fn new_with_callback(value: T, callback: F) -> Timeout<T, F> {
         Timeout {
             value,
             delay: None,
-            callback: F::create(d),
+            callback,
         }
     }
 }

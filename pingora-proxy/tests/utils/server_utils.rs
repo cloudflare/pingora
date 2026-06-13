@@ -43,9 +43,12 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -241,6 +244,16 @@ impl ProxyHttp for ExampleProxyHttps {
 
 pub struct ExampleProxyHttp {}
 
+static SUPPRESS_PROXY_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn reset_suppress_proxy_warn_log_calls() {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.store(0, Ordering::Relaxed);
+}
+
+pub fn suppress_proxy_warn_log_calls() -> usize {
+    SUPPRESS_PROXY_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
+
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
@@ -253,8 +266,19 @@ impl ProxyHttp for ExampleProxyHttp {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let req = session.req_header();
-        let downstream_compression = req.headers.get("x-downstream-compression").is_some();
+        let proxy_tasks_enabled = session
+            .req_header()
+            .headers
+            .get("x-proxy-tasks-enabled")
+            .is_some();
+        if proxy_tasks_enabled {
+            session.downstream_session.set_proxy_tasks_enabled(true);
+        }
+        let downstream_compression = session
+            .req_header()
+            .headers
+            .get("x-downstream-compression")
+            .is_some();
         if downstream_compression {
             session
                 .downstream_modules_ctx
@@ -346,6 +370,15 @@ impl ProxyHttp for ExampleProxyHttp {
             peer.options.set_http_version(2, 2);
         }
 
+        if let Some(ms) = req
+            .headers
+            .get("x-read-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
+        }
+
         Ok(peer)
     }
 
@@ -360,6 +393,23 @@ impl ProxyHttp for ExampleProxyHttp {
         ctx: &mut CTX,
     ) -> Result<()> {
         connected_to_upstream_common(reused, digest, ctx)
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if session.get_header_bytes("x-test-suppress-proxy-warn-log") == b"true"
+            && context == ProxyWarnLogContext::UpstreamRetry
+        {
+            SUPPRESS_PROXY_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -649,6 +699,12 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.remove_header(&CONTENT_LENGTH);
             upstream_response.remove_header(&TRANSFER_ENCODING);
         }
+        // Allow tests to inject Cache-Control into the upstream response
+        if let Some(cc) = session.req_header().headers.get("x-set-cache-control") {
+            upstream_response
+                .insert_header(http::header::CACHE_CONTROL, cc)
+                .unwrap();
+        }
         Ok(())
     }
 
@@ -814,13 +870,13 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
-    // h2c cache service, for tests that need raw h2 downstream control (e.g. RST_STREAM)
+    // H2C-enabled cache proxy on port 6154
     let mut proxy_service_cache_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
-    let http_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
-    let mut http_server_options = HttpServerOptions::default();
-    http_server_options.h2c = true;
-    http_logic.server_options = Some(http_server_options);
+    let cache_h2c_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
+    let mut cache_h2c_options = HttpServerOptions::default();
+    cache_h2c_options.h2c = true;
+    cache_h2c_logic.server_options = Some(cache_h2c_options);
     proxy_service_cache_h2c.add_tcp("0.0.0.0:6154");
 
     #[cfg(feature = "any_tls")]
@@ -874,16 +930,28 @@ pub struct PskTlsServer {
 #[cfg(feature = "s2n")]
 impl PskTlsServer {
     pub fn start() -> Self {
-        let server_handle = thread::spawn(|| {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Use a channel to wait for the server to bind its port.
+        // A TCP probe can't be used here because the TLS acceptor would
+        // try to handshake the probe connection, fail, and panic.
+        let (tx, rx) = mpsc::channel();
+        let server_handle = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(Self::run_server());
+            rt.block_on(Self::run_server(tx));
         });
+
+        // Wait up to 10s for the server to signal it has bound the port.
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("PSK TLS server failed to start within 10s");
+
         PskTlsServer {
             handle: server_handle,
         }
     }
 
-    async fn run_server() {
+    async fn run_server(ready_tx: std::sync::mpsc::Sender<()>) {
         use pingora_core::{protocols::tls::S2NConnectionBuilder, tls::TlsAcceptor};
         use pingora_core::{
             protocols::tls::{Psk, PskConfig, PskType},
@@ -900,6 +968,8 @@ impl PskTlsServer {
 
         let addr: std::net::SocketAddr = "127.0.0.1:6151".parse().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
+        let _ = ready_tx.send(()); // signal: port is bound
+
         let mut config_builder = Config::builder();
         unsafe {
             config_builder.disable_x509_verification();
@@ -916,12 +986,20 @@ impl PskTlsServer {
         let acceptor = TlsAcceptor::new(connection_builder);
 
         loop {
-            use tokio::{io::AsyncWriteExt, net::tcp};
+            use tokio::io::AsyncWriteExt;
             let (tcp_stream, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.clone().accept(tcp_stream).await.unwrap();
+            // Don't panic on handshake failure — a stale connection or probe
+            // shouldn't take down the server for subsequent real connections.
+            let mut stream = match acceptor.clone().accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("PSK TLS server: handshake failed: {e}");
+                    continue;
+                }
+            };
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-            stream.write(response).await.unwrap();
-            stream.shutdown().await;
+            let _ = stream.write_all(response).await;
+            let _ = stream.shutdown().await;
         }
     }
 }

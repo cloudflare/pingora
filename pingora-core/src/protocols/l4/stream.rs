@@ -179,7 +179,7 @@ impl RawStreamWrapper {
             #[cfg(target_os = "linux")]
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
-            reusable_cmsg_space: nix::cmsg_space!(nix::sys::time::TimeSpec),
+            reusable_cmsg_space: nix::cmsg_space!(nix::sys::socket::Timestamps),
         }
     }
 
@@ -242,7 +242,8 @@ impl AsyncRead for RawStreamWrapper {
                             as *mut [u8])
                     };
                     let mut iov = [IoSliceMut::new(b)];
-                    rs_wrapper.reusable_cmsg_space.clear();
+
+                    rs_wrapper.reusable_cmsg_space.fill(0);
 
                     match s.try_io(Interest::READABLE, || {
                         recvmsg::<SockaddrStorage>(
@@ -255,7 +256,7 @@ impl AsyncRead for RawStreamWrapper {
                     }) {
                         Ok(r) => {
                             if let Some(ControlMessageOwned::ScmTimestampsns(rtime)) = r
-                                .cmsgs()
+                                .cmsgs()?
                                 .find(|i| matches!(i, ControlMessageOwned::ScmTimestampsns(_)))
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
@@ -354,14 +355,69 @@ impl AsRawSocket for RawStreamWrapper {
     }
 }
 
-// Large read buffering helps reducing syscalls with little trade-off
-// Ssl layer always does "small" reads in 16k (TLS record size) so L4 read buffer helps a lot.
-const BUF_READ_SIZE: usize = 64 * 1024;
-// Small write buf to match MSS. Too large write buf delays real time communication.
-// This buffering effectively implements something similar to Nagle's algorithm.
-// The benefit is that user space can control when to flush, where Nagle's can't be controlled.
-// And userspace buffering reduce both syscalls and small packets.
-const BUF_WRITE_SIZE: usize = 1460;
+/// The default L4 read buffer size.
+///
+/// Large read buffering helps reducing syscalls with little trade-off. The SSL
+/// layer always does "small" reads in 16k chunks (TLS record size), so L4 read
+/// buffering helps a lot.
+pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 64 * 1024;
+
+/// The default L4 write buffer size.
+///
+/// Small write buffering matches a typical MSS. Too large a write buffer delays
+/// real-time communication. This buffering effectively implements something
+/// similar to Nagle's algorithm, but user space can control when to flush.
+pub const DEFAULT_L4_WRITE_BUFFER_SIZE: usize = 1460;
+
+/// L4 [`BufStream`] buffer sizing.
+///
+/// Leaving either side as `None` preserves Pingora's default for that side.
+/// Setting either side to `Some(0)` disables `BufStream` buffering for that
+/// direction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct L4BufferSettings {
+    /// Read buffer size in bytes. `None` uses [`DEFAULT_L4_READ_BUFFER_SIZE`].
+    pub read: Option<usize>,
+    /// Write buffer size in bytes. `None` uses [`DEFAULT_L4_WRITE_BUFFER_SIZE`].
+    pub write: Option<usize>,
+}
+
+impl L4BufferSettings {
+    /// Create settings with both read and write buffer sizes set explicitly.
+    pub fn new(read: usize, write: usize) -> Self {
+        Self {
+            read: Some(read),
+            write: Some(write),
+        }
+    }
+
+    /// Create settings that disable both read and write `BufStream` buffering.
+    pub fn unbuffered() -> Self {
+        Self::new(0, 0)
+    }
+
+    /// Set the read buffer size.
+    pub fn read(mut self, read: usize) -> Self {
+        self.read = Some(read);
+        self
+    }
+
+    /// Set the write buffer size.
+    pub fn write(mut self, write: usize) -> Self {
+        self.write = Some(write);
+        self
+    }
+
+    /// Resolved read buffer size after applying defaults.
+    pub fn read_capacity(&self) -> usize {
+        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE)
+    }
+
+    /// Resolved write buffer size after applying defaults.
+    pub fn write_capacity(&self) -> usize {
+        self.write.unwrap_or(DEFAULT_L4_WRITE_BUFFER_SIZE)
+    }
+}
 
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
@@ -434,7 +490,7 @@ impl Stream {
         if let RawStream::Tcp(s) = &self.stream_mut().get_mut().stream {
             let timestamp_options = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
                 | TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE;
-            setsockopt(s.as_raw_fd(), sockopt::Timestamping, &timestamp_options)
+            setsockopt(&s, sockopt::Timestamping, &timestamp_options)
                 .or_err(InternalError, "failed to set SOF_TIMESTAMPING_RX_SOFTWARE")?;
             self.stream_mut().get_mut().enable_rx_ts(true);
         }
@@ -447,8 +503,11 @@ impl Stream {
         Ok(())
     }
 
-    /// Put Some data back to the head of the stream to be read again
-    pub(crate) fn rewind(&mut self, data: &[u8]) {
+    /// Put some data back to the head of the stream to be read again.
+    ///
+    /// This is useful when you've read data to detect a protocol (e.g., PROXY protocol)
+    /// but the data wasn't what you expected, so you need to "unread" it.
+    pub fn rewind(&mut self, data: &[u8]) {
         if !data.is_empty() {
             self.rewind_read_buf.push(data.to_vec());
         }
@@ -456,13 +515,18 @@ impl Stream {
 
     /// Set the buffer of BufStream
     /// It is only set later because of the malloc overhead in critical accept() path
-    pub(crate) fn set_buffer(&mut self) {
+    pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
         // Since BufStream doesn't provide an API to adjust the buf directly,
         // we take the raw stream out of it and put it in a new BufStream with the size we want
         let stream = mem::take(&mut self.stream);
-        let stream =
-            stream.map(|s| BufStream::with_capacity(BUF_READ_SIZE, BUF_WRITE_SIZE, s.into_inner()));
+        let stream = stream.map(|s| {
+            BufStream::with_capacity(
+                buffer.read_capacity(),
+                buffer.write_capacity(),
+                s.into_inner(),
+            )
+        });
         let _ = mem::replace(&mut self.stream, stream);
     }
 }
@@ -733,129 +797,6 @@ impl AsyncWrite for Stream {
         }
     }
 }
-
-pub mod async_write_vec {
-    use bytes::Buf;
-    use futures::ready;
-    use std::future::Future;
-    use std::io::IoSlice;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io;
-    use tokio::io::AsyncWrite;
-
-    /*
-        the missing write_buf https://github.com/tokio-rs/tokio/pull/3156#issuecomment-738207409
-        https://github.com/tokio-rs/tokio/issues/2610
-        In general vectored write is lost when accessing the trait object: Box<S: AsyncWrite>
-    */
-
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct WriteVec<'a, W, B> {
-        writer: &'a mut W,
-        buf: &'a mut B,
-    }
-
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct WriteVecAll<'a, W, B> {
-        writer: &'a mut W,
-        buf: &'a mut B,
-    }
-
-    pub trait AsyncWriteVec {
-        fn poll_write_vec<B: Buf>(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut B,
-        ) -> Poll<io::Result<usize>>;
-
-        fn write_vec<'a, B>(&'a mut self, src: &'a mut B) -> WriteVec<'a, Self, B>
-        where
-            Self: Sized,
-            B: Buf,
-        {
-            WriteVec {
-                writer: self,
-                buf: src,
-            }
-        }
-
-        fn write_vec_all<'a, B>(&'a mut self, src: &'a mut B) -> WriteVecAll<'a, Self, B>
-        where
-            Self: Sized,
-            B: Buf,
-        {
-            WriteVecAll {
-                writer: self,
-                buf: src,
-            }
-        }
-    }
-
-    impl<W, B> Future for WriteVec<'_, W, B>
-    where
-        W: AsyncWriteVec + Unpin,
-        B: Buf,
-    {
-        type Output = io::Result<usize>;
-
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-            let me = &mut *self;
-            Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf)
-        }
-    }
-
-    impl<W, B> Future for WriteVecAll<'_, W, B>
-    where
-        W: AsyncWriteVec + Unpin,
-        B: Buf,
-    {
-        type Output = io::Result<()>;
-
-        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            let me = &mut *self;
-            while me.buf.has_remaining() {
-                let n = ready!(Pin::new(&mut *me.writer).poll_write_vec(ctx, me.buf))?;
-                if n == 0 {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    /* from https://github.com/tokio-rs/tokio/blob/master/tokio-util/src/lib.rs#L177 */
-    impl<T> AsyncWriteVec for T
-    where
-        T: AsyncWrite,
-    {
-        fn poll_write_vec<B: Buf>(
-            self: Pin<&mut Self>,
-            ctx: &mut Context,
-            buf: &mut B,
-        ) -> Poll<io::Result<usize>> {
-            const MAX_BUFS: usize = 64;
-
-            if !buf.has_remaining() {
-                return Poll::Ready(Ok(0));
-            }
-
-            let n = if self.is_write_vectored() {
-                let mut slices = [IoSlice::new(&[]); MAX_BUFS];
-                let cnt = buf.chunks_vectored(&mut slices);
-                ready!(self.poll_write_vectored(ctx, &slices[..cnt]))?
-            } else {
-                ready!(self.poll_write(ctx, buf.chunk()))?
-            };
-
-            buf.advance(n);
-
-            Poll::Ready(Ok(n))
-        }
-    }
-}
-
-pub use async_write_vec::AsyncWriteVec;
 
 #[derive(Debug)]
 struct AccumulatedDuration {

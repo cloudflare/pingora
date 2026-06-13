@@ -46,7 +46,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -72,7 +72,7 @@ use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
 use pingora_core::server::configuration::ServerConf;
-use pingora_core::server::ShutdownWatch;
+use pingora_core::server::{RuntimeOpts, ShutdownWatch};
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
@@ -91,10 +91,10 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp};
+pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
+    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -119,6 +119,8 @@ where
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules: HttpModules,
     max_retries: usize,
     process_custom_session: Option<ProcessCustomSession<SV, C>>,
 }
@@ -153,6 +155,8 @@ impl<SV> HttpProxy<SV, ()> {
             server_options: None,
             h2_options: None,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: None,
         }
@@ -169,13 +173,15 @@ where
         connector: C,
         on_custom: Option<ProcessCustomSession<SV, C>>,
         server_options: Option<HttpServerOptions>,
+        client_options: Option<ConnectorOptions>,
     ) -> Self
     where
         SV: ProxyHttp + Send + Sync + 'static,
         SV::CTX: Send + Sync,
     {
-        let client_upstream =
-            Connector::new_custom(Some(ConnectorOptions::from_server_conf(&conf)), connector);
+        let client_options =
+            client_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
+        let client_upstream = Connector::new_custom(Some(client_options), connector);
 
         HttpProxy {
             inner,
@@ -184,10 +190,23 @@ where
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: on_custom,
             h2_options: None,
         }
+    }
+
+    /// Return the number of times a pooled upstream connection was found to contain
+    /// unexpected data from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.client_upstream.unexpected_data_connection_count()
+    }
+
+    /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.client_upstream.unexpected_data_connection_counter()
     }
 
     /// Initialize the downstream modules for this proxy.
@@ -204,6 +223,8 @@ where
     {
         self.inner
             .init_downstream_modules(&mut self.downstream_modules);
+        #[cfg(feature = "upstream_modules")]
+        self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
     async fn handle_new_request(
@@ -417,14 +438,17 @@ where
 
         if reuse {
             // TODO: log error
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
@@ -461,6 +485,10 @@ pub struct Session {
     pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
+    /// Upstream filter modules. These run before `upstream_compression` and see the raw
+    /// (pre-compression) upstream response body.
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules_ctx: HttpModuleCtx,
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
@@ -474,6 +502,7 @@ impl Session {
     fn new(
         downstream_session: impl Into<Box<HttpSession>>,
         downstream_modules: &HttpModules,
+        #[cfg(feature = "upstream_modules")] upstream_modules: &HttpModules,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         Session {
@@ -486,6 +515,8 @@ impl Session {
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
@@ -501,6 +532,8 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             &modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -513,8 +546,45 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             downstream_modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// Run upstream module filters on the given [`HttpTask`].
+    ///
+    /// Upstream modules process each task **before** `upstream_compression` and
+    /// see the raw (pre-compression) upstream response. Like the downstream
+    /// module path, `response_trailer_filter` and `response_done_filter` return
+    /// values are converted to body tasks when present.
+    #[cfg(feature = "upstream_modules")]
+    pub async fn upstream_modules_filter_task(&mut self, t: &mut HttpTask) -> Result<()> {
+        match t {
+            HttpTask::Header(header, eos) => {
+                self.upstream_modules_ctx
+                    .response_header_filter(header, *eos)
+                    .await?;
+            }
+            HttpTask::Body(body, eos) | HttpTask::UpgradedBody(body, eos) => {
+                self.upstream_modules_ctx.response_body_filter(body, *eos)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .upstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                if let Some(buf) = self.upstream_modules_ctx.response_done_filter()? {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Failed(_) => {}
+        }
+        Ok(())
     }
 
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
@@ -584,57 +654,115 @@ impl Session {
             .await
     }
 
-    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        let mut seen_upgraded = self.was_upgraded();
-        for task in tasks.iter_mut() {
-            match task {
-                HttpTask::Header(resp, end) => {
-                    self.downstream_modules_ctx
-                        .response_header_filter(resp, *end)
-                        .await?;
-                }
-                HttpTask::Body(data, end) => {
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::UpgradedBody(data, end) => {
-                    seen_upgraded = true;
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::Trailer(trailers) => {
-                    if let Some(buf) = self
-                        .downstream_modules_ctx
-                        .response_trailer_filter(trailers)?
-                    {
-                        // Write the trailers into the body if the filter
-                        // returns a buffer.
-                        //
-                        // Note, this will not work if end of stream has already
-                        // been seen or we've written content-length bytes.
-                        // (Trailers should never come after upgraded body)
-                        *task = HttpTask::Body(Some(buf), true);
-                    }
-                }
-                HttpTask::Done => {
-                    // `Done` can be sent in certain response paths to mark end
-                    // of response if not already done via trailers or body with
-                    // end flag set.
-                    // If the filter returns body bytes on Done,
-                    // write them into the response.
+    // Run downstream module response filters on a single task, updating
+    // `seen_upgraded` to track whether an upgrade has been seen. Used by both
+    // `send_downstream_proxy_task` and `write_response_tasks`.
+    async fn downstream_response_task_filter(
+        &mut self,
+        task: &mut HttpTask,
+        seen_upgraded: &mut bool,
+    ) -> Result<()> {
+        match task {
+            HttpTask::Header(resp, end) => {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+            }
+            HttpTask::Body(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::UpgradedBody(data, end) => {
+                *seen_upgraded = true;
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .downstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    // Write the trailers into the body if the filter
+                    // returns a buffer.
                     //
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
-                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        if seen_upgraded {
-                            *task = HttpTask::UpgradedBody(Some(buf), true);
-                        } else {
-                            *task = HttpTask::Body(Some(buf), true);
-                        }
+                    // (Trailers should never come after upgraded body)
+                    *task = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                // `Done` can be sent in certain response paths to mark end
+                // of response if not already done via trailers or body with
+                // end flag set.
+                // If the filter returns body bytes on Done,
+                // write them into the response.
+                //
+                // Note, this will not work if end of stream has already
+                // been seen or we've written content-length bytes.
+                if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                    if *seen_upgraded {
+                        *task = HttpTask::UpgradedBody(Some(buf), true);
+                    } else {
+                        *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Failed */ }
             }
+            _ => { /* Failed */ }
+        }
+        Ok(())
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing after running
+    /// downstream module filters. This allows decoupling cache writes from
+    /// downstream writes.
+    ///
+    /// Only works with sessions that support the proxy task API (currently H1).
+    ///
+    /// # Panics
+    /// Panics if the session doesn't support the proxy task API.
+    /// Use `write_response_tasks()` for sessions that don't support the proxy task API.
+    pub async fn send_downstream_proxy_task(&mut self, mut task: HttpTask) -> Result<()> {
+        let mut seen_upgraded = self.was_upgraded();
+        self.downstream_response_task_filter(&mut task, &mut seen_upgraded)
+            .await?;
+        self.downstream_session.send_downstream_proxy_task(task);
+        Ok(())
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    ///
+    /// When disabled, the proxy falls back to the blocking `write_response_tasks`
+    /// path. This can be called from request filters to opt out on a per-request
+    /// basis.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.downstream_session.set_proxy_tasks_enabled(enabled);
+    }
+
+    /// Check if there are pending downstream tasks queued for writing.
+    /// Used for backpressure - don't queue more cache tasks if we have pending writes.
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_tasks(&self) -> bool {
+        self.downstream_session.supports_proxy_task_api()
+            && self.downstream_session.has_pending_downstream_proxy_tasks()
+    }
+
+    /// Write all queued downstream proxy tasks. This is cancel-safe and can be called
+    /// in a select! loop while waiting for upstream tasks.
+    /// For sessions that don't support the proxy task API, this is a no-op.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        if self.downstream_session.supports_proxy_task_api() {
+            self.downstream_session.write_downstream_proxy_tasks().await
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
+        for task in tasks.iter_mut() {
+            self.downstream_response_task_filter(task, &mut seen_upgraded)
+                .await?;
         }
         self.downstream_session.response_duplex_vec(tasks).await
     }
@@ -785,14 +913,17 @@ where
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+                    if let Some(uc) = self.inner.persist_connection_context(&session, &ctx) {
+                        persistent_settings.set_user_context(uc);
+                    }
                     return session
                         .downstream_session
                         .finish()
                         .await
                         .ok()
                         .flatten()
-                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
+                        .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings));
                 }
                 /* else continue */
             }
@@ -876,18 +1007,27 @@ where
             match e {
                 Some(error) => {
                     let retry = error.retry();
+                    // only log error that will be retried here, the final error will be logged below
+                    if retry
+                        && !self.inner.suppress_proxy_warn_log(
+                            &session,
+                            &ctx,
+                            &error,
+                            ProxyWarnLogContext::UpstreamRetry,
+                        )
+                    {
+                        warn!(
+                            "Fail to proxy: {}, tries: {}, retry: {}, {}",
+                            error,
+                            retries,
+                            retry,
+                            self.inner.request_summary(&session, &ctx)
+                        );
+                    }
                     proxy_error = Some(error);
                     if !retry {
                         break;
                     }
-                    // only log error that will be retried here, the final error will be logged below
-                    warn!(
-                        "Fail to proxy: {}, tries: {}, retry: {}, {}",
-                        proxy_error.as_ref().unwrap(),
-                        retries,
-                        retry,
-                        self.inner.request_summary(&session, &ctx)
-                    );
                 }
                 None => {
                     proxy_error = None;
@@ -931,7 +1071,7 @@ where
             if !self.inner.suppress_error_log(&session, &ctx, e) {
                 error!(
                     "Fail to proxy: {}, status: {}, tries: {}, retry: {}, {}",
-                    final_error.as_ref().unwrap(),
+                    e,
                     res.error_code,
                     retries,
                     false, // we never retry here
@@ -971,14 +1111,17 @@ where
         session.downstream_session.on_proxy_failure(e);
 
         if res.can_reuse_downstream {
-            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            let mut persistent_settings = HttpPersistentSettings::for_session(&session);
+            if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
+                persistent_settings.set_user_context(uc);
+            }
             session
                 .downstream_session
                 .finish()
                 .await
                 .ok()
                 .flatten()
-                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
+                .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings))
         } else {
             None
         }
@@ -1021,6 +1164,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return, // bad request
@@ -1135,9 +1280,12 @@ where
 {
     async fn process_new_http(
         self: &Arc<Self>,
-        session: HttpSession,
+        mut session: HttpSession,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
+        // Extract user context from the previous request before the session is moved into the Box
+        let prev_user_ctx = session.take_connection_user_context();
+
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
@@ -1145,6 +1293,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return None, // bad request
@@ -1155,7 +1305,14 @@ where
             session.set_keepalive(None);
         }
 
-        let ctx = self.inner.new_ctx();
+        let mut ctx = self.inner.new_ctx();
+
+        // Deliver user context from the previous request on this reused connection
+        if let Some(prev_ctx) = prev_user_ctx {
+            self.inner
+                .on_connection_reuse(&mut session, &mut ctx, prev_ctx);
+        }
+
         self.process_request(session, ctx).await
     }
 
@@ -1190,7 +1347,7 @@ where
     // TODO implement h2_options
 }
 
-use pingora_core::services::listening::Service;
+use pingora_core::services::listening::{RuntimeOptsOverride, Service};
 
 /// Create an [`HttpProxy`] without wrapping it in a [`Service`].
 ///
@@ -1272,7 +1429,8 @@ where
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
-    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None);
+    let mut proxy =
+        HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
     Service::new(name.to_string(), proxy)
@@ -1295,6 +1453,8 @@ where
     connector: C,
     custom: Option<ProcessCustomSession<SV, C>>,
     server_options: Option<HttpServerOptions>,
+    client_options: Option<ConnectorOptions>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, ()>
@@ -1319,6 +1479,8 @@ where
             connector: (),
             custom: None,
             server_options: None,
+            client_options: None,
+            runtime_opts_override: None,
         }
     }
 }
@@ -1353,6 +1515,8 @@ where
             inner,
             name,
             server_options,
+            client_options,
+            runtime_opts_override,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1362,7 +1526,17 @@ where
             connector,
             custom: Some(on_custom),
             server_options,
+            client_options,
+            runtime_opts_override,
         }
+    }
+
+    /// Set the upstream client connector options for the [ProxyServiceBuilder].
+    ///
+    /// Returns a new [ProxyServiceBuilder] with the upstream client connector options set.
+    pub fn client_options(mut self, options: ConnectorOptions) -> Self {
+        self.client_options = Some(options);
+        self
     }
 
     /// Set the server options for the [ProxyServiceBuilder].
@@ -1370,6 +1544,17 @@ where
     /// Returns a new [ProxyServiceBuilder] with the server options set.
     pub fn server_options(mut self, options: HttpServerOptions) -> Self {
         self.server_options = Some(options);
+        self
+    }
+
+    /// Set a runtime options override for the [Service] built by this builder.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn runtime_opts_override<F>(mut self, override_fn: F) -> Self
+    where
+        F: Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync + 'static,
+    {
+        self.runtime_opts_override = Some(Arc::new(override_fn));
         self
     }
 
@@ -1387,11 +1572,24 @@ where
             connector,
             custom,
             server_options,
+            client_options,
+            runtime_opts_override,
         } = self;
 
-        let mut proxy = HttpProxy::new_custom(inner, conf, connector, custom, server_options);
+        let mut proxy = HttpProxy::new_custom(
+            inner,
+            conf,
+            connector,
+            custom,
+            server_options,
+            client_options,
+        );
 
         proxy.handle_init_modules();
-        Service::new(name, proxy)
+        let mut service = Service::new(name, proxy);
+        if let Some(runtime_opts_override) = runtime_opts_override {
+            service.set_runtime_opts_override(runtime_opts_override);
+        }
+        service
     }
 }

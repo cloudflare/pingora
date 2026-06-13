@@ -67,6 +67,20 @@ impl AsRawSocket for Listener {
 }
 
 impl Listener {
+    /// Return the local address this listener is bound to.
+    ///
+    /// For TCP listeners this is the resolved address (including the
+    /// OS-assigned port when the listener was bound to port 0).
+    /// Returns `None` for non-TCP listeners (e.g. Unix domain sockets).
+    #[cfg(test)]
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(l) => l.local_addr().ok(),
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+        }
+    }
+
     /// Accept a connection from the listening endpoint
     pub async fn accept(&self) -> io::Result<Stream> {
         match &self {

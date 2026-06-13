@@ -123,8 +123,7 @@ impl ProxyHttp for MyGateway {
 
 fn main() {
    ...
-    let mut prometheus_service_http =
-        pingora::services::listening::Service::prometheus_http_service();
+    let mut prometheus_service_http = pingora_prometheus::prometheus_http_service();
     prometheus_service_http.add_tcp("127.0.0.1:6192");
     my_server.add_service(prometheus_service_http);
 

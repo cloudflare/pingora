@@ -27,7 +27,7 @@ arc-swap = "1"
 fnv = "1"
 rand = "0.8"
 tokio = { workspace = true }
-futures = "0"
+futures = { workspace = true }
 log = { workspace = true }
 http = { workspace = true }
 derivative.workspace = true
