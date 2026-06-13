@@ -814,6 +814,15 @@ fn test_main() {
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
+    // h2c cache service, for tests that need raw h2 downstream control (e.g. RST_STREAM)
+    let mut proxy_service_cache_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyCache {});
+    let http_logic = proxy_service_cache_h2c.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.h2c = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_cache_h2c.add_tcp("0.0.0.0:6154");
+
     #[cfg(feature = "any_tls")]
     {
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
@@ -830,6 +839,7 @@ fn test_main() {
         Box::new(proxy_service_http),
         Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
+        Box::new(proxy_service_cache_h2c),
     ];
 
     if let Some(proxy_service_https) = proxy_service_https_opt {
