@@ -73,7 +73,7 @@ pub enum HeaderNameVariant<'a> {
 pub struct RequestHeader {
     base: ReqParts,
     header_name_map: Option<CaseMap>,
-    // store the raw path bytes only if it is invalid utf-8
+    // raw target bytes, set for non-UTF-8 paths or targets with no path-and-query
     raw_path_fallback: Vec<u8>, // can also be Box<[u8]>
     // whether we send END_STREAM with HEADERS for h2 requests
     send_end_stream: bool,
@@ -251,29 +251,45 @@ impl RequestHeader {
         self.raw_path_fallback = vec![];
     }
 
+    fn parse_uri(s: &str) -> Result<Uri> {
+        if s.starts_with('/') || s == "*" {
+            Uri::builder().path_and_query(s).build().map_err(|_| ())
+        } else {
+            s.parse::<Uri>().map_err(|_| ())
+        }
+        .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {s}"))
+    }
+
     /// Set the request URI directly via raw bytes.
     ///
     /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
     ///
     /// This API is to allow supporting non UTF-8 cases.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
-        if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            self.base.uri = uri;
-            // keep raw_path empty, no need to store twice
-        } else {
-            // put a valid utf-8 path into base for read only access
-            let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            self.base.uri = uri;
-            self.raw_path_fallback = path.to_vec();
-        }
+        let (uri, fallback) = match std::str::from_utf8(path) {
+            Ok(p) => {
+                let uri = Self::parse_uri(p)?;
+                let has_no_path_and_query = uri
+                    .path_and_query()
+                    .map_or(true, |pq| pq.as_str() == "/" && !p.ends_with('/'));
+                let fallback = if has_no_path_and_query {
+                    path.to_vec()
+                } else {
+                    vec![]
+                };
+                (uri, fallback)
+            }
+            Err(_) => {
+                let lossy_str = String::from_utf8_lossy(path);
+                let uri = Uri::builder()
+                    .path_and_query(lossy_str.as_ref())
+                    .build()
+                    .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
+                (uri, path.to_vec())
+            }
+        };
+        self.base.uri = uri;
+        self.raw_path_fallback = fallback;
         Ok(())
     }
 
@@ -298,14 +314,18 @@ impl RequestHeader {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
         } else {
-            // Url should always be set
             self.base
                 .uri
                 .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+                .map(|pq| pq.as_str().as_bytes())
+                .or_else(|| {
+                    if self.base.method == Method::CONNECT {
+                        self.base.uri.authority().map(|a| a.as_str().as_bytes())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(b"/")
         }
     }
 
@@ -983,5 +1003,38 @@ mod tests {
                 .map(|d| d.as_bytes())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_connect_and_absolute_form() {
+        let connect = RequestHeader::build("CONNECT", b"example.com:443", None);
+        assert!(
+            connect.is_ok(),
+            "CONNECT request target failed to parse: {:?}",
+            connect.err()
+        );
+        let connect = connect.unwrap();
+        assert_eq!(connect.raw_path(), b"example.com:443");
+
+        let absolute_with_path =
+            RequestHeader::build("GET", b"http://example.com/index.html", None);
+        assert!(
+            absolute_with_path.is_ok(),
+            "Absolute-form with path failed to parse: {:?}",
+            absolute_with_path.err()
+        );
+        let absolute_with_path = absolute_with_path.unwrap();
+        // Since absolute-form targets with a path are expected to re-serialize as origin-form:
+        assert_eq!(absolute_with_path.raw_path(), b"/index.html");
+        assert_eq!(absolute_with_path.uri.path(), "/index.html");
+
+        let absolute_without_path = RequestHeader::build("GET", b"http://example.com", None);
+        assert!(
+            absolute_without_path.is_ok(),
+            "Absolute-form without path failed to parse: {:?}",
+            absolute_without_path.err()
+        );
+        let absolute_without_path = absolute_without_path.unwrap();
+        assert_eq!(absolute_without_path.raw_path(), b"http://example.com");
     }
 }
