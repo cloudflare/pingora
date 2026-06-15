@@ -51,6 +51,10 @@ pub async fn handshake_with_callback<S: IO>(
     io: S,
     callbacks: &TlsAcceptCallbacks,
 ) -> Result<SslStream<S>> {
+    // Capture the downstream socket fd before `io` is moved into the stream,
+    // then stash it on the SSL so the certificate callback can recover the
+    // connection's identity (e.g. getsockopt) at handshake time.
+    let downstream_fd = io.id();
     let mut tls_stream = prepare_tls_stream(ssl_acceptor, io)?;
     let done = Pin::new(&mut tls_stream)
         .start_accept()
@@ -59,6 +63,7 @@ pub async fn handshake_with_callback<S: IO>(
     if !done {
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
+        ext::set_downstream_fd(ssl_mut, downstream_fd);
         callbacks.certificate_callback(ssl_mut).await;
         Pin::new(&mut tls_stream)
             .resume_accept()
