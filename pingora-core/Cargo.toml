@@ -63,7 +63,7 @@ sfv = "0.10.4"
 rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
-brotli = "3"
+brotli = "8.0.4"
 openssl-probe = "0.1.6"
 tokio-test = "0.4"
 zstd = "0"
