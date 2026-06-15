@@ -24,9 +24,7 @@ use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
 #[cfg(feature = "patched_http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(feature = "patched_http1")]
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::{
     init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
