@@ -16,6 +16,7 @@ use super::HttpSession;
 use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, TransportConnector};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
+use crate::protocols::http::v1::common::MAX_H2_RESPONSE_HEADER_LIST_SIZE;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
@@ -604,6 +605,13 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
+        // Bound the decoded size of upstream H2 response headers so oversized
+        // headers fail while reading from the origin instead of being forwarded
+        // downstream. This is sized for H1-equivalence (not raw-byte parity):
+        // it accepts exactly the responses the H1 client would. See
+        // `MAX_H2_RESPONSE_HEADER_LIST_SIZE` for the derivation of why the H2
+        // (HPACK-decoded) limit differs from the H1 raw-byte limit.
+        .max_header_list_size(MAX_H2_RESPONSE_HEADER_LIST_SIZE as u32)
         .initial_window_size(stream_window)
         .initial_connection_window_size(conn_window)
         .handshake(stream)

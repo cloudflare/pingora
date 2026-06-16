@@ -27,7 +27,36 @@ use crate::utils::KVRef;
 pub(super) const MAX_HEADERS: usize = 256;
 
 pub(super) const INIT_HEADER_BUF_SIZE: usize = 4096;
-pub(super) const MAX_HEADER_SIZE: usize = 1048575;
+/// Maximum size, in bytes, of the raw HTTP/1 header block we will buffer while
+/// reading request/response headers (just under 1 MiB).
+pub(crate) const MAX_HEADER_SIZE: usize = 1048575;
+
+/// HTTP/2 client `max_header_list_size` for reading upstream *responses*,
+/// sized so the H2 client does not reject responses the H1 client would accept.
+///
+/// The two limits measure different things and cannot be made exactly equal:
+/// [`MAX_HEADER_SIZE`] caps the raw H1 wire bytes, whereas H2's
+/// `max_header_list_size` caps the HPACK-*decoded* header list, which the `h2`
+/// crate accounts as `sum(name.len + value.len) + 32 * N + 42` (the `42` is the
+/// mandatory `:status` pseudo-header: `7 + 3 + 32`). Pingora's H1 response
+/// serialization is approximately `sum(name.len + value.len) + 4 * N + 17 +
+/// reason_len`, so for the same header set:
+///
+/// ```text
+/// h2_list_size = h1_wire_size + 28 * N + 25 - reason_len
+/// ```
+///
+/// The invariant we want is "do not reject an H2 response whose H1-equivalent
+/// form the H1 client would have accepted". Taking the worst case
+/// (`reason_len = 0`, and `h2` rejects at `>=` the configured limit) gives a
+/// limit of `~1 MiB + 28 * N + 26`. We pick a deliberately generous header
+/// count (`N = 300`, comfortably above the typical max) so the H2 client errs
+/// toward accepting anything we would equivalently accept over H1:
+///
+/// ```text
+/// 1_048_576 + 28 * 300 + 26 = 1_057_002
+/// ```
+pub(crate) const MAX_H2_RESPONSE_HEADER_LIST_SIZE: usize = 1024 * 1024 + 28 * 300 + 26;
 
 pub(crate) const BODY_BUF_LIMIT: usize = 1024 * 64;
 
@@ -325,6 +354,27 @@ mod test {
 
         headers.append(TRANSFER_ENCODING, "chunkeds".try_into().unwrap());
         assert!(check_dup_content_length(&headers).is_ok());
+    }
+
+    #[test]
+    fn test_max_h2_response_header_list_size_accepts_max_h1_response() {
+        // Independently re-derive the worst-case H2 decoded list size for the
+        // largest response the H1 client would accept, to guard the H1-
+        // equivalence invariant behind MAX_H2_RESPONSE_HEADER_LIST_SIZE.
+        //
+        // h2 accounts a response header list as sum(name+value) + 32*N + 42.
+        // Pingora's H1 wire size is sum(name+value) + 4*N + 17 + reason_len.
+        // The H1 read path accepts at most MAX_HEADER_SIZE bytes and MAX_HEADERS
+        // headers, so the worst case is N = MAX_HEADERS and reason_len = 0.
+        let n = MAX_HEADERS;
+        let sum_name_value = MAX_HEADER_SIZE - 4 * n - 17; // largest H1-acceptable body
+        let worst_case_h2_list_size = sum_name_value + 32 * n + 42;
+
+        // h2 rejects at `>=` the limit, so the limit must be strictly greater
+        // than the worst-case H1-equivalent list size for us to accept it.
+        assert!(MAX_H2_RESPONSE_HEADER_LIST_SIZE > worst_case_h2_list_size);
+        // The connector casts this to u32.
+        assert!(u32::try_from(MAX_H2_RESPONSE_HEADER_LIST_SIZE).is_ok());
     }
 
     #[test]
