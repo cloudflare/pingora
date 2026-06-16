@@ -20,6 +20,8 @@ use x509_parser::{
     prelude::{FromDer, X509Certificate},
 };
 
+/// Extract the organization and serial from a raw [`X509Certificate`]
+/// reference.
 fn get_organization_serial_x509(
     x509cert: &X509Certificate<'_>,
 ) -> Result<(Option<String>, String)> {
@@ -134,18 +136,23 @@ impl CertKey {
         get_serial(self.leaf()).unwrap()
     }
 
+    /// Return the raw PEM bytes.
     pub fn raw_pem(&self) -> &[u8] {
         &self.pem.raw_pem
     }
 }
 
+/// Parsed PEM bundle containing one or more X.509 certificates.
 #[derive(Debug)]
 pub struct X509Pem {
+    /// The original PEM bytes.
     pub raw_pem: Vec<u8>,
+    /// The parsed certificates.
     pub certs: Vec<WrappedX509>,
 }
 
 impl X509Pem {
+    /// Parse a PEM-encoded certificate bundle.
     pub fn new(raw_pem: Vec<u8>) -> Self {
         let certs = Pem::iter_from_buffer(&raw_pem)
             .map(|part| {
@@ -156,11 +163,32 @@ impl X509Pem {
         X509Pem { raw_pem, certs }
     }
 
+    /// Iterate over the parsed certificates.
     pub fn iter(&self) -> std::slice::Iter<'_, WrappedX509> {
         self.certs.iter()
     }
 }
 
+/// Fallible variant of certificate parsing for use with
+/// [`WrappedX509::try_new`].
+fn try_parse_x509<C>(raw_cert: &C) -> Result<X509Certificate<'_>>
+where
+    C: AsRef<[u8]>,
+{
+    X509Certificate::from_der(raw_cert.as_ref())
+        .map(|(_, cert)| cert)
+        .map_err(|e| {
+            pingora_error::Error::explain(
+                pingora_error::ErrorType::InternalError,
+                format!("failed to parse DER certificate: {e}"),
+            )
+        })
+}
+
+/// Infallible certificate parse; panics on invalid DER.
+///
+/// Kept for internal callers ([`X509Pem::new`]) that already
+/// guarantee valid input.
 fn parse_x509<C>(raw_cert: &C) -> X509Certificate<'_>
 where
     C: AsRef<[u8]>,
@@ -181,6 +209,15 @@ pub struct WrappedX509 {
 }
 
 impl WrappedX509 {
+    /// Parse DER-encoded certificate bytes into a [`WrappedX509`].
+    ///
+    /// Returns an error if the bytes are not a valid DER-encoded
+    /// X.509 certificate.
+    pub fn parse(raw_cert: Vec<u8>) -> Result<Self> {
+        Self::try_new(raw_cert, try_parse_x509)
+    }
+
+    /// Return the `notAfter` validity timestamp as a string.
     pub fn not_after(&self) -> String {
         self.borrow_cert().validity.not_after.to_string()
     }
@@ -223,5 +260,54 @@ impl Hash for X509Pem {
 impl Hash for CertKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.pem.hash(state)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use x509_parser::pem::Pem;
+
+    use super::WrappedX509;
+
+    #[test]
+    fn parse_valid_der() {
+        let der = test_der_bytes();
+        let wrapped = WrappedX509::parse(der.clone()).expect("valid DER must parse");
+        assert_eq!(
+            wrapped.borrow_raw_cert(),
+            &der,
+            "raw_cert must match the input"
+        );
+    }
+
+    #[test]
+    fn parse_invalid_der_returns_error() {
+        let garbage = vec![0xFF, 0x00, 0xDE, 0xAD];
+        let result = WrappedX509::parse(garbage);
+        assert!(result.is_err(), "garbage bytes must produce an error");
+    }
+
+    #[test]
+    fn parse_empty_der_returns_error() {
+        let result = WrappedX509::parse(Vec::new());
+        assert!(result.is_err(), "empty input must produce an error");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Extract DER bytes from the bundled test PEM certificate.
+    fn test_der_bytes() -> Vec<u8> {
+        let pem_bytes = include_bytes!("../../../tests/keys/server.crt");
+        Pem::iter_from_buffer(pem_bytes)
+            .next()
+            .expect("PEM must contain at least one block")
+            .expect("PEM must parse")
+            .contents
     }
 }

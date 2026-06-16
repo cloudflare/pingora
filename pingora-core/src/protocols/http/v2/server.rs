@@ -808,6 +808,7 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+            tokio::task::yield_now().await;
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -880,6 +881,7 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+            tokio::task::yield_now().await;
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
