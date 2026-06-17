@@ -169,6 +169,42 @@ impl<T, const N: usize> Lru<T, N> {
         new_weight
     }
 
+    /// Update an existing entry while holding its shard write lock, or admit a
+    /// new entry if it is not present.
+    ///
+    /// Existing entries are passed to `update` with their current data and
+    /// weight. The returned weight is floored to `1`, the entry is promoted,
+    /// and the global weight is adjusted while the shard mutation is still
+    /// exclusive.
+    ///
+    /// Missing entries call `admit_data` to construct the data and initial
+    /// weight, insert the entry at the head, and floor the weight to `1`.
+    ///
+    /// Returns the old weight when the entry existed, or `None` when the
+    /// entry was newly admitted.
+    pub fn update_or_admit<U, A>(&self, key: u64, update: U, admit_data: A) -> Option<usize>
+    where
+        U: FnOnce(&mut T, usize) -> usize,
+        A: FnOnce() -> (T, usize),
+    {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+        let (old_weight, new_weight) = unit.update_or_admit(key, update, admit_data);
+        match old_weight {
+            Some(old_weight) => {
+                if old_weight != new_weight {
+                    self.weight.fetch_add(new_weight, Ordering::Relaxed);
+                    self.weight.fetch_sub(old_weight, Ordering::Relaxed);
+                }
+            }
+            None => {
+                self.weight.fetch_add(new_weight, Ordering::Relaxed);
+                self.incr_count(shard);
+            }
+        }
+        old_weight
+    }
+
     /// Set the weight associated with an existing key without changing LRU order.
     ///
     /// Missing keys are left unchanged and return `None`. The weight is floored
@@ -526,6 +562,40 @@ impl<T> LruUnit<T> {
         (0, weight, true)
     }
 
+    /// Update an existing entry in place, or admit it if missing.
+    ///
+    /// Returns `(old_weight, new_weight)`, where `old_weight` is `None` when a
+    /// new entry was inserted.
+    pub fn update_or_admit<U, A>(
+        &mut self,
+        key: u64,
+        update: U,
+        admit_data: A,
+    ) -> (Option<usize>, usize)
+    where
+        U: FnOnce(&mut T, usize) -> usize,
+        A: FnOnce() -> (T, usize),
+    {
+        if let Some(node) = self.lookup_table.get_mut(&key) {
+            let old_weight = node.weight;
+            let new_weight = update(&mut node.data, old_weight).max(1);
+            let old_weight = Self::adjust_weight(node, &mut self.used_weight, new_weight);
+            self.order.promote(node.list_index);
+            return (Some(old_weight), new_weight);
+        }
+        let (data, weight) = admit_data();
+        let weight = weight.max(1);
+        self.used_weight += weight;
+        let list_index = self.order.push_head(key);
+        let node = Box::new(LruNode {
+            data,
+            list_index,
+            weight,
+        });
+        self.lookup_table.insert(key, node);
+        (None, weight)
+    }
+
     pub fn access(&mut self, key: u64) -> bool {
         if let Some(node) = self.lookup_table.get(&key) {
             self.order.promote(node.list_index);
@@ -811,6 +881,57 @@ mod test_lru {
 
         assert_eq!(lru.increment_weight(2, || 2, 2, Some(3)), 4);
         assert_eq!(lru.weight(), 1 + 1 + 3 + 1 + 4);
+    }
+
+    #[test]
+    fn test_update_or_admit() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        assert_lru(&lru, &[40, 20], 0);
+        assert_eq!(lru.weight(), 6);
+        assert_eq!(lru.len(), 2);
+
+        let old_weight = lru.update_or_admit(
+            2,
+            |value, weight| {
+                *value += 1;
+                weight + 3
+            },
+            || (99, 99),
+        );
+
+        assert_eq!(old_weight, Some(2));
+        assert_lru(&lru, &[21, 40], 0);
+        assert_eq!(lru.weight(), 9);
+        assert_eq!(lru.len(), 2);
+
+        let old_weight = lru.update_or_admit(
+            6,
+            |_value, _weight| unreachable!("missing key should admit"),
+            || (60, 0),
+        );
+
+        assert_eq!(old_weight, None);
+        assert_lru(&lru, &[60, 21, 40], 0);
+        assert_eq!(lru.weight(), 10);
+        assert_eq!(lru.len(), 3);
+
+        assert_eq!(
+            lru.update_or_admit(
+                4,
+                |value, _weight| {
+                    *value += 1;
+                    0
+                },
+                || (99, 99),
+            ),
+            Some(4)
+        );
+        assert_lru(&lru, &[41, 60, 21], 0);
+        assert_eq!(lru.weight(), 7);
+        assert_eq!(lru.len(), 3);
     }
 
     #[test]
