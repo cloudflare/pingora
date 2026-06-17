@@ -994,6 +994,17 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+
+            // Drain the response to EOS before dropping the stream. Newer h2
+            // sends RST_STREAM(CANCEL) when a still-open recv stream is dropped,
+            // which would race with the server reading the request EOS and turn
+            // the server-side read into a stream-reset error.
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("response body error");
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .expect("release capacity");
+            }
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -1024,8 +1035,12 @@ mod test {
                 http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
-                // 3. Waiting for the client to close stream.
+                // 3. Read the empty DATA frame carrying the request EOS.
                 http.read_body_or_idle(http.is_body_done()).await.unwrap();
+
+                // 4. Finish the response so the client can drain it to EOS and
+                //    close the stream cleanly instead of cancelling it.
+                http.finish().unwrap();
             }));
         }
 
