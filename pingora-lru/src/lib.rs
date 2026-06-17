@@ -20,6 +20,7 @@
 //! - Memory layout and usage are optimized: small and no memory fragmentation
 
 pub mod linked_list;
+pub mod persistence;
 
 use linked_list::{LinkedList, LinkedListIter};
 

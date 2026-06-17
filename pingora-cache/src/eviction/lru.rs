@@ -18,16 +18,11 @@ use super::EvictionManager;
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
-use log::{info, warn};
-use pingora_error::{BError, Error, ErrorType::*, OrErr, Result};
-use pingora_lru::Lru;
-use rand::Rng;
+use pingora_error::{ErrorType::*, OrErr, Result};
+use pingora_lru::{persistence, Lru};
 use serde::de::SeqAccess;
 use serde::{Deserialize, Serialize};
-use std::fs::{rename, File};
 use std::hash::{Hash, Hasher};
-use std::io::prelude::*;
-use std::path::Path;
 use std::time::SystemTime;
 
 /// A shared LRU cache manager designed to manage a large volume of assets.
@@ -189,11 +184,6 @@ fn u64key(key: &CompactCacheKey) -> u64 {
 
 const FILE_NAME: &str = "lru.data";
 
-#[inline]
-fn err_str_path(s: &str, path: &Path) -> String {
-    format!("{s} {}", path.display())
-}
-
 #[async_trait]
 impl<const N: usize> EvictionManager for Manager<N> {
     fn total_size(&self) -> usize {
@@ -261,222 +251,26 @@ impl<const N: usize> EvictionManager for Manager<N> {
     }
 
     async fn save(&self, dir_path: &str) -> Result<()> {
-        let dir_path_str = dir_path.to_owned();
-
-        tokio::task::spawn_blocking(move || {
-            let dir_path = Path::new(&dir_path_str);
-            std::fs::create_dir_all(dir_path)
-                .or_err_with(InternalError, || err_str_path("fail to create", dir_path))
-        })
-        .await
-        .or_err(InternalError, "async blocking IO failure")??;
-
-        // Per-shard errors are isolated so a single failing shard does not abort
-        // the entire save and leave the remaining shards stale on disk.
-        let mut saved_shards = 0usize;
-        let mut failed_shards = 0usize;
-        for i in 0..N {
-            let data = match self.serialize_shard(i) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("Failed to serialize shard {i}: {e}. Skipping shard.");
-                    failed_shards += 1;
-                    continue;
-                }
-            };
-            let dir_path = dir_path.to_owned();
-            let result = tokio::task::spawn_blocking(move || {
-                let dir_path = Path::new(&dir_path);
-                let final_path = dir_path.join(format!("{}.{i}", FILE_NAME));
-                // create a temporary filename using a randomized u32 hash to minimize the chance of multiple writers writing to the same tmp file
-                let random_suffix: u32 = rand::thread_rng().gen();
-                let temp_path =
-                    dir_path.join(format!("{}.{i}.{:08x}.tmp", FILE_NAME, random_suffix));
-                let mut file = File::create(&temp_path)
-                    .or_err_with(InternalError, || err_str_path("fail to create", &temp_path))?;
-                file.write_all(&data).or_err_with(InternalError, || {
-                    err_str_path("fail to write to", &temp_path)
-                })?;
-                file.flush().or_err_with(InternalError, || {
-                    err_str_path("fail to flush temp file", &temp_path)
-                })?;
-                rename(&temp_path, &final_path).or_err_with(InternalError, || {
-                    format!(
-                        "Failed to rename file from {} to {}",
-                        temp_path.display(),
-                        final_path.display(),
-                    )
-                })
-            })
-            .await;
-
-            match result {
-                Ok(Ok(())) => saved_shards += 1,
-                Ok(Err(e)) => {
-                    warn!("Failed to save shard {i}: {e}. Skipping shard.");
-                    failed_shards += 1;
-                }
-                Err(join_err) => {
-                    warn!(
-                        "Failed to save shard {i}: async blocking IO failure {join_err}. Skipping shard."
-                    );
-                    failed_shards += 1;
-                }
-            }
-        }
-
-        if failed_shards == 0 {
-            info!("Successfully saved {saved_shards}/{N} shards.");
-            Ok(())
-        } else if failed_shards == N {
-            Error::e_explain(
-                InternalError,
-                format!("All {N} shards failed to save; see prior warnings for per-shard causes."),
-            )
-        } else {
-            warn!(
-                "Saved {saved_shards}/{N} shards; {failed_shards} shards failed. Persisted cache state may be incomplete."
-            );
-            Ok(())
-        }
+        persistence::save_shards(dir_path, FILE_NAME, N, |i| self.serialize_shard(i))
+            .await
+            .or_err(InternalError, "failed to save LRU")?;
+        Ok(())
     }
 
     async fn load(&self, dir_path: &str) -> Result<()> {
-        // Per-shard errors are isolated so a single failing shard does not abort
-        // the entire load. A missing shard file is treated as an empty shard.
-        let mut loaded_shards = 0usize;
-        let mut missing_shards = 0usize;
-        let mut error_shards = 0usize;
-        for i in 0..N {
-            let dir_path = dir_path.to_owned();
-
-            let read_result = tokio::task::spawn_blocking(move || {
-                let file_path = Path::new(&dir_path).join(format!("{}.{i}", FILE_NAME));
-                let mut file = match File::open(&file_path) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => {
-                        return Err(e).or_err_with(InternalError, || {
-                            err_str_path("fail to open", &file_path)
-                        });
-                    }
-                };
-                let mut buffer = Vec::with_capacity(8192);
-                file.read_to_end(&mut buffer)
-                    .or_err_with(InternalError, || {
-                        err_str_path("fail to read from", &file_path)
-                    })?;
-                Ok::<Option<Vec<u8>>, BError>(Some(buffer))
-            })
-            .await;
-
-            let data = match read_result {
-                Ok(Ok(Some(buf))) => buf,
-                Ok(Ok(None)) => {
-                    missing_shards += 1;
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    warn!("Failed to load shard {i}: {e}. Skipping shard.");
-                    error_shards += 1;
-                    continue;
-                }
-                Err(join_err) => {
-                    warn!(
-                        "Failed to load shard {i}: async blocking IO failure {join_err}. Skipping shard."
-                    );
-                    error_shards += 1;
-                    continue;
-                }
-            };
-
-            if let Err(e) = self.deserialize_shard(&data) {
-                warn!("Failed to deserialize shard {i}: {e}. Skipping shard.");
-                error_shards += 1;
-                continue;
-            }
-            loaded_shards += 1;
-        }
-
-        if loaded_shards == N {
-            info!("Successfully loaded {loaded_shards}/{N} shards.");
-        } else if loaded_shards == 0 && error_shards == 0 {
-            info!("No persisted LRU shards found. Cache will start empty.");
-        } else {
-            warn!(
-                "Loaded {loaded_shards}/{N} shards (missing: {missing_shards}, errored: {error_shards}). Cache may be incomplete."
-            );
-        }
-
-        cleanup_temp_files(dir_path);
-
+        persistence::load_shards(dir_path, FILE_NAME, N, |_i, data| {
+            self.deserialize_shard(data)
+        })
+        .await;
         Ok(())
     }
-}
-
-fn cleanup_temp_files(dir_path: &str) {
-    let dir_path = Path::new(dir_path).to_owned();
-
-    tokio::task::spawn_blocking({
-        move || {
-            if !dir_path.exists() {
-                return;
-            }
-
-            let entries = match std::fs::read_dir(&dir_path) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    warn!("Failed to read directory {}: {e}", dir_path.display());
-                    return;
-                }
-            };
-
-            let mut cleaned_count = 0;
-            let mut error_count = 0;
-
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        warn!(
-                            "Failed to read directory entry in {}: {e}",
-                            dir_path.display()
-                        );
-                        error_count += 1;
-                        continue;
-                    }
-                };
-
-                let file_name = entry.file_name();
-                let file_name_str = file_name.to_string_lossy();
-
-                if file_name_str.starts_with(FILE_NAME) && file_name_str.ends_with(".tmp") {
-                    match std::fs::remove_file(entry.path()) {
-                        Ok(()) => {
-                            info!("Cleaned up orphaned temp file: {}", entry.path().display());
-                            cleaned_count += 1;
-                        }
-                        Err(e) => {
-                            warn!("Failed to remove temp file {}: {e}", entry.path().display());
-                            error_count += 1;
-                        }
-                    }
-                }
-            }
-
-            if cleaned_count > 0 || error_count > 0 {
-                info!(
-                    "Temp file cleanup completed. Removed: {cleaned_count}, Errors: {error_count}"
-                );
-            }
-        }
-    });
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::CacheKey;
+    use std::path::Path;
 
     // we use shard (N) = 1 for eviction consistency in all tests
 
@@ -956,10 +750,8 @@ mod test {
             std::fs::write(&file_path, b"test").unwrap();
         }
 
-        // Run cleanup
-        cleanup_temp_files(test_dir);
-
-        tokio::time::sleep(core::time::Duration::from_secs(1)).await;
+        let lru = Manager::<3>::with_capacity(10, 10);
+        lru.load(test_dir).await.unwrap();
 
         // Check results
         assert!(!dir_path.join("lru.data.0.12345678.tmp").exists());
