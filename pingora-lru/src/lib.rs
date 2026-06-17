@@ -168,6 +168,25 @@ impl<T, const N: usize> Lru<T, N> {
         new_weight
     }
 
+    /// Set the weight associated with an existing key without changing LRU order.
+    ///
+    /// Missing keys are left unchanged and return `None`. The weight is floored
+    /// to `1`.
+    ///
+    /// Return the old weight if the key exists.
+    pub fn set_weight(&self, key: u64, weight: usize) -> Option<usize> {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+
+        let weight = weight.max(1);
+        let old_weight = unit.set_weight(key, weight)?;
+        if old_weight != weight {
+            self.weight.fetch_add(weight, Ordering::Relaxed);
+            self.weight.fetch_sub(old_weight, Ordering::Relaxed);
+        }
+        Some(old_weight)
+    }
+
     /// Promote the key to the head of the LRU
     ///
     /// Return `true` if the key exists.
@@ -515,6 +534,12 @@ impl<T> LruUnit<T> {
         }
     }
 
+    /// Set the weight associated with an existing key without changing LRU order.
+    pub fn set_weight(&mut self, key: u64, weight: usize) -> Option<usize> {
+        let node = self.lookup_table.get_mut(&key)?;
+        Some(Self::adjust_weight(node, &mut self.used_weight, weight))
+    }
+
     // Check if a key is already in the top n most recently used nodes.
     // this is a heuristic to reduce write, which requires exclusive locks, for promotion,
     // especially on very populate nodes
@@ -785,6 +810,31 @@ mod test_lru {
 
         assert_eq!(lru.increment_weight(2, || 2, 2, Some(3)), 4);
         assert_eq!(lru.weight(), 1 + 1 + 3 + 1 + 4);
+    }
+
+    #[test]
+    fn test_set_weight_does_not_promote() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        lru.admit(1, 1, 1);
+        lru.admit(2, 2, 2);
+        lru.admit(3, 3, 3);
+        assert_lru(&lru, &[3, 2, 1], 0);
+
+        assert_eq!(lru.set_weight(2, 5), Some(2));
+        assert_eq!(lru.peek_weight(2), Some(5));
+        assert_eq!(lru.weight(), 1 + 5 + 3);
+        assert_eq!(lru.len(), 3);
+        assert_lru(&lru, &[3, 2, 1], 0);
+
+        assert_eq!(lru.set_weight(9, 9), None);
+        assert_eq!(lru.weight(), 1 + 5 + 3);
+        assert_eq!(lru.len(), 3);
+        assert_lru(&lru, &[3, 2, 1], 0);
+
+        assert_eq!(lru.set_weight(2, 0), Some(5));
+        assert_eq!(lru.peek_weight(2), Some(1));
+        assert_eq!(lru.weight(), 1 + 1 + 3);
+        assert_lru(&lru, &[3, 2, 1], 0);
     }
 
     #[test]
@@ -1141,6 +1191,24 @@ mod test_lru_unit {
 
         assert_eq!(lru.increment_weight(3, || 3, 3, Some(3)), (5, 5, false));
         assert_eq!(lru.used_weight(), 1 + 1 + 3 + 1 + 2 + 2 + 3 + 2);
+    }
+
+    #[test]
+    fn test_set_weight_does_not_promote() {
+        let mut lru = LruUnit::with_capacity(10);
+        lru.admit(2, 2, 2);
+        lru.admit(3, 3, 3);
+        lru.admit(4, 4, 4);
+        assert_lru(&lru, &[4, 3, 2]);
+
+        assert_eq!(lru.set_weight(3, 6), Some(3));
+        assert_eq!(lru.peek_weight(3), Some(6));
+        assert_eq!(lru.used_weight(), 2 + 6 + 4);
+        assert_lru(&lru, &[4, 3, 2]);
+
+        assert_eq!(lru.set_weight(5, 5), None);
+        assert_eq!(lru.used_weight(), 2 + 6 + 4);
+        assert_lru(&lru, &[4, 3, 2]);
     }
 
     #[test]
