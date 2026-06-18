@@ -861,14 +861,15 @@ impl Session {
 
     /// Check if this session supports the cancel-safe proxy task API.
     ///
-    /// Currently supported by HTTP/1.x and Subrequest server sessions;
-    /// toggled per-session via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    /// Currently supported by HTTP/1.x, Subrequest, and opted-in Custom
+    /// server sessions; toggled per-session via
+    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
     pub fn supports_proxy_task_api(&self) -> bool {
         match self {
             Self::H1(s) => s.proxy_tasks_enabled(),
             Self::Subrequest(s) => s.proxy_tasks_enabled(),
+            Self::Custom(s) => s.proxy_tasks_enabled(),
             Self::H2(_) => false,
-            Self::Custom(_) => false,
         }
     }
 
@@ -877,8 +878,8 @@ impl Session {
         match self {
             Self::H1(s) => s.set_proxy_tasks_enabled(enabled),
             Self::Subrequest(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::Custom(s) => s.set_proxy_tasks_enabled(enabled),
             Self::H2(_) => {}
-            Self::Custom(_) => {}
         }
     }
 
@@ -928,7 +929,7 @@ impl Session {
             Self::H1(s) => s.send_proxy_task(task),
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
             Self::Subrequest(s) => s.send_proxy_task(task),
-            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+            Self::Custom(s) => s.send_proxy_task(task),
         }
     }
 
@@ -940,7 +941,7 @@ impl Session {
             Self::H1(s) => s.has_pending_proxy_tasks(),
             Self::H2(_) => false, // TODO: implement for H2
             Self::Subrequest(s) => s.has_pending_proxy_tasks(),
-            Self::Custom(_) => false, // TODO: implement for custom
+            Self::Custom(s) => s.has_pending_proxy_tasks(),
         }
     }
 
@@ -957,7 +958,7 @@ impl Session {
             Self::H1(s) => s.write_proxy_tasks().await,
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
             Self::Subrequest(s) => s.write_proxy_tasks().await,
-            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+            Self::Custom(s) => s.write_proxy_tasks().await,
         }
     }
 }

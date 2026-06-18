@@ -723,7 +723,7 @@ impl Session {
     /// downstream module filters. This allows decoupling cache writes from
     /// downstream writes.
     ///
-    /// Only works with sessions that support the proxy task API (currently H1).
+    /// Only works with sessions that support the proxy task API.
     ///
     /// # Panics
     /// Panics if the session doesn't support the proxy task API.

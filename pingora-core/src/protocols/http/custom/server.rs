@@ -46,6 +46,29 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
 
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    fn proxy_tasks_enabled(&self) -> bool {
+        false
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    fn set_proxy_tasks_enabled(&mut self, _enabled: bool) {}
+
+    /// Queue a proxy task for cancel-safe writing.
+    fn send_proxy_task(&mut self, _task: HttpTask) {
+        panic!("Custom proxy task API not implemented")
+    }
+
+    /// Whether there are pending proxy tasks queued for writing.
+    fn has_pending_proxy_tasks(&self) -> bool {
+        false
+    }
+
+    /// Write queued proxy tasks in a cancel-safe manner.
+    async fn write_proxy_tasks(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
 
     fn get_read_timeout(&self) -> Option<Duration>;
@@ -167,6 +190,26 @@ impl Session for () {
 
     async fn response_duplex_vec(&mut self, _tasks: Vec<HttpTask>) -> Result<bool> {
         unreachable!("server session: response_duplex_vec")
+    }
+
+    fn proxy_tasks_enabled(&self) -> bool {
+        unreachable!("server session: proxy_tasks_enabled")
+    }
+
+    fn set_proxy_tasks_enabled(&mut self, _enabled: bool) {
+        unreachable!("server session: set_proxy_tasks_enabled")
+    }
+
+    fn send_proxy_task(&mut self, _task: HttpTask) {
+        unreachable!("server session: send_proxy_task")
+    }
+
+    fn has_pending_proxy_tasks(&self) -> bool {
+        unreachable!("server session: has_pending_proxy_tasks")
+    }
+
+    async fn write_proxy_tasks(&mut self) -> Result<bool> {
+        unreachable!("server session: write_proxy_tasks")
     }
 
     fn set_read_timeout(&mut self, _timeout: Option<Duration>) {
