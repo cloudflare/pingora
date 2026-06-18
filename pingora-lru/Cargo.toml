@@ -22,10 +22,15 @@ parking_lot = "0"
 arrayvec = "0"
 log = { workspace = true }
 rand = "0.8"
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+async-channel = "2"
+ahash = "0"
+flurry = "0.5"
 
 [dev-dependencies]
 lru = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [[bench]]
 name = "bench_linked_list"
@@ -33,4 +38,8 @@ harness = false
 
 [[bench]]
 name = "bench_lru"
+harness = false
+
+[[bench]]
+name = "bench_async_lru"
 harness = false

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use pingora_error::Result;
 use std::time::SystemTime;
 
+pub mod async_lru;
 pub mod lru;
 pub mod simple_lru;
 

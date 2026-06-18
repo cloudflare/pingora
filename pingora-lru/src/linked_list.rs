@@ -14,7 +14,7 @@
 
 // Can't tell people you know Rust until you write a (doubly) linked list
 
-//! Doubly linked list
+//! Doubly linked list, generic over the stored data type `K`.
 //!
 //! Features
 //! - Preallocate consecutive memory, no memory fragmentation.
@@ -32,40 +32,40 @@ const TAIL: Index = 1;
 const OFFSET: usize = 2;
 
 #[derive(Debug)]
-struct Node {
+struct Node<K> {
     pub(crate) prev: Index,
     pub(crate) next: Index,
-    pub(crate) data: u64,
+    pub(crate) data: K,
 }
 
 // Functionally the same as vec![head, tail, data_nodes...] where head & tail are fixed and
 // the rest data nodes can expand. Both head and tail can be accessed faster than using index
-struct Nodes {
+struct Nodes<K> {
     // we use these sentinel nodes to guard the head and tail of the list so that list
     // manipulation is simpler (fewer if-else)
-    head: Node,
-    tail: Node,
-    data_nodes: Vec<Node>,
+    head: Node<K>,
+    tail: Node<K>,
+    data_nodes: Vec<Node<K>>,
 }
 
-impl Nodes {
+impl<K: Default> Nodes<K> {
     fn with_capacity(capacity: usize) -> Self {
         Nodes {
             head: Node {
                 prev: NULL,
                 next: TAIL,
-                data: 0,
+                data: K::default(),
             },
             tail: Node {
                 prev: HEAD,
                 next: NULL,
-                data: 0,
+                data: K::default(),
             },
             data_nodes: Vec::with_capacity(capacity),
         }
     }
 
-    fn new_node(&mut self, data: u64) -> Index {
+    fn new_node(&mut self, data: K) -> Index {
         const VEC_EXP_GROWTH_CAP: usize = 65536;
         let node = Node {
             prev: NULL,
@@ -92,17 +92,17 @@ impl Nodes {
         self.data_nodes.len()
     }
 
-    fn head(&self) -> &Node {
+    fn head(&self) -> &Node<K> {
         &self.head
     }
 
-    fn tail(&self) -> &Node {
+    fn tail(&self) -> &Node<K> {
         &self.tail
     }
 }
 
-impl std::ops::Index<usize> for Nodes {
-    type Output = Node;
+impl<K> std::ops::Index<usize> for Nodes<K> {
+    type Output = Node<K>;
 
     fn index(&self, index: usize) -> &Self::Output {
         match index {
@@ -113,7 +113,7 @@ impl std::ops::Index<usize> for Nodes {
     }
 }
 
-impl std::ops::IndexMut<usize> for Nodes {
+impl<K> std::ops::IndexMut<usize> for Nodes<K> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         match index {
             HEAD => &mut self.head,
@@ -123,14 +123,18 @@ impl std::ops::IndexMut<usize> for Nodes {
     }
 }
 
-/// Doubly linked list
-pub struct LinkedList {
-    nodes: Nodes,
+/// Doubly linked list, generic over the stored data type `K`.
+pub struct LinkedList<K = u64> {
+    nodes: Nodes<K>,
     free: Vec<Index>, // to keep track of freed node to be used again
 }
+
+/// Type alias preserving backward compatibility.
+pub type LinkedListU64 = LinkedList<u64>;
+
 // Panic when index used as parameters are invalid
 // Index returned by push_* is always valid.
-impl LinkedList {
+impl<K: Default + Clone> LinkedList<K> {
     /// Create a [LinkedList] with the given predicted capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         LinkedList {
@@ -141,7 +145,7 @@ impl LinkedList {
 
     // Allocate a new node and return its index
     // NOTE: this node is leaked if not used by caller
-    fn new_node(&mut self, data: u64) -> Index {
+    fn new_node(&mut self, data: K) -> Index {
         if let Some(index) = self.free.pop() {
             // have a free node, update its payload and return its index
             self.nodes[index].data = data;
@@ -165,7 +169,7 @@ impl LinkedList {
         // TODO: debug_check index not in self.free
     }
 
-    fn node(&self, index: Index) -> Option<&Node> {
+    fn node(&self, index: Index) -> Option<&Node<K>> {
         if self.valid_index(index) {
             Some(&self.nodes[index])
         } else {
@@ -173,30 +177,27 @@ impl LinkedList {
         }
     }
 
-    /// Peek into the list
-    pub fn peek(&self, index: Index) -> Option<u64> {
-        self.node(index).map(|n| n.data)
+    fn node_mut(&mut self, index: Index) -> Option<&mut Node<K>> {
+        if self.valid_index(index) {
+            Some(&mut self.nodes[index])
+        } else {
+            None
+        }
+    }
+
+    /// Peek into the list, returning a reference to the data at the given index.
+    pub fn peek(&self, index: Index) -> Option<&K> {
+        self.node(index).map(|n| &n.data)
+    }
+
+    /// Peek into the list, returning a mutable reference to the data at the given index.
+    pub fn peek_mut(&mut self, index: Index) -> Option<&mut K> {
+        self.node_mut(index).map(|n| &mut n.data)
     }
 
     // safe because the index still needs to be in the range of the vec
-    fn peek_unchecked(&self, index: Index) -> &u64 {
+    fn peek_unchecked(&self, index: Index) -> &K {
         &self.nodes[index].data
-    }
-
-    /// Whether the value exists closed (up to search_limit nodes) to the head of the list
-    // It can be done via iter().take().find() but this is cheaper
-    pub fn exist_near_head(&self, value: u64, search_limit: usize) -> bool {
-        let mut current_node = HEAD;
-        for _ in 0..search_limit {
-            current_node = self.nodes[current_node].next;
-            if current_node == TAIL {
-                return false;
-            }
-            if self.nodes[current_node].data == value {
-                return true;
-            }
-        }
-        false
     }
 
     // put a node right after the node at `at`
@@ -213,22 +214,25 @@ impl LinkedList {
     }
 
     /// Put the data at the head of the list.
-    pub fn push_head(&mut self, data: u64) -> Index {
+    pub fn push_head(&mut self, data: K) -> Index {
         let new_node_index = self.new_node(data);
         self.insert_after(new_node_index, HEAD);
         new_node_index
     }
 
     /// Put the data at the tail of the list.
-    pub fn push_tail(&mut self, data: u64) -> Index {
+    pub fn push_tail(&mut self, data: K) -> Index {
         let new_node_index = self.new_node(data);
         self.insert_after(new_node_index, self.nodes.tail().prev);
         new_node_index
     }
 
-    // lift the node out of the linked list, to either delete it or insert to another place
-    // NOTE: the node is leaked if not used by the caller
-    fn lift(&mut self, index: Index) -> u64 {
+    /// Unlink a node from the list without touching its data.
+    ///
+    /// After this call the node's prev/next pointers are `NULL` and the
+    /// surrounding nodes skip over it. The node can be re-inserted
+    /// elsewhere (e.g. by [`promote`]) or freed.
+    fn unlink(&mut self, index: Index) {
         // can't touch the sentinels
         assert!(index != HEAD && index != TAIL);
 
@@ -237,25 +241,26 @@ impl LinkedList {
         // zero out the pointers, useful in case we try to access a freed node
         let prev = replace(&mut node.prev, NULL);
         let next = replace(&mut node.next, NULL);
-        let data = node.data;
 
         // make sure we are accessing a node in the list, not freed already
         assert!(prev != NULL && next != NULL);
 
         self.nodes[prev].next = next;
         self.nodes[next].prev = prev;
-
-        data
     }
 
-    /// Remove the node at the index, and return the value
-    pub fn remove(&mut self, index: Index) -> u64 {
+    /// Remove the node at the index, and return the value.
+    ///
+    /// Uses [`std::mem::take`] to move data out of the node without
+    /// cloning, which avoids a heap allocation for types like `String`.
+    pub fn remove(&mut self, index: Index) -> K {
+        self.unlink(index);
         self.free.push(index);
-        self.lift(index)
+        std::mem::take(&mut self.nodes[index].data)
     }
 
     /// Remove the tail of the list
-    pub fn pop_tail(&mut self) -> Option<u64> {
+    pub fn pop_tail(&mut self) -> Option<K> {
         let data_tail = self.nodes.tail().prev;
         if data_tail == HEAD {
             None // empty list
@@ -269,15 +274,17 @@ impl LinkedList {
         if self.nodes.head().next == index {
             return; // already head
         }
-        self.lift(index);
+        self.unlink(index);
         self.insert_after(index, HEAD);
     }
 
-    fn next(&self, index: Index) -> Index {
+    /// Get the next index in the list (internal navigation).
+    pub fn next_index(&self, index: Index) -> Index {
         self.nodes[index].next
     }
 
-    fn prev(&self, index: Index) -> Index {
+    /// Get the previous index in the list (internal navigation).
+    pub fn prev_index(&self, index: Index) -> Index {
         self.nodes[index].prev
     }
 
@@ -302,7 +309,7 @@ impl LinkedList {
     }
 
     /// Iterate over the list
-    pub fn iter(&self) -> LinkedListIter<'_> {
+    pub fn iter(&self) -> LinkedListIter<'_, K> {
         LinkedListIter {
             list: self,
             head: HEAD,
@@ -312,19 +319,38 @@ impl LinkedList {
     }
 }
 
+/// `exist_near_head` is only meaningful when K is comparable by equality.
+impl<K: Default + Clone + PartialEq> LinkedList<K> {
+    /// Whether the value exists close (up to search_limit nodes) to the head of the list
+    pub fn exist_near_head(&self, value: &K, search_limit: usize) -> bool {
+        let mut current_node = HEAD;
+        for _ in 0..search_limit {
+            current_node = self.nodes[current_node].next;
+            if current_node == TAIL {
+                return false;
+            }
+            if self.nodes[current_node].data == *value {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The iter over the list
-pub struct LinkedListIter<'a> {
-    list: &'a LinkedList,
+pub struct LinkedListIter<'a, K = u64> {
+    list: &'a LinkedList<K>,
     head: Index,
+    #[cfg_attr(not(test), allow(dead_code))]
     tail: Index,
     len: usize,
 }
 
-impl<'a> Iterator for LinkedListIter<'a> {
-    type Item = &'a u64;
+impl<'a, K: Default + Clone> Iterator for LinkedListIter<'a, K> {
+    type Item = &'a K;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_index = self.list.next(self.head);
+        let next_index = self.list.next_index(self.head);
         if next_index == TAIL || next_index == NULL {
             None
         } else {
@@ -339,9 +365,9 @@ impl<'a> Iterator for LinkedListIter<'a> {
     }
 }
 
-impl DoubleEndedIterator for LinkedListIter<'_> {
+impl<K: Default + Clone> DoubleEndedIterator for LinkedListIter<'_, K> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let prev_index = self.list.prev(self.tail);
+        let prev_index = self.list.prev_index(self.tail);
         if prev_index == HEAD || prev_index == NULL {
             None
         } else {
@@ -357,12 +383,12 @@ mod test {
     use super::*;
 
     // assert the list is the same as `values`
-    fn assert_list(list: &LinkedList, values: &[u64]) {
+    fn assert_list(list: &LinkedList<u64>, values: &[u64]) {
         let list_values: Vec<_> = list.iter().copied().collect();
         assert_eq!(values, &list_values)
     }
 
-    fn assert_list_reverse(list: &LinkedList, values: &[u64]) {
+    fn assert_list_reverse(list: &LinkedList<u64>, values: &[u64]) {
         let list_values: Vec<_> = list.iter().rev().copied().collect();
         assert_eq!(values, &list_values)
     }
@@ -375,15 +401,15 @@ mod test {
         assert_eq!(list.head(), None);
         assert_eq!(list.tail(), None);
 
-        let index1 = list.push_head(2);
+        let index1 = list.push_head(2u64);
         assert_eq!(list.len(), 1);
-        assert_eq!(list.peek(index1).unwrap(), 2);
+        assert_eq!(*list.peek(index1).unwrap(), 2);
 
-        let index2 = list.push_head(3);
+        let index2 = list.push_head(3u64);
         assert_eq!(list.head(), Some(index2));
         assert_eq!(list.tail(), Some(index1));
 
-        let index3 = list.push_tail(4);
+        let index3 = list.push_tail(4u64);
         assert_eq!(list.head(), Some(index2));
         assert_eq!(list.tail(), Some(index3));
 
@@ -394,9 +420,9 @@ mod test {
     #[test]
     fn test_pop() {
         let mut list = LinkedList::with_capacity(10);
-        list.push_head(2);
-        list.push_head(3);
-        list.push_tail(4);
+        list.push_head(2u64);
+        list.push_head(3u64);
+        list.push_tail(4u64);
         assert_list(&list, &[3, 2, 4]);
         assert_eq!(list.pop_tail(), Some(4));
         assert_eq!(list.pop_tail(), Some(2));
@@ -407,9 +433,9 @@ mod test {
     #[test]
     fn test_promote() {
         let mut list = LinkedList::with_capacity(10);
-        let index2 = list.push_head(2);
-        let index3 = list.push_head(3);
-        let index4 = list.push_tail(4);
+        let index2 = list.push_head(2u64);
+        let index3 = list.push_head(3u64);
+        let index4 = list.push_tail(4u64);
         assert_list(&list, &[3, 2, 4]);
 
         list.promote(index3);
@@ -425,15 +451,35 @@ mod test {
     #[test]
     fn test_exist_near_head() {
         let mut list = LinkedList::with_capacity(10);
-        list.push_head(2);
-        list.push_head(3);
-        list.push_tail(4);
+        list.push_head(2u64);
+        list.push_head(3u64);
+        list.push_tail(4u64);
         assert_list(&list, &[3, 2, 4]);
 
-        assert!(!list.exist_near_head(4, 1));
-        assert!(!list.exist_near_head(4, 2));
-        assert!(list.exist_near_head(4, 3));
-        assert!(list.exist_near_head(4, 4));
-        assert!(list.exist_near_head(4, 99999));
+        assert!(!list.exist_near_head(&4, 1));
+        assert!(!list.exist_near_head(&4, 2));
+        assert!(list.exist_near_head(&4, 3));
+        assert!(list.exist_near_head(&4, 4));
+        assert!(list.exist_near_head(&4, 99999));
+    }
+
+    #[test]
+    fn test_generic_string_keys() {
+        let mut list: LinkedList<String> = LinkedList::with_capacity(10);
+
+        let i1 = list.push_head("hello".to_string());
+        let i2 = list.push_head("world".to_string());
+        let _i3 = list.push_tail("foo".to_string());
+
+        let values: Vec<_> = list.iter().cloned().collect();
+        assert_eq!(values, vec!["world", "hello", "foo"]);
+
+        list.promote(i1);
+        let values: Vec<_> = list.iter().cloned().collect();
+        assert_eq!(values, vec!["hello", "world", "foo"]);
+
+        assert_eq!(list.pop_tail(), Some("foo".to_string()));
+        assert_eq!(list.remove(i2), "world".to_string());
+        assert_eq!(list.len(), 1);
     }
 }

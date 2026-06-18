@@ -16,6 +16,7 @@ use log::{info, warn};
 use rand::Rng;
 use std::fmt;
 use std::fs::{rename, File};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::task::JoinError;
@@ -179,6 +180,88 @@ where
 
     for shard in 0..shards {
         let data = match serialize_shard(shard) {
+            Ok(data) => data,
+            Err(source) => {
+                report.failed_shards += 1;
+                report
+                    .failures
+                    .push(ShardSaveFailure::Serialize { shard, source });
+                continue;
+            }
+        };
+
+        let result = tokio::task::spawn_blocking({
+            let dir_path = dir_path_buf.clone();
+            let file_name = file_name.to_owned();
+            move || write_shard_file(&dir_path, &file_name, shard, &data)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => report.saved_shards += 1,
+            Ok(Err(source)) => {
+                report.failed_shards += 1;
+                report.failures.push(ShardSaveFailure::Io { shard, source });
+            }
+            Err(source) => {
+                report.failed_shards += 1;
+                report
+                    .failures
+                    .push(ShardSaveFailure::Join { shard, source });
+            }
+        }
+    }
+
+    log_save_report(shards, &report);
+
+    if report.failed_shards == shards {
+        return Err(ShardSaveError::AllShardsFailed {
+            shards,
+            failures: report.failures,
+        });
+    }
+
+    Ok(report)
+}
+
+/// Save asynchronously serialized shard payloads under `dir_path` using
+/// `file_name.{shard}`.
+///
+/// This is the asynchronous counterpart to [`save_shards`]. Shards are still
+/// serialized and written one at a time to bound memory usage.
+pub async fn save_shards_async<E, F, Fut>(
+    dir_path: &str,
+    file_name: &str,
+    shards: usize,
+    mut serialize_shard: F,
+) -> Result<ShardSaveReport<E>, ShardSaveError<E>>
+where
+    E: fmt::Display,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, E>>,
+{
+    let dir_path_buf = PathBuf::from(dir_path);
+    tokio::task::spawn_blocking({
+        let dir_path = dir_path_buf.clone();
+        move || {
+            std::fs::create_dir_all(&dir_path).map_err(|source| ShardSaveSetupError::CreateDir {
+                path: dir_path,
+                source,
+            })
+        }
+    })
+    .await
+    .map_err(|source| ShardSaveError::Setup(ShardSaveSetupError::Join { source }))?
+    .map_err(ShardSaveError::Setup)?;
+
+    let mut report = ShardSaveReport {
+        saved_shards: 0,
+        failed_shards: 0,
+        failures: Vec::new(),
+    };
+
+    for shard in 0..shards {
+        let data = match serialize_shard(shard).await {
             Ok(data) => data,
             Err(source) => {
                 report.failed_shards += 1;

@@ -19,10 +19,14 @@
 //! - LRUs are sharded to avoid global locks.
 //! - Memory layout and usage are optimized: small and no memory fragmentation
 
+pub mod async_lru;
 pub mod linked_list;
 pub mod persistence;
 
-use linked_list::{LinkedList, LinkedListIter};
+use linked_list::LinkedListIter;
+
+/// The old lock-based code uses `LinkedList<u64>`.
+type LinkedList = linked_list::LinkedList<u64>;
 
 use hashbrown::HashMap;
 use parking_lot::RwLock;
@@ -616,7 +620,7 @@ impl<T> LruUnit<T> {
     // especially on very populate nodes
     // NOTE: O(n) search here so limit needs to be small
     pub fn need_promote(&self, key: u64, limit: usize) -> bool {
-        !self.order.exist_near_head(key, limit)
+        !self.order.exist_near_head(&key, limit)
     }
 
     // try to evict 1 node
@@ -637,7 +641,7 @@ impl<T> LruUnit<T> {
         self.order
             .tail()
             .and_then(|idx| self.order.peek(idx))
-            .and_then(|key| self.lookup_table.get(&key))
+            .and_then(|key| self.lookup_table.get(key))
             .map(|node| (&node.data, node.weight))
     }
 
@@ -701,7 +705,7 @@ impl<T> LruUnit<T> {
 
 struct LruUnitIter<'a, T> {
     unit: &'a LruUnit<T>,
-    iter: LinkedListIter<'a>,
+    iter: LinkedListIter<'a, u64>,
 }
 
 impl<'a, T> Iterator for LruUnitIter<'a, T> {

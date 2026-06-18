@@ -89,7 +89,7 @@ fn main() {
 
     let before = Instant::now();
     for _ in 0..ITEMS {
-        assert!(!list.exist_near_head(1, 10));
+        assert!(!list.exist_near_head(&1, 10));
     }
     let elapsed = before.elapsed();
     println!(
