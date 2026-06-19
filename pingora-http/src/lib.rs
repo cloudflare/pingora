@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -68,7 +68,15 @@ pub enum HeaderNameVariant<'a> {
 /// It also preserves request path even if it is not UTF-8.
 ///
 /// [RequestHeader] implements [Deref] for [http::request::Parts] so it can be used as it in most
-/// places.
+/// places. Mutable access to the underlying parts is intentionally not provided because header and
+/// URI mutations must use methods on [RequestHeader] to preserve its internal state.
+///
+/// ```compile_fail
+/// use pingora_http::RequestHeader;
+///
+/// let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+/// request.headers.remove("user-agent");
+/// ```
 #[derive(Debug)]
 pub struct RequestHeader {
     base: ReqParts,
@@ -90,12 +98,6 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
-    }
-}
-
-impl DerefMut for RequestHeader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.base
     }
 }
 
@@ -239,6 +241,11 @@ impl RequestHeader {
         Ok(())
     }
 
+    /// Return mutable access to the request extensions.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.base.extensions
+    }
+
     /// Set the request method
     pub fn set_method(&mut self, method: Method) {
         self.base.method = method;
@@ -364,7 +371,15 @@ impl From<RequestHeader> for ReqParts {
 ///
 /// This type is similar to [http::response::Parts] but preserves header name case.
 /// [ResponseHeader] implements [Deref] for [http::response::Parts] so it can be used as it in most
-/// places.
+/// places. Mutable access to the underlying parts is intentionally not provided because header
+/// mutations must use methods on [ResponseHeader] to preserve its internal state.
+///
+/// ```compile_fail
+/// use pingora_http::ResponseHeader;
+///
+/// let mut response = ResponseHeader::build(200, None).unwrap();
+/// response.headers.remove("server");
+/// ```
 #[derive(Debug)]
 pub struct ResponseHeader {
     base: RespParts,
@@ -385,12 +400,6 @@ impl Deref for ResponseHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
-    }
-}
-
-impl DerefMut for ResponseHeader {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.base
     }
 }
 
@@ -561,6 +570,11 @@ impl ResponseHeader {
         }
 
         Ok(())
+    }
+
+    /// Return mutable access to the response extensions.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        &mut self.base.extensions
     }
 
     /// Set the status code

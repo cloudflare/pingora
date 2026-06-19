@@ -1581,7 +1581,7 @@ pub mod range_filter {
 
         // no range, try HEAD
         let mut req = gen_req();
-        req.method = Method::HEAD;
+        req.set_method(Method::HEAD);
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
