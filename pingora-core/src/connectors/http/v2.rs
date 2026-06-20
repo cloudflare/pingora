@@ -689,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)

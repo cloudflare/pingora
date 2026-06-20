@@ -27,6 +27,7 @@ use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
 use derivative::Derivative;
+use pingora_error::{Error, ErrorType};
 use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
@@ -701,10 +702,18 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
-    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Self {
-        let mut addrs_iter = address.to_socket_addrs().unwrap(); //TODO: handle error
-        let addr = addrs_iter.next().unwrap();
-        Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni)
+    pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
+        let mut addrs_iter = address.to_socket_addrs().map_err(|e| {
+            Error::explain(
+                ErrorType::Custom("Failed to resolve IP address"),
+                e.to_string(),
+            )
+        })?;
+        let addr = addrs_iter.next().ok_or(Error::explain(
+            ErrorType::Custom("No IP address found for the given host"),
+            "The address resolution iterator returned an empty list.",
+        ))?;
+        Ok(Self::new_from_sockaddr(SocketAddr::Inet(addr), tls, sni))
     }
 
     /// Create a new [`HttpPeer`] with the given path to Unix domain socket and TLS settings.
@@ -747,10 +756,10 @@ impl HttpPeer {
         address: A,
         sni: String,
         client_cert_key: Arc<CertKey>,
-    ) -> Self {
-        let mut peer = Self::new(address, true, sni);
+    ) -> Result<Self> {
+        let mut peer = Self::new(address, true, sni)?;
         peer.client_cert_key = Some(client_cert_key);
-        peer
+        Ok(peer)
     }
 
     fn peer_hash(&self) -> u64 {
