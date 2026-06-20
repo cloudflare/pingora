@@ -49,13 +49,15 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
 pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
+pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features = false }
 pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+pingora-rustls = { version = "0.8.0", path = "../pingora-rustls" }
+arc-swap = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"

@@ -26,11 +26,13 @@ pub use no_debug::{Ellipses, NoDebug, WithTypeInfo};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 
 pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-pub use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
+pub use rustls::server::{
+    ClientCertVerifierBuilder, ClientHello, ResolvesServerCert, WebPkiClientVerifier,
+};
 pub use rustls::{
-    client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
-    DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
-    SignatureScheme, Stream,
+    client::WebPkiServerVerifier, crypto::CryptoProvider, sign::CertifiedKey, version,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as RusTlsError, KeyLogFile,
+    RootCertStore, ServerConfig, SignatureScheme, Stream,
 };
 
 /// Install the default `ring` CryptoProvider for rustls.
@@ -43,7 +45,7 @@ pub fn install_default_crypto_provider() {
 }
 pub use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item;
-pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+pub use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 pub use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector, TlsStream};
