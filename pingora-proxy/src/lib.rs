@@ -235,15 +235,24 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // phase 1 read request header
+        // 1. Lock-free check first: if already shutting down, abort immediately
+        if self.shutdown_flag.load(Ordering::Acquire) {
+            return None;
+        }
 
-        let res = tokio::select! {
-            biased; // biased select is cheaper, and we don't want to drop already buffered requests
-            res = downstream_session.read_request() => { res }
-            _ = self.shutdown.notified() => {
-                // service shutting down, dropping the connection to stop more req from coming in
-                return None;
+        // 2. Only select on the shutdown Notify primitive if the connection is reused (keepalive).
+        // For new connections, the client will send the request immediately, avoiding registration lock contention.
+        let res = if downstream_session.is_reused() {
+            tokio::select! {
+                biased; // biased select is cheaper, and we don't want to drop already buffered requests
+                res = downstream_session.read_request() => { res }
+                _ = self.shutdown.notified() => {
+                    // service shutting down, dropping the connection to stop more req from coming in
+                    return None;
+                }
             }
+        } else {
+            downstream_session.read_request().await
         };
         match res {
             Ok(true) => {

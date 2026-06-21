@@ -390,7 +390,19 @@ impl SslDigest {
             .map(|(organization, serial)| (organization, Some(serial)))
             .unwrap_or_default();
 
-        SslDigest::new(cipher, version, organization, serial_number, cert_digest)
+        let server_name = match stream {
+            RusTlsStream::Server(s) => s.get_ref().1.server_name().map(|s| s.to_string()),
+            RusTlsStream::Client(_) => None,
+        };
+
+        SslDigest::new(
+            cipher,
+            version,
+            organization,
+            serial_number,
+            cert_digest,
+            server_name,
+        )
     }
 }
 

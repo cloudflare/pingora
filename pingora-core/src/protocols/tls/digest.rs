@@ -31,6 +31,8 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
+    /// The SNI (Server Name Indication) of this connection
+    pub server_name: Option<String>,
     /// The user-defined TLS data
     pub extension: SslDigestExtension,
 }
@@ -43,6 +45,7 @@ impl SslDigest {
         organization: Option<String>,
         serial_number: Option<String>,
         cert_digest: Vec<u8>,
+        server_name: Option<String>,
     ) -> Self
     where
         S: Into<Cow<'static, str>>,
@@ -53,6 +56,7 @@ impl SslDigest {
             organization,
             serial_number,
             cert_digest,
+            server_name,
             extension: SslDigestExtension::default(),
         }
     }

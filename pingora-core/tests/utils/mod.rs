@@ -53,10 +53,17 @@ impl ServeHttp for EchoApp {
             }
         };
 
+        let sni = http_stream
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .and_then(|s| s.server_name.as_deref())
+            .unwrap_or("none");
+
         Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CONTENT_TYPE, "text/html")
             .header(http::header::CONTENT_LENGTH, body.len())
+            .header("x-sni", sni)
             .body(body.to_vec())
             .unwrap()
     }

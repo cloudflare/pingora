@@ -258,18 +258,16 @@ impl RequestHeader {
     /// This API is to allow supporting non UTF-8 cases.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
         if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
+            let uri = p
+                .parse::<Uri>()
                 .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
             self.base.uri = uri;
             // keep raw_path empty, no need to store twice
         } else {
             // put a valid utf-8 path into base for read only access
             let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
+            let uri = lossy_str
+                .parse::<Uri>()
                 .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
             self.base.uri = uri;
             self.raw_path_fallback = path.to_vec();
@@ -297,15 +295,13 @@ impl RequestHeader {
     pub fn raw_path(&self) -> &[u8] {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
+        } else if let Some(pq) = self.base.uri.path_and_query() {
+            pq.as_str().as_bytes()
         } else {
-            // Url should always be set
             self.base
                 .uri
-                .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+                .authority()
+                .map_or(b"", |a| a.as_str().as_bytes())
         }
     }
 

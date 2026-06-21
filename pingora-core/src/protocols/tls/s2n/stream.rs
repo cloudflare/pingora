@@ -307,12 +307,15 @@ impl SslDigest {
             }
         }
 
+        let server_name = conn.server_name().map(|s| s.to_string());
+
         SslDigest::new(
             cipher,
             version,
             organization,
             serial_number,
             cert_digest.unwrap_or_default(),
+            server_name,
         )
     }
 }
