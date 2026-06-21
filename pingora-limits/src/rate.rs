@@ -222,6 +222,7 @@ impl Rate {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use float_cmp::assert_approx_eq;
 
     use super::*;
@@ -259,6 +260,7 @@ mod tests {
     /// tests are doing a lot of literal sleeping, so the measured results
     /// can't be accurate or consistent. This function does an assert with a
     /// generous tolerance
+    #[cfg(target_os = "linux")]
     fn assert_eq_ish(left: f64, right: f64) {
         assert_approx_eq!(f64, left, right, epsilon = 0.15)
     }
@@ -296,6 +298,10 @@ mod tests {
         assert_eq!(r.rate_with(&key, rate_90_10_fn), 0f64);
     }
 
+    // The macOS GitHub Actions runner has noisier timing than Linux, which
+    // makes the tight epsilons used by `assert_eq_ish` flake. Gate this test
+    // to Linux where the timing is reliable.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_observe_rate_custom_proportional() {
         let r = Rate::new(Duration::from_secs(1));

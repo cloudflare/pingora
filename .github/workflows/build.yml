@@ -4,12 +4,14 @@ name: build
 
 jobs:
   pingora:
+    name: ${{ matrix.os }} (${{ matrix.toolchain }})
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         # nightly, msrv, and latest stable
         toolchain: [nightly, 1.84.0, 1.91.1]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -19,15 +21,39 @@ jobs:
         with:
           submodules: "recursive"
 
-      - name: Install build dependencies
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt update
           sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends
           # openresty is used for convenience in tests as a server.
+          # arm64 packages are under a separate repo URL.
           wget -O - https://openresty.org/package/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openresty.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/openresty.list > /dev/null
+          ARCH=$(dpkg --print-architecture)
+          if [ "$ARCH" = "arm64" ]; then
+            REPO_URL="http://openresty.org/package/arm64/ubuntu"
+          else
+            REPO_URL="http://openresty.org/package/ubuntu"
+          fi
+          echo "deb [arch=$ARCH signed-by=/usr/share/keyrings/openresty.gpg] $REPO_URL $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/openresty.list > /dev/null
           sudo apt update
           sudo apt install -y openresty --no-install-recommends
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # macOS only assigns 127.0.0.1 to loopback by default (Linux
+          # assigns the entire 127.0.0.0/8). Tests bind to 127.0.0.2.
+          sudo ifconfig lo0 alias 127.0.0.2
+          brew tap openresty/brew
+          # The openresty formula tries to build with the GeoIP nginx module
+          # by default, but the legacy libGeoIP library is no longer available
+          # in Homebrew and the --without-geoip option is no longer supported.
+          # Patch the formula to remove geoip references before building.
+          sed -i '' '/geoip/Id' "$(brew --prefix)/Library/Taps/openresty/homebrew-brew/Formula/openresty.rb"
+          brew install --build-from-source openresty/brew/openresty
+          echo "$(brew --prefix openresty)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix openresty)/nginx/sbin" >> $GITHUB_PATH
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
