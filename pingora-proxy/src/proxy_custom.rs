@@ -766,7 +766,8 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
+                    .response_body_filter(session, &mut data, eos, ctx)
+                    .await?
                 {
                     trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
@@ -777,7 +778,8 @@ where
                 // range body filter doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
+                    .response_body_filter(session, &mut data, eos, ctx)
+                    .await?
                 {
                     trace!("delaying upgraded response for {duration:?}");
                     time::sleep(duration).await;

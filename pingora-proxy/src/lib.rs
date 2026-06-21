@@ -403,12 +403,15 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
+                    .upstream_response_trailer_filter(session, trailers, ctx)
+                    .await?;
                 None
             }
             _ => {
