@@ -135,6 +135,10 @@ impl TlsSettings {
             callbacks: self.callbacks,
         }
     }
+
+    pub(crate) fn try_build(self) -> Result<Acceptor> {
+        Ok(self.build())
+    }
 }
 
 impl Acceptor {

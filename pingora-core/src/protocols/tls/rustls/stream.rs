@@ -29,7 +29,9 @@ use crate::utils::tls::get_organization_serial_bytes;
 use pingora_error::ErrorType::{AcceptError, ConnectError, InternalError, TLSHandshakeFailure};
 use pingora_error::{OkOrErr, OrErr, Result};
 use pingora_rustls::TlsStream as RusTlsStream;
-use pingora_rustls::{hash_certificate, NoDebug};
+use pingora_rustls::{
+    hash_certificate, hash_certificate_with_provider, CertificateHashProvider, NoDebug,
+};
 use pingora_rustls::{Accept, Connect, ServerName, TlsConnector};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use x509_parser::nom::AsBytes;
@@ -46,6 +48,7 @@ pub struct InnerStream<T> {
 pub struct TlsStream<T> {
     tls: InnerStream<T>,
     digest: Option<Arc<SslDigest>>,
+    cert_digest_hash: NoDebug<Option<&'static CertificateHashProvider>>,
     timing: TimingDigest,
 }
 
@@ -69,6 +72,7 @@ where
         Ok(TlsStream {
             tls,
             digest: None,
+            cert_digest_hash: None.into(),
             timing: Default::default(),
         })
     }
@@ -85,6 +89,7 @@ where
         Ok(TlsStream {
             tls,
             digest: None,
+            cert_digest_hash: acceptor.cert_digest_hash.into(),
             timing: Default::default(),
         })
     }
@@ -163,7 +168,7 @@ where
     pub(crate) async fn connect(&mut self) -> Result<()> {
         self.tls.connect().await?;
         self.timing.established_ts = SystemTime::now();
-        self.digest = self.tls.digest();
+        self.digest = self.tls.digest(*self.cert_digest_hash);
         Ok(())
     }
 
@@ -171,7 +176,7 @@ where
     pub(crate) async fn accept(&mut self) -> Result<()> {
         self.tls.accept().await?;
         self.timing.established_ts = SystemTime::now();
-        self.digest = self.tls.digest();
+        self.digest = self.tls.digest(*self.cert_digest_hash);
         Ok(())
     }
 }
@@ -307,8 +312,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
         Ok(())
     }
 
-    pub(crate) fn digest(&mut self) -> Option<Arc<SslDigest>> {
-        Some(Arc::new(SslDigest::from_stream(&self.stream)))
+    pub(crate) fn digest(
+        &mut self,
+        cert_digest_hash: Option<&'static CertificateHashProvider>,
+    ) -> Option<Arc<SslDigest>> {
+        Some(Arc::new(SslDigest::from_stream(
+            &self.stream,
+            cert_digest_hash,
+        )))
     }
 }
 
@@ -361,7 +372,10 @@ where
 }
 
 impl SslDigest {
-    fn from_stream<T>(stream: &Option<RusTlsStream<T>>) -> Self {
+    fn from_stream<T>(
+        stream: &Option<RusTlsStream<T>>,
+        cert_digest_hash: Option<&'static CertificateHashProvider>,
+    ) -> Self {
         let stream = stream.as_ref().unwrap();
         let (_io, session) = stream.get_ref();
         let protocol = session.protocol_version();
@@ -378,7 +392,10 @@ impl SslDigest {
 
         let cert_digest = peer_certificates
             .and_then(|certs| certs.first())
-            .map(|cert| hash_certificate(cert))
+            .map(|cert| match cert_digest_hash {
+                Some(hash_provider) => hash_certificate_with_provider(cert, hash_provider),
+                None => hash_certificate(cert),
+            })
             .unwrap_or_default();
 
         let (organization, serial_number) = peer_certificates

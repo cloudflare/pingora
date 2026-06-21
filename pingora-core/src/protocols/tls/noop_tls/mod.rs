@@ -84,6 +84,10 @@ pub mod listeners {
             Acceptor
         }
 
+        pub fn try_build(&self) -> Result<Acceptor> {
+            Ok(self.build())
+        }
+
         pub fn intermediate(_: &str, _: &str) -> Result<Self> {
             Ok(Self)
         }
