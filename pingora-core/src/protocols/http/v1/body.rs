@@ -565,18 +565,32 @@ impl BodyReader {
             Ok(status) => {
                 match status {
                     httparse::Status::Complete((payload_index, chunk_size)) => {
-                        // TODO: Check chunk_size overflow
                         trace!(
                             "Got size {chunk_size}, payload_index: {payload_index}, chunk: {:?}",
                             String::from_utf8_lossy(buf).escape_default(),
                         );
-                        let chunk_size = chunk_size as usize;
+                        let chunk_size = match usize::try_from(chunk_size) {
+                            Ok(chunk_size) => chunk_size,
+                            Err(_) => {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk size overflows usize",
+                                );
+                            }
+                        };
                         // https://github.com/seanmonstar/httparse/issues/149
                         // httparse does not treat zero-size chunk differently, it does not check
                         // that terminating chunk is 0 + double CRLF
                         if chunk_size == 0 {
                             /* terminating chunk, also need to handle trailer. */
-                            let chunk_end_index = payload_index + 2;
+                            let Some(chunk_end_index) = payload_index.checked_add(2) else {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk terminator overflows buffer index",
+                                );
+                            };
                             return if chunk_end_index <= buf.len()
                                 && buf[payload_index..chunk_end_index] == CRLF[..]
                             {
@@ -603,8 +617,20 @@ impl BodyReader {
                             };
                         }
                         // chunk-size CRLF [payload_index] byte*[chunk_size] CRLF
-                        let data_end_index = payload_index + chunk_size;
-                        let chunk_end_index = data_end_index + 2;
+                        let Some(data_end_index) = payload_index.checked_add(chunk_size) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk size overflows buffer index",
+                            );
+                        };
+                        let Some(chunk_end_index) = data_end_index.checked_add(2) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk terminator overflows buffer index",
+                            );
+                        };
                         if chunk_end_index >= buf.len() {
                             // no multi chunk in this buf
                             let actual_size = if data_end_index > buf.len() {
@@ -2057,6 +2083,32 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(0));
         assert_eq!(body_reader.get_body_overread(), None);
+    }
+
+    #[tokio::test]
+    async fn read_with_body_overflowing_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFE\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_max_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFF\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
