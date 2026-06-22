@@ -781,6 +781,23 @@ impl CacheMeta {
         self.0.internal.stale_while_revalidate_sec = 0;
     }
 
+    /// Update the freshness metadata of this asset.
+    ///
+    /// Refreshes `fresh_until`, `stale_while_revalidate_sec`, and
+    /// `stale_if_error_sec`, and stamps `updated` to now. The response
+    /// header, variance, epoch override, and other fields are preserved.
+    pub fn update_freshness(
+        &mut self,
+        fresh_until: SystemTime,
+        stale_while_revalidate_sec: u32,
+        stale_if_error_sec: u32,
+    ) {
+        self.0.internal.fresh_until = fresh_until;
+        self.0.internal.stale_while_revalidate_sec = stale_while_revalidate_sec;
+        self.0.internal.stale_if_error_sec = stale_if_error_sec;
+        self.0.internal.updated = SystemTime::now();
+    }
+
     /// Get the variance hash of this asset
     pub fn variance(&self) -> Option<HashBinary> {
         self.0.internal.variance
