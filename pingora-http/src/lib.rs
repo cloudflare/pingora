@@ -686,10 +686,19 @@ fn append_header_value<T>(
         .or_err(InvalidHTTPHeader, "invalid header name")?;
     // store the original case in the map
     if let Some(name_map) = name_map {
-        name_map.append(header_name.clone(), case_header_name);
+        // Use the non-panicking `try_append`: the infallible `append` calls
+        // `.expect("size overflows MAX_SIZE")` internally, which would abort the
+        // process if the case map ever exceeded `http`'s `MAX_SIZE` (1 << 15).
+        name_map
+            .try_append(header_name.clone(), case_header_name)
+            .or_err(InvalidHTTPHeader, "header name map size overflows MAX_SIZE")?;
     }
 
-    Ok(value_map.append(header_name, value))
+    // Non-panicking `try_append` for the same reason as the case map above.
+    value_map.try_append(header_name, value).or_err(
+        InvalidHTTPHeader,
+        "header value map size overflows MAX_SIZE",
+    )
 }
 
 #[inline]
