@@ -18,7 +18,7 @@ use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
 use super::v1::server::HttpSession as SessionV1;
-use super::v2::server::HttpSession as SessionV2;
+use super::v2::server::{HttpSession as SessionV2, Idle};
 use super::HttpTask;
 use crate::custom_session;
 use crate::protocols::{Digest, SocketAddr, Stream};
@@ -682,15 +682,16 @@ impl Session {
         }
     }
 
-    /// Wait for the client to abort this stream without reading any body data.
+    /// Return a future that waits for the client to abort this H2 stream without
+    /// reading any body data.
     ///
     /// For HTTP/2 this resolves when the client resets the stream (RST_STREAM) or the
-    /// stream errors. Other protocols have no out-of-band abort signal (detecting a
-    /// close would require consuming reads), so this future is pending forever for them.
-    pub async fn watch_h2_stream_reset(&mut self) -> Result<h2::Reason> {
+    /// stream errors. Other protocols have no out-of-band abort signal, so this
+    /// returns `None` for them.
+    pub fn watch_h2_stream_reset(&mut self) -> Option<Idle<'_>> {
         match self {
-            Self::H2(s) => s.idle().await,
-            Self::H1(_) | Self::Subrequest(_) | Self::Custom(_) => std::future::pending().await,
+            Self::H2(s) => Some(s.idle()),
+            _ => None,
         }
     }
 

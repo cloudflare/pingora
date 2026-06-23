@@ -213,18 +213,21 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                let upstream_read_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let downstream_error = e.esource == ErrorSource::Downstream;
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
                 // we know we have not received END_STREAM at this point since we read timed out.
                 // Also cancel the upstream stream when downstream goes away/resets so the
                 // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
-                if (e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout))
-                    || e.esource == ErrorSource::Downstream
-                {
+                if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
-                    // Mark the underlying H2 connection for shutdown so it's not used
-                    // for new streams in case it is hung.
-                    client_session.conn.mark_shutdown();
+                    if upstream_read_timeout {
+                        // Mark the underlying H2 connection for shutdown so it's not used
+                        // for new streams in case it is hung.
+                        client_session.conn.mark_shutdown();
+                    }
                 }
                 (false, Some(e))
             }
@@ -487,11 +490,18 @@ where
                             }
                             // ignore downstream error so that upstream can continue to write cache
                             downstream_state.to_errored();
-                            warn!(
-                                "Downstream Error ignored during caching: {}, {}",
-                                e,
-                                self.inner.request_summary(session, ctx)
-                            );
+                            if !self.inner.suppress_proxy_warn_log(
+                                session,
+                                ctx,
+                                &e,
+                                ProxyWarnLogContext::DownstreamCache,
+                            ) {
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                            }
                             // This will not be treated as a final error, but we should signal to
                             // downstream session anyway.
                             session.downstream_session.on_proxy_failure(e);
@@ -935,25 +945,32 @@ where
             }
         };
 
-        /* Race the upstream write against a downstream stream reset. A write blocked
-         * on upstream flow control would otherwise keep the downstream stream handles
-         * referenced while a downstream RST_STREAM goes unobserved, pinning the
-         * downstream connection window credit until the write completes. */
-        tokio::select! {
-            biased;
-            res = write_body(client_body, data, end, write_timeout) => {
-                res.map_err(|e| e.into_up())?;
-            }
-            reset = session.downstream_session.watch_h2_stream_reset() => {
-                return match reset {
-                    Ok(reason) => Error::e_explain(
-                        H2Error,
-                        format!("downstream reset stream (reason: {reason}) while writing body to upstream"),
-                    ),
-                    Err(e) => Err(e),
+        /* For H2 downstreams, race the upstream write against a downstream stream
+         * reset. A write blocked on upstream flow control would otherwise keep the
+         * downstream stream handles referenced while a downstream RST_STREAM goes
+         * unobserved, pinning the downstream connection window credit until the
+         * write completes. */
+        if let Some(reset) = session.downstream_session.watch_h2_stream_reset() {
+            tokio::select! {
+                biased;
+                res = write_body(client_body, data, end, write_timeout) => {
+                    res.map_err(|e| e.into_up())?;
                 }
-                .map_err(|e| e.into_down());
+                reset = reset => {
+                    return match reset {
+                        Ok(reason) => Error::e_explain(
+                            H2Error,
+                            format!("downstream reset stream (reason: {reason}) while writing body to upstream"),
+                        ),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| e.into_down());
+                }
             }
+        } else {
+            write_body(client_body, data, end, write_timeout)
+                .await
+                .map_err(|e| e.into_up())?;
         }
 
         Ok(end_of_body)
