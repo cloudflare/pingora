@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use log::info;
+use pingora_core::connectors::l4::ConnectErrorExt;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
@@ -46,6 +47,9 @@ impl ProxyHttp for BackoffRetryProxy {
         ctx: &mut Self::CTX,
         e: Box<Error>,
     ) -> Box<Error> {
+        if let Some(local_addr) = e.connect_local_addr() {
+            info!("connection attempt used local address: {local_addr}");
+        }
         ctx.retries += 1;
         let mut retry_e = e;
         retry_e.set_retry(true);
