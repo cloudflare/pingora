@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,16 +13,150 @@
 // limitations under the License.
 
 //! Distributed tracing helpers
+//!
+//! When the `trace` feature is enabled, this module re-exports the real
+//! [`cf_rustracing`]/[`cf_rustracing_jaeger`] span types.
+//!
+//! When the `trace` feature is **disabled**, lightweight no-op shim types are
+//! provided instead so that the rest of the crate compiles without pulling in
+//! the tracing dependencies.
 
-use cf_rustracing_jaeger::span::SpanContextState;
 use std::time::SystemTime;
 
 use crate::{CacheMeta, CachePhase, HitStatus};
 
-pub use cf_rustracing::tag::Tag;
+// ---------------------------------------------------------------------------
+// Real tracing implementation (feature = "trace")
+// ---------------------------------------------------------------------------
+#[cfg(feature = "trace")]
+mod real {
+    pub use cf_rustracing::tag::Tag;
 
-pub type Span = cf_rustracing::span::Span<SpanContextState>;
-pub type SpanHandle = cf_rustracing::span::SpanHandle<SpanContextState>;
+    use cf_rustracing_jaeger::span::SpanContextState;
+
+    pub type Span = cf_rustracing::span::Span<SpanContextState>;
+    pub type SpanHandle = cf_rustracing::span::SpanHandle<SpanContextState>;
+}
+
+#[cfg(feature = "trace")]
+pub use real::*;
+
+// ---------------------------------------------------------------------------
+// No-op shim types (feature = "trace" disabled)
+// ---------------------------------------------------------------------------
+#[cfg(not(feature = "trace"))]
+mod noop {
+    /// A no-op replacement for [`cf_rustracing::tag::Tag`].
+    #[derive(Debug)]
+    pub struct Tag {
+        _priv: (),
+    }
+
+    impl Tag {
+        /// Create a no-op tag.  All arguments are ignored.
+        #[inline]
+        pub fn new<N, V>(_name: N, _value: V) -> Self {
+            Tag { _priv: () }
+        }
+    }
+
+    /// A no-op replacement for a rustracing `Span`.
+    #[derive(Debug)]
+    pub struct Span {
+        _priv: (),
+    }
+
+    impl Span {
+        /// Return an inactive (no-op) span.
+        #[inline]
+        pub fn inactive() -> Self {
+            Span { _priv: () }
+        }
+
+        /// Return a no-op handle.
+        #[inline]
+        pub fn handle(&self) -> SpanHandle {
+            SpanHandle { _priv: () }
+        }
+
+        /// No-op: create a child span.
+        #[inline]
+        pub fn child<F>(&self, _name: &'static str, _f: F) -> Span
+        where
+            F: FnOnce(SpanOptionsPlaceholder) -> SpanOptionsPlaceholder,
+        {
+            Span::inactive()
+        }
+
+        /// No-op: set a single tag via a closure.
+        #[inline]
+        pub fn set_tag<F: FnOnce() -> Tag>(&self, _f: F) {}
+
+        /// No-op: set multiple tags via a closure.
+        #[inline]
+        pub fn set_tags<F, I>(&self, _f: F)
+        where
+            F: FnOnce() -> I,
+            I: IntoIterator<Item = Tag>,
+        {
+        }
+
+        /// No-op: set a finish time.
+        #[inline]
+        pub fn set_finish_time<F: Fn() -> std::time::SystemTime>(&self, _f: F) {}
+    }
+
+    /// Placeholder type used in [`Span::child`] closure signatures so that
+    /// existing call-sites like `span.child("name", |o| o.start())` compile.
+    #[doc(hidden)]
+    pub struct SpanOptionsPlaceholder {
+        _priv: (),
+    }
+
+    impl SpanOptionsPlaceholder {
+        /// No-op: mirrors `SpanOptions::start()`.
+        #[inline]
+        pub fn start(self) -> Self {
+            self
+        }
+    }
+
+    /// A no-op replacement for a rustracing `SpanHandle`.
+    #[derive(Debug)]
+    pub struct SpanHandle {
+        _priv: (),
+    }
+}
+
+#[cfg(not(feature = "trace"))]
+pub use noop::*;
+
+// ---------------------------------------------------------------------------
+// Shared helpers (work with both real and no-op types)
+// ---------------------------------------------------------------------------
+
+/// Tag a span with metadata from a [`CacheMeta`].
+pub fn tag_span_with_meta(span: &mut Span, meta: &CacheMeta) {
+    fn ts2epoch(ts: SystemTime) -> f64 {
+        ts.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default() // should never overflow but be safe here
+            .as_secs_f64()
+    }
+    let internal = &meta.0.internal;
+    span.set_tags(|| {
+        [
+            Tag::new("created", ts2epoch(internal.created)),
+            Tag::new("fresh_until", ts2epoch(internal.fresh_until)),
+            Tag::new("updated", ts2epoch(internal.updated)),
+            Tag::new("stale_if_error_sec", internal.stale_if_error_sec as i64),
+            Tag::new(
+                "stale_while_revalidate_sec",
+                internal.stale_while_revalidate_sec as i64,
+            ),
+            Tag::new("variance", internal.variance.is_some()),
+        ]
+    });
+}
 
 #[derive(Debug)]
 pub(crate) struct CacheTraceCTX {
@@ -82,33 +216,11 @@ impl CacheTraceCTX {
         self.hit_span.set_finish_time(SystemTime::now);
     }
 
-    fn log_meta(span: &mut Span, meta: &CacheMeta) {
-        fn ts2epoch(ts: SystemTime) -> f64 {
-            ts.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default() // should never overflow but be safe here
-                .as_secs_f64()
-        }
-        let internal = &meta.0.internal;
-        span.set_tags(|| {
-            [
-                Tag::new("created", ts2epoch(internal.created)),
-                Tag::new("fresh_until", ts2epoch(internal.fresh_until)),
-                Tag::new("updated", ts2epoch(internal.updated)),
-                Tag::new("stale_if_error_sec", internal.stale_if_error_sec as i64),
-                Tag::new(
-                    "stale_while_revalidate_sec",
-                    internal.stale_while_revalidate_sec as i64,
-                ),
-                Tag::new("variance", internal.variance.is_some()),
-            ]
-        });
-    }
-
     pub fn log_meta_in_hit_span(&mut self, meta: &CacheMeta) {
-        CacheTraceCTX::log_meta(&mut self.hit_span, meta);
+        tag_span_with_meta(&mut self.hit_span, meta);
     }
 
     pub fn log_meta_in_miss_span(&mut self, meta: &CacheMeta) {
-        CacheTraceCTX::log_meta(&mut self.miss_span, meta);
+        tag_span_with_meta(&mut self.miss_span, meta);
     }
 }

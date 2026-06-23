@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,14 +114,14 @@ impl CompressionInner {
     }
 
     #[inline]
-    fn get_com_context(&self) -> RefMut<CCtx<'static>> {
+    fn get_com_context(&self) -> RefMut<'_, CCtx<'static>> {
         self.com_context
             .get_or(|| RefCell::new(CCtx::create()))
             .borrow_mut()
     }
 
     #[inline]
-    fn get_de_context(&self) -> RefMut<DCtx<'static>> {
+    fn get_de_context(&self) -> RefMut<'_, DCtx<'static>> {
         self.de_context
             .get_or(|| RefCell::new(DCtx::create()))
             .borrow_mut()

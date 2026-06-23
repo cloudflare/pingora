@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
-use super::l4::ext::{get_original_dest, get_recv_buf, get_tcp_info, TCP_INFO};
+use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
@@ -95,6 +95,15 @@ impl SocketDigest {
         }
     }
 
+    /// Return the kernel socket cookie for this connection.
+    ///
+    /// This is backed by Linux's `SO_COOKIE` socket option. On other Unix
+    /// platforms this returns `Ok(0)`.
+    #[cfg(unix)]
+    pub fn socket_cookie(&self) -> std::io::Result<u64> {
+        super::l4::ext::get_socket_cookie(self.raw_fd)
+    }
+
     #[cfg(unix)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
         self.peer_addr
@@ -164,6 +173,24 @@ impl SocketDigest {
     }
 
     #[cfg(unix)]
+    pub fn get_snd_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_snd_buf(self.raw_fd).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn get_snd_buf(&self) -> Option<usize> {
+        if self.is_inet() {
+            get_snd_buf(self.raw_sock).ok()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(unix)]
     pub fn original_dst(&self) -> Option<&SocketAddr> {
         self.original_dst
             .get_or_init(|| {
@@ -210,4 +237,34 @@ pub trait GetProxyDigest {
 pub trait GetSocketDigest {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>>;
     fn set_socket_digest(&mut self, _socket_digest: SocketDigest) {}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::SocketDigest;
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn socket_cookie_returns_cookie_for_tcp_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let client_digest = SocketDigest::from_raw_fd(client.as_raw_fd());
+        let server_digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+
+        assert_ne!(client_digest.socket_cookie().unwrap(), 0);
+        assert_ne!(server_digest.socket_cookie().unwrap(), 0);
+    }
+
+    #[test]
+    fn socket_cookie_returns_cookie_for_unix_socket() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+
+        let client_digest = SocketDigest::from_raw_fd(client.as_raw_fd());
+        let server_digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+
+        assert_ne!(client_digest.socket_cookie().unwrap(), 0);
+        assert_ne!(server_digest.socket_cookie().unwrap(), 0);
+    }
 }

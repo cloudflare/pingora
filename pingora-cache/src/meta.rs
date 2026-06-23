@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -93,8 +93,14 @@ mod internal_meta {
         //    schema to decode it
         // After full releases, remove `skip_serializing_if` so that we can add the next extended field.
         #[serde(default)]
-        #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) variance: Option<HashBinary>,
+        #[serde(default)]
+        pub(crate) epoch_override: Option<SystemTime>,
+        // Cache-object provenance timestamp for hit filtering decisions that need a
+        // stable reference point across metadata rewrites or refreshes.
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) provenance: Option<SystemTime>,
     }
 
     impl Default for InternalMetaV2 {
@@ -108,6 +114,8 @@ mod internal_meta {
                 stale_while_revalidate_sec: 0,
                 stale_if_error_sec: 0,
                 variance: None,
+                epoch_override: None,
+                provenance: None,
             }
         }
     }
@@ -258,35 +266,118 @@ mod internal_meta {
             assert_eq!(meta2.created, meta2.updated);
         }
 
+        // make sure that v2 format is backward compatible
+        // this is the base version of v2 without any extended fields
+        #[derive(Deserialize, Serialize)]
+        struct InternalMetaV2Base {
+            version: u8,
+            fresh_until: SystemTime,
+            created: SystemTime,
+            updated: SystemTime,
+            stale_while_revalidate_sec: u32,
+            stale_if_error_sec: u32,
+        }
+
+        impl InternalMetaV2Base {
+            pub const VERSION: u8 = 2;
+            pub fn serialize(&self) -> Result<Vec<u8>> {
+                assert!(self.version >= Self::VERSION);
+                rmp_serde::encode::to_vec(self).or_err(InternalError, "failed to encode cache meta")
+            }
+            fn deserialize(buf: &[u8]) -> Result<Self> {
+                rmp_serde::decode::from_slice(buf)
+                    .or_err(InternalError, "failed to decode cache meta v2")
+            }
+        }
+
+        // this is the base version of v2 with variance but without epoch_override
+        #[derive(Deserialize, Serialize)]
+        struct InternalMetaV2BaseWithVariance {
+            version: u8,
+            fresh_until: SystemTime,
+            created: SystemTime,
+            updated: SystemTime,
+            stale_while_revalidate_sec: u32,
+            stale_if_error_sec: u32,
+            #[serde(default)]
+            #[serde(skip_serializing_if = "Option::is_none")]
+            variance: Option<HashBinary>,
+        }
+
+        impl Default for InternalMetaV2BaseWithVariance {
+            fn default() -> Self {
+                let epoch = SystemTime::UNIX_EPOCH;
+                InternalMetaV2BaseWithVariance {
+                    version: InternalMetaV2::VERSION,
+                    fresh_until: epoch,
+                    created: epoch,
+                    updated: epoch,
+                    stale_while_revalidate_sec: 0,
+                    stale_if_error_sec: 0,
+                    variance: None,
+                }
+            }
+        }
+
+        impl InternalMetaV2BaseWithVariance {
+            pub const VERSION: u8 = 2;
+            pub fn serialize(&self) -> Result<Vec<u8>> {
+                assert!(self.version >= Self::VERSION);
+                rmp_serde::encode::to_vec(self).or_err(InternalError, "failed to encode cache meta")
+            }
+            fn deserialize(buf: &[u8]) -> Result<Self> {
+                rmp_serde::decode::from_slice(buf)
+                    .or_err(InternalError, "failed to decode cache meta v2")
+            }
+        }
+
+        // V2 with variance + epoch_override fixed in the wire layout, but without
+        // provenance. Models the layout produced by reader-prep binaries before
+        // provenance writes are enabled.
+        #[derive(Deserialize, Serialize)]
+        struct InternalMetaV2BeforeProvenance {
+            version: u8,
+            fresh_until: SystemTime,
+            created: SystemTime,
+            updated: SystemTime,
+            stale_while_revalidate_sec: u32,
+            stale_if_error_sec: u32,
+            #[serde(default)]
+            variance: Option<HashBinary>,
+            #[serde(default)]
+            epoch_override: Option<SystemTime>,
+        }
+
+        impl Default for InternalMetaV2BeforeProvenance {
+            fn default() -> Self {
+                let epoch = SystemTime::UNIX_EPOCH;
+                InternalMetaV2BeforeProvenance {
+                    version: InternalMetaV2::VERSION,
+                    fresh_until: epoch,
+                    created: epoch,
+                    updated: epoch,
+                    stale_while_revalidate_sec: 0,
+                    stale_if_error_sec: 0,
+                    variance: None,
+                    epoch_override: None,
+                }
+            }
+        }
+
+        impl InternalMetaV2BeforeProvenance {
+            pub fn serialize(&self) -> Result<Vec<u8>> {
+                rmp_serde::encode::to_vec(self).or_err(InternalError, "failed to encode cache meta")
+            }
+            fn deserialize(buf: &[u8]) -> Result<Self> {
+                rmp_serde::decode::from_slice(buf)
+                    .or_err(InternalError, "failed to decode cache meta v2")
+            }
+        }
+
         #[test]
-        fn test_internal_meta_serde_v2_extend_fields() {
-            // make sure that v2 format is backward compatible
-            // this is the base version of v2 without any extended fields
-            #[derive(Deserialize, Serialize)]
-            pub(crate) struct InternalMetaV2Base {
-                pub(crate) version: u8,
-                pub(crate) fresh_until: SystemTime,
-                pub(crate) created: SystemTime,
-                pub(crate) updated: SystemTime,
-                pub(crate) stale_while_revalidate_sec: u32,
-                pub(crate) stale_if_error_sec: u32,
-            }
-
-            impl InternalMetaV2Base {
-                pub const VERSION: u8 = 2;
-                pub fn serialize(&self) -> Result<Vec<u8>> {
-                    assert!(self.version >= Self::VERSION);
-                    rmp_serde::encode::to_vec(self)
-                        .or_err(InternalError, "failed to encode cache meta")
-                }
-                fn deserialize(buf: &[u8]) -> Result<Self> {
-                    rmp_serde::decode::from_slice(buf)
-                        .or_err(InternalError, "failed to decode cache meta v2")
-                }
-            }
-
+        fn test_internal_meta_serde_v2_extend_fields_variance() {
             // ext V2 to base v2
-            let meta = InternalMetaV2::default();
+            let meta = InternalMetaV2BaseWithVariance::default();
             let binary = meta.serialize().unwrap();
             let meta2 = InternalMetaV2Base::deserialize(&binary).unwrap();
             assert_eq!(meta2.version, 2);
@@ -305,11 +396,209 @@ mod internal_meta {
                 stale_if_error_sec: 0,
             };
             let binary = meta.serialize().unwrap();
+            let meta2 = InternalMetaV2BaseWithVariance::deserialize(&binary).unwrap();
+            assert_eq!(meta2.version, 2);
+            assert_eq!(meta.fresh_until, meta2.fresh_until);
+            assert_eq!(meta.created, meta2.created);
+            assert_eq!(meta.updated, meta2.updated);
+        }
+
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_epoch_override() {
+            let now = SystemTime::now();
+
+            // Backward compat: pre-epoch_override encodings (V2BaseWithVariance) must
+            // still decode into the current InternalMetaV2 with epoch_override = None.
+            // This direction is permanent — older on-disk entries written before
+            // epoch_override existed must remain readable.
+            let mut meta = InternalMetaV2BaseWithVariance {
+                version: InternalMetaV2::VERSION,
+                fresh_until: now,
+                created: now,
+                updated: now,
+                stale_while_revalidate_sec: 0,
+                stale_if_error_sec: 0,
+                variance: None,
+            };
+            let binary = meta.serialize().unwrap();
             let meta2 = InternalMetaV2::deserialize(&binary).unwrap();
             assert_eq!(meta2.version, 2);
             assert_eq!(meta.fresh_until, meta2.fresh_until);
             assert_eq!(meta.created, meta2.created);
             assert_eq!(meta.updated, meta2.updated);
+            assert!(meta2.variance.is_none());
+            assert!(meta2.epoch_override.is_none());
+
+            // Same direction with variance set.
+            meta.variance = Some(*b"variance_testing");
+            let binary = meta.serialize().unwrap();
+            let meta2 = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(meta2.version, 2);
+            assert_eq!(meta.fresh_until, meta2.fresh_until);
+            assert_eq!(meta.created, meta2.created);
+            assert_eq!(meta.updated, meta2.updated);
+            assert_eq!(meta.variance, meta2.variance);
+            assert!(meta2.epoch_override.is_none());
+        }
+
+        // Pins the wire-format change made when removing skip_serializing_if from
+        // epoch_override: a Some value and a None value must both round-trip cleanly
+        // and produce arrays of the same length. This is the precondition for appending
+        // a new optional field after epoch_override in a future release.
+        #[test]
+        fn test_internal_meta_serde_v2_epoch_override_always_serialized() {
+            let now = SystemTime::now();
+
+            let meta_none = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                epoch_override: None,
+                ..Default::default()
+            };
+            let meta_some = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                epoch_override: Some(now),
+                ..Default::default()
+            };
+
+            let bin_none = meta_none.serialize().unwrap();
+            let bin_some = meta_some.serialize().unwrap();
+
+            // Both encodings must produce the same array length so the next appended
+            // extended field always lands at the same fixed position regardless of
+            // whether epoch_override is set.
+            let len_none =
+                rmp::decode::read_array_len(&mut &bin_none[..]).expect("decode array len");
+            let len_some =
+                rmp::decode::read_array_len(&mut &bin_some[..]).expect("decode array len");
+            assert_eq!(len_none, len_some);
+
+            // Round-trip both values to confirm decoding still works.
+            let decoded_none = InternalMetaV2::deserialize(&bin_none).unwrap();
+            let decoded_some = InternalMetaV2::deserialize(&bin_some).unwrap();
+            assert!(decoded_none.epoch_override.is_none());
+            assert_eq!(decoded_some.epoch_override, Some(now));
+
+            // The same invariant should hold regardless of the preceding variance slot.
+            let meta_none_with_variance = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: None,
+                ..Default::default()
+            };
+            let meta_some_with_variance = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: Some(now),
+                ..Default::default()
+            };
+            let bin_none = meta_none_with_variance.serialize().unwrap();
+            let bin_some = meta_some_with_variance.serialize().unwrap();
+            let len_none =
+                rmp::decode::read_array_len(&mut &bin_none[..]).expect("decode array len");
+            let len_some =
+                rmp::decode::read_array_len(&mut &bin_some[..]).expect("decode array len");
+            assert_eq!(len_none, len_some);
+        }
+
+        // An on-disk entry written by a pre-provenance binary must decode cleanly
+        // into the current schema with provenance = None. The lookup path falls
+        // back to `created` for those entries.
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_provenance_backward_compat() {
+            let now = SystemTime::now();
+            let old = InternalMetaV2BeforeProvenance {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: Some(now),
+                ..Default::default()
+            };
+            let binary = old.serialize().unwrap();
+
+            let decoded = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(decoded.version, 2);
+            assert_eq!(decoded.fresh_until, now);
+            assert_eq!(decoded.created, now);
+            assert_eq!(decoded.variance, Some(*b"variance_testing"));
+            assert_eq!(decoded.epoch_override, Some(now));
+            // The new field is absent from the encoded blob, so serde gives us None.
+            assert!(decoded.provenance.is_none());
+        }
+
+        // Forward compat: a current encoding with provenance = None must still be
+        // decodable by a pre-provenance reader (the field is skipped on the wire when
+        // None thanks to skip_serializing_if, keeping the array length equal to the
+        // older schema's length).
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_provenance_forward_compat_none() {
+            let now = SystemTime::now();
+            let current = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: Some(now),
+                provenance: None,
+                ..Default::default()
+            };
+            let binary = current.serialize().unwrap();
+
+            // Old reader (no provenance field) accepts this encoding because the
+            // array length matches (provenance was skipped during serialization).
+            let decoded = InternalMetaV2BeforeProvenance::deserialize(&binary).unwrap();
+            assert_eq!(decoded.fresh_until, now);
+            assert_eq!(decoded.created, now);
+            assert_eq!(decoded.variance, Some(*b"variance_testing"));
+            assert_eq!(decoded.epoch_override, Some(now));
+        }
+
+        // Entries written with provenance = Some(...) require a reader that supports the
+        // provenance field. The previous test pins the compatible None encoding.
+        #[test]
+        fn test_internal_meta_serde_v2_extend_fields_provenance_some_needs_field_support() {
+            let now = SystemTime::now();
+            let current = InternalMetaV2 {
+                fresh_until: now,
+                created: now,
+                updated: now,
+                variance: Some(*b"variance_testing"),
+                epoch_override: Some(now),
+                provenance: Some(now),
+                ..Default::default()
+            };
+            let binary = current.serialize().unwrap();
+
+            assert!(InternalMetaV2BeforeProvenance::deserialize(&binary).is_err());
+            let decoded = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(decoded.provenance, Some(now));
+        }
+
+        // Round-trip a Some(provenance): preservation across encode/decode cycles is
+        // what the cache_vary_lookup tombstone relies on for SWR-refreshed entries.
+        #[test]
+        fn test_internal_meta_serde_v2_provenance_round_trip() {
+            let admission = SystemTime::now();
+            let updated = admission + Duration::from_secs(300);
+            let meta = InternalMetaV2 {
+                fresh_until: updated,
+                created: updated, // simulates an SWR-refreshed entry: created = now
+                updated,
+                provenance: Some(admission), // ... but provenance is the ORIGINAL admission
+                ..Default::default()
+            };
+            let binary = meta.serialize().unwrap();
+            let decoded = InternalMetaV2::deserialize(&binary).unwrap();
+            assert_eq!(decoded.created, updated);
+            assert_eq!(decoded.provenance, Some(admission));
         }
     }
 }
@@ -345,6 +634,7 @@ impl CacheMeta {
                 updated: created, // created == updated for new meta
                 stale_while_revalidate_sec,
                 stale_if_error_sec,
+                provenance: Some(created),
                 ..Default::default()
             },
             header,
@@ -364,6 +654,64 @@ impl CacheMeta {
         self.0.internal.updated
     }
 
+    /// Cache-object provenance timestamp.
+    ///
+    /// When populated, this is a stable reference point for the cache object's
+    /// lineage that hit filtering code can use instead of relying on the metadata
+    /// record's creation time. The accessor falls back to [`Self::created`] while
+    /// the field is absent.
+    pub fn provenance(&self) -> SystemTime {
+        self.0
+            .internal
+            .provenance
+            .unwrap_or(self.0.internal.created)
+    }
+
+    /// Set the cache-object provenance timestamp.
+    pub(crate) fn set_provenance(&mut self, provenance: SystemTime) {
+        self.0.internal.provenance = Some(provenance);
+    }
+
+    /// Reset provenance to this metadata record's creation time.
+    pub(crate) fn reset_provenance_to_created(&mut self) {
+        self.0.internal.provenance = Some(self.0.internal.created);
+    }
+
+    /// The raw provenance value, exposing whether the field was explicitly set
+    /// (`Some`) vs derived via the [`Self::created`] fallback (`None`).
+    ///
+    /// Test-only inspection helper for compatibility coverage.
+    #[cfg(test)]
+    pub(crate) fn provenance_raw(&self) -> Option<SystemTime> {
+        self.0.internal.provenance
+    }
+
+    /// The reference point for cache age. This represents the "starting point" for `fresh_until`.
+    ///
+    /// This defaults to the `updated` timestamp but is overridden by the `epoch_override` field
+    /// if set.
+    pub fn epoch(&self) -> SystemTime {
+        self.0.internal.epoch_override.unwrap_or(self.updated())
+    }
+
+    /// Get the epoch override for this asset
+    pub fn epoch_override(&self) -> Option<SystemTime> {
+        self.0.internal.epoch_override
+    }
+
+    /// Set the epoch override for this asset
+    ///
+    /// When set, this will be used as the reference point for calculating age and freshness
+    /// instead of the updated time.
+    pub fn set_epoch_override(&mut self, epoch: SystemTime) {
+        self.0.internal.epoch_override = Some(epoch);
+    }
+
+    /// Remove the epoch override for this asset
+    pub fn remove_epoch_override(&mut self) {
+        self.0.internal.epoch_override = None;
+    }
+
     /// Is the asset still valid
     pub fn is_fresh(&self, time: SystemTime) -> bool {
         // NOTE: HTTP cache time resolution is second
@@ -372,15 +720,17 @@ impl CacheMeta {
 
     /// How long (in seconds) the asset should be fresh since its admission/revalidation
     ///
-    /// This is essentially the max-age value (or its equivalence)
+    /// This is essentially the max-age value (or its equivalence).
+    /// If an epoch override is set, it will be used as the reference point instead of the updated time.
     pub fn fresh_sec(&self) -> u64 {
         // swallow `duration_since` error, assets that are always stale have earlier `fresh_until` than `created`
         // practically speaking we can always treat these as 0 ttl
         // XXX: return Error if `fresh_until` is much earlier than expected?
+        let reference = self.epoch();
         self.0
             .internal
             .fresh_until
-            .duration_since(self.0.internal.updated)
+            .duration_since(reference)
             .map_or(0, |duration| duration.as_secs())
     }
 
@@ -390,9 +740,12 @@ impl CacheMeta {
     }
 
     /// How old the asset is since its admission/revalidation
+    ///
+    /// If an epoch override is set, it will be used as the reference point instead of the updated time.
     pub fn age(&self) -> Duration {
+        let reference = self.epoch();
         SystemTime::now()
-            .duration_since(self.updated())
+            .duration_since(reference)
             .unwrap_or_default()
     }
 
@@ -499,6 +852,7 @@ impl CacheMeta {
     pub fn serialize(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         let internal = self.0.internal.serialize()?;
         let header = header_serialize(&self.0.header)?;
+        log::debug!("header to serialize: {:?}", &self.0.header);
         Ok((internal, header))
     }
 
@@ -615,4 +969,132 @@ pub fn set_compression_dict_path(path: &str) -> bool {
 /// a dictionary without an external file.
 pub fn set_compression_dict_content(content: Cow<'static, [u8]>) -> bool {
     COMPRESSION_DICT_CONTENT.set(content).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_cache_meta_age_without_override() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build_no_case(200, None).unwrap();
+        let meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        // Without epoch_override, age() should use updated() as reference
+        std::thread::sleep(Duration::from_millis(100));
+        let age = meta.age();
+        assert!(age.as_secs() < 1, "age should be close to 0");
+
+        // epoch() should return updated() when no override is set
+        assert_eq!(meta.epoch(), meta.updated());
+    }
+
+    #[test]
+    fn test_cache_meta_age_with_epoch_override_past() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        // Set epoch_override to 10 seconds in the past
+        let epoch_override = now - Duration::from_secs(10);
+        meta.set_epoch_override(epoch_override);
+
+        // age() should now use epoch_override as the reference
+        let age = meta.age();
+        assert!(age.as_secs() >= 10);
+        assert!(age.as_secs() < 12);
+
+        // epoch() should return the override
+        assert_eq!(meta.epoch(), epoch_override);
+        assert_eq!(meta.epoch_override(), Some(epoch_override));
+    }
+
+    #[test]
+    fn test_cache_meta_age_with_epoch_override_future() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build(200, None).unwrap();
+        let mut meta = CacheMeta::new(now + Duration::from_secs(100), now, 0, 0, header);
+
+        // Set epoch_override to a future time
+        let future_epoch = now + Duration::from_secs(10);
+        meta.set_epoch_override(future_epoch);
+
+        let age_with_epoch = meta.age();
+        // age should be 0 since epoch_override is in the future
+        assert_eq!(age_with_epoch, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_cache_meta_fresh_sec() {
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            SystemTime::now() + Duration::from_secs(100),
+            SystemTime::now() - Duration::from_secs(100),
+            0,
+            0,
+            header,
+        );
+
+        meta.0.internal.updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        meta.0.internal.fresh_until = SystemTime::UNIX_EPOCH + Duration::from_secs(1100);
+
+        // Without epoch_override, fresh_sec should use updated as reference
+        let fresh_sec_without_override = meta.fresh_sec();
+        assert_eq!(fresh_sec_without_override, 100); // 1100 - 1000 = 100 seconds
+
+        // With epoch_override set to a later time (1050), fresh_sec should be calculated from that reference
+        let epoch_override = SystemTime::UNIX_EPOCH + Duration::from_secs(1050);
+        meta.set_epoch_override(epoch_override);
+        assert_eq!(meta.epoch_override(), Some(epoch_override));
+        assert_eq!(meta.epoch(), epoch_override);
+
+        let fresh_sec_with_override = meta.fresh_sec();
+        // fresh_until - epoch_override = 1100 - 1050 = 50 seconds
+        assert_eq!(fresh_sec_with_override, 50);
+
+        meta.remove_epoch_override();
+        assert_eq!(meta.epoch_override(), None);
+        assert_eq!(meta.epoch(), meta.updated());
+        assert_eq!(meta.fresh_sec(), 100); // back to normal calculation
+    }
+
+    #[test]
+    fn test_cache_meta_new_stamps_provenance() {
+        let now = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let meta = CacheMeta::new(now + Duration::from_secs(60), now, 0, 0, header);
+
+        assert_eq!(meta.created(), now);
+        assert_eq!(meta.provenance(), now);
+        assert_eq!(meta.provenance_raw(), Some(now));
+    }
+
+    #[test]
+    fn test_cache_meta_provenance_fallback_for_absent_field() {
+        let admission = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(admission + Duration::from_secs(60), admission, 0, 0, header);
+        meta.0.internal.provenance = None;
+
+        assert_eq!(meta.created(), admission);
+        assert!(meta.provenance_raw().is_none());
+        // Fallback path: provenance() returns created().
+        assert_eq!(meta.provenance(), admission);
+    }
+
+    #[test]
+    fn test_cache_meta_set_provenance() {
+        let admission = SystemTime::now();
+        let provenance = admission - Duration::from_secs(30);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(admission + Duration::from_secs(60), admission, 0, 0, header);
+
+        meta.set_provenance(provenance);
+
+        assert_eq!(meta.created(), admission);
+        assert_eq!(meta.provenance(), provenance);
+        assert_eq!(meta.provenance_raw(), Some(provenance));
+    }
 }

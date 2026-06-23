@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,7 +59,10 @@ static NOT_PURGEABLE: Lazy<ResponseHeader> = Lazy::new(|| gen_purge_response(405
 // on cache storage or proxy error
 static INTERNAL_ERROR: Lazy<ResponseHeader> = Lazy::new(|| error_resp::gen_error_response(500));
 
-impl<SV> HttpProxy<SV> {
+impl<SV, C> HttpProxy<SV, C>
+where
+    C: custom::Connector,
+{
     pub(crate) async fn proxy_purge(
         &self,
         session: &mut Session,

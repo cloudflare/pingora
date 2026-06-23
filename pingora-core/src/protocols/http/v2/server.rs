@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
+use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
@@ -33,6 +34,7 @@ use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
+use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType, OrErr, Result};
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
@@ -41,13 +43,30 @@ type H2Connection<S> = server::Connection<S, Bytes>;
 
 pub use h2::server::Builder as H2Options;
 
+// 64 KiB decoded header-list limit.
+const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Build [`H2Options`] with bounded defaults for received requests.
+///
+/// Use this as the starting point when customizing options to retain the default
+/// decoded header-list and concurrent-stream limits.
+pub fn default_h2_options() -> H2Options {
+    let mut options = H2Options::default();
+    options.max_header_list_size(DEFAULT_MAX_HEADER_LIST_SIZE);
+    options.max_concurrent_streams(DEFAULT_MAX_CONCURRENT_STREAMS);
+    options
+}
+
 /// Perform HTTP/2 connection handshake with an established (TLS) connection.
 ///
 /// The optional `options` allow to adjust certain HTTP/2 parameters and settings.
-/// See [`H2Options`] for more details.
+/// When `options` is [`None`], bounded defaults from [`default_h2_options`] are
+/// used. See [`H2Options`] for more details.
 pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Connection<Stream>> {
-    let options = options.unwrap_or_default();
+    let options = options.unwrap_or_else(default_h2_options);
     let res = options.handshake(io).await;
+
     match res {
         Ok(connection) => {
             debug!("H2 handshake done.");
@@ -58,6 +77,77 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
             "while h2 handshaking with client",
             e,
         ),
+    }
+}
+
+/// Drive a server-side HTTP/2 connection's accept loop, dispatching each new
+/// stream to `on_session` until the connection closes.
+///
+/// This loop ends in one of three ways:
+///   * the client closes the H2 connection cleanly ([`HttpSession::from_h2_conn`]
+///     returns `Ok(None)` after the final GOAWAY is flushed),
+///   * the codec hits a connection error, or
+///   * the runtime-level `graceful_shutdown_timeout_seconds` ceiling fires and
+///     force-kills the task driving this future.
+///
+/// On a shutdown signal:
+///   1. [`h2::server::Connection::graceful_shutdown`] is called, which
+///      enqueues a GOAWAY with the maximum possible last_stream_id per
+///      RFC 9113 §6.8. The codec emits a second, real GOAWAY when the
+///      connection finishes draining.
+///   2. The loop continues calling [`HttpSession::from_h2_conn`] so that:
+///      - streams whose HEADERS were buffered in the codec before the shutdown
+///        signal arrived are still surfaced and dispatched,
+///      - streams the client opens after observing GOAWAY(MAX) but below the
+///        eventual last_stream_id are also dispatched, and
+///      - the codec is driven to completion so the final GOAWAY can be
+///        flushed and the connection closed cleanly.
+///
+/// `on_session` is invoked once per accepted stream. Typical callers spawn a
+/// task to process the session so the accept loop is not blocked.
+///
+/// Note: this function does not impose its own per-connection drain timeout.
+/// The runtime-level `graceful_shutdown_timeout_seconds` is the only ceiling,
+/// so a slow client can keep this future alive up to that bound.
+// TODO: add a per-connection drain timeout to bound how long a single
+// misbehaving client can keep this task alive after GOAWAY.
+pub(crate) async fn accept_downstream_sessions<F>(
+    mut conn: H2Connection<Stream>,
+    digest: Arc<Digest>,
+    mut shutdown: ShutdownWatch,
+    mut on_session: F,
+) where
+    F: FnMut(HttpSession),
+{
+    let mut shutdown_initiated = false;
+    loop {
+        let h2_stream = if shutdown_initiated {
+            HttpSession::from_h2_conn(&mut conn, digest.clone()).await
+        } else {
+            tokio::select! {
+                // Poll the shutdown signal first so a concurrent signal is
+                // observed deterministically. `from_h2_conn` is cancel-safe
+                // and is polled again on the next iteration.
+                biased;
+                _ = shutdown.changed() => {
+                    conn.graceful_shutdown();
+                    shutdown_initiated = true;
+                    continue;
+                }
+                h2_stream = HttpSession::from_h2_conn(&mut conn, digest.clone()) => h2_stream,
+            }
+        };
+        match h2_stream {
+            Err(e) => {
+                // It is common for the client to just disconnect TCP without
+                // properly closing H2. So we don't log the errors here
+                debug!("H2 error when accepting new stream {e}");
+                return;
+            }
+            // None means the connection is ready to be closed
+            Ok(None) => return,
+            Ok(Some(session)) => on_session(session),
+        }
     }
 }
 
@@ -186,6 +276,27 @@ impl HttpSession {
                 .release_capacity(data.len());
         }
         Ok(data)
+    }
+
+    #[doc(hidden)]
+    pub fn poll_read_body_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
+            Ok(data) => data,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        };
+
+        if let Some(data) = data {
+            self.body_read += data.len();
+            self.request_body_reader
+                .flow_control()
+                .release_capacity(data.len())?;
+            return Poll::Ready(Some(Ok(data)));
+        }
+
+        Poll::Ready(None)
     }
 
     async fn do_drain_request_body(&mut self) -> Result<()> {
@@ -319,7 +430,7 @@ impl HttpSession {
             ));
         };
         let data_len = data.len();
-        super::write_body(writer, data, end)
+        super::write_body(writer, data, end, self.write_timeout)
             .await
             .map_err(|e| e.into_down())?;
         self.body_sent += data_len;
@@ -397,6 +508,18 @@ impl HttpSession {
                     }
                     None => end,
                 },
+                HttpTask::UpgradedBody(..) => {
+                    // Seeing an Upgraded body means that the upstream session
+                    // was H1.1 that upgraded.
+                    //
+                    // While the downstream H2 session may encapsulate the opaque body bytes,
+                    // this represents an undefined discrepancy and change between how
+                    // the upstream and downstream sessions began intepreting the response body.
+                    return Error::e_explain(
+                        ErrorType::InternalError,
+                        "upgraded body on h2 server session",
+                    );
+                }
                 HttpTask::Trailer(Some(trailers)) => {
                     self.write_trailers(*trailers)?;
                     true
@@ -442,11 +565,29 @@ impl HttpSession {
 
     /// Give up the stream abruptly.
     ///
-    /// This will send a `INTERNAL_ERROR` stream error to the client
+    /// This will send an `INTERNAL_ERROR` stream error to the client.
     pub fn shutdown(&mut self) {
+        self.shutdown_with_reason(h2::Reason::INTERNAL_ERROR);
+    }
+
+    /// Give up the stream abruptly with a custom reason.
+    ///
+    /// This will send a `RST_STREAM` frame with the given reason to the client.
+    ///
+    /// Useful reasons include:
+    /// - [`h2::Reason::HTTP_1_1_REQUIRED`] - Signal to the client that HTTP/1.1 should be used
+    ///   instead. Per RFC 7540 §9.1.2, clients should retry the request over HTTP/1.1.
+    /// - [`h2::Reason::CANCEL`] - Indicate the stream is no longer needed.
+    /// - [`h2::Reason::REFUSED_STREAM`] - Indicate the stream was refused before processing.
+    pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
         if !self.ended {
-            self.send_response.send_reset(h2::Reason::INTERNAL_ERROR);
+            self.send_response.send_reset(reason);
         }
+    }
+
+    #[doc(hidden)]
+    pub fn take_response_body_writer(&mut self) -> Option<SendStream<Bytes>> {
+        self.send_response_body.take()
     }
 
     // This is a hack for pingora-proxy to create subrequests from h2 server session
@@ -500,7 +641,7 @@ impl HttpSession {
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
     /// its internal tasks as the client waiting for the tasks goes away
-    pub fn idle(&mut self) -> Idle {
+    pub fn idle(&mut self) -> Idle<'_> {
         Idle(self)
     }
 
@@ -552,8 +693,106 @@ impl HttpSession {
 #[cfg(test)]
 mod test {
     use super::*;
+    use bytes::Bytes;
+    use h2::frame::{Frame, Settings};
     use http::{HeaderValue, Method, Request};
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
+    use tokio_stream::StreamExt;
+
+    async fn advertised_settings(options: Option<H2Options>) -> Settings {
+        let (mut client, server) = duplex(65536);
+        let handshake = tokio::spawn(async move { handshake(Box::new(server), options).await });
+
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+        let settings = match codec.next().await.unwrap().unwrap() {
+            Frame::Settings(settings) => settings,
+            frame => panic!("expected SETTINGS frame, received {frame:?}"),
+        };
+
+        let _ = handshake.await.unwrap().unwrap();
+        settings
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_uses_bounded_default_options() {
+        let settings = advertised_settings(None).await;
+
+        assert_eq!(
+            settings.max_header_list_size(),
+            Some(DEFAULT_MAX_HEADER_LIST_SIZE)
+        );
+        assert_eq!(
+            settings.max_concurrent_streams(),
+            Some(DEFAULT_MAX_CONCURRENT_STREAMS)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_uses_caller_options() {
+        let mut options = H2Options::default();
+        options.max_header_list_size(1234);
+        options.max_concurrent_streams(42);
+
+        let settings = advertised_settings(Some(options)).await;
+
+        assert_eq!(settings.max_header_list_size(), Some(1234));
+        assert_eq!(settings.max_concurrent_streams(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_server_handshake_rejects_oversized_header_list_by_default() {
+        let (client, server) = duplex(256 * 1024);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            for _ in 0..2000 {
+                request
+                    .headers_mut()
+                    .append("a", HeaderValue::from_static(""));
+            }
+
+            let (response, _) = h2
+                .ready()
+                .await
+                .unwrap()
+                .send_request(request, true)
+                .unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            );
+        });
+
+        let server = tokio::spawn(async move {
+            let mut connection = handshake(Box::new(server), None).await.unwrap();
+            let digest = Arc::new(Digest::default());
+            let accepted = timeout(
+                Duration::from_secs(1),
+                HttpSession::from_h2_conn(&mut connection, digest),
+            )
+            .await;
+            assert!(
+                !matches!(accepted, Ok(Ok(Some(_)))),
+                "oversized request reached the application"
+            );
+        });
+
+        client.await.unwrap();
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_server_handshake_accept_request() {
@@ -755,6 +994,17 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+
+            // Drain the response to EOS before dropping the stream. Newer h2
+            // sends RST_STREAM(CANCEL) when a still-open recv stream is dropped,
+            // which would race with the server reading the request EOS and turn
+            // the server-side read into a stream-reset error.
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("response body error");
+                body.flow_control()
+                    .release_capacity(chunk.len())
+                    .expect("release capacity");
+            }
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
@@ -785,8 +1035,12 @@ mod test {
                 http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
-                // 3. Waiting for the client to close stream.
+                // 3. Read the empty DATA frame carrying the request EOS.
                 http.read_body_or_idle(http.is_body_done()).await.unwrap();
+
+                // 4. Finish the response so the client can drain it to EOS and
+                //    close the stream cleanly instead of cancelling it.
+                http.finish().unwrap();
             }));
         }
 

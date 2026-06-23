@@ -10,7 +10,7 @@ Pingora is battle tested as it has been serving more than 40 million Internet re
 ## Feature highlights
 * Async Rust: fast and reliable
 * HTTP 1/2 end to end proxy
-* TLS over OpenSSL, BoringSSL or rustls(experimental).
+* TLS over OpenSSL, BoringSSL, s2n-tls, or rustls(experimental).
 * gRPC and websocket proxying
 * Graceful reload
 * Customizable load balancing and failover strategies
@@ -40,6 +40,7 @@ API docs are also available for all the crates.
 * Pingora-limits: efficient counting algorithms
 * Pingora-load-balancing: load balancing algorithm extensions for pingora-proxy
 * Pingora-memory-cache: Async in-memory caching with cache lock to prevent cache stampede
+* Pingora-s2n: SSL extensions and APIs related to s2n-tls
 * Pingora-timeout: A more efficient async timer system
 * TinyUfo: The caching algorithm behind pingora-memory-cache
 
@@ -58,13 +59,11 @@ Both x86_64 and aarch64 architectures will be supported.
 
 ## Rust version
 
-Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old.
+Pingora keeps a rolling MSRV (minimum supported Rust version) policy of 6 months. This means we will accept PRs that upgrade the MSRV as long as the new Rust version used is at least 6 months old. However, we generally will not bump the highest MSRV across the workspace without a sufficiently compelling reason.
 
-Our current MSRV is effectively 1.82.
+Our current MSRV is 1.84.
 
-Previously Pingora advertised an MSRV of 1.72. Older Rust versions may still be able to compile via `cargo update` pinning dependencies such as `backtrace@0.3.74`. The advertised MSRV in config files will be officially bumped to 1.82 in an upcoming release.
-
-Building with the optional feature `boringssl` with Boring >= 4.14 requires Rust 1.80.
+Currently not all crates enforce `rust-version` as it is possible to use some crates on lower versions.
 
 ## Build Requirements
 

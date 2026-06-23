@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,13 +30,28 @@ fn get_shard(key: u128, n_shards: usize) -> usize {
     (key % n_shards as u128) as usize
 }
 
-impl<V, const N: usize> ConcurrentHashTable<V, N>
-where
-    [RwLock<HashMap<u128, V>>; N]: Default,
-{
+impl<V, const N: usize> ConcurrentHashTable<V, N> {
     pub fn new() -> Self {
+        // Build the per-shard array element-by-element via `arrayvec`. The
+        // stdlib only auto-derives `Default` for `[T; N]` up to N=32, so the
+        // previous `Default::default()`-based init silently capped this type
+        // at 32 shards. Mirrors the same `arrayvec::ArrayVec` pattern that
+        // `pingora_lru::Lru<T, N>::with_capacity_and_watermark` uses to lift
+        // the same constraint, so the two sharded structures now support
+        // identical shard counts (callers can pick any `N`).
+        let mut tables = arrayvec::ArrayVec::<_, N>::new();
+        for _ in 0..N {
+            tables.push(RwLock::new(HashMap::new()));
+        }
         ConcurrentHashTable {
-            tables: Default::default(),
+            // `into_inner` is infallible here because the loop above pushed
+            // exactly N elements. `.ok().expect(...)` avoids requiring the
+            // element type to be `Debug` (which `into_inner`'s `Err` payload
+            // would otherwise demand for `.expect`).
+            tables: tables
+                .into_inner()
+                .ok()
+                .expect("ArrayVec pushed N times, into_inner is infallible"),
         }
     }
     pub fn get(&self, key: u128) -> &RwLock<HashMap<u128, V>> {
@@ -49,11 +64,11 @@ where
     }
 
     #[allow(dead_code)]
-    pub fn read(&self, key: u128) -> RwLockReadGuard<HashMap<u128, V>> {
+    pub fn read(&self, key: u128) -> RwLockReadGuard<'_, HashMap<u128, V>> {
         self.get(key).read()
     }
 
-    pub fn write(&self, key: u128) -> RwLockWriteGuard<HashMap<u128, V>> {
+    pub fn write(&self, key: u128) -> RwLockWriteGuard<'_, HashMap<u128, V>> {
         self.get(key).write()
     }
 
@@ -73,10 +88,7 @@ where
     // TODO: work out the lifetimes to provide get/set directly
 }
 
-impl<V, const N: usize> Default for ConcurrentHashTable<V, N>
-where
-    [RwLock<HashMap<u128, V>>; N]: Default,
-{
+impl<V, const N: usize> Default for ConcurrentHashTable<V, N> {
     fn default() -> Self {
         Self::new()
     }
@@ -84,46 +96,45 @@ where
 
 #[doc(hidden)] // not need in public API
 pub struct LruShard<V>(RwLock<LruCache<u128, V>>);
-impl<V> Default for LruShard<V> {
-    fn default() -> Self {
-        // help satisfy default construction of arrays
-        LruShard(RwLock::new(LruCache::unbounded()))
-    }
-}
 
 /// Sharded concurrent data structure for LruCache
 pub struct ConcurrentLruCache<V, const N: usize> {
     lrus: [LruShard<V>; N],
 }
 
-impl<V, const N: usize> ConcurrentLruCache<V, N>
-where
-    [LruShard<V>; N]: Default,
-{
+impl<V, const N: usize> ConcurrentLruCache<V, N> {
     pub fn new(shard_capacity: usize) -> Self {
         use std::num::NonZeroUsize;
         // safe, 1 != 0
-        const ONE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
-        let mut cache = ConcurrentLruCache {
-            lrus: Default::default(),
-        };
-        for lru in &mut cache.lrus {
-            lru.0
-                .write()
-                .resize(shard_capacity.try_into().unwrap_or(ONE));
+        const ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+        // Same `arrayvec` element-by-element init as `ConcurrentHashTable::new`
+        // and `pingora_lru::Lru` — works for any `N`, not just `N <= 32`.
+        let cap = shard_capacity.try_into().unwrap_or(ONE);
+        let mut lrus = arrayvec::ArrayVec::<_, N>::new();
+        for _ in 0..N {
+            lrus.push(LruShard(RwLock::new(LruCache::new(cap))));
         }
-        cache
+        ConcurrentLruCache {
+            // Same as `ConcurrentHashTable::new` — `into_inner` cannot fail
+            // because we pushed exactly N elements; `.ok().expect(...)` keeps
+            // the message readable without forcing the element type to be
+            // `Debug`.
+            lrus: lrus
+                .into_inner()
+                .ok()
+                .expect("ArrayVec pushed N times, into_inner is infallible"),
+        }
     }
     pub fn get(&self, key: u128) -> &RwLock<LruCache<u128, V>> {
         &self.lrus[get_shard(key, N)].0
     }
 
     #[allow(dead_code)]
-    pub fn read(&self, key: u128) -> RwLockReadGuard<LruCache<u128, V>> {
+    pub fn read(&self, key: u128) -> RwLockReadGuard<'_, LruCache<u128, V>> {
         self.get(key).read()
     }
 
-    pub fn write(&self, key: u128) -> RwLockWriteGuard<LruCache<u128, V>> {
+    pub fn write(&self, key: u128) -> RwLockWriteGuard<'_, LruCache<u128, V>> {
         self.get(key).write()
     }
 

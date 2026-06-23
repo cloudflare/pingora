@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::rustls::TlsStream;
+use crate::protocols::tls::TlsRef;
 use crate::protocols::IO;
 use crate::{listeners::tls::Acceptor, protocols::Shutdown};
 use async_trait::async_trait;
@@ -68,7 +69,7 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
 pub async fn handshake_with_callback<S: IO>(
     acceptor: &Acceptor,
     io: S,
-    _callbacks: &TlsAcceptCallbacks,
+    callbacks: &TlsAcceptCallbacks,
 ) -> Result<TlsStream<S>> {
     let mut tls_stream = prepare_tls_stream(acceptor, io).await?;
     let done = Pin::new(&mut tls_stream).start_accept().await?;
@@ -81,7 +82,14 @@ pub async fn handshake_with_callback<S: IO>(
             .await
             .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     }
-
+    {
+        let tls_ref = TlsRef;
+        if let Some(extension) = callbacks.handshake_complete_callback(&tls_ref).await {
+            if let Some(digest_mut) = tls_stream.ssl_digest_mut() {
+                digest_mut.extension.set(extension);
+            }
+        }
+    }
     Ok(tls_stream)
 }
 

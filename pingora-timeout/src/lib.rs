@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -109,10 +109,14 @@ where
     F: ToTimeout,
 {
     pub(crate) fn new_with_delay(value: T, d: Duration) -> Timeout<T, F> {
+        Self::new_with_callback(value, F::create(d))
+    }
+
+    pub(crate) fn new_with_callback(value: T, callback: F) -> Timeout<T, F> {
         Timeout {
             value,
             delay: None,
-            callback: F::create(d),
+            callback,
         }
     }
 }

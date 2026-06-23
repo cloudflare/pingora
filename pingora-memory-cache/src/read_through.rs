@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -200,10 +200,9 @@ where
             }
         };
 
-        if my_read.is_some() {
+        if let Some(my_lock) = my_read {
             /* another task will do the lookup */
 
-            let my_lock = my_read.unwrap();
             /* if available_permits > 0, writer is done */
             if my_lock.lock.available_permits() == 0 {
                 /* block here to wait for writer to finish lookup */
@@ -268,10 +267,10 @@ where
                     (Err(err), cache_state)
                 }
             };
-            if my_write.is_some() {
+            if let Some(my_write) = my_write {
                 /* add permit so that reader can start. Any number of permits will do,
                  * since readers will return permits right away. */
-                my_write.unwrap().lock.add_permits(10);
+                my_write.lock.add_permits(10);
 
                 {
                     // remove the lock from locker

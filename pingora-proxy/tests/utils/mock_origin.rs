@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,6 +30,11 @@ fn init() -> bool {
         "{}/tests/utils/conf/keys/server_boringssl_openssl.crt",
         env!("CARGO_MANIFEST_DIR")
     );
+    #[cfg(feature = "s2n")]
+    let src_cert_path = format!(
+        "{}/tests/utils/conf/keys/server_s2n.crt",
+        env!("CARGO_MANIFEST_DIR")
+    );
 
     #[cfg(feature = "any_tls")]
     {
@@ -54,7 +59,22 @@ fn init() -> bool {
             .output()
             .unwrap();
     });
-    // wait until the server is up
-    thread::sleep(time::Duration::from_secs(2));
-    true
+    // Wait until openresty is accepting connections, then give it a moment
+    // to finish worker initialization.
+    let deadline = time::Instant::now() + time::Duration::from_secs(10);
+    while time::Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:8000".parse().unwrap(),
+            time::Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            // Port is listening; allow a brief window for workers to finish
+            // initializing before tests start sending real requests.
+            thread::sleep(time::Duration::from_millis(500));
+            return true;
+        }
+        thread::sleep(time::Duration::from_millis(50));
+    }
+    panic!("mock origin (openresty) failed to start within 10s");
 }

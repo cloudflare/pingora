@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,10 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::HandshakeCompleteHook;
+#[cfg(feature = "s2n")]
+use crate::protocols::tls::PskType;
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -27,6 +31,9 @@ use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
 };
+#[cfg(feature = "s2n")]
+use pingora_s2n::S2NPolicy;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -41,6 +48,23 @@ use std::time::Duration;
 use tokio::net::TcpSocket;
 
 pub use crate::protocols::tls::ALPN;
+
+/// A hook function that may generate user data for [`crate::protocols::raw_connect::ProxyDigest`].
+///
+/// Takes the request and response headers from the proxy connection establishment, and may produce
+/// arbitrary data to be stored in ProxyDigest's user_data field.
+///
+/// This can be useful when, for example, you want to store some parameter(s) from the request or
+/// response headers from when the proxy connection was first established.
+pub type ProxyDigestUserDataHook = Arc<
+    dyn Fn(
+            &http::request::Parts,         // request headers
+            &pingora_http::ResponseHeader, // response headers
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
@@ -104,6 +128,14 @@ pub trait Peer: Display + Clone {
             None => false,
         }
     }
+    /// Whether the system trust store should be loaded and used when verifying certificates
+    #[cfg(feature = "s2n")]
+    fn use_system_certs(&self) -> bool {
+        match self.get_peer_options() {
+            Some(opt) => opt.use_system_certs,
+            None => false,
+        }
+    }
     /// The alternative common name to use to verify the server cert.
     ///
     /// If the server cert doesn't match the SNI, this name will be used to
@@ -161,6 +193,40 @@ pub trait Peer: Display + Clone {
         None
     }
 
+    /// Get the PSK (pre-shared key) to use to validate the connection
+    ///
+    /// If not set, PSK validation will not be used
+    #[cfg(feature = "s2n")]
+    fn get_psk(&self) -> Option<&Arc<PskType>> {
+        match self.get_peer_options() {
+            Some(opt) => opt.psk.as_ref(),
+            None => None,
+        }
+    }
+
+    /// Get the Security Policy to use for this connection (S2N only)
+    ///
+    /// If not set, the default policy "default_tls13" will be used
+    /// https://aws.github.io/s2n-tls/usage-guide/ch06-security-policies.html
+    #[cfg(feature = "s2n")]
+    fn get_s2n_security_policy(&self) -> Option<&S2NPolicy> {
+        match self.get_peer_options() {
+            Some(opt) => opt.s2n_security_policy.as_ref(),
+            None => None,
+        }
+    }
+
+    /// S2N-TLS will delay a response up to the max blinding delay (default 30)
+    /// seconds whenever an error triggered by a peer occurs to mitigate against
+    /// timing side channels.
+    #[cfg(feature = "s2n")]
+    fn get_max_blinding_delay(&self) -> Option<u32> {
+        match self.get_peer_options() {
+            Some(opt) => opt.max_blinding_delay,
+            None => None,
+        }
+    }
+
     /// The TCP keepalive setting that should be applied to this connection
     fn tcp_keepalive(&self) -> Option<&TcpKeepalive> {
         self.get_peer_options()
@@ -213,6 +279,29 @@ pub trait Peer: Display + Clone {
     ) -> Option<&Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>> {
         self.get_peer_options()?
             .upstream_tcp_sock_tweak_hook
+            .as_ref()
+    }
+
+    /// Returns a [`ProxyDigestUserDataHook`] that may generate user data for
+    /// [`crate::protocols::raw_connect::ProxyDigest`] when establishing a new proxy connection.
+    fn proxy_digest_user_data_hook(&self) -> Option<&ProxyDigestUserDataHook> {
+        self.get_peer_options()?
+            .proxy_digest_user_data_hook
+            .as_ref()
+    }
+
+    /// Returns a hook that should be run on TLS handshake completion.
+    ///
+    /// Any value returned from the returned hook (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_handshake_complete_hook(&self) -> Option<&HandshakeCompleteHook> {
+        self.get_peer_options()?
+            .upstream_tls_handshake_complete_hook
             .as_ref()
     }
 }
@@ -312,6 +401,86 @@ impl Scheme {
     }
 }
 
+/// Policy for forwarding request headers to HTTP upstreams.
+///
+/// This policy applies to automatically forwarded downstream request headers. Application code
+/// may deliberately alter the resulting request in its upstream request filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpUpstreamRequestPolicy {
+    /// Strip standard hop-by-hop request fields inherited from the downstream request.
+    ///
+    /// Standard hop-by-hop framing fields are removed. If a non-empty request body is unframed
+    /// after application upstream request filtering, Pingora sends it chunked to an HTTP/1
+    /// upstream.
+    pub strip_hop_by_hop: bool,
+    /// Strip extension fields identified by tokens in the downstream `Connection` header field.
+    ///
+    /// Requests nominating `Host`, forwarding-origin fields, or pseudo-header-shaped fields are
+    /// rejected rather than forwarded with protected metadata removed when this behavior is
+    /// enabled.
+    pub strip_connection_nominated: bool,
+    /// Controls forwarding of HTTP/1 protocol upgrade request fields.
+    pub h1_upgrade: H1UpgradePolicy,
+}
+
+impl HttpUpstreamRequestPolicy {
+    /// Use standards-oriented forwarding with normalized WebSocket upgrade support.
+    pub fn standard() -> Self {
+        Self::default()
+    }
+
+    /// Preserve the previous HTTP/1 upstream request-header passthrough behavior.
+    ///
+    /// This mode is RFC-non-compliant and is provided only for legacy compatibility. Use it at
+    /// your own risk: the application's upstream request filter is solely responsible for
+    /// ensuring valid hop-by-hop header handling.
+    pub fn preserve() -> Self {
+        Self {
+            strip_hop_by_hop: false,
+            strip_connection_nominated: false,
+            h1_upgrade: H1UpgradePolicy::Preserve,
+        }
+    }
+
+    /// Strip hop-by-hop fields and do not forward any HTTP/1 upgrade handshake.
+    pub fn deny_upgrades() -> Self {
+        Self {
+            h1_upgrade: H1UpgradePolicy::Deny,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for HttpUpstreamRequestPolicy {
+    fn default() -> Self {
+        Self {
+            strip_hop_by_hop: true,
+            strip_connection_nominated: true,
+            h1_upgrade: H1UpgradePolicy::WebSocketOnly,
+        }
+    }
+}
+
+/// Policy for forwarding HTTP/1 protocol upgrade request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H1UpgradePolicy {
+    /// Forward normalized upgrade fields only for a valid WebSocket upgrade request.
+    WebSocketOnly,
+    /// Preserve complete request metadata for HTTP/1 requests containing an upgrade field.
+    ///
+    /// This is RFC-non-compliant and is provided only for legacy compatibility. Use it at your
+    /// own risk: the application's upstream request filter is solely responsible for ensuring
+    /// valid hop-by-hop metadata for upgraded requests.
+    ///
+    /// When this is selected, automatic hop-by-hop normalization is skipped for upgrade requests
+    /// because protocol-specific handshakes can depend on any connection-nominated field.
+    /// Protected nomination validation applies only when
+    /// [`HttpUpstreamRequestPolicy::strip_connection_nominated`] is enabled.
+    Preserve,
+    /// Do not forward HTTP/1 upgrade request fields.
+    Deny,
+}
+
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
@@ -327,6 +496,8 @@ pub struct PeerOptions {
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
     pub verify_hostname: bool,
+    #[cfg(feature = "s2n")]
+    pub use_system_certs: bool,
     /* accept the cert if it's CN matches the SNI or this name */
     pub alternative_cn: Option<String>,
     pub alpn: ALPN,
@@ -335,23 +506,53 @@ pub struct PeerOptions {
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
     pub h2_ping_interval: Option<Duration>,
-    // how many concurrent h2 stream are allowed in the same connection
+    #[cfg(feature = "s2n")]
+    pub psk: Option<Arc<PskType>>,
+    #[cfg(feature = "s2n")]
+    pub s2n_security_policy: Option<S2NPolicy>,
+    #[cfg(feature = "s2n")]
+    pub max_blinding_delay: Option<u32>,
+    /// How many concurrent h2 streams are allowed in the same connection.
     pub max_h2_streams: usize,
+    /// Initial per-stream H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_stream_window_size: Option<u32>,
+    /// Initial connection-level H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_connection_window_size: Option<u32>,
+    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    ///
+    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    /// It exists primarily for compatibility with legacy servers that send malformed headers.
+    pub allow_h1_response_invalid_content_length: bool,
+    /// Controls automatically forwarded request headers sent to HTTP upstreams.
+    pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
-    // The list of curve the tls connection should advertise
-    // if `None`, the default curves will be used
-    pub curves: Option<&'static str>,
-    // see ssl_use_second_key_share
+    /// The list of curves the tls connection should advertise
+    /// if `None`, the default curves will be used
+    pub curves: Option<Cow<'static, str>>,
+    /// see ssl_use_second_key_share
     pub second_keyshare: bool,
-    // whether to enable TCP fast open
+    /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
-    // use Arc because Clone is required but not allowed in trait object
+    /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
-    // A custom L4 connector to use to establish new L4 connections
+    /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
+    #[derivative(Debug = "ignore")]
+    pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
+    /// Hook that allows returning an optional `SslDigestExtension`.
+    /// Any returned value will be saved into the `SslDigest`.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
 }
 
 impl PeerOptions {
@@ -366,6 +567,8 @@ impl PeerOptions {
             write_timeout: None,
             verify_cert: true,
             verify_hostname: true,
+            #[cfg(feature = "s2n")]
+            use_system_certs: true,
             alternative_cn: None,
             alpn: ALPN::H1,
             ca: None,
@@ -373,7 +576,17 @@ impl PeerOptions {
             tcp_recv_buf: None,
             dscp: None,
             h2_ping_interval: None,
+            #[cfg(feature = "s2n")]
+            psk: None,
+            #[cfg(feature = "s2n")]
+            s2n_security_policy: None,
+            #[cfg(feature = "s2n")]
+            max_blinding_delay: None,
             max_h2_streams: 1,
+            h2_stream_window_size: None,
+            h2_connection_window_size: None,
+            allow_h1_response_invalid_content_length: false,
+            http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -381,6 +594,9 @@ impl PeerOptions {
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
+            proxy_digest_user_data_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_handshake_complete_hook: None,
         }
     }
 
@@ -407,6 +623,10 @@ impl Display for PeerOptions {
         if self.verify_hostname {
             write!(f, "verify_hostname: true,")?;
         }
+        #[cfg(feature = "s2n")]
+        if self.use_system_certs {
+            write!(f, "use_system_certs: true,")?;
+        }
         if let Some(cn) = &self.alternative_cn {
             write!(f, "alt_cn: {},", cn)?;
         }
@@ -418,6 +638,20 @@ impl Display for PeerOptions {
                     "CA: {}, expire: {},",
                     get_organization_unit(ca).unwrap_or_default(),
                     ca.not_after()
+                )?;
+            }
+        }
+        #[cfg(feature = "s2n")]
+        if let Some(policy) = &self.s2n_security_policy {
+            write!(f, "s2n_security_policy: {:?}, ", policy)?;
+        }
+        #[cfg(feature = "s2n")]
+        if let Some(psk_config) = &self.psk {
+            for psk in &psk_config.keys {
+                write!(
+                    f,
+                    "psk_identity: {}",
+                    String::from_utf8_lossy(psk.identity.as_slice())
                 )?;
             }
         }
@@ -508,6 +742,17 @@ impl HttpPeer {
         }
     }
 
+    /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    pub fn new_mtls<A: ToInetSocketAddrs>(
+        address: A,
+        sni: String,
+        client_cert_key: Arc<CertKey>,
+    ) -> Self {
+        let mut peer = Self::new(address, true, sni);
+        peer.client_cert_key = Some(client_cert_key);
+        peer
+    }
+
     fn peer_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self.hash(&mut hasher);
@@ -527,7 +772,17 @@ impl Hash for HttpPeer {
         self.verify_cert().hash(state);
         self.verify_hostname().hash(state);
         self.alternative_cn().hash(state);
+        #[cfg(feature = "s2n")]
+        self.get_psk().hash(state);
         self.group_key.hash(state);
+        // max h2 stream settings
+        self.options.max_h2_streams.hash(state);
+        // h2_stream_window_size and h2_connection_window_size are intentionally excluded
+        // from the reuse hash for now. These are per-connection settings applied at handshake
+        // time and may be revisited alongside other h2 settings that could be dynamically
+        // adjusted over the lifetime of a connection.
+        self.options.curves.hash(state);
+        self.options.second_keyshare.hash(state);
     }
 }
 
@@ -624,5 +879,26 @@ impl Display for Proxy {
             self.host,
             self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_http_upstream_request_policy_is_standards_oriented() {
+        let policy = PeerOptions::new().http_upstream_request_policy;
+        assert!(policy.strip_hop_by_hop);
+        assert!(policy.strip_connection_nominated);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
+    }
+
+    #[test]
+    fn preserve_http_upstream_request_policy_is_a_legacy_preset() {
+        let policy = HttpUpstreamRequestPolicy::preserve();
+        assert!(!policy.strip_hop_by_hop);
+        assert!(!policy.strip_connection_nominated);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
     }
 }

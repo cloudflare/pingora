@@ -1,6 +1,6 @@
 [package]
 name = "pingora-pool"
-version = "0.6.0"
+version = "0.8.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -18,12 +18,20 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { workspace = true, features = ["sync", "io-util"] }
-thread_local = "1.0"
 lru = { workspace = true }
 log = { workspace = true }
 parking_lot = "0.12"
+dashmap = "5"
 crossbeam-queue = "0.3"
-pingora-timeout = { version = "0.6.0", path = "../pingora-timeout" }
+futures = { workspace = true }
+pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "connection_pool"
+harness = false

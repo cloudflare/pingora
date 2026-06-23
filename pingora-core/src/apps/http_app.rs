@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -99,7 +99,7 @@ where
         }
         let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
+            Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings)),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None
@@ -207,7 +207,7 @@ where
         }
         let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
+            Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings)),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None

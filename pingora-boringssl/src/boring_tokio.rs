@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -263,9 +263,7 @@ where
                 return Poll::Pending;
             }
             Err(e) => {
-                return Poll::Ready(Err(e
-                    .into_io_error()
-                    .unwrap_or_else(|e| io::Error::new(io::ErrorKind::Other, e))));
+                return Poll::Ready(Err(e.into_io_error().unwrap_or_else(io::Error::other)));
             }
         }
 

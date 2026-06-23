@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,6 +85,7 @@ fn titled_header_name(header_name: &HeaderName) -> Bytes {
 
 pub(crate) fn titled_header_name_str(header_name: &HeaderName) -> Option<&'static str> {
     Some(match *header_name {
+        header::ACCEPT_RANGES => "Accept-Ranges",
         header::AGE => "Age",
         header::CACHE_CONTROL => "Cache-Control",
         header::CONNECTION => "Connection",

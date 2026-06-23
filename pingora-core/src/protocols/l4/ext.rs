@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -154,10 +154,7 @@ fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     get_opt(sock, opt, val, &mut payload, &mut size)?;
 
     if size != expected_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "get_opt size mismatch",
-        ));
+        return Err(std::io::Error::other("get_opt size mismatch"));
     }
     // Assume getsockopt() will set the value properly
     let payload = unsafe { payload.assume_init() };
@@ -305,6 +302,23 @@ pub fn set_recv_buf(_sock: RawSocket, _: usize) -> Result<()> {
     Ok(())
 }
 
+/// Set the TCP send buffer size. See SO_SNDBUF.
+#[cfg(target_os = "linux")]
+pub fn set_snd_buf(fd: RawFd, val: usize) -> Result<()> {
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, val as c_int)
+        .or_err(ConnectError, "failed to set SO_SNDBUF")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn set_snd_buf(_fd: RawFd, _: usize) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn set_snd_buf(_sock: RawSocket, _: usize) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as usize)
@@ -317,6 +331,21 @@ pub fn get_recv_buf(_fd: RawFd) -> io::Result<usize> {
 
 #[cfg(windows)]
 pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
+    get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as usize)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn get_snd_buf(_fd: RawFd) -> io::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(windows)]
+pub fn get_snd_buf(_sock: RawSocket) -> io::Result<usize> {
     Ok(0)
 }
 

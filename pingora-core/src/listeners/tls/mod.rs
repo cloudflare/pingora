@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,3 +23,9 @@ mod rustls;
 
 #[cfg(feature = "rustls")]
 pub use rustls::*;
+
+#[cfg(feature = "s2n")]
+mod s2n;
+
+#[cfg(feature = "s2n")]
+pub use s2n::*;

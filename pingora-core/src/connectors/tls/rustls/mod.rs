@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,14 @@ use pingora_error::{
 };
 use pingora_rustls::{
     load_ca_file_into_store, load_certs_and_key_files, load_platform_certs_incl_env_into_store,
-    version, CertificateDer, ClientConfig as RusTlsClientConfig, PrivateKeyDer, RootCertStore,
-    TlsConnector as RusTlsConnector,
+    version, CertificateDer, CertificateError, ClientConfig as RusTlsClientConfig,
+    DigitallySignedStruct, KeyLogFile, PrivateKeyDer, RootCertStore, RusTlsError, ServerName,
+    SignatureScheme, TlsConnector as RusTlsConnector, UnixTime, WebPkiServerVerifier,
+};
+
+// Uses custom certificate verification from rustls's 'danger' module.
+use pingora_rustls::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier as RusTlsServerCertVerifier,
 };
 
 use crate::protocols::tls::{client::handshake, TlsStream};
@@ -55,6 +61,9 @@ impl TlsConnector {
     where
         Self: Sized,
     {
+        // rustls 0.23+ requires an explicit CryptoProvider.
+        pingora_rustls::install_default_crypto_provider();
+
         // NOTE: Rustls only supports TLS 1.2 & 1.3
 
         // TODO: currently using Rustls defaults
@@ -75,7 +84,6 @@ impl TlsConnector {
                 if let Some((cert, key)) = conf.cert_key_file.as_ref() {
                     certs_key = load_certs_and_key_files(cert, key)?;
                 }
-                // TODO: support SSLKEYLOGFILE
             } else {
                 load_platform_certs_incl_env_into_store(&mut ca_certs)?;
             }
@@ -88,7 +96,7 @@ impl TlsConnector {
             RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
                 .with_root_certificates(ca_certs.clone());
 
-        let config = match certs_key {
+        let mut config = match certs_key {
             Some((certs, key)) => {
                 match builder.with_client_auth_cert(certs.clone(), key.clone_key()) {
                     Ok(config) => config,
@@ -101,6 +109,13 @@ impl TlsConnector {
             }
             None => builder.with_no_client_auth(),
         };
+
+        // Enable SSLKEYLOGFILE support for debugging TLS traffic
+        if let Some(options) = options.as_ref() {
+            if options.debug_ssl_keylog {
+                config.key_log = Arc::new(KeyLogFile::new());
+            }
+        }
 
         Ok(Connector {
             ctx: Arc::new(TlsConnector {
@@ -123,9 +138,28 @@ where
 {
     let config = &tls_ctx.config;
 
-    // TODO: setup CA/verify cert store from peer
-    // peer.get_ca() returns None by default. It must be replaced by the
-    // implementation of `peer`
+    // Build per-peer CA store if provided
+    let peer_ca_store: Option<Arc<RootCertStore>> = if let Some(ca_list) = peer.get_ca() {
+        if ca_list.is_empty() {
+            return Error::e_explain(InvalidCert, "per-peer CA list is empty");
+        }
+        let mut ca_store = RootCertStore::empty();
+        for ca_cert in &**ca_list {
+            let cert_der = CertificateDer::from(ca_cert);
+            ca_store.add(cert_der).or_err(
+                InvalidCert,
+                "Failed to add per-peer CA certificate to root store",
+            )?;
+        }
+
+        Some(Arc::new(ca_store))
+    } else {
+        None
+    };
+
+    // Determine effective CA store for this connection
+    let effective_ca_store = peer_ca_store.as_ref().unwrap_or(&tls_ctx.ca_certs);
+
     let key_pair = peer.get_client_cert_key();
     let mut updated_config_opt: Option<RusTlsClientConfig> = match key_pair {
         None => None,
@@ -152,16 +186,29 @@ where
                 &version::TLS12,
                 &version::TLS13,
             ])
-            .with_root_certificates(Arc::clone(&tls_ctx.ca_certs));
+            .with_root_certificates(Arc::clone(effective_ca_store));
             debug!("added root ca certificates");
 
-            let updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
+            let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
                 InvalidCert,
                 "Failed to use peer cert/key to update Rustls config",
             )?;
+            // Preserve keylog setting from original config
+            updated_config.key_log = Arc::clone(&config.key_log);
             Some(updated_config)
         }
     };
+
+    // Ensure config is updated if per-peer CA is set but no client cert
+    if peer_ca_store.is_some() && updated_config_opt.is_none() {
+        let mut updated_config =
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_root_certificates(Arc::clone(effective_ca_store))
+                .with_no_client_auth();
+
+        updated_config.key_log = Arc::clone(&config.key_log);
+        updated_config_opt = Some(updated_config);
+    }
 
     if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
         let alpn_protocols = alpn.to_wire_protocols();
@@ -174,29 +221,63 @@ where
         }
     }
 
+    let mut domain = peer.sni().to_string();
+
+    if let Some(updated_config) = updated_config_opt.as_mut() {
+        let verification_mode = if peer.sni().is_empty() {
+            updated_config.enable_sni = false;
+            /* NOTE: technically we can still verify who signs the cert but turn it off to be
+            consistent with nginx's behavior */
+            Some(VerificationMode::SkipAll) // disable verification if sni does not exist
+        } else if !peer.verify_cert() {
+            Some(VerificationMode::SkipAll)
+        } else if !peer.verify_hostname() {
+            Some(VerificationMode::SkipHostname)
+        } else {
+            // if sni had underscores in leftmost label replace and add
+            if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
+                domain = sni_s;
+            }
+            None
+            // to use the custom verifier for the full verify:
+            // Some(VerificationMode::Full)
+        };
+
+        // Builds the custom_verifier when verification_mode is set.
+        if let Some(mode) = verification_mode {
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
+                .build()
+                .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
+
+            let custom_verifier = Arc::new(CustomServerCertVerifier::new(delegate, mode));
+
+            updated_config
+                .dangerous()
+                .set_certificate_verifier(custom_verifier);
+        }
+    }
+
     // TODO: curve setup from peer
     // - second key share from peer, currently only used in boringssl with PQ features
+
+    // Patch config for dangerous verifier if needed, but only in test builds.
+    #[cfg(test)]
+    if !peer.verify_cert() || !peer.verify_hostname() {
+        use crate::connectors::http::rustls_no_verify::apply_no_verify;
+        if let Some(cfg) = updated_config_opt.as_mut() {
+            apply_no_verify(cfg);
+        } else {
+            let mut tmp = RusTlsClientConfig::clone(config);
+            apply_no_verify(&mut tmp);
+            updated_config_opt = Some(tmp);
+        }
+    }
 
     let tls_conn = if let Some(cfg) = updated_config_opt {
         RusTlsConnector::from(Arc::new(cfg))
     } else {
         RusTlsConnector::from(Arc::clone(config))
     };
-
-    // TODO: for consistent behavior between TLS providers some additions are required
-    // - allowing to disable verification
-    // - the validation/replace logic would need adjustments to match the boringssl/openssl behavior
-    //   implementing a custom certificate_verifier could be used to achieve matching behavior
-    //let d_conf = config.dangerous();
-    //d_conf.set_certificate_verifier(...);
-
-    let mut domain = peer.sni().to_string();
-    if peer.verify_cert() && peer.verify_hostname() {
-        // TODO: streamline logic with replacing first underscore within TLS implementations
-        if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
-            domain = sni_s;
-        }
-    }
 
     let connect_future = handshake(&tls_conn, &domain, stream);
 
@@ -209,5 +290,97 @@ where
             ),
         },
         None => connect_future.await,
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum VerificationMode {
+    SkipHostname,
+    SkipAll,
+    Full,
+    // Note: "Full" Included for completeness, making this verifier self-contained
+    // and explicit about all possible verification modes, not just exceptions.
+}
+
+#[derive(Debug)]
+pub struct CustomServerCertVerifier {
+    delegate: Arc<WebPkiServerVerifier>,
+    verification_mode: VerificationMode,
+}
+
+impl CustomServerCertVerifier {
+    pub fn new(delegate: Arc<WebPkiServerVerifier>, verification_mode: VerificationMode) -> Self {
+        Self {
+            delegate,
+            verification_mode,
+        }
+    }
+}
+
+// CustomServerCertVerifier delegates TLS signature verification and allows 3 VerificationMode:
+// Full: delegates all verification to the original WebPkiServerVerifier
+// SkipHostname: same as "Full" but ignores "NotValidForName" certificate errors
+// SkipAll: all certificate verification checks are skipped.
+impl RusTlsServerCertVerifier for CustomServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RusTlsError> {
+        match self.verification_mode {
+            VerificationMode::Full => self.delegate.verify_server_cert(
+                _end_entity,
+                _intermediates,
+                _server_name,
+                _ocsp,
+                _now,
+            ),
+            VerificationMode::SkipHostname => {
+                match self.delegate.verify_server_cert(
+                    _end_entity,
+                    _intermediates,
+                    _server_name,
+                    _ocsp,
+                    _now,
+                ) {
+                    Ok(scv) => Ok(scv),
+                    Err(RusTlsError::InvalidCertificate(cert_error)) => {
+                        if let CertificateError::NotValidForNameContext { .. } = cert_error {
+                            Ok(ServerCertVerified::assertion())
+                        } else {
+                            Err(RusTlsError::InvalidCertificate(cert_error))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            VerificationMode::SkipAll => Ok(ServerCertVerified::assertion()),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RusTlsError> {
+        self.delegate.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RusTlsError> {
+        self.delegate.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.delegate.supported_verify_schemes()
     }
 }

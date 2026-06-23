@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,9 +37,34 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tls::TlsConnector;
 use tokio::sync::Mutex;
+
+#[derive(Clone, Debug)]
+pub(crate) struct IdleConnection {
+    connection: ConnectionMeta,
+    idle_since: Instant,
+}
+
+impl IdleConnection {
+    pub(crate) fn new(connection: ConnectionMeta) -> Self {
+        Self {
+            connection,
+            idle_since: Instant::now(),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.idle_since.elapsed()
+    }
+}
+
+/// Callback invoked when an idle upstream connection leaves the keep-alive pool
+/// without being reused.
+pub type PoolCallback = Arc<dyn Fn(Duration) + Send + Sync>;
 
 /// The options to configure a [TransportConnector]
 #[derive(Clone)]
@@ -49,6 +74,13 @@ pub struct ConnectorOptions {
     /// If `None`, the CA in the [default](https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_default_verify_paths.html)
     /// locations will be loaded
     pub ca_file: Option<String>,
+    /// The maximum number of unique s2n configs to cache. Creating a new s2n config is an
+    /// expensive operation, so we cache and re-use config objects with identical configurations.
+    /// Defaults to a cache size of 10. A value of 0 disables the cache.
+    ///
+    /// WARNING: Disabling the s2n config cache can result in poor performance
+    #[cfg(feature = "s2n")]
+    pub s2n_config_cache_size: Option<usize>,
     /// The default client cert and key to use for mTLS
     ///
     /// Each individual connection can use their own cert key to override this.
@@ -57,7 +89,11 @@ pub struct ConnectorOptions {
     /// env variable. This can be used by tools like Wireshark to decrypt traffic
     /// for debugging purposes.
     pub debug_ssl_keylog: bool,
-    /// How many connections to keepalive
+    /// Effective global cap for the keepalive pool. Derived from
+    /// `server_conf.upstream_keepalive_pool_size * server_conf.threads`
+    /// in [`Self::from_server_conf`] so that operator-facing config keeps
+    /// its per-worker meaning even though the pool itself now uses a single
+    /// global LRU.
     pub keepalive_pool_size: usize,
     /// Optionally offload the connection establishment to dedicated thread pools
     ///
@@ -72,6 +108,9 @@ pub struct ConnectorOptions {
     pub bind_to_v4: Vec<SocketAddr>,
     /// Bind to any of the given source IPv4 addresses
     pub bind_to_v6: Vec<SocketAddr>,
+    /// Optional callback for observing how long upstream connections stayed idle
+    /// before leaving the keep-alive pool without reuse.
+    pub keepalive_pool_callback: Option<PoolCallback>,
 }
 
 impl ConnectorOptions {
@@ -105,11 +144,16 @@ impl ConnectorOptions {
         ConnectorOptions {
             ca_file: server_conf.ca_file.clone(),
             cert_key_file: None, // TODO: use it
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: server_conf.s2n_config_cache_size,
             debug_ssl_keylog: server_conf.upstream_debug_ssl_keylog,
-            keepalive_pool_size: server_conf.upstream_keepalive_pool_size,
+            keepalive_pool_size: server_conf
+                .upstream_keepalive_pool_size
+                .saturating_mul(server_conf.threads.max(1)),
             offload_threadpool,
             bind_to_v4,
             bind_to_v6,
+            keepalive_pool_callback: None,
         }
     }
 
@@ -117,12 +161,15 @@ impl ConnectorOptions {
     pub fn new(keepalive_pool_size: usize) -> Self {
         ConnectorOptions {
             ca_file: None,
+            #[cfg(feature = "s2n")]
+            s2n_config_cache_size: None,
             cert_key_file: None,
             debug_ssl_keylog: false,
             keepalive_pool_size,
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
+            keepalive_pool_callback: None,
         }
     }
 }
@@ -135,6 +182,10 @@ pub struct TransportConnector {
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
     preferred_http_version: PreferredHttpVersion,
+    /// Wrapped in `Arc` so external consumers (e.g. proxy services) can clone a reference
+    /// for periodic metric reporting without needing access to the connector itself.
+    unexpected_data_conn_count: Arc<AtomicU64>,
+    keepalive_pool_callback: Option<PoolCallback>,
 }
 
 const DEFAULT_POOL_SIZE: usize = 128;
@@ -154,6 +205,9 @@ impl TransportConnector {
         let bind_to_v6 = options
             .as_ref()
             .map_or_else(Vec::new, |o| o.bind_to_v6.clone());
+        let keepalive_pool_callback = options
+            .as_ref()
+            .and_then(|o| o.keepalive_pool_callback.clone());
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
@@ -161,6 +215,8 @@ impl TransportConnector {
             bind_to_v4,
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),
+            unexpected_data_conn_count: Arc::new(AtomicU64::new(0)),
+            keepalive_pool_callback,
         }
     }
 
@@ -201,7 +257,9 @@ impl TransportConnector {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
-                        if peer.matches_fd(stream.id()) && test_reusable_stream(&mut stream) {
+                        if peer.matches_fd(stream.id())
+                            && test_reusable_stream(&mut stream, &self.unexpected_data_conn_count)
+                        {
                             Some(stream)
                         } else {
                             None
@@ -216,7 +274,10 @@ impl TransportConnector {
                                 }
                             }
                             if peer.matches_sock(WrappedRawSocket(stream.id() as RawSocket))
-                                && test_reusable_stream(&mut stream)
+                                && test_reusable_stream(
+                                    &mut stream,
+                                    &self.unexpected_data_conn_count,
+                                )
                             {
                                 Some(stream)
                             } else {
@@ -248,9 +309,9 @@ impl TransportConnector {
         &self,
         mut stream: Stream,
         key: u64, // usually peer.reuse_hash()
-        idle_timeout: Option<std::time::Duration>,
+        idle_timeout: Option<Duration>,
     ) {
-        if !test_reusable_stream(&mut stream) {
+        if !test_reusable_stream(&mut stream, &self.unexpected_data_conn_count) {
             return;
         }
         let id = stream.id();
@@ -259,11 +320,25 @@ impl TransportConnector {
         let stream = Arc::new(Mutex::new(stream));
         let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
         let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
+        let idle_meta = IdleConnection::new(meta);
         let pool = self.connection_pool.clone(); //clone the arc
+        let keepalive_pool_callback = self.keepalive_pool_callback.clone();
         let rt = pingora_runtime::current_handle();
         rt.spawn(async move {
-            pool.idle_poll(locked_stream, &meta, idle_timeout, notify_close, watch_use)
-                .await;
+            if pool
+                .idle_poll(
+                    locked_stream,
+                    &idle_meta.connection,
+                    idle_timeout,
+                    notify_close,
+                    watch_use,
+                )
+                .await
+            {
+                if let Some(callback) = keepalive_pool_callback {
+                    callback(idle_meta.elapsed());
+                }
+            }
         });
     }
 
@@ -289,6 +364,21 @@ impl TransportConnector {
     /// Tell the connector to always send h1 for ALPN for the given peer in the future.
     pub fn prefer_h1(&self, peer: &impl Peer) {
         self.preferred_http_version.add(peer, 1);
+    }
+
+    /// Return the number of times a pooled connection was found to contain unexpected data
+    /// from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.unexpected_data_conn_count.load(Ordering::Relaxed)
+    }
+
+    /// Return a shared reference to the unexpected data connection counter.
+    ///
+    /// This allows external consumers (e.g. proxy services) to clone the `Arc` and
+    /// periodically read the counter for metric reporting without needing ongoing
+    /// access to the connector.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.unexpected_data_conn_count.clone()
     }
 }
 
@@ -365,7 +455,7 @@ use futures::future::FutureExt;
 use tokio::io::AsyncReadExt;
 
 /// Test whether a stream is already closed or not reusable (server sent unexpected data)
-fn test_reusable_stream(stream: &mut Stream) -> bool {
+fn test_reusable_stream(stream: &mut Stream, unexpected_data_conn_count: &AtomicU64) -> bool {
     let mut buf = [0; 1];
     // tokio::task::unconstrained because now_or_never may yield None when the future is ready
     let result = tokio::task::unconstrained(stream.read(&mut buf[..])).now_or_never();
@@ -376,6 +466,7 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
                     debug!("Idle connection is closed");
                 } else {
                     warn!("Unexpected data read in idle connection");
+                    unexpected_data_conn_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Err(e) => {
@@ -388,20 +479,96 @@ fn test_reusable_stream(stream: &mut Stream) -> bool {
     }
 }
 
+/// Test utilities for creating mock acceptors.
+#[cfg(all(test, unix))]
+pub(crate) mod test_utils {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+
+    /// Generates a unique socket path for testing to avoid conflicts when running in parallel
+    pub fn unique_uds_path(test_name: &str) -> String {
+        format!(
+            "/tmp/test_{test_name}_{:?}_{}.sock",
+            std::thread::current().id(),
+            std::process::id()
+        )
+    }
+
+    /// A mock UDS server that accepts one connection, sends data, and waits for shutdown signal
+    ///
+    /// Returns: (ready_rx, shutdown_tx, server_handle)
+    /// - ready_rx: Wait on this to know when server is ready to accept connections
+    /// - shutdown_tx: Send on this to tell server to shut down
+    /// - server_handle: Join handle for the server task
+    pub fn spawn_mock_uds_server(
+        socket_path: String,
+        response: &'static [u8],
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            // Signal that the server is ready to accept connections
+            let _ = ready_tx.send(());
+
+            if let Ok((mut stream, _addr)) = listener.accept().await {
+                let _ = stream.write_all(response).await;
+                // Keep the connection open until the test tells us to shutdown
+                let _ = shutdown_rx.await;
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        (ready_rx, shutdown_tx, server_handle)
+    }
+
+    /// A mock UDS server that immediately closes connections (for testing error handling)
+    ///
+    /// Returns: (ready_rx, shutdown_tx, server_handle)
+    pub fn spawn_mock_uds_server_close_immediate(
+        socket_path: String,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = tokio::spawn(async move {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            // Signal that the server is ready to accept connections
+            let _ = ready_tx.send(());
+
+            if let Ok((mut stream, _addr)) = listener.accept().await {
+                let _ = stream.shutdown().await;
+                // Wait for shutdown signal before cleaning up
+                let _ = shutdown_rx.await;
+            }
+            let _ = std::fs::remove_file(&socket_path);
+        });
+
+        (ready_rx, shutdown_tx, server_handle)
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "any_tls")]
 mod tests {
+    use std::time::Duration;
+
     use pingora_error::ErrorType;
     use tls::Connector;
 
     use super::*;
     use crate::upstreams::peer::BasicPeer;
-    use tokio::io::AsyncWriteExt;
-    #[cfg(unix)]
-    use tokio::net::UnixListener;
-
-    // 192.0.2.1 is effectively a black hole
-    const BLACK_HOLE: &str = "192.0.2.1:79";
 
     #[tokio::test]
     async fn test_connect() {
@@ -429,49 +596,53 @@ mod tests {
         assert!(reused);
     }
 
-    #[cfg(unix)]
-    const MOCK_UDS_PATH: &str = "/tmp/test_unix_transport_connector.sock";
-
-    // one-off mock server
-    #[cfg(unix)]
-    async fn mock_connect_server() {
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-        let listener = UnixListener::bind(MOCK_UDS_PATH).unwrap();
-        if let Ok((mut stream, _addr)) = listener.accept().await {
-            stream.write_all(b"it works!").await.unwrap();
-            // wait a bit so that the client can read
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let _ = std::fs::remove_file(MOCK_UDS_PATH);
-    }
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn test_connect_uds() {
-        tokio::spawn(async {
-            mock_connect_server().await;
-        });
+        let socket_path = test_utils::unique_uds_path("transport_connector");
+        let (ready_rx, shutdown_tx, server_handle) =
+            test_utils::spawn_mock_uds_server(socket_path.clone(), b"it works!");
+
+        // Wait for the server to be ready before connecting
+        ready_rx.await.unwrap();
+
         // create a new service at /tmp
         let connector = TransportConnector::new(None);
-        let peer = BasicPeer::new_uds(MOCK_UDS_PATH).unwrap();
+        let peer = BasicPeer::new_uds(&socket_path).unwrap();
         // make a new connection to mock uds
         let mut stream = connector.new_stream(&peer).await.unwrap();
         let mut buf = [0; 9];
         let _ = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf, b"it works!");
-        connector.release_stream(stream, peer.reuse_hash(), None);
 
-        let (_, reused) = connector.get_stream(&peer).await.unwrap();
+        // Test connection reuse by releasing and getting the stream back
+        connector.release_stream(stream, peer.reuse_hash(), None);
+        let (stream, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+
+        // Clean up: drop the stream, tell server to shutdown, and wait for it
+        drop(stream);
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
+
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
+    // dropped on Linux, producing ConnectTimedout. On macOS the kernel
+    // may instead return ENETUNREACH (ConnectNoRoute).
+    const BLACKHOLE: &str = "192.0.2.1:79";
 
     async fn do_test_conn_timeout(conf: Option<ConnectorOptions>) {
         let connector = TransportConnector::new(conf);
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1));
-        let stream = connector.new_stream(&peer).await;
-        match stream {
-            Ok(_) => panic!("should throw an error"),
-            Err(e) => assert_eq!(e.etype(), &ConnectTimedout),
-        }
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
+        let Err(e) = connector.new_stream(&peer).await else {
+            panic!("should throw an error");
+        };
+        assert!(
+            e.etype() == &ConnectTimedout || e.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            e.etype()
+        );
     }
 
     #[tokio::test]
@@ -496,13 +667,21 @@ mod tests {
 
         let stream = connector.new_stream(&peer).await;
         let error = stream.unwrap_err();
-        // XXX: some systems will allow the socket to bind and connect without error, only to timeout
-        assert!(error.etype() == &ConnectError || error.etype() == &ConnectTimedout)
+        // The exact error varies by platform: Linux may return ConnectError,
+        // some systems time out (ConnectTimedout), and macOS/others may
+        // return ConnectNoRoute (ENETUNREACH) for unreachable addresses.
+        assert!(
+            error.etype() == &ConnectError
+                || error.etype() == &ConnectTimedout
+                || error.etype() == &ConnectNoRoute,
+            "unexpected error type: {:?}",
+            error.etype()
+        )
     }
 
     /// Helper function for testing error handling in the `do_connect` function.
-    /// This assumes that the connection will fail to on the peer and returns
-    /// the decomposed error type and message
+    /// This assumes that the connection will fail on the peer and returns
+    /// the decomposed error type and message.
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
         let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
@@ -520,27 +699,65 @@ mod tests {
 
     #[tokio::test]
     async fn test_do_connect_with_total_timeout() {
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.total_connection_timeout = Some(std::time::Duration::from_millis(1));
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.total_connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
-        assert_eq!(etype, ConnectTimedout);
-        assert!(context.contains("total-connection timeout"));
+        assert!(
+            etype == ConnectTimedout || etype == ConnectNoRoute,
+            "unexpected error type: {etype:?}"
+        );
+        if etype == ConnectTimedout {
+            assert!(context.contains("total-connection timeout"));
+        }
     }
 
     #[tokio::test]
     async fn test_tls_connect_timeout_supersedes_total() {
-        let mut peer = BasicPeer::new(BLACK_HOLE);
-        peer.options.total_connection_timeout = Some(std::time::Duration::from_millis(10));
-        peer.options.connection_timeout = Some(std::time::Duration::from_millis(1));
+        let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.total_connection_timeout = Some(Duration::from_millis(10));
+        peer.options.connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
-        assert_eq!(etype, ConnectTimedout);
-        assert!(!context.contains("total-connection timeout"));
+        assert!(
+            etype == ConnectTimedout || etype == ConnectNoRoute,
+            "unexpected error type: {etype:?}"
+        );
+        if etype == ConnectTimedout {
+            assert!(!context.contains("total-connection timeout"));
+        }
     }
 
     #[tokio::test]
     async fn test_do_connect_without_total_timeout() {
-        let peer = BasicPeer::new(BLACK_HOLE);
+        let peer = BasicPeer::new(BLACKHOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_unexpected_data_connection_count_increments() {
+        // Create a duplex stream where we control both ends
+        let (mut server, client) = tokio::io::duplex(64);
+
+        let counter = AtomicU64::new(0);
+        let mut stream: Stream = Box::new(client);
+
+        // With no data available, the stream should be considered reusable
+        assert!(test_reusable_stream(&mut stream, &counter));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Write unexpected data from the server side
+        use tokio::io::AsyncWriteExt;
+        server.write_all(b"unexpected").await.unwrap();
+
+        // Give the data a moment to be buffered
+        tokio::task::yield_now().await;
+
+        // Now test_reusable_stream should detect the unexpected data
+        assert!(!test_reusable_stream(&mut stream, &counter));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "unexpected_data_connection_count should have incremented"
+        );
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
 use pingora_error::{ErrorType::*, OrErr, Result};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
 pub use http::status::StatusCode;
@@ -43,6 +43,7 @@ pub use case_header_name::IntoCaseHeaderName;
 
 pub mod prelude {
     pub use crate::RequestHeader;
+    pub use crate::ResponseHeader;
 }
 
 /* an ordered header map to store the original case of each header name
@@ -55,6 +56,11 @@ same order of the map of header values.
 This idea is inspaired by hyper @nox
 */
 type CaseMap = HMap<CaseHeaderName>;
+
+pub enum HeaderNameVariant<'a> {
+    Case(&'a CaseHeaderName),
+    Titled(&'a str),
+}
 
 /// The HTTP request header type.
 ///
@@ -84,6 +90,12 @@ impl Deref for RequestHeader {
 
     fn deref(&self) -> &Self::Target {
         &self.base
+    }
+}
+
+impl DerefMut for RequestHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
     }
 }
 
@@ -185,6 +197,46 @@ impl RequestHeader {
     /// The header case will be preserved.
     pub fn header_to_h1_wire(&self, buf: &mut impl BufMut) {
         header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
+    }
+
+    /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
+    /// Otherwise returns an empty iterator.
+    ///
+    /// Headers of the same name are visited in insertion order.
+    pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
+        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+    }
+
+    /// Returns true if the request has case-sensitive headers.
+    pub fn has_case(&self) -> bool {
+        self.header_name_map.is_some()
+    }
+
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Set the request method
@@ -336,6 +388,12 @@ impl Deref for ResponseHeader {
     }
 }
 
+impl DerefMut for ResponseHeader {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
+    }
+}
+
 impl Clone for ResponseHeader {
     fn clone(&self) -> Self {
         Self {
@@ -465,6 +523,46 @@ impl ResponseHeader {
         header_to_h1_wire(self.header_name_map.as_ref(), &self.base.headers, buf)
     }
 
+    /// If case sensitivity is enabled, returns an iterator to iterate over case-sensitive header names and values.
+    /// Otherwise returns an empty iterator.
+    ///
+    /// Headers of the same name are visited in insertion order.
+    pub fn case_header_iter(&self) -> impl Iterator<Item = (&CaseHeaderName, &HeaderValue)> + '_ {
+        case_header_iter(self.header_name_map.as_ref(), &self.base.headers)
+    }
+
+    /// Returns true if the response has case-sensitive headers.
+    pub fn has_case(&self) -> bool {
+        self.header_name_map.is_some()
+    }
+
+    pub fn map<F: FnMut(HeaderNameVariant, &HeaderValue) -> Result<()>>(
+        &self,
+        mut f: F,
+    ) -> Result<()> {
+        let key_map = self.header_name_map.as_ref();
+        let value_map = &self.base.headers;
+
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
+                f(HeaderNameVariant::Case(case_header), val)?;
+            }
+        } else {
+            for (header, value) in value_map {
+                let titled_header =
+                    case_header_name::titled_header_name_str(header).unwrap_or(header.as_str());
+                f(HeaderNameVariant::Titled(titled_header), value)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Set the status code
     pub fn set_status(&mut self, status: impl TryInto<StatusCode>) -> Result<()> {
         self.base.status = status
@@ -520,6 +618,7 @@ fn clone_req_parts(me: &ReqParts) -> ReqParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 
@@ -532,6 +631,7 @@ fn clone_resp_parts(me: &RespParts) -> RespParts {
         .into_parts()
         .0;
     parts.headers = me.headers.clone();
+    parts.extensions = me.extensions.clone();
     parts
 }
 
@@ -617,23 +717,115 @@ where
     removed
 }
 
+/// Build a [`HeaderValue`] from owned bytes, normalizing the value per RFC
+/// 9110 section 5.5 and RFC 9112 section 5.2: obs-fold continuations
+/// collapse to a single SP, and any stray CR / LF / NUL is replaced with SP.
+/// Zero-copy when the input contains no CR/LF/NUL.
+///
+/// # Precondition
+///
+/// Input must come from a conformant HTTP/1.1 parser: bytes must satisfy
+/// the `field-content` grammar (SP, HTAB, `%x21-7E`, `obs-text` `%x80-FF`),
+/// with CR/LF/NUL only appearing as part of an obs-fold or as invalid bytes
+/// that this function will replace with SP. All workspace callers satisfy
+/// this via httparse.
+///
+/// # Panics
+///
+/// Debug builds panic on precondition violation via the sanity check in
+/// [`HeaderValue::from_maybe_shared_unchecked`]. Release builds skip the
+/// check; invalid input is undefined behavior per the `http` crate.
+pub fn header_value_from_raw(raw: impl Into<bytes::Bytes>) -> HeaderValue {
+    let normalized = normalize_field_value(raw.into());
+    // SAFETY: `normalize_field_value` replaces all CR/LF/NUL with SP; by
+    // precondition the remaining bytes pass the `http` crate's `is_valid`
+    // byte-set check (other controls except HTAB are not expected here). The
+    // crate's documented safety contract names "valid UTF-8", but its
+    // internal use of the bytes never relies on UTF-8 in release. Matches
+    // long-standing precedent.
+    unsafe { HeaderValue::from_maybe_shared_unchecked(normalized) }
+}
+
+/// Build a [`HeaderValue`] from a borrowed slice, normalizing obs-fold per
+/// RFC 9112 section 5.2. The slice is copied into an owned buffer.
+///
+/// Precondition and panic behavior are the same as [`header_value_from_raw`].
+pub fn header_value_from_slice(raw: &[u8]) -> HeaderValue {
+    header_value_from_raw(bytes::Bytes::copy_from_slice(raw))
+}
+
+/// Normalize a header field value per RFC 9110 section 5.5 and RFC 9112
+/// section 5.2:
+///
+/// - Each CRLF + WSP obs-fold continuation collapses to a single SP
+///   ([RFC 9112 section 5.2]).
+/// - Any standalone CR, LF, or NUL (not part of an obs-fold being collapsed)
+///   is replaced with a single SP ([RFC 9110 section 5.5]).
+/// - Other CTL characters are retained, as RFC 9110 section 5.5 permits.
+///
+/// Zero-copy when the input contains no CR, LF, or NUL.
+/// Example: `b"obs\r\n fold\r\n\t line"` becomes `b"obs fold line"`.
+///
+/// [RFC 9112 section 5.2]: https://datatracker.ietf.org/doc/html/rfc9112#section-5.2
+/// [RFC 9110 section 5.5]: https://datatracker.ietf.org/doc/html/rfc9110#section-5.5
+fn normalize_field_value(raw: bytes::Bytes) -> bytes::Bytes {
+    // Fast path: no CR/LF/NUL, nothing to do.
+    if !raw.iter().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+        return raw;
+    }
+
+    // No LF means no obs-fold (which requires CRLF). Replace each stray CR
+    // or NUL with SP per RFC 9110 section 5.5.
+    let Some(first_nl) = raw.iter().position(|b| *b == b'\n') else {
+        let replaced: Vec<u8> = raw
+            .iter()
+            .map(|&b| if matches!(b, b'\r' | b'\0') { b' ' } else { b })
+            .collect();
+        return bytes::Bytes::from(replaced);
+    };
+
+    // Mid-segment CRs (and NULs) — which boundary trimming can't reach because
+    // they're not at a segment boundary — are replaced with SP at copy time
+    // per RFC 9110 section 5.5. Empty continuations contribute no SP, so
+    // leading/trailing newlines don't introduce spurious whitespace.
+    fn push_with_replacement(dst: &mut Vec<u8>, src: &[u8]) {
+        dst.extend(
+            src.iter()
+                .map(|&b| if matches!(b, b'\r' | b'\0') { b' ' } else { b }),
+        );
+    }
+
+    // Trim ASCII whitespace at segment boundaries (we split on `\n`) so the
+    // trailing `\r` of each CRLF is absorbed into the obs-fold collapse along
+    // with the fold's SP/HTAB run.
+    let head = raw[..first_nl].trim_ascii_end();
+    let mut unfolded = Vec::with_capacity(raw.len());
+    push_with_replacement(&mut unfolded, head);
+    for line in raw[first_nl + 1..].split(|b| *b == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        if !unfolded.is_empty() {
+            unfolded.push(b' ');
+        }
+        push_with_replacement(&mut unfolded, line);
+    }
+    bytes::Bytes::from(unfolded)
+}
+
 #[inline]
 fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl BufMut) {
     const CRLF: &[u8; 2] = b"\r\n";
     const HEADER_KV_DELIMITER: &[u8; 2] = b": ";
 
     if let Some(key_map) = key_map {
-        let iter = key_map.iter().zip(value_map.iter());
-        for ((header, case_header), (header2, val)) in iter {
-            if header != header2 {
-                // in case the header iteration order changes in future versions of HMap
-                panic!("header iter mismatch {}, {}", header, header2)
-            }
+        case_header_iter(key_map.into(), value_map).for_each(|(case_header, val)| {
             buf.put_slice(case_header.as_slice());
             buf.put_slice(HEADER_KV_DELIMITER);
             buf.put_slice(val.as_ref());
             buf.put_slice(CRLF);
-        }
+        });
     } else {
         for (header, value) in value_map {
             let titled_header =
@@ -644,6 +836,23 @@ fn header_to_h1_wire(key_map: Option<&CaseMap>, value_map: &HMap, buf: &mut impl
             buf.put_slice(CRLF);
         }
     }
+}
+
+#[inline]
+fn case_header_iter<'a>(
+    name_map: Option<&'a CaseMap>,
+    value_map: &'a HMap,
+) -> impl Iterator<Item = (&'a CaseHeaderName, &'a HeaderValue)> + 'a {
+    name_map.into_iter().flat_map(|name_map| {
+        name_map
+            .iter()
+            .zip(value_map.iter())
+            .map(|((h1, name), (h2, value))| {
+                // in case the header iteration order changes in future versions of HMap
+                assert_eq!(h1, h2, "header iter mismatch {}, {}", h1, h2);
+                (name, value)
+            })
+    })
 }
 
 #[cfg(test)]
@@ -659,12 +868,23 @@ mod tests {
 
     #[test]
     fn test_single_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.insert_header("foo", "bar").unwrap();
         req.insert_header("FoO", "Bar").unwrap();
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"FoO: Bar\r\n");
+        req.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
 
         let mut resp = ResponseHeader::new(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -672,6 +892,17 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"FoO: Bar\r\n");
+        resp.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
     }
 
     #[test]
@@ -682,6 +913,9 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
+        req.case_header_iter().for_each(|(_, _)| {
+            unreachable!("request has no case");
+        });
 
         let mut resp = ResponseHeader::new_no_case(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -689,11 +923,14 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
+        resp.case_header_iter().for_each(|(_, _)| {
+            unreachable!("response has no case");
+        });
     }
 
     #[test]
     fn test_multiple_header() {
-        let mut req = RequestHeader::build("GET", b"\\", None).unwrap();
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
         req.append_header("FoO", "Bar").unwrap();
         req.append_header("fOO", "bar").unwrap();
         req.append_header("BAZ", "baR").unwrap();
@@ -707,6 +944,29 @@ mod tests {
             buf,
             b"FoO: Bar\r\nfOO: bar\r\nBAZ: baR\r\nContent-Length: 0\r\n"
         );
+        req.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                2 => {
+                    assert_eq!(name, "fOO");
+                    assert_eq!(value, "bar");
+                }
+                3 => {
+                    assert_eq!(name, "BAZ");
+                    assert_eq!(value, "baR");
+                }
+                4 => {
+                    assert_eq!(name, "Content-Length");
+                    assert_eq!(value, "0");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
 
         let mut resp = ResponseHeader::new(None);
         resp.append_header("FoO", "Bar").unwrap();
@@ -722,6 +982,29 @@ mod tests {
             buf,
             b"FoO: Bar\r\nfOO: bar\r\nBAZ: baR\r\nContent-Length: 0\r\n"
         );
+        resp.case_header_iter().enumerate().for_each(|(i, (k, v))| {
+            let name = String::from_utf8_lossy(k.as_slice()).into_owned();
+            let value = String::from_utf8_lossy(v.as_ref()).into_owned();
+            match i + 1 {
+                1 => {
+                    assert_eq!(name, "FoO");
+                    assert_eq!(value, "Bar");
+                }
+                2 => {
+                    assert_eq!(name, "fOO");
+                    assert_eq!(value, "bar");
+                }
+                3 => {
+                    assert_eq!(name, "BAZ");
+                    assert_eq!(value, "baR");
+                }
+                4 => {
+                    assert_eq!(name, "Content-Length");
+                    assert_eq!(value, "0");
+                }
+                _ => panic!("too many headers"),
+            }
+        });
     }
 
     #[cfg(feature = "patched_http1")]
@@ -797,5 +1080,192 @@ mod tests {
                 .map(|d| d.as_bytes())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn normalize_field_value_no_fold_is_zero_copy() {
+        // The value has no newline at all -> the input `Bytes` must be
+        // returned untouched (same allocation). We assert pointer/length
+        // identity via `Bytes::ptr_eq` semantics: cloning a `Bytes` shares
+        // the same underlying buffer, so comparing byte content + length
+        // is sufficient to confirm no allocation happened.
+        let input = bytes::Bytes::from_static(b"text/html; charset=utf-8");
+        let out = normalize_field_value(input.clone());
+        assert_eq!(out, input);
+        assert_eq!(out.as_ptr(), input.as_ptr());
+    }
+
+    #[test]
+    fn normalize_field_value_single_fold() {
+        // CRLF + SP continuation collapses to a single SP.
+        let input = bytes::Bytes::from_static(b"obs\r\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold");
+    }
+
+    #[test]
+    fn normalize_field_value_multiple_folds_mixed_ws() {
+        // "obs\r\n fold\r\n\t line" -> "obs fold line". Each fold becomes
+        // exactly one SP regardless of how many SP/HTAB chars the
+        // continuation indented with.
+        let input = bytes::Bytes::from_static(b"obs\r\n fold\r\n\t line");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold line");
+    }
+
+    #[test]
+    fn normalize_field_value_collapses_long_indent() {
+        // Real-world CSP-style values often indent continuations with many
+        // spaces. All of that indent collapses to a single SP.
+        let input =
+            bytes::Bytes::from_static(b"default-src 'self';\r\n        script-src 'self' blob:");
+        assert_eq!(
+            &normalize_field_value(input)[..],
+            b"default-src 'self'; script-src 'self' blob:"
+        );
+    }
+
+    #[test]
+    fn normalize_field_value_removes_all_cr_and_lf() {
+        // After normalization no CR or LF byte may survive in the value
+        // (each obs-fold collapses to a single SP).
+        let input = bytes::Bytes::from_static(b"a\r\n b\r\n c\r\n d");
+        let out = normalize_field_value(input);
+        assert!(!out.contains(&b'\r'));
+        assert!(!out.contains(&b'\n'));
+        assert_eq!(&out[..], b"a b c d");
+    }
+
+    #[test]
+    fn normalize_field_value_bare_lf() {
+        // Defensive: bare LF (no preceding CR) is also treated as a fold,
+        // since the implementation splits on `\n` alone.
+        let input = bytes::Bytes::from_static(b"obs\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"obs fold");
+    }
+
+    #[test]
+    fn normalize_field_value_empty() {
+        let input = bytes::Bytes::new();
+        let out = normalize_field_value(input.clone());
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn header_value_from_raw_round_trip() {
+        // End-to-end: a folded value parses into a HeaderValue whose bytes
+        // contain no CR/LF and equal the normalized form.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(
+            b"default-src 'self';\r\n script-src 'self'",
+        ));
+        assert_eq!(hv.as_bytes(), b"default-src 'self'; script-src 'self'");
+    }
+
+    #[test]
+    fn header_value_from_raw_passthrough() {
+        // No fold -> bytes preserved exactly.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(b"application/json"));
+        assert_eq!(hv.as_bytes(), b"application/json");
+    }
+
+    // The remaining tests pin down the contract on edge-case inputs.
+    // `header_value_from_raw` is `pub`, so any caller (not just our own
+    // httparse-driven paths) can pass arbitrary bytes; these cases
+    // document what they will get back.
+
+    #[test]
+    fn normalize_field_value_leading_newline_no_spurious_space() {
+        // A value starting with a fold collapses to just the continuation,
+        // with no spurious leading SP.
+        let input = bytes::Bytes::from_static(b"\r\n fold");
+        assert_eq!(&normalize_field_value(input)[..], b"fold");
+    }
+
+    #[test]
+    fn normalize_field_value_trailing_newline_no_spurious_space() {
+        // A trailing CRLF (or CRLF + WSP that ends the value) is dropped
+        // without leaving a trailing SP.
+        let input = bytes::Bytes::from_static(b"foo\r\n");
+        assert_eq!(&normalize_field_value(input)[..], b"foo");
+
+        let input = bytes::Bytes::from_static(b"a\r\n b\r\n");
+        assert_eq!(&normalize_field_value(input)[..], b"a b");
+    }
+
+    #[test]
+    fn normalize_field_value_only_newlines() {
+        // Pathological input made entirely of newlines collapses to empty.
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\r\n"))[..],
+            b""
+        );
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\n"))[..],
+            b""
+        );
+        assert_eq!(
+            &normalize_field_value(bytes::Bytes::from_static(b"\r\n\r\n"))[..],
+            b""
+        );
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_bare_cr_with_sp() {
+        // Per RFC 9110 section 5.5, stray CR / LF / NUL within a field
+        // value MUST be replaced with SP (not stripped, not left in place).
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"foo\rbar", b"foo bar"),
+            (b"foo\r", b"foo "),
+            (b"\rfoo", b" foo"),
+            (b"\r", b" "),
+            (b"\r\r\r", b"   "),
+        ];
+        for (input, expected) in cases {
+            let out = normalize_field_value(bytes::Bytes::copy_from_slice(input));
+            assert_eq!(&out[..], *expected, "input = {input:?}");
+            assert!(!out.contains(&b'\r'));
+            assert!(!out.contains(&b'\n'));
+            assert!(!out.contains(&b'\0'));
+        }
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_cr_mid_segment_with_sp() {
+        // Mid-segment CR (sits inside a segment, not at a boundary the
+        // trim helpers reach) is replaced with SP per RFC 9110 section 5.5.
+        let input = bytes::Bytes::from_static(b"foo\rbar\r\n baz");
+        assert_eq!(&normalize_field_value(input)[..], b"foo bar baz");
+    }
+
+    #[test]
+    fn normalize_field_value_replaces_nul_with_sp() {
+        // NUL within a field value MUST be replaced with SP per RFC 9110
+        // section 5.5. Covers NUL standalone, between CR and LF, and after
+        // CRLF.
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"foo\0bar", b"foo bar"),
+            (b"\0\0\0", b"   "),
+            (b"foo\0", b"foo "),
+            // NUL between CR and LF: each is a stray byte -> three SPs.
+            (b"foo\r\0\nbar", b"foo   bar"),
+            // NUL after CRLF: CRLF treated as a fold boundary (one SP),
+            // NUL replaced with one SP -> two SPs total.
+            (b"foo\r\n\0bar", b"foo  bar"),
+        ];
+        for (input, expected) in cases {
+            let out = normalize_field_value(bytes::Bytes::copy_from_slice(input));
+            assert_eq!(&out[..], *expected, "input = {input:?}");
+            assert!(!out.contains(&b'\r'));
+            assert!(!out.contains(&b'\n'));
+            assert!(!out.contains(&b'\0'));
+        }
+    }
+
+    #[test]
+    fn header_value_from_raw_handles_invalid_bytes() {
+        // Bare CR and NUL aren't valid `field-content`, but
+        // `normalize_field_value` replaces them with SP before the
+        // unchecked constructor sees them, so no invalid byte ever reaches
+        // `HeaderValue`.
+        let hv = header_value_from_raw(bytes::Bytes::from_static(b"foo\rbar\0baz"));
+        assert_eq!(hv.as_bytes(), b"foo bar baz");
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ pub struct Error {
     /// if the error is retry-able
     pub retry: RetryType,
     /// chain to the cause of this error
-    pub cause: Option<Box<(dyn ErrorTrait + Send + Sync)>>,
+    pub cause: Option<Box<dyn ErrorTrait + Send + Sync>>,
     /// an arbitrary string that explains the context when the error happens
     pub context: Option<ImmutStr>,
 }
@@ -88,7 +88,7 @@ impl From<bool> for RetryType {
 
 impl ErrorSource {
     /// for displaying the error source
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Upstream => "Upstream",
             Self::Downstream => "Downstream",
@@ -159,7 +159,7 @@ impl ErrorType {
     }
 
     /// for displaying the error type
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ErrorType::ConnectTimedout => "ConnectTimedout",
             ErrorType::ConnectRefused => "ConnectRefused",

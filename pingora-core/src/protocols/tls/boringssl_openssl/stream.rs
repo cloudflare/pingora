@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -90,6 +90,12 @@ where
 impl<T> SslStream<T> {
     pub fn ssl_digest(&self) -> Option<Arc<SslDigest>> {
         self.digest.clone()
+    }
+
+    /// Attempts to obtain a mutable reference to the SslDigest.
+    /// This method returns `None` if the SslDigest is currently held by other references.
+    pub(crate) fn ssl_digest_mut(&mut self) -> Option<&mut SslDigest> {
+        Arc::get_mut(self.digest.as_mut()?)
     }
 }
 
@@ -203,13 +209,7 @@ impl SslDigest {
             None => (Vec::new(), None, None),
         };
 
-        SslDigest {
-            cipher,
-            version: ssl.version_str(),
-            organization: org,
-            serial_number: sn,
-            cert_digest,
-        }
+        SslDigest::new(cipher, ssl.version_str(), org, sn, cert_digest)
     }
 }
 
