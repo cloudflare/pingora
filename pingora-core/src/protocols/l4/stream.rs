@@ -434,6 +434,8 @@ pub struct Stream {
     socket_digest: Option<Arc<SocketDigest>>,
     /// When this connection is established
     pub established_ts: SystemTime,
+    establishment_duration: Option<Duration>,
+    offload_wait_duration: Option<Duration>,
     /// The distributed tracing object for this stream
     pub tracer: Option<Tracer>,
     read_pending_time: AccumulatedDuration,
@@ -449,6 +451,16 @@ impl Stream {
 
     fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
         self.stream.as_mut().expect("stream should always be set")
+    }
+
+    /// Record transport connection timing for this stream.
+    pub(crate) fn set_establishment_timing(
+        &mut self,
+        establishment_duration: Duration,
+        offload_wait_duration: Option<Duration>,
+    ) {
+        self.establishment_duration = Some(establishment_duration);
+        self.offload_wait_duration = offload_wait_duration;
     }
 
     /// set TCP nodelay for this connection if `self` is TCP
@@ -542,6 +554,8 @@ impl From<TcpStream> for Stream {
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
+            establishment_duration: None,
+            offload_wait_duration: None,
             proxy_digest: None,
             socket_digest: None,
             tracer: None,
@@ -563,6 +577,8 @@ impl From<virt::VirtualSocketStream> for Stream {
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
+            establishment_duration: None,
+            offload_wait_duration: None,
             proxy_digest: None,
             socket_digest: None,
             tracer: None,
@@ -585,6 +601,8 @@ impl From<UnixStream> for Stream {
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
+            establishment_duration: None,
+            offload_wait_duration: None,
             proxy_digest: None,
             socket_digest: None,
             tracer: None,
@@ -650,6 +668,8 @@ impl GetTimingDigest for Stream {
         let mut digest = Vec::with_capacity(2); // expect to have both L4 stream and TLS layer
         digest.push(Some(TimingDigest {
             established_ts: self.established_ts,
+            establishment_duration: self.establishment_duration,
+            offload_wait_duration: self.offload_wait_duration,
         }));
         digest
     }

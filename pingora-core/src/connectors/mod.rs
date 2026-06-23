@@ -233,11 +233,22 @@ impl TransportConnector {
         let stream = if let Some(rt) = rt {
             let peer = peer.clone();
             let tls_ctx = self.tls_ctx.clone();
-            rt.spawn(async move { do_connect(&peer, bind_to, alpn_override, &tls_ctx.ctx).await })
+            let offload_start = Instant::now();
+            rt.spawn(async move {
+                let offload_wait = offload_start.elapsed();
+                do_connect(
+                    &peer,
+                    bind_to,
+                    alpn_override,
+                    &tls_ctx.ctx,
+                    Some(offload_wait),
+                )
                 .await
-                .or_err(InternalError, "offload runtime failure")??
+            })
+            .await
+            .or_err(InternalError, "offload runtime failure")??
         } else {
-            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx).await?
+            do_connect(peer, bind_to, alpn_override, &self.tls_ctx.ctx, None).await?
         };
 
         Ok(stream)
@@ -389,10 +400,12 @@ async fn do_connect<P: Peer + Send + Sync>(
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
     tls_ctx: &TlsConnector,
+    offload_wait_duration: Option<Duration>,
 ) -> Result<Stream> {
     // Create the future that does the connections, but don't evaluate it until
     // we decide if we need a timeout or not
-    let connect_future = do_connect_inner(peer, bind_to, alpn_override, tls_ctx);
+    let connect_future =
+        do_connect_inner(peer, bind_to, alpn_override, tls_ctx, offload_wait_duration);
 
     match peer.total_connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {
@@ -412,8 +425,11 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     bind_to: Option<BindTo>,
     alpn_override: Option<ALPN>,
     tls_ctx: &TlsConnector,
+    offload_wait_duration: Option<Duration>,
 ) -> Result<Stream> {
-    let stream = l4_connect(peer, bind_to).await?;
+    let l4_connect_start = Instant::now();
+    let mut stream = l4_connect(peer, bind_to).await?;
+    stream.set_establishment_timing(l4_connect_start.elapsed(), offload_wait_duration);
     if peer.tls() {
         let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
         Ok(Box::new(tls_stream))
@@ -576,10 +592,29 @@ mod tests {
         let peer = BasicPeer::new("1.1.1.1:80");
         // make a new connection to 1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        assert_eq!(timing.len(), 1);
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_none());
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+    }
+
+    #[tokio::test]
+    async fn test_connect_with_offload_timing() {
+        let mut conf = ConnectorOptions::new(1);
+        conf.offload_threadpool = Some((1, 1));
+        let connector = TransportConnector::new(Some(conf));
+        let peer = BasicPeer::new("1.1.1.1:80");
+
+        let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_some());
     }
 
     #[tokio::test]
@@ -590,6 +625,14 @@ mod tests {
         peer.sni = "one.one.one.one".to_string();
         // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
+        let timing = stream.get_timing_digest();
+        assert_eq!(timing.len(), 2);
+        let l4_timing = timing[0].as_ref().unwrap();
+        assert!(l4_timing.establishment_duration.is_some());
+        assert!(l4_timing.offload_wait_duration.is_none());
+        let tls_timing = timing[1].as_ref().unwrap();
+        assert!(tls_timing.establishment_duration.is_some());
+        assert!(tls_timing.offload_wait_duration.is_none());
         connector.release_stream(stream, peer.reuse_hash(), None);
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
@@ -684,7 +727,7 @@ mod tests {
     /// the decomposed error type and message.
     async fn get_do_connect_failure_with_peer(peer: &BasicPeer) -> (ErrorType, String) {
         let tls_connector = Connector::new(None);
-        let stream = do_connect(peer, None, None, &tls_connector.ctx).await;
+        let stream = do_connect(peer, None, None, &tls_connector.ctx, None).await;
         match stream {
             Ok(_) => panic!("should throw an error"),
             Err(e) => (

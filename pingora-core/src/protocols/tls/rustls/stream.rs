@@ -17,7 +17,7 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
@@ -161,7 +161,9 @@ where
 {
     /// Connect to the remote TLS server as a client
     pub(crate) async fn connect(&mut self) -> Result<()> {
+        let handshake_start = Instant::now();
         self.tls.connect().await?;
+        self.timing.establishment_duration = Some(handshake_start.elapsed());
         self.timing.established_ts = SystemTime::now();
         self.digest = self.tls.digest();
         Ok(())
@@ -169,7 +171,9 @@ where
 
     /// Finish the TLS handshake from client as a server
     pub(crate) async fn accept(&mut self) -> Result<()> {
+        let handshake_start = Instant::now();
         self.tls.accept().await?;
+        self.timing.establishment_duration = Some(handshake_start.elapsed());
         self.timing.established_ts = SystemTime::now();
         self.digest = self.tls.digest();
         Ok(())

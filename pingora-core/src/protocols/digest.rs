@@ -44,17 +44,33 @@ pub trait ProtoDigest {
     }
 }
 
-/// The timing information of the connection
+/// Timing information for one layer of a connection.
 #[derive(Clone, Debug)]
 pub struct TimingDigest {
-    /// When this connection was established
+    /// When this connection layer was established.
     pub established_ts: SystemTime,
+    /// Monotonic duration of this layer's establishment operation.
+    ///
+    /// This avoids estimating elapsed time by subtracting wall-clock [`Self::established_ts`]
+    /// values. On the lowest transport-layer entry, it measures L4 connection establishment. On
+    /// a TLS entry, it measures the actual TLS handshake and excludes TLS configuration setup.
+    /// `None` means that the producer did not measure this operation.
+    pub establishment_duration: Option<Duration>,
+    /// Monotonic duration between submitting connection work to an offload runtime and that work
+    /// beginning execution.
+    ///
+    /// This allows consumers to distinguish runtime scheduling delay from network connection
+    /// latency. It is only set on the lowest transport-layer entry when connection establishment
+    /// was offloaded. `None` means that no offload wait occurred or was measured.
+    pub offload_wait_duration: Option<Duration>,
 }
 
 impl Default for TimingDigest {
     fn default() -> Self {
         TimingDigest {
             established_ts: SystemTime::UNIX_EPOCH,
+            establishment_duration: None,
+            offload_wait_duration: None,
         }
     }
 }
