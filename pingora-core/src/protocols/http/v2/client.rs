@@ -33,9 +33,21 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use crate::connectors::http::v2::ConnectionRef;
+use crate::protocols::http::v1::common::validate_content_length_without_transfer_encoding;
 use crate::protocols::{Digest, SocketAddr, UniqueIDType};
 
 pub const PING_TIMEDOUT: ErrorType = ErrorType::new("PingTimedout");
+
+/// Validate response headers after HTTP/2 decoding but before Pingora accepts
+/// them as an upstream response.
+///
+/// Reconciles `Content-Length` per RFC 9110 section 8.6 (hyper parity):
+/// identical duplicates and comma-combined identical values are accepted while
+/// differing or unparseable values are rejected, so an ambiguous H2 response is
+/// not forwarded to a downstream H1 or custom session.
+fn validate_response_header(header: &ResponseHeader) -> Result<()> {
+    validate_content_length_without_transfer_encoding(&header.headers)
+}
 
 pub struct Http2Session {
     send_req: SendRequest<Bytes>,
@@ -191,7 +203,9 @@ impl Http2Session {
             None => resp_fut.await,
         };
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
-        self.response_header = Some(resp.into());
+        let response_header = ResponseHeader::from(resp);
+        validate_response_header(&response_header)?;
+        self.response_header = Some(response_header);
         self.response_body_reader = Some(body_reader);
 
         Ok(())
@@ -220,7 +234,13 @@ impl Http2Session {
         };
 
         let (resp, body_reader) = res.into_parts();
-        self.response_header = Some(resp.into());
+        let response_header = ResponseHeader::from(resp);
+        if let Err(e) = validate_response_header(&response_header) {
+            warn!("invalid h2 response header: {e}");
+            return Poll::Ready(Err(Reason::PROTOCOL_ERROR.into()));
+        }
+
+        self.response_header = Some(response_header);
         self.response_body_reader = Some(body_reader);
 
         Poll::Ready(Ok(()))
@@ -687,5 +707,39 @@ mod tests_h2 {
         }
         assert_eq!(total, 3);
         assert_eq!(h2s.body_bytes_received(), 3);
+    }
+
+    #[test]
+    fn h2_response_conflicting_content_length_rejected() {
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response
+            .append_header(http::header::CONTENT_LENGTH, "5")
+            .unwrap();
+        response
+            .append_header(http::header::CONTENT_LENGTH, "6")
+            .unwrap();
+
+        let err = validate_response_header(&response).unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+    }
+
+    #[test]
+    fn h2_response_duplicate_identical_content_length_accepted() {
+        // RFC 9110 section 8.6 / hyper: identical duplicate (or comma-combined
+        // identical) Content-Length values are reconciled to a single value.
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response
+            .append_header(http::header::CONTENT_LENGTH, "5")
+            .unwrap();
+        response
+            .append_header(http::header::CONTENT_LENGTH, "5")
+            .unwrap();
+        assert!(validate_response_header(&response).is_ok());
+
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response
+            .append_header(http::header::CONTENT_LENGTH, "5, 5")
+            .unwrap();
+        assert!(validate_response_header(&response).is_ok());
     }
 }

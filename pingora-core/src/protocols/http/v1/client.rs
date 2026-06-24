@@ -209,13 +209,23 @@ impl HttpSession {
             .as_ref()
             .expect("response header must be read");
 
-        // ad-hoc checks
-        super::common::check_dup_content_length(&resp_header.headers)?;
-
-        // Validate content-length value if present
-        // Note: Content-Length is already removed if Transfer-Encoding is present
-        if !self.allow_h1_response_invalid_content_length {
-            self.get_content_length()?;
+        // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
+        // parity): identical duplicates and comma-combined identical values are
+        // accepted and collapsed. Conflicting or duplicate values are always an
+        // unrecoverable framing error. A peer may opt to tolerate a single,
+        // otherwise-invalid value and treat the response as close-delimited.
+        // Note: Content-Length is already removed if Transfer-Encoding is present.
+        if let Err(e) = super::common::validate_content_length(&resp_header.headers) {
+            if self.allow_h1_response_invalid_content_length
+                && super::common::content_length_is_single_token(&resp_header.headers)
+            {
+                debug!(
+                    "tolerating invalid Content-Length ({e}); \
+                     treating response as close-delimited"
+                );
+            } else {
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -734,10 +744,10 @@ impl HttpSession {
     }
 
     fn get_content_length(&self) -> Result<Option<usize>> {
-        buf_to_content_length(
-            self.get_header(header::CONTENT_LENGTH)
-                .map(|v| v.as_bytes()),
-        )
+        match self.resp_header() {
+            Some(h) => content_length_for_framing(&h.headers),
+            None => Ok(None),
+        }
     }
 
     fn is_chunked_encoding(&self) -> bool {
@@ -754,20 +764,24 @@ impl HttpSession {
         if is_chunked_encoding_from_headers(headers) {
             // transfer-encoding takes priority over content-length
             self.body_writer.init_chunked();
-        } else {
-            let content_length =
-                header_value_content_length(headers.get(http::header::CONTENT_LENGTH));
-            match content_length {
-                Some(length) => {
-                    self.body_writer.init_content_length(length);
-                }
-                None => {
-                    // Per RFC 9112: "Request messages are never close-delimited because they are
-                    // always explicitly framed by length or transfer coding, with the absence of
-                    // both implying the request ends immediately after the header section."
-                    // Requests without Content-Length or Transfer-Encoding have 0 body
-                    self.body_writer.init_content_length(0);
-                }
+            return;
+        }
+        // Resolve Content-Length through the shared, range-checked helper so the
+        // value is reconciled (identical duplicates / comma lists) and never
+        // truncated. Per RFC 9112, requests are never close-delimited: an absent
+        // or unusable Content-Length means a zero-length body. Headers are
+        // expected to be validated on read.
+        match content_length_for_framing(headers) {
+            Ok(Some(length)) => self.body_writer.init_content_length(length),
+            Ok(None) => self.body_writer.init_content_length(0),
+            Err(e) => {
+                // Headers are validated on read, so this is not expected here;
+                // log the fallback to a zero-length body rather than failing
+                // silently if validation was somehow bypassed.
+                debug!(
+                    "invalid Content-Length while writing request; framing zero-length body: {e}"
+                );
+                self.body_writer.init_content_length(0);
             }
         }
     }
@@ -1418,6 +1432,23 @@ mod tests_stream {
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
     }
 
+    #[tokio::test]
+    async fn allow_invalid_content_length_still_rejects_conflicting_when_configured() {
+        // The tolerance option only relaxes a single, otherwise-invalid value.
+        // Conflicting/duplicate Content-Length is always an unrecoverable framing
+        // error and must be rejected even when the option is enabled.
+        init_log();
+        let input =
+            b"HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.set_allow_h1_response_invalid_content_length(true);
+
+        let res = http_stream.read_response().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().etype(), &ErrorType::InvalidHTTPHeader);
+    }
+
     #[rstest]
     #[case::valid_zero("0")]
     #[case::valid_small("123")]
@@ -1443,6 +1474,42 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         let res = http_stream.read_response().await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_response_accepts_duplicate_identical_content_length() {
+        // RFC 9110 section 8.6 / hyper: identical duplicate Content-Length values
+        // are reconciled to a single value and used to frame the body.
+        init_log();
+        let input_header =
+            b"HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n";
+        let input_body = b"abc";
+        let mock_io = Builder::new()
+            .read(&input_header[..])
+            .read(&input_body[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert!(res.is_ok());
+        let body = http_stream.read_body_ref().await.unwrap().unwrap();
+        assert_eq!(body, input_body);
+        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
+        let body = http_stream.read_body_ref().await.unwrap();
+        assert!(body.is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_response_rejects_conflicting_content_length() {
+        // RFC 9110 section 8.6 / hyper: differing duplicate Content-Length values
+        // are an unrecoverable framing error.
+        init_log();
+        let input =
+            b"HTTP/1.1 200 OK\r\nServer: test\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().etype(), &ErrorType::InvalidHTTPHeader);
     }
 
     #[rstest]

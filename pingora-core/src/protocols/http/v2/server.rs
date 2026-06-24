@@ -34,6 +34,7 @@ use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
     http_req_header_to_wire, request_target_has_forbidden_byte,
 };
+use crate::protocols::http::v1::common::validate_content_length_without_transfer_encoding;
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::server::ShutdownWatch;
@@ -48,6 +49,17 @@ pub use h2::server::Builder as H2Options;
 // 64 KiB decoded header-list limit.
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+// Per-connection lifetime budget for malformed downstream requests (e.g.
+// ambiguous Content-Length framing) that we will reset before treating the
+// connection as abusive and tearing it down. The count is NOT reset by valid
+// streams, so a client cannot evade the bound by interleaving valid requests.
+// A well-behaved client never sends malformed framing, so this is never tripped
+// in practice; it bounds the total reset work a misbehaving or malicious client
+// can drive over the life of a single connection.
+// TODO: expose this through HTTP/2 server configuration if deployments need a
+// different tolerance for malformed stream resets.
+const MAX_MALFORMED_STREAMS_PER_CONN: usize = 32;
 
 /// Build [`H2Options`] with bounded defaults for received requests.
 ///
@@ -122,9 +134,16 @@ pub(crate) async fn accept_downstream_sessions<F>(
     F: FnMut(HttpSession),
 {
     let mut shutdown_initiated = false;
+    // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
+    let mut malformed_streams = 0usize;
     loop {
         let h2_stream = if shutdown_initiated {
-            HttpSession::from_h2_conn(&mut conn, digest.clone()).await
+            HttpSession::from_h2_conn_with_malformed_budget(
+                &mut conn,
+                digest.clone(),
+                &mut malformed_streams,
+            )
+            .await
         } else {
             tokio::select! {
                 // Poll the shutdown signal first so a concurrent signal is
@@ -136,7 +155,11 @@ pub(crate) async fn accept_downstream_sessions<F>(
                     shutdown_initiated = true;
                     continue;
                 }
-                h2_stream = HttpSession::from_h2_conn(&mut conn, digest.clone()) => h2_stream,
+                h2_stream = HttpSession::from_h2_conn_with_malformed_budget(
+                    &mut conn,
+                    digest.clone(),
+                    &mut malformed_streams,
+                ) => h2_stream,
             }
         };
         match h2_stream {
@@ -239,9 +262,33 @@ impl HttpSession {
     /// * `Ok(Some(`[`H2Accept::Rejected`]`))` — the stream was reset during
     ///   acceptance; the caller should keep looping to accept sibling streams.
     /// * `Ok(None)` — the connection is closing, so the loop can exit.
+    ///
+    /// This convenience wrapper uses a fresh malformed-stream counter on every
+    /// call. It preserves the public API, but does not enforce the
+    /// [`MAX_MALFORMED_STREAMS_PER_CONN`] budget across repeated calls by an
+    /// external accept loop. Pingora's built-in downstream accept loop uses the
+    /// internal budgeted helper to share one counter for the connection lifetime.
     pub async fn from_h2_conn(
         conn: &mut H2Connection<Stream>,
         digest: Arc<Digest>,
+    ) -> Result<Option<H2Accept>> {
+        let mut malformed_streams = 0usize;
+        Self::from_h2_conn_with_malformed_budget(conn, digest, &mut malformed_streams).await
+    }
+
+    /// Like [`Self::from_h2_conn`], but shares a malformed-stream counter across
+    /// calls for the same connection.
+    ///
+    /// `malformed_streams` is a per-connection counter, owned by the caller and
+    /// shared across every call for the same connection. It tracks the total
+    /// number of malformed streams reset over the connection's lifetime (it is
+    /// never reset by valid streams), so a client cannot evade the
+    /// [`MAX_MALFORMED_STREAMS_PER_CONN`] bound by interleaving valid requests.
+    /// Callers should initialize it to `0` once per connection.
+    async fn from_h2_conn_with_malformed_budget(
+        conn: &mut H2Connection<Stream>,
+        digest: Arc<Digest>,
+        malformed_streams: &mut usize,
     ) -> Result<Option<H2Accept>> {
         // NOTE: conn.accept().await is what drives the entire connection.
         let res = conn.accept().await.transpose().or_err(
@@ -265,6 +312,36 @@ impl HttpSession {
         if request_target_has_forbidden_byte(request_header.raw_path()) {
             debug!("Rejecting H2 request: forbidden delimiter byte in request target");
             send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
+            return Ok(Some(H2Accept::Rejected));
+        }
+
+        // Reject ambiguous Content-Length framing at the stream level.
+        // Identical duplicates and comma-combined identical values are
+        // reconciled (RFC 9110 section 8.6), but conflicting or unparseable
+        // values are an unrecoverable error and are treated as a stream
+        // error per RFC 9113 section 8.1.1. This keeps the request path
+        // consistent with HTTP/1 and prevents ambiguous framing from being
+        // forwarded (e.g. when downgraded to an HTTP/1 upstream).
+        if let Err(e) = validate_content_length_without_transfer_encoding(&request_header.headers) {
+            // debug, not warn: per-stream, client-influenced; avoids log
+            // floods. Connection-level abuse is surfaced via the error below.
+            debug!("rejecting downstream h2 request: {e}");
+            send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
+
+            *malformed_streams += 1;
+            if *malformed_streams >= MAX_MALFORMED_STREAMS_PER_CONN {
+                // Rare, connection-level abuse signal (at most once per
+                // torn-down connection), so warn! is flood-safe here and
+                // useful for detecting abuse in production.
+                warn!(
+                    "tearing down downstream h2 connection after \
+                     {malformed_streams} malformed requests"
+                );
+                return Error::e_explain(
+                    ErrorType::H2Error,
+                    "too many malformed downstream requests on connection",
+                );
+            }
             return Ok(Some(H2Accept::Rejected));
         }
 
@@ -991,6 +1068,116 @@ mod test {
             // ensure no panics
             assert!(handle.await.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn test_req_conflicting_content_length_rejected() {
+        let (client, server) = duplex(65536);
+
+        let client_task = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            // Conflicting duplicate Content-Length values: unrecoverable framing.
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/")
+                .header("content-length", "5")
+                .header("content-length", "6")
+                .body(())
+                .unwrap();
+
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            // Send a body matching the first Content-Length value so the h2
+            // codec accepts the stream and Pingora's duplicate-CL validation is
+            // what rejects the request.
+            req_body.reserve_capacity(5);
+            req_body.send_data("abcde".into(), true).unwrap();
+
+            // The server must reject the stream with PROTOCOL_ERROR rather than
+            // surface the request to the application.
+            let err = response.await.unwrap_err();
+            assert_eq!(err.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+            // Dropping `h2` lets the connection close so the server loop exits.
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        // The malformed stream is reset during acceptance, so it is reported as
+        // rejected rather than surfaced to the application as a session.
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "malformed request must not surface as a session"
+        );
+
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn(&mut connection, digest),
+        )
+        .await
+        .expect("from_h2_conn hung after rejecting malformed request")
+        .expect("from_h2_conn returned an error after rejecting malformed request");
+        assert!(done.is_none(), "connection should close after rejection");
+
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_req_malformed_stream_budget_exhausted() {
+        let (client, server) = duplex(65536);
+
+        let client_task = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/")
+                .header("content-length", "5")
+                .header("content-length", "6")
+                .body(())
+                .unwrap();
+
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.reserve_capacity(5);
+            req_body.send_data("abcde".into(), true).unwrap();
+            let err = response.await.unwrap_err();
+            if let Some(reason) = err.reason() {
+                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
+            }
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+
+        let err = match HttpSession::from_h2_conn_with_malformed_budget(
+            &mut connection,
+            digest,
+            &mut malformed_streams,
+        )
+        .await
+        {
+            Ok(Some(_)) => panic!("malformed request must not surface as a session"),
+            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.etype(), &ErrorType::H2Error);
+        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
+
+        drop(connection);
+        client_task.await.unwrap();
     }
 
     #[tokio::test]

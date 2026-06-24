@@ -520,9 +520,14 @@ pub struct PeerOptions {
     /// Initial connection-level H2 receive window size in bytes.
     /// If `None`, the default of 8MB is used.
     pub h2_connection_window_size: Option<u32>,
-    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
-    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    /// When enabled, a response carrying a single, otherwise-unparseable
+    /// Content-Length value is treated as a close-delimited response instead of
+    /// being rejected. Conflicting or duplicate Content-Length values (multiple
+    /// header lines, or a comma-separated list with differing values) are an
+    /// unrecoverable framing error and are always rejected, even when this is
+    /// enabled.
     ///
     /// **Note:** This field is unstable and may be removed or changed in future versions.
     /// It exists primarily for compatibility with legacy servers that send malformed headers.

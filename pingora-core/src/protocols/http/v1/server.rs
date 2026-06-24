@@ -444,8 +444,11 @@ impl HttpSession {
     pub fn validate_request(&self) -> Result<()> {
         let req_header = self.req_header();
 
-        // ad-hoc checks
-        super::common::check_dup_content_length(&req_header.headers)?;
+        // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
+        // parity): identical duplicates and comma-combined identical values are
+        // accepted and collapsed; differing or unparseable values are rejected.
+        // This is a no-op when Transfer-Encoding is present (TE overrides CL).
+        super::common::validate_content_length(&req_header.headers)?;
 
         if req_header.headers.contains_key(TRANSFER_ENCODING) {
             // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
@@ -463,8 +466,6 @@ impl HttpSession {
                 return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
             }
         }
-        // validate content-length value if present to avoid ambiguous framing
-        self.get_content_length()?;
 
         Ok(())
     }
@@ -1068,10 +1069,7 @@ impl HttpSession {
     }
 
     fn get_content_length(&self) -> Result<Option<usize>> {
-        buf_to_content_length(
-            self.get_header(header::CONTENT_LENGTH)
-                .map(|v| v.as_bytes()),
-        )
+        content_length_for_framing(&self.req_header().headers)
     }
 
     fn init_body_reader(&mut self) {

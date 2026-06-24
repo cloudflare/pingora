@@ -246,7 +246,6 @@ mod test {
         // Server
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
-
         while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
