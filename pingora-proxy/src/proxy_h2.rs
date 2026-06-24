@@ -197,6 +197,10 @@ where
 
         session.as_mut().enable_retry_buffering();
 
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
@@ -207,9 +211,10 @@ where
                 ctx,
                 write_timeout,
                 &mut downstream_custom_message_writer,
-                &mut downstream_custom_message_reader
+                &mut downstream_custom_message_reader,
+                pipe_state.clone(),
             ),
-            pipe_up_to_down_response(client_session, tx)
+            pipe_up_to_down_response(client_session, tx, pipe_state)
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -304,7 +309,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -384,6 +391,7 @@ where
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
         >,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -727,6 +735,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
@@ -941,6 +952,7 @@ where
 pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
+    pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
     client
         .read_response_header()
@@ -1027,19 +1039,17 @@ pub(crate) async fn pipe_up_to_down_response(
                      * misread as the terminating chunk */
                     continue;
                 }
-                let sent = tx
-                    .send(HttpTask::Body(Some(data), eos))
-                    .await
-                    .or_err(InternalError, "sending h2 body to pipe");
-                // If the response with content-length is sent to an HTTP1 downstream,
-                // bidirection_down_to_up() could decide that the body has finished and exit without
-                // waiting for this function to signal the eos. In this case tx being closed is not
-                // a sign of error. It should happen if the only thing left for the h2 to send is
-                // an empty data frame with eos set.
-                if sent.is_err() && eos && empty {
+                // A send failure is benign only when the downstream half signaled it
+                // completed (e.g. an H1 downstream finished by Content-Length before the
+                // H2 stream signaled end-of-stream): stop reading the upstream stream.
+                // Otherwise the closure is unexpected, so surface the original error.
+                let send_result = tx.send(HttpTask::Body(Some(data), eos)).await;
+                if send_result.is_err()
+                    && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+                {
                     return Ok(());
                 }
-                sent?;
+                send_result.or_err(InternalError, "sending h2 body to pipe")?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
@@ -1049,11 +1059,18 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    // If the channel is already closed, downstream is finished
-    // TODO: note that this does skip trailers/done, but downstream
-    // has already finished so no more is in theory necessary to send
+    // If the channel is already closed, the downstream half is finished. This
+    // skips trailers/done, but the downstream half has already finished so there
+    // is nothing more to send. Benign only if the downstream half signaled
+    // completion; otherwise the closure is unexpected, so surface it.
     if tx.is_closed() {
-        return Ok(());
+        if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+        return Error::e_explain(
+            InternalError,
+            "h2 task pipe closed unexpectedly before trailers",
+        );
     }
 
     // attempt to get trailers, racing against channel close
@@ -1069,21 +1086,35 @@ pub(crate) async fn pipe_up_to_down_response(
             }
         }
         _ = tx.closed() => {
-            return Ok(());
+            // Benign only if the downstream half signaled completion; otherwise
+            // the closure is unexpected, so surface it.
+            if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
+                return Ok(());
+            }
+            return Error::e_explain(InternalError, "h2 task pipe closed unexpectedly while reading trailers");
         }
     };
 
     let trailers = trailers.map(Box::new);
 
     if trailers.is_some() {
-        tx.send(HttpTask::Trailer(trailers))
-            .await
-            .or_err(InternalError, "sending h2 trailer to pipe")?;
+        // Benign only if the downstream signaled completion, same as the body sends above.
+        let send_result = tx.send(HttpTask::Trailer(trailers)).await;
+        if send_result.is_err()
+            && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        send_result.or_err(InternalError, "sending h2 trailer to pipe")?;
     }
 
-    tx.send(HttpTask::Done)
-        .await
-        .unwrap_or_else(|_| debug!("h2 to h1 channel closed!"));
+    let send_result = tx.send(HttpTask::Done).await;
+    if send_result.is_err() && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+    {
+        debug!("h2 to h1 channel closed!");
+        return Ok(());
+    }
+    send_result.or_err(InternalError, "sending h2 done to pipe")?;
 
     Ok(())
 }

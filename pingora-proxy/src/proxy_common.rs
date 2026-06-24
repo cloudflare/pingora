@@ -293,6 +293,32 @@ impl ResponseStateMachine {
     }
 }
 
+/// Shared signal from the downstream proxy half to the upstream half: set to
+/// [`DownstreamComplete`](Self::DownstreamComplete) right before the downstream
+/// half returns successfully, so the upstream half can tell an expected pipe
+/// closure (downstream finished the response by its own framing) from an
+/// unexpected one.
+///
+/// Stored in an `AtomicU8` shared via `Arc`: the downstream half stores with
+/// [`Release`](std::sync::atomic::Ordering::Release) and the upstream half loads
+/// with [`Acquire`](std::sync::atomic::Ordering::Acquire), comparing against
+/// `PipeState::DownstreamComplete as u8`.
+#[derive(Debug)]
+#[repr(u8)]
+pub(crate) enum PipeState {
+    Active = 0,
+    DownstreamComplete = 1,
+}
+
+impl PipeState {
+    /// Whether `raw` — a value previously read from the shared `AtomicU8` — is
+    /// [`DownstreamComplete`](Self::DownstreamComplete). Centralizes the `as u8`
+    /// comparison the upstream halves perform on a task-pipe closure.
+    pub(crate) fn is_downstream_complete(raw: u8) -> bool {
+        raw == PipeState::DownstreamComplete as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

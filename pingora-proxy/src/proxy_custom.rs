@@ -21,7 +21,7 @@ use pingora_core::{
     ImmutStr,
 };
 use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
-use proxy_common::{DownstreamStateMachine, ResponseStateMachine};
+use proxy_common::{DownstreamStateMachine, PipeState, ResponseStateMachine};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -235,6 +235,10 @@ where
             cancel: cancel_upstream_reader_rx,
         };
 
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+
         /* read downstream body and upstream response at the same time */
         let ret = tokio::try_join!(
             self.custom_bidirection_down_to_up(
@@ -246,8 +250,9 @@ where
                 downstream_custom_message_filter_rx,
                 downstream_custom_final_hop,
                 cancel_downstream_reader_tx,
+                pipe_state.clone(),
             ),
-            custom_pipe_up_to_down_response(client_session, tx),
+            custom_pipe_up_to_down_response(client_session, tx, pipe_state),
             upstream_custom_message_forwarder.proxy(),
             downstream_custom_message_forwarder.proxy(),
         );
@@ -286,7 +291,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -371,6 +378,7 @@ where
         )>,
         downstream_custom_final_hop: bool,
         cancel_downstream_reader_tx: oneshot::Sender<()>,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -673,7 +681,9 @@ where
             }
         }
 
-        // Re-raise the error then the loop is finished.
+        // Re-raise the error then the loop is finished. This returns without
+        // signaling PipeState::DownstreamComplete, so the upstream half treats
+        // the resulting task-pipe closure as unexpected and surfaces the error.
         if downstream_state.is_errored() {
             let err = Error::e_explain(WriteError, "downstream_state is_errored");
             error!("custom_bidirection_down_to_up: downstream_state.is_errored",);
@@ -694,6 +704,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
@@ -896,6 +909,7 @@ where
 async fn custom_pipe_up_to_down_response<S: CustomSession>(
     client: &mut S,
     tx: mpsc::Sender<HttpTask>,
+    pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
     let mut is_informational = true;
     while is_informational {
@@ -955,19 +969,17 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
                 } else {
                     HttpTask::Body(Some(data), eos)
                 };
-                let sent = tx
-                    .send(body_task)
-                    .await
-                    .or_err(InternalError, "sending custom body to pipe");
-                // If the if the response with content-length is sent to an HTTP1 downstream,
-                // custom_bidirection_down_to_up() could decide that the body has finished and exit without
-                // waiting for this function to signal the eos. In this case tx being closed is not
-                // an sign of error. It should happen if the only thing left for the custom to send is
-                // an empty data frame with eos set.
-                if sent.is_err() && eos && empty {
+                // A send failure is benign only when the downstream half signaled it
+                // completed (it finished the response by its own framing and dropped the
+                // task pipe): stop reading the upstream. Otherwise the closure is
+                // unexpected, so surface the original error.
+                let send_result = tx.send(body_task).await;
+                if send_result.is_err()
+                    && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+                {
                     return Ok(());
                 }
-                sent?;
+                send_result.or_err(InternalError, "sending custom body to pipe")?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
@@ -990,14 +1002,23 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
     let trailers = trailers.map(Box::new);
 
     if trailers.is_some() {
-        tx.send(HttpTask::Trailer(trailers))
-            .await
-            .or_err(InternalError, "sending custom trailer to pipe")?;
+        // Benign only if the downstream signaled completion, same as the body sends above.
+        let send_result = tx.send(HttpTask::Trailer(trailers)).await;
+        if send_result.is_err()
+            && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        send_result.or_err(InternalError, "sending custom trailer to pipe")?;
     }
 
-    tx.send(HttpTask::Done)
-        .await
-        .unwrap_or_else(|_| debug!("custom channel closed!"));
+    let send_result = tx.send(HttpTask::Done).await;
+    if send_result.is_err() && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+    {
+        debug!("custom channel closed!");
+        return Ok(());
+    }
+    send_result.or_err(InternalError, "sending custom done to pipe")?;
 
     Ok(())
 }
