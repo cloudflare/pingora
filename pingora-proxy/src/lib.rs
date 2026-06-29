@@ -78,6 +78,9 @@ use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
 
+type DownstreamCustomMessageReader =
+    Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
+
 mod proxy_cache;
 mod proxy_common;
 mod proxy_custom;
@@ -809,11 +812,7 @@ impl Session {
         self.shutdown_flag.load(Ordering::Acquire)
     }
 
-    pub fn downstream_custom_message(
-        &mut self,
-    ) -> Result<
-        Option<Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>>,
-    > {
+    pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
         if let Some(custom_session) = self.downstream_session.as_custom_mut() {
             custom_session
                 .take_custom_message_reader()
@@ -825,6 +824,31 @@ impl Session {
         } else {
             Ok(None)
         }
+    }
+
+    fn take_downstream_custom_message_reader(
+        &mut self,
+        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+    ) -> Result<Option<DownstreamCustomMessageReader>> {
+        if downstream_custom_message_writer.is_none() {
+            return Ok(None);
+        }
+
+        let Some(custom_session) = self.downstream_session.as_custom_mut() else {
+            return Ok(None);
+        };
+
+        let Some(reader) = custom_session.take_custom_message_reader() else {
+            if let Some(writer) = downstream_custom_message_writer.take() {
+                custom_session.restore_custom_message_writer(writer)?;
+            }
+            return Err(Error::explain(
+                ReadError,
+                "can't extract custom reader from downstream",
+            ));
+        };
+
+        Ok(Some(reader))
     }
 }
 

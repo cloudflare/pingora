@@ -191,6 +191,32 @@ where
         let (cancel_downstream_reader_tx, cancel_downstream_reader_rx) = oneshot::channel();
         let (_cancel_upstream_reader_tx, cancel_upstream_reader_rx) = oneshot::channel();
 
+        if let Err(e) = self
+            .inner
+            .custom_forwarding(
+                session,
+                ctx,
+                Some(upstream_custom_message_inject_tx),
+                downstream_custom_message_inject_tx,
+            )
+            .await
+        {
+            if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+                if let Err(restore_error) =
+                    custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    return (false, Some(restore_error));
+                }
+
+                if let Err(restore_error) =
+                    custom_session.restore_custom_message_reader(downstream_custom_message_reader)
+                {
+                    return (false, Some(restore_error));
+                }
+            }
+            return (false, Some(e));
+        }
+
         let upstream_custom_message_forwarder = CustomMessageForwarder {
             ctx: "down_to_up".into(),
             reader: &mut downstream_custom_message_reader,
@@ -208,19 +234,6 @@ where
             inject: downstream_custom_message_inject_rx,
             cancel: cancel_upstream_reader_rx,
         };
-
-        if let Err(e) = self
-            .inner
-            .custom_forwarding(
-                session,
-                ctx,
-                Some(upstream_custom_message_inject_tx),
-                downstream_custom_message_inject_tx,
-            )
-            .await
-        {
-            return (false, Some(e));
-        }
 
         /* read downstream body and upstream response at the same time */
         let ret = tokio::try_join!(
