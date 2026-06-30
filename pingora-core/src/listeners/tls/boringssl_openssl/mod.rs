@@ -13,16 +13,18 @@
 // limitations under the License.
 
 use log::debug;
-use pingora_error::{ErrorType, OrErr, Result};
+use pingora_error::{ErrorType, ErrorType::InternalError, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
 use crate::listeners::tls::boringssl_openssl::alpn::valid_alpn;
+use crate::offload::OffloadRuntime;
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
+use crate::server::configuration::ServerConf;
 use crate::tls::ssl::AlpnError;
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use crate::{
-    listeners::TlsAcceptCallbacks,
+    listeners::{SharedTlsAcceptCallbacks, TlsAcceptCallbacks},
     protocols::tls::{
         server::{handshake, handshake_with_callback},
         SslStream,
@@ -32,13 +34,15 @@ pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
 pub(crate) struct Acceptor {
     ssl_acceptor: SslAcceptor,
-    callbacks: Option<TlsAcceptCallbacks>,
+    callbacks: Option<SharedTlsAcceptCallbacks>,
+    offload: Option<OffloadRuntime>,
 }
 
 /// The TLS settings of a listening endpoint
 pub struct TlsSettings {
     accept_builder: SslAcceptorBuilder,
     callbacks: Option<TlsAcceptCallbacks>,
+    offload_threadpool: Option<(usize, usize)>,
 }
 
 impl From<SslAcceptorBuilder> for TlsSettings {
@@ -46,6 +50,7 @@ impl From<SslAcceptorBuilder> for TlsSettings {
         TlsSettings {
             accept_builder: settings,
             callbacks: None,
+            offload_threadpool: None,
         }
     }
 }
@@ -84,6 +89,7 @@ impl TlsSettings {
         Ok(TlsSettings {
             accept_builder,
             callbacks: None,
+            offload_threadpool: None,
         })
     }
 
@@ -97,7 +103,40 @@ impl TlsSettings {
         Ok(TlsSettings {
             accept_builder,
             callbacks: Some(callbacks),
+            offload_threadpool: None,
         })
+    }
+
+    /// Offload server-side TLS handshakes for this endpoint to dedicated
+    /// single-threaded runtime pools.
+    ///
+    /// `shards` partitions accepted connections by connection id, and
+    /// `threads_per_shard` controls how many single-threaded runtimes are
+    /// available per shard. Both values must be greater than zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either `shards` or `threads_per_shard` is zero.
+    #[track_caller]
+    pub fn set_offload_threadpool(&mut self, shards: usize, threads_per_shard: usize) {
+        assert!(shards != 0, "shards must be greater than zero");
+        assert!(
+            threads_per_shard != 0,
+            "threads_per_shard must be greater than zero"
+        );
+        self.offload_threadpool = Some((shards, threads_per_shard));
+    }
+
+    /// Offload server-side TLS handshakes using the downstream TLS offload
+    /// settings in [`ServerConf`], when both values are set and non-zero.
+    ///
+    /// This helper lets callers wire configuration files into per-listener
+    /// [`TlsSettings`]. If either configuration value is unset or zero,
+    /// this method leaves handshake offload disabled.
+    pub fn set_offload_threadpool_from_server_conf(&mut self, server_conf: &ServerConf) {
+        if let Some((shards, threads_per_shard)) = server_conf.downstream_tls_offload_threadpool() {
+            self.set_offload_threadpool(shards, threads_per_shard);
+        }
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.
@@ -132,17 +171,32 @@ impl TlsSettings {
     pub(crate) fn build(self) -> Acceptor {
         Acceptor {
             ssl_acceptor: self.accept_builder.build(),
-            callbacks: self.callbacks,
+            callbacks: self.callbacks.map(SharedTlsAcceptCallbacks::from),
+            offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
+                OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
+            }),
         }
     }
 }
 
 impl Acceptor {
-    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<SslStream<S>> {
+    pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<SslStream<S>> {
         debug!("new ssl session");
-        // TODO: be able to offload this handshake in a thread pool
-        if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(&self.ssl_acceptor, stream, cb).await
+        if let Some(offload) = self.offload.as_ref() {
+            let ssl_acceptor = self.ssl_acceptor.clone();
+            let callbacks = self.callbacks.clone();
+            let rt = offload.get_runtime(stream.id() as u64);
+            rt.spawn(async move {
+                if let Some(cb) = callbacks.as_ref() {
+                    handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
+                } else {
+                    handshake(&ssl_acceptor, stream).await
+                }
+            })
+            .await
+            .or_err(InternalError, "TLS offload runtime failure")?
+        } else if let Some(cb) = self.callbacks.as_ref() {
+            handshake_with_callback(&self.ssl_acceptor, stream, cb.as_ref()).await
         } else {
             handshake(&self.ssl_acceptor, stream).await
         }

@@ -95,6 +95,7 @@ pub mod apps;
 pub mod connectors;
 pub mod listeners;
 pub mod modules;
+pub(crate) mod offload;
 pub mod protocols;
 pub mod server;
 pub mod services;

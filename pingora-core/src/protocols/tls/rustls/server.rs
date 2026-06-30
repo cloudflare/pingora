@@ -14,7 +14,7 @@
 
 //! Rustls TLS server specific implementation
 
-use crate::listeners::TlsAcceptCallbacks;
+use crate::listeners::TlsAccept;
 use crate::protocols::tls::rustls::TlsStream;
 use crate::protocols::tls::TlsRef;
 use crate::protocols::IO;
@@ -69,7 +69,7 @@ pub async fn handshake<S: IO>(acceptor: &Acceptor, io: S) -> Result<TlsStream<S>
 pub async fn handshake_with_callback<S: IO>(
     acceptor: &Acceptor,
     io: S,
-    callbacks: &TlsAcceptCallbacks,
+    callbacks: &(dyn TlsAccept + Send + Sync),
 ) -> Result<TlsStream<S>> {
     let mut tls_stream = prepare_tls_stream(acceptor, io).await?;
     let done = Pin::new(&mut tls_stream).start_accept().await?;

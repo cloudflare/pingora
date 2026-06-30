@@ -120,6 +120,8 @@ pub trait TlsAccept {
 }
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
+#[cfg(any(feature = "openssl_derived", feature = "rustls"))]
+pub(crate) type SharedTlsAcceptCallbacks = Arc<dyn TlsAccept + Send + Sync>;
 
 /// Callback for processing raw bytes before TLS handshake.
 ///
@@ -664,6 +666,79 @@ mod test {
 
         let res = client.get(format!("https://{addr}")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_listen_tls_with_offload() {
+        use tokio::io::AsyncReadExt;
+
+        const REQUESTS: usize = 8;
+
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut tls_settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        let conf = crate::server::configuration::ServerConf {
+            downstream_tls_offload_threadpools: Some(2),
+            downstream_tls_offload_thread_per_pool: Some(2),
+            ..Default::default()
+        };
+        tls_settings.set_offload_threadpool_from_server_conf(&conf);
+
+        let mut listeners = Listeners::new();
+        listeners.add_tls_with_settings("127.0.0.1:0", None, tls_settings);
+        let listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::with_capacity(REQUESTS);
+            for _ in 0..REQUESTS {
+                streams.push(listener.accept().await.unwrap());
+            }
+
+            let mut responses = Vec::with_capacity(REQUESTS);
+            for stream in streams {
+                responses.push(tokio::spawn(async move {
+                    let mut stream = stream.handshake().await.unwrap();
+                    let mut buf = [0; 1024];
+                    let _ = stream.read(&mut buf).await.unwrap();
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+                        .await
+                        .unwrap();
+                }));
+            }
+
+            for response in responses {
+                response.await.unwrap();
+            }
+        });
+
+        let url = format!("https://{addr}");
+        let mut requests = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let url = url.clone();
+            requests.push(tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .build()
+                    .unwrap();
+                client.get(url).send().await.unwrap().status()
+            }));
+        }
+
+        for request in requests {
+            assert_eq!(request.await.unwrap(), reqwest::StatusCode::OK);
+        }
+        server.await.unwrap();
     }
 
     #[cfg(feature = "connection_filter")]

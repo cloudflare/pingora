@@ -16,8 +16,6 @@
 
 pub mod http;
 pub mod l4;
-mod offload;
-
 #[cfg(feature = "any_tls")]
 mod tls;
 
@@ -28,10 +26,10 @@ use crate::protocols::Stream;
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
 
+use crate::offload::OffloadRuntime;
 pub use l4::Connect as L4Connect;
 use l4::{connect as l4_connect, BindTo};
 use log::{debug, error, warn};
-use offload::OffloadRuntime;
 use parking_lot::RwLock;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
@@ -116,12 +114,6 @@ pub struct ConnectorOptions {
 impl ConnectorOptions {
     /// Derive the [ConnectorOptions] from a [ServerConf]
     pub fn from_server_conf(server_conf: &ServerConf) -> Self {
-        // if both pools and threads are Some(>0)
-        let offload_threadpool = server_conf
-            .upstream_connect_offload_threadpools
-            .zip(server_conf.upstream_connect_offload_thread_per_pool)
-            .filter(|(pools, threads)| *pools > 0 && *threads > 0);
-
         // create SocketAddrs with port 0 for src addr bind
 
         let bind_to_v4 = server_conf
@@ -150,7 +142,7 @@ impl ConnectorOptions {
             keepalive_pool_size: server_conf
                 .upstream_keepalive_pool_size
                 .saturating_mul(server_conf.threads.max(1)),
-            offload_threadpool,
+            offload_threadpool: server_conf.upstream_connect_offload_threadpool(),
             bind_to_v4,
             bind_to_v6,
             keepalive_pool_callback: None,
@@ -211,7 +203,7 @@ impl TransportConnector {
         TransportConnector {
             tls_ctx: tls::Connector::new(options),
             connection_pool: Arc::new(ConnectionPool::new(pool_size)),
-            offload: offload.map(|v| OffloadRuntime::new(v.0, v.1)),
+            offload: offload.map(|v| OffloadRuntime::new("upstream connect offload", v.0, v.1)),
             bind_to_v4,
             bind_to_v6,
             preferred_http_version: PreferredHttpVersion::new(),

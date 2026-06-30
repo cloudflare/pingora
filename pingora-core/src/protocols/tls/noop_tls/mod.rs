@@ -73,6 +73,8 @@ pub mod listeners {
     use pingora_error::Result;
     use tokio::io::{AsyncRead, AsyncWrite};
 
+    use crate::server::configuration::ServerConf;
+
     use super::stream::SslStream;
 
     pub struct Acceptor;
@@ -89,6 +91,10 @@ pub mod listeners {
         }
 
         pub fn enable_h2(&mut self) {}
+
+        pub fn set_offload_threadpool(&mut self, _: usize, _: usize) {}
+
+        pub fn set_offload_threadpool_from_server_conf(&mut self, _: &ServerConf) {}
     }
 
     impl Acceptor {

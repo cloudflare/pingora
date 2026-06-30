@@ -36,9 +36,33 @@ group: webusers
 | runtime_metrics_poll_time_histogram_resolution_micros | Width of the first Tokio poll-time histogram bucket in microseconds. Must be greater than 0. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | number |
 | runtime_metrics_poll_time_histogram_buckets | Number of Tokio poll-time histogram buckets. Must be greater than 0 and at most 1024. Memory usage scales with runtimes × workers × buckets. Ignored unless `runtime_metrics_poll_time_histogram` is enabled. | number |
 | upstream_keepalive_pool_size | The number of idle upstream connections to keep per tokio worker. The pool's effective ceiling is `upstream_keepalive_pool_size × threads`. Eviction is globally consistent across workers. | number |
+| upstream_connect_offload_threadpools | Number of dedicated thread pools to use for upstream connection establishment. Enabled only when `upstream_connect_offload_thread_per_pool` is also set and both values are greater than 0. | number |
+| upstream_connect_offload_thread_per_pool | Number of threads per dedicated upstream connection establishment pool. Enabled only when `upstream_connect_offload_threadpools` is also set and both values are greater than 0. | number |
+| downstream_tls_offload_threadpools | Number of dedicated thread pools to use for downstream TLS handshakes. Enabled only when `downstream_tls_offload_thread_per_pool` is also set and both values are greater than 0. | number |
+| downstream_tls_offload_thread_per_pool | Number of threads per dedicated downstream TLS handshake pool. Enabled only when `downstream_tls_offload_threadpools` is also set and both values are greater than 0. | number |
 | daemon_wait_for_ready | When `true` and `daemon` is `true`, the parent process waits for the daemon to signal readiness (via `SIGUSR1`) before exiting. This causes systemd to delay sending `SIGQUIT` to the old process until the new instance is fully bootstrapped. Default: `false` | bool |
 | daemon_ready_timeout_seconds | How long (in seconds) the parent waits for the daemon to signal readiness when `daemon_wait_for_ready` is `true`. If the daemon does not signal in time the parent exits with a non-zero code, causing systemd to abort the reload. Default: `600` | number |
 | daemon_notify_timeout_seconds | How long (in seconds) the daemon retries sending `SIGUSR1` to the parent when the attempt fails with a permission error. This covers the brief window after the fork where the parent has not yet dropped its UID to match the daemon. Default: `60` | number |
+
+## Offload pools
+
+The upstream connection offload settings are applied automatically when callers
+build `ConnectorOptions` with `ConnectorOptions::from_server_conf()`.
+
+Downstream TLS handshake offload is applied per TLS listener because each
+listener owns its own `TlsSettings`. Callers that build TLS listeners from a
+`ServerConf` can opt in by applying the config before adding the listener:
+
+```rust,no_run
+use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::server::configuration::ServerConf;
+
+fn tls_settings_from_conf(conf: &ServerConf) -> pingora_error::Result<TlsSettings> {
+    let mut tls_settings = TlsSettings::intermediate("server.crt", "key.pem")?;
+    tls_settings.set_offload_threadpool_from_server_conf(conf);
+    Ok(tls_settings)
+}
+```
 
 ## dial9
 

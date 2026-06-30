@@ -14,8 +14,10 @@
 
 use std::sync::Arc;
 
-use crate::listeners::TlsAcceptCallbacks;
+use crate::listeners::SharedTlsAcceptCallbacks;
+use crate::offload::OffloadRuntime;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
+use crate::server::configuration::ServerConf;
 use log::debug;
 use pingora_error::ErrorType::InternalError;
 use pingora_error::{Error, OrErr, Result};
@@ -32,11 +34,13 @@ pub struct TlsSettings {
     cert_path: String,
     key_path: String,
     client_cert_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    offload_threadpool: Option<(usize, usize)>,
 }
 
 pub struct Acceptor {
     pub acceptor: RusTlsAcceptor,
-    callbacks: Option<TlsAcceptCallbacks>,
+    callbacks: Option<SharedTlsAcceptCallbacks>,
+    offload: Option<OffloadRuntime>,
 }
 
 impl TlsSettings {
@@ -80,6 +84,9 @@ impl TlsSettings {
         Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
             callbacks: None,
+            offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
+                OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
+            }),
         }
     }
 
@@ -98,6 +105,38 @@ impl TlsSettings {
         self.client_cert_verifier = Some(verifier);
     }
 
+    /// Offload server-side TLS handshakes for this endpoint to dedicated
+    /// single-threaded runtime pools.
+    ///
+    /// `shards` partitions accepted connections by connection id, and
+    /// `threads_per_shard` controls how many single-threaded runtimes are
+    /// available per shard. Both values must be greater than zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either `shards` or `threads_per_shard` is zero.
+    #[track_caller]
+    pub fn set_offload_threadpool(&mut self, shards: usize, threads_per_shard: usize) {
+        assert!(shards != 0, "shards must be greater than zero");
+        assert!(
+            threads_per_shard != 0,
+            "threads_per_shard must be greater than zero"
+        );
+        self.offload_threadpool = Some((shards, threads_per_shard));
+    }
+
+    /// Offload server-side TLS handshakes using the downstream TLS offload
+    /// settings in [`ServerConf`], when both values are set and non-zero.
+    ///
+    /// This helper lets callers wire configuration files into per-listener
+    /// [`TlsSettings`]. If either configuration value is unset or zero,
+    /// this method leaves handshake offload disabled.
+    pub fn set_offload_threadpool_from_server_conf(&mut self, server_conf: &ServerConf) {
+        if let Some((shards, threads_per_shard)) = server_conf.downstream_tls_offload_threadpool() {
+            self.set_offload_threadpool(shards, threads_per_shard);
+        }
+    }
+
     pub fn intermediate(cert_path: &str, key_path: &str) -> Result<Self>
     where
         Self: Sized,
@@ -107,6 +146,7 @@ impl TlsSettings {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
             client_cert_verifier: None,
+            offload_threadpool: None,
         })
     }
 
@@ -123,11 +163,28 @@ impl TlsSettings {
 }
 
 impl Acceptor {
-    pub async fn tls_handshake<S: IO>(&self, stream: S) -> Result<TlsStream<S>> {
+    pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
-        // TODO: be able to offload this handshake in a thread pool
-        if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(self, stream, cb).await
+        if let Some(offload) = self.offload.as_ref() {
+            // Clone without offload to prevent recursive offloading on the worker runtime.
+            let acceptor = Acceptor {
+                acceptor: self.acceptor.clone(),
+                callbacks: None,
+                offload: None,
+            };
+            let callbacks = self.callbacks.clone();
+            let rt = offload.get_runtime(stream.id() as u64);
+            rt.spawn(async move {
+                if let Some(cb) = callbacks.as_ref() {
+                    handshake_with_callback(&acceptor, stream, cb.as_ref()).await
+                } else {
+                    handshake(&acceptor, stream).await
+                }
+            })
+            .await
+            .or_err(InternalError, "TLS offload runtime failure")?
+        } else if let Some(cb) = self.callbacks.as_ref() {
+            handshake_with_callback(self, stream, cb.as_ref()).await
         } else {
             handshake(self, stream).await
         }
