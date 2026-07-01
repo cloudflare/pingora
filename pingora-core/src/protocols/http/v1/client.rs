@@ -34,6 +34,8 @@ use crate::utils::{BufRef, KVRef};
 /// The HTTP 1.x client session
 pub struct HttpSession {
     buf: Bytes,
+    /// In-progress response header bytes, kept on the session so cancelled reads can resume.
+    response_header_read_buf: BytesMut,
     pub(crate) underlying_stream: Stream,
     raw_header: Option<BufRef>,
     preread_body: Option<BufRef>,
@@ -81,6 +83,7 @@ impl HttpSession {
         HttpSession {
             underlying_stream: stream,
             buf: Bytes::new(), // zero size, will be replaced by parsed header later
+            response_header_read_buf: BytesMut::new(),
             raw_header: None,
             preread_body: None,
             body_reader: BodyReader::new(true),
@@ -218,63 +221,190 @@ impl HttpSession {
         Ok(())
     }
 
+    fn clear_response_header_read_state(&mut self) {
+        self.response_header_read_buf.clear();
+        self.preread_body = None;
+    }
+
+    fn fail_response_header_read<T>(&mut self, e: pingora_error::BError) -> Result<T> {
+        self.clear_response_header_read_state();
+        Err(e)
+    }
+
     /// Read the response header from the server
     /// This function can be called multiple times, if the headers received are just informational
     /// headers.
     pub async fn read_response(&mut self) -> Result<usize> {
-        if self.preread_body.as_ref().is_none_or(|b| b.is_empty()) {
-            // preread_body is set after a completed valid response header is read
-            // if called multiple times (i.e. after informational responses),
-            // we want to parse the already read buffer bytes as more headers.
-            // (https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
+        let mut parse_existing_buffer = true;
+
+        if self.response_header_read_buf.is_empty() {
+            // preread_body is set after a completed valid response header is read.
+            // If read_response() is called multiple times (i.e. after informational
+            // responses), already-read bytes after the 1xx header should be parsed as
+            // more response headers. (https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
             // "A 1xx response is terminated by the end of the header section;
             // it cannot contain content or trailers.")
-            // If this next read_response call completes successfully,
-            // self.buf will be reset to the last response + any body.
-            self.buf.clear();
+            //
+            // Move these bytes into response_header_read_buf so that if parsing the
+            // next header is cancelled, a future call can resume without dropping the
+            // preread bytes.
+            if let Some(preread) = self.preread_body.take().filter(|b| !b.is_empty()) {
+                self.response_header_read_buf
+                    .put_slice(preread.get(&self.buf));
+            } else {
+                // If this next read_response call completes successfully, self.buf
+                // will be reset to the last response + any body.
+                self.buf.clear();
+                parse_existing_buffer = false;
+            }
         }
-        let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
-        let mut already_read: usize = 0;
+
         loop {
+            if parse_existing_buffer {
+                let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+                let mut resp = httparse::Response::new(&mut headers);
+                let parsed = parse_resp_buffer(&mut resp, &self.response_header_read_buf);
+                match parsed {
+                    HeaderParseState::Complete(s) => {
+                        let total_read = self.response_header_read_buf.len();
+                        let base = self.response_header_read_buf.as_ptr() as usize;
+                        let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
+
+                        // Note: resp.headers has the correct number of headers
+                        // while header_refs doesn't as it is still empty
+                        let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
+
+                        let mut response_header = match ResponseHeader::build(
+                            resp.code.unwrap(),
+                            Some(resp.headers.len()),
+                        ) {
+                            Ok(header) => Box::new(header),
+                            Err(e) => return self.fail_response_header_read(e),
+                        };
+
+                        // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
+                        // "Since HTTP/1.0 did not define any 1xx status codes,
+                        // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
+                        response_header.set_version(match resp.version {
+                            Some(1) => Version::HTTP_11,
+                            Some(0) => Version::HTTP_10,
+                            _ => Version::HTTP_09,
+                        });
+
+                        if let Err(e) = response_header.set_reason_phrase(resp.reason) {
+                            return self.fail_response_header_read(e);
+                        }
+
+                        let buf = std::mem::take(&mut self.response_header_read_buf).freeze();
+
+                        for header in header_refs {
+                            let header_name = header.get_name_bytes(&buf);
+                            let header_name = header_name.into_case_header_name();
+                            let value_bytes = header.get_value_bytes(&buf);
+                            let header_value = pingora_http::header_value_from_raw(value_bytes);
+                            if let Err(e) = response_header
+                                .append_header(header_name, header_value)
+                                .or_err(InvalidHTTPHeader, "while parsing request header")
+                            {
+                                return self.fail_response_header_read(e);
+                            }
+                        }
+
+                        let contains_transfer_encoding = response_header
+                            .headers
+                            .contains_key(header::TRANSFER_ENCODING);
+                        let contains_content_length =
+                            response_header.headers.contains_key(header::CONTENT_LENGTH);
+
+                        // Transfer encoding overrides content length, so when
+                        // both are present, we MUST remove content length. This is
+                        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
+                        if contains_content_length && contains_transfer_encoding {
+                            response_header.remove_header(&header::CONTENT_LENGTH);
+                        }
+
+                        self.raw_header = Some(BufRef(0, s));
+                        self.preread_body = Some(BufRef(s, total_read));
+                        self.buf = buf;
+                        self.response_header = Some(response_header);
+                        if let Err(e) = self.validate_response() {
+                            return self.fail_response_header_read(e);
+                        }
+                        // convert to upgrade body type
+                        // https://datatracker.ietf.org/doc/html/rfc9110#status.101
+                        // as an "informational" header, this cannot have a body
+                        self.upgraded = self
+                            .is_upgrade(self.response_header.as_deref().expect("init above"))
+                            .unwrap_or(false);
+                        // init body reader if upgrade status has changed body mode
+                        // (read_response_task will immediately try to init body afterwards anyways)
+                        // informational headers will automatically avoid initializing body reader
+                        self.init_body_reader();
+                        // note that the (request) body writer is converted to close delimit
+                        // when the upgraded body tasks are received
+                        return Ok(s);
+                    }
+                    HeaderParseState::Partial => { /* read more below */ }
+                    HeaderParseState::Invalid(e) => {
+                        return self.fail_response_header_read(Error::because(
+                            InvalidHTTPHeader,
+                            format!("buf: {}", self.response_header_read_buf.escape_ascii()),
+                            e,
+                        ));
+                    }
+                }
+            }
+
+            let already_read = self.response_header_read_buf.len();
             if already_read > MAX_HEADER_SIZE {
                 /* NOTE: this check only blocks second read. The first large read is allowed
                 since the buf is already allocated. The goal is to avoid slowly bloating
                 this buffer */
-                return Error::e_explain(
+                return self.fail_response_header_read(Error::explain(
                     InvalidHTTPHeader,
                     format!("Response header larger than {MAX_HEADER_SIZE}"),
-                );
+                ));
             }
 
-            let preread = self.preread_body.take();
-            let read_result = if let Some(preread) = preread.filter(|b| !b.is_empty()) {
-                buf.put_slice(preread.get(&self.buf));
-                Ok(preread.len())
-            } else {
-                let read_fut = self.underlying_stream.read_buf(&mut buf);
-                match self.read_timeout {
-                    Some(t) => timeout(t, read_fut).await.map_err(|_| {
-                        Error::explain(ReadTimedout, "while reading response headers")
-                    })?,
-                    None => read_fut.await,
-                }
-            };
-            let n = match read_result {
-                Ok(n) => match n {
-                    0 => {
-                        let mut e = Error::explain(
-                            ConnectionClosed,
-                            format!(
-                                "while reading response headers, bytes already read: {already_read}",
-                            ),
-                        );
-                        e.retry = RetryType::ReusedOnly;
-                        return Err(e);
-                    }
-                    _ => {
-                        n /* read n bytes, continue */
+            if self
+                .response_header_read_buf
+                .capacity()
+                .saturating_sub(self.response_header_read_buf.len())
+                < INIT_HEADER_BUF_SIZE
+            {
+                self.response_header_read_buf.reserve(INIT_HEADER_BUF_SIZE);
+            }
+
+            let read_fut = self
+                .underlying_stream
+                .read_buf(&mut self.response_header_read_buf);
+            let read_result = match self.read_timeout {
+                Some(t) => match timeout(t, read_fut).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        return self.fail_response_header_read(Error::explain(
+                            ReadTimedout,
+                            "while reading response headers",
+                        ));
                     }
                 },
+                None => read_fut.await,
+            };
+
+            match read_result {
+                Ok(0) => {
+                    let mut e = Error::explain(
+                        ConnectionClosed,
+                        format!(
+                            "while reading response headers, bytes already read: {already_read}",
+                        ),
+                    );
+                    e.retry = RetryType::ReusedOnly;
+                    return self.fail_response_header_read(e);
+                }
+                Ok(_) => {
+                    parse_existing_buffer = true;
+                }
                 Err(e) => {
                     let true_io_error = e.raw_os_error().is_some();
                     let mut e = Error::because(
@@ -288,89 +418,7 @@ impl HttpSession {
                     if true_io_error {
                         e.retry = RetryType::ReusedOnly;
                     } // else: not safe to retry TLS error
-                    return Err(e);
-                }
-            };
-            already_read += n;
-            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut resp = httparse::Response::new(&mut headers);
-            let parsed = parse_resp_buffer(&mut resp, &buf);
-            match parsed {
-                HeaderParseState::Complete(s) => {
-                    self.raw_header = Some(BufRef(0, s));
-                    self.preread_body = Some(BufRef(s, already_read));
-                    let base = buf.as_ptr() as usize;
-                    let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
-
-                    // Note: resp.headers has the correct number of headers
-                    // while header_refs doesn't as it is still empty
-                    let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
-
-                    let mut response_header = Box::new(ResponseHeader::build(
-                        resp.code.unwrap(),
-                        Some(resp.headers.len()),
-                    )?);
-
-                    // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
-                    // "Since HTTP/1.0 did not define any 1xx status codes,
-                    // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
-                    response_header.set_version(match resp.version {
-                        Some(1) => Version::HTTP_11,
-                        Some(0) => Version::HTTP_10,
-                        _ => Version::HTTP_09,
-                    });
-
-                    response_header.set_reason_phrase(resp.reason)?;
-
-                    let buf = buf.freeze();
-
-                    for header in header_refs {
-                        let header_name = header.get_name_bytes(&buf);
-                        let header_name = header_name.into_case_header_name();
-                        let value_bytes = header.get_value_bytes(&buf);
-                        let header_value = pingora_http::header_value_from_raw(value_bytes);
-                        response_header
-                            .append_header(header_name, header_value)
-                            .or_err(InvalidHTTPHeader, "while parsing request header")?;
-                    }
-
-                    let contains_transfer_encoding = response_header
-                        .headers
-                        .contains_key(header::TRANSFER_ENCODING);
-                    let contains_content_length =
-                        response_header.headers.contains_key(header::CONTENT_LENGTH);
-
-                    // Transfer encoding overrides content length, so when
-                    // both are present, we MUST remove content length. This is
-                    // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.3
-                    if contains_content_length && contains_transfer_encoding {
-                        response_header.remove_header(&header::CONTENT_LENGTH);
-                    }
-
-                    self.buf = buf;
-                    self.response_header = Some(response_header);
-                    self.validate_response()?;
-                    // convert to upgrade body type
-                    // https://datatracker.ietf.org/doc/html/rfc9110#status.101
-                    // as an "informational" header, this cannot have a body
-                    self.upgraded = self
-                        .is_upgrade(self.response_header.as_deref().expect("init above"))
-                        .unwrap_or(false);
-                    // init body reader if upgrade status has changed body mode
-                    // (read_response_task will immediately try to init body afterwards anyways)
-                    // informational headers will automatically avoid initializing body reader
-                    self.init_body_reader();
-                    // note that the (request) body writer is converted to close delimit
-                    // when the upgraded body tasks are received
-                    return Ok(s);
-                }
-                HeaderParseState::Partial => { /* continue the loop */ }
-                HeaderParseState::Invalid(e) => {
-                    return Error::e_because(
-                        InvalidHTTPHeader,
-                        format!("buf: {}", buf.escape_ascii()),
-                        e,
-                    );
+                    return self.fail_response_header_read(e);
                 }
             }
         }
@@ -1167,6 +1215,126 @@ mod tests_stream {
 
         assert_eq!(Some(StatusCode::OK), http_stream.get_status());
         assert_eq!(Version::HTTP_11, http_stream.resp_header().unwrap().version);
+    }
+
+    async fn read_response_with_cancellations(
+        http_stream: &mut HttpSession,
+    ) -> (Result<usize>, usize) {
+        let mut cancel_count = 0;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                res = http_stream.read_response() => {
+                    return (res, cancel_count);
+                }
+            }
+        }
+    }
+
+    async fn read_response_task_with_cancellations(
+        http_stream: &mut HttpSession,
+    ) -> (Result<HttpTask>, usize) {
+        let mut cancel_count = 0;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                res = http_stream.read_response_task() => {
+                    return (res, cancel_count);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_response_cancel_safe_after_partial_header_read() {
+        init_log();
+        let input1 = b"HTTP/1.1 200";
+        let input2 = b" OK\r\nContent-Length: 0\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .wait(Duration::from_millis(100))
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let (res, cancel_count) = read_response_with_cancellations(&mut http_stream).await;
+
+        assert!(cancel_count > 0, "read_response should have been cancelled");
+        assert_eq!(expected_header.len(), res.unwrap());
+        assert_eq!(Some(StatusCode::OK), http_stream.get_status());
+        assert_eq!(expected_header, http_stream.get_headers_raw());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_response_task_cancel_safe_after_informational_preread() {
+        init_log();
+        let input1 = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 2";
+        let input2 = b"00 OK\r\nContent-Length: 0\r\n\r\n";
+        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .wait(Duration::from_millis(100))
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => panic!("task should be informational header"),
+        }
+
+        let (task, cancel_count) = read_response_task_with_cancellations(&mut http_stream).await;
+
+        assert!(
+            cancel_count > 0,
+            "final response read should have been cancelled"
+        );
+        match task.unwrap() {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob);
+            }
+            task => panic!("task {task:?} should be final header"),
+        }
+        assert_eq!(expected_header, http_stream.get_headers_raw());
+    }
+
+    #[tokio::test]
+    async fn read_response_clears_header_read_state_on_error() {
+        init_log();
+        let input = b"HTTP/1.1 100 Continue\r\n\r\nHTP/1.1 200 OK\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 100);
+                assert!(!eob);
+            }
+            _ => panic!("task should be informational header"),
+        }
+
+        let err = http_stream.read_response_task().await.unwrap_err();
+
+        assert_eq!(err.etype(), &ErrorType::InvalidHTTPHeader);
+        assert!(http_stream.response_header_read_buf.is_empty());
+        assert!(http_stream.preread_body.is_none());
     }
 
     #[tokio::test]
