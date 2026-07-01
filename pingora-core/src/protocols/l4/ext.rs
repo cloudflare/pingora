@@ -474,10 +474,10 @@ pub fn get_original_dest(_sock: RawSocket) -> Result<Option<SocketAddr>> {
     Ok(None)
 }
 
-/// The underlying error and local address from a failed TCP connection attempt.
+/// The underlying error (if any) and local address from a failed connection attempt.
 #[derive(Debug)]
 pub(crate) struct ConnectErrorDetails {
-    source: Box<dyn std::error::Error + Send + Sync>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
     local_addr: Option<SocketAddr>,
 }
 
@@ -487,7 +487,7 @@ impl ConnectErrorDetails {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Self {
-            source: source.into(),
+            source: Some(source.into()),
             local_addr,
         }
     }
@@ -499,13 +499,23 @@ impl ConnectErrorDetails {
 
 impl std::fmt::Display for ConnectErrorDetails {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
+        match &self.source {
+            Some(source) => source.fmt(f),
+            // No wrapped error (e.g. a TLS handshake failure, whose detail stays in the parent's
+            // context): surface the local address so the chain still carries useful information.
+            None => match self.local_addr {
+                Some(local_addr) => write!(f, "local address {local_addr}"),
+                None => Ok(()),
+            },
+        }
     }
 }
 
 impl std::error::Error for ConnectErrorDetails {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -515,6 +525,25 @@ pub(crate) fn connect_error_local_addr(error: &Error) -> Option<SocketAddr> {
         .root_cause()
         .downcast_ref::<ConnectErrorDetails>()
         .and_then(ConnectErrorDetails::local_addr)
+}
+
+/// Attaches the local address to an error from a stage after the socket connected (e.g. a TLS
+/// handshake failure) so it stays recoverable via
+/// [`crate::connectors::l4::ConnectErrorExt::connect_local_addr`]. Returns `e` unchanged when
+/// `local_addr` is `None`.
+pub(crate) fn attach_connect_local_addr(
+    mut e: Box<Error>,
+    local_addr: Option<SocketAddr>,
+) -> Box<Error> {
+    if let Some(local_addr) = local_addr {
+        // Wrap any existing cause and take over as the root cause; the error's own type, retry
+        // semantics, and context are left in place.
+        e.cause = Some(Box::new(ConnectErrorDetails {
+            source: e.cause.take(),
+            local_addr: Some(local_addr),
+        }));
+    }
+    e
 }
 
 /// State retained across a connection timeout to preserve the assigned local address.

@@ -22,7 +22,8 @@ mod tls;
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
-use crate::protocols::Stream;
+use crate::protocols::l4::ext::attach_connect_local_addr;
+use crate::protocols::{GetSocketDigest, Stream};
 use crate::server::configuration::ServerConf;
 use crate::upstreams::peer::{Peer, ALPN};
 
@@ -423,7 +424,15 @@ async fn do_connect_inner<P: Peer + Send + Sync>(
     let mut stream = l4_connect(peer, bind_to).await?;
     stream.set_establishment_timing(l4_connect_start.elapsed(), offload_wait_duration);
     if peer.tls() {
-        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx).await?;
+        // Capture the local address before the handshake consumes the stream, so a TLS failure
+        // can still report the address we connected from.
+        // Arc clone plus a copy of the small SocketAddr, negligible next to the handshake.
+        let local_addr = stream
+            .get_socket_digest()
+            .and_then(|digest| digest.local_addr().and_then(|addr| addr.as_inet()).copied());
+        let tls_stream = tls::connect(stream, peer, alpn_override, tls_ctx)
+            .await
+            .map_err(|e| attach_connect_local_addr(e, local_addr))?;
         Ok(Box::new(tls_stream))
     } else {
         Ok(Box::new(stream))
@@ -766,6 +775,38 @@ mod tests {
         let peer = BasicPeer::new(BLACKHOLE);
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
         assert!(etype != ConnectTimedout || !context.contains("total-connection timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_tls_handshake_failure_records_local_addr() {
+        use crate::connectors::l4::ConnectErrorExt;
+
+        // A plaintext listener that closes each connection immediately, so the TLS handshake fails
+        // after the TCP connection is established.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        // Non-empty SNI makes BasicPeer request TLS against the plaintext listener.
+        let mut peer = BasicPeer::new(&server_addr.to_string());
+        peer.sni = "openrusty.org".to_string();
+        // Safety net so the test fails fast rather than hanging if a platform does not surface the
+        // handshake failure immediately; a handshake timeout still exercises the same code path.
+        peer.options.connection_timeout = Some(Duration::from_secs(5));
+
+        let tls_connector = Connector::new(None);
+        let err = do_connect(&peer, None, None, &tls_connector.ctx, None)
+            .await
+            .unwrap_err();
+
+        let local_addr = err
+            .connect_local_addr()
+            .expect("TLS handshake failure should retain the assigned local address");
+        assert_ne!(local_addr.port(), 0);
     }
 
     #[tokio::test]
