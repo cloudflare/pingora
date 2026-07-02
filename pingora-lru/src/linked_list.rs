@@ -65,6 +65,11 @@ impl<K: Default> Nodes<K> {
         }
     }
 
+    /// Reserve space for exactly `additional` more data nodes (no growth slack).
+    fn reserve(&mut self, additional: usize) {
+        self.data_nodes.reserve_exact(additional);
+    }
+
     fn new_node(&mut self, data: K) -> Index {
         const VEC_EXP_GROWTH_CAP: usize = 65536;
         let node = Node {
@@ -141,6 +146,22 @@ impl<K: Default + Clone> LinkedList<K> {
             nodes: Nodes::with_capacity(capacity),
             free: vec![],
         }
+    }
+
+    /// Reserve space for `additional` more nodes up front, avoiding incremental
+    /// reallocation when bulk-loading a list of known size.
+    ///
+    /// Only the node storage is reserved, not the free list: bulk loading pushes
+    /// new nodes rather than reusing freed ones, so the free list stays empty and
+    /// needs no pre-allocation.
+    pub fn reserve(&mut self, additional: usize) {
+        self.nodes.reserve(additional);
+    }
+
+    /// Capacity of the backing node storage (excludes the head/tail sentinels).
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.nodes.data_nodes.capacity()
     }
 
     // Allocate a new node and return its index
@@ -415,6 +436,23 @@ mod test {
 
         assert_list(&list, &[3, 2, 4]);
         assert_list_reverse(&list, &[4, 2, 3]);
+    }
+
+    #[test]
+    fn test_reserve() {
+        let mut list = LinkedList::<u64>::with_capacity(0);
+        assert_eq!(list.capacity(), 0);
+
+        list.reserve(100);
+        // `reserve_exact` from empty => no doubling slack.
+        assert_eq!(list.capacity(), 100);
+
+        for i in 0..100u64 {
+            list.push_tail(i);
+        }
+        // The pre-sized capacity absorbed all pushes without reallocating.
+        assert_eq!(list.len(), 100);
+        assert_eq!(list.capacity(), 100);
     }
 
     #[test]

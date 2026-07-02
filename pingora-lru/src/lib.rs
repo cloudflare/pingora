@@ -469,6 +469,28 @@ impl<T, const N: usize> Lru<T, N> {
     pub fn shard_weight(&self, shard: usize) -> usize {
         self.units[shard].read().used_weight
     }
+
+    /// Reserve capacity for `additional` more entries in `shard`, avoiding the
+    /// reallocation/rehashing of incremental [`Self::insert_tail`] when bulk
+    /// loading a shard of known size.
+    pub fn reserve_shard(&self, shard: usize, additional: usize) {
+        if let Some(unit) = self.units.get(shard) {
+            unit.write().reserve(additional);
+        }
+    }
+
+    /// Capacity of a shard's ordering list (backing node storage).
+    #[cfg(test)]
+    fn shard_capacity(&self, shard: usize) -> usize {
+        self.units[shard].read().order.capacity()
+    }
+
+    /// Number of entries a shard's lookup table can hold before it must grow
+    /// and rehash.
+    #[cfg(test)]
+    fn shard_lookup_capacity(&self, shard: usize) -> usize {
+        self.units[shard].read().lookup_table.capacity()
+    }
 }
 
 #[inline]
@@ -656,6 +678,13 @@ impl<T> LruUnit<T> {
         })
     }
 
+    /// Reserve capacity for `additional` more entries in this shard (lookup
+    /// table + ordering list), avoiding reallocation/rehashing on bulk load.
+    fn reserve(&mut self, additional: usize) {
+        self.lookup_table.reserve(additional);
+        self.order.reserve(additional);
+    }
+
     pub fn insert_tail(&mut self, key: u64, data: T, weight: usize) -> bool {
         if self.lookup_table.contains_key(&key) {
             return false;
@@ -746,6 +775,39 @@ mod test_lru {
         let mut list_values = vec![];
         lru.iter_for_each(shard, |(v, _)| list_values.push(*v));
         assert_eq!(values, &list_values)
+    }
+
+    #[test]
+    fn test_reserve_shard() {
+        // Start with no pre-sized per-shard capacity.
+        let lru = Lru::<u64, 2>::with_capacity(1000, 0);
+        assert_eq!(lru.shard_capacity(0), 0);
+
+        lru.reserve_shard(0, 50);
+        // The ordering list uses `reserve_exact`, so from empty it is sized
+        // exactly to the request with no slack.
+        assert_eq!(lru.shard_capacity(0), 50);
+        // The lookup table uses `HashMap::reserve`, which guarantees room for at
+        // least the requested count but may over-allocate to honor its load
+        // factor, so only a lower bound can be asserted.
+        assert!(lru.shard_lookup_capacity(0) >= 50);
+
+        // Reserving does not fabricate entries.
+        assert_eq!(lru.shard_len(0), 0);
+
+        // keys 0, 2, 4, ... map to shard 0 (key % 2).
+        for k in (0..20u64).step_by(2) {
+            assert!(lru.insert_tail(k, k, 1));
+        }
+        assert_eq!(lru.shard_len(0), 10);
+        // The 10 inserts fit within the reserved capacity: no reallocation.
+        assert_eq!(lru.shard_capacity(0), 50);
+
+        // Order is preserved (inserted at tail, iterated head -> tail).
+        assert_lru(&lru, &[0, 2, 4, 6, 8, 10, 12, 14, 16, 18], 0);
+
+        // Out-of-range shard is a no-op, not a panic.
+        lru.reserve_shard(99, 100);
     }
 
     #[test]
