@@ -100,7 +100,7 @@ mod test {
     use pingora_timeout::sleep;
 
     use crate::protocols::{
-        http::v2::server::{self, handshake, HttpSession},
+        http::v2::server::{self, handshake, H2Accept, HttpSession},
         Digest,
     };
 
@@ -247,10 +247,13 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        while let Some(mut h2_stream) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
         {
+            let H2Accept::Session(mut h2_stream) = accepted else {
+                continue;
+            };
             handles.push(tokio::spawn(async move {
                 h2_stream.set_write_timeout(Some(Duration::from_millis(100)));
                 let req = h2_stream.req_header();

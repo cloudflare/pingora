@@ -305,14 +305,17 @@ impl RequestHeader {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
         } else {
-            // Url should always be set
             self.base
                 .uri
                 .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+                .map(|path| path.as_str().as_bytes())
+                .or_else(|| {
+                    self.base
+                        .uri
+                        .authority()
+                        .map(|authority| authority.as_str().as_bytes())
+                })
+                .unwrap_or_default()
         }
     }
 
@@ -1051,6 +1054,16 @@ mod tests {
         req.set_uri(Uri::builder().path_and_query(new_path).build().unwrap());
         assert_eq!(new_path, req.uri.path_and_query().unwrap());
         assert_eq!(new_path.as_bytes(), req.raw_path());
+    }
+
+    #[test]
+    fn test_authority_form_raw_path() {
+        let mut req = RequestHeader::new_no_case(None);
+        req.set_method(Method::CONNECT);
+        req.set_uri(Uri::builder().authority("pingora.org:443").build().unwrap());
+
+        assert!(req.uri.path_and_query().is_none());
+        assert_eq!(b"pingora.org:443", req.raw_path());
     }
 
     #[test]

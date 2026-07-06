@@ -878,8 +878,11 @@ fn parse_resp_buffer<'buf>(
 
 /// Returns `true` if `path` contains a byte that must never appear in an HTTP/1.1
 /// request target: NUL (`0x00`), LF (`0x0a`), CR (`0x0d`), or SP (`0x20`).
+///
+/// See RFC 9112 §3.2 (request-target) and RFC 3986 §2.1 (URI characters).
+/// These bytes are also forbidden in HTTP/2 `:path` per RFC 7540 §8.1.2.3.
 #[inline]
-fn request_target_has_forbidden_byte(path: &[u8]) -> bool {
+pub(crate) fn request_target_has_forbidden_byte(path: &[u8]) -> bool {
     path.iter().any(|&b| matches!(b, 0x00 | 0x0a | 0x0d | 0x20))
 }
 

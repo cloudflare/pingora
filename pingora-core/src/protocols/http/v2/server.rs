@@ -31,7 +31,9 @@ use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
-use crate::protocols::http::v1::client::http_req_header_to_wire;
+use crate::protocols::http::v1::client::{
+    http_req_header_to_wire, request_target_has_forbidden_byte,
+};
 use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::server::ShutdownWatch;
@@ -146,7 +148,10 @@ pub(crate) async fn accept_downstream_sessions<F>(
             }
             // None means the connection is ready to be closed
             Ok(None) => return,
-            Ok(Some(session)) => on_session(session),
+            // The offending stream was already reset; keep the connection alive
+            // and continue accepting sibling streams.
+            Ok(Some(H2Accept::Rejected)) => continue,
+            Ok(Some(H2Accept::Session(session))) => on_session(*session),
         }
     }
 }
@@ -199,6 +204,20 @@ pub struct HttpSession {
     total_drain_timeout: Option<Duration>,
 }
 
+/// The outcome of accepting the next event on an HTTP/2 downstream connection.
+///
+/// Returned by [`HttpSession::from_h2_conn`] so the accept loop can react to a
+/// rejected stream without tearing down the whole connection.
+pub enum H2Accept {
+    /// A new request stream was established and is ready to be served.
+    Session(Box<HttpSession>),
+    /// The next stream was rejected during acceptance (for example, its request
+    /// target contained a forbidden byte) and has already been reset with
+    /// `RST_STREAM`. Sibling streams and the connection are unaffected; the
+    /// caller should continue accepting.
+    Rejected,
+}
+
 impl HttpSession {
     /// Create a new [`HttpSession`] from the HTTP/2 connection.
     /// This function returns a new HTTP/2 session when the provided HTTP/2 connection, `conn`,
@@ -211,35 +230,54 @@ impl HttpSession {
     /// Note: in order to handle all **existing** and new HTTP/2 sessions, the server must call
     /// this function in a loop until the client decides to close the connection.
     ///
-    /// `None` will be returned when the connection is closing so that the loop can exit.
-    ///
+    /// The return value distinguishes three outcomes:
+    /// * `Ok(Some(`[`H2Accept::Session`]`))` — a new stream is ready to serve.
+    /// * `Ok(Some(`[`H2Accept::Rejected`]`))` — the stream was reset during
+    ///   acceptance; the caller should keep looping to accept sibling streams.
+    /// * `Ok(None)` — the connection is closing, so the loop can exit.
     pub async fn from_h2_conn(
         conn: &mut H2Connection<Stream>,
         digest: Arc<Digest>,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Option<H2Accept>> {
         // NOTE: conn.accept().await is what drives the entire connection.
         let res = conn.accept().await.transpose().or_err(
             ErrorType::H2Error,
             "while accepting new downstream requests",
         )?;
 
-        Ok(res.map(|(req, send_response)| {
-            let (request_header, request_body_reader) = req.into_parts();
-            HttpSession {
-                request_header: request_header.into(),
-                request_body_reader,
-                send_response,
-                send_response_body: None,
-                response_written: None,
-                ended: false,
-                body_read: 0,
-                body_sent: 0,
-                retry_buffer: None,
-                digest,
-                write_timeout: None,
-                total_drain_timeout: None,
-            }
-        }))
+        let Some((req, mut send_response)) = res else {
+            return Ok(None);
+        };
+
+        let (request_header, request_body_reader) = req.into_parts();
+        let request_header: RequestHeader = request_header.into();
+
+        // Depending on how the request URI is parsed, control bytes
+        // (including CR and LF) may be accepted in the `:path`
+        // pseudo-header. Reject them here as defense-in-depth: these
+        // bytes are not permitted in a URI, and they would be dangerous
+        // if forwarded to an HTTP/1.1 upstream. Reset only the offending
+        // stream so sibling streams on the connection are unaffected.
+        if request_target_has_forbidden_byte(request_header.raw_path()) {
+            debug!("Rejecting H2 request: forbidden delimiter byte in request target");
+            send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
+            return Ok(Some(H2Accept::Rejected));
+        }
+
+        Ok(Some(H2Accept::Session(Box::new(HttpSession {
+            request_header,
+            request_body_reader,
+            send_response,
+            send_response_body: None,
+            response_written: None,
+            ended: false,
+            body_read: 0,
+            body_sent: 0,
+            retry_buffer: None,
+            digest,
+            write_timeout: None,
+            total_drain_timeout: None,
+        }))))
     }
 
     /// The request sent from the client
@@ -593,8 +631,14 @@ impl HttpSession {
     // This is a hack for pingora-proxy to create subrequests from h2 server session
     // TODO: be able to convert from h2 to h1 subrequest
     pub fn pseudo_raw_h1_request_header(&self) -> Bytes {
-        let buf = http_req_header_to_wire(&self.request_header).unwrap(); // safe, None only when version unknown
-        buf.freeze()
+        // `http_req_header_to_wire` returns `None` for an unsupported HTTP
+        // version or a request target containing forbidden delimiter bytes.
+        // Neither should happen here: H2 sessions always carry `HTTP_2`, and
+        // forbidden targets are rejected when the session is created (see
+        // `from_h2_conn`).
+        http_req_header_to_wire(&self.request_header)
+            .map(|buf| buf.freeze())
+            .expect("http_req_header_to_wire should not fail for a validated h2 request")
     }
 
     /// Whether there is no more body to read
@@ -794,6 +838,58 @@ mod test {
         server.await.unwrap();
     }
 
+    #[cfg(feature = "patched_http1")]
+    #[tokio::test]
+    async fn test_server_rejects_forbidden_byte_in_request_target() {
+        // Control bytes (CR/LF) may be accepted in the request path depending
+        // on URI parsing. Ensure such a request target is rejected on ingest as
+        // defense-in-depth, since these bytes are not permitted in a URI.
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/a\r\nX-Injected: 1")
+                .body(())
+                .unwrap();
+            // Ensure CR/LF survived URI parsing, otherwise the test is a no-op.
+            assert!(request.uri().path().contains('\n'));
+
+            let (response, _) = h2.send_request(request, true).unwrap();
+            // The stream must be rejected (reset), not answered.
+            assert!(response.await.is_err());
+        });
+
+        let server = tokio::spawn(async move {
+            let mut connection = handshake(Box::new(server), None).await.unwrap();
+            let digest = Arc::new(Digest::default());
+            let accepted = timeout(
+                Duration::from_secs(1),
+                HttpSession::from_h2_conn(&mut connection, digest),
+            )
+            .await
+            .expect("from_h2_conn hung: the offending stream was not rejected")
+            .expect("from_h2_conn returned an error");
+            // The offending stream is reset during acceptance, so `from_h2_conn`
+            // yields `Rejected` rather than a session built from the forbidden
+            // request target. Sibling streams and the connection are unaffected.
+            assert!(
+                matches!(accepted, Some(H2Accept::Rejected)),
+                "request with forbidden byte in target was not rejected"
+            );
+        });
+
+        client.await.unwrap();
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_server_handshake_accept_request() {
         let (client, server) = duplex(65536);
@@ -834,10 +930,13 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
         {
+            let H2Accept::Session(mut http) = accepted else {
+                continue;
+            };
             let trailers = trailers.clone();
             handles.push(tokio::spawn(async move {
                 let req = http.req_header();
@@ -927,10 +1026,13 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
         {
+            let H2Accept::Session(mut http) = accepted else {
+                continue;
+            };
             handles.push(tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::POST);
@@ -1010,10 +1112,13 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
         {
+            let H2Accept::Session(mut http) = accepted else {
+                continue;
+            };
             handles.push(tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::POST);
