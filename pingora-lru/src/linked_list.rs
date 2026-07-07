@@ -23,18 +23,61 @@
 
 // inspired by clru::FixedSizeList (Élie!)
 
-use std::mem::replace;
+use std::mem::{replace, size_of};
 
+/// Public index type, kept as `usize` for compatibility.
 type Index = usize;
-const NULL: Index = usize::MAX;
-const HEAD: Index = 0;
-const TAIL: Index = 1;
-const OFFSET: usize = 2;
+
+/// Compact internal node and free-list index.
+type CompactIndex = u32;
+
+const NULL: CompactIndex = u32::MAX;
+const HEAD: CompactIndex = 0;
+const TAIL: CompactIndex = 1;
+const OFFSET: CompactIndex = 2;
+
+/// Number of non-NULL internal indices, including [`HEAD`] and [`TAIL`].
+const MAX_SLOTS: usize = u32::MAX as usize;
+
+// Ensure widening CompactIndex to Index is lossless.
+const _: () = assert!(size_of::<usize>() >= size_of::<CompactIndex>());
+
+/// Losslessly widen a compact index to the public index type.
+#[inline]
+fn to_index(index: CompactIndex) -> Index {
+    index as Index
+}
+
+/// Narrow a public index, panicking if it is unrepresentable or [`NULL`].
+#[track_caller]
+#[inline]
+fn to_compact(index: Index) -> CompactIndex {
+    CompactIndex::try_from(index)
+        .ok()
+        .filter(|&compact| compact != NULL)
+        .unwrap_or_else(|| {
+            panic!(
+                "linked list index {index} exceeds the maximum supported index {}",
+                MAX_SLOTS - 1
+            )
+        })
+}
+
+/// Return whether `index` addresses one of `data_len` data slots.
+#[inline]
+fn is_valid_slot(index: Index, data_len: usize) -> bool {
+    if index == to_index(NULL) {
+        return false;
+    }
+    // Subtract to avoid overflowing `data_len + offset`.
+    let offset = to_index(OFFSET);
+    index >= offset && index - offset < data_len
+}
 
 #[derive(Debug)]
 struct Node<K> {
-    pub(crate) prev: Index,
-    pub(crate) next: Index,
+    pub(crate) prev: CompactIndex,
+    pub(crate) next: CompactIndex,
     pub(crate) data: K,
 }
 
@@ -70,8 +113,15 @@ impl<K: Default> Nodes<K> {
         self.data_nodes.reserve_exact(additional);
     }
 
-    fn new_node(&mut self, data: K) -> Index {
+    fn new_node(&mut self, data: K) -> CompactIndex {
         const VEC_EXP_GROWTH_CAP: usize = 65536;
+        // Validate before mutation so a panic leaves `data_nodes` unchanged.
+        let compact_index = to_compact(
+            self.data_nodes
+                .len()
+                .checked_add(to_index(OFFSET))
+                .expect("linked list length overflow"),
+        );
         let node = Node {
             prev: NULL,
             next: NULL,
@@ -90,7 +140,7 @@ impl<K: Default> Nodes<K> {
                 .reserve_exact(self.data_nodes.capacity() / 10)
         }
         self.data_nodes.push(node);
-        self.data_nodes.len() - 1 + OFFSET
+        compact_index
     }
 
     fn len(&self) -> usize {
@@ -106,32 +156,36 @@ impl<K: Default> Nodes<K> {
     }
 }
 
-impl<K> std::ops::Index<usize> for Nodes<K> {
+impl<K> std::ops::Index<CompactIndex> for Nodes<K> {
     type Output = Node<K>;
 
-    fn index(&self, index: usize) -> &Self::Output {
+    fn index(&self, index: CompactIndex) -> &Self::Output {
         match index {
             HEAD => &self.head,
             TAIL => &self.tail,
-            _ => &self.data_nodes[index - OFFSET],
+            // HEAD and TAIL are matched, so subtraction cannot underflow.
+            _ => &self.data_nodes[to_index(index - OFFSET)],
         }
     }
 }
 
-impl<K> std::ops::IndexMut<usize> for Nodes<K> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+impl<K> std::ops::IndexMut<CompactIndex> for Nodes<K> {
+    fn index_mut(&mut self, index: CompactIndex) -> &mut Self::Output {
         match index {
             HEAD => &mut self.head,
             TAIL => &mut self.tail,
-            _ => &mut self.data_nodes[index - OFFSET],
+            // HEAD and TAIL are matched, so subtraction cannot underflow.
+            _ => &mut self.data_nodes[to_index(index - OFFSET)],
         }
     }
 }
 
 /// Doubly linked list, generic over the stored data type `K`.
+///
+/// Each list supports up to `u32::MAX - 2` data slots.
 pub struct LinkedList<K = u64> {
     nodes: Nodes<K>,
-    free: Vec<Index>, // to keep track of freed node to be used again
+    free: Vec<CompactIndex>, // to keep track of freed node to be used again
 }
 
 /// Type alias preserving backward compatibility.
@@ -164,9 +218,9 @@ impl<K: Default + Clone> LinkedList<K> {
         self.nodes.data_nodes.capacity()
     }
 
-    // Allocate a new node and return its index
+    // Allocate a new node and return its index.
     // NOTE: this node is leaked if not used by caller
-    fn new_node(&mut self, data: K) -> Index {
+    fn new_node(&mut self, data: K) -> CompactIndex {
         if let Some(index) = self.free.pop() {
             // have a free node, update its payload and return its index
             self.nodes[index].data = data;
@@ -185,14 +239,14 @@ impl<K: Default + Clone> LinkedList<K> {
     }
 
     fn valid_index(&self, index: Index) -> bool {
-        index != HEAD && index != TAIL && index < self.nodes.len() + OFFSET
+        is_valid_slot(index, self.nodes.len())
         // TODO: check node prev/next not NULL
         // TODO: debug_check index not in self.free
     }
 
     fn node(&self, index: Index) -> Option<&Node<K>> {
         if self.valid_index(index) {
-            Some(&self.nodes[index])
+            Some(&self.nodes[to_compact(index)])
         } else {
             None
         }
@@ -200,13 +254,16 @@ impl<K: Default + Clone> LinkedList<K> {
 
     fn node_mut(&mut self, index: Index) -> Option<&mut Node<K>> {
         if self.valid_index(index) {
-            Some(&mut self.nodes[index])
+            Some(&mut self.nodes[to_compact(index)])
         } else {
             None
         }
     }
 
     /// Peek into the list, returning a reference to the data at the given index.
+    ///
+    /// Returns `None` for sentinels and out-of-range indices. Removed slots
+    /// remain addressable with their default value until reused.
     pub fn peek(&self, index: Index) -> Option<&K> {
         self.node(index).map(|n| &n.data)
     }
@@ -217,12 +274,12 @@ impl<K: Default + Clone> LinkedList<K> {
     }
 
     // safe because the index still needs to be in the range of the vec
-    fn peek_unchecked(&self, index: Index) -> &K {
+    fn peek_unchecked(&self, index: CompactIndex) -> &K {
         &self.nodes[index].data
     }
 
     // put a node right after the node at `at`
-    fn insert_after(&mut self, node_index: Index, at: Index) {
+    fn insert_after(&mut self, node_index: CompactIndex, at: CompactIndex) {
         assert!(at != TAIL && at != node_index); // can't insert after tail or to itself
 
         let next = replace(&mut self.nodes[at].next, node_index);
@@ -235,17 +292,27 @@ impl<K: Default + Clone> LinkedList<K> {
     }
 
     /// Put the data at the head of the list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a new slot is needed after `u32::MAX - 2` slots have been
+    /// allocated.
     pub fn push_head(&mut self, data: K) -> Index {
         let new_node_index = self.new_node(data);
         self.insert_after(new_node_index, HEAD);
-        new_node_index
+        to_index(new_node_index)
     }
 
     /// Put the data at the tail of the list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a new slot is needed after `u32::MAX - 2` slots have been
+    /// allocated.
     pub fn push_tail(&mut self, data: K) -> Index {
         let new_node_index = self.new_node(data);
         self.insert_after(new_node_index, self.nodes.tail().prev);
-        new_node_index
+        to_index(new_node_index)
     }
 
     /// Unlink a node from the list without touching its data.
@@ -253,7 +320,7 @@ impl<K: Default + Clone> LinkedList<K> {
     /// After this call the node's prev/next pointers are `NULL` and the
     /// surrounding nodes skip over it. The node can be re-inserted
     /// elsewhere (e.g. by [`promote`]) or freed.
-    fn unlink(&mut self, index: Index) {
+    fn unlink(&mut self, index: CompactIndex) {
         // can't touch the sentinels
         assert!(index != HEAD && index != TAIL);
 
@@ -270,14 +337,23 @@ impl<K: Default + Clone> LinkedList<K> {
         self.nodes[next].prev = prev;
     }
 
+    /// Remove a node, return its value, and add its slot to the free list.
+    fn remove_at(&mut self, index: CompactIndex) -> K {
+        self.unlink(index);
+        self.free.push(index);
+        std::mem::take(&mut self.nodes[index].data)
+    }
+
     /// Remove the node at the index, and return the value.
     ///
     /// Uses [`std::mem::take`] to move data out of the node without
     /// cloning, which avoids a heap allocation for types like `String`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is invalid, already removed, or at least `u32::MAX`.
     pub fn remove(&mut self, index: Index) -> K {
-        self.unlink(index);
-        self.free.push(index);
-        std::mem::take(&mut self.nodes[index].data)
+        self.remove_at(to_compact(index))
     }
 
     /// Remove the tail of the list
@@ -286,12 +362,17 @@ impl<K: Default + Clone> LinkedList<K> {
         if data_tail == HEAD {
             None // empty list
         } else {
-            Some(self.remove(data_tail))
+            Some(self.remove_at(data_tail))
         }
     }
 
-    /// Put the node at the index to the head
+    /// Put the node at the index to the head.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is invalid, already removed, or at least `u32::MAX`.
     pub fn promote(&mut self, index: Index) {
+        let index = to_compact(index);
         if self.nodes.head().next == index {
             return; // already head
         }
@@ -299,14 +380,30 @@ impl<K: Default + Clone> LinkedList<K> {
         self.insert_after(index, HEAD);
     }
 
-    /// Get the next index in the list (internal navigation).
-    pub fn next_index(&self, index: Index) -> Index {
+    fn next_compact(&self, index: CompactIndex) -> CompactIndex {
         self.nodes[index].next
     }
 
-    /// Get the previous index in the list (internal navigation).
-    pub fn prev_index(&self, index: Index) -> Index {
+    fn prev_compact(&self, index: CompactIndex) -> CompactIndex {
         self.nodes[index].prev
+    }
+
+    /// Get the next index in the list (internal navigation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of range or at least `u32::MAX`.
+    pub fn next_index(&self, index: Index) -> Index {
+        to_index(self.next_compact(to_compact(index)))
+    }
+
+    /// Get the previous index in the list (internal navigation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of range or at least `u32::MAX`.
+    pub fn prev_index(&self, index: Index) -> Index {
+        to_index(self.prev_compact(to_compact(index)))
     }
 
     /// Get the head of the list
@@ -315,7 +412,7 @@ impl<K: Default + Clone> LinkedList<K> {
         if data_head == TAIL {
             None
         } else {
-            Some(data_head)
+            Some(to_index(data_head))
         }
     }
 
@@ -325,7 +422,7 @@ impl<K: Default + Clone> LinkedList<K> {
         if data_tail == HEAD {
             None
         } else {
-            Some(data_tail)
+            Some(to_index(data_tail))
         }
     }
 
@@ -361,9 +458,9 @@ impl<K: Default + Clone + PartialEq> LinkedList<K> {
 /// The iter over the list
 pub struct LinkedListIter<'a, K = u64> {
     list: &'a LinkedList<K>,
-    head: Index,
+    head: CompactIndex,
     #[cfg_attr(not(test), allow(dead_code))]
-    tail: Index,
+    tail: CompactIndex,
     len: usize,
 }
 
@@ -371,7 +468,7 @@ impl<'a, K: Default + Clone> Iterator for LinkedListIter<'a, K> {
     type Item = &'a K;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_index = self.list.next_index(self.head);
+        let next_index = self.list.next_compact(self.head);
         if next_index == TAIL || next_index == NULL {
             None
         } else {
@@ -388,7 +485,7 @@ impl<'a, K: Default + Clone> Iterator for LinkedListIter<'a, K> {
 
 impl<K: Default + Clone> DoubleEndedIterator for LinkedListIter<'_, K> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        let prev_index = self.list.prev_index(self.tail);
+        let prev_index = self.list.prev_compact(self.tail);
         if prev_index == HEAD || prev_index == NULL {
             None
         } else {
@@ -519,5 +616,94 @@ mod test {
         assert_eq!(list.pop_tail(), Some("foo".to_string()));
         assert_eq!(list.remove(i2), "world".to_string());
         assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn test_node_is_compact() {
+        // Compact links reduce `Node<u64>` from 24 to 16 bytes on 64-bit targets.
+        if size_of::<usize>() == 8 {
+            assert_eq!(size_of::<Node<u64>>(), 16);
+        }
+        assert!(size_of::<Node<u64>>() <= 24);
+    }
+
+    #[test]
+    fn test_peek_invalid_index_returns_none() {
+        let mut list = LinkedList::<u64>::with_capacity(4);
+        let valid = list.push_head(1u64);
+        assert!(list.peek(valid).is_some());
+
+        assert!(list.peek(100).is_none());
+        assert!(list.peek(to_index(HEAD)).is_none());
+        assert!(list.peek(to_index(TAIL)).is_none());
+        assert!(list.peek(to_index(NULL)).is_none());
+        assert!(list.peek(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_freed_index_reuse() {
+        let mut list = LinkedList::with_capacity(4);
+        let i1 = list.push_head(1u64);
+        let i2 = list.push_head(2u64);
+        let _i3 = list.push_head(3u64);
+        assert_list(&list, &[3, 2, 1]);
+
+        assert_eq!(list.remove(i2), 2);
+        assert_eq!(list.len(), 2);
+        // Removed slots remain addressable with their default value.
+        assert_eq!(list.peek(i2), Some(&0));
+
+        // The next insertion reuses the freed slot.
+        let i4 = list.push_head(4u64);
+        assert_eq!(i4, i2, "freed slot index should be reused");
+        assert_eq!(*list.peek(i4).unwrap(), 4);
+        assert_eq!(*list.peek(i1).unwrap(), 1);
+        assert_list(&list, &[4, 3, 1]);
+        assert_list_reverse(&list, &[1, 3, 4]);
+    }
+
+    #[test]
+    fn test_to_compact_roundtrip() {
+        for i in [0usize, 1, 2, 100, MAX_SLOTS - 1] {
+            assert_eq!(to_index(to_compact(i)), i);
+        }
+        assert_eq!(to_compact(MAX_SLOTS - 1), NULL - 1);
+    }
+
+    #[test]
+    fn test_to_compact_reserves_null() {
+        assert!(std::panic::catch_unwind(|| to_compact(to_index(NULL))).is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_to_compact_rejects_overflow() {
+        let too_big = u32::MAX as usize + 1;
+        assert!(std::panic::catch_unwind(|| to_compact(too_big)).is_err());
+    }
+
+    #[test]
+    fn test_is_valid_slot_sentinels_and_small_range() {
+        assert!(!is_valid_slot(to_index(HEAD), 10));
+        assert!(!is_valid_slot(to_index(TAIL), 10));
+
+        assert!(!is_valid_slot(to_index(OFFSET), 0));
+
+        let offset = to_index(OFFSET);
+        assert!(is_valid_slot(offset, 10));
+        assert!(is_valid_slot(offset + 9, 10));
+        assert!(!is_valid_slot(offset + 10, 10));
+    }
+
+    #[test]
+    fn test_is_valid_slot_max_length_rejects_null() {
+        // Test the maximum length without allocating it.
+        let max_data_len = MAX_SLOTS - to_index(OFFSET);
+
+        let highest_valid = to_index(NULL) - 1;
+        assert!(is_valid_slot(highest_valid, max_data_len));
+
+        assert!(!is_valid_slot(to_index(NULL), max_data_len));
+        assert!(!is_valid_slot(usize::MAX, max_data_len));
     }
 }

@@ -537,8 +537,8 @@ impl<T> LruUnit<T> {
             self.order.promote(node.list_index);
             return old_weight;
         }
-        self.used_weight += weight;
         let list_index = self.order.push_head(key);
+        self.used_weight += weight;
         let node = Box::new(LruNode {
             data,
             list_index,
@@ -577,8 +577,8 @@ impl<T> LruUnit<T> {
             return (old_weight, new_weight, false);
         }
         let weight = max_weight.map_or(delta, |m| delta.min(m)).max(1);
-        self.used_weight += weight;
         let list_index = self.order.push_head(key);
+        self.used_weight += weight;
         let node = Box::new(LruNode {
             data: admit_data(),
             list_index,
@@ -611,8 +611,8 @@ impl<T> LruUnit<T> {
         }
         let (data, weight) = admit_data();
         let weight = weight.max(1);
-        self.used_weight += weight;
         let list_index = self.order.push_head(key);
+        self.used_weight += weight;
         let node = Box::new(LruNode {
             data,
             list_index,
