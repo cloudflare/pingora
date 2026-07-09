@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{BackendIter, BackendSelection, LoadBalancer};
+use super::{BackendIter, BackendSelection, LoadBalancer, LoadBalancerGroup};
 use async_trait::async_trait;
 use pingora_core::services::{background::BackgroundService, ServiceReadyNotifier};
 
@@ -87,6 +87,78 @@ where
     }
 
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) -> () {
+        self.run(shutdown, None).await
+    }
+}
+
+impl<S: Send + Sync + BackendSelection + 'static> LoadBalancerGroup<S>
+where
+    S::Iter: BackendIter,
+{
+    /// Run shared discovery and health checks until shutdown.
+    pub async fn run(
+        &self,
+        shutdown: pingora_core::server::ShutdownWatch,
+        mut ready_opt: Option<ServiceReadyNotifier>,
+    ) {
+        // 136 years
+        const NEVER: Duration = Duration::from_secs(u32::MAX as u64);
+        let mut now = Instant::now();
+        // run update and health check once
+        let mut next_update = now;
+        let mut next_health_check = now;
+
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+
+            if next_update <= now {
+                match self.update().await {
+                    Ok(()) => {
+                        // The first successful update publishes all selectors.
+                        if let Some(ready) = ready_opt.take() {
+                            ServiceReadyNotifier::notify_ready(ready)
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("load balancer group update failed: {error}");
+                    }
+                }
+                next_update = now + self.update_frequency.unwrap_or(NEVER);
+            }
+
+            if next_health_check <= now {
+                self.backends
+                    .run_health_check(self.parallel_health_check)
+                    .await;
+                next_health_check = now + self.health_check_frequency.unwrap_or(NEVER);
+            }
+
+            if self.update_frequency.is_none() && self.health_check_frequency.is_none() {
+                return;
+            }
+            let to_wake = std::cmp::min(next_update, next_health_check);
+            tokio::time::sleep_until(to_wake.into()).await;
+            now = Instant::now();
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Send + Sync + BackendSelection + 'static> BackgroundService for LoadBalancerGroup<S>
+where
+    S::Iter: BackendIter,
+{
+    async fn start_with_ready_notifier(
+        &self,
+        shutdown: pingora_core::server::ShutdownWatch,
+        ready: ServiceReadyNotifier,
+    ) {
+        self.run(shutdown, Some(ready)).await
+    }
+
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
         self.run(shutdown, None).await
     }
 }

@@ -132,6 +132,7 @@ pub struct Backends {
     discovery: Box<dyn ServiceDiscovery + Send + Sync + 'static>,
     health_check: Option<Arc<dyn health_check::HealthCheck + Send + Sync + 'static>>,
     backends: ArcSwap<BTreeSet<Backend>>,
+    backend_keys: ArcSwap<HashMap<SocketAddr, Option<u64>>>,
     health: ArcSwap<HashMap<u64, Health>>,
 }
 
@@ -144,6 +145,7 @@ impl Backends {
             discovery,
             health_check: None,
             backends: Default::default(),
+            backend_keys: Default::default(),
             health: Default::default(),
         }
     }
@@ -170,6 +172,7 @@ impl Backends {
         if (**self.backends.load()) != new_backends {
             let old_health = self.health.load();
             let mut health = HashMap::with_capacity(new_backends.len());
+            let mut backend_keys = HashMap::with_capacity(new_backends.len());
             for backend in new_backends.iter() {
                 let hash_key = backend.hash_key();
                 // use the default health if the backend is new
@@ -180,6 +183,10 @@ impl Backends {
                     backend_health.enable(*backend_enabled);
                 }
                 health.insert(hash_key, backend_health);
+                backend_keys
+                    .entry(backend.addr.clone())
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(hash_key));
             }
 
             // TODO: put this all under 1 ArcSwap so the update is atomic
@@ -188,8 +195,11 @@ impl Backends {
             // they may encounter false positives if the selector isn't ready yet.
             let new_backends = Arc::new(new_backends);
             callback(new_backends.clone());
-            self.backends.store(new_backends);
+            self.backends.store(new_backends.clone());
             self.health.store(Arc::new(health));
+            // Publish address membership last so readiness never resolves a new
+            // address against the previous health table.
+            self.backend_keys.store(Arc::new(backend_keys));
         } else {
             // no backend change, just check enablement
             for (hash_key, backend_enabled) in enablement.iter() {
@@ -208,13 +218,20 @@ impl Backends {
     /// This function returns true when the health check is unset but the backend is enabled.
     /// When the health check is set, this function will return false for the `backend` it
     /// doesn't know.
+    ///
+    /// Backends are matched by their full identity first. If that identity is stale, the
+    /// current backend with the same address is used only when the address uniquely identifies
+    /// one discovered backend. An unknown or ambiguous address fails closed.
     pub fn ready(&self, backend: &Backend) -> bool {
-        self.health
-            .load()
-            .get(&backend.hash_key())
-            // Racing: return `None` when this function is called between the
-            // backend store and the health store
-            .map_or(self.health_check.is_none(), |h| h.ready())
+        let health = self.health.load();
+        if let Some(health) = health.get(&backend.hash_key()) {
+            return health.ready();
+        }
+
+        let Some(Some(hash_key)) = self.backend_keys.load().get(&backend.addr).copied() else {
+            return false;
+        };
+        health.get(&hash_key).is_some_and(Health::ready)
     }
 
     /// Manually set if a [Backend] is ready to serve traffic.
@@ -223,10 +240,20 @@ impl Backends {
     /// to stop a backend from accepting traffic when it is still healthy.
     ///
     /// This method is noop when the given backend doesn't exist in the service discovery.
+    /// A stale backend identity is resolved by address only when that address uniquely
+    /// identifies one currently discovered backend.
     pub fn set_enable(&self, backend: &Backend, enabled: bool) {
-        // this should always be Some(_) because health is always populated during update
-        if let Some(h) = self.health.load().get(&backend.hash_key()) {
-            h.enable(enabled)
+        let health = self.health.load();
+        if let Some(health) = health.get(&backend.hash_key()) {
+            health.enable(enabled);
+            return;
+        }
+
+        let Some(Some(hash_key)) = self.backend_keys.load().get(&backend.addr).copied() else {
+            return;
+        };
+        if let Some(health) = health.get(&hash_key) {
+            health.enable(enabled)
         };
     }
 
@@ -303,7 +330,8 @@ impl Backends {
     }
 }
 
-/// Timing information from the most recent [`LoadBalancer::update`] call.
+/// Timing information from the most recent [`LoadBalancer::update`] or
+/// [`LoadBalancerGroup::update`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct UpdateTimings {
     /// Time spent in [`ServiceDiscovery::discover`].
@@ -343,6 +371,56 @@ where
     pub parallel_health_check: bool,
 }
 
+/// One selector configuration and its currently published selection data.
+struct SelectorSlot<S>
+where
+    S: BackendSelection,
+{
+    selector: ArcSwap<S>,
+    config: Option<S::Config>,
+}
+
+/// A collection of load-balancing selectors that share one backend pool.
+///
+/// Service discovery, health checks, enablement, and backend membership are
+/// shared. When membership changes, all selectors are rebuilt before the new
+/// membership is published.
+pub struct LoadBalancerGroup<S>
+where
+    S: BackendSelection,
+{
+    backends: Backends,
+    selectors: Box<[SelectorSlot<S>]>,
+
+    /// Timing information from the most recent [`update`](Self::update) call.
+    ///
+    /// `None` until the first successful update completes.
+    last_update_timing: ArcSwap<Option<UpdateTimings>>,
+
+    /// How frequently the health check logic (if set) should run.
+    ///
+    /// If `None`, the health check logic will only run once at the beginning.
+    pub health_check_frequency: Option<Duration>,
+    /// How frequently service discovery should run.
+    ///
+    /// If `None`, service discovery will only run once at the beginning.
+    pub update_frequency: Option<Duration>,
+    /// Whether to run health checks for all backends in parallel. Default is false.
+    pub parallel_health_check: bool,
+}
+
+/// Build one selector with either its explicit configuration or the algorithm default.
+fn build_selector<S>(backends: &BTreeSet<Backend>, config: Option<&S::Config>) -> S
+where
+    S: BackendSelection,
+{
+    if let Some(config) = config {
+        S::build_with_config(backends, config)
+    } else {
+        S::build(backends)
+    }
+}
+
 impl<S> LoadBalancer<S>
 where
     S: BackendSelection + 'static,
@@ -368,11 +446,7 @@ where
 
     /// Build a [LoadBalancer] with the given [Backends] and the config.
     pub fn from_backends_with_config(backends: Backends, config_opt: Option<S::Config>) -> Self {
-        let selector_raw = if let Some(config) = config_opt.as_ref() {
-            S::build_with_config(&backends.get_backend(), config)
-        } else {
-            S::build(&backends.get_backend())
-        };
+        let selector_raw = build_selector::<S>(&backends.get_backend(), config_opt.as_ref());
 
         let selector = ArcSwap::new(Arc::new(selector_raw));
 
@@ -408,11 +482,7 @@ where
         self.backends
             .update(|backends| {
                 let build_start = Instant::now();
-                let selector = if let Some(config) = &self.config {
-                    S::build_with_config(&backends, config)
-                } else {
-                    S::build(&backends)
-                };
+                let selector = build_selector::<S>(&backends, self.config.as_ref());
                 self.selector.store(Arc::new(selector));
                 build_nanos.store(build_start.elapsed().as_nanos() as u64, Relaxed);
             })
@@ -485,12 +555,322 @@ where
     }
 }
 
+impl<S> LoadBalancerGroup<S>
+where
+    S: BackendSelection + 'static,
+    S::Iter: BackendIter,
+{
+    /// Build a group of selectors over one shared backend pool.
+    ///
+    /// Each item in `configs` creates one selector. `None` uses
+    /// [`BackendSelection::build`], while `Some(config)` uses
+    /// [`BackendSelection::build_with_config`].
+    pub fn from_backends_with_configs(
+        backends: Backends,
+        configs: impl IntoIterator<Item = Option<S::Config>>,
+    ) -> Self {
+        let current_backends = backends.get_backend();
+        let selectors = configs
+            .into_iter()
+            .map(|config| SelectorSlot {
+                selector: ArcSwap::new(Arc::new(build_selector::<S>(
+                    &current_backends,
+                    config.as_ref(),
+                ))),
+                config,
+            })
+            .collect();
+
+        Self {
+            backends,
+            selectors,
+            last_update_timing: ArcSwap::new(Arc::new(None)),
+            health_check_frequency: None,
+            update_frequency: None,
+            parallel_health_check: false,
+        }
+    }
+
+    /// Return the number of selectors in this group.
+    pub fn selector_count(&self) -> usize {
+        self.selectors.len()
+    }
+
+    /// Run service discovery and rebuild all selectors when membership changes.
+    ///
+    /// On success, the timing information from this call is stored and can be
+    /// retrieved via [`last_update_timing`](Self::last_update_timing).
+    pub async fn update(&self) -> Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        let build_nanos = AtomicU64::new(0);
+        let total_start = Instant::now();
+
+        self.backends
+            .update(|backends| {
+                let build_start = Instant::now();
+                let selectors: Vec<S> = self
+                    .selectors
+                    .iter()
+                    .map(|slot| build_selector::<S>(&backends, slot.config.as_ref()))
+                    .collect();
+
+                for (slot, selector) in self.selectors.iter().zip(selectors) {
+                    slot.selector.store(Arc::new(selector));
+                }
+                build_nanos.store(build_start.elapsed().as_nanos() as u64, Relaxed);
+            })
+            .await?;
+
+        let total = total_start.elapsed();
+        let build = Duration::from_nanos(build_nanos.load(Relaxed));
+        self.last_update_timing.store(Arc::new(Some(UpdateTimings {
+            discovery_duration: total.saturating_sub(build),
+            build_duration: build,
+        })));
+
+        Ok(())
+    }
+
+    /// Return the first healthy backend from the selected load-balancing configuration.
+    ///
+    /// Returns `None` when `selector_index` is out of bounds.
+    pub fn select(
+        &self,
+        selector_index: usize,
+        key: &[u8],
+        max_iterations: usize,
+    ) -> Option<Backend> {
+        self.select_with(selector_index, key, max_iterations, |_, health| health)
+    }
+
+    /// Select a backend using one selector and an additional acceptance function.
+    ///
+    /// All selectors consult the same backend readiness state. Returns `None`
+    /// when `selector_index` is out of bounds.
+    pub fn select_with<F>(
+        &self,
+        selector_index: usize,
+        key: &[u8],
+        max_iterations: usize,
+        accept: F,
+    ) -> Option<Backend>
+    where
+        F: Fn(&Backend, bool) -> bool,
+    {
+        let selection = self.selectors.get(selector_index)?.selector.load();
+        let mut iter = UniqueIterator::new(selection.iter(key), max_iterations);
+        while let Some(backend) = iter.get_next() {
+            if accept(&backend, self.backends.ready(&backend)) {
+                return Some(backend);
+            }
+        }
+        None
+    }
+
+    /// Set the health check implementation shared by every selector.
+    pub fn set_health_check(
+        &mut self,
+        hc: Box<dyn health_check::HealthCheck + Send + Sync + 'static>,
+    ) {
+        self.backends.set_health_check(hc);
+    }
+
+    /// Access the shared backend pool.
+    pub fn backends(&self) -> &Backends {
+        &self.backends
+    }
+
+    /// Return timing information from the most recent successful [`update`](Self::update) call.
+    ///
+    /// Returns `None` if [`update`](Self::update) has never completed successfully.
+    pub fn last_update_timing(&self) -> Option<UpdateTimings> {
+        **self.last_update_timing.load()
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Condvar, Mutex};
 
     use super::*;
     use async_trait::async_trait;
+    use pingora_core::services::ServiceReadyNotifier;
+
+    #[derive(Default)]
+    struct BuildTracker {
+        blocked: Mutex<bool>,
+        unblocked: Condvar,
+        active: AtomicUsize,
+    }
+
+    impl BuildTracker {
+        fn run_build(&self) {
+            self.active.fetch_add(1, Relaxed);
+
+            let mut blocked = self
+                .blocked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while *blocked {
+                blocked = self
+                    .unblocked
+                    .wait(blocked)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            self.active.fetch_sub(1, Relaxed);
+        }
+
+        fn block(&self) {
+            *self
+                .blocked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        }
+
+        fn unblock(&self) {
+            *self
+                .blocked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+            self.unblocked.notify_all();
+        }
+
+        fn reset(&self) {
+            self.active.store(0, Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestSelectionConfig {
+        reverse: bool,
+        tracker: Option<Arc<BuildTracker>>,
+    }
+
+    struct TestSelection {
+        backends: Vec<Backend>,
+    }
+
+    struct TestSelectionIter {
+        selection: Arc<TestSelection>,
+        index: usize,
+    }
+
+    impl BackendIter for TestSelectionIter {
+        fn next(&mut self) -> Option<&Backend> {
+            let backend = self.selection.backends.get(self.index);
+            self.index += 1;
+            backend
+        }
+    }
+
+    impl BackendSelection for TestSelection {
+        type Iter = TestSelectionIter;
+        type Config = TestSelectionConfig;
+
+        fn build_with_config(backends: &BTreeSet<Backend>, config: &Self::Config) -> Self {
+            if let Some(tracker) = &config.tracker {
+                tracker.run_build();
+            }
+            let mut backends: Vec<_> = backends.iter().cloned().collect();
+            if config.reverse {
+                backends.reverse();
+            }
+            Self { backends }
+        }
+
+        fn build(backends: &BTreeSet<Backend>) -> Self {
+            Self {
+                backends: backends.iter().cloned().collect(),
+            }
+        }
+
+        fn iter(self: &Arc<Self>, _key: &[u8]) -> Self::Iter {
+            TestSelectionIter {
+                selection: self.clone(),
+                index: 0,
+            }
+        }
+    }
+
+    struct MutableDiscovery {
+        backends: ArcSwap<BTreeSet<Backend>>,
+    }
+
+    impl MutableDiscovery {
+        fn new(backends: BTreeSet<Backend>) -> Self {
+            Self {
+                backends: ArcSwap::new(Arc::new(backends)),
+            }
+        }
+
+        fn add(&self, backend: Backend) {
+            let mut backends = BTreeSet::clone(&self.backends.load());
+            backends.insert(backend);
+            self.backends.store(Arc::new(backends));
+        }
+
+        fn replace(&self, backends: BTreeSet<Backend>) {
+            self.backends.store(Arc::new(backends));
+        }
+    }
+
+    #[async_trait]
+    impl ServiceDiscovery for Arc<MutableDiscovery> {
+        async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+            Ok((BTreeSet::clone(&self.backends.load()), HashMap::new()))
+        }
+    }
+
+    struct FailThenWaitDiscovery {
+        backend: Backend,
+        attempts: AtomicUsize,
+        allow_success: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ServiceDiscovery for Arc<FailThenWaitDiscovery> {
+        async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)> {
+            let attempt = self.attempts.fetch_add(1, Relaxed);
+            if attempt == 0 {
+                return Err(pingora_error::Error::explain(
+                    ErrorType::InternalError,
+                    "intentional discovery failure",
+                ));
+            }
+            if attempt == 1 {
+                self.allow_success.notified().await;
+            }
+            Ok((BTreeSet::from([self.backend.clone()]), HashMap::new()))
+        }
+    }
+
+    struct CountingHealthCheck {
+        checks: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl health_check::HealthCheck for CountingHealthCheck {
+        async fn check(&self, _target: &Backend) -> Result<()> {
+            self.checks.fetch_add(1, Relaxed);
+            Ok(())
+        }
+
+        fn health_threshold(&self, _success: bool) -> usize {
+            1
+        }
+    }
+
+    async fn wait_for_active_builds(tracker: &BuildTracker, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tracker.active.load(Relaxed) != expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("selector builds did not start");
+    }
 
     #[tokio::test]
     async fn test_static_backends() {
@@ -674,6 +1054,215 @@ mod test {
 
         // Selection should work
         assert!(lb.select(b"test", 10).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_load_balancer_group_rebuilds_all_selectors() {
+        let b1 = Backend::new("1.0.0.1:80").unwrap();
+        let b2 = Backend::new("1.1.1.1:80").unwrap();
+        let b3 = Backend::new("1.1.1.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([
+            b1.clone(),
+            b2.clone(),
+        ])));
+
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(discovery.clone())),
+            [
+                Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: None,
+                }),
+                Some(TestSelectionConfig {
+                    reverse: true,
+                    tracker: None,
+                }),
+            ],
+        );
+
+        assert_eq!(group.selector_count(), 2);
+        group.update().await.unwrap();
+        assert_eq!(group.select(0, b"", 10), Some(b1.clone()));
+        assert_eq!(group.select(1, b"", 10), Some(b2));
+
+        discovery.add(b3.clone());
+        group.update().await.unwrap();
+        assert_eq!(group.select(0, b"", 10), Some(b1));
+        assert_eq!(group.select(1, b"", 10), Some(b3));
+        let timing = group
+            .last_update_timing()
+            .expect("timing should be Some after update");
+        assert!(timing.build_duration > Duration::ZERO);
+        assert_eq!(group.select(2, b"", 10), None);
+    }
+
+    #[tokio::test]
+    async fn test_load_balancer_group_shares_health_checks() {
+        let b1 = Backend::new("1.0.0.1:80").unwrap();
+        let b2 = Backend::new("1.1.1.1:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([
+            b1.clone(),
+            b2.clone(),
+        ])));
+        let checks = Arc::new(AtomicUsize::new(0));
+
+        let mut group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(discovery)),
+            [
+                Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: None,
+                }),
+                Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: None,
+                }),
+            ],
+        );
+        group.set_health_check(Box::new(CountingHealthCheck {
+            checks: checks.clone(),
+        }));
+
+        group.update().await.unwrap();
+        group.backends().run_health_check(false).await;
+
+        assert_eq!(checks.load(Relaxed), 2);
+        group.backends().set_enable(&b1, false);
+        assert_eq!(group.select(0, b"", 10), Some(b2.clone()));
+        assert_eq!(group.select(1, b"", 10), Some(b2));
+    }
+
+    #[tokio::test]
+    async fn test_readiness_uses_current_backend_for_stale_selector_entries() {
+        let old_backend = Backend::new_with_weight("1.0.0.1:80", 1).unwrap();
+        let new_backend = Backend::new_with_weight("1.0.0.1:80", 2).unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([old_backend.clone()])));
+        let backends = Backends::new(Box::new(discovery.clone()));
+
+        backends.update(|_| {}).await.unwrap();
+        assert!(backends.ready(&old_backend));
+
+        discovery.replace(BTreeSet::from([new_backend.clone()]));
+        backends.update(|_| {}).await.unwrap();
+        assert!(backends.ready(&old_backend));
+        assert!(backends.ready(&new_backend));
+
+        discovery.replace(BTreeSet::new());
+        backends.update(|_| {}).await.unwrap();
+        assert!(!backends.ready(&old_backend));
+        assert!(!backends.ready(&new_backend));
+    }
+
+    #[tokio::test]
+    async fn test_stale_backend_address_fallback_fails_closed_when_ambiguous() {
+        let backend_v1 = Backend::new_with_weight("1.0.0.1:80", 1).unwrap();
+        let backend_v2 = Backend::new_with_weight("1.0.0.1:80", 2).unwrap();
+        let stale_backend = Backend::new_with_weight("1.0.0.1:80", 3).unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([
+            backend_v1.clone(),
+            backend_v2.clone(),
+        ])));
+        let backends = Backends::new(Box::new(discovery));
+
+        backends.update(|_| {}).await.unwrap();
+        assert!(backends.ready(&backend_v1));
+        assert!(backends.ready(&backend_v2));
+        assert!(!backends.ready(&stale_backend));
+
+        backends.set_enable(&stale_backend, false);
+        assert!(backends.ready(&backend_v1));
+        assert!(backends.ready(&backend_v2));
+
+        backends.set_enable(&backend_v1, false);
+        assert!(!backends.ready(&backend_v1));
+        assert!(backends.ready(&backend_v2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_load_balancer_group_waits_for_initial_selectors_before_ready() {
+        let backend = Backend::new("1.0.0.1:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([backend])));
+        let tracker = Arc::new(BuildTracker::default());
+        let group = Arc::new(
+            LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+                Backends::new(Box::new(discovery)),
+                [Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: Some(Arc::clone(&tracker)),
+                })],
+            ),
+        );
+        tracker.reset();
+        tracker.block();
+
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let run_group = Arc::clone(&group);
+        let run_task = tokio::spawn(async move {
+            run_group
+                .run(shutdown, Some(ServiceReadyNotifier::new(ready_tx)))
+                .await;
+        });
+
+        wait_for_active_builds(&tracker, 1).await;
+        assert!(!*ready_rx.borrow());
+
+        tracker.unblock();
+        tokio::time::timeout(Duration::from_secs(5), ready_rx.changed())
+            .await
+            .expect("ready notification timed out")
+            .expect("ready notifier was dropped");
+        assert!(*ready_rx.borrow());
+        run_task.await.expect("group background task failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_load_balancer_group_waits_for_successful_update_before_ready() {
+        let discovery = Arc::new(FailThenWaitDiscovery {
+            backend: Backend::new("1.0.0.1:80").unwrap(),
+            attempts: AtomicUsize::new(0),
+            allow_success: tokio::sync::Notify::new(),
+        });
+        let mut group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: None,
+            })],
+        );
+        group.update_frequency = Some(Duration::from_millis(1));
+        let group = Arc::new(group);
+
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+        let run_group = Arc::clone(&group);
+        let run_task = tokio::spawn(async move {
+            run_group
+                .run(shutdown, Some(ServiceReadyNotifier::new(ready_tx)))
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while discovery.attempts.load(Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("second discovery attempt did not start");
+        assert!(!*ready_rx.borrow());
+
+        discovery.allow_success.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), ready_rx.changed())
+            .await
+            .expect("ready notification timed out")
+            .expect("ready notifier was dropped");
+        assert!(*ready_rx.borrow());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("group background task did not stop")
+            .expect("group background task failed");
     }
 
     mod thread_safety {
