@@ -366,6 +366,11 @@ where
             else => break,
         }
     }
+    // The output channel can close in the same poll that publishes a proxy error.
+    // Reconcile the terminal error before reporting successful pipe completion.
+    if let Ok(e) = proxy_error_rx.try_recv() {
+        return Err(PipeSubrequestError::new(e, true, state));
+    }
     Ok(state)
 }
 
@@ -435,7 +440,9 @@ mod tests {
     use crate::{Session, Subrequest, SubrequestSpawner};
     use async_trait::async_trait;
     use pingora_core::protocols::http::ServerSession as HttpSession;
-    use std::sync::Arc;
+    use pingora_http::ResponseHeader;
+    use std::sync::{Arc, Barrier};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Drops session without producing output — channels close, rx returns None.
     struct NoopApp;
@@ -450,6 +457,33 @@ mod tests {
         }
     }
 
+    struct HeaderThenErrorApp {
+        header_selected: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl Subrequest for HeaderThenErrorApp {
+        async fn process_subrequest(
+            self: Arc<Self>,
+            mut session: Box<HttpSession>,
+            _ctx: Box<SubrequestCtx>,
+        ) {
+            let mut header =
+                ResponseHeader::build(200, Some(1)).expect("test response header should build");
+            header
+                .insert_header(http::header::CONTENT_LENGTH, "0")
+                .expect("test content-length should be valid");
+            session
+                .write_response_header(Box::new(header))
+                .await
+                .expect("test response header should be written");
+
+            self.header_selected.wait();
+            session.on_proxy_failure(Error::new(FileReadError));
+            self.header_selected.wait();
+        }
+    }
+
     async fn mock_session() -> Session {
         let input = b"GET / HTTP/1.1\r\nHost: test\r\n\r\n";
         let mock_io = tokio_test::io::Builder::new().read(&input[..]).build();
@@ -460,6 +494,58 @@ mod tests {
             .await
             .expect("mock request should parse");
         session
+    }
+
+    async fn writable_mock_session() -> Session {
+        let input = b"GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(input)
+            .await
+            .expect("mock request should be written");
+        tokio::spawn(async move {
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response).await;
+        });
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .downstream_session
+            .read_request()
+            .await
+            .expect("mock request should parse");
+        session
+    }
+
+    fn hold_header_until_error(
+        task: HttpTask,
+        header_selected: &Barrier,
+    ) -> Result<Option<HttpTask>> {
+        if matches!(&task, HttpTask::Header(..)) {
+            header_selected.wait();
+            header_selected.wait();
+        }
+        Ok(Some(task))
+    }
+
+    async fn pipe_header_then_error(
+    ) -> std::result::Result<PipeSubrequestState, PipeSubrequestError> {
+        let header_selected = Arc::new(Barrier::new(2));
+        let mut session = writable_mock_session().await;
+        let app = HeaderThenErrorApp {
+            header_selected: Arc::clone(&header_selected),
+        };
+        let spawner = SubrequestSpawner::new(Arc::new(app));
+        let ctx = SubrequestCtx::builder().body_mode(BodyMode::NoBody).build();
+        let (subrequest, handle) = spawner.create_subrequest(session.as_downstream(), ctx);
+        pipe_subrequest(
+            &mut session,
+            subrequest,
+            handle,
+            move |task| hold_header_until_error(task, &header_selected),
+            InputBodyType::Preset(InputBody::NoBody),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -486,5 +572,15 @@ mod tests {
             "no header should have been received from the no-op subrequest"
         );
         assert!(state.join_handle.is_some(), "task handle should be set");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preserves_proxy_error_queued_before_pipe_completion() {
+        let error = pipe_header_then_error()
+            .await
+            .expect_err("subrequest proxy error should be preserved");
+        assert!(error.from_subreq);
+        assert_eq!(error.error.root_etype(), &FileReadError);
+        assert!(error.state.header_received);
     }
 }
