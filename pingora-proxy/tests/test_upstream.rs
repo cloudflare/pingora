@@ -1554,6 +1554,37 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_deferred_cache_admission_fetches_from_upstream() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_deferred_cache_admission/now";
+        let client = reqwest::Client::new();
+
+        for _ in 0..2 {
+            let res = client
+                .get(url)
+                .header("x-defer-cache-admission", "true")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["x-cache-status"], "deferred");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        }
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        let cache_miss_epoch = res.headers()["x-epoch"].to_str().unwrap().to_owned();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.headers()["x-epoch"], cache_miss_epoch);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_cache_miss_finish_error_does_not_break_response() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_cache_miss_finish_error/now";

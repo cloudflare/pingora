@@ -28,6 +28,7 @@ use storage::MissFinishType;
 use strum::IntoStaticStr;
 use trace::{CacheTraceCTX, Span, Tag};
 
+pub mod admission;
 pub mod cache_control;
 pub mod eviction;
 pub mod filters;
@@ -44,6 +45,7 @@ pub mod trace;
 mod variance;
 
 use crate::max_file_size::MaxFileSizeTracker;
+use admission::{AdmissionPolicy, Decision};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, Locked};
 pub use memory::MemCache;
@@ -129,11 +131,10 @@ pub enum NoCacheReason {
     StorageError,
     /// Due to other types of internal issues
     InternalError,
-    /// will be cacheable but skip cache admission now
+    /// The response may be cacheable, but this request should not fill the cache.
     ///
-    /// This happens when the cache predictor predicted that this request is not cacheable, but
-    /// the response turns out to be OK to cache. However, it might be too large to re-enable caching
-    /// for this request
+    /// This can happen when an admission policy defers an absent key, or when the cache predictor
+    /// bypassed lookup and the response cannot safely be admitted by the current request.
     Deferred,
     /// Due to the proxy upstream filter declining the current request from going upstream
     DeclinedToUpstream,
@@ -179,6 +180,8 @@ pub struct HttpCacheDigest {
     pub lock_duration: Option<Duration>,
     // time spent in cache lookup and reading the header
     pub lookup_duration: Option<Duration>,
+    /// Admission decision made for an absent key, if an admission policy was configured.
+    pub admission: Option<Decision>,
 }
 
 /// Convenience function to add a duration to an optional duration
@@ -305,6 +308,7 @@ struct HttpCacheInnerEnabled {
     pub body_reader: Option<HitHandler>,
     pub storage: &'static (dyn storage::Storage + Sync), // static for now
     pub eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
+    pub admission: Option<&'static dyn AdmissionPolicy>,
     pub lock_ctx: Option<LockCtx>,
     pub traces: trace::CacheTraceCTX,
 }
@@ -527,6 +531,7 @@ impl HttpCache {
                         body_reader: None,
                         storage,
                         eviction,
+                        admission: None,
                         lock_ctx,
                         traces: CacheTraceCTX::new(),
                     })),
@@ -577,6 +582,23 @@ impl HttpCache {
                 }
             }
             _ => panic!("wrong phase: {:?}", self.phase),
+        }
+    }
+
+    /// Set the [`AdmissionPolicy`] used to decide whether an absent key may fill the cache.
+    ///
+    /// The policy is only consulted when storage reports a raw miss. Entries rejected
+    /// by `valid_after` filtering still follow the normal miss path.
+    ///
+    /// # Panics
+    ///
+    /// Panics after a cache lookup or fill has started.
+    pub fn set_admission_policy(&mut self, policy: &'static dyn AdmissionPolicy) {
+        match self.phase {
+            CachePhase::Uninit | CachePhase::CacheKey => {
+                self.inner_enabled_mut().admission = Some(policy);
+            }
+            _ => panic!("wrong phase to set admission policy: {:?}", self.phase),
         }
     }
 
@@ -1368,46 +1390,83 @@ impl HttpCache {
     ///
     /// A cache hit will return [CacheMeta] which contains the header and meta info about
     /// the cache as well as a [HitHandler] to read the cache hit body.
+    ///
+    /// When an admission policy defers a raw storage miss, this returns `Ok(None)` and disables
+    /// caching with [`NoCacheReason::Deferred`]. Callers must check [`Self::enabled()`] before
+    /// calling [`Self::cache_miss()`].
+    ///
+    /// Admission is observed at most once per [`HttpCache`], on an initial
+    /// [`CachePhase::CacheKey`] raw storage miss. Retried lookups and stale refills reuse the
+    /// existing admission outcome or proceed without another observation.
+    ///
+    /// Entries rejected by `valid_after` filtering are not raw storage misses and bypass
+    /// admission. After an invalidation, admission therefore does not provide additional
+    /// suppression for concurrent fills beyond the configured cache-lock behavior.
+    ///
     /// # Panic
     /// Panic in other phases.
     pub async fn cache_lookup(&mut self) -> Result<Option<(CacheMeta, HitHandler)>> {
         match self.phase {
             // Stale is allowed here because stale-> cache_lock -> lookup again
             CachePhase::CacheKey | CachePhase::Stale => {
-                let inner = self
-                    .inner
-                    .as_mut()
-                    .expect("Cache phase is checked and should have inner");
-                let inner_enabled = inner
-                    .enabled_ctx
-                    .as_mut()
-                    .expect("Cache enabled on cache_lookup");
-                #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
-                let mut span = inner_enabled.traces.child("lookup");
-                let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
-                let now = Instant::now();
-                let result = inner_enabled.storage.lookup(key, &span.handle()).await?;
-                // one request may have multiple lookups
-                self.digest.add_lookup_duration(now.elapsed());
-                let result = result.and_then(|(meta, header)| {
-                    if let Some(ts) = inner_enabled.valid_after {
-                        // `created` (not `provenance`) is the right field to compare on
-                        // the variant side: we are asking "was this specific variant
-                        // admitted before the primary's tombstone?" -- a fact about the
-                        // variant entry itself.
-                        if meta.created() < ts {
-                            span.set_tag(|| trace::Tag::new("not valid", true));
-                            return None;
+                let observe_admission =
+                    self.phase == CachePhase::CacheKey && self.digest.admission.is_none();
+                let (result, admission) = {
+                    let inner = self
+                        .inner
+                        .as_mut()
+                        .expect("Cache phase is checked and should have inner");
+                    let inner_enabled = inner
+                        .enabled_ctx
+                        .as_mut()
+                        .expect("Cache enabled on cache_lookup");
+                    #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
+                    let mut span = inner_enabled.traces.child("lookup");
+                    let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
+                    let now = Instant::now();
+                    let result = inner_enabled.storage.lookup(key, &span.handle()).await?;
+                    // one request may have multiple lookups
+                    self.digest.add_lookup_duration(now.elapsed());
+                    let storage_miss = result.is_none();
+                    let result = result.and_then(|(meta, header)| {
+                        if let Some(ts) = inner_enabled.valid_after {
+                            // `created` (not `provenance`) is the right field to compare on
+                            // the variant side: we are asking "was this specific variant
+                            // admitted before the primary's tombstone?" -- a fact about the
+                            // variant entry itself.
+                            if meta.created() < ts {
+                                span.set_tag(|| trace::Tag::new("not valid", true));
+                                return None;
+                            }
+                        }
+                        Some((meta, header))
+                    });
+                    let admission = (storage_miss && observe_admission)
+                        .then(|| inner_enabled.admission.map(|policy| policy.observe(key)))
+                        .flatten();
+                    if let Some(decision) = admission {
+                        span.set_tag(|| {
+                            trace::Tag::new("admission.observed", decision.observed() as i64)
+                        });
+                        span.set_tag(|| {
+                            trace::Tag::new("admission.deferred", decision.is_deferred())
+                        });
+                    }
+                    if result.is_none() && admission.is_none_or(|decision| !decision.is_deferred())
+                    {
+                        if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+                            lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
                         }
                     }
-                    Some((meta, header))
-                });
-                if result.is_none() {
-                    if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
+                    span.set_tag(|| trace::Tag::new("found", result.is_some()));
+                    (result, admission)
+                };
+                if let Some(decision) = admission {
+                    self.digest.admission = Some(decision);
+                    if decision.is_deferred() {
+                        self.disable(NoCacheReason::Deferred);
                     }
                 }
-                span.set_tag(|| trace::Tag::new("found", result.is_some()));
                 Ok(result)
             }
             _ => panic!("wrong phase {:?}", self.phase),
@@ -1597,6 +1656,11 @@ impl HttpCache {
         self.digest.lookup_duration
     }
 
+    /// Return the [`Decision`] made for an absent cache key.
+    pub fn admission_decision(&self) -> Option<Decision> {
+        self.digest.admission
+    }
+
     /// Delete the asset from the cache storage
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
@@ -1703,13 +1767,17 @@ mod tests {
     use async_trait::async_trait;
     use http::StatusCode;
     use std::any::Any;
-    use std::sync::Mutex;
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
 
     struct UpdateOkStorage;
     struct OneShotLookupStorage {
         entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
     }
     struct EmptyHitHandler;
+    struct CountingDeferPolicy(AtomicUsize);
+    struct CountingReadyPolicy(AtomicUsize);
 
     static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
     // Only one test uses this storage. Keep it that way unless the tests also isolate their keys
@@ -1717,6 +1785,28 @@ mod tests {
     static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
         entries: Mutex::new(Vec::new()),
     };
+    static RAW_MISS_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static VALID_AFTER_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static STALE_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static RAW_MISS_READY_POLICY: CountingReadyPolicy = CountingReadyPolicy(AtomicUsize::new(0));
+    static TWO_USE_ADMISSION_POLICY: LazyLock<admission::MinUsesAdmissionPolicy> =
+        LazyLock::new(|| admission::MinUsesAdmissionPolicy::new(NonZeroU32::new(2).unwrap()));
+
+    impl AdmissionPolicy for CountingDeferPolicy {
+        fn observe(&self, _key: &CacheKey) -> Decision {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Decision::Defer { observed: 1 }
+        }
+    }
+
+    impl AdmissionPolicy for CountingReadyPolicy {
+        fn observe(&self, _key: &CacheKey) -> Decision {
+            let observed = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+            Decision::Ready {
+                observed: observed as u32,
+            }
+        }
+    }
 
     #[async_trait]
     impl storage::HandleHit for EmptyHitHandler {
@@ -1854,6 +1944,106 @@ mod tests {
         cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
         cache.set_cache_key(key);
         cache
+    }
+
+    #[tokio::test]
+    async fn raw_storage_miss_can_defer_admission() {
+        RAW_MISS_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&RAW_MISS_DEFER_POLICY);
+        cache.set_cache_key(CacheKey::new("", "deferred-storage-miss", ""));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(cache.phase(), CachePhase::Disabled(NoCacheReason::Deferred));
+        assert_eq!(
+            cache.admission_decision(),
+            Some(Decision::Defer { observed: 1 })
+        );
+        assert_eq!(RAW_MISS_DEFER_POLICY.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn second_storage_miss_can_proceed_to_fill() {
+        let key = CacheKey::new("", "two-use-admission", "");
+
+        let mut first = HttpCache::new();
+        first.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        first.set_admission_policy(&*TWO_USE_ADMISSION_POLICY);
+        first.set_cache_key(key.clone());
+        assert!(first.cache_lookup().await.unwrap().is_none());
+        assert_eq!(first.phase(), CachePhase::Disabled(NoCacheReason::Deferred));
+
+        let mut second = HttpCache::new();
+        second.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        second.set_admission_policy(&*TWO_USE_ADMISSION_POLICY);
+        second.set_cache_key(key);
+        assert!(second.cache_lookup().await.unwrap().is_none());
+        assert_eq!(
+            second.admission_decision(),
+            Some(Decision::Ready { observed: 2 })
+        );
+        assert_eq!(second.phase(), CachePhase::CacheKey);
+        second.cache_miss();
+        assert_eq!(second.phase(), CachePhase::Miss);
+    }
+
+    #[tokio::test]
+    async fn repeated_raw_miss_is_observed_once_per_request() {
+        RAW_MISS_READY_POLICY.0.store(0, Ordering::Relaxed);
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&RAW_MISS_READY_POLICY);
+        cache.set_cache_key(CacheKey::new("", "repeated-ready-admission", ""));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(RAW_MISS_READY_POLICY.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cache.admission_decision(),
+            Some(Decision::Ready { observed: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_refill_does_not_observe_admission() {
+        STALE_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let key = CacheKey::new("", "stale-refill-admission", "");
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&STALE_DEFER_POLICY);
+        cache.set_cache_key(key);
+        cache.phase = CachePhase::Stale;
+        cache.inner_enabled_mut().meta = Some(test_meta(SystemTime::now()));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(STALE_DEFER_POLICY.0.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.admission_decision(), None);
+        cache.cache_miss();
+        assert_eq!(cache.phase(), CachePhase::Miss);
+    }
+
+    #[tokio::test]
+    async fn valid_after_rejection_does_not_observe_admission() {
+        VALID_AFTER_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let key = CacheKey::new("", "valid-after-not-admission", "");
+        ONE_SHOT_LOOKUP_STORAGE
+            .entries
+            .lock()
+            .unwrap()
+            .push((key.to_compact(), test_meta(created)));
+
+        let mut cache = HttpCache::new();
+        cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&VALID_AFTER_DEFER_POLICY);
+        cache.set_cache_key(key);
+        cache.inner_enabled_mut().valid_after = Some(created + Duration::from_secs(1));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(cache.phase(), CachePhase::CacheKey);
+        assert_eq!(cache.admission_decision(), None);
+        assert_eq!(VALID_AFTER_DEFER_POLICY.0.load(Ordering::Relaxed), 0);
     }
 
     #[test]

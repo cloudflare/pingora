@@ -161,7 +161,10 @@ where
 
                     if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
-                        if session.cache.is_cache_locked() {
+                        if !session.cache.enabled() {
+                            // An admission policy may have disabled caching during cache_lookup().
+                            break None;
+                        } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
                             let lock_status = session.cache.cache_lock_wait().await;
                             if self.handle_lock_status(session, ctx, lock_status) {
