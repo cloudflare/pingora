@@ -151,7 +151,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // The offending stream was already reset; keep the connection alive
             // and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
-            Ok(Some(H2Accept::Session(session))) => on_session(*session),
+            Ok(Some(H2Accept::Session(session))) => on_session(session),
         }
     }
 }
@@ -208,9 +208,13 @@ pub struct HttpSession {
 ///
 /// Returned by [`HttpSession::from_h2_conn`] so the accept loop can react to a
 /// rejected stream without tearing down the whole connection.
+///
+/// The session is stored inline to avoid a heap allocation for every accepted
+/// HTTP/2 stream.
+#[allow(clippy::large_enum_variant)]
 pub enum H2Accept {
     /// A new request stream was established and is ready to be served.
-    Session(Box<HttpSession>),
+    Session(HttpSession),
     /// The next stream was rejected during acceptance (for example, its request
     /// target contained a forbidden byte) and has already been reset with
     /// `RST_STREAM`. Sibling streams and the connection are unaffected; the
@@ -264,7 +268,7 @@ impl HttpSession {
             return Ok(Some(H2Accept::Rejected));
         }
 
-        Ok(Some(H2Accept::Session(Box::new(HttpSession {
+        Ok(Some(H2Accept::Session(HttpSession {
             request_header,
             request_body_reader,
             send_response,
@@ -277,7 +281,7 @@ impl HttpSession {
             digest,
             write_timeout: None,
             total_drain_timeout: None,
-        }))))
+        })))
     }
 
     /// The request sent from the client
