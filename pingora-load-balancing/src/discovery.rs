@@ -31,9 +31,12 @@ use crate::Backend;
 /// [ServiceDiscovery] is the interface to discover [Backend]s.
 #[async_trait]
 pub trait ServiceDiscovery {
-    /// Return the discovered collection of backends.
-    /// And *optionally* whether these backends are enabled to serve or not in a `HashMap`. Any backend
-    /// that is not explicitly in the set is considered enabled.
+    /// Return the discovered collection of backends and, optionally, whether
+    /// individual backends are enabled to serve.
+    ///
+    /// Enablement map keys are hashes of the corresponding [`Backend`] values,
+    /// produced with [`std::collections::hash_map::DefaultHasher`]. A backend
+    /// omitted from the map is considered enabled.
     async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)>;
 }
 

@@ -35,6 +35,7 @@
 //!     |   `-- pending SelectorRebuildRequest
 //!     `-- ArcSwap<PublishedSelector<S>>
 //!         |-- Arc<S>
+//!         |-- readiness snapshot
 //!         `-- SelectorReleaseGuard
 //!             `-- SelectorReleaseSignal
 //!
@@ -44,26 +45,26 @@
 //!
 //! The main roles are:
 //!
-//! - `Backends`, also named `BackendView`, owns one discovered membership,
-//!   view-local enablement, and references to health stored in its registry.
+//! - `Backends`, also named `BackendView`, owns discovered membership,
+//!   enablement, health references, and the membership generation. Each
+//!   published group selector owns the readiness snapshot for its generation,
+//!   so older selectors keep serving their own snapshot.
 //! - `HealthRegistry` reconciles the targets contributed by its views and owns
-//!   one health state and probe target per health key.
+//!   one health state and probe target per backend equivalence key.
 //! - `HealthCheckService` runs one active health-check loop for a shared
 //!   registry. Views with private registries are checked by their load balancer.
 //! - `SelectorSlot<S>` owns one selector configuration, its published selector,
 //!   generation, pending work, timings, and counters.
-//! - `SelectorRebuildRequest` contains the backend snapshot and generation to
-//!   build.
+//! - `SelectorRebuildRequest` contains the backend membership, its readiness
+//!   snapshot, and generation to build.
 //! - `SelectorRebuildState` tracks the active rebuild task and newest pending
 //!   request.
 //! - `SelectorRebuildTaskGuard` clears the running state and restores an
 //!   in-flight request if the task exits unexpectedly.
 //! - `SelectorRebuildCancellation` stops rebuild tasks when the group is
 //!   dropped.
-//! - `PublishedSelector<S>` pairs the selector exposed to requests with its
-//!   lifetime tracking.
-//! - `PublishedSelectorIter<S>` keeps that published selector alive while a
-//!   request iterates candidates.
+//! - `PublishedSelector<S>` pairs the selector exposed to requests with the
+//!   readiness snapshot for its generation and its lifetime tracking.
 //! - `SelectorReleaseGuard` and `SelectorReleaseSignal` notify the gate after a
 //!   replaced selector and all its readers are gone.
 //! - `SelectorRebuildGate` allows one build at a time and prevents another build
@@ -77,15 +78,16 @@
 //! 3. `BackendView` publishes that membership and updates its contribution to
 //!    `HealthRegistry`.
 //! 4. `HealthRegistry` reconciles the targets from all of its views.
-//! 5. In shared mode, `HealthCheckService` probes each registry health key once.
+//! 5. In shared mode, `HealthCheckService` probes each registry target once.
 //! 6. The resulting health state is visible through every contributing view.
-//! 7. Each view still applies its own membership and enablement when deciding
-//!    whether a backend is ready.
+//! 7. Each view applies its own membership and enablement. Each rebuilt group
+//!    selector is published with the readiness snapshot for its generation.
 //!
 //! ### Selector rebuild flow
 //!
-//! 1. `LoadBalancerGroup<S>` advances the backend generation after discovery.
-//! 2. It stores a `SelectorRebuildRequest` in each `SelectorSlot<S>`.
+//! 1. `Backends` advances the membership generation and produces an indivisible
+//!    membership and readiness update bundle.
+//! 2. `LoadBalancerGroup<S>` schedules each selector rebuild from that bundle.
 //! 3. `SelectorRebuildState` keeps one active rebuild and coalesces newer work
 //!    into its pending request.
 //! 4. `SelectorRebuildTaskGuard` tracks the in-flight request while the task
@@ -100,10 +102,10 @@
 //!
 //! 1. `LoadBalancerGroup<S>::select` loads a `PublishedSelector<S>` from the
 //!    chosen `SelectorSlot<S>`.
-//! 2. `PublishedSelectorIter<S>` keeps that selector alive while it yields
-//!    ordered backend candidates.
-//! 3. `BackendView` checks each candidate against current membership, local
-//!    enablement, and the health from `HealthRegistry`.
+//! 2. That published selector snapshot is held for the whole selection while it
+//!    yields ordered backend candidates.
+//! 3. The published selector's own readiness snapshot answers enablement and
+//!    health for each candidate.
 //! 4. The first accepted backend is returned; otherwise selection returns
 //!    `None`.
 //! 5. Replacing the selector does not affect this request's iterator.
@@ -144,7 +146,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
 };
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -508,11 +510,11 @@ impl HealthRegistry {
 /// View-local enablement paired with the shared [`Health`] handle for one
 /// backend identity.
 ///
-/// Caching the [`Health`] handle in the published view state lets
-/// [`Backends::ready`] answer with a single view-state snapshot and one map
-/// lookup, avoiding a second snapshot of the [`HealthRegistry`]. The handle
-/// shares its inner state with the registry, so health observations and
-/// reconciliation remain visible through it.
+/// Caching the [`Health`] handle in a [`ReadinessSnapshot`] lets readiness be
+/// answered with a single map lookup, avoiding a snapshot of the
+/// [`HealthRegistry`]. The handle shares its inner state with the registry, so
+/// health observations and reconciliation remain visible through it, including
+/// through a snapshot retained by an older selector.
 #[derive(Clone)]
 struct BackendReadiness {
     enabled: Arc<AtomicBool>,
@@ -525,40 +527,57 @@ impl BackendReadiness {
     }
 }
 
-/// One published snapshot of a backend view.
+/// An immutable, readiness-only snapshot of one backend view generation.
 ///
-/// During selector replacement, the lookup maps can temporarily contain both
-/// the old and new backends so either selector generation remains usable.
-struct BackendViewState {
-    /// The backend membership exposed by this snapshot.
-    backends: Arc<BTreeSet<Backend>>,
-    /// Readiness indexed by [`Backend::hash_key`] (address and weight), not by
-    /// the registry's health equivalence key.
-    readiness: HashMap<u64, BackendReadiness>,
-    /// The unique backend key at each address, or `None` when multiple backends
-    /// share that address.
-    backend_keys: HashMap<SocketAddr, Option<u64>>,
-}
+/// Readiness is indexed by [`Backend::hash_key`]. Cloning shares the underlying
+/// map through an [`Arc`]; each [`BackendReadiness`] keeps the shared live
+/// [`Health`] handle and the [`struct@AtomicBool`] enablement flag, so health
+/// observations and manual enable/disable stay visible through every clone of a
+/// generation's snapshot, including one owned by an older selector.
+#[derive(Clone)]
+struct ReadinessSnapshot(Arc<HashMap<u64, BackendReadiness>>);
 
-impl BackendViewState {
-    fn readiness(&self, backend: &Backend) -> Option<&BackendReadiness> {
-        self.readiness.get(&backend.hash_key()).or_else(|| {
-            let hash_key = self.backend_keys.get(&backend.addr).copied().flatten()?;
-            self.readiness.get(&hash_key)
-        })
+impl ReadinessSnapshot {
+    /// A snapshot with no known backends.
+    fn empty() -> Self {
+        Self(Arc::new(HashMap::new()))
+    }
+
+    /// Look up readiness by full backend identity.
+    fn get(&self, backend: &Backend) -> Option<&BackendReadiness> {
+        self.0.get(&backend.hash_key())
+    }
+
+    /// Whether the backend is present in this snapshot and both enabled and
+    /// healthy.
+    fn ready(&self, backend: &Backend) -> bool {
+        self.get(backend).is_some_and(BackendReadiness::ready)
     }
 }
 
-fn record_backend_key(backend_keys: &mut HashMap<SocketAddr, Option<u64>>, backend: &Backend) {
-    let hash_key = backend.hash_key();
-    backend_keys
-        .entry(backend.addr.clone())
-        .and_modify(|existing| {
-            if *existing != Some(hash_key) {
-                *existing = None;
-            }
-        })
-        .or_insert(Some(hash_key));
+/// One published snapshot of a backend view: its current membership paired with
+/// the readiness snapshot for that generation.
+struct BackendViewState {
+    /// The backend membership exposed by this snapshot.
+    backends: Arc<BTreeSet<Backend>>,
+    /// Readiness for the current membership, keyed by full backend identity.
+    readiness: ReadinessSnapshot,
+}
+
+/// An indivisible membership and readiness update produced by a membership
+/// change.
+///
+/// Groups schedule selector rebuilds from this bundle so each rebuilt selector
+/// is published with the exact readiness snapshot for its generation, keeping
+/// membership, readiness, and generation consistent across coalescing, retries,
+/// and cancellation.
+struct BackendUpdate {
+    /// Membership generation this update advanced to.
+    generation: u64,
+    /// Membership captured for this generation.
+    backends: Arc<BTreeSet<Backend>>,
+    /// Readiness snapshot for this generation.
+    readiness: ReadinessSnapshot,
 }
 
 /// A discovered backend membership with view-local enablement and shared
@@ -571,6 +590,17 @@ pub struct Backends {
     health_registry: Arc<HealthRegistry>,
     view_id: u64,
     state: ArcSwap<BackendViewState>,
+    /// Membership generation, advanced on each change.
+    generation: AtomicU64,
+    /// Weak enablement handles keyed by full backend identity.
+    ///
+    /// Lets [`Backends::set_enable`] reach a removed backend whose enablement
+    /// flag is still held by an older selector's readiness snapshot, and lets a
+    /// re-added backend recover its manual enablement while an older selector
+    /// still references it. Never read on the request path, so it takes a lock
+    /// only during membership updates and manual enable/disable. Expired entries
+    /// are cleaned up opportunistically on each membership change.
+    enablement_handles: Mutex<HashMap<u64, Weak<AtomicBool>>>,
     /// Whether the load balancer owning this view owns its active health checks.
     /// Shared-registry views leave them to [`HealthCheckService`].
     owns_health_checks: bool,
@@ -613,11 +643,28 @@ impl Backends {
             view_id,
             state: ArcSwap::new(Arc::new(BackendViewState {
                 backends: Arc::new(BTreeSet::new()),
-                readiness: HashMap::new(),
-                backend_keys: HashMap::new(),
+                readiness: ReadinessSnapshot::empty(),
             })),
+            generation: AtomicU64::new(0),
+            enablement_handles: Mutex::new(HashMap::new()),
             owns_health_checks,
         }
+    }
+
+    /// The current membership generation, advanced once per membership change.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Relaxed)
+    }
+
+    fn lock_enablement_handles(&self) -> MutexGuard<'_, HashMap<u64, Weak<AtomicBool>>> {
+        self.enablement_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The readiness snapshot for the currently published generation.
+    fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        self.state.load().readiness.clone()
     }
 
     /// Set the health check used by this view's entire health registry.
@@ -633,72 +680,76 @@ impl Backends {
         new_backends: BTreeSet<Backend>,
         enablement: HashMap<u64, bool>,
         callback: F,
-    ) -> Option<Arc<BTreeSet<Backend>>>
+    ) -> Option<BackendUpdate>
     where
         F: FnOnce(Arc<BTreeSet<Backend>>),
     {
         let old_state = self.state.load_full();
         let membership_changed = *old_state.backends != new_backends;
         if membership_changed {
+            let generation = self.generation.fetch_add(1, Relaxed) + 1;
             let new_backends = Arc::new(new_backends);
             let registry_state = self
                 .health_registry
                 .update_view(self.view_id, Arc::clone(&new_backends));
 
-            let mut backend_keys = HashMap::with_capacity(new_backends.len());
-            let new_readiness = new_backends
-                .iter()
-                .map(|backend| {
-                    let hash_key = backend.hash_key();
-                    record_backend_key(&mut backend_keys, backend);
+            let mut new_readiness = HashMap::with_capacity(new_backends.len());
+            {
+                let mut handles = self.lock_enablement_handles();
+                // Opportunistically drop enablement handles that no readiness
+                // snapshot references anymore.
+                handles.retain(|_, weak| weak.strong_count() > 0);
+                for backend in new_backends.iter() {
+                    let key = backend.hash_key();
+                    // Preserve enablement across removal and re-addition while
+                    // an older selector's snapshot still holds the flag.
                     let enabled = old_state
                         .readiness
-                        .get(&hash_key)
+                        .get(backend)
                         .map(|current| Arc::clone(&current.enabled))
+                        .or_else(|| handles.get(&key).and_then(Weak::upgrade))
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-                    if let Some(enabled_override) = enablement.get(&hash_key) {
+                    if let Some(enabled_override) = enablement.get(&key) {
                         enabled.store(*enabled_override, Relaxed);
                     }
+                    handles.insert(key, Arc::downgrade(&enabled));
                     let health = registry_state
                         .health
                         .get(&self.health_registry.health_key(backend))
                         .cloned()
                         .unwrap_or_default();
-                    (hash_key, BackendReadiness { enabled, health })
-                })
-                .collect();
+                    new_readiness.insert(key, BackendReadiness { enabled, health });
+                }
+            }
+            let new_readiness = ReadinessSnapshot(Arc::new(new_readiness));
 
-            let final_state = Arc::new(BackendViewState {
-                backends: Arc::clone(&new_backends),
-                readiness: new_readiness,
-                backend_keys,
-            });
-
-            // Keep both generations ready while the selector is replaced. This
-            // closes both publication orderings without blocking selections.
-            let mut transition_readiness = old_state.readiness.clone();
-            transition_readiness.extend(
-                final_state
-                    .readiness
-                    .iter()
-                    .map(|(key, readiness)| (*key, readiness.clone())),
-            );
-            let mut transition_backend_keys = old_state.backend_keys.clone();
-            for backend in new_backends.iter() {
-                record_backend_key(&mut transition_backend_keys, backend);
+            // Cover both the old and new readiness during a synchronous selector
+            // rebuild so a request in the callback does not lose a backend the
+            // about-to-be-replaced selector may still yield. This allocation is
+            // linear in old and new membership and only runs on membership changes.
+            let mut transition = old_state.readiness.0.as_ref().clone();
+            for (key, readiness) in new_readiness.0.iter() {
+                transition.insert(*key, readiness.clone());
             }
             self.state.store(Arc::new(BackendViewState {
                 backends: Arc::clone(&old_state.backends),
-                readiness: transition_readiness,
-                backend_keys: transition_backend_keys,
+                readiness: ReadinessSnapshot(Arc::new(transition)),
             }));
 
             callback(Arc::clone(&new_backends));
-            self.state.store(final_state);
-            Some(new_backends)
+
+            self.state.store(Arc::new(BackendViewState {
+                backends: Arc::clone(&new_backends),
+                readiness: new_readiness.clone(),
+            }));
+            Some(BackendUpdate {
+                generation,
+                backends: new_backends,
+                readiness: new_readiness,
+            })
         } else {
-            for (hash_key, enabled) in enablement {
-                if let Some(current) = old_state.readiness.get(&hash_key) {
+            for (key, enabled) in enablement {
+                if let Some(current) = old_state.readiness.0.get(&key) {
                     current.enabled.store(enabled, Relaxed);
                 }
             }
@@ -706,34 +757,46 @@ impl Backends {
         }
     }
 
-    /// Whether a backend is a current, enabled member of this view and healthy
-    /// in the shared registry.
+    /// Whether `backend` is enabled and healthy in this view's current
+    /// membership.
     ///
     /// This is on the hot request path: it takes a single snapshot of the
     /// published view state and performs one map lookup to a `BackendReadiness`
     /// carrying both the view-local enablement flag and the shared `Health`
     /// handle, so no second registry snapshot is required.
     ///
-    /// Backends are matched by their full identity first. A stale identity can
-    /// fall back to the current backend at the same address only when that
-    /// address uniquely identifies one backend in this view.
+    /// Readiness is keyed by full backend identity. Only the current membership
+    /// is reported: a removed backend is not ready here even while an older
+    /// group selector can still return it through its own readiness snapshot.
     pub fn ready(&self, backend: &Backend) -> bool {
-        self.state
-            .load()
-            .readiness(backend)
-            .is_some_and(BackendReadiness::ready)
+        self.state.load().readiness.ready(backend)
     }
 
-    /// Manually enable or disable a current member of this view.
+    /// Manually enable or disable `backend` by full backend identity.
     ///
-    /// A stale identity can fall back by address only when that address is
-    /// unambiguous within this view.
+    /// The current membership is updated in place. A removed backend is reached
+    /// through the weak enablement-handle interner, so disabling or re-enabling
+    /// a backend still held by an older group selector's readiness snapshot
+    /// takes effect for that selector too. Not on the request path, so it may
+    /// take the interner lock. If the backend is unknown or no snapshot retains
+    /// its enablement flag, this method does nothing.
     pub fn set_enable(&self, backend: &Backend, enabled: bool) {
-        let state = self.state.load();
-        let Some(readiness) = state.readiness(backend) else {
+        let key = backend.hash_key();
+        // Current membership shares the same `Arc<AtomicBool>` as the interner
+        // and any older snapshot, so flipping it here is sufficient.
+        if let Some(readiness) = self.state.load().readiness.0.get(&key) {
+            readiness.enabled.store(enabled, Relaxed);
             return;
-        };
-        readiness.enabled.store(enabled, Relaxed);
+        }
+        // Otherwise reach a removed backend whose flag an older selector's
+        // snapshot may still hold.
+        if let Some(enabled_flag) = self
+            .lock_enablement_handles()
+            .get(&key)
+            .and_then(Weak::upgrade)
+        {
+            enabled_flag.store(enabled, Relaxed);
+        }
     }
 
     /// Return this view's current backend membership.
@@ -742,6 +805,8 @@ impl Backends {
     }
 
     /// Run discovery and invoke `callback` when membership changes.
+    ///
+    /// Calls on the same backend view must not overlap with another update.
     pub async fn update<F>(&self, callback: F) -> Result<()>
     where
         F: FnOnce(Arc<BTreeSet<Backend>>),
@@ -751,7 +816,9 @@ impl Backends {
         Ok(())
     }
 
-    async fn update_backends(&self) -> Result<Option<Arc<BTreeSet<Backend>>>> {
+    /// Run discovery and return the membership and readiness update bundle when
+    /// membership changes, for a group to schedule selector rebuilds.
+    async fn update_backends(&self) -> Result<Option<BackendUpdate>> {
         let (new_backends, enablement) = self.discovery.discover().await?;
         Ok(self.do_update(new_backends, enablement, |_| {}))
     }
@@ -1022,6 +1089,10 @@ struct SelectorRebuildRequest {
     generation: u64,
     /// Backend membership captured for this generation.
     backends: Arc<BTreeSet<Backend>>,
+    /// Readiness snapshot published with the rebuilt selector, kept together
+    /// with membership and generation through coalescing, retries, and
+    /// cancellation.
+    readiness: ReadinessSnapshot,
     /// Time the rebuild was requested, used to measure queue delay.
     requested_at: Instant,
 }
@@ -1220,21 +1291,26 @@ impl Drop for SelectorReleaseGuard {
 
 /// A built selector snapshot published to request readers through [`ArcSwap`].
 ///
-/// It pairs the selection data with a signal used to track when a replaced
-/// snapshot is no longer referenced.
+/// It pairs the selection data with the readiness snapshot for its generation
+/// and a signal used to track when a replaced snapshot is no longer referenced.
+/// Keeping readiness here lets a retired selector keep serving its own backends
+/// with their own readiness, independently of the current view state.
 struct PublishedSelector<S> {
     /// Declared before `release_guard` so the shared selector is dropped (and,
     /// when this holds the last reference, destroyed) before release is
     /// signaled.
     selector: Arc<S>,
+    /// Readiness for the generation this selector was built from.
+    readiness: ReadinessSnapshot,
     /// Signals after `selector` and all published references are dropped.
     release_guard: SelectorReleaseGuard,
 }
 
 impl<S> PublishedSelector<S> {
-    fn new(selector: S) -> Self {
+    fn new(selector: S, readiness: ReadinessSnapshot) -> Self {
         Self {
             selector: Arc::new(selector),
+            readiness,
             release_guard: SelectorReleaseGuard {
                 release_signal: Arc::new(SelectorReleaseSignal::new()),
             },
@@ -1243,30 +1319,6 @@ impl<S> PublishedSelector<S> {
 
     fn release_signal(&self) -> Arc<SelectorReleaseSignal> {
         Arc::clone(&self.release_guard.release_signal)
-    }
-}
-
-/// A backend iterator that keeps its published selector snapshot alive.
-struct PublishedSelectorIter<S>
-where
-    S: BackendSelection,
-{
-    /// Declared before `_published` so the per-iteration `Arc<S>` clone held by
-    /// `iter` is dropped before the guard that keeps the published selector
-    /// (and thus the release signal) alive. This ensures release is not
-    /// signaled while an iterator still references the retired selector.
-    iter: S::Iter,
-    /// Keeps the published selector alive for the iterator's lifetime.
-    _published: arc_swap::Guard<Arc<PublishedSelector<S>>>,
-}
-
-impl<S> BackendIter for PublishedSelectorIter<S>
-where
-    S: BackendSelection,
-    S::Iter: BackendIter,
-{
-    fn next(&mut self) -> Option<&Backend> {
-        self.iter.next()
     }
 }
 
@@ -1320,7 +1372,7 @@ impl SelectorRebuildGate {
                 .retired
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Clear only the signal we waited for, not a newer retirement.
+            // Clear only the signal we waited for, not a newer retired selector.
             if registered
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &retired))
@@ -1356,9 +1408,10 @@ impl SelectorRebuildGate {
 /// in-progress build or a shared rebuild gate. Selector builds and retired
 /// generations are bounded by a [`SelectorRebuildGate`].
 ///
-/// Membership is authoritative while selectors are rebuilding. A selector
-/// still serving an older generation can therefore temporarily return `None`
-/// when none of its backends remain in the current membership.
+/// Each published selector owns the readiness snapshot for its generation, so a
+/// removed backend stays selectable only through selectors still serving an
+/// older generation. That readiness is released when the selector is replaced
+/// and its last reader drops it; no separate pruning step is needed.
 pub struct LoadBalancerGroup<S>
 where
     S: BackendSelection,
@@ -1367,8 +1420,6 @@ where
     backends: Backends,
     /// Independently configured selectors and their rebuild state.
     selectors: Box<[Arc<SelectorSlot<S>>]>,
-    /// Latest generation assigned after backend membership changes.
-    backend_generation: AtomicU64,
     /// Limits selector builds and waits for retired selectors to be released.
     rebuild_gate: Arc<SelectorRebuildGate>,
     /// Wakes startup readiness checks when a selector rebuild changes state.
@@ -1464,6 +1515,7 @@ async fn run_selector_rebuilds<S>(
         let generation = request.generation;
         let requested_at = request.requested_at;
         let backends = Arc::clone(&request.backends);
+        let readiness = request.readiness.clone();
         task_guard.in_flight = Some(request);
         let build_backends = Arc::clone(&backends);
         let build_slot = Arc::clone(&slot);
@@ -1490,8 +1542,8 @@ async fn run_selector_rebuilds<S>(
             Ok(selector) => {
                 let retired = slot
                     .selector
-                    .swap(Arc::new(PublishedSelector::new(selector)));
-                // old ref gets dropped / retired
+                    .swap(Arc::new(PublishedSelector::new(selector, readiness)));
+                // Track the replaced selector until all readers release it.
                 rebuild_gate.retire(&retired);
                 let _drop_task = tokio::task::spawn_blocking(move || drop(retired));
                 slot.last_update_timing
@@ -1538,6 +1590,7 @@ async fn run_selector_rebuilds<S>(
                         state.pending_request = Some(SelectorRebuildRequest {
                             generation,
                             backends,
+                            readiness,
                             requested_at,
                         });
                         true
@@ -1582,19 +1635,30 @@ where
     /// Each item in `configs` creates one selector. `None` uses
     /// [`BackendSelection::build`], while `Some(config)` uses
     /// [`BackendSelection::build_with_config`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `backends` has already been updated. A group owns backend
+    /// updates and must start with selector generation zero.
     pub fn from_backends_with_configs(
         backends: Backends,
         configs: impl IntoIterator<Item = Option<S::Config>>,
     ) -> Self {
+        assert_eq!(
+            backends.generation(),
+            0,
+            "backends must not be updated before constructing a load balancer group"
+        );
         let current_backends = backends.get_backend();
+        let current_readiness = backends.readiness_snapshot();
         let selectors = configs
             .into_iter()
             .map(|config| {
                 Arc::new(SelectorSlot {
-                    selector: ArcSwap::new(Arc::new(PublishedSelector::new(build_selector::<S>(
-                        &current_backends,
-                        config.as_ref(),
-                    )))),
+                    selector: ArcSwap::new(Arc::new(PublishedSelector::new(
+                        build_selector::<S>(&current_backends, config.as_ref()),
+                        current_readiness.clone(),
+                    ))),
                     config,
                     generation: AtomicU64::new(0),
                     rebuild_state: Mutex::new(SelectorRebuildState::default()),
@@ -1609,7 +1673,6 @@ where
         Self {
             backends,
             selectors,
-            backend_generation: AtomicU64::new(0),
             rebuild_gate: Arc::new(SelectorRebuildGate::new()),
             rebuild_notify: Arc::new(Notify::new()),
             rebuild_cancellation: Arc::new(SelectorRebuildCancellation::new()),
@@ -1638,8 +1701,7 @@ where
     fn schedule_selector_rebuild(
         &self,
         slot: &Arc<SelectorSlot<S>>,
-        generation: u64,
-        backends: Arc<BTreeSet<Backend>>,
+        update: &BackendUpdate,
         requested_at: Instant,
     ) {
         let should_spawn = {
@@ -1648,8 +1710,9 @@ where
             if rebuild_state
                 .pending_request
                 .replace(SelectorRebuildRequest {
-                    generation,
-                    backends,
+                    generation: update.generation,
+                    backends: Arc::clone(&update.backends),
+                    readiness: update.readiness.clone(),
                     requested_at,
                 })
                 .is_some()
@@ -1683,26 +1746,21 @@ where
     /// Run service discovery and enqueue selector rebuilds when membership changes.
     ///
     /// The discovered backend membership is published before this method returns.
-    /// Selector rebuilds continue asynchronously and retain their previous
-    /// generation until a replacement is ready.
+    /// Selector rebuilds run asynchronously. A removed backend stays selectable
+    /// through selectors still serving an older generation, via the readiness
+    /// snapshot each of those selectors owns.
     ///
     /// To wait for convergence, read [`backend_generation`](Self::backend_generation)
     /// after this call and poll [`selectors_ready_for`](Self::selectors_ready_for).
+    /// Calls on the same group must not overlap. [`Self::run`] serializes them.
     pub async fn update(&self) -> Result<()> {
         let start = Instant::now();
-        let changed_backends = self.backends.update_backends().await?;
+        let changed = self.backends.update_backends().await?;
         let discovery_duration = start.elapsed();
 
-        if let Some(backends) = changed_backends {
-            // `fetch_add` returns the previous value; rebuilds use the new generation.
-            let generation = self.backend_generation.fetch_add(1, Relaxed) + 1;
+        if let Some(update) = changed {
             for slot in &self.selectors {
-                self.schedule_selector_rebuild(
-                    slot,
-                    generation,
-                    Arc::clone(&backends),
-                    Instant::now(),
-                );
+                self.schedule_selector_rebuild(slot, &update, Instant::now());
             }
         }
 
@@ -1729,8 +1787,9 @@ where
 
     /// Select a backend using one selector and an additional acceptance function.
     ///
-    /// All selectors consult the same backend readiness state. Returns `None`
-    /// when `selector_index` is out of bounds.
+    /// Each selector consults the readiness snapshot published with it, so a
+    /// selector serving an older generation keeps using that generation's
+    /// readiness. Returns `None` when `selector_index` is out of bounds.
     pub fn select_with<F>(
         &self,
         selector_index: usize,
@@ -1741,17 +1800,19 @@ where
     where
         F: Fn(&Backend, bool) -> bool,
     {
+        // `published` is an `ArcSwap` guard held for the whole selection so the
+        // selector data and its matching readiness snapshot share one snapshot
+        // without a per-request `Arc` clone.
+        //
+        // Declaration order matters for the release invariant: `published` is
+        // declared before `iter`, so `iter` (and the per-iteration `Arc<S>`
+        // clone it holds) is dropped before the guard. The guard's drop can
+        // destroy the retired selector and fire its release signal, so release
+        // must not be signaled while an iterator still references the selector.
         let published = self.selectors.get(selector_index)?.selector.load();
-        let iter = published.selector.iter(key);
-        let mut iter = UniqueIterator::new(
-            PublishedSelectorIter {
-                iter,
-                _published: published,
-            },
-            max_iterations,
-        );
+        let mut iter = UniqueIterator::new(published.selector.iter(key), max_iterations);
         while let Some(backend) = iter.get_next() {
-            if accept(&backend, self.backends.ready(&backend)) {
+            if accept(&backend, published.readiness.ready(&backend)) {
                 return Some(backend);
             }
         }
@@ -1773,7 +1834,7 @@ where
 
     /// Return the latest backend membership generation.
     pub fn backend_generation(&self) -> u64 {
-        self.backend_generation.load(Relaxed)
+        self.backends.generation()
     }
 
     /// Return the generation currently served by one selector.
@@ -2391,6 +2452,20 @@ mod test {
     }
 
     #[tokio::test]
+    #[should_panic(
+        expected = "backends must not be updated before constructing a load balancer group"
+    )]
+    async fn test_load_balancer_group_rejects_updated_backends() {
+        let backend = Backend::new("1.0.0.1:80").unwrap();
+        let backends = Backends::new(Box::new(Arc::new(MutableDiscovery::new(BTreeSet::from([
+            backend,
+        ])))));
+        backends.update(|_| {}).await.unwrap();
+
+        let _ = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(backends, [None]);
+    }
+
+    #[tokio::test]
     async fn test_load_balancer_group_rebuilds_all_selectors() {
         let b1 = Backend::new("1.0.0.1:80").unwrap();
         let b2 = Backend::new("1.1.1.1:80").unwrap();
@@ -2558,7 +2633,7 @@ mod test {
             second_only.clone(),
         ])));
         let checks = Arc::new(AtomicUsize::new(0));
-        let registry = Arc::new(HealthRegistry::with_equivalence(address_health_key));
+        let registry = Arc::new(HealthRegistry::new());
         registry.set_health_check(Box::new(SelectiveHealthCheck {
             checks: Arc::clone(&checks),
             unhealthy: Some(shared.addr.clone()),
@@ -2708,6 +2783,49 @@ mod test {
         discovery.set_enabled(&first_backend, true);
         backends.update(|_| {}).await.unwrap();
         assert!(backends.ready(&first_backend));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_discovery_override_updates_retained_snapshot_on_readd() {
+        let old = Backend::new("1.0.0.1:80").unwrap();
+        let replacement = Backend::new("1.0.0.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([old.clone()])));
+        let tracker = Arc::new(BuildTracker::default());
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: Some(Arc::clone(&tracker)),
+            })],
+        );
+
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 1).await;
+        group.backends().set_enable(&old, false);
+        assert_eq!(group.select(0, b"", 10), None);
+
+        // Keep the old selector published while its backend leaves and then
+        // returns in newer backend generations.
+        tracker.reset();
+        tracker.block();
+        discovery.replace(BTreeSet::from([replacement]));
+        group.update().await.unwrap();
+        wait_for_active_builds(&tracker, 1).await;
+        assert_eq!(group.selector_generation(0), Some(1));
+        assert_eq!(group.select(0, b"", 10), None);
+
+        // An explicit discovery override is authoritative. Re-adding the exact
+        // identity updates both current readiness and the retained selector's
+        // shared enablement flag.
+        discovery.set_enabled(&old, true);
+        discovery.replace(BTreeSet::from([old.clone()]));
+        group.update().await.unwrap();
+        assert!(group.backends().ready(&old));
+        assert_eq!(group.select(0, b"", 10), Some(old.clone()));
+
+        tracker.unblock();
+        wait_for_group_generation(&group, 3).await;
+        assert_eq!(group.select(0, b"", 10), Some(old));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2913,10 +3031,11 @@ mod test {
             .expect("health service task failed");
     }
 
+    // Keep a removed backend available until the selector rebuilds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_stale_group_selector_cannot_escape_current_view_membership() {
+    async fn test_stale_group_selector_serves_removed_backend_until_converged() {
         let backend = Backend::new("1.0.0.1:80").unwrap();
-        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([backend])));
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([backend.clone()])));
         let registry = Arc::new(HealthRegistry::new());
         let tracker = Arc::new(BuildTracker::default());
         let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
@@ -2933,23 +3052,343 @@ mod test {
 
         group.update().await.unwrap();
         wait_for_group_generation(&group, 1).await;
-        assert!(group.select(0, b"", 10).is_some());
+        assert_eq!(group.select(0, b"", 10), Some(backend.clone()));
 
+        // Remove the backend while the rebuild is blocked.
         tracker.block();
         discovery.replace(BTreeSet::new());
         group.update().await.unwrap();
         wait_for_active_builds(&tracker, 1).await;
 
         assert_eq!(group.selector_generation(0), Some(1));
-        assert_eq!(group.select(0, b"", 10), None);
+        assert_eq!(group.select(0, b"", 10), Some(backend.clone()));
         assert_eq!(registry.target_count(), 0);
 
+        // Finish the rebuild and remove the old readiness.
         tracker.unblock();
         wait_for_group_generation(&group, 2).await;
+        assert_eq!(group.select(0, b"", 10), None);
+        group.update().await.unwrap();
+        assert!(!group.backends().ready(&backend));
+    }
+
+    // Keep selection available during a disjoint membership change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_group_selection_available_across_disjoint_membership_swap() {
+        let old = Backend::new("1.0.0.1:80").unwrap();
+        let new = Backend::new("1.0.0.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([old.clone()])));
+        let tracker = Arc::new(BuildTracker::default());
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: Some(Arc::clone(&tracker)),
+            })],
+        );
+        tracker.reset();
+
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 1).await;
+        assert_eq!(group.select(0, b"", 10), Some(old.clone()));
+
+        // Change membership while the rebuild is blocked.
+        tracker.block();
+        discovery.replace(BTreeSet::from([new.clone()]));
+        group.update().await.unwrap();
+        wait_for_active_builds(&tracker, 1).await;
+        assert_eq!(group.selector_generation(0), Some(1));
+        assert_eq!(group.backend_generation(), 2);
+
+        // The old selector can still use `old` through the readiness snapshot
+        // it was published with, even though current membership dropped it.
+        assert_eq!(group.select(0, b"", 10), Some(old.clone()));
+        // Current-view readiness reports only the current membership.
+        assert!(!group.backends().ready(&old));
+        assert!(group.backends().ready(&new));
+
+        // The old selector's snapshot shares the removed backend's enablement
+        // flag, reached through the interner, so manual disable/enable affects it.
+        group.backends().set_enable(&old, false);
+        assert_eq!(group.select(0, b"", 10), None);
+        group.backends().set_enable(&old, true);
+        assert_eq!(group.select(0, b"", 10), Some(old.clone()));
+
+        // Finish the rebuild. The old selector and its readiness snapshot are
+        // replaced and released; no explicit prune is needed.
+        tracker.unblock();
+        wait_for_group_generation(&group, 2).await;
+        assert_eq!(group.select(0, b"", 10), Some(new.clone()));
+        assert!(!group.backends().ready(&old));
+        assert!(group.backends().ready(&new));
+        assert_eq!(group.select(0, b"", 10), Some(new));
+    }
+
+    // Keep each backend identity paired with its own readiness while weights change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_group_weight_churn_preserves_selector_identity() {
+        let addr = "1.0.0.1:80";
+        let w100 = Backend::new_with_weight(addr, 100).unwrap();
+        let w101 = Backend::new_with_weight(addr, 101).unwrap();
+        let w102 = Backend::new_with_weight(addr, 102).unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([w100.clone()])));
+        let tracker = Arc::new(BuildTracker::default());
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: Some(Arc::clone(&tracker)),
+            })],
+        );
+
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 1).await;
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+
+        // Change the weight twice while the rebuild is blocked.
+        tracker.reset();
+        tracker.block();
+        discovery.replace(BTreeSet::from([w101.clone()]));
+        group.update().await.unwrap();
+        discovery.replace(BTreeSet::from([w102.clone()]));
+        group.update().await.unwrap();
+        assert_eq!(group.backend_generation(), 3);
+        wait_for_active_builds(&tracker, 1).await;
+        assert_eq!(group.selector_generation(0), Some(1));
+
+        // Current-view readiness contains only the latest identity, while the
+        // old selector retains the exact readiness paired with `w100`.
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+        assert!(!group.backends().ready(&w100));
+        assert!(!group.backends().ready(&w101));
+        assert!(group.backends().ready(&w102));
+
+        // Disabling the current identity does not affect the old selector.
+        group.backends().set_enable(&w102, false);
+        assert!(!group.backends().ready(&w102));
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+
+        // The old identity can still be disabled through its retained handle.
+        group.backends().set_enable(&w100, false);
+        assert_eq!(group.select(0, b"", 10), None);
+
+        // Re-enable both independent identities before publication converges.
+        group.backends().set_enable(&w100, true);
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+        group.backends().set_enable(&w102, true);
+        assert!(group.backends().ready(&w102));
+
+        // Finish the rebuild at the latest weight.
+        tracker.unblock();
+        wait_for_group_generation(&group, 3).await;
+        assert_eq!(group.selector_generation(0), Some(3));
+        assert_eq!(group.select(0, b"", 10), Some(w102.clone()));
+
+        // The latest identity is current and ready.
+        assert!(group.backends().ready(&w102));
+        assert_eq!(group.select(0, b"", 10), Some(w102));
+    }
+
+    // An old selector keeps serving a backend whose address disappeared before
+    // its rebuild, from the readiness snapshot it was published with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_group_old_selector_serves_disappeared_address_via_snapshot() {
+        let old_addr = "1.0.0.1:80";
+        let w100 = Backend::new_with_weight(old_addr, 100).unwrap();
+        let w101 = Backend::new_with_weight(old_addr, 101).unwrap();
+        let moved = Backend::new("1.0.0.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([w100.clone()])));
+        let tracker = Arc::new(BuildTracker::default());
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: Some(Arc::clone(&tracker)),
+            })],
+        );
+
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 1).await;
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+
+        // Change the weight, then remove the address while blocked.
+        tracker.reset();
+        tracker.block();
+        discovery.replace(BTreeSet::from([w101.clone()]));
+        group.update().await.unwrap();
+        discovery.replace(BTreeSet::from([moved.clone()]));
+        group.update().await.unwrap();
+        assert_eq!(group.backend_generation(), 3);
+        wait_for_active_builds(&tracker, 1).await;
+        assert_eq!(group.selector_generation(0), Some(1));
+
+        // The old selector keeps serving `w100` from its own readiness
+        // snapshot, though its address left current membership.
+        assert!(!group.backends().ready(&w100));
+        assert_eq!(group.select(0, b"", 10), Some(w100.clone()));
+        assert!(group.backends().ready(&moved));
+
+        // Finish the rebuild. The old selector and snapshot are released.
+        tracker.unblock();
+        wait_for_group_generation(&group, 3).await;
+        assert_eq!(group.select(0, b"", 10), Some(moved.clone()));
+        assert!(!group.backends().ready(&w100));
+        assert!(group.backends().ready(&moved));
+        assert_eq!(group.select(0, b"", 10), Some(moved));
+    }
+
+    // An older published selector keeps selecting its own disjoint backend from
+    // the readiness snapshot it was published with, even after a newer
+    // generation is published. The snapshot's lifetime ends when the reader
+    // drops it; no prune step runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_old_published_snapshot_selects_disjoint_backend_after_update() {
+        let old = Backend::new("1.0.0.1:80").unwrap();
+        let new = Backend::new("1.0.0.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([old.clone()])));
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::clone(&discovery))),
+            [Some(TestSelectionConfig {
+                reverse: false,
+                tracker: None,
+            })],
+        );
+
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 1).await;
+
+        // Capture the generation-1 published selector and hold it across a later
+        // update, as an in-flight request iterator would.
+        let published = group.selectors[0].selector.load_full();
+        assert!(published.readiness.ready(&old));
+
+        // Publish a disjoint generation 2.
+        discovery.replace(BTreeSet::from([new.clone()]));
+        group.update().await.unwrap();
+        wait_for_group_generation(&group, 2).await;
+
+        // The held generation-1 snapshot still yields `old` and still marks it
+        // ready, though current membership dropped it.
+        let mut iter = published.selector.iter(b"");
+        assert_eq!(iter.next(), Some(&old));
+        assert!(published.readiness.ready(&old));
+        assert!(!group.backends().ready(&old));
+
+        // Current selection uses the generation-2 snapshot.
+        assert_eq!(group.select(0, b"", 10), Some(new.clone()));
+        assert!(group.backends().ready(&new));
+
+        // Dropping the reader ends the old snapshot's lifetime without a prune.
+        drop(iter);
+        drop(published);
+        assert_eq!(group.select(0, b"", 10), Some(new));
+    }
+
+    // Two selectors published at different generations each consult the
+    // readiness snapshot they were built with, not a shared current view.
+    #[tokio::test]
+    async fn test_selectors_at_different_generations_use_matching_snapshots() {
+        let a = Backend::new("1.0.0.1:80").unwrap();
+        let b = Backend::new("1.0.0.2:80").unwrap();
+
+        // Build two independent readiness snapshots from separate views.
+        let backends_a =
+            Backends::new(Box::new(Arc::new(MutableDiscovery::new(BTreeSet::from([
+                a.clone(),
+            ])))));
+        backends_a.update(|_| {}).await.unwrap();
+        let readiness_a = backends_a.readiness_snapshot();
+        assert!(readiness_a.ready(&a));
+
+        let backends_b =
+            Backends::new(Box::new(Arc::new(MutableDiscovery::new(BTreeSet::from([
+                b.clone(),
+            ])))));
+        backends_b.update(|_| {}).await.unwrap();
+        let readiness_b = backends_b.readiness_snapshot();
+        assert!(readiness_b.ready(&b));
+
+        // A group with two selectors; publish each slot at a distinct generation
+        // with its matching snapshot.
+        let group = LoadBalancerGroup::<TestSelection>::from_backends_with_configs(
+            Backends::new(Box::new(Arc::new(MutableDiscovery::new(BTreeSet::new())))),
+            [
+                Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: None,
+                }),
+                Some(TestSelectionConfig {
+                    reverse: false,
+                    tracker: None,
+                }),
+            ],
+        );
+        group.selectors[0]
+            .selector
+            .store(Arc::new(PublishedSelector::new(
+                TestSelection::build(&BTreeSet::from([a.clone()])),
+                readiness_a,
+            )));
+        group.selectors[0].generation.store(1, Release);
+        group.selectors[1]
+            .selector
+            .store(Arc::new(PublishedSelector::new(
+                TestSelection::build(&BTreeSet::from([b.clone()])),
+                readiness_b,
+            )));
+        group.selectors[1].generation.store(2, Release);
+
+        // Each selector selects its own backend, marked ready by its own
+        // snapshot.
+        assert_eq!(group.select(0, b"", 10), Some(a.clone()));
+        assert_eq!(group.select(1, b"", 10), Some(b.clone()));
+
+        // The snapshots are distinct: neither knows the other's backend.
+        let published0 = group.selectors[0].selector.load();
+        assert!(published0.readiness.ready(&a));
+        assert!(!published0.readiness.ready(&b));
+        let published1 = group.selectors[1].selector.load();
+        assert!(published1.readiness.ready(&b));
+        assert!(!published1.readiness.ready(&a));
+    }
+
+    // The transition state published during a synchronous update callback must
+    // cover both the outgoing and incoming readiness, so a request in the
+    // callback (before the selector is swapped) does not lose the old backend.
+    // Once the callback returns, only the current membership is ready.
+    #[tokio::test]
+    async fn test_transition_snapshot_covers_outgoing_and_incoming_readiness() {
+        let a = Backend::new("1.0.0.1:80").unwrap();
+        let b = Backend::new("1.0.0.2:80").unwrap();
+        let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([a.clone()])));
+        let backends = Backends::new(Box::new(Arc::clone(&discovery)));
+
+        backends.update(|_| {}).await.unwrap();
+        assert!(backends.ready(&a));
+
+        // Disjoint swap A -> B. During the callback both must be ready.
+        discovery.replace(BTreeSet::from([b.clone()]));
+        let ran = AtomicBool::new(false);
+        backends
+            .update(|_| {
+                ran.store(true, Relaxed);
+                assert!(
+                    backends.ready(&a),
+                    "outgoing backend dropped mid-transition"
+                );
+                assert!(backends.ready(&b));
+            })
+            .await
+            .unwrap();
+        assert!(ran.load(Relaxed));
+
+        // After the callback the current view holds only B.
+        assert!(!backends.ready(&a));
+        assert!(backends.ready(&b));
     }
 
     #[tokio::test]
-    async fn test_readiness_uses_current_backend_for_stale_selector_entries() {
+    async fn test_current_readiness_uses_exact_backend_identity() {
         let old_backend = Backend::new_with_weight("1.0.0.1:80", 1).unwrap();
         let new_backend = Backend::new_with_weight("1.0.0.1:80", 2).unwrap();
         let discovery = Arc::new(MutableDiscovery::new(BTreeSet::from([old_backend.clone()])));
@@ -2960,7 +3399,7 @@ mod test {
 
         discovery.replace(BTreeSet::from([new_backend.clone()]));
         backends.update(|_| {}).await.unwrap();
-        assert!(backends.ready(&old_backend));
+        assert!(!backends.ready(&old_backend));
         assert!(backends.ready(&new_backend));
 
         discovery.replace(BTreeSet::new());
@@ -2969,8 +3408,9 @@ mod test {
         assert!(!backends.ready(&new_backend));
     }
 
+    // Backend variants sharing an address retain independent enablement.
     #[tokio::test]
-    async fn test_stale_backend_address_fallback_fails_closed_when_ambiguous() {
+    async fn test_same_address_variants_have_independent_readiness() {
         let backend_v1 = Backend::new_with_weight("1.0.0.1:80", 1).unwrap();
         let backend_v2 = Backend::new_with_weight("1.0.0.1:80", 2).unwrap();
         let stale_backend = Backend::new_with_weight("1.0.0.1:80", 3).unwrap();
@@ -2985,13 +3425,10 @@ mod test {
         assert!(backends.ready(&backend_v2));
         assert!(!backends.ready(&stale_backend));
 
-        backends.set_enable(&stale_backend, false);
-        assert!(backends.ready(&backend_v1));
-        assert!(backends.ready(&backend_v2));
-
         backends.set_enable(&backend_v1, false);
         assert!(!backends.ready(&backend_v1));
         assert!(backends.ready(&backend_v2));
+        assert!(!backends.ready(&stale_backend));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3116,9 +3553,10 @@ mod test {
     async fn test_rebuild_gate_cancellation_preserves_retired_selector() {
         let gate = Arc::new(SelectorRebuildGate::new());
         let permit = gate.acquire().await;
-        let retired = Arc::new(PublishedSelector::new(TestSelection::build(
-            &BTreeSet::new(),
-        )));
+        let retired = Arc::new(PublishedSelector::new(
+            TestSelection::build(&BTreeSet::new()),
+            ReadinessSnapshot::empty(),
+        ));
         let release_signal = retired.release_signal();
         gate.retire(&retired);
         drop(permit);
@@ -3226,13 +3664,23 @@ mod test {
         tracker.reset();
         tracker.block();
 
+        // A distinguishable readiness snapshot travels with the request, so the
+        // abort path must restore it alongside membership and generation.
+        let readiness = ReadinessSnapshot(Arc::new(HashMap::from([(
+            backend.hash_key(),
+            BackendReadiness {
+                enabled: Arc::new(AtomicBool::new(true)),
+                health: Health::default(),
+            },
+        )])));
         let slot = Arc::clone(&group.selectors[0]);
         {
             let mut rebuild_state = lock_rebuild_state(&slot.rebuild_state);
             rebuild_state.is_running = true;
             rebuild_state.pending_request = Some(SelectorRebuildRequest {
                 generation: 1,
-                backends: Arc::new(BTreeSet::from([backend])),
+                backends: Arc::new(BTreeSet::from([backend.clone()])),
+                readiness,
                 requested_at: Instant::now(),
             });
         }
@@ -3255,6 +3703,13 @@ mod test {
                     .as_ref()
                     .map(|request| request.generation),
                 Some(1)
+            );
+            assert!(
+                state
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| request.readiness.ready(&backend)),
+                "aborted rebuild lost its readiness bundle"
             );
         }
 
@@ -3747,13 +4202,12 @@ mod test {
         tracker.reset();
 
         // Hold a live iterator over the generation-1 selector. It keeps both the
-        // published selector guard and a separate `Arc<S>` clone alive.
+        // published selector guard and a separate `Arc<S>` clone alive. The
+        // tuple drops `iter` (and its `Arc<S>` clone) before the guard, matching
+        // the release ordering `select_with` relies on.
         let published = group.selectors[0].selector.load();
         let iter = published.selector.iter(b"");
-        let reader = PublishedSelectorIter {
-            iter,
-            _published: published,
-        };
+        let reader = (iter, published);
 
         // Make the eventual destructor of the generation-1 selector block.
         tracker.block_drop();
@@ -3829,9 +4283,8 @@ mod test {
         );
     }
 
-    // Finding 7: a private registry keys health by full backend identity, so two
-    // backends sharing an address but differing in weight retain independent
-    // readiness.
+    // A private registry keys health by full backend identity, so two backends
+    // sharing an address but differing in weight retain independent health.
     #[tokio::test]
     async fn test_private_registry_preserves_backend_identity() {
         let healthy = Backend::new_with_weight("1.0.0.1:80", 1).unwrap();
@@ -3869,7 +4322,7 @@ mod test {
                 let mut m = HashMap::with_capacity(self.expected);
                 for i in 0..self.expected {
                     let b = Backend::new(&format!("1.1.1.1:{i}")).unwrap();
-                    m.insert(i as u64, true);
+                    m.insert(b.hash_key(), true);
                     d.insert(b);
                 }
                 Ok((d, m))
