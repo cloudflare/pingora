@@ -15,7 +15,7 @@
 //! [Foundations](https://docs.rs/foundations) telemetry integration for
 //! [pingora](https://docs.rs/pingora) services.
 //!
-//! This crate provides a [`BackgroundService`](pingora_core::services::background::BackgroundService)
+//! This crate provides a [`BackgroundService`]
 //! that initializes foundations telemetry (logging, metrics, telemetry HTTP
 //! server) and runs the [`TelemetryDriver`](foundations::telemetry::TelemetryDriver)
 //! for the lifetime of the server.
@@ -43,7 +43,7 @@
 //!   memory profiler. Together with `telemetry-server`, this serves
 //!   `/pprof/heap`, `/pprof/heap_stats`, and `/pprof/symbol`.
 //!
-//! - **`service`**: Enables the Pingora [`BackgroundService`](pingora_core::services::background::BackgroundService)
+//! - **`service`**: Enables the Pingora [`BackgroundService`]
 //!   adapter. This is enabled by default.
 //!
 //! - **`telemetry-server`**: Runs foundations' built-in telemetry HTTP server
@@ -63,12 +63,10 @@
 //! let mut server = Server::new(None).unwrap();
 //!
 //! // Configure and add the telemetry service
-//! let config = FoundationsTelemetryConfig {
-//!     service_info: foundations::service_info!(),
-//!     settings: foundations::telemetry::settings::TelemetrySettings::default(),
-//!     metrics_producers: vec![],
-//!     custom_server_routes: vec![],
-//! };
+//! let config = FoundationsTelemetryConfig::new(
+//!     foundations::service_info!(),
+//!     foundations::telemetry::settings::TelemetrySettings::default(),
+//! );
 //! let telemetry = FoundationsTelemetryService::new(config);
 //! let telemetry_handle = server.add_service(
 //!     background_service("Foundations Telemetry", telemetry),
@@ -113,6 +111,7 @@ use pingora_core::services::ServiceReadyNotifier;
 pub use foundations;
 
 /// Configuration for foundations telemetry integration.
+#[non_exhaustive]
 pub struct FoundationsTelemetryConfig {
     /// Service metadata used by foundations for metric prefixes, log context,
     /// and the telemetry server's `/health` endpoint.
@@ -135,6 +134,24 @@ pub struct FoundationsTelemetryConfig {
     /// Additional routes served by the foundations telemetry server.
     #[cfg(feature = "telemetry-server")]
     pub custom_server_routes: Vec<foundations::telemetry::TelemetryServerRoute>,
+}
+
+impl FoundationsTelemetryConfig {
+    /// Create a telemetry configuration with no extra metrics producers or
+    /// custom server routes.
+    pub fn new(
+        service_info: foundations::ServiceInfo,
+        settings: foundations::telemetry::settings::TelemetrySettings,
+    ) -> Self {
+        Self {
+            service_info,
+            settings,
+            #[cfg(feature = "metrics")]
+            metrics_producers: Vec::new(),
+            #[cfg(feature = "telemetry-server")]
+            custom_server_routes: Vec::new(),
+        }
+    }
 }
 
 /// Initialize foundations telemetry subsystems.
@@ -180,6 +197,7 @@ pub fn init_telemetry(
 /// held for as long as logging is needed — dropping it unsets the global
 /// logger.
 #[cfg(feature = "logging")]
+#[must_use = "dropping this guard disables the log bridge"]
 pub fn init_log_bridge() -> slog_scope::GlobalLoggerGuard {
     use std::ops::Deref;
 
@@ -213,6 +231,11 @@ pub fn init_log_bridge() -> slog_scope::GlobalLoggerGuard {
 ///    foundations' slog pipeline via `slog-stdlog`.
 /// 3. Signals readiness so dependent services can start.
 /// 4. Polls the `TelemetryDriver` future until server shutdown.
+///
+/// If telemetry initialization fails, the service reports the error to Sentry
+/// in release builds when enabled, logs it to stderr, and intentionally does
+/// not signal readiness. Services that depend on this service remain blocked
+/// until shutdown rather than starting without their required telemetry.
 #[cfg(feature = "service")]
 pub struct FoundationsTelemetryService {
     config: Mutex<Option<FoundationsTelemetryConfig>>,
@@ -246,6 +269,12 @@ impl BackgroundService for FoundationsTelemetryService {
         let mut driver = match init_telemetry(config) {
             Ok(driver) => driver,
             Err(e) => {
+                #[cfg(all(not(debug_assertions), feature = "sentry"))]
+                {
+                    let error: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
+                    sentry::capture_error(error);
+                }
+
                 eprintln!("failed to initialize foundations telemetry: {e}");
                 // Keep the notifier alive so dependent services remain blocked.
                 wait_for_shutdown(&mut shutdown).await;
@@ -312,24 +341,21 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = FoundationsTelemetryConfig {
-            service_info: foundations::service_info!(),
-            settings,
-            metrics_producers: vec![Box::new(|buffer: &mut Vec<u8>| {
-                buffer.extend_from_slice(b"custom_metric 1\n# EOF\n");
-            })],
-            custom_server_routes: vec![TelemetryServerRoute {
-                path: "/custom".into(),
-                methods: vec![Method::GET],
-                handler: Box::new(|_, _| {
-                    Box::pin(async {
-                        Ok(Response::new(TelemetryRouteBody::new(
-                            Full::from("custom response").map_err(Into::into),
-                        )))
-                    })
-                }),
-            }],
-        };
+        let mut config = FoundationsTelemetryConfig::new(foundations::service_info!(), settings);
+        config.metrics_producers = vec![Box::new(|buffer: &mut Vec<u8>| {
+            buffer.extend_from_slice(b"custom_metric 1\n# EOF\n");
+        })];
+        config.custom_server_routes = vec![TelemetryServerRoute {
+            path: "/custom".into(),
+            methods: vec![Method::GET],
+            handler: Box::new(|_, _| {
+                Box::pin(async {
+                    Ok(Response::new(TelemetryRouteBody::new(
+                        Full::from("custom response").map_err(Into::into),
+                    )))
+                })
+            }),
+        }];
 
         let mut driver = init_telemetry(config).expect("telemetry should initialize");
         let addr = driver

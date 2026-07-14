@@ -32,6 +32,7 @@ API docs are also available for all the crates.
 # Notable crates in this workspace
 * Pingora: the "public facing" crate to build networked systems and proxies
 * Pingora-core: this crate defines the protocols, functionalities and basic traits
+* Pingora-foundations: Foundations telemetry integration for Pingora services
 * Pingora-proxy: the logic and APIs to build HTTP proxies
 * Pingora-error: the common error type used across Pingora crates
 * Pingora-http: the HTTP header definitions and APIs
