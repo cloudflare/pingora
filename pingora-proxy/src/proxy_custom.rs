@@ -14,9 +14,12 @@
 
 use futures::StreamExt;
 use pingora_core::{
-    protocols::http::custom::{
-        client::Session as CustomSession, is_informational_except_101, BodyWrite,
-        CustomMessageWrite, CUSTOM_MESSAGE_QUEUE_SIZE,
+    protocols::http::{
+        custom::{
+            client::Session as CustomSession, is_informational_except_101, BodyWrite,
+            CustomMessageWrite, CUSTOM_MESSAGE_QUEUE_SIZE,
+        },
+        v1::common::is_upgrade_req as is_h1_upgrade_req,
     },
     ImmutStr,
 };
@@ -100,6 +103,8 @@ where
                 return (false, Some(e));
             }
         }
+
+        session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
@@ -726,6 +731,11 @@ where
         if !from_cache {
             self.upstream_filter(session, &mut task, ctx).await?;
 
+            if let HttpTask::Header(header, _) = &task {
+                reject_mismatched_h1_upgrade_101(session, header, "custom_upstream_filter")
+                    .map_err(|e| e.into_up())?;
+            }
+
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
             if session.cache.enabled() || session.cache.bypassing() {
@@ -777,6 +787,11 @@ where
                     .await?;
                 /* Downgrade the version so that write_response_header won't panic */
                 header.set_version(Version::HTTP_11);
+                if !from_cache {
+                    // Re-check after response_filter in case it changed the final status to 101.
+                    reject_mismatched_h1_upgrade_101(session, &header, "custom_response_filter")
+                        .map_err(|e| e.into_in())?;
+                }
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
                 let no_body = session.req_header().method == "HEAD"

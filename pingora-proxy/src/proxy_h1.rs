@@ -19,7 +19,9 @@ use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
-use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
+use pingora_core::protocols::http::{
+    custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
+};
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -84,8 +86,7 @@ where
             return (false, true, Some(e));
         }
 
-        session.upstream_h1_upgrade_status_mismatch = session.downstream_session.is_upgrade_req()
-            != req.headers.get(header::UPGRADE).is_some();
+        session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
         session.upstream_compression.request_filter(&req);
 
@@ -838,21 +839,9 @@ where
                 time::sleep(duration).await;
             }
 
-            if matches!(
-                &task,
-                HttpTask::Header(header, _)
-                    if header.status == http::StatusCode::SWITCHING_PROTOCOLS
-                        && session.upstream_h1_upgrade_status_mismatch
-            ) {
-                // Upstream and downstream must agree that this request is an upgrade before
-                // a 101 can establish a tunnel. Otherwise one side changes protocol while
-                // the other stays in HTTP handling, allowing tunneled traffic to bypass the
-                // intended request processing or corrupting the connection state.
-                return Error::e_explain(
-                    InvalidHTTPHeader,
-                    "received 101 response with mismatched upstream/downstream upgrade status",
-                )
-                .map_err(|e| e.into_up());
+            if let HttpTask::Header(header, _) = &task {
+                reject_mismatched_h1_upgrade_101(session, header, "h1_upstream_filter")
+                    .map_err(|e| e.into_up())?;
             }
 
             // cache the original response before any downstream transformation
@@ -931,10 +920,15 @@ where
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
 
-                match self.inner.response_filter(session, &mut header, ctx).await {
-                    Ok(_) => Ok(HttpTask::Header(header, end)),
-                    Err(e) => Err(e),
+                self.inner
+                    .response_filter(session, &mut header, ctx)
+                    .await?;
+                if !from_cache {
+                    // Re-check after response_filter in case it changed the final status to 101.
+                    reject_mismatched_h1_upgrade_101(session, &header, "h1_response_filter")
+                        .map_err(|e| e.into_in())?;
                 }
+                Ok(HttpTask::Header(header, end))
             }
             HttpTask::Body(data, end) => {
                 if track_max_cache_size {
@@ -1128,5 +1122,118 @@ pub(crate) async fn send_body_to1(
         }
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    struct ResponseFilter101;
+
+    #[async_trait]
+    impl ProxyHttp for ResponseFilter101 {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            response.set_status(http::StatusCode::SWITCHING_PROTOCOLS)?;
+            response.set_version(Version::HTTP_11);
+            Ok(())
+        }
+    }
+
+    async fn upgrade_request_session() -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+    }
+
+    #[tokio::test]
+    async fn h1_response_filter_rejects_filter_created_101_with_upgrade_mismatch() {
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let mut session = upgrade_request_session().await;
+        session.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(false),
+        };
+
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = HttpTask::Header(Box::new(ResponseHeader::build(200, Some(0)).unwrap()), true);
+
+        let err = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+    }
+
+    #[tokio::test]
+    async fn h1_response_filter_rejects_upstream_101_upgrade_mismatch_as_upstream() {
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let mut session = upgrade_request_session().await;
+        session.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(false),
+        };
+
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let mut response =
+            ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, Some(0)).unwrap();
+        response.set_version(Version::HTTP_11);
+        let task = HttpTask::Header(Box::new(response), true);
+
+        let err = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Upstream);
     }
 }

@@ -776,6 +776,26 @@ impl Session {
         }
     }
 
+    /// Return whether this response completes an upgrade handshake.
+    ///
+    /// Returns `Some(true)` when an upgrade request gets an upgrade response,
+    /// `Some(false)` when an upgrade request gets a non-upgrade response, and
+    /// `None` when this request is not an upgrade.
+    pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
+        match self {
+            Self::H1(s) => s.is_upgrade(header),
+            Self::H2(_) => None,
+            Self::Subrequest(s) => s.is_upgrade(header),
+            Self::Custom(s) => {
+                if s.is_upgrade_req() {
+                    Some(super::v1::common::is_upgrade_resp(header))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Whether this session was fully upgraded (completed Upgrade handshake).
     pub fn was_upgraded(&self) -> bool {
         match self {
