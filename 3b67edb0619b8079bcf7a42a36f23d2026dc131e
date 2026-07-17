@@ -1,0 +1,21 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "3b67edb0619b8079bcf7a42a36f23d2026dc131e",
+  "prompts": {
+    "1f7e06a3dd12b828": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1c37511c1ffexsGFif3iXNzJKU",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "Fei Deng",
+      "messages": [],
+      "total_additions": 4,
+      "total_deletions": 11,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
