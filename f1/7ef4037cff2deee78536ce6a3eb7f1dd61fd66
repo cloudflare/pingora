@@ -1,0 +1,19 @@
+pingora-cache/src/cache_control.rs
+  s_be1bc1dcc1bb9d::t_92110746646cbb 25,51-172,359-361,365,424-427,429-433,439,443,454,457,464,469,474,479,482,497,502,507,512,517,522,527,536-539,549,569-572,581-584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f17ef4037cff2deee78536ce6a3eb7f1dd61fd66",
+  "prompts": {},
+  "sessions": {
+    "s_be1bc1dcc1bb9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_08efd40e2ffevhBdedfbznAPWU",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "J Evans <j@cloudflare.com>"
+    }
+  }
+}
