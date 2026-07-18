@@ -1,0 +1,28 @@
+pingora-core/src/connectors/l4.rs
+  s_722ea0365faff3::t_bdb0444402e7ac 360,362-363
+  s_722ea0365faff3::t_7be7906325d16e 353,361
+pingora-core/src/listeners/tls/rustls/mod.rs
+  s_722ea0365faff3::t_7e91db41804d64 17,222
+  s_722ea0365faff3::t_0acd0f61f7c7e5 100
+  s_722ea0365faff3::t_1079db90610ddf 219-221
+  s_722ea0365faff3::t_ca7b4c882f488a 223
+  s_722ea0365faff3::t_727bca4590f61b 22,26,37,39,68-92,122-158,199,201,206-211,215-218
+pingora-http/src/lib.rs
+  s_722ea0365faff3::t_e9f7123b50e98c 942,950
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7b0e71827d0dddb90384e5e8c6949f325d018ee6",
+  "prompts": {},
+  "sessions": {
+    "s_722ea0365faff3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f72a1-f77e-72b0-86ce-8bf583ec9db1",
+        "model": "gpt-5.5"
+      },
+      "human_author": "mariiaiurchenko <mariia@cloudflare.com>"
+    }
+  }
+}
