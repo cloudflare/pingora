@@ -1,0 +1,28 @@
+pingora-lru/src/persistence.rs
+  s_4a9618700658da::t_73ef77e8d03cc4 910-911,928
+  s_4a9618700658da::t_c9903ae2ca8884 840-862,867-871,873-879,881-909,912-918,920-927,929-955,965-966,968-970,972-988,993-1008,1010,1012-1068,1070-1076,1078-1092,1102,1108-1109,1111
+  s_4a9618700658da::t_f6d3ff5c38628a 116-120,125-126
+  s_4a9618700658da::t_6e8ef6ef76655d 971,989-992
+  s_4a9618700658da::t_1489dd45475e0f 172-199
+  s_4a9618700658da::t_a0bf664f359d59 514-596,602-614,619-621
+  s_4a9618700658da::t_c8a338760646ff 296-299
+  s_4a9618700658da::t_b2bde1597e24e5 863-866,872,880
+  s_4a9618700658da::t_955f86101d45e2 200-215
+  s_4a9618700658da::t_91f30cd3c46ebe 138-143
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fff6dd4677599d52bca1668c89cea165943930cc",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}
