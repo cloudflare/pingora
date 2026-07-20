@@ -1,0 +1,28 @@
+pingora-foundations/Cargo.toml
+  s_863f2f2c66da34::t_d3a8682924e475 26,36
+  s_863f2f2c66da34::t_d6caec99409dcd 21
+pingora-foundations/src/lib.rs
+  s_863f2f2c66da34::t_d3a8682924e475 235,272,277
+  s_863f2f2c66da34::t_c753b9780f4676 273-276
+  s_863f2f2c66da34::t_497812bb98ec9a 236-238
+  s_863f2f2c66da34::t_2dc37eadf0cdf5 234
+  s_863f2f2c66da34::t_bd1a96961d1738 18,46,66-69,114,139-156,200,344-358
+README.md
+  s_863f2f2c66da34::t_723485972cf64f 35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "485224fd6dd8a4e30de0b7ba35ba0f78dd403330",
+  "prompts": {},
+  "sessions": {
+    "s_863f2f2c66da34": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f720c-a071-7cc2-9f1f-2ae752892312",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
