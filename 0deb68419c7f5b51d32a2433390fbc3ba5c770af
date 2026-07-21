@@ -1,0 +1,28 @@
+pingora-lru/src/persistence.rs
+  s_4a9618700658da::t_1625860c8ecf9a 51-58
+  s_4a9618700658da::t_5419eb941f8719 2087-2092,2114-2124
+  s_4a9618700658da::t_8eb5d6c6dbc9ba 1872-1874,1897-1902
+  s_4a9618700658da::t_e51eb19eb2a240 2262-2269
+  s_4a9618700658da::t_92b7c95a143eb0 2192-2193
+  s_4a9618700658da::t_82214fed4f4cd2 745-746,748-749,751-755
+  s_4a9618700658da::t_e833ef2887d3d1 128-133,138-139
+  s_4a9618700658da::t_180b03724ffec4 229-232
+  s_4a9618700658da::t_0996b6a28536b3 2130-2134,2147,2159-2161,2165-2166,2171-2191,2194-2217
+  s_4a9618700658da::t_c3c043387978a9 302-320,322-329,343-354,359,364-365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0deb68419c7f5b51d32a2433390fbc3ba5c770af",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}

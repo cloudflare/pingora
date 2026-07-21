@@ -1,0 +1,25 @@
+pingora-lru/src/persistence.rs
+  s_4a9618700658da::t_715edfbe5c5414 2167-2171,2180-2181
+  s_4a9618700658da::t_21304933c2c87b 1903-1905,1907-1908
+  s_4a9618700658da::t_c20e0f8b01ec79 2269-2270
+  s_4a9618700658da::t_cae1b2c38f78bf 2130-2132
+  s_4a9618700658da::t_a639c39a9d8da6 2182,2185-2226
+  s_4a9618700658da::t_92ffcc2ea763e1 344-352,355
+  s_4a9618700658da::t_947e77273b77f9 2183-2184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb8a6961eaeffc46b7f5fe4944fe7231e9ef3d64",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}

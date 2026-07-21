@@ -1,0 +1,23 @@
+pingora-cache/src/cache_control.rs
+  s_be1bc1dcc1bb9d::t_92110746646cbb 25,51-117,119-120,123-125,130-147,174-193,379-381,444-447,453-457,463,467,478,481,488,493,498,503,506,521,526,531,536,541,546,551,560-563,573,593-596,605-608
+  s_be1bc1dcc1bb9d::t_afa2181de948a1 118,121-122,126-129,148-171
+  s_be1bc1dcc1bb9d::t_07f8ffe27bf408 385
+  s_be1bc1dcc1bb9d::t_cbab01d973e379 448-451
+  s_be1bc1dcc1bb9d::t_d2f2d2e7c77082 172-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5ea6e781013760f78bef7ba58cec8e6949bf9a09",
+  "prompts": {},
+  "sessions": {
+    "s_be1bc1dcc1bb9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_08efd40e2ffevhBdedfbznAPWU",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "J Evans <j@cloudflare.com>"
+    }
+  }
+}
