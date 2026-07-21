@@ -225,6 +225,22 @@ impl TlsSettings {
 }
 
 impl Acceptor {
+    /// Build an `Acceptor` from a runtime-constructed rustls [`ServerConfig`],
+    /// rather than from certificate/key files.
+    ///
+    /// This supports configurations whose key material does not live in files
+    /// on disk, e.g. certificates fetched from a secrets manager. The
+    /// resulting `Acceptor` accepts TLS connections via
+    /// [`Self::tls_handshake`] exactly as one built by [`TlsSettings::build`]
+    /// with no handshake offload configured.
+    pub fn from_server_config(config: Arc<ServerConfig>) -> Self {
+        Self {
+            acceptor: RusTlsAcceptor::from(config),
+            callbacks: None,
+            offload: None,
+        }
+    }
+
     pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<TlsStream<S>> {
         debug!("new tls session");
         if let Some(offload) = self.offload.as_ref() {
@@ -250,5 +266,58 @@ impl Acceptor {
         } else {
             handshake(self, stream).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::l4::stream::Stream as L4Stream;
+    use pingora_rustls::load_certs_and_key_files;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn test_from_server_config_handshake() {
+        // Build a rustls ServerConfig by hand, as a server whose key material
+        // arrives in memory (e.g. from a secrets manager) would. The fixture
+        // files stand in for that material here.
+        pingora_rustls::install_default_crypto_provider();
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let (certs, key) = load_certs_and_key_files(&cert_path, &key_path)
+            .unwrap()
+            .unwrap();
+        let config =
+            ServerConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
+        let acceptor = Acceptor::from_server_config(Arc::new(config));
+
+        // Accept a plain TCP connection and drive the TLS handshake directly
+        // through the Acceptor, with no TlsSettings (and no cert/key files)
+        // involved.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let stream: L4Stream = tcp_stream.into();
+            let mut tls_stream = acceptor.tls_handshake(stream).await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = tls_stream.read(&mut buf).await.unwrap();
+            tls_stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+                .await
+                .unwrap();
+            tls_stream.flush().await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let res = client.get(format!("https://{addr}")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
     }
 }
