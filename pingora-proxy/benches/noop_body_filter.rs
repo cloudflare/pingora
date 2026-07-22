@@ -60,7 +60,7 @@ impl ProxyHttp for OverriddenFilter {
         unreachable!("not used by this benchmark")
     }
 
-    fn upstream_response_body_filter(
+    async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
@@ -102,6 +102,7 @@ async fn call_filter<F: ProxyHttp<CTX = ()> + Send + Sync>(
                 false,
                 &mut ctx,
             )
+            .await
             .unwrap(),
     );
 }
