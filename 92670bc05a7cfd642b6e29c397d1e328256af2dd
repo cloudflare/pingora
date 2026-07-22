@@ -1,0 +1,20 @@
+pingora-lru/src/lib.rs
+  s_4a9618700658da::t_91e284189bbd43 1290-1301
+  s_4a9618700658da::t_af836e2ae51465 1302
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "92670bc05a7cfd642b6e29c397d1e328256af2dd",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}

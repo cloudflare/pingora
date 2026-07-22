@@ -1,0 +1,26 @@
+pingora-lru/src/lib.rs
+  s_4a9618700658da::t_05f894767959d4 106-107,112-113,133-136
+  s_4a9618700658da::t_852ff2db6d09dd 866-869
+  s_4a9618700658da::t_95c3603e1bd34b 2253-2257
+  s_4a9618700658da::t_ac6961fb0a9163 66-70
+  s_4a9618700658da::t_c40a03ee49af2d 834-846,848-863
+  s_4a9618700658da::t_e93c80fc99f720 864,2201-2207,2210-2211,2217-2225,2231,2234,2240-2242,2249-2251,2258
+  s_4a9618700658da::t_8c474454e0f49f 2208-2209,2212-2216,2226-2230,2232-2233,2235-2239,2243-2248,2252
+  s_4a9618700658da::t_868b5f80091392 865
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "78d3a6edd0301674a4ae24fedc8211152c1882b8",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}

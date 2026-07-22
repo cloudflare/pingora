@@ -1,0 +1,25 @@
+pingora-core/src/protocols/http/v1/body.rs
+  1f7e06a3dd12b828 23-24,1198,1516-1518,1617-1619,1705-1709,1782-1784,3856-4072
+pingora-core/src/protocols/http/v1/header.rs
+  1f7e06a3dd12b828 19-20,22,260-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "5de2c2dcea5abd47de9478b6388786cdce7c9f52",
+  "prompts": {
+    "1f7e06a3dd12b828": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1c37511c1ffexsGFif3iXNzJKU",
+        "model": "anthropic/claude-opus-4-7"
+      },
+      "human_author": "Fei Deng",
+      "messages": [],
+      "total_additions": 242,
+      "total_deletions": 195,
+      "accepted_lines": 242,
+      "overriden_lines": 0
+    }
+  }
+}

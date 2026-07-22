@@ -1,0 +1,29 @@
+pingora-lru/src/lib.rs
+  s_4a9618700658da::t_80100404811803 2540-2545
+  s_4a9618700658da::t_0ed43547632cc3 1273,1290-1291,1299-1300,1314
+  s_4a9618700658da::t_043f256f6286ee 1292-1298
+  s_4a9618700658da::t_13ad31d2d5cb26 2453-2455,2460,2468-2470
+  s_4a9618700658da::t_aa34bbedde8767 1301-1302
+  s_4a9618700658da::t_8dddb5f12f6c7e 1265-1272
+  s_4a9618700658da::t_4493bfa78d64e6 2456-2459,2461-2467
+  s_4a9618700658da::t_316e79b7eac033 2539
+  s_4a9618700658da::t_e8c421d356d077 678-688,692-695,699-702,704-705,707,710
+  s_4a9618700658da::t_72f89a03db5df2 708,711
+  s_4a9618700658da::t_1eb3a4e34774d1 1306-1308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d262d45c4b82c879dcda87629915b331d0480f10",
+  "prompts": {},
+  "sessions": {
+    "s_4a9618700658da": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07e4af3b5fferiUMNbTa8vnD8h",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}
