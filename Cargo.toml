@@ -27,6 +27,7 @@ members = [
     "pingora-memory-cache",
     "pingora-prometheus",
     "tinyufo",
+    "pingora-wasm",
 ]
 
 [workspace.dependencies]
