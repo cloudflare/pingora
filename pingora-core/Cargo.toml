@@ -82,6 +82,7 @@ nix = { version = "~0.31.1", features = ["socket", "net", "fs", "uio"] }
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio"] }
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
@@ -94,6 +95,10 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 rstest = "0.23.0"
 rustls = "0.23"
+
+[[bench]]
+name = "h1_pipelining"
+harness = false
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
