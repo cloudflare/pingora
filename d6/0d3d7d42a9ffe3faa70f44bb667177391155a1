@@ -1,0 +1,38 @@
+pingora-core/src/protocols/http/v1/server.rs
+  s_c8b32df3855b77::t_ba10edf78699c8 4389-4412
+  s_c8b32df3855b77::t_9d96703a3052d5 4318-4388,4413-4443
+  s_c8b32df3855b77::t_7397dd532e03c2 1129,1136
+  s_c8b32df3855b77::t_81b9a5cdb06913 82-84,279-288,296,300-302,362-364,409,1114,1119,1122
+  s_c8b32df3855b77::t_73f2dabe643b3c 303,365-374,430-439
+pingora-core/benches/h1_pipelining.rs
+  s_c8b32df3855b77::t_b18fb2e9c94b7f 21-29,60-78,82-94
+  s_c8b32df3855b77::t_5de75f0a2fc3d4 1-20,30-59,79-81,95-98
+pingora-core/Cargo.toml
+  s_c8b32df3855b77::t_5de75f0a2fc3d4 85,99-101
+  s_c8b32df3855b77::t_3b5f658f0362e2 102
+pingora-core/src/protocols/http/v1/body.rs
+  s_c8b32df3855b77::t_e9cbe2c3c48838 1976-2001,2650
+  s_c8b32df3855b77::t_81b9a5cdb06913 186-190,192-193,195-196,198-203,209-213,232-235,237-244,250-254,268-269,372-373,419,421,586-588,593-594,764,766
+  s_c8b32df3855b77::t_9d96703a3052d5 191,194,371,420,461,765
+  s_c8b32df3855b77::t_7397dd532e03c2 236
+  s_c8b32df3855b77::t_bd74917be66b6c 366-369
+  s_c8b32df3855b77::t_73f2dabe643b3c 177,197,374,376-377,424,426-427,462,464-465,475-476,481,488-489,767,775-776
+  s_c8b32df3855b77::t_7ea4df2d3d29c7 477-480,482-486,2628-2649
+  s_c8b32df3855b77::t_a53b70bf0f1391 2651
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d60d3d7d42a9ffe3faa70f44bb667177391155a1",
+  "prompts": {},
+  "sessions": {
+    "s_c8b32df3855b77": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07909ea13ffetakpHlooQXGn6i",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
