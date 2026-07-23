@@ -1,0 +1,21 @@
+pingora-proxy/src/proxy_common.rs
+  s_0c4ee63e34427b::t_96cf444de7cc5f 62-65,72-95,97-99
+  s_0c4ee63e34427b::t_4f66355fabc399 413,433,444-446,448-449,454-486
+  s_0c4ee63e34427b::t_ccf54655642d39 414-432,434-443,447,450-453,487-488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c3adbe59d2607c02417c606a7a76836a3d46d39f",
+  "prompts": {},
+  "sessions": {
+    "s_0c4ee63e34427b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06fd3d7beffe4X4yO0JeK3rddg",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
