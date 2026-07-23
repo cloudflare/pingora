@@ -346,6 +346,11 @@ pub trait ServiceWithDependents: Send + Sync {
             time_waited.as_millis()
         );
     }
+
+    /// See [`Service::listen_addresses`].
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[async_trait]
@@ -387,6 +392,10 @@ where
 
     fn on_startup_delay(&self, time_waited: Duration) {
         S::on_startup_delay(self, time_waited)
+    }
+
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        S::listen_addresses(self)
     }
 }
 
@@ -449,6 +458,14 @@ pub trait Service: Sync + Send {
             self.name(),
             time_waited.as_millis()
         );
+    }
+
+    /// The bind addresses of the listening sockets this service owns.
+    ///
+    /// Addresses must match the keys used for transferred listening fds. Return [`None`] (the
+    /// default) if the service may consume fds without declaring every key; this disables cleanup.
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        None
     }
 }
 

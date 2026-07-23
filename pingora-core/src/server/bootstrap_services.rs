@@ -15,8 +15,12 @@
 #[cfg(unix)]
 pub use super::transfer_fd::Fds;
 use async_trait::async_trait;
+#[cfg(unix)]
+use log::warn;
 use log::{debug, error, info};
 use parking_lot::Mutex;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -68,6 +72,9 @@ pub struct Bootstrap {
     #[cfg(unix)]
     listen_fds: ListenFds,
 
+    #[cfg(unix)]
+    expected_listen_addrs: Option<HashSet<String>>,
+
     /// PID of the original parent process to notify via `SIGUSR1` after bootstrap completes.
     /// Set when [`ServerConf::daemon_wait_for_ready`] is `true`.
     #[cfg(unix)]
@@ -115,6 +122,8 @@ impl Bootstrap {
             #[cfg(unix)]
             listen_fds: Arc::new(Mutex::new(Fds::new())),
             #[cfg(unix)]
+            expected_listen_addrs: None,
+            #[cfg(unix)]
             notify_parent_pid: None,
             #[cfg(unix)]
             daemon_notify_timeout: conf
@@ -140,6 +149,13 @@ impl Bootstrap {
     #[cfg(unix)]
     pub fn set_notify_parent_pid(&mut self, pid: u32) {
         self.notify_parent_pid = Some(pid);
+    }
+
+    /// Set the expected bind addresses and prune any inherited sockets already loaded.
+    #[cfg(unix)]
+    pub fn set_expected_listen_addrs(&mut self, addrs: HashSet<String>) {
+        Self::close_unclaimed_fds(&mut self.listen_fds.lock(), &addrs);
+        self.expected_listen_addrs = Some(addrs);
     }
 
     /// Initialize the Sentry client from the configured [`ClientOptions`] and
@@ -232,10 +248,25 @@ impl Bootstrap {
             debug!("Trying to receive socks");
             let mut fds = Fds::new();
             fds.get_from_sock(self.upgrade_sock.as_str())?;
+            if let Some(expected) = &self.expected_listen_addrs {
+                Self::close_unclaimed_fds(&mut fds, expected);
+            }
             // Mutate through the existing Arc so all clones held by services see the update.
             *self.listen_fds.lock() = fds;
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn close_unclaimed_fds(fds: &mut Fds, expected: &HashSet<String>) {
+        let closed = fds.close_unclaimed(expected);
+        if !closed.is_empty() {
+            warn!(
+                "Closed {} inherited listening socket(s) not claimed by any service: {:?}",
+                closed.len(),
+                closed
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -253,5 +284,35 @@ impl BackgroundService for BootstrapService {
     ) {
         self.inner.lock().bootstrap();
         notifier.notify_ready();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_addresses_prune_already_loaded_fds() {
+        let (execution_phase_watch, _) = broadcast::channel(1);
+        let mut bootstrap = Bootstrap::new(&None, &ServerConf::default(), &execution_phase_watch);
+        let keep_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        let drop_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(keep_fd >= 0 && drop_fd >= 0);
+
+        {
+            let mut fds = bootstrap.listen_fds.lock();
+            fds.add("127.0.0.1:80".to_string(), keep_fd);
+            fds.add("127.0.0.1:9090".to_string(), drop_fd);
+        }
+
+        bootstrap.set_expected_listen_addrs(["127.0.0.1:80".to_string()].into_iter().collect());
+
+        let fds = bootstrap.listen_fds.lock();
+        assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
+        assert!(fds.get("127.0.0.1:9090").is_none());
+        drop(fds);
+        assert_eq!(unsafe { libc::fcntl(drop_fd, libc::F_GETFD) }, -1);
+        assert_ne!(unsafe { libc::fcntl(keep_fd, libc::F_GETFD) }, -1);
+        unsafe { libc::close(keep_fd) };
     }
 }

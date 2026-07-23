@@ -426,6 +426,14 @@ impl Listeners {
         self.add_endpoint(addr, None);
     }
 
+    /// The configured bind addresses, using the keys expected by transferred listening fds.
+    pub fn addresses(&self) -> Vec<String> {
+        self.stacks
+            .iter()
+            .map(|stack| stack.l4.as_ref().to_string())
+            .collect()
+    }
+
     /// Set a connection filter for all endpoints in this listener collection
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
