@@ -1,0 +1,31 @@
+pingora-core/src/protocols/http/v2/client.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 36,41-51,206-208,237-243,711-744
+pingora-core/src/upstreams/peer.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 523,525-530
+pingora-core/src/protocols/http/v1/server.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 447-451,1072
+pingora-core/src/protocols/http/v2/server.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 37,53-63,137-138,141-146,158-162,1073-1109,1113-1115,1117-1172
+  s_c0690d61d7878c::t_451f61f481426a 1110-1112,1116
+  s_c0690d61d7878c::t_f0f4acd60dca90 265-270,274-291,318-344
+pingora-core/src/protocols/http/v1/client.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 212-228,747-750,767-784,1435-1451,1479-1513
+pingora-core/src/protocols/http/v1/common.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 18,127-147,289-398,400,403-415,417-431,445,448-449,451,453,455-459,461-466,468-592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e2b2b070d67bd88f8ccab1dbe421029cea73405e",
+  "prompts": {},
+  "sessions": {
+    "s_c0690d61d7878c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_106d59655ffew0b1FYGAbMoodm",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Abhishek Aiyer <aaiyer@cloudflare.com>"
+    }
+  }
+}

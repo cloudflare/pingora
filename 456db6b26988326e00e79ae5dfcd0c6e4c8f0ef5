@@ -1,0 +1,25 @@
+pingora-proxy/src/lib.rs
+  s_1e5b8d1e81b5a5::t_7b11cbc5baac3e 1857,1861,1867-1881,1883,1891,1979-2008,2020,2023-2047
+  s_1e5b8d1e81b5a5::t_5d800c8bb2ab46 1882,1892-1947
+  s_1e5b8d1e81b5a5::t_52d0b35c672471 1804-1835
+  s_1e5b8d1e81b5a5::t_36f005b2d179c2 733
+  s_1e5b8d1e81b5a5::t_65a05883a62084 1687
+  s_1e5b8d1e81b5a5::t_fa62324fa8e02f 679-681,692,694-695,698-700,705-707,717,721-723,892-906
+  s_1e5b8d1e81b5a5::t_02c5f3e7ea4873 907
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "456db6b26988326e00e79ae5dfcd0c6e4c8f0ef5",
+  "prompts": {},
+  "sessions": {
+    "s_1e5b8d1e81b5a5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6b91-e3e3-72c3-aba7-8712c1d78ce6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}

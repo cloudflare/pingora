@@ -1,0 +1,32 @@
+pingora-proxy/src/proxy_custom.rs
+  s_1e5b8d1e81b5a5::t_f122102bdfb400 108
+  s_1e5b8d1e81b5a5::t_f138ae35e98015 920-936
+  s_1e5b8d1e81b5a5::t_51d1b318d4be63 104-107,735,789-791
+  s_1e5b8d1e81b5a5::t_faeaa6b3286480 734,736-737
+pingora-proxy/src/lib.rs
+  s_1e5b8d1e81b5a5::t_02d869ce23899f 1644-1648,1650-1712,1714-1715,1717-1718,1720,1723,1725-1726,1730-1732,1735,1737,1739,1741-1744,1746-1747,1751,1753,1794-1795
+  s_1e5b8d1e81b5a5::t_d87b122bcc0ac1 751,754,788,793
+  s_1e5b8d1e81b5a5::t_a44f92b33d8577 712-716
+  s_1e5b8d1e81b5a5::t_80f8a517e78535 1649,1719,1727-1729,1738,1748-1750
+  s_1e5b8d1e81b5a5::t_6045286cc84aea 503-504,532
+  s_1e5b8d1e81b5a5::t_c1198f87465bb0 682,684
+  s_1e5b8d1e81b5a5::t_da6f577a93b18f 683,685-687,692-694
+  s_1e5b8d1e81b5a5::t_e833e2633684e2 1713,1716,1721-1722,1724,1733-1734,1736,1740,1745,1752,1754-1793
+  s_1e5b8d1e81b5a5::t_c3a88dcb8f8134 1796-1798
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "502bca71bb2a7624561fb8dd67a35c0beffa21e1",
+  "prompts": {},
+  "sessions": {
+    "s_1e5b8d1e81b5a5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6b91-e3e3-72c3-aba7-8712c1d78ce6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
