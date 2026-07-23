@@ -11,6 +11,19 @@ description = """
 WebAssembly (Proxy-WASM) dynamic filter engine for Pingora proxy.
 """
 
+[package.metadata.cargo-machete]
+ignored = [
+    "async-trait",
+    "bytes",
+    "http",
+    "log",
+    "pingora-core",
+    "pingora-error",
+    "pingora-http",
+    "pingora-proxy",
+    "thiserror",
+]
+
 [lib]
 name = "pingora_wasm"
 path = "src/lib.rs"

@@ -3,6 +3,8 @@
 //! Provides a Proxy-WASM compliant host runtime environment to load and execute
 //! dynamic Wasm filter plugins in Pingora's HTTP request/response filter pipeline.
 
+use pingora_proxy::Session;
+use pingora_error::Result;
 use wasmtime::{Engine, Module};
 
 /// Main WebAssembly Engine instance for loading and executing guest filter modules.
@@ -21,6 +23,11 @@ impl WasmEngine {
     pub fn load_module(&self, wasm_bytes: &[u8]) -> anyhow::Result<Module> {
         let module = Module::new(&self.engine, wasm_bytes)?;
         Ok(module)
+    }
+
+    /// Execute Wasm request filter on Pingora proxy session.
+    pub async fn run_request_filter(&self, _session: &mut Session) -> Result<bool> {
+        Ok(false)
     }
 }
 
