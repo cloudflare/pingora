@@ -21,7 +21,7 @@ pingora-core = { version = "0.8.0", path = "../pingora-core", default-features =
 pingora-proxy = { version = "0.8.0", path = "../pingora-proxy" }
 pingora-error = { version = "0.8.0", path = "../pingora-error" }
 pingora-http = { version = "0.8.0", path = "../pingora-http" }
-wasmtime = "22.0"
+wasmtime = "26.0"
 bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
