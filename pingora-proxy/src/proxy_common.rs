@@ -22,6 +22,29 @@ pub(crate) const KEEP_ALIVE: &str = "keep-alive";
 pub(crate) const PROXY_CONNECTION: &str = "proxy-connection";
 pub(crate) const HTTP2_SETTINGS: &str = "http2-settings";
 
+/// Whether `byte` is a `tchar`, the character set of an HTTP `token` (RFC 9110 §5.6.2). Checked
+/// here because `HeaderName::from_bytes` may accept bytes outside the `token` set.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 fn is_websocket_upgrade_request(req: &RequestHeader, downstream_is_http11: bool) -> bool {
     downstream_is_http11
         && req
@@ -36,7 +59,7 @@ struct ConnectionNominations {
 }
 
 impl ConnectionNominations {
-    fn parse(req: &RequestHeader) -> Result<Self> {
+    fn parse(req: &RequestHeader, reject_malformed: bool) -> Result<Self> {
         let mut headers = std::array::from_fn(|_| None);
         let mut len = 0;
         let mut nomination_count = 0;
@@ -59,26 +82,53 @@ impl ConnectionNominations {
                 );
             }
 
-            if token.starts_with(b":") // `:` denotes pseudo-headers such as `:authority`.
-                || [
-                    b"host".as_slice(),
-                    b"x-forwarded-for".as_slice(),
-                    b"x-forwarded-host".as_slice(),
-                    b"x-forwarded-proto".as_slice(),
-                ]
-                .iter()
-                .any(|protected| token.eq_ignore_ascii_case(protected))
-            {
+            // `:`-prefixed tokens nominate pseudo-headers (e.g. `:authority`); rejected in both modes.
+            if token.starts_with(b":") {
                 return Error::e_explain(
                     InvalidHTTPHeader,
                     "protected header cannot be nominated by the Connection header",
                 );
             }
 
-            if let Ok(name) = HeaderName::from_bytes(token) {
-                headers[len] = Some(name);
-                len += 1;
+            // A nomination is an HTTP `token` (RFC 9110 §5.6.2). We validate that ourselves rather
+            // than trust `HeaderName::from_bytes`, which may accept non-`token` bytes and let a
+            // decorated spelling like `Connection: "X-Forwarded-For"` slip past the protected-name
+            // check below. The RFC lets a recipient reject or ignore a malformed option, so
+            // `reject_malformed` is a policy choice: fail closed (default) or tolerate it.
+            if reject_malformed && !token.iter().all(|&byte| is_tchar(byte)) {
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    "invalid token nominated by the Connection header",
+                );
             }
+
+            // `HeaderName` lowercases, so the protected-set check below cannot be evaded via casing.
+            let name = match HeaderName::from_bytes(token) {
+                Ok(name) => name,
+                // Strict mode: every token is valid `tchar` and parses; a residual failure (e.g. a
+                // length limit) still fails closed. Lenient mode: an unparsable token names
+                // nothing, so ignore it.
+                Err(_) if reject_malformed => {
+                    return Error::e_explain(
+                        InvalidHTTPHeader,
+                        "invalid token nominated by the Connection header",
+                    );
+                }
+                Err(_) => continue,
+            };
+
+            if matches!(
+                name.as_str(),
+                "host" | "x-forwarded-for" | "x-forwarded-host" | "x-forwarded-proto"
+            ) {
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    "protected header cannot be nominated by the Connection header",
+                );
+            }
+
+            headers[len] = Some(name);
+            len += 1;
         }
 
         Ok(Self { headers, len })
@@ -116,7 +166,7 @@ pub(crate) fn sanitize_h1_upstream_request(
 
     let nominations = policy
         .strip_connection_nominated
-        .then(|| ConnectionNominations::parse(req))
+        .then(|| ConnectionNominations::parse(req, policy.reject_malformed_connection_nominations))
         .transpose()?;
 
     if policy.h1_upgrade == H1UpgradePolicy::Preserve && req.headers.contains_key(header::UPGRADE) {
@@ -176,7 +226,8 @@ pub(crate) fn sanitize_h2_upstream_request(
     policy: HttpUpstreamRequestPolicy,
 ) -> Result<()> {
     if policy.strip_connection_nominated {
-        ConnectionNominations::parse(req)?.remove_from(req);
+        ConnectionNominations::parse(req, policy.reject_malformed_connection_nominations)?
+            .remove_from(req);
     }
     if policy.strip_hop_by_hop {
         strip_standard_hop_by_hop_headers(req);
@@ -390,6 +441,125 @@ mod tests {
             sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn connection_nomination_rejects_protected_header() {
+        for token in [
+            "Host",
+            "x-forwarded-for",
+            "X-Forwarded-For",
+            "X-FORWARDED-HOST",
+            "x-Forwarded-Proto",
+        ] {
+            let mut request = request_with_headers(&[("Connection", token)]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
+                    .is_err(),
+                "protected nomination should be rejected regardless of casing: {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_nomination_rejects_pseudo_header() {
+        for token in [":authority", ":method", ":path"] {
+            let mut request = request_with_headers(&[("Connection", token)]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
+                    .is_err(),
+                "pseudo-header nomination should be rejected: {token:?}"
+            );
+        }
+    }
+
+    /// A nomination that is not a valid `token` is rejected outright instead of silently dropped.
+    #[test]
+    fn connection_nomination_rejects_malformed_token() {
+        let mut request = request_with_headers(&[("Connection", "keep-alive, bad token")]);
+        assert!(
+            sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
+                .is_err()
+        );
+    }
+
+    /// A protected name decorated with any non-`token` byte is rejected, independent of how
+    /// permissive the header-name parser is.
+    #[test]
+    fn connection_nomination_rejects_decorated_protected_header() {
+        for token in [
+            "\"X-Forwarded-For\"",
+            "(X-Forwarded-For",
+            "X-Forwarded-For)",
+            "X-Forwarded-For/",
+            "X-Forwarded-For:",
+            "X -Forwarded-For",
+            "@X-Forwarded-For",
+        ] {
+            let mut request =
+                request_with_headers(&[("Connection", token), ("X-Forwarded-For", "6.6.6.6")]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
+                    .is_err(),
+                "decorated protected nomination should be rejected: {token:?}"
+            );
+        }
+    }
+
+    /// A protected name decorated with a valid `tchar` (e.g. `'X-Forwarded-For'`) is a well-formed
+    /// nomination of a *distinct* header: accepted, but harmless — the real header is untouched.
+    #[test]
+    fn connection_nomination_allows_tchar_decorated_lookalike() {
+        for token in ["'X-Forwarded-For'", "X-Forwarded-For.", "!X-Forwarded-For"] {
+            let mut request =
+                request_with_headers(&[("Connection", token), ("X-Forwarded-For", "6.6.6.6")]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, HttpUpstreamRequestPolicy::standard())
+                    .is_ok(),
+                "tchar-decorated lookalike is a distinct header, not a protected match: {token:?}"
+            );
+            assert_eq!(request.headers["x-forwarded-for"], "6.6.6.6");
+        }
+    }
+
+    /// A policy that tolerates malformed `Connection` nominations while still stripping them.
+    fn lenient_policy() -> HttpUpstreamRequestPolicy {
+        let mut policy = HttpUpstreamRequestPolicy::standard();
+        policy.reject_malformed_connection_nominations = false;
+        policy
+    }
+
+    /// In lenient mode a malformed nomination is tolerated: it targets a distinct field and leaves
+    /// the real protected header intact.
+    #[test]
+    fn lenient_connection_nomination_tolerates_malformed_token() {
+        for token in [
+            "\"X-Forwarded-For\"",
+            "(X-Forwarded-For",
+            "@X-Forwarded-For",
+            "X -Forwarded-For",
+            "keep-alive, bad token",
+        ] {
+            let mut request =
+                request_with_headers(&[("Connection", token), ("X-Forwarded-For", "6.6.6.6")]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, lenient_policy()).is_ok(),
+                "malformed nomination should be tolerated in lenient mode: {token:?}"
+            );
+            assert_eq!(request.headers["x-forwarded-for"], "6.6.6.6");
+        }
+    }
+
+    /// Even in lenient mode, an exact protected or pseudo-header nomination is still rejected.
+    #[test]
+    fn lenient_connection_nomination_still_rejects_exact_protected() {
+        for token in ["x-forwarded-for", "X-Forwarded-For", "host", ":authority"] {
+            let mut request = request_with_headers(&[("Connection", token)]);
+            assert!(
+                sanitize_h2_upstream_request(&mut request, lenient_policy()).is_err(),
+                "exact protected/pseudo nomination must be rejected even in lenient mode: {token:?}"
+            );
+        }
     }
 
     #[test]
