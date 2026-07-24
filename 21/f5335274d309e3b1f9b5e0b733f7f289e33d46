@@ -1,0 +1,25 @@
+pingora-proxy/src/proxy_common.rs
+  s_0c4ee63e34427b::t_54ce25910dce10 99-100
+  s_0c4ee63e34427b::t_27a8c8eb49ed6b 87-89,97-98,101-119
+  s_0c4ee63e34427b::t_4f66355fabc399 452,472,483-485,487-488,493-494,499,501-511,537
+  s_0c4ee63e34427b::t_ccf54655642d39 453-471,473-482,486,489-492,538-539
+  s_0c4ee63e34427b::t_089a8bb142408e 25-49
+  s_0c4ee63e34427b::t_eab15556a4afbb 495-498,500,512-536
+  s_0c4ee63e34427b::t_96cf444de7cc5f 90,120-134,136-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "21f5335274d309e3b1f9b5e0b733f7f289e33d46",
+  "prompts": {},
+  "sessions": {
+    "s_0c4ee63e34427b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06fd3d7beffe4X4yO0JeK3rddg",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
