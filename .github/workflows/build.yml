@@ -8,7 +8,7 @@ jobs:
       fail-fast: false
       matrix:
         # nightly, msrv, and latest stable
-        toolchain: [nightly, 1.84.0, 1.91.1]
+        toolchain: [nightly, 1.85.0, 1.91.1]
     runs-on: ubuntu-latest
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -42,13 +42,13 @@ jobs:
         run: cargo check --workspace
 
       - name: Run cargo test
-        if: matrix.toolchain != '1.84.0'
+        if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --lib --bins --tests --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
-        if: matrix.toolchain != '1.84.0'
+        if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --doc
 
       - name: Run cargo clippy
