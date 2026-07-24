@@ -338,13 +338,11 @@ pub(crate) fn content_length_parse_all(headers: &HMap) -> Option<u64> {
         // framing is ambiguous.
         let line = value.to_str().ok()?;
         for v in line.split(',') {
-            match from_digits(v.trim().as_bytes()) {
-                Some(n) => match content_length {
-                    None => content_length = Some(n),
-                    Some(prev) if prev != n => return None,
-                    Some(_) => {}
-                },
-                None => return None,
+            let n = from_digits(v.trim().as_bytes())?;
+            match content_length {
+                None => content_length = Some(n),
+                Some(prev) if prev != n => return None,
+                Some(_) => {}
             }
         }
     }

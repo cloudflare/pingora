@@ -539,7 +539,7 @@ impl BodyReader {
                             let body_buf = self.body_buf.as_deref_mut().unwrap();
                             trace!(
                                 "last chunk size end buf {:?}",
-                                &body_buf[..existing_buf_end].escape_ascii(),
+                                body_buf[..existing_buf_end].escape_ascii(),
                             );
                             body_buf.copy_within(idx..existing_buf_end, 0);
                         }

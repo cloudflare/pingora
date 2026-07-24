@@ -2524,19 +2524,17 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                // safety: called only if the async_body_reader exists
-                if cache.miss_body_reader().unwrap().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range()?;
-                    cache
-                        .miss_body_reader()
-                        .unwrap()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            // safety: called only if the async_body_reader exists
+            RangeType::Multi(_info) if cache.miss_body_reader().unwrap().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .miss_body_reader()
+                    .unwrap()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }
@@ -2562,17 +2560,15 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                if cache.hit_handler().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range()?;
-                    cache
-                        .hit_handler()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            RangeType::Multi(_info) if cache.hit_handler().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .hit_handler()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }

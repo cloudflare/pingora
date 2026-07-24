@@ -939,9 +939,7 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        req.case_header_iter().for_each(|(_, _)| {
-            unreachable!("request has no case");
-        });
+        assert!(req.case_header_iter().next().is_none());
 
         let mut resp = ResponseHeader::new_no_case(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -949,9 +947,7 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        resp.case_header_iter().for_each(|(_, _)| {
-            unreachable!("response has no case");
-        });
+        assert!(resp.case_header_iter().next().is_none());
     }
 
     #[test]
