@@ -1,0 +1,46 @@
+pingora-core/src/connectors/l4.rs
+  s_b9fccad5d2248a::t_1aa58f86b41a85 316
+  s_b9fccad5d2248a::t_0445e8b50c8f52 349,355-358
+pingora-proxy/src/proxy_cache.rs
+  s_b9fccad5d2248a::t_5f0e945c44159e 2527-2537,2563-2571
+pingora-core/src/protocols/raw_connect.rs
+  s_b9fccad5d2248a::t_1aa58f86b41a85 158
+pingora-http/src/lib.rs
+  s_b9fccad5d2248a::t_ef34fcb8377a1a 942,950
+ci/Dockerfile
+  s_b9fccad5d2248a::t_fcf3015f19e365 20
+  s_b9fccad5d2248a::t_c5d04ce31b10a8 2-4
+  s_b9fccad5d2248a::t_ccd61b08e79782 7,12-14,18
+  s_b9fccad5d2248a::t_66b9277b1d19d4 28-30,51
+  s_b9fccad5d2248a::t_c050252f0f6036 10-11
+  s_b9fccad5d2248a::t_64b23f7331b6e0 26,42-43,45,47-50
+  s_b9fccad5d2248a::t_56bcfb4e4f6ce5 27,33-41,44,46
+  s_b9fccad5d2248a::t_d516f206e716c0 31-32
+pingora-core/src/protocols/http/v1/body.rs
+  s_b9fccad5d2248a::t_1aa58f86b41a85 542
+ci/common.yml
+  s_b9fccad5d2248a::t_08d6a60c4ae500 93-98,128-133
+  s_b9fccad5d2248a::t_c5d04ce31b10a8 14-16,108,143
+pingora-pool/src/connection.rs
+  s_b9fccad5d2248a::t_88129629610757 275
+pingora-cache/src/meta.rs
+  s_b9fccad5d2248a::t_0445e8b50c8f52 872
+pingora-core/src/protocols/http/v1/common.rs
+  s_b9fccad5d2248a::t_7a6170efef361f 341-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "104fd34b1280563894e24d3c4da75c62e44a13cd",
+  "prompts": {},
+  "sessions": {
+    "s_b9fccad5d2248a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f95ac-9e08-75a2-aa51-5e7a02870e8e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
