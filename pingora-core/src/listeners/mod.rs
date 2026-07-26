@@ -434,7 +434,9 @@ impl Listeners {
 
         // Apply to existing stacks
         for stack in &mut self.stacks {
-            stack.connection_filter = Some(filter.clone());
+            if stack.connection_filter.is_none() {
+                stack.connection_filter = Some(filter.clone());
+            }
         }
     }
 
@@ -488,6 +490,59 @@ impl Listeners {
             l4_buffer: L4BufferSettings::default(),
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
+            pre_tls_callback: self.pre_tls_callback.clone(),
+        })
+    }
+
+    /// Add a listening endpoint with an optional per-endpoint [`ConnectionFilter`].
+    ///
+    /// This method allows applying a connection filter to a specific endpoint,
+    /// overriding any global filter set via [`set_connection_filter`](Self::set_connection_filter).
+    ///
+    /// # Filter resolution priority
+    ///
+    /// 1. If `filter` is `Some(...)`, that filter is used for this endpoint.
+    /// 2. If `filter` is `None`, the global filter (if any) is used as fallback.
+    /// 3. If neither is set, no filtering is applied.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pingora_core::listeners::{Listeners, ConnectionFilter};
+    /// use std::sync::Arc;
+    ///
+    /// let mut listeners = Listeners::new();
+    ///
+    /// // Global filter applied to all endpoints by default
+    /// listeners.set_connection_filter(Arc::new(GlobalFilter));
+    ///
+    /// // This endpoint uses its own filter (ignores the global one)
+    /// listeners.add_endpoint_with_filter(
+    ///     ServerAddress::Tcp("0.0.0.0:443".into(), None),
+    ///     Some(tls_settings),
+    ///     Some(Arc::new(StrictFilter)),
+    /// );
+    ///
+    /// // This endpoint inherits the global filter
+    /// listeners.add_endpoint_with_filter(
+    ///     ServerAddress::Tcp("0.0.0.0:8080".into(), None),
+    ///     None,
+    ///     None,
+    /// );
+    /// ```
+    pub fn add_endpoint_with_filter(
+        &mut self,
+        l4: ServerAddress,
+        tls: Option<TlsSettings>,
+        #[cfg(feature = "connection_filter")] filter: Option<Arc<dyn ConnectionFilter>>,
+    ) {
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            l4_buffer: L4BufferSettings::default(),
+            #[cfg(feature = "connection_filter")]
+            // Use the endpoint-specific filter if provided; otherwise, fall back to the listener's global filter.
+            connection_filter: filter.or_else(|| self.connection_filter.clone()),
             pre_tls_callback: self.pre_tls_callback.clone(),
         })
     }
@@ -713,5 +768,202 @@ mod test {
                 "All stacks should have the connection filter set"
             );
         }
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_add_endpoint_with_filter_uses_provided_filter() {
+        #[derive(Debug)]
+        struct PerEndpointFilter;
+
+        #[async_trait]
+        impl ConnectionFilter for PerEndpointFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                true
+            }
+        }
+
+        let mut listeners = Listeners::new();
+        let per_endpoint = Arc::new(PerEndpointFilter);
+
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7200".into(), None),
+            None,
+            Some(per_endpoint.clone()),
+        );
+
+        let stack = &listeners.stacks[0];
+        assert!(
+            stack.connection_filter.is_some(),
+            "Per-endpoint filter should be set"
+        );
+
+        // The Arc should point to the same filter we provided
+        let provided = std::sync::Arc::as_ptr(stack.connection_filter.as_ref().unwrap());
+        let expected = std::sync::Arc::as_ptr(&per_endpoint);
+        assert_eq!(provided, expected, "Should use the exact filter provided");
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_add_endpoint_with_filter_none_falls_back_to_global() {
+        #[derive(Debug)]
+        struct GlobalFilter;
+
+        #[async_trait]
+        impl ConnectionFilter for GlobalFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                true
+            }
+        }
+
+        let mut listeners = Listeners::new();
+        let global = Arc::new(GlobalFilter);
+
+        // Set a global filter first
+        listeners.set_connection_filter(global.clone());
+
+        // Now add an endpoint with filter=None — it should inherit the global one
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7201".into(), None),
+            None,
+            None,
+        );
+
+        let stack = &listeners.stacks[0];
+        assert!(
+            stack.connection_filter.is_some(),
+            "Should inherit the global filter when per-endpoint is None"
+        );
+
+        let inherited = std::sync::Arc::as_ptr(stack.connection_filter.as_ref().unwrap());
+        let expected = std::sync::Arc::as_ptr(&global);
+        assert_eq!(inherited, expected, "Should be the global filter");
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_add_endpoint_with_filter_provided_overrides_global() {
+        #[derive(Debug)]
+        struct GlobalFilter;
+
+        #[derive(Debug)]
+        struct StrictFilter;
+
+        #[async_trait]
+        impl ConnectionFilter for GlobalFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                true
+            }
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for StrictFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                false
+            }
+        }
+
+        let mut listeners = Listeners::new();
+        let global = Arc::new(GlobalFilter);
+        let strict = Arc::new(StrictFilter);
+
+        // Set a global filter
+        listeners.set_connection_filter(global.clone());
+
+        // Add an endpoint with its own filter — should NOT use the global one
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7202".into(), None),
+            None,
+            Some(strict.clone()),
+        );
+
+        let stack = &listeners.stacks[0];
+        let actual = std::sync::Arc::as_ptr(stack.connection_filter.as_ref().unwrap());
+        let expected = std::sync::Arc::as_ptr(&strict);
+        assert_eq!(
+            actual, expected,
+            "Per-endpoint filter should override the global filter"
+        );
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_add_endpoint_with_filter_no_global_no_per_endpoint() {
+        let mut listeners = Listeners::new();
+
+        // No global filter, no per-endpoint filter
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7203".into(), None),
+            None,
+            None,
+        );
+
+        let stack = &listeners.stacks[0];
+        assert!(
+            stack.connection_filter.is_none(),
+            "Should have no filter when neither global nor per-endpoint is set"
+        );
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[test]
+    fn test_add_endpoint_with_filter_preserves_existing_per_endpoint_filter() {
+        #[derive(Debug)]
+        struct GlobalFilter;
+
+        #[derive(Debug)]
+        struct StrictFilter;
+
+        #[async_trait]
+        impl ConnectionFilter for GlobalFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                true
+            }
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for StrictFilter {
+            async fn should_accept(&self, _addr: Option<&std::net::SocketAddr>) -> bool {
+                false
+            }
+        }
+
+        let mut listeners = Listeners::new();
+        let global = Arc::new(GlobalFilter);
+        let strict = Arc::new(StrictFilter);
+
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7204".into(), None),
+            None,
+            Some(strict.clone()),
+        );
+
+        listeners.add_endpoint_with_filter(
+            ServerAddress::Tcp("127.0.0.1:7205".into(), None),
+            None,
+            None,
+        );
+
+        // Set a global filter
+        listeners.set_connection_filter(global.clone());
+
+        let stack_strict = &listeners.stacks[0];
+        let actual_strict =
+            std::sync::Arc::as_ptr(stack_strict.connection_filter.as_ref().unwrap());
+        let expected_strict = std::sync::Arc::as_ptr(&strict);
+        assert_eq!(
+            actual_strict, expected_strict,
+            "An existing per-endpoint filter should NOT be overwritten by set_connection_filter"
+        );
+
+        let stack_global = &listeners.stacks[1];
+        let actual_global =
+            std::sync::Arc::as_ptr(stack_global.connection_filter.as_ref().unwrap());
+        let expected_global = std::sync::Arc::as_ptr(&global);
+        assert_eq!(
+            actual_global, expected_global,
+            "Endpoints without a specific filter should receive the global filter"
+        );
     }
 }
