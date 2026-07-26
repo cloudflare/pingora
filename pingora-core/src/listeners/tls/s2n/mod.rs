@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use log::debug;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorSource, ErrorType, ImmutStr, Result, RetryType};
 use pingora_s2n::{
     load_certs_and_key_files, ClientAuthType, Config, IgnoreVerifyHostnameCallback, S2NPolicy,
     TlsAcceptor, DEFAULT_TLS13,
@@ -43,7 +43,7 @@ pub struct Acceptor {
 }
 
 impl TlsSettings {
-    pub fn build(self) -> Acceptor {
+    pub fn build(self) -> Result<Acceptor> {
         let mut builder = Config::builder();
 
         // Default security policy with TLS 1.3 support
@@ -82,9 +82,15 @@ impl TlsSettings {
         }
 
         if !self.verify_client_hostname {
-            builder
-                .set_verify_host_callback(IgnoreVerifyHostnameCallback::new())
-                .unwrap();
+            if let Err(_) = builder.set_verify_host_callback(IgnoreVerifyHostnameCallback::new()) {
+                return Err(Box::new(Error {
+                    etype: ErrorType::InternalError,
+                    esource: ErrorSource::Internal,
+                    retry: RetryType::Decided(false),
+                    cause: None,
+                    context: Some(ImmutStr::from("Failed to verify client hostname")),
+                }));
+            }
         }
 
         let config = builder.build().unwrap();
@@ -94,9 +100,9 @@ impl TlsSettings {
             security_policy: Some(policy.clone()),
         };
 
-        Acceptor {
+        Ok(Acceptor {
             acceptor: TlsAcceptor::new(connection_builder),
-        }
+        })
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.

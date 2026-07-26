@@ -18,7 +18,7 @@ use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::{server::handshake, server::handshake_with_callback, TlsStream};
 use log::debug;
 use pingora_error::ErrorType::InternalError;
-use pingora_error::{Error, OrErr, Result};
+use pingora_error::{Error, ErrorSource, ErrorType, ImmutStr, OrErr, Result, RetryType};
 use pingora_rustls::load_certs_and_key_files;
 use pingora_rustls::ClientCertVerifier;
 use pingora_rustls::ServerConfig;
@@ -46,17 +46,24 @@ impl TlsSettings {
     /// _NOTE_ This function will panic if there is an error in loading
     /// certificate files or constructing the builder
     ///
-    /// Todo: Return a result instead of panicking XD
-    pub fn build(self) -> Acceptor {
+    pub fn build(self) -> Result<Acceptor> {
         // rustls 0.23+ requires an explicit CryptoProvider.
         pingora_rustls::install_default_crypto_provider();
 
         let Ok(Some((certs, key))) = load_certs_and_key_files(&self.cert_path, &self.key_path)
         else {
-            panic!(
+            let error_message = format!(
                 "Failed to load provided certificates \"{}\" or key \"{}\".",
                 self.cert_path, self.key_path
-            )
+            );
+
+            return Err(Box::new(Error {
+                etype: ErrorType::InternalError,
+                esource: ErrorSource::Internal,
+                retry: RetryType::Decided(false),
+                cause: None,
+                context: Some(ImmutStr::Owned(error_message.into_boxed_str())),
+            }));
         };
 
         let builder =
@@ -77,10 +84,10 @@ impl TlsSettings {
             config.alpn_protocols = alpn_protocols;
         }
 
-        Acceptor {
+        Ok(Acceptor {
             acceptor: RusTlsAcceptor::from(Arc::new(config)),
             callbacks: None,
-        }
+        })
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.

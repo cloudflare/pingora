@@ -188,9 +188,14 @@ impl TransportStackBuilder {
         #[cfg(windows)]
         let l4 = builder.listen().await?;
 
+        let tls_val = match self.tls.take() {
+            Some(tls) => Some(Arc::new(tls.build()?)),
+            None => None,
+        };
+
         Ok(TransportStack {
             l4,
-            tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            tls: tls_val,
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
         })

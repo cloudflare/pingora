@@ -80,8 +80,8 @@ pub mod listeners {
     pub struct TlsSettings;
 
     impl TlsSettings {
-        pub fn build(&self) -> Acceptor {
-            Acceptor
+        pub fn build(&self) -> Result<Acceptor> {
+            Ok(Acceptor)
         }
 
         pub fn intermediate(_: &str, _: &str) -> Result<Self> {
