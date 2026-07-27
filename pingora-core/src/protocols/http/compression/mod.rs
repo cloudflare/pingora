@@ -116,6 +116,11 @@ impl ResponseCompressionCtx {
         }
     }
 
+    /// Whether this ctx is in the response header phase.
+    pub fn is_header_phase(&self) -> bool {
+        matches!(self.0, CtxInner::HeaderPhase { .. })
+    }
+
     /// Return the stat of this ctx:
     /// algorithm name, in bytes, out bytes, time took for the compression
     pub fn get_info(&self) -> Option<(&'static str, usize, usize, Duration)> {
@@ -1442,5 +1447,26 @@ mod tests_dictionary_compression {
             .as_bytes()
             .split(|b| *b == b',')
             .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+    }
+
+    #[test]
+    fn is_header_phase_after_header_and_body_transition() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        assert!(ctx.is_header_phase());
+
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("accept-encoding", "gzip").unwrap();
+        ctx.request_filter(&req);
+        assert!(ctx.is_header_phase());
+
+        let mut cont = ResponseHeader::build(100, None).unwrap();
+        ctx.response_header_filter(&mut cont, false);
+        assert!(ctx.is_header_phase());
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "text/plain").unwrap();
+        resp.insert_header("content-length", "0").unwrap();
+        ctx.response_header_filter(&mut resp, true);
+        assert!(!ctx.is_header_phase());
     }
 }
