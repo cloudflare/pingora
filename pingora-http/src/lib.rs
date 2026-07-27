@@ -38,6 +38,7 @@ pub use http::version::Version;
 pub use http::HeaderMap as HMap;
 
 pub mod authority;
+use authority::{raw_target_authority, RawTargetAuthority};
 
 mod case_header_name;
 use case_header_name::CaseHeaderName;
@@ -83,8 +84,14 @@ pub enum HeaderNameVariant<'a> {
 pub struct RequestHeader {
     base: ReqParts,
     header_name_map: Option<CaseMap>,
-    // store the raw path bytes only if it is invalid utf-8
+    // raw request-target bytes for wire serialization, set when the parsed Uri does not
+    // round-trip the original target: non-UTF-8 paths, absolute-form, and the
+    // authority-form CONNECT target
     raw_path_fallback: Vec<u8>, // can also be Box<[u8]>
+    // whether the request-target was valid UTF-8. Tracked separately because
+    // raw_path_fallback is also populated for valid-UTF-8 non-origin-form targets, so
+    // its emptiness no longer implies UTF-8.
+    raw_path_utf8: bool,
     // whether we send END_STREAM with HEADERS for h2 requests
     send_end_stream: bool,
 }
@@ -111,6 +118,7 @@ impl RequestHeader {
             base,
             header_name_map: None,
             raw_path_fallback: vec![],
+            raw_path_utf8: true,
             send_end_stream: true,
         }
     }
@@ -258,31 +266,37 @@ impl RequestHeader {
         self.base.uri = uri;
         // Clear out raw_path_fallback, or it will be used when serializing
         self.raw_path_fallback = vec![];
+        // The Uri is now the sole source of the target, and it is valid UTF-8
+        self.raw_path_utf8 = true;
     }
 
-    /// Set the request URI directly via raw bytes.
+    /// Set the request target directly via raw bytes.
     ///
-    /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
+    /// Generally prefer [`Self::set_uri()`] to modify the header's URI if able.
     ///
-    /// This API is to allow supporting non UTF-8 cases.
+    /// This API is to allow supporting non UTF-8 cases, and request-targets that are not
+    /// in origin-form ([RFC 9112 section 3.2]).
+    ///
+    /// Origin-form and asterisk-form targets round-trip through the URI. Absolute-form and
+    /// the authority-form CONNECT target do not, so they are additionally kept verbatim for
+    /// [`Self::raw_path()`]. For those two forms the URI carries only the path component,
+    /// which means [`http::Uri::path()`] returns a path rather than a whole URL and
+    /// [`http::Uri::authority()`] is left unset.
+    ///
+    /// Any fragment is dropped: it is not part of the request-target and must not be sent
+    /// upstream.
+    ///
+    /// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
-        if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            self.base.uri = uri;
-            // keep raw_path empty, no need to store twice
-        } else {
-            // put a valid utf-8 path into base for read only access
-            let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            self.base.uri = uri;
-            self.raw_path_fallback = path.to_vec();
-        }
+        // Everything is computed before anything is stored: a rejected target must
+        // leave the existing one intact.
+        let parsed = parse_request_target(path)?;
+        self.base.uri = parsed.uri;
+        // Origin-form and asterisk-form replace the fallback with an empty vec, so a
+        // reused header (e.g. a CONNECT mutated into a normal request) cannot
+        // serialize the stale target.
+        self.raw_path_fallback = parsed.raw_path_fallback;
+        self.raw_path_utf8 = parsed.raw_path_utf8;
         Ok(())
     }
 
@@ -300,9 +314,14 @@ impl RequestHeader {
         Some(self.send_end_stream)
     }
 
-    /// Return the request path in its raw format
+    /// Return the request target in its raw format, as it should appear on the wire.
     ///
-    /// Non-UTF8 is supported.
+    /// For origin-form and asterisk-form this is the path and query. For absolute-form and
+    /// the authority-form CONNECT target it is the whole target as received, less any
+    /// fragment.
+    ///
+    /// Non-UTF8 is supported; [`Self::raw_path_is_utf8()`] reports whether these bytes are
+    /// valid UTF-8 or were replaced lossily in the URI.
     pub fn raw_path(&self) -> &[u8] {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
@@ -323,7 +342,7 @@ impl RequestHeader {
 
     /// Whether [`Self::raw_path`] is valid UTF-8 without lossy replacement.
     pub fn raw_path_is_utf8(&self) -> bool {
-        self.raw_path_fallback.is_empty()
+        self.raw_path_utf8
     }
 
     /// Return the file extension of the path
@@ -353,6 +372,7 @@ impl Clone for RequestHeader {
             base: self.as_owned_parts(),
             header_name_map: self.header_name_map.clone(),
             raw_path_fallback: self.raw_path_fallback.clone(),
+            raw_path_utf8: self.raw_path_utf8,
             send_end_stream: self.send_end_stream,
         }
     }
@@ -366,6 +386,7 @@ impl From<ReqParts> for RequestHeader {
             header_name_map: None,
             // no illegal path
             raw_path_fallback: vec![],
+            raw_path_utf8: true,
             send_end_stream: true,
         }
     }
@@ -630,6 +651,99 @@ impl ResponseHeader {
     pub fn set_content_length(&mut self, len: usize) -> Result<()> {
         self.insert_header(http::header::CONTENT_LENGTH, len)
     }
+}
+
+/// Build a [Uri] carrying only a path-and-query component. `target` is the original
+/// request-target, used for error context.
+fn path_and_query_uri(path_and_query: &str, target: &str) -> Result<Uri> {
+    Uri::builder()
+        .path_and_query(path_and_query)
+        .build()
+        .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {target}"))
+}
+
+/// A request-target parsed into the pieces a [RequestHeader] stores.
+struct ParsedRequestTarget {
+    /// The [Uri] to store, carrying at most a path-and-query component.
+    uri: Uri,
+    /// Bytes for [RequestHeader::raw_path()] to re-serialize. Empty when `uri`
+    /// round-trips the original target.
+    raw_path_fallback: Vec<u8>,
+    /// Whether the original target was valid UTF-8, i.e. `uri` is not lossy.
+    raw_path_utf8: bool,
+}
+
+/// Parse a request-target (RFC 9112 §3.2) into the pieces to store on the header.
+fn parse_request_target(path: &[u8]) -> Result<ParsedRequestTarget> {
+    let Ok(p) = std::str::from_utf8(path) else {
+        // put a valid utf-8 path into base for read only access
+        let lossy_str = String::from_utf8_lossy(path);
+        let uri = Uri::builder()
+            .path_and_query(lossy_str.as_ref())
+            .build()
+            .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {lossy_str}"))?;
+        return Ok(ParsedRequestTarget {
+            uri,
+            raw_path_fallback: path.to_vec(),
+            raw_path_utf8: false,
+        });
+    };
+
+    // Origin-form (§3.2.1) and asterisk-form (§3.2.4) round-trip through the Uri's
+    // path_and_query(), so they need no raw fallback.
+    if p.starts_with('/') || p == "*" {
+        return Ok(ParsedRequestTarget {
+            uri: path_and_query_uri(p, p)?,
+            raw_path_fallback: vec![],
+            raw_path_utf8: true,
+        });
+    }
+
+    // A fragment is not part of the request-target (§3.2) and is separated from the URI
+    // before dereference (RFC 3986 §3.5), so it must not reach the upstream request-line.
+    // Both authority validators already terminate the authority at `#`, so dropping it
+    // cannot change the authority they reconcile against `Host`.
+    let target = p
+        .split_once('#')
+        .map_or(p, |(before_fragment, _)| before_fragment);
+
+    // Absolute-form (§3.2.2) and the authority-form CONNECT target (§3.2.3) are kept
+    // verbatim for raw_path(), while the Uri carries only the path component so that
+    // callers reading uri.path() see a path rather than a whole URL.
+    //
+    // Scheme and authority are deliberately left off the Uri. The proxy layer
+    // reconciles the target's authority against `Host` by parsing these raw bytes;
+    // populating uri.authority() here would send that reconciliation down its URI
+    // branch instead, rewriting the target on egress.
+    //
+    // The authority boundary comes from the same classifier the proxy layer reconciles
+    // with, so the path extracted here cannot disagree with the authority validated
+    // there. A second parser with its own idea of where the authority ends would let
+    // targets like `foo:bar://host/admin` yield a path that was never validated.
+    let uri = match raw_target_authority(target.as_bytes()) {
+        RawTargetAuthority::Absolute { path_and_query, .. } => {
+            // `path_and_query` is a suffix of `target` starting at an ASCII delimiter, so
+            // it is always valid UTF-8; an empty component leaves the Uri at its default.
+            match std::str::from_utf8(path_and_query).unwrap_or_default() {
+                "" => Uri::default(),
+                // "http://host?q=1" has no path, but origin-form requires at least "/"
+                // (§3.2.1), so anchor the component to the root.
+                pq if !pq.starts_with('/') => path_and_query_uri(&format!("/{pq}"), p)?,
+                pq => path_and_query_uri(pq, p)?,
+            }
+        }
+        // No absolute-form authority means there is no path component to extract: the
+        // authority-form CONNECT target (§3.2.3), opaque custom schemes, and targets
+        // whose authority is ambiguous all land here. Leaving the Uri at its default
+        // keeps uri.path() at "/" rather than inventing a path from bytes the authority
+        // classifier read differently.
+        RawTargetAuthority::None | RawTargetAuthority::AmbiguousAuthority => Uri::default(),
+    };
+    Ok(ParsedRequestTarget {
+        uri,
+        raw_path_fallback: target.as_bytes().to_vec(),
+        raw_path_utf8: true,
+    })
 }
 
 fn clone_req_parts(me: &ReqParts) -> ReqParts {
@@ -1059,6 +1173,311 @@ mod tests {
         assert_eq!(new_path, req.uri.path_and_query().unwrap());
         assert_eq!(new_path.as_bytes(), req.raw_path());
         assert!(req.raw_path_is_utf8());
+    }
+
+    #[test]
+    fn test_absolute_form_http() {
+        // The Uri exposes the path component, while raw_path() keeps the target
+        // verbatim for the wire.
+        let req = RequestHeader::build("GET", b"http://host/path?query=1", None).unwrap();
+        assert_eq!("/path?query=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/path", req.uri.path());
+        assert_eq!(b"http://host/path?query=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_https() {
+        let req = RequestHeader::build("GET", b"https://example.com/a/b/c?d=e", None).unwrap();
+        assert_eq!("/a/b/c?d=e", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/a/b/c", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_no_path() {
+        // No path component, so the Uri is left at its default of "/".
+        let req = RequestHeader::build("GET", b"http://host", None).unwrap();
+        assert_eq!("/", req.uri.path());
+        assert_eq!(Some("/"), req.uri.path_and_query().map(|pq| pq.as_str()));
+        assert_eq!(b"http://host", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_root() {
+        let req = RequestHeader::build("GET", b"http://host/", None).unwrap();
+        assert_eq!("/", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_no_path_with_query() {
+        // "http://host?query" has no path; origin-form requires at least "/"
+        // (§3.2.1), so the query is anchored to the root on the stored Uri.
+        let req = RequestHeader::build("GET", b"http://host?query=1", None).unwrap();
+        assert_eq!("/", req.uri.path());
+        assert_eq!(Some("query=1"), req.uri.query());
+        assert_eq!("/?query=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!(b"http://host?query=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_absolute_form_uri_has_no_authority() {
+        // Scheme and authority are deliberately kept off the Uri: the proxy layer
+        // reconciles the target authority against `Host` from the raw bytes, and a
+        // populated uri.authority() would divert it to rewriting the target instead.
+        let req = RequestHeader::build("GET", b"http://host:8080/path?q=1", None).unwrap();
+        assert_eq!(None, req.uri.scheme_str());
+        assert_eq!(None, req.uri.authority());
+        assert_eq!("/path", req.uri.path());
+        assert_eq!(b"http://host:8080/path?q=1", req.raw_path());
+    }
+
+    #[test]
+    fn test_fragment_is_not_forwarded() {
+        // A fragment is not part of the request-target (§3.2) and is separated from the
+        // URI before dereference (RFC 3986 §3.5), so it must not reach the upstream
+        // request-line.
+        for (target, raw, path) in [
+            (&b"http://host/p#frag"[..], &b"http://host/p"[..], "/p"),
+            (b"http://host#frag", b"http://host", "/"),
+            (b"http://host?q=1#frag", b"http://host?q=1", "/"),
+            // Both authority classifiers terminate at `#`, so a fragment cannot smuggle
+            // userinfo or a second authority past `Host` reconciliation.
+            (b"http://host#@evil.example/", b"http://host", "/"),
+        ] {
+            let req = RequestHeader::build("GET", target, None).unwrap();
+            let target = String::from_utf8_lossy(target);
+            assert_eq!(raw, req.raw_path(), "{target}");
+            assert_eq!(path, req.uri.path(), "{target}");
+        }
+
+        // Origin-form fragments are already dropped by the Uri, so stripping here keeps
+        // absolute-form consistent with origin-form rather than diverging from it.
+        let req = RequestHeader::build("GET", b"/p#frag", None).unwrap();
+        assert_eq!(b"/p", req.raw_path());
+
+        // CONNECT reconciles `Host` against the `#`-truncated prefix, so the stored
+        // bytes are exactly the ones that were validated.
+        let req = RequestHeader::build("CONNECT", b"host:443#x", None).unwrap();
+        assert_eq!(b"host:443", req.raw_path());
+    }
+
+    #[test]
+    fn test_uri_path_cannot_disagree_with_validated_authority() {
+        // The Uri path is extracted with the same classifier the proxy layer uses to
+        // reconcile the authority. A separate parser anchoring on the first "://" would
+        // read "/admin" out of these targets, a path no authority check ever saw,
+        // because the classifier stops at the first scheme-terminating colon.
+        for target in [
+            &b"foo:bar://evil.example/admin"[..],
+            b"myproto:x://evil.example/admin",
+            b"myproto:opaque",
+        ] {
+            let req = RequestHeader::build("GET", target, None).unwrap();
+            let label = String::from_utf8_lossy(target);
+            assert_eq!(
+                RawTargetAuthority::None,
+                raw_target_authority(req.raw_path()),
+                "{label}"
+            );
+            assert_eq!("/", req.uri.path(), "{label}");
+            assert_eq!(target, req.raw_path(), "{label}");
+        }
+
+        // An ambiguous authority yields no path either: normalization could move the
+        // authority boundary, so no extracted path would be trustworthy.
+        let req = RequestHeader::build("GET", b"http:///path", None).unwrap();
+        assert_eq!("/", req.uri.path());
+        assert_eq!(b"http:///path", req.raw_path());
+    }
+
+    #[test]
+    fn test_origin_form_raw_path_is_byte_identical() {
+        // Origin-form is the hot path and must round-trip through the Uri untouched.
+        for target in [
+            &b"/"[..],
+            b"/index.html",
+            b"/a/b/c?d=e&f=g",
+            b"/%2e%2e/x",
+            b"/a+b/c%20d",
+            b"*",
+        ] {
+            let req = RequestHeader::build("GET", target, None).unwrap();
+            assert_eq!(
+                target,
+                req.raw_path(),
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+            assert!(req.raw_path_is_utf8());
+        }
+    }
+
+    #[test]
+    fn test_non_origin_form_survives_clone_and_parts_round_trip() {
+        let req = RequestHeader::build("GET", b"http://host:8080/p?q=1", None).unwrap();
+
+        let cloned = req.clone();
+        assert_eq!(req.raw_path(), cloned.raw_path());
+        assert_eq!(req.uri.path(), cloned.uri.path());
+        assert_eq!(req.raw_path_is_utf8(), cloned.raw_path_is_utf8());
+
+        // ReqParts carries no raw target, so the round-trip falls back to the Uri and
+        // yields the origin-form path rather than the original absolute-form target.
+        let from_parts = RequestHeader::from(req.as_owned_parts());
+        assert_eq!(b"/p?q=1", from_parts.raw_path());
+        assert!(from_parts.raw_path_is_utf8());
+    }
+
+    #[test]
+    fn test_connect_authority_form() {
+        // §3.2.3: authority-form is only used for CONNECT and must reach the tunnel
+        // destination verbatim. It has no path component, so the Uri is left at its
+        // default and the authority stays available only through raw_path().
+        let req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert_eq!(b"example.com:443", req.raw_path());
+        assert_eq!(None, req.uri.authority());
+        assert_eq!("/", req.uri.path());
+    }
+
+    #[test]
+    fn test_connect_authority_form_default_port() {
+        // RFC 9112 §3.2.3 example: CONNECT www.example.com:80.
+        let req = RequestHeader::build("CONNECT", b"www.example.com:80", None).unwrap();
+        assert_eq!(b"www.example.com:80", req.raw_path());
+    }
+
+    #[test]
+    fn test_connect_authority_form_shapes_pass_through() {
+        // Parsing deliberately does not validate the authority grammar: that belongs to
+        // the authority module, which applications running custom protocols can opt out
+        // of. What this level guarantees is that whichever shape arrives reaches the
+        // tunnel destination byte-identically and contributes no path, covering both the
+        // IP-literal and reg-name forms of RFC 3986 §3.2.2.
+        for target in [
+            &b"[v7.x]:443"[..],
+            b"[vF.a:b~!$&'()*+,;=]:8443",
+            b"[::1]:443",
+            b"[2001:db8::1]:8443",
+            b"127.0.0.1:443",
+            b"sub.example.com:8080",
+            b"host-with-dash:1",
+            b"a_b:443",
+        ] {
+            let req = RequestHeader::build("CONNECT", target, None).unwrap();
+            let label = String::from_utf8_lossy(target);
+            assert_eq!(target, req.raw_path(), "{label}");
+            assert_eq!("/", req.uri.path(), "{label}");
+        }
+    }
+
+    #[test]
+    fn test_set_raw_path_replaces_all_target_state() {
+        // set_raw_path computes every field before storing any of them, so a mutation
+        // leaves nothing from the previous target behind.
+        //
+        // The rejection half of that contract is not covered here: the pinned http
+        // fork accepts every request-target, including spaces and control bytes, so
+        // the error path is unreachable in this configuration. Forbidden bytes are
+        // caught when the request-line is serialized instead.
+        let mut req = RequestHeader::build("GET", b"/path-\xff", None).unwrap();
+        assert!(!req.raw_path_is_utf8());
+        assert!(!req.raw_path_fallback.is_empty());
+
+        req.set_raw_path(b"/plain").unwrap();
+        assert_eq!(b"/plain", req.raw_path());
+        assert_eq!("/plain", req.uri.path());
+        assert!(req.raw_path_is_utf8());
+        assert!(req.raw_path_fallback.is_empty());
+
+        req.set_raw_path(b"http://host/abs?q=1").unwrap();
+        assert_eq!(b"http://host/abs?q=1", req.raw_path());
+        assert_eq!("/abs", req.uri.path());
+        assert!(req.raw_path_is_utf8());
+    }
+
+    #[test]
+    fn test_raw_path_is_utf8_tracks_encoding_not_fallback() {
+        // The fallback is populated for valid-UTF-8 non-origin-form targets too, so
+        // raw_path_is_utf8() cannot be inferred from it being non-empty.
+        let req = RequestHeader::build("GET", b"http://host/path", None).unwrap();
+        assert!(!req.raw_path_fallback.is_empty());
+        assert!(req.raw_path_is_utf8());
+
+        let req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert!(!req.raw_path_fallback.is_empty());
+        assert!(req.raw_path_is_utf8());
+
+        let req = RequestHeader::build("GET", b"/path-\xff", None).unwrap();
+        assert!(!req.raw_path_fallback.is_empty());
+        assert!(!req.raw_path_is_utf8());
+
+        let req = RequestHeader::build("GET", b"/path", None).unwrap();
+        assert!(req.raw_path_fallback.is_empty());
+        assert!(req.raw_path_is_utf8());
+    }
+
+    #[test]
+    fn test_set_raw_path_clears_stale_connect_fallback() {
+        // Reusing a header: the CONNECT authority-form target must not survive into
+        // a subsequent origin-form request via a stale raw_path_fallback.
+        let mut req = RequestHeader::build("CONNECT", b"example.com:443", None).unwrap();
+        assert_eq!(b"example.com:443", req.raw_path());
+        req.set_method(Method::GET);
+        req.set_raw_path(b"/ok").unwrap();
+        assert_eq!(b"/ok", req.raw_path());
+        assert_eq!("/ok", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_set_raw_path_mutation() {
+        // The mutation path, not just construction via build().
+        let mut req = RequestHeader::build("GET", b"/original", None).unwrap();
+        assert_eq!("/original", req.uri.path());
+        req.set_raw_path(b"http://host/mutated?q=1").unwrap();
+        assert_eq!("/mutated?q=1", req.uri.path_and_query().unwrap().as_str());
+        assert_eq!("/mutated", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_with_port() {
+        let req = RequestHeader::build("GET", b"http://host:8080/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_uppercase_scheme() {
+        // RFC 3986 §3.1: scheme is case-insensitive.
+        let req = RequestHeader::build("GET", b"HTTP://HOST/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_absolute_form_non_http_scheme() {
+        // scheme().is_some() admits any valid scheme, not just http/https.
+        let req = RequestHeader::build("GET", b"ftp://host/path", None).unwrap();
+        assert_eq!("/path", req.uri.path());
+    }
+
+    #[test]
+    fn test_origin_form_unchanged() {
+        let req = RequestHeader::build("GET", b"/path?q=1", None).unwrap();
+        assert_eq!("/path?q=1", req.uri.path_and_query().unwrap().as_str());
+    }
+
+    #[test]
+    fn test_origin_form_with_scheme_in_query() {
+        // An origin-form path whose query contains "://" must not be mistaken
+        // for absolute-form (guarded by the starts_with('/') fast path).
+        let req = RequestHeader::build("GET", b"/redir?url=http://other", None).unwrap();
+        assert_eq!(
+            "/redir?url=http://other",
+            req.uri.path_and_query().unwrap().as_str()
+        );
+    }
+
+    #[test]
+    fn test_asterisk_form_unchanged() {
+        let req = RequestHeader::build("OPTIONS", b"*", None).unwrap();
+        assert_eq!("*", req.uri.path_and_query().unwrap().as_str());
     }
 
     #[test]

@@ -22,7 +22,6 @@ use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
-#[cfg(feature = "patched_http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -757,9 +756,6 @@ async fn test_connect_close() {
     assert_eq!(body, "Hello World!\n");
 }
 
-// Authority-form CONNECT request targets require patched HTTP/1 parsing until
-// general request-target form support is available.
-#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_disallowed_h1() {
     init();
@@ -803,7 +799,6 @@ async fn test_connect_proxying_disallowed_h2() {
     }
 }
 
-#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_allowed_h1() {
     init();
@@ -869,6 +864,56 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     let status_line = resp.lines().next().unwrap_or("");
     assert!(status_line.contains(" 200 "));
     assert!(resp.ends_with("ok"));
+}
+
+/// Read a complete HTTP/1 header block. A single `read()` can return a partial
+/// request line, so responding or asserting on one risks a flaky failure.
+async fn read_h1_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.unwrap();
+        assert_ne!(0, read, "connection closed before end of headers");
+        head.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+#[tokio::test]
+async fn test_absolute_form_request_target_h1() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_h1_head(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+        request
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let request = format!(
+        "GET http://pingora.org/absolute?q=1 HTTP/1.1\r\nHost: pingora.org\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let resp = read_h1_head(&mut stream).await;
+    assert!(resp.lines().next().unwrap().contains(" 200 "));
+
+    // RFC 9112 §3.2.2: absolute-form is accepted inbound and forwarded verbatim.
+    // Rewriting it to origin-form is the proxy layer's call, since only it knows
+    // whether the next hop is an origin server (§3.2.1) or another proxy (§3.2.2).
+    let upstream_request = upstream.await.unwrap();
+    assert_eq!(
+        "GET http://pingora.org/absolute?q=1 HTTP/1.1",
+        upstream_request.lines().next().unwrap()
+    );
 }
 
 #[tokio::test]

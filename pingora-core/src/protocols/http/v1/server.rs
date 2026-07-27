@@ -2904,6 +2904,57 @@ mod tests_stream {
         assert_eq!(input3, http_stream.get_body(&res));
     }
 
+    #[tokio::test]
+    async fn read_absolute_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.2: a server MUST accept absolute-form. The target is kept
+        // verbatim, while the Uri exposes only the path component.
+        // §3.2.2 requires Host to match the request-target authority; a mismatch is
+        // rejected by the ingress authority validation, which this fixture is not
+        // exercising.
+        let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org:8080\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(
+            &b"http://pingora.org:8080/a?q=b"[..],
+            http_stream.get_path()
+        );
+        let uri = &http_stream.req_header().uri;
+        assert_eq!("/a", uri.path());
+        assert_eq!(Some("q=b"), uri.query());
+        // Scheme and authority stay off the Uri so the proxy layer reconciles the
+        // target authority against `Host` from the raw bytes.
+        assert_eq!(None, uri.authority());
+        assert_eq!(None, uri.scheme_str());
+    }
+
+    #[tokio::test]
+    async fn read_absolute_form_request_target_rejects_host_mismatch() {
+        init_log();
+        // The fixture above has to keep `Host` and the request-target authority
+        // consistent to get past ingress validation. Pin the rejection it relies on, so
+        // that agreement stays a deliberate property of the fixture rather than an
+        // assumption that could silently stop holding.
+        let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
+    }
+
+    #[tokio::test]
+    async fn read_authority_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.3: authority-form reaches the tunnel destination verbatim.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(&b"pingora.org:443"[..], http_stream.get_path());
+        assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
+    }
+
     #[test]
     fn escape_illegal() {
         init_log();
