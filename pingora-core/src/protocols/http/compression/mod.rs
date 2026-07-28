@@ -258,6 +258,51 @@ impl ResponseCompressionCtx {
         }
     }
 
+    /// Whether [`Self::response_header_filter`] would decompress the body of this response.
+    ///
+    /// This ctx replaces the response body in place, so a filter that runs before it cannot tell
+    /// from the response header alone what the body will look like by the time it reaches
+    /// downstream. This predicate answers that question ahead of time. For example, a caller
+    /// framing a byte range against the response body needs to know whether the body it is
+    /// measuring is about to be swapped for its decompressed form, which invalidates both the
+    /// offsets and the length it computed.
+    ///
+    /// This assumes the response has a body: unlike [`Self::response_header_filter`] it takes no
+    /// `end` flag, and a response without a body is never decompressed. Informational (`1xx`)
+    /// responses are not final, so they are reported as not decompressed; ask again with the
+    /// final response header.
+    ///
+    /// Returns `false` once this ctx has left the header phase, because by then the decision has
+    /// already been made. This is a read-only query, so unlike the `adjust_*` methods it never
+    /// panics and is safe to call in any phase.
+    pub fn will_decompress(&self, resp: &ResponseHeader) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        match &self.0 {
+            CtxInner::HeaderPhase {
+                decompress_enable,
+                accept_encoding,
+                ..
+            } => {
+                // an informational response is not the final one, the filter defers the decision
+                if resp.status.is_informational() {
+                    return false;
+                }
+                match decide_action(resp, accept_encoding) {
+                    Action::Decompress(algorithm) => {
+                        // mirrors `algorithm.decompressor(decompress_enable[idx]).is_some()`
+                        // in the response header filter, without building the decompressor
+                        decompress_enable[algorithm.index()] && algorithm.can_decompress()
+                    }
+                    Action::Noop | Action::Compress(_) => false,
+                }
+            }
+            // the response header was already filtered, whatever it decided is done
+            CtxInner::BodyPhase(_) => false,
+        }
+    }
+
     /// Feed the response header into this ctx
     pub fn response_header_filter(&mut self, resp: &mut ResponseHeader, end: bool) {
         if !self.is_enabled() {
@@ -454,16 +499,44 @@ impl Algorithm {
         }
     }
 
+    // The single source of truth for which algorithms can be decompressed: both
+    // `decompressor` and `can_decompress` are derived from it, so the set cannot drift
+    // between the two. The match is exhaustive on purpose, so that a newly added algorithm
+    // has to state whether a decompressor exists for it.
+    fn decompressor_impl(&self) -> Option<fn() -> Box<dyn Encode + Send + Sync>> {
+        match self {
+            Self::Gzip => Some(|| Box::new(gzip::Decompressor::new())),
+            Self::Brotli => Some(|| Box::new(brotli::Decompressor::new())),
+            // not implemented
+            Self::Any | Self::Zstd | Self::Dcb | Self::Dcz | Self::Other => None,
+        }
+    }
+
     pub fn decompressor(&self, enabled: bool) -> Option<Box<dyn Encode + Send + Sync>> {
         if !enabled {
             None
         } else {
-            match self {
-                Self::Gzip => Some(Box::new(gzip::Decompressor::new())),
-                Self::Brotli => Some(Box::new(brotli::Decompressor::new())),
-                _ => None, // not implemented
-            }
+            self.decompressor_impl()
+                .map(|new_decompressor| new_decompressor())
         }
+    }
+
+    /// Whether a decompressor is implemented for this algorithm.
+    ///
+    /// This is a property of the algorithm alone: it says nothing about whether decompression is
+    /// *enabled* for it, which is configured separately with
+    /// [`ResponseCompressionCtx::adjust_algorithm_decompression`]. [`Algorithm::decompressor`]
+    /// hands out a decompressor only when both hold.
+    ///
+    /// Note that [`Algorithm::Other`] can never be decompressed: it stands for any content coding
+    /// that isn't recognized, which includes multi-coding values such as `gzip, br`.
+    ///
+    /// This lets a caller tell whether a `Content-Encoding` is one that can be undone without
+    /// paying to construct a decompressor, e.g. to predict what
+    /// [`ResponseCompressionCtx::response_header_filter`] is about to do; see
+    /// [`ResponseCompressionCtx::will_decompress`].
+    pub fn can_decompress(&self) -> bool {
+        self.decompressor_impl().is_some()
     }
 
     pub fn index(&self) -> usize {
@@ -740,6 +813,162 @@ fn test_decide_action() {
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-encoding", "br").unwrap();
     assert_eq!(decide_action(&header, &[Dcb]), Decompress(Brotli));
+}
+
+#[test]
+fn test_can_decompress() {
+    use Algorithm::*;
+
+    // every variant spelled out, sized by Algorithm::COUNT so that adding an algorithm fails
+    // to compile here until it is considered
+    const ALL: [Algorithm; Algorithm::COUNT] = [Any, Gzip, Brotli, Zstd, Dcb, Dcz, Other];
+
+    for algorithm in ALL {
+        // only gzip and brotli have a decompressor implementation
+        assert_eq!(
+            algorithm.can_decompress(),
+            matches!(algorithm, Gzip | Brotli),
+            "unexpected can_decompress() for {}",
+            algorithm.as_str()
+        );
+        // can_decompress() must agree with what decompressor() actually hands out
+        assert_eq!(
+            algorithm.can_decompress(),
+            algorithm.decompressor(true).is_some(),
+            "can_decompress() disagrees with decompressor() for {}",
+            algorithm.as_str()
+        );
+        // and nothing is decompressed when the flag is off
+        assert!(algorithm.decompressor(false).is_none());
+    }
+}
+
+// build a ctx that has already seen a request with the given accept-encoding
+#[cfg(test)]
+fn ctx_for_test(
+    compression_level: u32,
+    decompress_enable: bool,
+    accept_encoding: Option<&str>,
+) -> ResponseCompressionCtx {
+    let mut ctx = ResponseCompressionCtx::new(compression_level, decompress_enable, false);
+    let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+    if let Some(ae) = accept_encoding {
+        req.insert_header("accept-encoding", ae).unwrap();
+    }
+    ctx.request_filter(&req);
+    ctx
+}
+
+// build a compressible response with the given status and content-encoding
+#[cfg(test)]
+fn resp_for_test(status: u16, content_encoding: Option<&str>) -> ResponseHeader {
+    let mut resp = ResponseHeader::build(status, None).unwrap();
+    resp.insert_header("content-type", "text/html").unwrap();
+    resp.insert_header("content-length", "1000").unwrap();
+    if let Some(ce) = content_encoding {
+        resp.insert_header("content-encoding", ce).unwrap();
+    }
+    resp
+}
+
+#[test]
+fn test_will_decompress() {
+    // gzip response the client cannot take: the body will be decompressed
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // the client takes gzip, so the body is passed through as is
+    let ctx = ctx_for_test(0, true, Some("gzip"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // multi-coding content-encoding parses to Algorithm::Other, which has no decompressor,
+    // so the body is left alone even though decompression is on for every algorithm
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip, br"))));
+
+    // zstd has no decompressor either
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("zstd"))));
+
+    // (de)compression entirely disabled
+    let ctx = ctx_for_test(0, false, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // compression on but decompression off
+    let ctx = ctx_for_test(6, false, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // the per algorithm decompression flag is respected: gzip turned off
+    let mut ctx = ctx_for_test(0, true, Some("br"));
+    ctx.adjust_algorithm_decompression(Algorithm::Gzip, false);
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+    // ...while brotli is still on
+    let mut ctx = ctx_for_test(0, true, Some("gzip"));
+    ctx.adjust_algorithm_decompression(Algorithm::Gzip, false);
+    assert!(ctx.will_decompress(&resp_for_test(200, Some("br"))));
+
+    // informational responses are not final, no decision yet
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(100, Some("gzip"))));
+    assert!(!ctx.will_decompress(&resp_for_test(101, Some("gzip"))));
+
+    // uncompressed response, nothing to decompress even when compression kicks in
+    let ctx = ctx_for_test(6, true, Some("gzip"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, None)));
+
+    // once the response header has been filtered the decision is already made
+    let mut ctx = ctx_for_test(0, true, Some("br"));
+    let mut resp = resp_for_test(200, Some("gzip"));
+    assert!(ctx.will_decompress(&resp));
+    ctx.response_header_filter(&mut resp, false);
+    assert!(!ctx.will_decompress(&resp));
+    // also safe to ask when the body phase installed no encoder at all
+    let mut ctx = ctx_for_test(0, true, Some("gzip"));
+    let mut resp = resp_for_test(200, Some("gzip"));
+    ctx.response_header_filter(&mut resp, false);
+    assert!(!ctx.will_decompress(&resp));
+}
+
+#[test]
+fn test_will_decompress_agrees_with_response_header_filter() {
+    // will_decompress() must predict exactly what response_header_filter() does. Decompression
+    // is the only outcome that both drops content-encoding and starts streaming the body, so
+    // that pair of headers is the observable signal.
+    for (level, decompress, accept_encoding, content_encoding) in [
+        (0, true, Some("br"), Some("gzip")),
+        (0, true, Some("br"), Some("GzIp")),
+        (0, true, Some("gzip"), Some("gzip")),
+        (0, true, Some("gzip"), Some("br")),
+        (0, true, Some("br"), Some("gzip, br")),
+        (0, true, Some("br"), Some("zstd")),
+        (0, true, Some("br"), Some("dcz")),
+        (0, true, Some("br"), Some("nonsense")),
+        (0, true, None, Some("gzip")),
+        (0, true, Some("gzip"), None),
+        (0, false, Some("br"), Some("gzip")),
+        (6, false, Some("br"), Some("gzip")),
+        (6, true, Some("br"), Some("gzip")),
+        (6, true, Some("gzip"), None),
+        (6, true, None, None),
+        (0, false, None, None),
+    ] {
+        let mut ctx = ctx_for_test(level, decompress, accept_encoding);
+        let mut resp = resp_for_test(200, content_encoding);
+        let predicted = ctx.will_decompress(&resp);
+
+        ctx.response_header_filter(&mut resp, false);
+        let decompressed = resp.headers.get(http::header::CONTENT_ENCODING).is_none()
+            && resp
+                .headers
+                .get(http::header::TRANSFER_ENCODING)
+                .is_some_and(|te| te.as_bytes() == b"chunked");
+
+        assert_eq!(
+            predicted, decompressed,
+            "will_decompress() mismatch for level {level}, decompress {decompress}, \
+             accept-encoding {accept_encoding:?}, content-encoding {content_encoding:?}"
+        );
+    }
 }
 
 use once_cell::sync::Lazy;
