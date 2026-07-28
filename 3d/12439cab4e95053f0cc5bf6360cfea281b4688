@@ -1,0 +1,27 @@
+pingora-core/src/protocols/http/compression/mod.rs
+  s_407b6a41c6fb1c::t_0f7dd92738f5fa 276
+  s_407b6a41c6fb1c::t_48fd6a4f521afe 863
+  s_407b6a41c6fb1c::t_a984b8a913ec62 519-520
+  s_407b6a41c6fb1c::t_f26543625db6e6 540,818-846,848-862,864-900,904,908-973
+  s_407b6a41c6fb1c::t_5fb0293de98656 261-275,277-305
+  s_407b6a41c6fb1c::t_a177f0c46ed21b 847
+  s_407b6a41c6fb1c::t_85f59ac37f33ef 502-514,524-539
+  s_407b6a41c6fb1c::t_570bc0bef334f8 901-903,905-907
+  s_407b6a41c6fb1c::t_f845a6bf626b46 541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d12439cab4e95053f0cc5bf6360cfea281b4688",
+  "prompts": {},
+  "sessions": {
+    "s_407b6a41c6fb1c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_059bb971bffezPbUZkQNWxJyN8",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
