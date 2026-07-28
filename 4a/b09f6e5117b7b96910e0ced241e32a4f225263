@@ -1,0 +1,35 @@
+pingora-core/src/protocols/http/v2/server.rs
+  s_c0690d61d7878c::t_79aa16a259b391 1120-1128
+  s_c0690d61d7878c::t_451f61f481426a 1110-1112,1116
+  s_c0690d61d7878c::t_ce38259d5a781b 37,53-63,137-138,141-146,158-162,1073-1109,1113-1115,1117-1119,1129-1181
+  s_c0690d61d7878c::t_f0f4acd60dca90 265-270,274-291,318-344
+  s_c0690d61d7878c::t_8d27da8dcbee21 345-347
+  s_c0690d61d7878c::t_983ac221a226cb 1182
+pingora-core/src/protocols/http/v2/client.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 36,41-51,206-208,237-243,711-744
+pingora-core/src/upstreams/peer.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 523,525-530
+pingora-core/src/protocols/http/v1/common.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 18,127-147,289-398,400,403-415,417-431,445,448-449,451,453,455-459,461-466,468-592
+pingora-core/src/protocols/http/v1/server.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 447-451,1072
+pingora-core/src/protocols/http/v1/client.rs
+  s_c0690d61d7878c::t_ce38259d5a781b 212-228,747-750,767-784,1435-1451,1479-1513
+  s_c0690d61d7878c::t_93a1cc97795f74 1514
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4ab09f6e5117b7b96910e0ced241e32a4f225263",
+  "prompts": {},
+  "sessions": {
+    "s_c0690d61d7878c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_106d59655ffew0b1FYGAbMoodm",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}
