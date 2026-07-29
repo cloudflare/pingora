@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use futures::StreamExt;
+use pingora_cache::CachePhase;
 use pingora_core::{
     protocols::http::{
         custom::{
@@ -764,7 +765,12 @@ where
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        match task {
+        let track_max_cache_size = matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+
+        let res = match task {
             HttpTask::Header(mut header, eos) => {
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
@@ -808,6 +814,12 @@ where
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
@@ -819,6 +831,12 @@ where
                 Ok(HttpTask::Body(data, eos))
             }
             HttpTask::UpgradedBody(mut data, eos) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
                 // range body filter doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
@@ -862,7 +880,17 @@ where
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
+        };
+        if let Ok(task) = res.as_ref() {
+            if track_max_cache_size
+                && task.is_end()
+                && !matches!(task, HttpTask::Failed(_))
+                && !session.cache.exceeded_max_file_size()
+            {
+                session.cache.response_became_cacheable();
+            }
         }
+        res
     }
 
     async fn send_body_to_custom(
@@ -1149,5 +1177,122 @@ impl CustomMessageForwarder<'_> {
             },
             ret = forwarder => ret
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        predictor::{CacheablePredictor, Predictor},
+        CacheKey, MemCache,
+    };
+    use std::sync::{Arc, LazyLock};
+    use tokio::io::AsyncWriteExt;
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls custom_response_filter directly")
+        }
+    }
+
+    async fn predicted_too_large_session(key: CacheKey, max_file_size: usize) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+        CACHE_PREDICTOR.mark_uncacheable(&key, NoCacheReason::OriginNotCache);
+        session
+            .cache
+            .disable(NoCacheReason::PredictedResponseTooLarge);
+        session
+    }
+
+    async fn filter_task(session: &mut Session, task: HttpTask) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .custom_response_filter(
+                session,
+                task,
+                &mut (),
+                &mut ServeFromCache::new(),
+                &mut RangeBodyFilter::new(),
+                false,
+            )
+            .await
+            .expect("response task should pass filters");
+    }
+
+    #[tokio::test]
+    async fn completed_response_under_limit_clears_predictor() {
+        let key = CacheKey::new("", "/custom-under-limit", "");
+        let mut session = predicted_too_large_session(key.clone(), 10).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"small")), true),
+        )
+        .await;
+
+        assert!(CACHE_PREDICTOR.cacheable_prediction(&key));
+    }
+
+    #[tokio::test]
+    async fn completed_response_over_limit_keeps_predictor() {
+        let key = CacheKey::new("", "/custom-over-limit", "");
+        let mut session = predicted_too_large_session(key.clone(), 4).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"large")), true),
+        )
+        .await;
+
+        assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
+    }
+
+    #[tokio::test]
+    async fn failed_response_keeps_predictor() {
+        let key = CacheKey::new("", "/custom-failed", "");
+        let mut session = predicted_too_large_session(key.clone(), 10).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"small")), false),
+        )
+        .await;
+        filter_task(
+            &mut session,
+            HttpTask::Failed(Error::explain(InternalError, "test failure")),
+        )
+        .await;
+
+        assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
     }
 }
