@@ -1,0 +1,20 @@
+Cargo.toml
+  s_7131ba8d93112b::t_4390ad3f9a6b5d 45
+  s_7131ba8d93112b::t_21721aed4b054b 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d7608454126e13cc1e397ea9a64541bfaadcfb24",
+  "prompts": {},
+  "sessions": {
+    "s_7131ba8d93112b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_056a6e985ffeQJ78Gcdiq8s5jP",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}

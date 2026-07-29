@@ -1,0 +1,43 @@
+pingora-proxy/src/proxy_h1.rs
+  s_1e5b8d1e81b5a5::t_7d3226f50b4966 921-923,1133,1153
+  s_1e5b8d1e81b5a5::t_02466711c686f2 1124-1132,1134-1152,1154-1201
+  s_1e5b8d1e81b5a5::t_dfed266438c7f5 841-842,924-926,928
+pingora-core/src/protocols/http/server.rs
+  s_1e5b8d1e81b5a5::t_f2ed2e59f3ada1 784,796-798
+  s_1e5b8d1e81b5a5::t_63a461e5ed6d2d 785-795
+  s_1e5b8d1e81b5a5::t_c9ccbd8147c527 779-783
+pingora-proxy/src/proxy_custom.rs
+  s_1e5b8d1e81b5a5::t_51d1b318d4be63 104-107,735,789,791-792
+  s_1e5b8d1e81b5a5::t_f122102bdfb400 108
+  s_1e5b8d1e81b5a5::t_faeaa6b3286480 734,736-737
+  s_1e5b8d1e81b5a5::t_97bc73759bb7fb 790
+pingora-proxy/src/lib.rs
+  s_1e5b8d1e81b5a5::t_f2ed2e59f3ada1 682
+  s_1e5b8d1e81b5a5::t_da6f577a93b18f 683-684,689,691-692
+  s_1e5b8d1e81b5a5::t_80f8a517e78535 1669,1739,1747-1749,1758,1768-1770
+  s_1e5b8d1e81b5a5::t_d87b122bcc0ac1 752,755,789,794
+  s_1e5b8d1e81b5a5::t_c3a88dcb8f8134 1816-1818
+  s_1e5b8d1e81b5a5::t_6045286cc84aea 503-504,532
+  s_1e5b8d1e81b5a5::t_02d869ce23899f 1664-1668,1670-1732,1734-1735,1737-1738,1740,1743,1745-1746,1750-1752,1755,1757,1759,1761-1764,1766-1767,1771,1773,1814-1815
+  s_1e5b8d1e81b5a5::t_e833e2633684e2 1733,1736,1741-1742,1744,1753-1754,1756,1760,1765,1772,1774-1813
+  s_1e5b8d1e81b5a5::t_ce539bb2dcf6c7 874-892
+  s_1e5b8d1e81b5a5::t_63a461e5ed6d2d 709-712
+  s_1e5b8d1e81b5a5::t_e4cace2cf8bb44 690
+  s_1e5b8d1e81b5a5::t_a44f92b33d8577 713-717
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d150bd531ebe7d08ae019ae210bc08b61a0cae6",
+  "prompts": {},
+  "sessions": {
+    "s_1e5b8d1e81b5a5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6b91-e3e3-72c3-aba7-8712c1d78ce6",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

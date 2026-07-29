@@ -1,0 +1,46 @@
+pingora-cache/src/eviction/simple_lru.rs
+  s_b865b04f03cad2::t_8df5e3ad4e1277 344,348,368,372,393,397,420,422,438,444,456,461,471,475,502,506,532,536
+  s_b865b04f03cad2::t_30f684b901a105 351,357,375,384,400,409,424,427,478,488,509,523,539,553,567
+pingora-cache/src/predictor.rs
+  s_b865b04f03cad2::t_8df5e3ad4e1277 153,178,233
+  s_b865b04f03cad2::t_efb97b37605161 190,200,204,208,215
+pingora-cache/src/eviction/async_lru.rs
+  s_b865b04f03cad2::t_8df5e3ad4e1277 370
+pingora-cache/src/eviction/lru.rs
+  s_b865b04f03cad2::t_8df5e3ad4e1277 280,284,287,305-307,324,328,331,340,349,353,356,365,376,378,380,383,395,401,413,418,428,432,435,461,463,472,476,479
+  s_b865b04f03cad2::t_2822a843dcde45 293,445,493,504-509,550,582,614,639,667,693,754,760,763
+pingora-cache/src/key.rs
+  s_b865b04f03cad2::t_fd0114688831ec 100-106,292-293,307-317
+  s_b865b04f03cad2::t_8df5e3ad4e1277 95-99,221-223,225,277,288-291,294-306
+  s_b865b04f03cad2::t_af0b24eb195a0d 109-110,218,220,318
+pingora-cache/src/lib.rs
+  s_b865b04f03cad2::t_8df5e3ad4e1277 1955,1968,1997,2011,2030,2059,2077,2100,2121,2140,2156,2178,2210
+pingora-cache/benches/lru_memory.rs
+  s_b865b04f03cad2::t_3ecb0acb7b9954 93
+pingora-cache/benches/lru_serde.rs
+  s_b865b04f03cad2::t_5bbfb545b8bfca 29
+pingora-cache/benches/simple_lru_memory.rs
+  s_b865b04f03cad2::t_ef8fa886982ae3 75
+pingora-cache/src/lock.rs
+  s_b865b04f03cad2::t_edd2a57f2dd0cb 405,423,444,489,537,563
+pingora-cache/src/memory.rs
+  s_b865b04f03cad2::t_983b1c2d942498 451,488,533,600,627
+pingora-cache/src/put.rs
+  s_b865b04f03cad2::t_85bce61f8d1111 260,294,315,355
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "815d5fd43ca0d4fe4311dfad7cfdfa57a7c50db7",
+  "prompts": {},
+  "sessions": {
+    "s_b865b04f03cad2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa5e6-8ba8-7111-b38c-62316d6dc34f",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}

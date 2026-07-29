@@ -1,0 +1,43 @@
+pingora-core/src/upstreams/peer.rs
+  s_0c4ee63e34427b::t_f9e4a5d99ef3b8 909,918
+  s_0c4ee63e34427b::t_d74f5480261ae1 454
+  s_0c4ee63e34427b::t_6ce7df4bb0b1d8 422-434
+  s_0c4ee63e34427b::t_4c2a8826ed6607 473
+pingora-proxy/src/proxy_common.rs
+  s_0c4ee63e34427b::t_27a8c8eb49ed6b 101-103,110-115
+  s_0c4ee63e34427b::t_ccf54655642d39 460-478,480-489,493,496-499
+  s_0c4ee63e34427b::t_089a8bb142408e 25-49
+  s_0c4ee63e34427b::t_52b8dbe0d6d56a 242-243
+  s_0c4ee63e34427b::t_e5c36a9ad49da3 87-88,96-100,104-109,116-130
+  s_0c4ee63e34427b::t_eab15556a4afbb 502-505,507,519-541
+  s_0c4ee63e34427b::t_58740efe8837d4 542-545,547-590
+  s_0c4ee63e34427b::t_4f66355fabc399 459,479,490-492,494-495,500-501,506,508-518
+  s_0c4ee63e34427b::t_bccaaf94025316 64
+  s_0c4ee63e34427b::t_96cf444de7cc5f 89,131-140,142-144
+  s_0c4ee63e34427b::t_9c06e332728ac2 182
+  s_2ed936a373e940::t_ffe1b76daef398 546
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f7f86db3ed879683da57c070f21be4d3431326df",
+  "prompts": {},
+  "sessions": {
+    "s_0c4ee63e34427b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06fd3d7beffe4X4yO0JeK3rddg",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_2ed936a373e940": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f956b-6642-7001-9bce-483a7e631d50",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}

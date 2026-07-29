@@ -1,0 +1,27 @@
+pingora-core/src/protocols/http/subrequest/server.rs
+  s_b60b259f118d9d::t_a83c7a21163688 51
+  s_b60b259f118d9d::t_3d4b9dae026a6c 1162-1165
+  s_b60b259f118d9d::t_da2dd40b7cd9c7 561-565
+pingora-core/src/protocols/http/v1/common.rs
+  s_b60b259f118d9d::t_b5c6e6307f59de 208-213
+  s_b60b259f118d9d::t_586a866d3929f6 365
+pingora-proxy/src/proxy_cache.rs
+  s_b60b259f118d9d::t_d710f84614fc26 23
+  s_b60b259f118d9d::t_e47e9ea2a6bcac 645-647,649
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ed239943941f02aa0fc3c8c0b8582ebaf24301ec",
+  "prompts": {},
+  "sessions": {
+    "s_b60b259f118d9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06b2793fdffeATFiWEDSr17xYK",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}

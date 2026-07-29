@@ -1,0 +1,56 @@
+pingora-core/src/listeners/mod.rs
+  s_406fb70a24fa99::t_27e89a31618ffe 430-436
+  s_406fb70a24fa99::t_7006cb711e3f5d 429
+pingora-core/src/services/background.rs
+  s_406fb70a24fa99::t_cf60a22ea6c44e 111-114
+pingora-core/src/server/mod.rs
+  s_406fb70a24fa99::t_00d558c48462ae 378-379,381-382,387-388
+  s_406fb70a24fa99::t_7006cb711e3f5d 692
+  s_406fb70a24fa99::t_cf60a22ea6c44e 380,383-386,694
+  s_406fb70a24fa99::t_cb53e6e5bf2f2c 693,695-697
+  s_406fb70a24fa99::t_6e8a7776cb5aa8 869-892
+pingora-core/src/server/transfer_fd/mod.rs
+  s_406fb70a24fa99::t_c1affcca9ddf76 23
+  s_406fb70a24fa99::t_a5c29b7ee99e32 111,569-582,584-587,589,591-607,609-611,613-618
+  s_406fb70a24fa99::t_9443505b70d8ed 90,92,96-102,105-110
+  s_406fb70a24fa99::t_7006cb711e3f5d 91,93-95,583,588,590,608,612
+  s_406fb70a24fa99::t_1eabb5fdd08e17 103-104
+  s_406fb70a24fa99::t_ddb1e6f23e9208 112,619-620
+pingora-core/src/services/mod.rs
+  s_406fb70a24fa99::t_80db33526d8ea8 396,398-399
+  s_406fb70a24fa99::t_8bd6da18ee9941 462,464,469
+  s_406fb70a24fa99::t_cc456f28ffa4f0 349,353
+  s_406fb70a24fa99::t_7006cb711e3f5d 350,463
+  s_406fb70a24fa99::t_cf60a22ea6c44e 351-352,397,465-468
+pingora-core/src/server/bootstrap_services.rs
+  s_406fb70a24fa99::t_ade404c33c271d 126
+  s_406fb70a24fa99::t_ad3abb0a487a16 19,22-23
+  s_406fb70a24fa99::t_cf60a22ea6c44e 76,125,154,158,251-252,260-269
+  s_406fb70a24fa99::t_4961adb03d25c1 253
+  s_406fb70a24fa99::t_f2a28644c926c6 18
+  s_406fb70a24fa99::t_7519b59211834a 155-156,159-160
+  s_406fb70a24fa99::t_f49a1e7fb633b0 157
+  s_406fb70a24fa99::t_6e8a7776cb5aa8 270,289-307,309-318
+  s_406fb70a24fa99::t_af06e8ec322ba9 308
+  s_406fb70a24fa99::t_d20ac309c71a8b 75,77
+  s_406fb70a24fa99::t_77f148f665ee65 271
+pingora-core/src/services/listening.rs
+  s_406fb70a24fa99::t_cf60a22ea6c44e 336-337
+  s_406fb70a24fa99::t_2e2979ffa64fbf 335,338
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bf7d45f834d7a7deb509110103e390a1ae0066f6",
+  "prompts": {},
+  "sessions": {
+    "s_406fb70a24fa99": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_08cebe26affeWmCrcRIuS91mdt",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

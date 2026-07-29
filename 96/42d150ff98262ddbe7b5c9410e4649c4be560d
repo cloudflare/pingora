@@ -1,0 +1,42 @@
+pingora-core/src/listeners/mod.rs
+  s_406fb70a24fa99::t_27e89a31618ffe 429,432-438
+  s_406fb70a24fa99::t_82c04dbb008693 430-431
+pingora-core/src/services/mod.rs
+  s_406fb70a24fa99::t_cc456f28ffa4f0 349-360
+  s_406fb70a24fa99::t_80db33526d8ea8 403-406
+  s_406fb70a24fa99::t_8bd6da18ee9941 469-477
+pingora-core/src/server/mod.rs
+  s_406fb70a24fa99::t_00d558c48462ae 378-389
+  s_406fb70a24fa99::t_cb53e6e5bf2f2c 698-707
+  s_406fb70a24fa99::t_c6fbd6fcb220ee 606-610
+pingora-core/src/services/listening.rs
+  s_406fb70a24fa99::t_2e2979ffa64fbf 335-338
+pingora-core/src/server/transfer_fd/mod.rs
+  s_406fb70a24fa99::t_9443505b70d8ed 90-118,120-128
+  s_406fb70a24fa99::t_ca8c03647326cc 119
+  s_406fb70a24fa99::t_c1affcca9ddf76 23
+  s_406fb70a24fa99::t_a5c29b7ee99e32 585-642
+pingora-core/src/server/bootstrap_services.rs
+  s_406fb70a24fa99::t_ade404c33c271d 129-130
+  s_406fb70a24fa99::t_f2a28644c926c6 18
+  s_406fb70a24fa99::t_ad3abb0a487a16 19,22-23
+  s_406fb70a24fa99::t_d20ac309c71a8b 75-81
+  s_406fb70a24fa99::t_7519b59211834a 158-167
+  s_406fb70a24fa99::t_4961adb03d25c1 258-270
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9642d150ff98262ddbe7b5c9410e4649c4be560d",
+  "prompts": {},
+  "sessions": {
+    "s_406fb70a24fa99": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_08cebe26affeWmCrcRIuS91mdt",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

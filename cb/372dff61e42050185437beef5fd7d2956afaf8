@@ -1,0 +1,38 @@
+pingora-core/src/protocols/http/v1/server.rs
+  s_e23012a9aa8f7f::t_94ad82b3a243a8 3997-3998,4000,4004-4006
+  s_e23012a9aa8f7f::t_d791e44cb73ccd 1196-1197,4014,4243-4319,4344-4367
+  s_e23012a9aa8f7f::t_5dbfa92ad664b5 1168,1222-1230,1232-1234,3963
+  s_e23012a9aa8f7f::t_da7382bed6c7cc 1198-1199,1214-1215,1255,3988-3996,3999,4001-4003,4007-4013
+  s_e23012a9aa8f7f::t_a68b1a9570aa59 4369-4395
+  s_e23012a9aa8f7f::t_79ea11a6c62357 1190-1194,3979-3986,4160,4162,4165-4170,4174,4195-4196,4199-4200,4208-4242,4320-4343
+  s_e23012a9aa8f7f::t_a2cb286e98cb0f 42-44,151-153,201,950-954,975-990,1162-1163,1167,1169,1171,1213,1216-1221,1231,1235-1254,1256-1272,1274
+  s_e23012a9aa8f7f::t_3a230a7e7df671 3987
+  s_e23012a9aa8f7f::t_2eec37b958f0db 4015
+  s_e23012a9aa8f7f::t_23b53988b9f012 4368
+pingora-core/src/apps/mod.rs
+  s_e23012a9aa8f7f::t_a2cb286e98cb0f 113-114,125,154,171-173
+  s_e23012a9aa8f7f::t_79ea11a6c62357 419-435
+pingora-core/src/protocols/http/server.rs
+  s_e23012a9aa8f7f::t_a2cb286e98cb0f 931-940,952-961
+  s_e23012a9aa8f7f::t_0d9e880e1304c1 962
+pingora-core/src/protocols/http/v1/body.rs
+  s_e23012a9aa8f7f::t_79ea11a6c62357 249
+  s_e23012a9aa8f7f::t_5dbfa92ad664b5 269,282-283,285-286
+  s_e23012a9aa8f7f::t_a2cb286e98cb0f 250-253,255
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb372dff61e42050185437beef5fd7d2956afaf8",
+  "prompts": {},
+  "sessions": {
+    "s_e23012a9aa8f7f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f865a-546c-7f12-a02b-4b3b06d24954",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
