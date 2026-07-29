@@ -1,0 +1,25 @@
+pingora-core/src/protocols/http/v1/server.rs
+  s_0efd13410630f8::t_dfbdd3c70c9470 437-438,440-443
+pingora-core/src/protocols/http/v1/body.rs
+  s_0efd13410630f8::t_01cb88d78181ac 511-517
+  s_0efd13410630f8::t_8f90e09e178ac0 428-438
+  s_0efd13410630f8::t_4bca9705489464 398-400
+pingora-core/src/protocols/http/v1/common.rs
+  s_0efd13410630f8::t_25b93c398c045a 35-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "37e252738f182960505b3b55e13f821b24c5cdab",
+  "prompts": {},
+  "sessions": {
+    "s_0efd13410630f8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0590a8eecffelVZh8IyArRsQs7",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
