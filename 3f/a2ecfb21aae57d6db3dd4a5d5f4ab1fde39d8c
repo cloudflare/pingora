@@ -1,0 +1,20 @@
+pingora-core/src/connectors/mod.rs
+  s_2489f7be3f7e48::t_fb8cc28f55546a 41,529-533,538-550,557-561,584-586
+  s_2489f7be3f7e48::t_a44846f070a4c1 973,996-998
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3fa2ecfb21aae57d6db3dd4a5d5f4ab1fde39d8c",
+  "prompts": {},
+  "sessions": {
+    "s_2489f7be3f7e48": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04ede8d35ffe1f5A0PoYg4t2uj",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
