@@ -2,6 +2,7 @@ pingora-core/examples/client_cert.rs
   s_696f18770634af::t_7cc6b653877acd 118-122
 pingora-core/src/utils/tls/boringssl_openssl.rs
   s_696f18770634af::t_7cc6b653877acd 25-30,33
+  s_696f18770634af::t_8d0f85ae0f07b3 24,31-32,34
 ---
 {
   "schema_version": "authorship/3.0.0",
