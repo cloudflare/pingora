@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
@@ -98,10 +99,11 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 /// Drive a server-side HTTP/2 connection's accept loop, dispatching each new
 /// stream to `on_session` until the connection closes.
 ///
-/// This loop ends in one of three ways:
+/// This loop ends when:
 ///   * the client closes the H2 connection cleanly ([`HttpSession::from_h2_conn`]
 ///     returns `Ok(None)` after the final GOAWAY is flushed),
 ///   * the codec hits a connection error, or
+///   * the configured idle timeout expires while no streams are active, or
 ///   * the runtime-level `graceful_shutdown_timeout_seconds` ceiling fires and
 ///     force-kills the task driving this future.
 ///
@@ -142,7 +144,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
     // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
-    let active = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(ActiveSessions::new());
     loop {
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
@@ -167,15 +169,14 @@ pub(crate) async fn accept_downstream_sessions<F>(
                     digest.clone(),
                     &mut malformed_streams,
                 ) => h2_stream,
-                // Idle timeout: re-armed each iteration, so any accepted stream resets it
-                _ = pingora_timeout::sleep(idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
-                    if active.load(Ordering::Relaxed) == 0 {
-                        // Idle with nothing in flight: drop `conn` to close the
-                        // socket now (no graceful GOAWAY wait that could hang on
-                        // a dead peer).
-                        return;
-                    }
-                    continue;
+                // Any accepted stream cancels this future. The next iteration
+                // waits for all active streams to finish before starting a fresh
+                // idle period.
+                _ = wait_for_idle_timeout(&active, idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                    // Idle with nothing in flight: drop `conn` to close the
+                    // socket now (no graceful GOAWAY wait that could hang on
+                    // a dead peer).
+                    return;
                 }
             }
         };
@@ -192,8 +193,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
             Ok(Some(H2Accept::Session(session))) => {
-                active.fetch_add(1, Ordering::Relaxed);
-                on_session(session, StreamGuard(active.clone()));
+                on_session(session, active.start_session());
             }
         }
     }
@@ -204,11 +204,45 @@ pub(crate) async fn accept_downstream_sessions<F>(
 /// the session is being processed (e.g. move it into the spawned task) so the
 /// accept loop's idle timeout can tell a busy connection from an idle one. It
 /// decrements the in-flight counter when dropped.
-pub(crate) struct StreamGuard(Arc<AtomicUsize>);
+pub(crate) struct StreamGuard(Arc<ActiveSessions>);
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0.idle.notify_one();
+        }
+    }
+}
+
+struct ActiveSessions {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl ActiveSessions {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
+    fn start_session(self: &Arc<Self>) -> StreamGuard {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        StreamGuard(self.clone())
+    }
+
+    async fn wait_until_idle(&self) {
+        while self.count.load(Ordering::Relaxed) != 0 {
+            self.idle.notified().await;
+        }
+    }
+}
+
+async fn wait_for_idle_timeout(active: &ActiveSessions, idle_timeout: Duration) {
+    active.wait_until_idle().await;
+    if !idle_timeout.is_zero() {
+        pingora_timeout::sleep(idle_timeout).await;
     }
 }
 
@@ -1241,6 +1275,28 @@ mod test {
 
         assert_eq!(settings.max_header_list_size(), Some(1234));
         assert_eq!(settings.max_concurrent_streams(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_zero_idle_timeout_waits_for_active_session() {
+        let active = Arc::new(ActiveSessions::new());
+        let guard = active.start_session();
+        let timeout_active = active.clone();
+        let timeout = tokio::spawn(async move {
+            wait_for_idle_timeout(&timeout_active, Duration::ZERO).await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !timeout.is_finished(),
+            "zero timeout must not spin or expire while a session is active"
+        );
+
+        drop(guard);
+        pingora_timeout::timeout(Duration::from_secs(1), timeout)
+            .await
+            .expect("zero timeout did not expire after the session finished")
+            .expect("timeout task panicked");
     }
 
     #[tokio::test]
