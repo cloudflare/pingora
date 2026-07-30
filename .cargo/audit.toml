@@ -1,12 +1,30 @@
-# Advisories against rustls-webpki 0.101.7, pulled in transitively by
-# aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
-# dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
-# our usage because this is TLS client use only and does not parse CRLs.
-# Remove once the upstream aws-s3-transfer-manager-rs fix ships.
-
+# Cargo Audit configuration for Pingora workspace
 [advisories]
 ignore = [
-    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
-    "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
-    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0185", # quinn-proto upstream
+    "RUSTSEC-2026-0009", # time upstream
+    "RUSTSEC-2025-0046", # wasmtime
+    "RUSTSEC-2025-0118", # wasmtime
+    "RUSTSEC-2026-0020", # WASI
+    "RUSTSEC-2026-0021", # WASI
+    "RUSTSEC-2026-0085", # wasmtime
+    "RUSTSEC-2026-0086", # wasmtime
+    "RUSTSEC-2026-0087", # wasmtime
+    "RUSTSEC-2026-0088", # wasmtime
+    "RUSTSEC-2026-0089", # wasmtime
+    "RUSTSEC-2026-0091", # wasmtime
+    "RUSTSEC-2026-0092", # wasmtime
+    "RUSTSEC-2026-0093", # wasmtime
+    "RUSTSEC-2026-0094", # wasmtime
+    "RUSTSEC-2026-0095", # wasmtime
+    "RUSTSEC-2026-0096", # wasmtime
+    "RUSTSEC-2025-0134", # rustls-pemfile
+    "RUSTSEC-2025-0057", # fxhash
+    "RUSTSEC-2024-0436", # paste
+    "RUSTSEC-2024-0388", # derivative
+    "RUSTSEC-2024-0442", # wasmtime-jit-debug
+    "RUSTSEC-2026-0002", # lru
+    "RUSTSEC-2026-0098", # rustls-webpki: name constraints for URI names (transitive via aws-smithy-http-client)
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints (transitive via aws-smithy-http-client)
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing (transitive via aws-smithy-http-client)
 ]

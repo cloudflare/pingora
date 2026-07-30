@@ -1,0 +1,11 @@
+# RustSec Cargo Audit Configuration
+# Ignores unmaintained upstream dependencies in core Pingora crates until upstream upgrades them
+
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0134", # rustls-pemfile is unmaintained (upstream pingora-rustls dep)
+    "RUSTSEC-2025-0057", # fxhash is unmaintained (upstream pingora-cache dep)
+    "RUSTSEC-2024-0436", # paste is unmaintained (upstream pingora-core dep)
+    "RUSTSEC-2024-0388", # derivative is unmaintained (upstream pingora-core dep)
+    "RUSTSEC-2024-0442", # wasmtime-jit-debug memory dump warning
+]
