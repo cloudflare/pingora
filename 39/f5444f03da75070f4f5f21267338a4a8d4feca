@@ -1,0 +1,32 @@
+pingora-cache/src/eviction/lru.rs
+  s_6a817d37951549::t_2ee5e91e0eee75 353
+  s_8f47f87db6bac3::t_cc18d67a93da14 60,65-70,75-84,336-352
+pingora-lru/src/lib.rs
+  s_8f47f87db6bac3::t_cc18d67a93da14 32,44,52-70,103,112,117-124,128-142,144-148,1279-1314,1332
+  s_8f47f87db6bac3::t_d027cff82d5ba4 125-126,143,1315-1331
+  s_6a817d37951549::t_714af40e1aa605 1333
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "39f5444f03da75070f4f5f21267338a4a8d4feca",
+  "prompts": {},
+  "sessions": {
+    "s_6a817d37951549": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f66e7-b579-7880-9b4a-9caac6e48e3e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    },
+    "s_8f47f87db6bac3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fafa8-b641-7222-b0bc-7413a695732a",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
