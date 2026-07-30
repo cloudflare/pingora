@@ -1,0 +1,19 @@
+pingora-proxy/src/proxy_custom.rs
+  s_696f18770634af::t_733fb1fb3292d4 1254,1268,1282
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ef466ef2876cfea827a939803d9e3a0c82b17ea",
+  "prompts": {},
+  "sessions": {
+    "s_696f18770634af": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0506cf16effeY0V8wXYaWaELXd",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}

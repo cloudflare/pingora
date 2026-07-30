@@ -1,0 +1,24 @@
+pingora-core/src/apps/mod.rs
+  s_5d9d70bc2a6d7f::t_8dc3817ddf95ae 25,86-91,323-341
+pingora-core/src/protocols/http/v2/mod.rs
+  s_5d9d70bc2a6d7f::t_8dc3817ddf95ae 354-367,454-465,519-527,536-578,666-677
+pingora-core/src/protocols/http/v2/server.rs
+  s_5d9d70bc2a6d7f::t_88454670e61a91 194
+  s_5d9d70bc2a6d7f::t_8dc3817ddf95ae 28,121-124,126-129,136,139,144-145,170-179,195-197,202-211
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "84f5f3f933f4c839e294ce8e28cacca38008155b",
+  "prompts": {},
+  "sessions": {
+    "s_5d9d70bc2a6d7f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04c41caefffevrjW7gFuxgXLs0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}
