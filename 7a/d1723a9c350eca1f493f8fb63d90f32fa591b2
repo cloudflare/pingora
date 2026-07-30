@@ -1,0 +1,21 @@
+pingora-core/examples/client_cert.rs
+  s_696f18770634af::t_7cc6b653877acd 118-122
+pingora-core/src/utils/tls/boringssl_openssl.rs
+  s_696f18770634af::t_7cc6b653877acd 25-30,33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7ad1723a9c350eca1f493f8fb63d90f32fa591b2",
+  "prompts": {},
+  "sessions": {
+    "s_696f18770634af": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0506cf16effeY0V8wXYaWaELXd",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
