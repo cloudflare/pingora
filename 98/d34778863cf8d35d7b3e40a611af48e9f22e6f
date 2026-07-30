@@ -1,0 +1,23 @@
+pingora-boringssl/src/ext.rs
+  s_696f18770634af::t_1ac62dd1896879 214-215,217-218,251,254,257-258,261-262
+pingora-openssl/src/ext.rs
+  s_696f18770634af::t_1ac62dd1896879 38-39,41-42,286,289,292-293,296-297
+pingora-core/src/protocols/tls/boringssl_openssl/server.rs
+  s_696f18770634af::t_1ac62dd1896879 184
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "98d34778863cf8d35d7b3e40a611af48e9f22e6f",
+  "prompts": {},
+  "sessions": {
+    "s_696f18770634af": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0506cf16effeY0V8wXYaWaELXd",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Fei Deng <fdeng@cloudflare.com>"
+    }
+  }
+}
