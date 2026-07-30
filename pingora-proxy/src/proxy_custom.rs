@@ -1251,7 +1251,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_response_under_limit_clears_predictor() {
-        let key = CacheKey::new("", "/custom-under-limit", "");
+        let key = CacheKey::new("/custom-under-limit", "");
         let mut session = predicted_too_large_session(key.clone(), 10).await;
 
         filter_task(
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_response_over_limit_keeps_predictor() {
-        let key = CacheKey::new("", "/custom-over-limit", "");
+        let key = CacheKey::new("/custom-over-limit", "");
         let mut session = predicted_too_large_session(key.clone(), 4).await;
 
         filter_task(
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_response_keeps_predictor() {
-        let key = CacheKey::new("", "/custom-failed", "");
+        let key = CacheKey::new("/custom-failed", "");
         let mut session = predicted_too_large_session(key.clone(), 10).await;
 
         filter_task(
