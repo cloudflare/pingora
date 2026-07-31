@@ -1,0 +1,23 @@
+pingora-proxy/src/lib.rs
+  s_2489f7be3f7e48::t_44ac29037acd36 342,410,1261
+  s_2489f7be3f7e48::t_6871afb40d1429 1257-1260,1262-1264
+  s_2489f7be3f7e48::t_a17f36412ec71e 85,88,95-100,331,338-341,343-344,403-409,411,424-428,1204,1209-1210,1212,1233,1240,1279-1283,1839-1840,1845-1846,1918-1928,1935
+pingora-core/src/connectors/mod.rs
+  s_2489f7be3f7e48::t_a17f36412ec71e 72,88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6a141204fe47100bbd1f166056838a0bc975c906",
+  "prompts": {},
+  "sessions": {
+    "s_2489f7be3f7e48": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04ede8d35ffe1f5A0PoYg4t2uj",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
