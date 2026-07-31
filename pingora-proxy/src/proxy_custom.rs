@@ -84,6 +84,9 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        client_session.set_read_timeout(peer.options.read_timeout);
+        client_session.set_write_timeout(peer.options.write_timeout);
+
         let mut req = session.req_header().clone();
 
         if session.cache.enabled() {
@@ -116,9 +119,6 @@ where
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
             return (false, Some(e.into_up()));
         }
-
-        client_session.set_read_timeout(peer.options.read_timeout);
-        client_session.set_write_timeout(peer.options.write_timeout);
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
