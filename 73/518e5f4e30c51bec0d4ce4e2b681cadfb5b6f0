@@ -1,0 +1,19 @@
+docs/user_guide/conf.md
+  s_2489f7be3f7e48::t_81c17f1cfb0d81 41-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "73518e5f4e30c51bec0d4ce4e2b681cadfb5b6f0",
+  "prompts": {},
+  "sessions": {
+    "s_2489f7be3f7e48": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_04ede8d35ffe1f5A0PoYg4t2uj",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
