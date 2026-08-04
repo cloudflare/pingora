@@ -229,6 +229,12 @@ where
         let mut upstream_can_reuse = true;
         let mut send_error = None;
         let mut upgraded = false;
+        // The end of the *request body* is not the end of an upgraded tunnel. Exactly one
+        // end-of-body task belongs to the original request, but whether it is handled before
+        // or after the 101 is read is decided by task scheduling, so it has to be accounted
+        // for in both branches below. Without this the tunnel is torn down as soon as it is
+        // established whenever the upstream response wins the race.
+        let mut request_body_end_handled = false;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
@@ -242,6 +248,10 @@ where
                                 upgraded = true;
                                 if send_error.is_none() {
                                     // continue receiving from downstream after body mode change
+                                    // If the request body already ended, that end belonged to the
+                                    // request and has now been accounted for; the branch below
+                                    // must not consume a second one.
+                                    request_body_end_handled = request_done;
                                     request_done = false;
                                 }
                             }
@@ -291,12 +301,23 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // A closed pipe is the downstream half going away, which ends the tunnel
+                    // no matter what the original request body did.
+                    let downstream_pipe_closed = body.is_none();
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
-                                response_done = true;
+                                if !request_body_end_handled && !downstream_pipe_closed {
+                                    // The 101 was read while the end of the request body was
+                                    // still in the pipe. That end says the request finished,
+                                    // not that the tunnel did, so keep reading from downstream.
+                                    request_body_end_handled = true;
+                                    request_done = false;
+                                } else {
+                                    response_done = true;
+                                }
                             }
                         },
                         Err(e) => {
