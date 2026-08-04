@@ -16,7 +16,7 @@ use super::*;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
-use pingora_cache::lock::LockStatus;
+use pingora_cache::lock::LockWaitOutcome;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
@@ -166,8 +166,8 @@ where
                             break None;
                         } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
-                            let lock_status = session.cache.cache_lock_wait().await;
-                            if self.handle_lock_status(session, ctx, lock_status) {
+                            let outcome = session.cache.cache_lock_wait().await;
+                            if self.handle_lock_wait_outcome(session, ctx, outcome) {
                                 if self.cache_lock_retry_limit_exceeded(
                                     session,
                                     ctx,
@@ -207,8 +207,8 @@ where
                             let will_serve_stale = session.cache.can_serve_stale_updating()
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if !will_serve_stale {
-                                let lock_status = session.cache.cache_lock_wait().await;
-                                if self.handle_lock_status(session, ctx, lock_status) {
+                                let outcome = session.cache.cache_lock_wait().await;
+                                if self.handle_lock_wait_outcome(session, ctx, outcome) {
                                     if self.cache_lock_retry_limit_exceeded(
                                         session,
                                         ctx,
@@ -940,30 +940,34 @@ where
     }
 
     // helper function to check when to continue to retry lock (true) or give up (false)
-    fn handle_lock_status(
+    fn handle_lock_wait_outcome(
         &self,
         session: &mut Session,
         ctx: &SV::CTX,
-        lock_status: LockStatus,
+        outcome: LockWaitOutcome,
     ) -> bool
     where
         SV: ProxyHttp,
     {
-        debug!("cache unlocked {lock_status:?}");
-        match lock_status {
+        debug!("cache unlocked {outcome:?}");
+        match outcome {
             // should lookup the cached asset again
-            LockStatus::Done => true,
+            LockWaitOutcome::Done => true,
             // should compete to be a new writer
-            LockStatus::TransientError => true,
-            // the request is uncacheable, go ahead to fetch from the origin
-            LockStatus::GiveUp => {
-                // TODO: It will be nice for the writer to propagate the real reason
+            LockWaitOutcome::TransientError => true,
+            // the writer found no lock was needed; every reader goes upstream
+            LockWaitOutcome::GiveUp => {
                 session.cache.disable(NoCacheReason::CacheLockGiveUp);
-                // not cacheable, just go to the origin.
+                false
+            }
+            // this reader alone stopped waiting, over a fill it cannot use; the
+            // cause travels with the outcome, so there is nothing to look up
+            LockWaitOutcome::Abandoned { reason, .. } => {
+                session.cache.disable(reason);
                 false
             }
             // treat this the same as TransientError
-            LockStatus::Dangling => {
+            LockWaitOutcome::Dangling => {
                 // software bug, but request can recover from this
                 warn!(
                     "Dangling cache lock, {}",
@@ -973,7 +977,7 @@ where
             }
             // If this reader has spent too long waiting on locks, let the request
             // through while disabling cache (to avoid amplifying disk writes).
-            LockStatus::WaitTimeout => {
+            LockWaitOutcome::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -985,9 +989,7 @@ where
             // When a singular cache lock has been held for too long,
             // we should allow requests to recompete for the lock
             // to protect upstreams from load.
-            LockStatus::AgeTimeout => true,
-            // software bug, this status should be impossible to reach
-            LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+            LockWaitOutcome::AgeTimeout => true,
         }
     }
 

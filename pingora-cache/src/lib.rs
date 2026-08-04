@@ -47,7 +47,7 @@ mod variance;
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
 pub use key::CacheKey;
-use lock::{CacheKeyLockImpl, LockStatus, Locked};
+use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
 pub use meta::{set_compression_dict_content, set_compression_dict_path};
 pub use meta::{CacheMeta, CacheMetaDefaults};
@@ -182,6 +182,21 @@ pub struct HttpCacheDigest {
     pub lookup_duration: Option<Duration>,
     /// Admission decision made for an absent key, if an admission policy was configured.
     pub admission: Option<Decision>,
+    /// Set when a reader stopped waiting over a published fill it could not use.
+    /// See [`lock::UnusableFills`].
+    pub lock_abandon: Option<LockAbandon>,
+}
+
+/// A cache-lock wait abandoned over a fill the reader could not use. One value
+/// rather than two options, because the two are only ever known together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockAbandon {
+    /// Why this reader cannot use the fill, from its own matched
+    /// [`lock::UnusableFill`]. The writer publishes only tokens; the reason is the
+    /// reader's, wrapped as [`NoCacheReason::Custom`].
+    pub reason: NoCacheReason,
+    /// The published token it matched.
+    pub token: u64,
 }
 
 /// Convenience function to add a duration to an optional duration
@@ -387,6 +402,24 @@ impl HttpCache {
                     .and_then(|ie| ie.storage.as_any().downcast_ref::<T>())
             })
             .is_some()
+    }
+
+    /// Say something about this request's cache fill, so readers coalescing behind
+    /// it that cannot use it stop waiting. See [`lock::UnusableFills`] for the
+    /// reader's side.
+    ///
+    /// No-op unless this request holds the write lock. Each call **replaces** the
+    /// last, so publish the whole set each time.
+    pub fn lock_publish_fill_tokens(&self, tokens: &[u64]) {
+        if let Some(Locked::Write(permit)) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.enabled_ctx.as_ref())
+            .and_then(|enabled| enabled.lock_ctx.as_ref())
+            .and_then(|lock_ctx| lock_ctx.lock.as_ref())
+        {
+            permit.publish(tokens);
+        }
     }
 
     /// Release the cache lock if the current request is a cache writer.
@@ -1623,33 +1656,57 @@ impl HttpCache {
     }
 
     /// Wait for the cache read lock to be unlocked
+    ///
+    /// A request carrying an [`lock::UnusableFills`] on its cache key can also stop
+    /// early with [`LockWaitOutcome::Abandoned`], which [`Self::lock_abandon`] keeps
+    /// afterwards.
+    ///
     /// # Panic
     /// Check [Self::is_cache_locked()], panic if this request doesn't have a read lock.
-    pub async fn cache_lock_wait(&mut self) -> LockStatus {
+    pub async fn cache_lock_wait(&mut self) -> LockWaitOutcome {
+        // Taken before the mutable borrow below. Naming nothing waits as always.
+        let unusable = self
+            .maybe_cache_key()
+            .and_then(|key| key.extensions.get::<UnusableFills>())
+            .cloned();
+
         let inner_enabled = self.inner_enabled_mut();
         #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut span = inner_enabled.traces.child("cache_lock");
         // should always call is_cache_locked() before this function, which should guarantee that
         // the inner cache has a read lock and lock ctx
-        let (read_lock, status) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+        let (read_lock, outcome) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
             let lock = lock_ctx.lock.take(); // remove the lock from self
             if let Some(Locked::Read(r)) = lock {
                 let now = Instant::now();
                 // it's possible for a request to be locked more than once,
                 // so wait the remainder of our configured timeout
-                let status = if let Some(wait_timeout) = lock_ctx.wait_timeout {
+                let wait = async {
+                    match unusable.as_ref() {
+                        Some(unusable) => r.wait_unless_published(unusable).await,
+                        None => {
+                            r.wait().await;
+                            WaitOutcome::Released
+                        }
+                    }
+                };
+                let outcome = if let Some(wait_timeout) = lock_ctx.wait_timeout {
                     let wait_timeout =
                         wait_timeout.saturating_sub(self.lock_duration().unwrap_or(Duration::ZERO));
-                    match timeout(wait_timeout, r.wait()).await {
-                        Ok(()) => r.lock_status(),
-                        Err(_) => LockStatus::WaitTimeout,
+                    match timeout(wait_timeout, wait).await {
+                        Ok(outcome) => Self::wait_result(&r, outcome),
+                        Err(_) => LockWaitOutcome::WaitTimeout,
                     }
                 } else {
-                    r.wait().await;
-                    r.lock_status()
+                    Self::wait_result(&r, wait.await)
                 };
                 self.digest.add_lock_duration(now.elapsed());
-                (r, status)
+                // On the digest as well as returned: a logging filter reports it
+                // long after the caller has acted on the outcome.
+                if let LockWaitOutcome::Abandoned { reason, token } = outcome {
+                    self.digest.lock_abandon = Some(LockAbandon { reason, token });
+                }
+                (r, outcome)
             } else {
                 panic!("cache_lock_wait on wrong type of lock")
             }
@@ -1659,14 +1716,55 @@ impl HttpCache {
         if let Some(lock_ctx) = self.inner_enabled().lock_ctx.as_ref() {
             lock_ctx
                 .cache_lock
-                .trace_lock_wait(&mut span, &read_lock, status);
+                .trace_lock_wait(&mut span, &read_lock, outcome.lock_status());
         }
-        status
+        outcome
     }
 
     /// How long did this request wait behind the read lock
     pub fn lock_duration(&self) -> Option<Duration> {
         self.digest.lock_duration
+    }
+
+    /// An abandoning reader's outcome is deliberately not written to the shared
+    /// lock status: the writer and every other reader are unaffected.
+    fn wait_result(lock: &lock::ReadLock, outcome: WaitOutcome) -> LockWaitOutcome {
+        match outcome {
+            WaitOutcome::Abandoned(matched) => LockWaitOutcome::Abandoned {
+                reason: NoCacheReason::Custom(matched.reason),
+                token: matched.token,
+            },
+            WaitOutcome::Released | WaitOutcome::AgeTimeout => {
+                Self::released_result(lock.lock_status())
+            }
+        }
+    }
+
+    /// A released lock should never still read [`LockStatus::Waiting`]. `Dangling`
+    /// already means "bad state, recompete", and warns, so no panic is needed.
+    fn released_result(status: LockStatus) -> LockWaitOutcome {
+        match status {
+            LockStatus::Done => LockWaitOutcome::Done,
+            LockStatus::TransientError => LockWaitOutcome::TransientError,
+            LockStatus::Dangling => LockWaitOutcome::Dangling,
+            LockStatus::WaitTimeout => LockWaitOutcome::WaitTimeout,
+            LockStatus::AgeTimeout => LockWaitOutcome::AgeTimeout,
+            LockStatus::GiveUp => LockWaitOutcome::GiveUp,
+            LockStatus::Waiting => {
+                debug_assert!(false, "a released lock cannot still be Waiting");
+                LockWaitOutcome::Dangling
+            }
+        }
+    }
+
+    /// The fill this request stopped waiting over, and why it could not use it.
+    ///
+    /// Set only when [`Self::cache_lock_wait`] returned
+    /// [`LockWaitOutcome::Abandoned`]. Absent for every other outcome, including
+    /// [`LockWaitOutcome::GiveUp`], which is the writer giving up rather than this
+    /// request abandoning the wait.
+    pub fn lock_abandon(&self) -> Option<LockAbandon> {
+        self.digest.lock_abandon
     }
 
     /// How long did this request spent on cache lookup and reading the header
@@ -1793,6 +1891,7 @@ impl HttpCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{CacheLock, UnusableFill};
     use async_trait::async_trait;
     use http::StatusCode;
     use std::any::Any;
@@ -1966,6 +2065,167 @@ mod tests {
         cache.phase = CachePhase::Stale;
         cache.inner_enabled_mut().meta = Some(meta);
         cache
+    }
+
+    static FILL_INTEREST_LOCK: LazyLock<CacheLock> =
+        LazyLock::new(|| CacheLock::new(Duration::from_secs(30)));
+
+    const WRONG_PLACE: u64 = 7;
+    const SOMEWHERE_ELSE: u64 = 9;
+
+    /// Reasons are the application's, not the cache's; it wraps them as
+    /// [`NoCacheReason::Custom`].
+    const NO_GOOD: &str = "NoGoodToThisReader";
+    const NO_GOOD_EITHER: &str = "AlsoNoGood";
+
+    fn cannot_use(token: u64) -> UnusableFills {
+        UnusableFills {
+            fills: vec![UnusableFill {
+                token,
+                reason: NO_GOOD,
+            }]
+            .into(),
+        }
+    }
+
+    fn locked_reader(key: &str, interest: Option<UnusableFills>) -> HttpCache {
+        let mut cache_key = CacheKey::new(key, "");
+        if let Some(interest) = interest {
+            cache_key.extensions.insert(interest);
+        }
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &UPDATE_OK_STORAGE,
+            None,
+            None,
+            Some(&*FILL_INTEREST_LOCK),
+            None,
+        );
+        cache.set_cache_key(cache_key);
+        cache
+    }
+
+    /// A reader that stops waiting reports `GiveUp` with its own reason, so the
+    /// give-up is attributed to why it stopped rather than the generic
+    /// `CacheLockGiveUp`.
+    #[tokio::test]
+    async fn a_reader_that_stops_waiting_reports_its_own_reason() {
+        let key = "stops-waiting";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+        assert!(!writer.is_cache_locked(), "the first request is the writer");
+
+        let mut reader = locked_reader(key, Some(cannot_use(WRONG_PLACE)));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked(), "the second request coalesces");
+
+        // The writer learns where it is filling from, and says so.
+        let waiting = tokio::spawn(async move {
+            let status = reader.cache_lock_wait().await;
+            (status, reader.lock_abandon())
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "nothing published yet");
+
+        writer.lock_publish_fill_tokens(&[WRONG_PLACE]);
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            (
+                LockWaitOutcome::Abandoned {
+                    reason: NoCacheReason::Custom(NO_GOOD),
+                    token: WRONG_PLACE,
+                },
+                Some(LockAbandon {
+                    reason: NoCacheReason::Custom(NO_GOOD),
+                    token: WRONG_PLACE,
+                })
+            ),
+            "its own reason and token, on the outcome and on the digest alike"
+        );
+
+        // The writer never released, so a reader arriving afterwards without an
+        // interest still coalesces behind it.
+        let mut other = locked_reader(key, None);
+        assert!(other.cache_lookup().await.unwrap().is_none());
+        assert!(other.is_cache_locked(), "the lock is untouched");
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+    }
+
+    /// The reason follows the token that matched, not the set: a key carries one
+    /// [`UnusableFills`], so unrelated parts of an application share it.
+    #[tokio::test]
+    async fn the_reason_comes_from_the_token_that_matched() {
+        let key = "reason-per-token";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+
+        let interest = UnusableFills {
+            fills: vec![
+                UnusableFill {
+                    token: WRONG_PLACE,
+                    reason: NO_GOOD,
+                },
+                UnusableFill {
+                    token: SOMEWHERE_ELSE,
+                    reason: NO_GOOD_EITHER,
+                },
+            ]
+            .into(),
+        };
+        let mut reader = locked_reader(key, Some(interest));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move {
+            let status = reader.cache_lock_wait().await;
+            (status, reader.lock_abandon())
+        });
+        tokio::task::yield_now().await;
+
+        // Only the second token is published, so only its reason may surface.
+        writer.lock_publish_fill_tokens(&[SOMEWHERE_ELSE]);
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            (
+                LockWaitOutcome::Abandoned {
+                    reason: NoCacheReason::Custom(NO_GOOD_EITHER),
+                    token: SOMEWHERE_ELSE,
+                },
+                Some(LockAbandon {
+                    reason: NoCacheReason::Custom(NO_GOOD_EITHER),
+                    token: SOMEWHERE_ELSE,
+                })
+            ),
+            "the matched token's own reason, not the first in the set"
+        );
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+    }
+
+    /// A reader whose tokens are never published waits for the writer, as before.
+    #[tokio::test]
+    async fn a_reader_naming_unpublished_tokens_still_waits() {
+        let key = "unpublished-tokens";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+
+        let mut reader = locked_reader(key, Some(cannot_use(WRONG_PLACE)));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move { reader.cache_lock_wait().await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "the reader is still coalescing");
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+
+        assert_eq!(waiting.await.unwrap(), LockWaitOutcome::TransientError);
     }
 
     fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
