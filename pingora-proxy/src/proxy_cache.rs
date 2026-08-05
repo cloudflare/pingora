@@ -603,13 +603,20 @@ where
                     Cacheable(meta) => {
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
-                            // The cache might have been bypassed because the response exceeded the
-                            // maximum cacheable asset size. If that looks like the case (there
-                            // is a maximum file size configured and we don't know the content
-                            // length up front), attempting to re-enable the cache now would cause
-                            // the request to fail when the chunked response exceeds the maximum
-                            // file size again.
-                            if session.cache.max_file_size_bytes().is_some()
+                            // Only hold this request back if the predictor bypassed it over size.
+                            // Re-enabling the cache without a known content length would fail the
+                            // request mid-body if the response exceeds the maximum file size
+                            // again, so wait for the body to finish and let the response filters
+                            // re-admit the key. Every other bypass reason says nothing about size
+                            // and must not be reported as PredictedResponseTooLarge.
+                            let bypassed_over_size =
+                                match session.cache.predicted_uncacheable_reason() {
+                                    Some(reason) => reason == NoCacheReason::ResponseTooLarge,
+                                    // unknown reason, stay conservative
+                                    None => true,
+                                };
+                            if bypassed_over_size
+                                && session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
                                 session
@@ -2574,5 +2581,201 @@ impl ServeFromCache {
         }
         *self = Self::CacheBody(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        predictor::{CacheablePredictor, Predictor},
+        CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
+    };
+    use pingora_http::ResponseHeader;
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Stands in for a caller-defined `NoCacheReason::Custom` that has nothing to do with size.
+    const AUTHORIZATION_HEADER: &str = "AuthorizationHeader";
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test drives cache_http_task directly")
+        }
+
+        fn response_cache_filter(
+            &self,
+            _session: &Session,
+            resp: &ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<RespCacheable> {
+            let now = SystemTime::now();
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                now + Duration::from_secs(60),
+                now,
+                0,
+                0,
+                resp.clone(),
+            )))
+        }
+    }
+
+    /// Build a session that the predictor has bypassed, exactly as `proxy_cache` would:
+    /// the key is remembered as uncacheable for `reason`, so lookup is skipped.
+    async fn bypassed_session(
+        key: CacheKey,
+        reason: NoCacheReason,
+        max_file_size: usize,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+
+        CACHE_PREDICTOR.mark_uncacheable(&key, reason);
+        assert!(
+            !session.cache.cacheable_prediction(),
+            "predictor should bypass a key it just marked uncacheable"
+        );
+        session.cache.bypass();
+        session
+    }
+
+    /// A cacheable 200 with no `Content-Length`, i.e. an origin that chunks the body.
+    fn chunked_cacheable_response() -> ResponseHeader {
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.insert_header(http::header::CACHE_CONTROL, "max-age=60")
+            .unwrap();
+        resp
+    }
+
+    async fn run_header_task(session: &mut Session, resp: ResponseHeader) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(resp), true),
+                &mut (),
+                &mut ServeFromCache::new(),
+            )
+            .await
+            .expect("cache_http_task should succeed");
+    }
+
+    /// A predictor bypass that had nothing to do with size must not be reported as
+    /// PredictedResponseTooLarge, and must not cost the request a wasted bypass.
+    #[tokio::test]
+    async fn non_size_bypass_admits_and_clears_predictor() {
+        for reason in [
+            NoCacheReason::Custom(AUTHORIZATION_HEADER),
+            NoCacheReason::OriginNotCache,
+        ] {
+            let key = CacheKey::new(format!("/non-size-bypass/{}", reason.as_str()), "");
+            let mut session = bypassed_session(key.clone(), reason, 1024).await;
+
+            run_header_task(&mut session, chunked_cacheable_response()).await;
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Miss,
+                "bypass remembered for {reason:?} should admit this response, got {:?}",
+                session.cache.phase()
+            );
+            assert!(
+                CACHE_PREDICTOR.cacheable_prediction(&key),
+                "bypass remembered for {reason:?} should be cleared once the response came back cacheable"
+            );
+        }
+    }
+
+    /// The deferral only exists to protect against a response that already blew the size
+    /// limit once. That case still defers, and still reports the reason it acted on.
+    #[tokio::test]
+    async fn size_bypass_defers_when_length_is_unknown() {
+        let key = CacheKey::new("/size-bypass-chunked", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+        assert!(
+            !CACHE_PREDICTOR.cacheable_prediction(&key),
+            "the response body has not been measured yet, so the key stays marked"
+        );
+    }
+
+    /// With a Content-Length the size is known up front, so even a size bypass can admit.
+    #[tokio::test]
+    async fn size_bypass_admits_when_length_is_known() {
+        let key = CacheKey::new("/size-bypass-with-length", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        let mut resp = chunked_cacheable_response();
+        resp.insert_header(CONTENT_LENGTH, "5").unwrap();
+        run_header_task(&mut session, resp).await;
+
+        assert_eq!(session.cache.phase(), CachePhase::Miss);
+    }
+
+    /// Without a predictor reason there is nothing to act on, so the conservative
+    /// deferral stays in place.
+    #[tokio::test]
+    async fn unknown_bypass_reason_stays_conservative() {
+        let key = CacheKey::new("/unknown-bypass-reason", "");
+        // Bypass without the predictor remembering anything, e.g. a caller that bypassed
+        // for its own reasons.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key);
+        session.cache.set_max_file_size_bytes(1024);
+        session.cache.bypass();
+        assert_eq!(session.cache.predicted_uncacheable_reason(), None);
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
     }
 }

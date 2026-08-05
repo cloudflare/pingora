@@ -322,6 +322,10 @@ struct HttpCacheInner {
     // when set, an asset will be rejected from the cache if it exceeds configured size in bytes
     pub max_file_size_tracker: Option<MaxFileSizeTracker>,
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
+    // Why the predictor considered this key uncacheable, captured in bypass() so later
+    // phases report the reason they acted on rather than inferring one. Outlives cache
+    // disablement because it is read after the response header arrives.
+    pub predicted_uncacheable_reason: Option<NoCacheReason>,
 }
 
 #[derive(Debug, Default)]
@@ -479,10 +483,23 @@ impl HttpCache {
             CachePhase::CacheKey => {
                 // before cache lookup / found / miss
                 self.phase = CachePhase::Bypass;
-                self.inner_enabled_mut()
-                    .traces
+                // Record why the predictor gave up on this key while we still know.
+                // Reading it later would race with concurrent requests re-marking the key.
+                let predicted_reason = self
+                    .inner()
+                    .predictor
+                    .and_then(|predictor| predictor.predicted_uncacheable_reason(self.cache_key()));
+                self.inner_mut().predicted_uncacheable_reason = predicted_reason;
+
+                let traces = &mut self.inner_enabled_mut().traces;
+                traces
                     .cache_span
                     .set_tag(|| trace::Tag::new("bypassed", true));
+                if let Some(reason) = predicted_reason {
+                    traces
+                        .cache_span
+                        .set_tag(|| trace::Tag::new("bypass_reason", reason.as_str()));
+                }
             }
             _ => panic!("wrong phase to bypass HttpCache {:?}", self.phase),
         }
@@ -538,6 +555,7 @@ impl HttpCache {
                     key: None,
                     max_file_size_tracker: None,
                     predictor,
+                    predicted_uncacheable_reason: None,
                 }));
             }
             _ => panic!("Cannot enable already enabled HttpCache {:?}", self.phase),
@@ -1734,6 +1752,17 @@ impl HttpCache {
         } else {
             true
         }
+    }
+
+    /// The reason the predictor remembered for this key when [Self::bypass] ran.
+    ///
+    /// `None` when the cache was not bypassed, when no predictor is configured, or when the
+    /// predictor does not track reasons. Callers must treat `None` as "unknown" rather than
+    /// as evidence about the previous response.
+    pub fn predicted_uncacheable_reason(&self) -> Option<NoCacheReason> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.predicted_uncacheable_reason)
     }
 
     /// Tell the predictor that this response, which is previously predicted to be uncacheable,

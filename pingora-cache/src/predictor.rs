@@ -28,7 +28,9 @@ pub type CustomReasonPredicate = fn(&'static str) -> bool;
 /// The predictor's bypass mechanism handles cases where the request _looks_ cacheable
 /// but its previous responses suggest otherwise. The request _could_ be cacheable in the future.
 pub struct Predictor<const N_SHARDS: usize> {
-    uncacheable_keys: ConcurrentLruCache<(), N_SHARDS>,
+    /// Maps a remembered-uncacheable key to the [NoCacheReason] it was last marked with,
+    /// so callers can tell a size-driven bypass apart from any other kind.
+    uncacheable_keys: ConcurrentLruCache<NoCacheReason, N_SHARDS>,
     skip_custom_reasons_fn: Option<CustomReasonPredicate>,
 }
 
@@ -41,6 +43,17 @@ use log::debug;
 pub trait CacheablePredictor {
     /// Return true if likely cacheable, false if likely not.
     fn cacheable_prediction(&self, key: &CacheKey) -> bool;
+
+    /// Return the [NoCacheReason] this key is currently remembered as uncacheable for.
+    ///
+    /// Callers use this to report *why* a request bypassed the cache instead of inferring it.
+    /// `None` means the key is not remembered as uncacheable, or the implementation does not
+    /// track reasons, so callers must not assume anything about the previous response.
+    ///
+    /// The default implementation returns `None`.
+    fn predicted_uncacheable_reason(&self, _key: &CacheKey) -> Option<NoCacheReason> {
+        None
+    }
 
     /// Mark cacheable to allow next request to cache.
     /// Returns false if the key was already marked cacheable.
@@ -67,7 +80,7 @@ impl<const N_SHARDS: usize> Predictor<N_SHARDS> {
         skip_custom_reasons_fn: Option<CustomReasonPredicate>,
     ) -> Predictor<N_SHARDS> {
         Predictor {
-            uncacheable_keys: ConcurrentLruCache::<(), N_SHARDS>::new(shard_capacity),
+            uncacheable_keys: ConcurrentLruCache::<NoCacheReason, N_SHARDS>::new(shard_capacity),
             skip_custom_reasons_fn,
         }
     }
@@ -75,13 +88,18 @@ impl<const N_SHARDS: usize> Predictor<N_SHARDS> {
 
 impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS> {
     fn cacheable_prediction(&self, key: &CacheKey) -> bool {
+        self.predicted_uncacheable_reason(key).is_none()
+    }
+
+    fn predicted_uncacheable_reason(&self, key: &CacheKey) -> Option<NoCacheReason> {
         // variance key is ignored because this check happens before cache lookup
         let hash = key.primary_bin();
         let key = u128::from_be_bytes(hash); // Endianness doesn't matter
 
         // Note: LRU updated in mark_* functions only,
-        // as we assume the caller always updates the cacheability of the response later
-        !self.uncacheable_keys.read(key).contains(&key)
+        // as we assume the caller always updates the cacheability of the response later.
+        // peek() reads without promoting, matching that.
+        self.uncacheable_keys.read(key).peek(&key).copied()
     }
 
     fn mark_cacheable(&self, key: &CacheKey) -> bool {
@@ -135,8 +153,9 @@ impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS> {
         let key = u128::from_be_bytes(hash);
 
         let mut cache = self.uncacheable_keys.get(key).write();
-        // put() returns Some(old_value) if the key existed, else None
-        let new_key = cache.put(key, ()).is_none();
+        // put() returns Some(old_reason) if the key existed, else None.
+        // Re-marking overwrites, so the most recent reason is the one reported.
+        let new_key = cache.put(key, reason).is_none();
         if new_key {
             debug!("request marked uncacheable");
         }
@@ -167,6 +186,36 @@ mod tests {
         // mark cacheable again
         predictor.mark_cacheable(&key);
         assert!(predictor.cacheable_prediction(&key));
+    }
+
+    #[test]
+    fn test_remembers_uncacheable_reason() {
+        let predictor = Predictor::<1>::new(10, None);
+        let key = CacheKey::new("reason", "tag");
+        assert_eq!(predictor.predicted_uncacheable_reason(&key), None);
+
+        predictor.mark_uncacheable(&key, NoCacheReason::Custom("AuthorizationHeader"));
+        assert_eq!(
+            predictor.predicted_uncacheable_reason(&key),
+            Some(NoCacheReason::Custom("AuthorizationHeader"))
+        );
+
+        // re-marking replaces the reason
+        predictor.mark_uncacheable(&key, NoCacheReason::ResponseTooLarge);
+        assert_eq!(
+            predictor.predicted_uncacheable_reason(&key),
+            Some(NoCacheReason::ResponseTooLarge)
+        );
+
+        // a skipped reason leaves the remembered one alone
+        predictor.mark_uncacheable(&key, NoCacheReason::InternalError);
+        assert_eq!(
+            predictor.predicted_uncacheable_reason(&key),
+            Some(NoCacheReason::ResponseTooLarge)
+        );
+
+        predictor.mark_cacheable(&key);
+        assert_eq!(predictor.predicted_uncacheable_reason(&key), None);
     }
 
     #[test]

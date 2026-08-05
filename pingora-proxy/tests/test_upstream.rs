@@ -4605,6 +4605,43 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
+    /// A predictor bypass that had nothing to do with size must not be treated as one.
+    ///
+    /// `/test3` is chunked, so the cache cannot confirm the body size from the response
+    /// header. That used to be enough to report `PredictedResponseTooLarge` and burn a
+    /// bypass on every recovery, no matter why the key was bypassed in the first place.
+    #[tokio::test]
+    async fn test_cache_max_file_size_chunked_non_size_bypass() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_non_size_bypass_chunked/test3";
+
+        // origin says private, so the key is remembered as uncacheable for OriginNotCache
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-cache-max-file-size-bytes", "1000")
+            .header("x-set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // same key, now cacheable. The bypass was never about size, so this request fills
+        // the cache rather than spending itself confirming the body fits.
+        let res = send_max_file_size_req(url, 1000, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 1000, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
     #[tokio::test]
     async fn test_cache_max_file_size_range() {
         init();
