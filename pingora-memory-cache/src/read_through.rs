@@ -285,7 +285,11 @@ where
             /* this one will do the look up, either because it gets the write lock or the read
              * lock age is reached */
             let value = CB::lookup(key, extra).await;
-            let ret = match value {
+            // `my_write` (the WriterLockGuard) is dropped at the end of this
+            // block: it wakes waiters and removes the lock entry, and the same
+            // cleanup runs if this future is cancelled while awaiting the
+            // lookup above.
+            match value {
                 Ok((v, new_ttl)) => {
                     /* Don't put() if lock ago too old, to avoid too many concurrent writes */
                     if my_write.is_some() {
@@ -298,11 +302,7 @@ where
                     err.set_cause(e);
                     (Err(err), cache_state)
                 }
-            };
-            // `my_write` (the WriterLockGuard) is dropped here: it wakes
-            // waiters and removes the lock entry. If this future is cancelled
-            // while awaiting the lookup above, the same cleanup still runs.
-            ret
+            }
         }
     }
 
