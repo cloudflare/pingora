@@ -49,6 +49,34 @@ impl CacheLock {
     }
 }
 
+/// Owns the per-key lock inserted by a cache-miss writer. On drop — including
+/// when the writer future is cancelled while awaiting the user `Lookup`
+/// callback — it wakes any waiters and removes the lock entry so later
+/// same-key requests can make bounded progress instead of blocking forever on
+/// a lock whose writer is gone.
+struct WriterLockGuard {
+    lockers: Arc<RwLock<HashMap<u64, Arc<CacheLock>>>>,
+    hashed_key: u64,
+    lock: Arc<CacheLock>,
+}
+
+impl Drop for WriterLockGuard {
+    fn drop(&mut self) {
+        // Wake waiters so they can retry their own lookup. Any number of
+        // permits will do, since readers return them right away.
+        self.lock.lock.add_permits(10);
+
+        // Remove the lock only if it is still the one this guard owns: a
+        // cancelled writer must not delete a newer writer's lock.
+        let mut lockers = self.lockers.write();
+        if let Some(stored) = lockers.get(&self.hashed_key) {
+            if Arc::ptr_eq(stored, &self.lock) {
+                lockers.remove(&self.hashed_key);
+            }
+        }
+    }
+}
+
 #[async_trait]
 /// [Lookup] defines the caching behavior that the implementor needs. The `extra` field can be used
 /// to define any additional metadata that the implementor uses to determine cache eligibility.
@@ -114,7 +142,7 @@ where
 {
     inner: MemoryCache<K, T>,
     _callback: PhantomData<CB>,
-    lockers: RwLock<HashMap<u64, Arc<CacheLock>>>,
+    lockers: Arc<RwLock<HashMap<u64, Arc<CacheLock>>>>,
     lock_age: Option<Duration>,
     lock_timeout: Option<Duration>,
     phantom: PhantomData<S>,
@@ -130,7 +158,7 @@ where
     pub fn new(size: usize, lock_age: Option<Duration>, lock_timeout: Option<Duration>) -> Self {
         RTCache {
             inner: MemoryCache::new(size),
-            lockers: RwLock::new(HashMap::new()),
+            lockers: Arc::new(RwLock::new(HashMap::new())),
             _callback: PhantomData,
             lock_age,
             lock_timeout,
@@ -192,9 +220,13 @@ where
                     }
                     None => {
                         let new_lock = CacheLock::new_arc();
-                        let new_lock2 = new_lock.clone();
-                        lockers.insert(hashed_key, new_lock2);
-                        (Some(new_lock), None)
+                        let guard = WriterLockGuard {
+                            lockers: self.lockers.clone(),
+                            hashed_key,
+                            lock: new_lock.clone(),
+                        };
+                        lockers.insert(hashed_key, new_lock);
+                        (Some(guard), None)
                     }
                 } // write lock dropped
             }
@@ -267,18 +299,9 @@ where
                     (Err(err), cache_state)
                 }
             };
-            if let Some(my_write) = my_write {
-                /* add permit so that reader can start. Any number of permits will do,
-                 * since readers will return permits right away. */
-                my_write.lock.add_permits(10);
-
-                {
-                    // remove the lock from locker
-                    let mut lockers = self.lockers.write();
-                    lockers.remove(&hashed_key);
-                } // write lock dropped here
-            }
-
+            // `my_write` (the WriterLockGuard) is dropped here: it wakes
+            // waiters and removes the lock entry. If this future is cancelled
+            // while awaiting the lookup above, the same cleanup still runs.
             ret
         }
     }
@@ -738,6 +761,83 @@ mod tests {
             .multi_get([4, 5, 6].iter(), None, opt1.as_ref())
             .await
             .unwrap();
+    }
+
+    #[derive(Clone, Debug)]
+    struct CancelledLookupOpt {
+        entered: Arc<tokio::sync::Notify>,
+        used: Arc<AtomicI32>,
+    }
+
+    struct CancelledLookupCB();
+
+    #[async_trait]
+    impl Lookup<i32, i32, CancelledLookupOpt> for CancelledLookupCB {
+        async fn lookup(
+            _key: &i32,
+            extra: Option<&CancelledLookupOpt>,
+        ) -> Result<(i32, Option<Duration>), Box<dyn ErrorTrait + Send + Sync>> {
+            let extra = extra.expect("test lookup must receive coordination state");
+            let used = extra.used.fetch_add(1, atomic::Ordering::SeqCst) + 1;
+            if used == 1 {
+                extra.entered.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("first lookup is cancelled while pending");
+            }
+            Ok((used, None))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_lookup_releases_coalescing_lock() {
+        // A cache-miss writer cancelled while awaiting the user lookup
+        // callback must release the per-key coalescing lock: later same-key
+        // requests become a new writer and make progress (issue #931).
+        let cache: Arc<RTCache<i32, i32, CancelledLookupCB, CancelledLookupOpt>> =
+            Arc::new(RTCache::new(10, None, None));
+        let opt = CancelledLookupOpt {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            used: Arc::new(AtomicI32::new(0)),
+        };
+        assert!(cache.lockers.read().is_empty());
+
+        let writer_cache = cache.clone();
+        let writer_opt = opt.clone();
+        let writer =
+            tokio::spawn(async move { writer_cache.get(&1, None, Some(&writer_opt)).await });
+
+        // Wait until the writer is suspended inside the lookup callback,
+        // which is the cancellation window after lock insertion.
+        opt.entered.notified().await;
+        assert_eq!(
+            opt.used.load(atomic::Ordering::SeqCst),
+            1,
+            "the first cache miss writer must enter lookup before cancellation"
+        );
+
+        writer.abort();
+        assert!(
+            writer.await.unwrap_err().is_cancelled(),
+            "aborting the writer task is the cancellation source"
+        );
+
+        let hashed_key = cache.inner.hasher.hash_one(1);
+        assert!(
+            cache.lockers.read().get(&hashed_key).is_none(),
+            "a cancelled writer must remove its coalescing lock"
+        );
+
+        // The next same-key get becomes a replacement writer and completes.
+        let (res, _status) =
+            tokio::time::timeout(Duration::from_secs(1), cache.get(&1, None, Some(&opt)))
+                .await
+                .expect("the next same-key get must make bounded progress");
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(
+            opt.used.load(atomic::Ordering::SeqCst),
+            2,
+            "the second get must become a replacement writer and call lookup again"
+        );
     }
 
     #[tokio::test]
