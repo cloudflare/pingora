@@ -1,0 +1,29 @@
+pingora-cache/src/lib.rs
+  s_9a98a1e10d6249::t_2daaeb653ed429 50,185-191,395-412,1636-1643,1655-1664,1667-1669,1672,1675-1687,1708-1734,1848,2024-2169
+pingora-cache/src/lock.rs
+  s_89775394380532::t_81d4be32813c38 18,167,171,223-243,255,263-321,353-435,437-456,459-472,474,482-488,493-543,616-626,656-854,1046-1122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f6046fae920bbad29cbace9585f21381d24e2692",
+  "prompts": {},
+  "sessions": {
+    "s_89775394380532": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_053d0ff52ffeWOFdLf6DE4kXjy",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    },
+    "s_9a98a1e10d6249": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0599d2496ffeIuzc26CHB8SaeA",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
