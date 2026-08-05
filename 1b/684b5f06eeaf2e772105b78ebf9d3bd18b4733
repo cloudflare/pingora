@@ -1,0 +1,53 @@
+pingora-cache/src/lock.rs
+  s_22a1467471c0e6::t_0815c1f42a12c5 241-243
+  s_22a1467471c0e6::t_dfab248ec4c4aa 267,277
+  s_89775394380532::t_81d4be32813c38 167-168,171,223-240,244-245,257,265-266,268-276,278-323,355-437,441-454,456,464-470,475-525,561-564,580,603-623,653-853,856,858-860,862-865,867-871,873,875,878,880-882,1076,1085,1087,1095
+  s_89775394380532::t_17b101bdbe71f2 854-855
+  s_89775394380532::t_6dcbbfd6fbd272 857
+  s_89775394380532::t_a95cfb8ccd2ffc 861
+  s_89775394380532::t_509371dd273c7c 866
+  s_89775394380532::t_6c5b716f7dffd2 872
+  s_89775394380532::t_ccc2aa19004811 874
+  s_89775394380532::t_1f2f0b37ac564b 876-877
+  s_89775394380532::t_c53a05ecd6e953 879
+  s_89775394380532::t_6b91f01106000a 883
+  s_89775394380532::t_a190fa99b0f200 1075
+  s_89775394380532::t_bacd9ec66e0c09 1077-1079,1082-1084
+  s_89775394380532::t_754323590084a8 1086
+  s_89775394380532::t_57d0f26ad78ee7 1088-1090,1092-1094
+  s_89775394380532::t_547bf561b20c96 1096-1098
+pingora-cache/src/lib.rs
+  s_9a98a1e10d6249::t_2daaeb653ed429 50,185-190,394-411,1635-1642,1654-1663,1666-1668,1671,1674-1682,1703-1729,1843,2019-2169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1b684b5f06eeaf2e772105b78ebf9d3bd18b4733",
+  "prompts": {},
+  "sessions": {
+    "s_22a1467471c0e6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_045df5d1affeWwu86e852961Bv",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    },
+    "s_89775394380532": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_053d0ff52ffeWOFdLf6DE4kXjy",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    },
+    "s_9a98a1e10d6249": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0599d2496ffeIuzc26CHB8SaeA",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
