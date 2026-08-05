@@ -1,0 +1,38 @@
+pingora-core/src/protocols/http/v2/server.rs
+  s_d3901b84afead9::t_6d98e021982d67 908-910,922,927,932,937,942,947,952,980,1023
+  s_d3901b84afead9::t_34fa53099518a1 885-886,898-907,915
+  s_d3901b84afead9::t_7c0ed5c88e774f 887-888
+  s_d3901b84afead9::t_d8e3c4e27035d7 891-893
+  s_d3901b84afead9::t_78cef870bae8f0 24,242-244,248-260,362,374-375,889-890,894,911,921
+  s_c0690d61d7878c::t_f0f4acd60dca90 366-373,953
+  s_d3901b84afead9::t_cc55c6395f94d8 895-897
+  s_d3901b84afead9::t_2d20253512fce2 912-914
+  s_d3901b84afead9::t_364dd7778c728c 361
+  s_d3901b84afead9::t_391386cfa01747 376-378
+  s_d3901b84afead9::t_a96e0a1f60d2ef 916-920
+  s_d3901b84afead9::t_b0c63d4d1eba8a 923-926
+  s_d3901b84afead9::t_2cf3b37bab79d1 928-931
+  s_d3901b84afead9::t_57d1ad3f6e60c7 933-936
+  s_d3901b84afead9::t_35a2bb8260974d 938-941
+  s_d3901b84afead9::t_575a0293f75f32 943-946
+  s_d3901b84afead9::t_0a2c0044a936ff 948-951
+  s_d3901b84afead9::t_0846351e7ffebb 981-983,1020-1022
+  s_d3901b84afead9::t_7e77394a6de087 1024-1026
+  s_d3901b84afead9::t_b42917785d4d6a 275-276,363-365,379-387,954-979,984-1019,1027
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "adaea34fc87740a5fc26de345c0e91f93b7f9a05",
+  "prompts": {},
+  "sessions": {
+    "s_d3901b84afead9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa5fe-afb0-71e3-9f4e-65bbfdf5015f",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}
