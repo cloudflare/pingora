@@ -19,7 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 hashbrown = "0"
 parking_lot = "0"
-arrayvec = "0"
+arrayvec = "0.7"
 log = { workspace = true }
 rand = "0.8"
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
