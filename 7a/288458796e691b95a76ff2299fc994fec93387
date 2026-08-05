@@ -1,0 +1,35 @@
+pingora-cache/src/lib.rs
+  s_db4f054c5e120f::t_911a4cdd76b8c4 325-328
+  s_db4f054c5e120f::t_8e0b04e153afdf 486-495,498-502
+  s_db4f054c5e120f::t_4a9f5d4c8edeeb 558
+  s_db4f054c5e120f::t_4596f1748fae61 1757-1767
+pingora-proxy/tests/test_upstream.rs
+  s_db4f054c5e120f::t_062ed756d8cd4c 4608-4644
+pingora-cache/src/predictor.rs
+  s_db4f054c5e120f::t_9fea9d325baf83 31-33
+  s_db4f054c5e120f::t_dba8d69d24016b 47-57
+  s_db4f054c5e120f::t_79ab4875ed14a0 83
+  s_db4f054c5e120f::t_843ba0f42ee1a7 91-94,100-102
+  s_db4f054c5e120f::t_68b3614ccd5724 156-158
+  s_db4f054c5e120f::t_eedfafb16ce234 192-220
+  s_db4f054c5e120f::t_9009932f6e5aa7 191
+pingora-proxy/src/proxy_cache.rs
+  s_db4f054c5e120f::t_d4500d11c450e4 606-619
+  s_db4f054c5e120f::t_e1af6cac915d77 2586-2781
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7a288458796e691b95a76ff2299fc994fec93387",
+  "prompts": {},
+  "sessions": {
+    "s_db4f054c5e120f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_02d31dd0cffe4Z7yNzXKzXn7vL",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
