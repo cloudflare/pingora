@@ -18,7 +18,7 @@ use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
 use super::v1::server::HttpSession as SessionV1;
-use super::v2::server::HttpSession as SessionV2;
+use super::v2::server::{HttpSession as SessionV2, Idle};
 use super::HttpTask;
 use crate::custom_session;
 use crate::protocols::{Digest, SocketAddr, Stream};
@@ -689,6 +689,19 @@ impl Session {
             Self::H2(s) => s.read_body_or_idle(no_body_expected).await,
             Self::Subrequest(s) => s.read_body_or_idle(no_body_expected).await,
             Self::Custom(s) => s.read_body_or_idle(no_body_expected).await,
+        }
+    }
+
+    /// Return an [`Idle`] future that waits for this H2 stream to close without
+    /// reading any body data.
+    ///
+    /// For HTTP/2 this resolves when the client resets the stream (`RST_STREAM`),
+    /// cleanly closes the stream, or the stream errors. Other protocols have no
+    /// out-of-band close signal, so this returns `None` for them.
+    pub fn watch_h2_stream_close(&mut self) -> Option<Idle<'_>> {
+        match self {
+            Self::H2(s) => Some(s.idle()),
+            _ => None,
         }
     }
 
