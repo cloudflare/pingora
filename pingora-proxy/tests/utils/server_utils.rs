@@ -568,6 +568,17 @@ pub struct CacheCTX {
 
 pub struct ExampleProxyCache {}
 
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the cache proxy has reported a downstream error that it ignored in order
+/// to let a cache fill finish.
+///
+/// Tests use this to wait for the proxy to actually observe a downstream error instead of
+/// sleeping for an arbitrary duration.
+pub fn downstream_cache_warn_log_calls() -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
+
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
     type CTX = CacheCTX;
@@ -966,6 +977,20 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if context == ProxyWarnLogContext::DownstreamCache {
+            DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // only observing, keep the logging behavior unchanged
+        false
     }
 }
 

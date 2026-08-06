@@ -27,7 +27,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::{
-    init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+    downstream_cache_warn_log_calls, init, reset_suppress_proxy_warn_log_calls,
+    suppress_proxy_warn_log_calls,
 };
 
 fn is_specified_port(port: u16) -> bool {
@@ -1141,6 +1142,49 @@ async fn test_103_die() {
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
+// Push request body until the proxy stops granting send capacity, which means it has
+// stopped draining the downstream body because its upstream write is parked.
+//
+// The first grant and the later ones need different deadlines. Before the first grant the
+// proxy may still be accepting the connection and settling the H2 handshake, so a short
+// deadline there measures startup rather than the behavior under test. Once data has
+// flowed, a quiet period really does mean the write is parked.
+//
+// Returns the number of body bytes accepted by the downstream connection.
+async fn flood_until_upstream_write_parks(req_body: &mut h2::SendStream<Bytes>) -> usize {
+    use std::future::poll_fn;
+    use std::time::Duration;
+
+    const FIRST_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
+    const PARKED_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let mut sent = 0usize;
+    while sent < 512 * 1024 {
+        req_body.reserve_capacity(16 * 1024);
+        let first_grant = sent == 0;
+        let deadline = if first_grant {
+            FIRST_GRANT_TIMEOUT
+        } else {
+            PARKED_TIMEOUT
+        };
+        let granted =
+            match tokio::time::timeout(deadline, poll_fn(|cx| req_body.poll_capacity(cx))).await {
+                Ok(Some(Ok(n))) => n,
+                Ok(other) => panic!("downstream send capacity error: {other:?}"),
+                Err(_) if first_grant => {
+                    panic!("proxy never granted any request body capacity within {deadline:?}")
+                }
+                // no new capacity for a while: the proxy is parked on the upstream write
+                Err(_) => break,
+            };
+        req_body
+            .send_data(Bytes::from(vec![0u8; granted]), false)
+            .unwrap();
+        sent += granted;
+    }
+    sent
+}
+
 // A downstream RST_STREAM must be observed even while the proxy is blocked writing the
 // request body to the upstream (parked on h2 flow control). Otherwise the stream is held
 // open as a zombie: its handles stay referenced and the downstream connection-window
@@ -1203,27 +1247,7 @@ async fn test_h2_downstream_rst_while_upstream_write_blocked() {
 
     let (_response, mut req_body) = client.send_request(req, false).unwrap();
 
-    // Push body until the proxy stops granting capacity, meaning it is no longer
-    // reading the downstream body because its upstream write is parked on flow control.
-    let mut sent = 0usize;
-    while sent < 512 * 1024 {
-        req_body.reserve_capacity(16 * 1024);
-        let granted = match tokio::time::timeout(
-            Duration::from_millis(500),
-            poll_fn(|cx| req_body.poll_capacity(cx)),
-        )
-        .await
-        {
-            Ok(Some(Ok(n))) => n,
-            Ok(other) => panic!("downstream send capacity error: {other:?}"),
-            // no new capacity for a while: the proxy is parked on the upstream write
-            Err(_) => break,
-        };
-        req_body
-            .send_data(Bytes::from(vec![0u8; granted]), false)
-            .unwrap();
-        sent += granted;
-    }
+    let sent = flood_until_upstream_write_parks(&mut req_body).await;
     // we must have at least filled the upstream stream window for the write to park
     assert!(sent >= 1024, "only sent {sent} bytes");
 
@@ -1245,7 +1269,7 @@ async fn test_h2_downstream_rst_while_upstream_write_blocked() {
 #[tokio::test]
 async fn test_h2_downstream_rst_during_cache_fill() {
     use std::future::poll_fn;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     init();
 
@@ -1324,10 +1348,14 @@ async fn test_h2_downstream_rst_during_cache_fill() {
 
     // a small first body chunk, fits the upstream window
     req_body.reserve_capacity(16);
-    let granted = poll_fn(|cx| req_body.poll_capacity(cx))
-        .await
-        .unwrap()
-        .unwrap();
+    let granted = tokio::time::timeout(
+        Duration::from_secs(10),
+        poll_fn(|cx| req_body.poll_capacity(cx)),
+    )
+    .await
+    .expect("proxy never granted the initial request body capacity")
+    .unwrap()
+    .unwrap();
     assert!(granted >= 16);
     req_body
         .send_data(Bytes::from_static(b"upload.........."), false)
@@ -1344,69 +1372,164 @@ async fn test_h2_downstream_rst_during_cache_fill() {
 
     // flood the request body until the proxy stops granting capacity, i.e. it is
     // parked writing to the upstream whose window is exhausted
-    let mut sent = 0usize;
-    while sent < 512 * 1024 {
-        req_body.reserve_capacity(16 * 1024);
-        let granted = match tokio::time::timeout(
-            Duration::from_millis(500),
-            poll_fn(|cx| req_body.poll_capacity(cx)),
-        )
-        .await
-        {
-            Ok(Some(Ok(n))) => n,
-            Ok(other) => panic!("downstream send capacity error: {other:?}"),
-            Err(_) => break,
-        };
-        req_body
-            .send_data(Bytes::from(vec![0u8; granted]), false)
-            .unwrap();
-        sent += granted;
-    }
+    let sent = flood_until_upstream_write_parks(&mut req_body).await;
     assert!(sent >= 1024, "only sent {sent} bytes");
 
     // reset the stream while the proxy is blocked writing upstream;
     // since a cache fill is in progress, the proxy should swallow this error
     // and keep admitting the upstream response
+    let warn_log_calls_before = downstream_cache_warn_log_calls();
     req_body.send_reset(h2::Reason::CANCEL);
 
-    // give the proxy a moment to observe the RST, then let the upstream finish
-    // the response
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for the proxy to actually report the ignored downstream error before letting
+    // the upstream finish. Sleeping instead would let a slow machine finish the response
+    // first, which still passes but silently stops covering the case under test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while downstream_cache_warn_log_calls() == warn_log_calls_before {
+        assert!(
+            Instant::now() < deadline,
+            "proxy never reported a downstream error ignored during caching"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     finish_tx.send(()).unwrap();
 
-    // let the fill complete
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The object must now be fully in cache: a new request is a hit with the complete
+    // body and does not need the (single use) upstream. Poll for the admission to land
+    // rather than sleeping a fixed amount; a miss would reach for the upstream that is no
+    // longer accepting, so bound each attempt as well.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        assert!(
+            Instant::now() < deadline,
+            "cache admission did not complete: second request never became a hit"
+        );
 
-    // the object must now be fully in cache: a new request is a hit with the
-    // complete body and does not need the (single use) upstream
-    let tcp = TcpStream::connect("127.0.0.1:6154").await.unwrap();
-    let (mut client, conn) = client::handshake(tcp).await.unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("x-port", upstream_port.to_string())
-        .body(())
-        .unwrap();
-    let (response, _) = client.send_request(req, true).unwrap();
-    let (head, mut resp_body) = tokio::time::timeout(Duration::from_secs(5), response)
-        .await
-        .expect("no response for the second request")
-        .unwrap()
-        .into_parts();
-    assert_eq!(head.status, 200);
-    assert_eq!(head.headers.get("x-cache-status").unwrap(), "hit");
+        let tcp = TcpStream::connect("127.0.0.1:6154").await.unwrap();
+        let (mut client, conn) = client::handshake(tcp).await.unwrap();
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("x-port", upstream_port.to_string())
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(req, true).unwrap();
 
-    let mut body = Vec::new();
-    while let Some(chunk) = resp_body.data().await {
-        let chunk = chunk.unwrap();
-        let _ = resp_body.flow_control().release_capacity(chunk.len());
-        body.extend_from_slice(&chunk);
-    }
+        let attempt = tokio::time::timeout(Duration::from_secs(1), response).await;
+        if let Ok(Ok(response)) = attempt {
+            let (head, mut resp_body) = response.into_parts();
+            if head.status == StatusCode::OK
+                && head.headers.get("x-cache-status").map(|v| v.as_bytes()) == Some(b"hit")
+            {
+                let mut body = Vec::new();
+                while let Some(chunk) = resp_body.data().await {
+                    let chunk = chunk.unwrap();
+                    let _ = resp_body.flow_control().release_capacity(chunk.len());
+                    body.extend_from_slice(&chunk);
+                }
+                break body;
+            }
+        }
+
+        conn_task.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(body, b"hello world!");
 
     // release the upstream's stream handles
     let _ = done_tx.send(());
+}
+
+// The H2 upstream error path resets the upstream request body stream as soon as the
+// downstream stream goes away. That is only safe because h2 keeps a stream's queued
+// initial HEADERS when the stream has not been opened yet.
+//
+// A stream stays unopened whenever its HEADERS have not been flushed, most durably when
+// the peer's SETTINGS_MAX_CONCURRENT_STREAMS is already exhausted. If a reset discarded
+// those queued HEADERS, RST_STREAM would become the first frame of an idle stream, which
+// RFC 9113 section 6.4 requires the peer to treat as a connection-level PROTOCOL_ERROR.
+// The peer then tears down the whole connection, failing every other request multiplexed
+// onto it, not just the one being reset.
+//
+// Assert the ordering guarantee directly against the h2 dependency: reset a stream before
+// the connection task has ever been polled, so the HEADERS are guaranteed to still be
+// queued, then check what actually reaches the peer first.
+#[tokio::test]
+async fn test_h2_reset_before_headers_flush_keeps_headers_first() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    const FRAME_TYPE_HEADERS: u8 = 0x1;
+    const FRAME_TYPE_RST_STREAM: u8 = 0x3;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Minimal H2 peer: it only needs to read frames, so parse the 9 byte frame headers and
+    // skip the payloads rather than pulling in a full server implementation.
+    let peer = tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+
+        let mut preface = [0u8; 24];
+        io.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface[..], b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+        // report the first frame that belongs to the request stream, ignoring
+        // connection level frames such as SETTINGS and WINDOW_UPDATE
+        loop {
+            let mut header = [0u8; 9];
+            io.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let frame_type = header[3];
+            let stream_id =
+                u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+
+            let mut payload = vec![0u8; len];
+            io.read_exact(&mut payload).await.unwrap();
+
+            if stream_id == 1 {
+                return frame_type;
+            }
+        }
+    });
+
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    // handshake() only writes the client preface, it does not flush the queued frames,
+    // so nothing below reaches the peer until the connection task is polled
+    let (client, conn) = client::handshake(tcp).await.unwrap();
+    let mut client = client.ready().await.unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("http://example.com/")
+        .body(())
+        .unwrap();
+    let (_response, mut send_stream) = client.send_request(req, false).unwrap();
+
+    // reset while the initial HEADERS are still queued on an unopened stream
+    send_stream.send_reset(h2::Reason::CANCEL);
+
+    let conn_task = tokio::spawn(async move {
+        // the peer never replies, so the connection is expected to end in an error
+        let _ = conn.await;
+    });
+
+    let first_frame = tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .expect("timed out waiting for the first frame on the request stream")
+        .unwrap();
+
+    assert_ne!(
+        first_frame, FRAME_TYPE_RST_STREAM,
+        "RST_STREAM was sent as the first frame of an unopened stream: peers reject this \
+         with a connection level PROTOCOL_ERROR, which fails every stream on the connection"
+    );
+    assert_eq!(first_frame, FRAME_TYPE_HEADERS);
+
+    drop(send_stream);
+    let _ = conn_task.await;
 }
