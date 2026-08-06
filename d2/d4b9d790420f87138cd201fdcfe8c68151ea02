@@ -1,0 +1,19 @@
+pingora-proxy/tests/test_basic.rs
+  s_55b490ce279936::t_d0b5a012197602 1413-1502
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d2d4b9d790420f87138cd201fdcfe8c68151ea02",
+  "prompts": {},
+  "sessions": {
+    "s_55b490ce279936": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0276c81aeffeaTyrNDiBErmvJf",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
