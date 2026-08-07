@@ -39,7 +39,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run cargo check
-        run: cargo check --workspace
+        run: |
+          if [[ ${{ matrix.toolchain }} == 1.85.0 ]]; then
+            # pingora-foundations follows Foundations' higher MSRV and is covered by the other toolchains in this matrix.
+            cargo check --workspace --exclude pingora-foundations
+          else
+            cargo check --workspace
+          fi
 
       - name: Run cargo test
         if: matrix.toolchain != '1.85.0'
