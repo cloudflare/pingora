@@ -46,12 +46,13 @@ mod variance;
 
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
+pub use eviction::{CacheEntryId, CacheEntryKey};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
 pub use meta::{set_compression_dict_content, set_compression_dict_path};
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
+pub use storage::{HitHandler, MissHandler, PurgeOutcome, PurgeTarget, PurgeType, Storage};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -849,11 +850,12 @@ impl HttpCache {
             inner_enabled.traces.start_hit_span(phase, hit_status);
             inner_enabled.traces.log_meta_in_hit_span(&meta);
             if let Some(eviction) = inner_enabled.eviction {
-                // TODO: make access() accept CacheKey
                 let cache_key = key.to_compact();
                 if hit_handler.should_count_access() {
                     let size = hit_handler.get_eviction_weight();
-                    eviction.access(&cache_key, size, meta.0.internal.fresh_until);
+                    let entry_key =
+                        eviction::CacheEntryKey::from_entry_id(cache_key, hit_handler.entry_id());
+                    eviction.access(&entry_key, size, meta.0.internal.fresh_until);
                 }
             }
             inner_enabled.meta = Some(meta);
@@ -1054,11 +1056,12 @@ impl HttpCache {
                     .enabled_ctx
                     .as_mut()
                     .expect("cache enabled on miss and expired");
-                if inner_enabled.miss_handler.is_none() {
+                let Some(miss_handler) = inner_enabled.miss_handler.take() else {
                     // already finished, we allow calling this function more than once
                     return Ok(());
-                }
-                let miss_handler = inner_enabled.miss_handler.take().unwrap();
+                };
+                // Save the entry ID before `finish` consumes the miss handler.
+                let entry_id = miss_handler.entry_id();
                 let finish_result = miss_handler.finish().await;
                 let key = inner
                     .key
@@ -1087,12 +1090,13 @@ impl HttpCache {
                 if let Some(eviction) = inner_enabled.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner_enabled.meta.as_ref().unwrap();
+                    let entry_key = eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
                     let evicted = match size {
                         MissFinishType::Created(size) => {
-                            eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                            eviction.admit(entry_key, size, meta.0.internal.fresh_until)
                         }
                         MissFinishType::Appended(size, max_size) => {
-                            eviction.increment_weight(&cache_key, size, max_size)
+                            eviction.increment_weight(&entry_key, size, max_size)
                         }
                     };
                     // actual eviction can be done async
@@ -1101,9 +1105,13 @@ impl HttpCache {
                     let storage = inner_enabled.storage;
                     tokio::task::spawn(async move {
                         for item in evicted {
-                            if let Err(e) = storage.purge(&item, PurgeType::Eviction, &handle).await
+                            let target = storage::PurgeTarget::Exact(item);
+                            if let Err(e) =
+                                storage.purge(&target, PurgeType::Eviction, &handle).await
                             {
-                                warn!("Failed to purge {item} during eviction for finish miss handler: {e}");
+                                warn!(
+                                    "Failed to purge {target} during eviction for finish miss handler: {e}"
+                                );
                             }
                         }
                     });
@@ -1827,18 +1835,22 @@ impl HttpCache {
         key: &CompactCacheKey,
         mut span: Span,
     ) -> Result<bool> {
+        let target = storage::PurgeTarget::Active(key.clone());
         let result = storage
-            .purge(key, PurgeType::Invalidation, &span.handle())
+            .purge(&target, PurgeType::Invalidation, &span.handle())
             .await;
-        let purged = matches!(result, Ok(true));
-        // need to inform eviction manager if asset was removed
-        if let Some(eviction) = eviction.as_ref() {
-            if purged {
-                eviction.remove(key);
+        let purged = match result.as_ref() {
+            Ok(storage::PurgeOutcome::NotFound) | Err(_) => false,
+            Ok(storage::PurgeOutcome::Purged(entry)) => {
+                if let Some(eviction) = eviction {
+                    eviction.remove(entry);
+                }
+                true
             }
-        }
+        };
         span.set_tag(|| trace::Tag::new("purged", purged));
-        result
+        result?;
+        Ok(purged)
     }
 
     /// Check the cacheable prediction
@@ -1900,14 +1912,33 @@ mod tests {
     use std::sync::{LazyLock, Mutex};
 
     struct UpdateOkStorage;
+    struct IdentifiedEntryStorage {
+        append: bool,
+    }
     struct OneShotLookupStorage {
         entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
     }
-    struct EmptyHitHandler;
+    struct EmptyHitHandler {
+        entry_id: Option<u64>,
+    }
+    struct IdentifiedMissHandler {
+        finish: MissFinishType,
+    }
     struct CountingDeferPolicy(AtomicUsize);
     struct CountingReadyPolicy(AtomicUsize);
+    #[derive(Default)]
+    struct RecordingEviction {
+        removed: Mutex<Option<eviction::CacheEntryKey>>,
+        accessed: Mutex<Option<eviction::CacheEntryKey>>,
+        admitted: Mutex<Option<eviction::CacheEntryKey>>,
+        incremented: Mutex<Option<(eviction::CacheEntryKey, usize, Option<usize>)>>,
+    }
 
     static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
+    static IDENTIFIED_CREATED_STORAGE: IdentifiedEntryStorage =
+        IdentifiedEntryStorage { append: false };
+    static IDENTIFIED_APPENDED_STORAGE: IdentifiedEntryStorage =
+        IdentifiedEntryStorage { append: true };
     // Only one test uses this storage. Keep it that way unless the tests also isolate their keys
     // and clear any entries they push.
     static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
@@ -1919,7 +1950,6 @@ mod tests {
     static RAW_MISS_READY_POLICY: CountingReadyPolicy = CountingReadyPolicy(AtomicUsize::new(0));
     static TWO_USE_ADMISSION_POLICY: LazyLock<admission::MinUsesAdmissionPolicy> =
         LazyLock::new(|| admission::MinUsesAdmissionPolicy::new(NonZeroU32::new(2).unwrap()));
-
     impl AdmissionPolicy for CountingDeferPolicy {
         fn observe(&self, _key: &CacheKey) -> Decision {
             self.0.fetch_add(1, Ordering::Relaxed);
@@ -1958,6 +1988,25 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
             self
         }
+
+        fn entry_id(&self) -> Option<eviction::CacheEntryId> {
+            self.entry_id.map(eviction::CacheEntryId::new)
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for IdentifiedMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            Ok(self.finish)
+        }
+
+        fn entry_id(&self) -> Option<eviction::CacheEntryId> {
+            Some(eviction::CacheEntryId::new(7))
+        }
     }
 
     #[async_trait]
@@ -1981,11 +2030,11 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _key: &CompactCacheKey,
+            _target: &storage::PurgeTarget,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
-        ) -> Result<bool> {
-            Ok(false)
+        ) -> Result<storage::PurgeOutcome> {
+            Ok(storage::PurgeOutcome::NotFound)
         }
 
         async fn update_meta(
@@ -1999,6 +2048,124 @@ mod tests {
 
         fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
             self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for IdentifiedEntryStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            let finish = if self.append {
+                MissFinishType::Appended(2, Some(9))
+            } else {
+                MissFinishType::Created(1)
+            };
+            Ok(Box::new(IdentifiedMissHandler { finish }))
+        }
+
+        async fn purge(
+            &'static self,
+            target: &storage::PurgeTarget,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            let entry = match target {
+                storage::PurgeTarget::Active(key) => {
+                    eviction::CacheEntryKey::identified(key.clone(), eviction::CacheEntryId::new(1))
+                }
+                storage::PurgeTarget::Exact(entry) => entry.clone(),
+            };
+            Ok(storage::PurgeOutcome::Purged(entry))
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl eviction::EvictionManager for RecordingEviction {
+        fn total_size(&self) -> usize {
+            0
+        }
+
+        fn total_items(&self) -> usize {
+            0
+        }
+
+        fn evicted_size(&self) -> usize {
+            0
+        }
+
+        fn evicted_items(&self) -> usize {
+            0
+        }
+
+        fn admit(
+            &self,
+            item: eviction::CacheEntryKey,
+            _size: usize,
+            _fresh_until: SystemTime,
+        ) -> Vec<eviction::CacheEntryKey> {
+            *self.admitted.lock().unwrap() = Some(item);
+            Vec::new()
+        }
+
+        fn increment_weight(
+            &self,
+            item: &eviction::CacheEntryKey,
+            delta: usize,
+            max_weight: Option<usize>,
+        ) -> Vec<eviction::CacheEntryKey> {
+            *self.incremented.lock().unwrap() = Some((item.clone(), delta, max_weight));
+            Vec::new()
+        }
+
+        fn remove(&self, item: &eviction::CacheEntryKey) {
+            *self.removed.lock().unwrap() = Some(item.clone());
+        }
+
+        fn access(
+            &self,
+            item: &eviction::CacheEntryKey,
+            _size: usize,
+            _fresh_until: SystemTime,
+        ) -> bool {
+            *self.accessed.lock().unwrap() = Some(item.clone());
+            true
+        }
+
+        fn peek(&self, _item: &eviction::CacheEntryKey) -> bool {
+            false
+        }
+
+        async fn save(&self, _dir_path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load(&self, _dir_path: &str) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -2018,7 +2185,7 @@ mod tests {
                 return Ok(None);
             };
             let (_, meta) = entries.remove(pos);
-            Ok(Some((meta, Box::new(EmptyHitHandler))))
+            Ok(Some((meta, Box::new(EmptyHitHandler { entry_id: None }))))
         }
 
         async fn get_miss_handler(
@@ -2032,11 +2199,11 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _key: &CompactCacheKey,
+            _target: &storage::PurgeTarget,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
-        ) -> Result<bool> {
-            Ok(false)
+        ) -> Result<storage::PurgeOutcome> {
+            Ok(storage::PurgeOutcome::NotFound)
         }
 
         async fn update_meta(
@@ -2233,6 +2400,123 @@ mod tests {
         cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
         cache.set_cache_key(key);
         cache
+    }
+
+    #[tokio::test]
+    async fn purge_removes_identified_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expanded-purge", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            &key,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("purge should remove the identified entry");
+        assert_eq!(
+            removed,
+            eviction::CacheEntryKey::identified(key, eviction::CacheEntryId::new(1))
+        );
+        assert!(recording.accessed.lock().unwrap().is_none());
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_hit_passes_entry_id_to_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("identified-hit", "");
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_found(
+            test_meta(SystemTime::now()),
+            Box::new(EmptyHitHandler { entry_id: Some(7) }),
+            HitStatus::Fresh,
+        );
+
+        assert_eq!(
+            recording.accessed.lock().unwrap().take(),
+            Some(eviction::CacheEntryKey::identified(
+                key.to_compact(),
+                eviction::CacheEntryId::new(7)
+            ))
+        );
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_miss_passes_entry_id_to_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("identified-miss", "");
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_miss();
+        cache.set_cache_meta(test_meta(SystemTime::now()));
+        cache.set_miss_handler().await.unwrap();
+        cache.finish_miss_handler().await.unwrap();
+        assert_eq!(
+            recording.admitted.lock().unwrap().take(),
+            Some(eviction::CacheEntryKey::identified(
+                key.to_compact(),
+                eviction::CacheEntryId::new(7)
+            ))
+        );
+        assert!(recording.incremented.lock().unwrap().is_none());
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.accessed.lock().unwrap().is_none());
+
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_APPENDED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_miss();
+        cache.set_cache_meta(test_meta(SystemTime::now()));
+        cache.set_miss_handler().await.unwrap();
+        cache.finish_miss_handler().await.unwrap();
+        assert_eq!(
+            recording.incremented.lock().unwrap().take(),
+            Some((
+                eviction::CacheEntryKey::identified(
+                    key.to_compact(),
+                    eviction::CacheEntryId::new(7)
+                ),
+                2,
+                Some(9)
+            ))
+        );
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.accessed.lock().unwrap().is_none());
     }
 
     #[tokio::test]

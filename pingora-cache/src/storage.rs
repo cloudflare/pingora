@@ -15,12 +15,14 @@
 //! Cache backend storage abstraction
 
 use super::{CacheKey, CacheMeta};
+use crate::eviction::{CacheEntryId, CacheEntryKey};
 use crate::key::CompactCacheKey;
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
 use pingora_error::Result;
 use std::any::Any;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 /// The reason a purge() is called
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +31,46 @@ pub enum PurgeType {
     Eviction,
     // For cache invalidation
     Invalidation,
+}
+
+/// The entry a [`Storage::purge`] call should remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PurgeTarget {
+    /// Remove storage's current entry for this logical cache key.
+    ///
+    /// This targets one entry. Storage that retains multiple generations for a logical key does
+    /// not need to remove inactive generations.
+    Active(CompactCacheKey),
+    /// Remove this exact cache entry.
+    Exact(CacheEntryKey),
+}
+
+impl Display for PurgeTarget {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::Active(key) => write!(f, "active entry for {key}"),
+            Self::Exact(entry) => write!(f, "{entry}"),
+        }
+    }
+}
+
+impl PurgeTarget {
+    /// Return the target's logical cache key.
+    pub fn key(&self) -> &CompactCacheKey {
+        match self {
+            Self::Active(key) => key,
+            Self::Exact(entry) => entry.key(),
+        }
+    }
+}
+
+/// Outcome of a successful [`Storage::purge`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    /// Storage did not find the target entry.
+    NotFound,
+    /// Storage removed this exact entry.
+    Purged(CacheEntryKey),
 }
 
 /// Cache storage interface
@@ -72,15 +114,22 @@ pub trait Storage {
         trace: &SpanHandle,
     ) -> Result<MissHandler>;
 
-    /// Delete the cached asset for the given key
+    /// Delete one cached entry for the given target.
     ///
-    /// [CompactCacheKey] is used here because it is how eviction managers store the keys
+    /// [`PurgeTarget::Active`] asks storage to select one active entry for a logical cache key; it
+    /// does not request removal of every retained generation. [`PurgeTarget::Exact`] identifies the
+    /// exact entry to remove.
+    ///
+    /// On success, storage must return the complete identity of the entry it actually removed in
+    /// [`PurgeOutcome::Purged`]. If [`HandleHit::entry_id`] or [`HandleMiss::entry_id`] returns
+    /// `Some`, this identity must contain the corresponding [`CacheEntryId`]. Returning a key-only
+    /// identity would leave the identified entry tracked by the eviction manager.
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: &PurgeTarget,
         purge_type: PurgeType,
         trace: &SpanHandle,
-    ) -> Result<bool>;
+    ) -> Result<PurgeOutcome>;
 
     /// Update cache header and metadata for the already stored asset.
     async fn update_meta(
@@ -170,6 +219,19 @@ pub trait HandleHit {
         0
     }
 
+    /// Return the identity of this entry to the eviction manager.
+    ///
+    /// Storage that identifies a stored generation beyond its
+    /// [`crate::key::CompactCacheKey`] can return that identity here so access accounting targets
+    /// the exact entry. Storage that keys eviction only on the cache key should leave this at the
+    /// default `None`.
+    ///
+    /// Storage that identifies entries must implement both this method and
+    /// [`HandleMiss::entry_id`] using the same identity scheme.
+    fn entry_id(&self) -> Option<CacheEntryId> {
+        None
+    }
+
     /// Helper function to cast the trait object to concrete types
     fn as_any(&self) -> &(dyn Any + Send + Sync);
 
@@ -215,6 +277,20 @@ pub trait HandleMiss {
     // But most use cases likely only require a simple integer and may not like the overhead of a
     // Vec/String allocation or even a Cow, though such data types can also be used here.
     fn streaming_write_tag(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Return the identity of the entry produced by this write to the eviction manager.
+    ///
+    /// Storage that identifies a stored generation beyond its
+    /// [`crate::key::CompactCacheKey`] should return that identity here so admission and weight
+    /// updates target the entry that storage will produce. Storage that keys eviction only on the
+    /// cache key should leave this at the default `None`.
+    ///
+    /// The value must identify the committed entry and remain valid after [`Self::finish`]. It
+    /// must not identify only temporary write state. Storage that identifies entries must implement
+    /// both this method and [`HandleHit::entry_id`] using the same identity scheme.
+    fn entry_id(&self) -> Option<CacheEntryId> {
         None
     }
 }

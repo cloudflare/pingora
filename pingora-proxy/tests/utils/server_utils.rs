@@ -23,7 +23,7 @@ use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
-use pingora_cache::key::{CompactCacheKey, HashBinary};
+use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
@@ -527,11 +527,11 @@ impl Storage for FinishFailCache {
 
     async fn purge(
         &'static self,
-        _key: &CompactCacheKey,
+        _target: &pingora_cache::PurgeTarget,
         _purge_type: PurgeType,
         _trace: &pingora_cache::trace::SpanHandle,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        Ok(pingora_cache::storage::PurgeOutcome::NotFound)
     }
 
     async fn update_meta(

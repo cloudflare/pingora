@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use pingora_cache::{
-    eviction::{lru::Manager, EvictionManager},
+    eviction::{lru::Manager, CacheEntryKey, EvictionManager},
     CacheKey,
 };
 
@@ -27,7 +27,7 @@ fn main() {
     let unused_ttl = std::time::SystemTime::now();
     for i in 0..ITEMS {
         let item = CacheKey::new(i.to_string(), "").to_compact();
-        manager.admit(item, 1, unused_ttl);
+        manager.admit(CacheEntryKey::key_only(item), 1, unused_ttl);
     }
 
     /* lru serialize shard 19 22.573338ms, 5241623 bytes

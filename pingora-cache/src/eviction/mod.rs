@@ -18,13 +18,144 @@ use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
 use pingora_error::Result;
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::time::SystemTime;
 
 pub mod async_lru;
 pub mod lru;
 pub mod simple_lru;
 
-/// The trait that a cache eviction algorithm needs to implement
+/// Storage-defined identity for a cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CacheEntryId(u64);
+
+impl CacheEntryId {
+    /// Construct an entry ID from its storage-defined value.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the storage-defined value.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The identity of an entry tracked by an eviction manager.
+///
+/// Identified entries combine a logical cache key with storage-defined entry identity. Eviction
+/// managers paired with storage that returns identified entries must preserve and compare the
+/// complete key. Managers that use only the compact key cannot correctly account for such storage.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CacheEntryKey {
+    /// An entry identified only by its logical cache key.
+    KeyOnly(CompactCacheKey),
+    /// An entry with additional storage-defined identity.
+    Identified {
+        /// The logical cache key.
+        key: CompactCacheKey,
+        /// The storage-defined entry ID.
+        id: CacheEntryId,
+    },
+}
+
+impl Serialize for CacheEntryKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::KeyOnly(key) => key.serialize(serializer),
+            Self::Identified { key, id } => {
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element(key)?;
+                tuple.serialize_element(id)?;
+                tuple.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheEntryKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        CacheEntryKeyRepr::deserialize(deserializer).map(|entry| match entry {
+            CacheEntryKeyRepr::Identified(key, id) => Self::from_entry_id(key, id),
+            CacheEntryKeyRepr::KeyOnly(key) => Self::KeyOnly(key),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CacheEntryKeyRepr {
+    Identified(CompactCacheKey, Option<CacheEntryId>),
+    KeyOnly(CompactCacheKey),
+}
+
+impl Display for CacheEntryKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.key())?;
+        if let Some(id) = self.entry_id() {
+            write!(f, ", entry ID: {:x}", id.get())?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for CacheEntryKey {
+    fn default() -> Self {
+        Self::KeyOnly(CompactCacheKey::default())
+    }
+}
+
+impl CacheEntryKey {
+    /// Construct an entry from its logical key and optional storage-defined identity.
+    pub fn from_entry_id(key: CompactCacheKey, id: Option<CacheEntryId>) -> Self {
+        match id {
+            Some(id) => Self::Identified { key, id },
+            None => Self::KeyOnly(key),
+        }
+    }
+
+    /// Construct an entry identified only by its logical cache key.
+    pub fn key_only(key: CompactCacheKey) -> Self {
+        Self::KeyOnly(key)
+    }
+
+    /// Construct an entry with storage-defined identity.
+    pub fn identified(key: CompactCacheKey, id: CacheEntryId) -> Self {
+        Self::Identified { key, id }
+    }
+
+    /// Return the underlying cache key.
+    pub fn key(&self) -> &CompactCacheKey {
+        match self {
+            Self::KeyOnly(key) | Self::Identified { key, .. } => key,
+        }
+    }
+
+    /// Consume the eviction key and return its underlying cache key.
+    pub fn into_key(self) -> CompactCacheKey {
+        match self {
+            Self::KeyOnly(key) | Self::Identified { key, .. } => key,
+        }
+    }
+
+    /// Return the storage-defined entry ID, if present.
+    pub fn entry_id(&self) -> Option<CacheEntryId> {
+        match self {
+            Self::KeyOnly(_) => None,
+            Self::Identified { id, .. } => Some(*id),
+        }
+    }
+}
+
+/// The trait that a cache eviction algorithm needs to implement.
 ///
 /// NOTE: these trait methods require &self not &mut self, which means concurrency should
 /// be handled the implementations internally.
@@ -53,10 +184,10 @@ pub trait EvictionManager: Send + Sync {
     /// existing one, Some(_) might be returned for the caller to evict.
     fn admit(
         &self,
-        item: CompactCacheKey,
+        item: CacheEntryKey,
         size: usize,
         fresh_until: SystemTime,
-    ) -> Vec<CompactCacheKey>;
+    ) -> Vec<CacheEntryKey>;
 
     /// Adjust an item's weight upwards by a delta. If the item is not already admitted,
     /// track it with the delta as its initial weight, capped by `max_weight`, and floored to 1.
@@ -70,15 +201,15 @@ pub trait EvictionManager: Send + Sync {
     /// removed from the storage.
     fn increment_weight(
         &self,
-        item: &CompactCacheKey,
+        item: &CacheEntryKey,
         delta: usize,
         max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey>;
+    ) -> Vec<CacheEntryKey>;
 
     /// Remove an item from the eviction manager.
     ///
     /// The size of the item will be deducted.
-    fn remove(&self, item: &CompactCacheKey);
+    fn remove(&self, item: &CacheEntryKey);
 
     /// Access an item that should already be in cache.
     ///
@@ -86,13 +217,13 @@ pub trait EvictionManager: Send + Sync {
     ///
     /// The call used for asking the eviction manager to track the assets that are already admitted
     /// in the cache storage system.
-    fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool;
+    fn access(&self, item: &CacheEntryKey, size: usize, fresh_until: SystemTime) -> bool;
 
     /// Peek into the manager to see if the item is already tracked by the system
     ///
     /// This function should have no side-effect on the asset itself. For example, for LRU, this
     /// method shouldn't change the popularity of the asset being peeked.
-    fn peek(&self, item: &CompactCacheKey) -> bool;
+    fn peek(&self, item: &CacheEntryKey) -> bool;
 
     /// Serialize to save the state of this eviction manager to disk
     ///
@@ -104,4 +235,35 @@ pub trait EvictionManager: Send + Sync {
 
     /// The counterpart of [Self::save()].
     async fn load(&self, dir_path: &str) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CacheKey;
+
+    #[test]
+    fn cache_entry_key_serde_preserves_identity() {
+        let key = CacheKey::new("entry", "1").to_compact();
+        let legacy = rmp_serde::to_vec(&key).unwrap();
+        let key_only = CacheEntryKey::key_only(key.clone());
+        assert_eq!(rmp_serde::to_vec(&key_only).unwrap(), legacy);
+        assert_eq!(
+            rmp_serde::from_slice::<CacheEntryKey>(&legacy).unwrap(),
+            key_only
+        );
+        let previous_key_only =
+            rmp_serde::to_vec(&(key.clone(), Option::<CacheEntryId>::None)).unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<CacheEntryKey>(&previous_key_only).unwrap(),
+            key_only
+        );
+
+        let entry = CacheEntryKey::identified(key, CacheEntryId::new(7));
+
+        let serialized = rmp_serde::to_vec(&entry).unwrap();
+        let deserialized = rmp_serde::from_slice(&serialized).unwrap();
+
+        assert_eq!(entry, deserialized);
+    }
 }

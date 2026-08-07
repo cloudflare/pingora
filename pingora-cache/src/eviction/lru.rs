@@ -14,7 +14,8 @@
 
 //! A shared LRU cache manager
 
-use super::EvictionManager;
+use super::{CacheEntryKey, EvictionManager};
+#[cfg(test)]
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
@@ -32,10 +33,10 @@ use std::time::SystemTime;
 ///
 /// This allows [EvictionManager::save()] not to lock the entire cache manager while performing
 /// serialization.
-pub struct Manager<const N: usize>(Lru<CompactCacheKey, N>);
+pub struct Manager<const N: usize>(Lru<CacheEntryKey, N>);
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SerdeHelperNode(CompactCacheKey, usize);
+struct SerdeHelperNode(CacheEntryKey, usize);
 
 impl<const N: usize> Manager<N> {
     /// Create a [Manager] with the given size limit and estimated per shard capacity.
@@ -84,20 +85,20 @@ impl<const N: usize> Manager<N> {
         self.0.shard_len(shard)
     }
 
-    /// Get the shard index for a given cache key
+    /// Get the shard index for a given cache entry
     ///
     /// This allows callers to know which shard was affected by an operation
     /// without acquiring any locks.
-    pub fn get_shard_for_key(&self, key: &CompactCacheKey) -> usize {
+    pub fn get_shard_for_key(&self, key: &CacheEntryKey) -> usize {
         (u64key(key) % N as u64) as usize
     }
 
     /// Peek at the least-recently-used key in the given shard without evicting it.
     ///
-    /// Returns the cache key at the LRU tail of the shard, or `None` if empty.
+    /// Returns the cache entry at the LRU tail of the shard, or `None` if empty.
     /// Useful for reporting the eviction frontier (the age of the next item
     /// that would be evicted).
-    pub fn peek_lru(&self, shard: usize) -> Option<CompactCacheKey> {
+    pub fn peek_lru(&self, shard: usize) -> Option<CacheEntryKey> {
         self.0.peek_lru(shard).map(|(key, _weight)| key)
     }
 
@@ -144,8 +145,8 @@ impl<const N: usize> Manager<N> {
         Ok(())
     }
 
-    /// Peek the weight associated with a cache key without changing its LRU order.
-    pub fn peek_weight(&self, item: &CompactCacheKey) -> Option<usize> {
+    /// Peek the weight associated with a cache entry without changing its LRU order.
+    pub fn peek_weight(&self, item: &CacheEntryKey) -> Option<usize> {
         let key = u64key(item);
         self.0.peek_weight(key)
     }
@@ -175,7 +176,7 @@ impl<'de, const N: usize> serde::de::Visitor<'de> for InsertToManager<'_, N> {
 }
 
 #[inline]
-fn u64key(key: &CompactCacheKey) -> u64 {
+fn u64key(key: &CacheEntryKey) -> u64 {
     // note that std hash is not uniform, I'm not sure if ahash is also the case
     let mut hasher = ahash::AHasher::default();
     key.hash(&mut hasher);
@@ -201,10 +202,10 @@ impl<const N: usize> EvictionManager for Manager<N> {
 
     fn admit(
         &self,
-        item: CompactCacheKey,
+        item: CacheEntryKey,
         size: usize,
         _fresh_until: SystemTime,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(&item);
         self.0.admit(key, item, size);
         self.0
@@ -216,10 +217,10 @@ impl<const N: usize> EvictionManager for Manager<N> {
 
     fn increment_weight(
         &self,
-        item: &CompactCacheKey,
+        item: &CacheEntryKey,
         delta: usize,
         max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(item);
         self.0
             .increment_weight(key, || item.clone(), delta, max_weight);
@@ -230,12 +231,12 @@ impl<const N: usize> EvictionManager for Manager<N> {
             .collect()
     }
 
-    fn remove(&self, item: &CompactCacheKey) {
+    fn remove(&self, item: &CacheEntryKey) {
         let key = u64key(item);
         self.0.remove(key);
     }
 
-    fn access(&self, item: &CompactCacheKey, size: usize, _fresh_until: SystemTime) -> bool {
+    fn access(&self, item: &CacheEntryKey, size: usize, _fresh_until: SystemTime) -> bool {
         let key = u64key(item);
         if !self.0.promote(key) {
             self.0.admit(key, item.clone(), size);
@@ -245,7 +246,7 @@ impl<const N: usize> EvictionManager for Manager<N> {
         }
     }
 
-    fn peek(&self, item: &CompactCacheKey) -> bool {
+    fn peek(&self, item: &CacheEntryKey) -> bool {
         let key = u64key(item);
         self.0.peek(key)
     }
@@ -263,6 +264,55 @@ impl<const N: usize> EvictionManager for Manager<N> {
         })
         .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> Manager<N> {
+    fn admit(
+        &self,
+        item: CompactCacheKey,
+        size: usize,
+        fresh_until: SystemTime,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::admit(self, CacheEntryKey::key_only(item), size, fresh_until)
+            .into_iter()
+            .map(CacheEntryKey::into_key)
+            .collect()
+    }
+
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::increment_weight(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            delta,
+            max_weight,
+        )
+        .into_iter()
+        .map(CacheEntryKey::into_key)
+        .collect()
+    }
+
+    fn remove(&self, item: &CompactCacheKey) {
+        EvictionManager::remove(self, &CacheEntryKey::key_only(item.clone()));
+    }
+
+    fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {
+        EvictionManager::access(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            size,
+            fresh_until,
+        )
+    }
+
+    fn peek(&self, item: &CompactCacheKey) -> bool {
+        EvictionManager::peek(self, &CacheEntryKey::key_only(item.clone()))
     }
 }
 
@@ -296,6 +346,22 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_identified_entries_are_distinct() {
+        let lru = Manager::<1>::with_capacity(1, 2);
+        let key = CacheKey::new("a", "1").to_compact();
+        let first = CacheEntryKey::identified(key.clone(), crate::CacheEntryId::new(1));
+        let second = CacheEntryKey::identified(key, crate::CacheEntryId::new(2));
+        let until = SystemTime::now();
+
+        assert!(EvictionManager::admit(&lru, first.clone(), 1, until).is_empty());
+        assert_eq!(
+            EvictionManager::admit(&lru, second.clone(), 1, until),
+            vec![first]
+        );
+        assert_eq!(lru.peek_lru(0), Some(second));
     }
 
     #[test]
@@ -754,7 +820,10 @@ mod test {
         let key1 = CacheKey::new("a", "1").to_compact();
         lru.admit(key1.clone(), 1, until);
         // single item: it's both the head and the tail
-        assert_eq!(lru.peek_lru(0).unwrap(), key1);
+        assert_eq!(
+            lru.peek_lru(0).unwrap(),
+            CacheEntryKey::key_only(key1.clone())
+        );
 
         // admit more keys to push key1 to the tail
         let key2 = CacheKey::new("b", "1").to_compact();
@@ -763,14 +832,23 @@ mod test {
             lru.admit(CacheKey::new(format!("f{i}"), "1").to_compact(), 1, until);
         }
         // key1 is the LRU tail (admitted first)
-        assert_eq!(lru.peek_lru(0).unwrap(), key1);
+        assert_eq!(
+            lru.peek_lru(0).unwrap(),
+            CacheEntryKey::key_only(key1.clone())
+        );
 
         // promote key1 — now key2 becomes the tail
         lru.access(&key1, 1, until);
-        assert_eq!(lru.peek_lru(0).unwrap(), key2);
+        assert_eq!(
+            lru.peek_lru(0).unwrap(),
+            CacheEntryKey::key_only(key2.clone())
+        );
 
         // peek_lru should not remove the item
-        assert_eq!(lru.peek_lru(0).unwrap(), key2);
+        assert_eq!(
+            lru.peek_lru(0).unwrap(),
+            CacheEntryKey::key_only(key2.clone())
+        );
         assert!(lru.peek(&key2));
 
         // out-of-bounds shard returns None
