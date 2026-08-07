@@ -1,0 +1,46 @@
+pingora-proxy/tests/test_upstream.rs
+  s_fc60a5920e45b6::t_ef68f86842dcd3 1587-1629,4276-4310
+pingora-proxy/src/proxy_trait.rs
+  s_fc60a5920e45b6::t_48cc4bba0a4774 17,195-209
+pingora-cache/src/admission.rs
+  s_fc60a5920e45b6::t_65ab1aa2b7f4d3 56,58,60-62
+pingora-cache/src/lib.rs
+  s_fc60a5920e45b6::t_e4e640d86306ba 312-313,496,557,614-616,864-867,871-920,925-928,1517-1519,1531,1533,1563-1568,1579,1903,1912-1913,1917,1920-1921,1939-1945,2084-2091,2101-2106,2115,2117-2129,2132-2135,2138-2149,2151-2155,2253-2256,2264-2267,2285-2289,2311,2336-2372
+  s_fc60a5920e45b6::t_5da33eb51bf104 2180-2181
+  s_fc60a5920e45b6::t_0f80f5bb7c117a 2192
+  s_fc60a5920e45b6::t_e11ed7f05ae9e3 930,935-941,943-944,947-950
+  s_fc60a5920e45b6::t_31f858957aa6f8 2182-2184
+  s_fc60a5920e45b6::t_fc85d87715f2aa 2136-2137,2150
+  s_fc60a5920e45b6::t_2d95e7ebe18eea 1037-1040,1051-1054
+  s_fc60a5920e45b6::t_fdcb468baf6d61 497-499
+  s_fc60a5920e45b6::t_58c804b7d9f651 2185,2195,2198-2243
+  s_fc60a5920e45b6::t_ae387026127e43 921-924,929,931-934,942,945-946,951
+  s_fc60a5920e45b6::t_f58fa71ad9ce92 2193-2194
+  s_fc60a5920e45b6::t_0cdfbc5a9282f3 868-870
+  s_fc60a5920e45b6::t_75bad2094fdbd0 2186-2191
+  s_fc60a5920e45b6::t_baabc5a00b61d2 2196-2197
+  s_fc60a5920e45b6::t_6a38e08be6b1d7 1570-1573
+  s_fc60a5920e45b6::t_d9f1c571ca08f5 952-953
+  s_fc60a5920e45b6::t_b2b08b4b7889ed 2116,2130-2131,2156-2179
+pingora-proxy/tests/utils/server_utils.rs
+  s_fc60a5920e45b6::t_e4f52d7e19e1b0 52,495-496,502-510,518-544,750-771
+  s_fc60a5920e45b6::t_e656d77602f6ae 749
+pingora-proxy/src/proxy_cache.rs
+  s_fc60a5920e45b6::t_a07122ffa57685 58-60,681-687
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ee0d9c70833f7987b06217caac1bb26355587913",
+  "prompts": {},
+  "sessions": {
+    "s_fc60a5920e45b6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_028eb5285ffexABRJ7nRsHuIzK",
+        "model": "grok-4.5"
+      },
+      "human_author": "Chenxi Zhang <chenxi@cloudflare.com>"
+    }
+  }
+}
