@@ -1,6 +1,6 @@
 [package]
 name = "pingora-proxy"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -23,11 +23,11 @@ name = "shutdown_signal"
 harness = false
 
 [dependencies]
-pingora-error = { version = "0.8.0", path = "../pingora-error" }
-pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
-pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features = false }
+pingora-error = { version = "0.9.0", path = "../pingora-error" }
+pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
+pingora-cache = { version = "0.9.0", path = "../pingora-cache", default-features = false }
 tokio = { workspace = true, features = ["macros", "net"] }
-pingora-http = { version = "0.8.0", path = "../pingora-http" }
+pingora-http = { version = "0.9.0", path = "../pingora-http" }
 http = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
@@ -52,9 +52,9 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.26"
-pingora-limits = { version = "0.8.0", path = "../pingora-limits" }
-pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing", default-features=false }
-pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
+pingora-limits = { version = "0.9.0", path = "../pingora-limits" }
+pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", default-features=false }
+pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
 prometheus = "0"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
