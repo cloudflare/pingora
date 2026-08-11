@@ -1,0 +1,37 @@
+pingora-proxy/tests/utils/server_utils.rs
+  s_b42d96656e0f70::t_1e0f7dcd61cb70 497-498,722-729
+pingora-cache/src/lib.rs
+  s_b42d96656e0f70::t_700314af0419d4 412
+  s_b42d96656e0f70::t_1e0f7dcd61cb70 413,2121
+  s_b42d96656e0f70::t_46c56f34f0ac17 338-339,1627
+pingora-proxy/tests/test_upstream.rs
+  s_b42d96656e0f70::t_700314af0419d4 1608,1652-1655,1663-1668
+  s_b42d96656e0f70::t_46c56f34f0ac17 1597,1610-1614,1616,1647-1649,1660
+  s_b42d96656e0f70::t_1e0f7dcd61cb70 1588-1596,1598-1607,1609,1615,1617-1623,1625,1632,1634-1646,1650-1651,1656-1659,1661-1662,1669-1674
+  s_b42d96656e0f70::t_d891262d97be88 1624,1626-1631,1633
+  s_b42d96656e0f70::t_6b4ccc8eefd33c 1587
+pingora-cache/src/lock.rs
+  s_b42d96656e0f70::t_1e0f7dcd61cb70 191-192,205,561-567
+  s_b42d96656e0f70::t_a34d16dc3b7e13 568-569
+pingora-proxy/src/proxy_cache.rs
+  s_b42d96656e0f70::t_46c56f34f0ac17 29-30,89,179,222,1016,1038-1039,1044,2812-2815,2817-2842
+  s_b42d96656e0f70::t_1e0f7dcd61cb70 177,220,972-973,1014
+  s_b42d96656e0f70::t_903bfac56245e6 1021-1037,2816
+  s_b42d96656e0f70::t_1c31131d70b398 2843-2844
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6f63cf03e3633333e53974d2037b672bb3e5c637",
+  "prompts": {},
+  "sessions": {
+    "s_b42d96656e0f70": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_023a270eeffemwiAvzEk35S9rS",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Chenxi Zhang <chenxi@cloudflare.com>"
+    }
+  }
+}

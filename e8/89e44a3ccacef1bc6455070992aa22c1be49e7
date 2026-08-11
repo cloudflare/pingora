@@ -1,0 +1,19 @@
+pingora-proxy/tests/utils/server_utils.rs
+  s_b42d96656e0f70::t_ea7135a3e80018 26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e889e44a3ccacef1bc6455070992aa22c1be49e7",
+  "prompts": {},
+  "sessions": {
+    "s_b42d96656e0f70": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_023a270eeffemwiAvzEk35S9rS",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Chenxi Zhang <chenxi@cloudflare.com>"
+    }
+  }
+}

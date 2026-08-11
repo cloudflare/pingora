@@ -1,0 +1,32 @@
+pingora-core/src/protocols/http/v2/server.rs
+  s_c8b0e2708415ad::t_32383100f763ff 389-390,1029,1132
+  s_d3901b84afead9::t_09ff40ea0494e6 369-371
+  s_d3901b84afead9::t_6a7e9bc27b0589 382-387
+  s_d3901b84afead9::t_121323ba369721 865-867,869,1030-1065,1067-1131
+  s_d3901b84afead9::t_f1b86735243c47 1066
+  s_d3901b84afead9::t_bea6a2a757a446 24,242-244,248-260,275-276,361-368,372-381,388,890-1028
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b4f287f2e07568f3670d74e245889925345d37aa",
+  "prompts": {},
+  "sessions": {
+    "s_c8b0e2708415ad": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fddcf-f4c5-7fe3-b77b-01efb9e94c88",
+        "model": "gpt-5.6-terra"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    },
+    "s_d3901b84afead9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa5fe-afb0-71e3-9f4e-65bbfdf5015f",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": null
+    }
+  }
+}

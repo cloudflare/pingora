@@ -1,0 +1,29 @@
+pingora-proxy/tests/test_basic.rs
+  s_55b490ce279936::t_d0b5a012197602 1446-1535
+  s_55b490ce279936::t_6a89cb784d9a81 1250
+  s_55b490ce279936::t_7db93ce8c16a85 1375,1384-1394,1396,1398-1436,1438-1440
+  s_55b490ce279936::t_6a130c32c3a83a 1381
+  s_55b490ce279936::t_346927be58a4bb 1351-1358
+  s_55b490ce279936::t_b509818a38d42f 1145-1169,1180-1187
+  s_55b490ce279936::t_4fe87e7d987f35 1170-1179
+  s_55b490ce279936::t_5d0689b5a1c9d3 30-31,1272
+pingora-proxy/tests/utils/server_utils.rs
+  s_55b490ce279936::t_fcf136bfb61ca8 981-994
+  s_55b490ce279936::t_19faa4cf68769f 571-581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e952007272d7d41f09908815ecf97ec88017bec",
+  "prompts": {},
+  "sessions": {
+    "s_55b490ce279936": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0276c81aeffeaTyrNDiBErmvJf",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}

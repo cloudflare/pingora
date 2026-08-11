@@ -1,0 +1,26 @@
+pingora-cache/src/lib.rs
+  s_fc60a5920e45b6::t_0f80f5bb7c117a 2192
+  s_fc60a5920e45b6::t_2d95e7ebe18eea 1037-1040,1051-1054
+  s_fc60a5920e45b6::t_58c804b7d9f651 2185,2195,2198-2243
+  s_fc60a5920e45b6::t_ae387026127e43 921-924,929,931-934,942,945-946,951
+  s_fc60a5920e45b6::t_31f858957aa6f8 2182-2184
+  s_fc60a5920e45b6::t_75bad2094fdbd0 2186-2191
+  s_fc60a5920e45b6::t_f58fa71ad9ce92 2193-2194
+  s_fc60a5920e45b6::t_baabc5a00b61d2 2196-2197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0923d5dae323b4ce2bb38356cb3751ea6d6e2d61",
+  "prompts": {},
+  "sessions": {
+    "s_fc60a5920e45b6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_028eb5285ffexABRJ7nRsHuIzK",
+        "model": "grok-4.5"
+      },
+      "human_author": "Chenxi Zhang <chenxi@cloudflare.com>"
+    }
+  }
+}

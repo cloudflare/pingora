@@ -1,0 +1,19 @@
+pingora-cache/Cargo.toml
+  s_04c1430b4b2924::t_8efa3fc9552d51 50
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "23595ad65d66688e45b4306a86a2ed25274d7fdb",
+  "prompts": {},
+  "sessions": {
+    "s_04c1430b4b2924": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_022c5bed4ffewHdVlXLSPwtLOD",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
