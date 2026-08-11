@@ -365,6 +365,18 @@ impl ProxyHttp for ExampleProxyHttp {
         req: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let host = session.get_header_bytes("host-override");
+        if !host.is_empty() {
+            req.insert_header("host", host)?;
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-delete-host")
+        {
+            req.remove_header(&http::header::HOST);
+        }
+
         // Test-only hook: deliberately declare a larger outbound body than the valid
         // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
         // a client that directly ended a shorter-than-declared body; this hook lets tests
