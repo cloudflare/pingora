@@ -1,0 +1,22 @@
+pingora-proxy/tests/test_cache_fill_downstream_stall.rs
+  s_0b885f93fe6087::t_7e42ae7f2a35a4 15-327
+  s_0b885f93fe6087::t_164b64fd078129 1-14,328-331
+pingora-proxy/tests/utils/server_utils.rs
+  s_0b885f93fe6087::t_fc7ed354617791 620-627
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2920fce2d070c438bd16e73d4e7accd8b6dd4a25",
+  "prompts": {},
+  "sessions": {
+    "s_0b885f93fe6087": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_016bba1dfffe8zj5i5P5LQU4rT",
+        "model": "claude-opus-5"
+      },
+      "human_author": "zaidoon <zaidoon@cloudflare.com>"
+    }
+  }
+}
