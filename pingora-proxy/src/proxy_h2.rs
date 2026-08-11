@@ -20,53 +20,96 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
+use pingora_core::protocols::http::authority::{
+    raw_target_authority, validate_request_authority, RawTargetAuthority,
+};
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
-// add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(
-    header: &mut http::request::Parts,
-    raw_host: &[u8],
-    tls: bool,
-) -> Result<()> {
-    let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
-        if s.starts_with('[') {
-            // don't mess with ipv6 host
-            s
-        } else if let Some(colon) = s.find(':') {
-            if s.len() == colon + 1 {
-                // colon is the last char, ignore
-                s
-            } else if let Some(another_colon) = s[colon + 1..].find(':') {
-                // try to get rid of extra port numbers
-                &s[..colon + 1 + another_colon]
-            } else {
-                s
-            }
-        } else {
-            s
-        }
-    } else {
+/// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
+///
+/// Reclassifies after filters and rejects non-UTF-8 or ambiguous targets.
+///
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+fn h2_path_and_query(header: &RequestHeader) -> Result<http::uri::PathAndQuery> {
+    let target = header.raw_path();
+    if !header.raw_path_is_utf8() {
         return Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {:?}", raw_host),
+            "non-UTF-8 request target cannot be forwarded over HTTP/2",
         );
+    }
+    let Some(uri_path_and_query) = header.uri.path_and_query() else {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
     };
+    // Preserve origin-form and the server-wide `OPTIONS *` asterisk-form (RFC 9112 section 3.2.4).
+    // https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.4
+    if target.starts_with(b"/") || target == b"*" {
+        return Ok(uri_path_and_query.clone());
+    }
+
+    // Origin-form and asterisk-form returned above; classify the remainder to extract an H1
+    // absolute-form path/query or reject ambiguous authority syntax.
+    let absolute_path_and_query = match raw_target_authority(target) {
+        RawTargetAuthority::None => return Ok(uri_path_and_query.clone()),
+        RawTargetAuthority::AmbiguousAuthority => {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "ambiguous HTTP absolute-form request target",
+            )
+        }
+        RawTargetAuthority::Absolute { path_and_query, .. } => path_and_query,
+    };
+    if absolute_path_and_query.is_empty() {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
+    }
+    if absolute_path_and_query.first() == Some(&b'?') {
+        let mut origin_form = Vec::with_capacity(absolute_path_and_query.len() + 1);
+        origin_form.push(b'/');
+        origin_form.extend_from_slice(absolute_path_and_query);
+        return http::uri::PathAndQuery::try_from(origin_form).or_err(
+            InvalidHTTPHeader,
+            "invalid query in absolute-form request target",
+        );
+    }
+    http::uri::PathAndQuery::try_from(absolute_path_and_query).or_err(
+        InvalidHTTPHeader,
+        "invalid path in absolute-form request target",
+    )
+}
+
+fn update_h2_scheme_authority(
+    header: &mut RequestHeader,
+    raw_host: &[u8],
+    tls: bool,
+    path_and_query: http::uri::PathAndQuery,
+) -> Result<()> {
+    let authority = http::uri::Authority::try_from(raw_host).map_err(|cause| {
+        Error::because(
+            InvalidHTTPHeader,
+            format!("invalid authority from Host {raw_host:?}"),
+            cause,
+        )
+    })?;
+    // Last guard before this authority is serialized on the wire.
+    if authority.as_str().contains('@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
+    }
 
     let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
         .scheme(scheme)
         .authority(authority)
-        .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
+        .path_and_query(path_and_query)
         .build();
     match uri {
         Ok(uri) => {
-            header.uri = uri;
+            header.set_uri(uri);
             Ok(())
         }
         Err(_) => Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {}", authority),
+            format!("failed to build H2 URI from Host {raw_host:?}"),
         ),
     }
 }
@@ -88,8 +131,21 @@ where
         SV::CTX: Send + Sync,
     {
         let mut req = session.req_header().clone();
+        let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
 
-        if req.version != Version::HTTP_2 || session.downstream_session.is_custom() {
+        // A patched HTTP/1 parser can preserve non-UTF-8 request-target bytes, but `http::Uri`,
+        // which the H2 client API requires, cannot represent them. Reject client input as a
+        // downstream error before a filter has a chance to mutate the target. This wire-format
+        // constraint applies to both standard and custom downstream authority policies.
+        if !req.raw_path_is_utf8() {
+            let e = Error::explain(
+                InvalidHTTPHeader,
+                "non-UTF-8 request target cannot be forwarded over HTTP/2",
+            );
+            return (false, Some(e.into_down()));
+        }
+
+        if req.version != Version::HTTP_2 || authority_policy.is_custom() {
             if let Err(e) =
                 sanitize_h2_upstream_request(&mut req, peer.options.http_upstream_request_policy)
             {
@@ -126,6 +182,43 @@ where
             }
         }
 
+        if authority_policy.is_standard() {
+            if let Err(e) = reconcile_upstream_authority(&mut req) {
+                return (false, Some(e.into_in()));
+            }
+            if let Err(e) = validate_request_authority(&req) {
+                // The final filter-produced request is invalid, so classify this as internal.
+                return (false, Some(e.into_in()));
+            }
+        }
+
+        // A Host-less H1 absolute-form request still needs H2 :authority. Copy its raw target
+        // authority into local storage without inserting a temporary Host header.
+        let raw_authority =
+            if req.headers.get(http::header::HOST).is_none() && authority_policy.is_standard() {
+                raw_target_authority(req.raw_path())
+                    .authority()
+                    .map(<[u8]>::to_owned)
+            } else {
+                None
+            };
+        if req.headers.get(http::header::HOST).is_none()
+            && req.uri.authority().is_none()
+            && raw_authority.is_none()
+        {
+            // The final filter-produced request has no authority source.
+            let e = Error::explain(InvalidHTTPHeader, "no authority for H2 upstream request");
+            return (false, Some(e.into_in()));
+        }
+
+        // Run for every request, including Host-less HTTP/1.0, before conversion to
+        // `http::request::Parts` discards RequestHeader's raw byte fallback. A failure here after
+        // the initial check was produced by a filter and is therefore internal.
+        let path_and_query = match h2_path_and_query(&req) {
+            Ok(path_and_query) => path_and_query,
+            Err(e) => return (false, Some(e.into_in())),
+        };
+
         // Remove H1 `Host` header, save it in order to add to :authority
         // We do this because certain H2 servers expect request not to have a host header.
         // The `Host` is removed after the upstream filters above for 2 reasons
@@ -139,14 +232,20 @@ where
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
 
-        let mut req: http::request::Parts = req.into();
-
-        // H2 requires authority to be set, so copy that from H1 host if that is set
-        if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
+        // Host is consumed locally to build :authority and is never sent on the H2 wire.
+        let authority = host
+            .as_ref()
+            .map(|host| host.as_bytes())
+            .or(raw_authority.as_deref());
+        if let Some(authority) = authority {
+            if let Err(e) =
+                update_h2_scheme_authority(&mut req, authority, peer.is_tls(), path_and_query)
+            {
                 return (false, Some(e));
             }
         }
+
+        let req: http::request::Parts = req.into();
 
         debug!("Request to h2: {req:?}");
 
@@ -1183,26 +1282,85 @@ pub(crate) async fn pipe_up_to_down_response(
 }
 
 #[test]
-fn test_update_authority() {
-    let mut parts = http::request::Builder::new()
+fn test_update_h2_scheme_authority() {
+    fn update(header: &mut RequestHeader, raw_host: &[u8], tls: bool) -> Result<()> {
+        let path_and_query = h2_path_and_query(header)?;
+        update_h2_scheme_authority(header, raw_host, tls, path_and_query)
+    }
+
+    let parts = http::request::Builder::new()
         .body(())
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
-    assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
-    assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
-    assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
-    assert_eq!("[::1]", parts.uri.authority().unwrap());
+    let mut header = RequestHeader::from(parts);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("example.com", header.uri.authority().unwrap());
+    let err = update(&mut header, b"user@example.com", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"example.com:456", true).unwrap();
+    assert_eq!("example.com:456", header.uri.authority().unwrap());
+    update(&mut header, b"example.com:", true).unwrap();
+    assert_eq!("example.com:", header.uri.authority().unwrap());
+    let err = update(&mut header, b"example.com:123:345", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"[::1]", true).unwrap();
+    assert_eq!("[::1]", header.uri.authority().unwrap());
 
     // verify scheme
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("https://example.com", parts.uri);
-    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
-    assert_eq!("http://example.com", parts.uri);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", header.uri);
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", header.uri);
+
+    // H1 absolute-form is decomposed into H2 pseudo-header components.
+    let mut header = RequestHeader::build("GET", b"http://example.com/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build(
+        "GET",
+        b"http://example.com/caf%C3%A9?q=r%C3%A9sum%C3%A9",
+        None,
+    )
+    .unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/caf%C3%A9?q=r%C3%A9sum%C3%A9"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com?only=query", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/?only=query"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/");
+
+    // Origin-form remains unchanged.
+    let mut header = RequestHeader::build("GET", b"/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build("GET", b"http:/\\/\\other.example/admin", None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("ambiguous HTTP absolute-form request target")
+    );
+
+    let raw_target = b"http://example.com/\xff";
+    let mut header = RequestHeader::build("GET", raw_target, None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("non-UTF-8 request target cannot be forwarded over HTTP/2")
+    );
+    assert_eq!(header.raw_path(), raw_target);
 }

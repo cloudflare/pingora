@@ -31,6 +31,10 @@ use std::task::ready;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+use crate::protocols::http::authority::{
+    has_ambiguous_port_suffix, raw_target_authority, validate_request_authority_fields,
+    RawTargetAuthority,
+};
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
@@ -52,13 +56,8 @@ pub use h2::server::Builder as H2Options;
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
 
-// Per-connection lifetime budget for selected malformed downstream requests
-// rejected during acceptance (currently ambiguous Content-Length framing and
-// conflicting authority/Host fields). The count is NOT reset by valid streams,
-// so a client cannot evade the bound by interleaving valid requests. A
-// well-behaved client never sends these requests, so this is never tripped in
-// practice; it bounds the total rejection work a misbehaving or malicious
-// client can drive over the life of a single connection.
+// Per-connection budget for requests rejected during acceptance. Valid streams do not reset it,
+// preventing unbounded rejection work, but interoperability errors can also consume the budget.
 // TODO: expose this through HTTP/2 server configuration if deployments need a
 // different tolerance for malformed stream rejections.
 const MAX_MALFORMED_STREAMS_PER_CONN: usize = 32;
@@ -308,20 +307,60 @@ pub enum H2Accept {
     /// The next stream was rejected during acceptance (for example, its request
     /// target contained a forbidden byte) and has already been answered or
     /// reset. Sibling streams and the connection are unaffected; the caller
-    /// should continue accepting.
+    /// should continue accepting. Repeated rejections can exhaust the
+    /// per-connection budget, causing acceptance to return a connection error
+    /// instead to bound rejection work.
     Rejected,
 }
 
-fn authority_host_mismatch(request: &RequestHeader) -> bool {
-    let Some(authority) = request.uri.authority() else {
-        return false;
-    };
+/// Reject ambiguous H2 authority representations:
+///
+/// - duplicate `Host` ([RFC 9112 section 3.2]);
+/// - userinfo or conflicting authority fields ([RFC 9113 section 8.3.1]);
+/// - missing `Host` and `:authority`;
+/// - absolute-form or ambiguous HTTP `:path`;
+///
+/// HTTP/1 uses
+/// [`validate_request_authority`](crate::protocols::http::authority::validate_request_authority).
+///
+/// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+fn invalid_request_authority(request: &RequestHeader) -> bool {
+    if let Err(error) = validate_request_authority_fields(request) {
+        debug!("rejecting downstream h2 request: {error}");
+        return true;
+    }
+    if request.uri.authority().is_none() && !request.headers.contains_key(header::HOST) {
+        debug!("rejecting downstream h2 request: missing authority");
+        return true;
+    }
 
-    let mut hosts = request.headers.get_all(header::HOST).iter();
-    match (hosts.next(), hosts.next()) {
-        (Some(host), None) => host.as_bytes() != authority.as_str().as_bytes(),
-        (Some(_), Some(_)) => true,
-        (None, _) => false,
+    // Normal CONNECT has no `:protocol` and carries its target only in `:authority`. Extended
+    // CONNECT sets `:protocol` and also has a `:path`, which must pass the raw-target checks below.
+    let is_normal_connect = request.method == http::Method::CONNECT
+        && request.extensions.get::<h2::ext::Protocol>().is_none();
+    if is_normal_connect {
+        if request
+            .uri
+            .authority()
+            .is_some_and(|authority| has_ambiguous_port_suffix(authority.as_str().as_bytes()))
+        {
+            debug!("rejecting downstream h2 request: ambiguous CONNECT authority");
+            return true;
+        } else {
+            return false;
+        }
+    }
+    match raw_target_authority(request.raw_path()) {
+        RawTargetAuthority::None => false,
+        RawTargetAuthority::Absolute { .. } => {
+            debug!("rejecting downstream h2 request: absolute-form in :path");
+            true
+        }
+        RawTargetAuthority::AmbiguousAuthority => {
+            debug!("rejecting downstream h2 request: ambiguous HTTP absolute-form in :path");
+            true
+        }
     }
 }
 
@@ -411,6 +450,7 @@ impl HttpSession {
         if request_target_has_forbidden_byte(request_header.raw_path()) {
             debug!("Rejecting H2 request: forbidden delimiter byte in request target");
             send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
+            account_malformed_stream(malformed_streams)?;
             return Ok(Some(H2Accept::Rejected));
         }
 
@@ -431,31 +471,15 @@ impl HttpSession {
             return Ok(Some(H2Accept::Rejected));
         }
 
-        if authority_host_mismatch(&request_header) {
-            // RFC 9113 section 8.3.1 says a server SHOULD treat a request as
-            // malformed when Host does not match :authority after
-            // normalization. Until shared authority normalization exists,
-            // conservatively require identical field values:
-            // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
-            //
-            // RFC 9112 section 3.2 requires HTTP/1.1 servers to reject more
-            // than one Host field. When :authority is present, reject
-            // duplicates that cannot be compared unambiguously before a
-            // possible H1 downgrade:
-            // https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
-            debug!("rejecting downstream h2 request: conflicting :authority and Host fields");
+        // RFC 9113 section 8.1.1 forbids forwarding a malformed request:
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.1.1
+        if invalid_request_authority(&request_header) {
             let mut response = Response::new(());
             *response.status_mut() = StatusCode::BAD_REQUEST;
-            // RFC 9113 section 8.1.1 requires malformed requests to use a
-            // PROTOCOL_ERROR stream error and permits sending an HTTP response
-            // first. h2 replaces the queued response when reset immediately,
-            // so prioritize an observable 400. An unfinished request body can
-            // still cause h2 to reset the stream when its handles are dropped:
-            // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.1.1
+            // An immediate PROTOCOL_ERROR reset would replace this observable 400 in h2. Dropping
+            // an unfinished request body can still reset the stream.
             if let Err(e) = send_response.send_response(response, true) {
-                // The client can reset this stream before the rejection is
-                // written. Keep that stream-local failure from closing the
-                // connection and dropping sibling streams.
+                // A client reset before the write is stream-local; siblings survive.
                 debug!("failed to send downstream h2 authority rejection: {e}");
             }
             account_malformed_stream(malformed_streams)?;
@@ -962,12 +986,9 @@ mod test {
     }
 
     #[test]
-    fn test_authority_host_mismatch() {
-        let request = |hosts: &[&str]| {
-            let mut request = Request::builder()
-                .uri("https://authority.example/test")
-                .body(())
-                .unwrap();
+    fn test_invalid_request_authority() {
+        let request = |uri: &str, hosts: &[&str]| {
+            let mut request = Request::builder().uri(uri).body(()).unwrap();
             for host in hosts {
                 request
                     .headers_mut()
@@ -975,33 +996,176 @@ mod test {
             }
             RequestHeader::from(request.into_parts().0)
         };
+        let authority_request = |hosts: &[&str]| request("https://authority.example/test", hosts);
 
-        assert!(!authority_host_mismatch(&request(&[])));
-        assert!(!authority_host_mismatch(&request(&["authority.example"])));
-        assert!(authority_host_mismatch(&request(&["other.example"])));
-        assert!(authority_host_mismatch(&request(&["AUTHORITY.EXAMPLE"])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(!invalid_request_authority(&authority_request(&[])));
+        assert!(!invalid_request_authority(&authority_request(&[
+            "authority.example"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "other.example"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "AUTHORITY.EXAMPLE"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
             "authority.example:443"
         ])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(invalid_request_authority(&authority_request(&[
             "authority.example",
             "authority.example",
         ])));
-        assert!(authority_host_mismatch(&request(&[
+        assert!(invalid_request_authority(&authority_request(&[
             "authority.example",
             "other.example",
         ])));
 
-        let request = RequestHeader::from(
+        // Names the same host, but is not the same field value, and we do not normalize.
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example."
+        ])));
+
+        // An :authority with a port is compared the same way, in both directions.
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["other.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["authority.example"]
+        )));
+        assert!(!invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["authority.example:443"]
+        )));
+
+        // Userinfo is rejected regardless of Host, including a byte-identical one.
+        for uri in [
+            "https://user@authority.example/test",
+            "https://other.example@authority.example/test",
+            "https://user:pass@authority.example:8443/test",
+            "https://@authority.example/test",
+        ] {
+            let authority = uri
+                .parse::<http::Uri>()
+                .unwrap()
+                .authority()
+                .unwrap()
+                .to_string();
+            assert!(
+                invalid_request_authority(&request(uri, &[])),
+                "{uri} should be rejected without a Host field"
+            );
+            assert!(
+                invalid_request_authority(&request(uri, &[&authority])),
+                "{uri} should be rejected with a matching Host field"
+            );
+        }
+
+        // Without :authority, Host is the only authority.
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["user@evil.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["other.example@authority.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["@evil.example"]
+        )));
+        assert!(!invalid_request_authority(&request(
+            "/test",
+            &["authority.example"]
+        )));
+        assert!(invalid_request_authority(&request("/test", &[])));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["a.example", "b.example"]
+        )));
+
+        let raw_path_request = |target: &str, host: &str| {
+            let mut request = RequestHeader::build_no_case("GET", target.as_bytes(), None).unwrap();
+            request.set_version(http::Version::HTTP_2);
+            request.append_header(header::HOST, host).unwrap();
+            request
+        };
+        assert!(invalid_request_authority(&raw_path_request(
+            "http://other.example/admin",
+            "authority.example"
+        )));
+        assert!(invalid_request_authority(&raw_path_request(
+            "http://authority.example/admin",
+            "authority.example"
+        )));
+        assert!(invalid_request_authority(&raw_path_request(
+            "http:/\\/\\other.example/admin",
+            "authority.example"
+        )));
+        assert!(!invalid_request_authority(&raw_path_request(
+            "/redirect?next=http://other.example/admin",
+            "authority.example"
+        )));
+
+        let connect = RequestHeader::from(
             Request::builder()
-                .uri("/test")
-                .header(header::HOST, "host.example")
+                .method(http::Method::CONNECT)
+                .uri("http:443")
                 .body(())
                 .unwrap()
                 .into_parts()
                 .0,
         );
-        assert!(!authority_host_mismatch(&request));
+        assert!(!invalid_request_authority(&connect));
+
+        let mut extended_connect =
+            raw_path_request("http://other.example/tunnel", "authority.example");
+        extended_connect.set_method(http::Method::CONNECT);
+        extended_connect
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from("websocket"));
+        assert!(invalid_request_authority(&extended_connect));
+
+        // Pin the divergence the rejection above exists to prevent.
+        let sneaky = "https://other.example@authority.example/test"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert_eq!(sneaky.host(), Some("authority.example"));
+        assert_eq!(
+            sneaky.authority().map(|a| a.as_str()),
+            Some("other.example@authority.example")
+        );
+
+        // The authority parser refuses `%40`, so a literal `@` is the only reachable form.
+        assert!("https://other.example%40authority.example/test"
+            .parse::<http::Uri>()
+            .is_err());
+
+        // Bracketed hosts, zone ID included, must not trip the `@` check.
+        for uri in [
+            "https://[::1]:8443/test",
+            "https://[fe80::1%25eth0]:8443/test",
+        ] {
+            assert!(
+                !invalid_request_authority(&request(uri, &[])),
+                "{uri} should be accepted"
+            );
+        }
+
+        // Nothing to reconcile, but duplicate Host is still rejected.
+        assert!(!invalid_request_authority(&request(
+            "/test",
+            &["host.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["host.example", "other.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["host.example", "host.example"]
+        )));
     }
 
     #[tokio::test]
@@ -1044,6 +1208,15 @@ mod test {
             assert!(body.data().await.is_none());
 
             let mut h2 = h2.ready().await.unwrap();
+            let missing = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(missing, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+            let mut h2 = h2.ready().await.unwrap();
             let matching = Request::builder()
                 .method(Method::GET)
                 .uri("https://authority.example/test")
@@ -1073,6 +1246,14 @@ mod test {
             "duplicate Host fields reached the application"
         );
 
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "missing authority reached the application"
+        );
+
         let Some(H2Accept::Session(mut session)) =
             HttpSession::from_h2_conn(&mut connection, digest.clone())
                 .await
@@ -1099,6 +1280,96 @@ mod test {
         .await
         .expect("connection did not finish after authority mismatch test")
         .expect("connection failed after authority mismatch test");
+        assert!(done.is_none());
+
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_authority_userinfo_with_400() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            // The H1 downgrade would synthesize Host from the full authority.
+            let mut h2 = h2.ready().await.unwrap();
+            let synthesized = Request::builder()
+                .method(Method::GET)
+                .uri("https://other.example@authority.example/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(synthesized, true).unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "userinfo authority was accepted without a Host field"
+            );
+
+            // A byte-identical Host does not make the userinfo acceptable.
+            let mut h2 = h2.ready().await.unwrap();
+            let matching_host = Request::builder()
+                .method(Method::GET)
+                .uri("https://other.example@authority.example/test")
+                .header(header::HOST, "other.example@authority.example")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(matching_host, true).unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "userinfo authority was accepted with a matching Host field"
+            );
+
+            // Rejections are stream-local: a clean sibling still reaches the application.
+            let mut h2 = h2.ready().await.unwrap();
+            let clean = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(clean, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        for case in ["without a Host field", "with a matching Host field"] {
+            let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(accepted, Some(H2Accept::Rejected)),
+                "userinfo authority {case} reached the application"
+            );
+        }
+
+        let Some(H2Accept::Session(mut session)) =
+            HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("clean request did not reach the application after rejections");
+        };
+        session
+            .write_response_header(
+                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
+                true,
+            )
+            .unwrap();
+        drop(session);
+
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn(&mut connection, digest),
+        )
+        .await
+        .expect("connection did not finish after authority userinfo test")
+        .expect("connection failed after authority userinfo test");
         assert!(done.is_none());
 
         client.await.unwrap();
@@ -1223,8 +1494,6 @@ mod test {
                 .unwrap();
             let (response, _) = h2.send_request(mismatched, true).unwrap();
 
-            // The connection can close before the queued 400 is flushed when
-            // this request exhausts the connection-level malformed budget.
             let _ = response.await;
         });
 
@@ -1400,6 +1669,51 @@ mod test {
 
         client.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[cfg(feature = "patched_http1")]
+    #[tokio::test]
+    async fn test_forbidden_target_exhausts_malformed_stream_budget() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/a\r\nX-Injected: 1")
+                .body(())
+                .unwrap();
+            assert!(request.uri().path().contains('\n'));
+            let (response, _) = h2.send_request(request, true).unwrap();
+            let _ = response.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+
+        let err = match HttpSession::from_h2_conn_with_malformed_budget(
+            &mut connection,
+            digest,
+            &mut malformed_streams,
+        )
+        .await
+        {
+            Ok(Some(_)) => panic!("forbidden target must not surface as a session"),
+            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.etype(), &ErrorType::H2Error);
+        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
+
+        drop(connection);
+        client.await.unwrap();
     }
 
     #[tokio::test]

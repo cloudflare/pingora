@@ -319,6 +319,11 @@ impl RequestHeader {
         }
     }
 
+    /// Whether [`Self::raw_path`] is valid UTF-8 without lossy replacement.
+    pub fn raw_path_is_utf8(&self) -> bool {
+        self.raw_path_fallback.is_empty()
+    }
+
     /// Return the file extension of the path
     pub fn uri_file_extension(&self) -> Option<&str> {
         // get everything after the last '.' in path
@@ -1036,6 +1041,7 @@ mod tests {
         let req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
         assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
         assert_eq!(raw_path, req.raw_path());
+        assert!(!req.raw_path_is_utf8());
     }
 
     #[cfg(feature = "patched_http1")]
@@ -1050,6 +1056,7 @@ mod tests {
         req.set_uri(Uri::builder().path_and_query(new_path).build().unwrap());
         assert_eq!(new_path, req.uri.path_and_query().unwrap());
         assert_eq!(new_path.as_bytes(), req.raw_path());
+        assert!(req.raw_path_is_utf8());
     }
 
     #[test]
@@ -1060,6 +1067,7 @@ mod tests {
 
         assert!(req.uri.path_and_query().is_none());
         assert_eq!(b"pingora.org:443", req.raw_path());
+        assert!(req.raw_path_is_utf8());
     }
 
     #[test]

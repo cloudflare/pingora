@@ -258,18 +258,24 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!(
-                    "Fail to proxy: {e}, downstream session type: {}",
-                    downstream_session.session_type()
-                );
                 if matches!(e.etype, InvalidHTTPHeader) {
+                    debug!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
                     downstream_session
                         .respond_error(400)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
                         });
-                } // otherwise the connection must be broken, no need to send anything
+                } else {
+                    // otherwise the connection must be broken, no need to send anything
+                    error!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
+                }
                 downstream_session.shutdown().await;
                 return None;
             }

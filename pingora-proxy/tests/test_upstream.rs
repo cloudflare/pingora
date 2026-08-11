@@ -377,12 +377,531 @@ async fn capture_upstream_request(
             }
             request.extend_from_slice(&buf[..n]);
         }
-        tx.send(request).unwrap();
+        // A panic here would be swallowed: this task is detached.
+        let _ = tx.send(request);
         stream.write_all(response).await.unwrap();
         stream.flush().await.unwrap();
     });
 
     (port, rx)
+}
+
+// Send h2c with independently controlled `:authority` and `Host`.
+// A direct h2 client is required because higher-level clients make them agree.
+async fn send_h2c_authority_request(
+    upstream_port: u16,
+    authority: Option<&str>,
+    host: Option<&str>,
+) -> StatusCode {
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let target = match authority {
+        Some(authority) => format!("http://{authority}/test"),
+        None => "/test".to_string(),
+    };
+    let mut request = http::Request::builder()
+        .method("GET")
+        .uri(target)
+        .header("x-port", upstream_port.to_string());
+    if let Some(host) = host {
+        request = request.header(http::header::HOST, host);
+    }
+
+    let mut h2 = h2.ready().await.unwrap();
+    let (response, _) = h2.send_request(request.body(()).unwrap(), true).unwrap();
+    // Rejections are sent with END_STREAM, so no reset races the response.
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the h2 response")
+        .expect("h2 stream failed instead of returning a response")
+        .status()
+}
+
+// Send H2 downstream with a filter-only `Host` override.
+async fn send_h2c_host_override_request(
+    upstream_port: u16,
+    upstream_h2: bool,
+    host_override: &str,
+) -> StatusCode {
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let mut request = http::Request::builder()
+        .method("GET")
+        .uri("http://client.example/test")
+        .header("x-port", upstream_port.to_string())
+        .header("host-override", host_override);
+    if upstream_h2 {
+        request = request.header("x-h2", "true");
+    }
+
+    let mut h2 = h2.ready().await.unwrap();
+    let (response, _) = h2.send_request(request.body(()).unwrap(), true).unwrap();
+    timeout(Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the host-override response")
+        .expect("h2 stream failed instead of returning a response")
+        .status()
+}
+
+fn capture_h1_upstream() -> impl std::future::Future<Output = (u16, oneshot::Receiver<Vec<u8>>)> {
+    capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+}
+
+// Ambiguous H2 authority must not reach upstream.
+#[tokio::test]
+async fn test_h2_ambiguous_authority_never_reaches_h1_upstream() {
+    init();
+
+    // With only `:authority` to go on, the downgrade synthesizes a matching `Host`.
+    let (port, received) = capture_h1_upstream().await;
+    let status = send_h2c_authority_request(port, Some("authority.example"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let upstream = timeout(Duration::from_secs(5), received)
+        .await
+        .expect("upstream was never contacted for the control request")
+        .unwrap();
+    let upstream = String::from_utf8(upstream).unwrap().to_ascii_lowercase();
+    assert!(
+        upstream.contains("\r\nhost: authority.example\r\n"),
+        "{upstream}"
+    );
+
+    for (case, authority, host) in [
+        (
+            "conflicting Host",
+            Some("authority.example"),
+            Some("other.example"),
+        ),
+        ("userinfo", Some("user@authority.example"), None),
+        (
+            "conflicting Host against an authority with a port",
+            Some("authority.example:443"),
+            Some("other.example"),
+        ),
+        // Host is the only authority here.
+        (
+            "userinfo in Host without :authority",
+            None,
+            Some("user@evil.example"),
+        ),
+    ] {
+        let (port, mut received) = capture_h1_upstream().await;
+        let status = send_h2c_authority_request(port, authority, host).await;
+
+        // Checked first so a regression reports what reached the upstream, not just the
+        // status. Borrowed so the receiver stays alive for the check below.
+        match timeout(Duration::from_millis(500), &mut received).await {
+            // No connection arrived, or the capture ended without one.
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(request)) => panic!(
+                "{case} reached the upstream: {:?}",
+                String::from_utf8_lossy(&request)
+            ),
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{case}");
+
+        // The wait can finish before a slow connection lands.
+        if let Ok(request) = received.try_recv() {
+            panic!(
+                "{case} reached the upstream after it was answered: {:?}",
+                String::from_utf8_lossy(&request)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_h2_downstream_host_override_selects_upstream_authority() {
+    init();
+
+    let (port, received) = capture_h1_upstream().await;
+    assert_eq!(
+        send_h2c_host_override_request(port, false, "origin.example").await,
+        StatusCode::OK
+    );
+    let request = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(request.contains("\r\nhost: origin.example\r\n"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        tx.send((
+            request.uri().authority().unwrap().to_string(),
+            request.uri().path_and_query().unwrap().to_string(),
+        ))
+        .unwrap();
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        respond.send_response(response, true).unwrap();
+        let _ = timeout(Duration::from_millis(100), connection.accept()).await;
+    });
+
+    assert_eq!(
+        send_h2c_host_override_request(port, true, "origin.example").await,
+        StatusCode::OK
+    );
+    let (authority, path_and_query) = rx.await.unwrap();
+    assert_eq!(authority, "origin.example");
+    assert_eq!(path_and_query, "/test");
+}
+
+#[tokio::test]
+async fn test_post_filter_userinfo_authority_never_reaches_upstream() {
+    init();
+
+    let (port, mut received) = capture_h1_upstream().await;
+    let status = send_h2c_host_override_request(port, false, "user@evil.example").await;
+
+    match timeout(Duration::from_millis(500), &mut received).await {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok(request)) if request.is_empty() => {}
+        Ok(Ok(request)) => panic!(
+            "post-filter userinfo reached the upstream: {:?}",
+            String::from_utf8_lossy(&request)
+        ),
+    }
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    if let Ok(request) = received.try_recv() {
+        assert!(
+            request.is_empty(),
+            "post-filter userinfo reached the upstream after the response: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+    }
+}
+
+// Send raw H1 that normal clients cannot express; `{port}` selects upstream.
+async fn send_h1_raw_request(upstream_port: u16, request: &str) -> String {
+    let request = request.replace("{port}", &upstream_port.to_string());
+    send_h1_raw_bytes(request.as_bytes()).await
+}
+
+async fn send_h1_raw_bytes(request: &[u8]) -> String {
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    stream.write_all(request).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // Read only the status line so a keepalive response does not block until timeout.
+    let mut response = Vec::new();
+    let mut buf = [0; 256];
+    while !response.windows(2).any(|w| w == b"\r\n") {
+        let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("timed out waiting for the h1 response")
+            .unwrap();
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(feature = "patched_http1")]
+#[tokio::test]
+async fn test_hostless_non_utf8_h1_target_is_rejected_before_h2_serialization() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let received = timeout(Duration::from_secs(1), connection.accept()).await;
+        let _ = tx.send(matches!(received, Ok(Some(Ok(_)))));
+    });
+
+    let mut request = b"GET /\xff HTTP/1.0\r\nx-port: ".to_vec();
+    request.extend_from_slice(port.to_string().as_bytes());
+    request.extend_from_slice(b"\r\nx-h2: true\r\n\r\n");
+    let status = send_h1_raw_bytes(&request).await;
+
+    assert!(status.contains("400 Bad Request"), "{status}");
+    assert!(!rx.await.unwrap(), "non-UTF-8 target reached H2 upstream");
+}
+
+#[tokio::test]
+async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
+    init();
+
+    let request = concat!(
+        "GET http://client.example/test HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "host-override: origin.example\r\n",
+        "x-port: {port}\r\n",
+        "\r\n",
+    );
+    let (port, received) = capture_h1_upstream().await;
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let received = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(received.starts_with("get http://origin.example/test http/1.1\r\n"));
+    assert!(received.contains("\r\nhost: origin.example\r\n"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        tx.send(request.uri().clone()).unwrap();
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        respond.send_response(response, true).unwrap();
+        let _ = timeout(Duration::from_millis(100), connection.accept()).await;
+    });
+
+    let request = concat!(
+        "GET http://client.example/test HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "host-override: origin.example\r\n",
+        "x-port: {port}\r\n",
+        "x-h2: true\r\n",
+        "\r\n",
+    );
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let uri = rx.await.unwrap();
+    assert_eq!(uri.authority().unwrap(), "origin.example");
+    assert_eq!(uri.path_and_query().unwrap(), "/test");
+}
+
+#[tokio::test]
+async fn test_h1_absolute_form_host_is_restored_after_filter_deletion() {
+    init();
+
+    let request = concat!(
+        "GET http://client.example/test HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "x-upstream-delete-host: true\r\n",
+        "x-port: {port}\r\n",
+        "\r\n",
+    );
+    let (port, received) = capture_h1_upstream().await;
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let received = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(received.starts_with("get http://client.example/test http/1.1\r\n"));
+    assert!(received.contains("\r\nhost: client.example\r\n"));
+}
+
+#[tokio::test]
+async fn test_origin_form_host_deletion_is_handled_before_upstream() {
+    init();
+
+    let request = concat!(
+        "GET /test HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "x-upstream-delete-host: true\r\n",
+        "x-port: {port}\r\n",
+        "\r\n",
+    );
+    let (port, received) = capture_h1_upstream().await;
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let received = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(received.starts_with("get /test http/1.1\r\n"));
+    assert!(received.contains("\r\nhost: \r\n"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let received = timeout(Duration::from_secs(1), connection.accept()).await;
+        let _ = tx.send(matches!(received, Ok(Some(Ok(_)))));
+    });
+
+    let request = concat!(
+        "GET /test HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "x-upstream-delete-host: true\r\n",
+        "x-port: {port}\r\n",
+        "x-h2: true\r\n",
+        "\r\n",
+    );
+    let status = send_h1_raw_request(port, request).await;
+    assert!(status.contains("500 Internal Server Error"), "{status}");
+    assert!(!rx.await.unwrap(), "Host-less request reached H2 upstream");
+}
+
+#[tokio::test]
+async fn test_hostless_h1_absolute_form_uses_target_authority() {
+    init();
+
+    let request = concat!(
+        "GET http://client.example/test HTTP/1.0\r\n",
+        "x-port: {port}\r\n",
+        "\r\n",
+    );
+    let (port, received) = capture_h1_upstream().await;
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let received = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(received.starts_with("get http://client.example/test http/1.1\r\n"));
+    assert!(received.contains("\r\nhost: client.example\r\n"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        let _ = tx.send(request.uri().clone());
+        respond
+            .send_response(http::Response::new(()), true)
+            .unwrap();
+        let _ = timeout(Duration::from_millis(100), connection.accept()).await;
+    });
+
+    let request = concat!(
+        "GET http://client.example/test HTTP/1.0\r\n",
+        "x-port: {port}\r\n",
+        "x-h2: true\r\n",
+        "\r\n",
+    );
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let uri = rx.await.unwrap();
+    assert_eq!(uri.authority().unwrap(), "client.example");
+    assert_eq!(uri.path_and_query().unwrap(), "/test");
+}
+
+#[tokio::test]
+async fn test_hostless_http10_request_remains_hostless_upstream() {
+    init();
+
+    let (port, received) = capture_h1_upstream().await;
+    let request = "GET /test HTTP/1.0\r\nx-port: {port}\r\n\r\n";
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+
+    let received = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(received.starts_with("get /test http/1.1\r\n"));
+    assert!(!received.contains("\r\nhost:"));
+}
+
+// Ambiguous H1 authority must not reach upstream.
+#[tokio::test]
+async fn test_h1_ambiguous_authority_never_reaches_upstream() {
+    init();
+
+    // A single valid Host is proxied, and "@" outside an authority is ordinary data.
+    for (case, request) in [
+        (
+            "single Host",
+            "GET /test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+        (
+            "\"@\" in the path",
+            "GET /users/foo@bar.example HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+        // Only a scheme at the start of the target makes it absolute form.
+        (
+            "an absolute URL inside the query",
+            "GET /redirect?next=http://user@evil.example/ HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+        (
+            "\"@\" in a fragment-like target",
+            "GET /test#user@evil.example HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+    ] {
+        let (port, received) = capture_h1_upstream().await;
+        let status = send_h1_raw_request(port, request).await;
+        assert!(status.contains("200 OK"), "{case}: {status}");
+        timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap_or_else(|_| panic!("{case}: upstream was never contacted"))
+            .unwrap();
+    }
+
+    for (case, request) in [
+        (
+            "duplicate Host",
+            "GET /test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\nHost: other.example\r\n\r\n",
+        ),
+        (
+            "identical duplicate Host",
+            "GET /test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\nHost: authority.example\r\n\r\n",
+        ),
+        (
+            "userinfo in Host",
+            "GET /test HTTP/1.1\r\nx-port: {port}\r\nHost: user@authority.example\r\n\r\n",
+        ),
+        (
+            "userinfo in an absolute-form target",
+            "GET http://user@authority.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+        (
+            "encoded backslash in absolute-form authority",
+            "GET http://good.example%5Cevil.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: good.example%5Cevil.example\r\n\r\n",
+        ),
+        (
+            "encoded userinfo in absolute-form authority",
+            "GET http://user%40authority.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: user%40authority.example\r\n\r\n",
+        ),
+        (
+            "encoded slash in absolute-form authority",
+            "GET http://a%2f.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: a%2f.example\r\n\r\n",
+        ),
+        (
+            "multiple ports in absolute-form authority",
+            "GET http://authority.example:443:8080/test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example:443:8080\r\n\r\n",
+        ),
+        (
+            "invalid absolute-form scheme",
+            "GET ht_tp://authority.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
+        ),
+        (
+            "empty absolute-form authority",
+            "GET http:///test HTTP/1.1\r\nx-port: {port}\r\nHost: \r\n\r\n",
+        ),
+    ] {
+        let (port, mut received) = capture_h1_upstream().await;
+        let status = send_h1_raw_request(port, request).await;
+
+        // Checked first so a regression reports what reached the upstream. Borrowed so the
+        // receiver stays alive for the check below.
+        match timeout(Duration::from_millis(500), &mut received).await {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(request)) => panic!(
+                "{case} reached the upstream: {:?}",
+                String::from_utf8_lossy(&request)
+            ),
+        }
+        assert!(status.contains("400 Bad Request"), "{case}: {status}");
+
+        // The wait can finish before a slow connection lands.
+        if let Ok(request) = received.try_recv() {
+            panic!(
+                "{case} reached the upstream after it was answered: {:?}",
+                String::from_utf8_lossy(&request)
+            );
+        }
+    }
 }
 
 async fn send_raw_request_to_test_proxy(request: String) -> ResponseHeader {

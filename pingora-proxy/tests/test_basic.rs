@@ -764,15 +764,20 @@ async fn test_connect_close() {
 async fn test_connect_proxying_disallowed_h1() {
     init();
 
-    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
-    let request = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
-    stream.write_all(request).await.unwrap();
+    for request in [
+        b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n".as_slice(),
+        b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n".as_slice(),
+        b"CONNECT /ws?token=a@b.com HTTP/1.1\r\nHost: other.example\r\n\r\n".as_slice(),
+    ] {
+        let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+        stream.write_all(request).await.unwrap();
 
-    let mut buf = [0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
-    let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 405 "));
+        let mut buf = [0u8; 1024];
+        let read = stream.read(&mut buf).await.unwrap();
+        let resp = std::str::from_utf8(&buf[..read]).unwrap();
+        let status_line = resp.lines().next().unwrap_or("");
+        assert!(status_line.contains(" 405 "), "{status_line}");
+    }
 }
 
 #[tokio::test]
@@ -820,6 +825,40 @@ async fn test_connect_proxying_allowed_h1() {
     let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
     let request = format!(
         "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
+}
+
+#[cfg(feature = "patched_http1")]
+#[tokio::test]
+async fn test_connect_proxying_allowed_h1_without_host() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nX-Port: {}\r\n\r\n",
         upstream_addr.port()
     );
     stream.write_all(request.as_bytes()).await.unwrap();
