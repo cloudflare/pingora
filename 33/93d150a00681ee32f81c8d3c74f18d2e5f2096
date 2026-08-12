@@ -1,0 +1,22 @@
+pingora-core/src/protocols/http/v2/client.rs
+  s_c9a183f5b9e0de::t_bc376e8b1daac6 194-195,664-772
+  s_c9a183f5b9e0de::t_656b4ba1bd8459 200,216-225,227-231,234,237,255
+  s_c9a183f5b9e0de::t_d2c586e9e9bf56 226,232-233,235-236
+  s_c9a183f5b9e0de::t_e6804bf159365d 196
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3393d150a00681ee32f81c8d3c74f18d2e5f2096",
+  "prompts": {},
+  "sessions": {
+    "s_c9a183f5b9e0de": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff787-448f-7761-8786-640dcee86567",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}
