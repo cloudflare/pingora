@@ -157,13 +157,17 @@ impl<S: Session> HttpSession<S> {
     }
 
     /// Give up the http session abruptly.
+    ///
+    /// This is a failure path: the request is abandoned mid-message, so each
+    /// protocol signals it in whatever way lets the peer tell this apart from a
+    /// request that was completed.
     /// For H1 this will close the underlying connection
     /// For H2 this will send RST_STREAM frame to end this stream if the stream has not ended at all
     pub async fn shutdown(&mut self) {
         match self {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
-            Self::Custom(c) => c.shutdown(0, "shutdown").await,
+            Self::Custom(c) => c.abandon("shutdown").await,
         }
     }
 
@@ -227,5 +231,157 @@ impl<S: Session> HttpSession<S> {
             Self::H2(_) => None,
             Self::Custom(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HttpSession, Session};
+    use crate::protocols::http::custom::{BodyWrite, CustomMessageWrite};
+    use crate::protocols::{Digest, SocketAddr, UniqueIDType};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::Stream;
+    use http::HeaderMap;
+    use pingora_error::Result;
+    use pingora_http::{RequestHeader, ResponseHeader};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Records which shutdown entry point the session dispatcher reached. Every
+    /// other method is `unreachable!()`: this exists to pin the dispatch, not to
+    /// model a protocol.
+    struct ShutdownRecordingCustom {
+        shutdown_calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Session for ShutdownRecordingCustom {
+        async fn shutdown(&mut self, code: u32, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("shutdown({code}, {ctx})"));
+        }
+
+        async fn abandon(&mut self, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("abandon({ctx})"));
+        }
+
+        async fn write_request_header(
+            &mut self,
+            _req: Box<RequestHeader>,
+            _end: bool,
+        ) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn write_request_body(&mut self, _data: Bytes, _end: bool) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn finish_request_body(&mut self) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn set_write_timeout(&mut self, _timeout: Option<Duration>) {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn read_response_header(&mut self) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn response_finished(&self) -> bool {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn response_header(&self) -> Option<&ResponseHeader> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn was_upgraded(&self) -> bool {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn digest(&self) -> Option<&Digest> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn digest_mut(&mut self) -> Option<&mut Digest> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn server_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn client_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn read_trailers(&mut self) -> Result<Option<HeaderMap>> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn fd(&self) -> UniqueIDType {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn check_response_end_or_error(&mut self, _headers: bool) -> Result<bool> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn finish_custom(&mut self) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn take_custom_message_reader(
+            &mut self,
+        ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        async fn drain_custom_messages(&mut self) -> Result<()> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+
+        fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
+            unreachable!("not used by the shutdown dispatch test")
+        }
+    }
+
+    /// `HttpSession::shutdown` abandons a request mid-message, so it must take the
+    /// entry point that lets a custom protocol convey exactly that. Mirrors the
+    /// server-side `custom_session_shutdown_signals_an_incomplete_message`.
+    ///
+    /// This method has no callers in-tree today, so the test guards the routing
+    /// rather than a live path — which is precisely when a silent regression back
+    /// to the benign `shutdown(0, ..)` would go unnoticed.
+    #[tokio::test]
+    async fn custom_session_shutdown_signals_an_incomplete_message() {
+        let shutdown_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = HttpSession::Custom(ShutdownRecordingCustom {
+            shutdown_calls: shutdown_calls.clone(),
+        });
+
+        session.shutdown().await;
+
+        assert_eq!(*shutdown_calls.lock().unwrap(), ["abandon(shutdown)"]);
     }
 }

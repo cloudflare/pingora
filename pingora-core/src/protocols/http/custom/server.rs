@@ -94,6 +94,22 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn shutdown(&mut self, code: u32, ctx: &str);
 
+    /// Abandon the response mid-message, in a way the peer can tell apart from a
+    /// response that was completed.
+    ///
+    /// Callers use this to signal that the message they were sending cannot be
+    /// finished, so the peer must not treat what it has already received as a
+    /// whole message. It is the counterpart of [`Session::finish`], which ends a
+    /// message that *is* complete.
+    ///
+    /// Defaults to [`Session::shutdown`], preserving the behavior of
+    /// implementations that predate this method. Implementations whose protocol
+    /// can distinguish an abandoned message from a completed one should override
+    /// this; otherwise a peer may read the abandoned message as successful.
+    async fn abandon(&mut self, ctx: &str) {
+        self.shutdown(0, ctx).await;
+    }
+
     fn is_body_done(&mut self) -> bool;
 
     async fn finish(&mut self) -> Result<()>;

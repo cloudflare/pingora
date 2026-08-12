@@ -530,6 +530,10 @@ impl Session {
     }
 
     /// Give up the http session abruptly.
+    ///
+    /// This is a failure path: the response is abandoned mid-message, so each
+    /// protocol signals it in whatever way lets the peer tell this apart from a
+    /// response that was completed.
     /// For H1 this will close the underlying connection
     /// For H2 this will send RESET frame to end this stream without impacting the connection
     /// For subrequests, this will drop task senders and receivers.
@@ -538,7 +542,7 @@ impl Session {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
-            Self::Custom(s) => s.shutdown(0, "shutdown").await,
+            Self::Custom(s) => s.abandon("shutdown").await,
         }
     }
 
@@ -1004,6 +1008,7 @@ mod tests {
     use async_trait::async_trait;
     use futures::Stream;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn custom_proxy_task_defaults_are_opted_out_and_fail_loudly() {
@@ -1037,10 +1042,28 @@ mod tests {
         assert!(!session.has_pending_downstream_proxy_tasks());
     }
 
+    /// `Session::shutdown` abandons a response mid-message, so it must take the
+    /// entry point that lets a custom protocol convey exactly that. Routing it to
+    /// the bare `shutdown` instead leaves the protocol with no way to distinguish
+    /// an abandoned response from a completed one, which a peer can then read as
+    /// success.
+    #[tokio::test]
+    async fn custom_session_shutdown_signals_an_incomplete_message() {
+        let shutdown_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = Session::new_custom(Box::new(ProxyTaskCustom::with_shutdown_calls(
+            shutdown_calls.clone(),
+        )));
+
+        session.shutdown().await;
+
+        assert_eq!(*shutdown_calls.lock().unwrap(), ["abandon(shutdown)"]);
+    }
+
     struct ProxyTaskCustom {
         header: RequestHeader,
         enabled: bool,
         tasks: Vec<HttpTask>,
+        shutdown_calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl ProxyTaskCustom {
@@ -1049,6 +1072,14 @@ mod tests {
                 header: RequestHeader::build("GET", b"/", None).unwrap(),
                 enabled: false,
                 tasks: Vec::new(),
+                shutdown_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_shutdown_calls(shutdown_calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                shutdown_calls,
+                ..Self::new()
             }
         }
     }
@@ -1152,8 +1183,18 @@ mod tests {
             unreachable!("not used by proxy task dispatch test")
         }
 
-        async fn shutdown(&mut self, _code: u32, _ctx: &str) {
-            unreachable!("not used by proxy task dispatch test")
+        async fn shutdown(&mut self, code: u32, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("shutdown({code}, {ctx})"));
+        }
+
+        async fn abandon(&mut self, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("abandon({ctx})"));
         }
 
         fn is_body_done(&mut self) -> bool {
