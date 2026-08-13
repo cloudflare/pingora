@@ -1,0 +1,19 @@
+pingora-core/src/protocols/http/v2/client.rs
+  s_c9a183f5b9e0de::t_24b10b2b782a47 194-203,205,651-759
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5dfad47d39413240944ad17499dc149feed4742e",
+  "prompts": {},
+  "sessions": {
+    "s_c9a183f5b9e0de": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ff787-448f-7761-8786-640dcee86567",
+        "model": "gpt-5.5"
+      },
+      "human_author": "mariiaiurchenko <mariia@cloudflare.com>"
+    }
+  }
+}
