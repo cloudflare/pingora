@@ -1,0 +1,67 @@
+pingora-core/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,22-30
+pingora/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,25-30,48
+pingora-boringssl/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-memory-cache/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,20,24,27
+pingora-foundations/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,20
+pingora-cache/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,21-26
+pingora-pool/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,27
+pingora-proxy/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,22-24,26,51-53
+pingora-error/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-rustls/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,19
+pingora-s2n/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,18
+tinyufo/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-header-serde/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,30-31
+pingora-http/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,22
+pingora-lru/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-runtime/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-openssl/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-timeout/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-limits/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-ketama/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3
+pingora-load-balancing/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,21-25
+pingora-prometheus/Cargo.toml
+  s_6b3e85e6e818b3::t_464d51c6d809d5 3,19
+docs/quick_start.md
+  s_6b3e85e6e818b3::t_08c64f0461402f 22
+docs/user_guide/prom.md
+  s_6b3e85e6e818b3::t_8a6bd77408407e 11
+docs/user_guide/rate_limiter.md
+  s_6b3e85e6e818b3::t_4ae63a46305798 8-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9583fb58e5d8910c69ae8611b6b636b9b3f52366",
+  "prompts": {},
+  "sessions": {
+    "s_6b3e85e6e818b3": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0165193b0ffe2NmesbcO32XT4M",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
