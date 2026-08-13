@@ -1,0 +1,23 @@
+pingora-core/src/protocols/http/v2/server.rs
+  s_06b7580d49c972::t_1f962b789c8f9d 1011-1031
+pingora-proxy/src/proxy_common.rs
+  s_06b7580d49c972::t_7fec3c2e9a6d0f 425-426,429-434,437
+  s_06b7580d49c972::t_7536f166d4da5a 164,166-171
+  s_06b7580d49c972::t_3cc97920338a2a 157,159-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3cbc2779b0b5af44125715d79c48ac2803a132d3",
+  "prompts": {},
+  "sessions": {
+    "s_06b7580d49c972": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00e0e6354ffehaU8ERcmYnGHX6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}

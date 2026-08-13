@@ -1,0 +1,66 @@
+pingora-proxy/src/proxy_h1.rs
+  s_06b7580d49c972::t_629c1e946f07a1 49-51
+  s_06b7580d49c972::t_d8910bbb331be8 52
+pingora-proxy/src/proxy_common.rs
+  s_06b7580d49c972::t_d02b9baf18bfd8 162
+  s_06b7580d49c972::t_683f469c7d8cbb 440
+  s_06b7580d49c972::t_5be13291f48c74 410-424,427-428,435-436,438-439,441-442
+  s_06b7580d49c972::t_60081f5410308a 158,165,172-174
+  s_06b7580d49c972::t_1868c8eb5fce20 163
+  s_06b7580d49c972::t_cfed84c249c400 409
+  s_06b7580d49c972::t_7fec3c2e9a6d0f 425-426,429-434,437
+  s_06b7580d49c972::t_7536f166d4da5a 164,166-171
+  s_06b7580d49c972::t_3cc97920338a2a 157,159-161
+pingora-core/src/protocols/http/v2/server.rs
+  s_06b7580d49c972::t_d1974f3ab00765 1238-1248
+  s_06b7580d49c972::t_997845a51f6361 461
+  s_06b7580d49c972::t_c4ca7fdcf3c21c 1045,1049
+  s_06b7580d49c972::t_04ec8fb00c625a 336
+  s_06b7580d49c972::t_6ec7d1f7dcf311 459-460,464-465,469-470
+  s_06b7580d49c972::t_578dd2875c5c58 989,1002
+  s_06b7580d49c972::t_5dbd1950dbee2b 1224
+  s_06b7580d49c972::t_2ad9ae9df290a0 1264-1278
+  s_06b7580d49c972::t_3e031caa2b50ff 314,330-333,337,340-345,349-350
+  s_06b7580d49c972::t_189164cb31c5ad 329
+  s_06b7580d49c972::t_ba3c13fb7c011b 1032
+  s_469347732e0c1c::t_505665bd23d100 1064,1195-1199
+  s_06b7580d49c972::t_7a5f7ebd627578 338-339
+  s_06b7580d49c972::t_8221af71c0ea99 1055
+  s_06b7580d49c972::t_4a107fdd73e06e 466-467
+  s_06b7580d49c972::t_9d9557de37705b 55-60
+  s_06b7580d49c972::t_851ae4a1f9fe2a 977-979,987,999,1006,1033-1040,1042-1044,1046-1048,1050-1054,1056-1062
+  s_06b7580d49c972::t_70af2323b75532 1065-1066,1071-1072
+  s_06b7580d49c972::t_aaae6a8a7ed260 334-335
+  s_06b7580d49c972::t_2034c2a4bcc7da 1209-1210
+  s_06b7580d49c972::t_ec4a515b3abe67 990-998,1085-1087,1096
+  s_06b7580d49c972::t_739204b4976923 328
+  s_06b7580d49c972::t_2cb269fdda98c1 1200-1208,1211-1223,1225-1237,1249-1263,1279-1286
+  s_06b7580d49c972::t_4a6bca8dcdb101 315,317-325
+  s_06b7580d49c972::t_51b64bb3cd3d27 1067-1070,1073-1084,1088-1095
+  s_06b7580d49c972::t_10a47453762802 316,326-327
+  s_06b7580d49c972::t_1f962b789c8f9d 1011-1031
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7758bfd8b6b865915b0016a574ae3a8a01a1bf02",
+  "prompts": {},
+  "sessions": {
+    "s_06b7580d49c972": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00e0e6354ffehaU8ERcmYnGHX6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    },
+    "s_469347732e0c1c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_013a50a3dffe3eyzwGaf3caV7h",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
