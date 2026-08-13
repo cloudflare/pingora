@@ -23,12 +23,11 @@
 //! This flavor is as efficient as the single-threaded runtime while allows the async
 //! program to use multiple cores.
 
-use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "dial9")]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use thread_local::ThreadLocal;
@@ -566,7 +565,7 @@ impl Runtime {
 }
 
 // only NoStealRuntime set the pools in thread threads
-static CURRENT_HANDLE: Lazy<ThreadLocal<Pools>> = Lazy::new(ThreadLocal::new);
+static CURRENT_HANDLE: LazyLock<ThreadLocal<Pools>> = LazyLock::new(ThreadLocal::new);
 
 /// Return the [Handle] of current runtime.
 /// If the current thread is under a `Steal` runtime, the current [Handle] is returned.
@@ -586,7 +585,7 @@ pub fn current_handle() -> Handle {
 }
 
 type Control = (Sender<Duration>, JoinHandle<()>);
-type Pools = Arc<OnceCell<Box<[Handle]>>>;
+type Pools = Arc<OnceLock<Box<[Handle]>>>;
 
 /// Multi-threaded runtime backed by a pool of single threaded tokio runtime
 pub struct NoStealRuntime {
@@ -597,7 +596,7 @@ pub struct NoStealRuntime {
     // Lazily init the runtimes so that they are created after pingora
     // daemonize itself. Otherwise the runtime threads are lost.
     pools: Pools,
-    controls: OnceCell<Vec<Control>>,
+    controls: OnceLock<Vec<Control>>,
 }
 
 impl NoStealRuntime {
@@ -614,8 +613,8 @@ impl NoStealRuntime {
             name: name.to_string(),
             blocking_opts,
             runtime_opts,
-            pools: Arc::new(OnceCell::new()),
-            controls: OnceCell::new(),
+            pools: Arc::new(OnceLock::new()),
+            controls: OnceLock::new(),
         }
     }
 
@@ -669,15 +668,15 @@ impl NoStealRuntime {
             // TODO: use a mutex to avoid creating a lot threads only to drop them
             let (pools, controls) = self.init_pools();
             // there could be another thread racing with this one to init the pools
-            match self.pools.try_insert(pools) {
-                Ok(p) => {
+            match self.pools.set(pools) {
+                Ok(()) => {
                     // unwrap to make sure that this is the one that init both pools and controls
                     self.controls.set(controls).unwrap();
-                    p
                 }
-                // another thread already set it, just return it
-                Err((p, _my_pools)) => p,
+                // another thread already set it, just use that thread's pools
+                Err(_my_pools) => {}
             }
+            self.pools.get().unwrap()
         }
     }
 
@@ -762,6 +761,42 @@ fn test_no_steal_shutdown() {
     assert_eq!(ret, 1);
 
     rt.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn test_no_steal_runtime_concurrent_initialization() {
+    use std::sync::Barrier;
+
+    let runtime = Arc::new(NoStealRuntime::new(
+        2,
+        "test",
+        BlockingPoolOpts::default(),
+        RuntimeOpts::default(),
+    ));
+    let barrier = Arc::new(Barrier::new(5));
+    let mut threads = Vec::new();
+
+    for _ in 0..4 {
+        let runtime = runtime.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            runtime.get_runtime_at(0).clone()
+        }));
+    }
+    barrier.wait();
+
+    for thread in threads {
+        let _ = thread.join().unwrap();
+    }
+
+    assert!(runtime.pools.get().is_some());
+    assert!(runtime.controls.get().is_some());
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("runtime still has shared owners after initialization"),
+    };
+    runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[cfg(feature = "dial9")]

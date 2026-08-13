@@ -315,10 +315,8 @@ where
     /// Similar to [Self::get_stale], but when it returns the stale value, it also initiates a lookup
     /// in the background in order to refresh the value.
     ///
-    /// Note that this function requires the [RTCache] to be static, which can be done by wrapping
-    /// it with something like [once_cell::sync::Lazy].
-    ///
-    /// [once_cell::sync::Lazy]: https://docs.rs/once_cell/latest/once_cell/sync/struct.Lazy.html
+    /// This function requires a static [RTCache]. Use [`std::sync::LazyLock`] to initialize one
+    /// when it is first accessed.
     pub async fn get_stale_while_update(
         &'static self,
         key: &K,
@@ -772,10 +770,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stale_while_update() {
-        use once_cell::sync::Lazy;
+        use std::sync::LazyLock;
         let ttl = Some(Duration::from_millis(100));
-        static CACHE: Lazy<RTCache<i32, i32, TestCB, ExtraOpt>> =
-            Lazy::new(|| RTCache::new(10, None, None));
+        static CACHE: LazyLock<RTCache<i32, i32, TestCB, ExtraOpt>> =
+            LazyLock::new(|| RTCache::new(10, None, None));
         let opt = Some(ExtraOpt {
             error: false,
             empty: false,

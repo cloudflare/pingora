@@ -21,13 +21,13 @@ pub mod mock_origin;
 pub mod server_utils;
 pub mod websocket;
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use tokio::runtime::{Builder, Runtime};
 
 // for tests with a static connection pool, if we use tokio::test the reactor
 // will no longer be associated with the backing pool fds since it's dropped per test
-pub static GLOBAL_RUNTIME: Lazy<Runtime> =
-    Lazy::new(|| Builder::new_multi_thread().enable_all().build().unwrap());
+pub static GLOBAL_RUNTIME: LazyLock<Runtime> =
+    LazyLock::new(|| Builder::new_multi_thread().enable_all().build().unwrap());
 
 pub fn conf_dir() -> String {
     format!("{}/tests/utils/conf", env!("CARGO_MANIFEST_DIR"))

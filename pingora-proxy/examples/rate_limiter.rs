@@ -1,12 +1,11 @@
 use async_trait::async_trait;
-use once_cell::sync::Lazy;
 use pingora_core::prelude::*;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_limits::rate::Rate;
 use pingora_load_balancing::prelude::{RoundRobin, TcpHealthCheck};
 use pingora_load_balancing::LoadBalancer;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 fn main() {
@@ -50,7 +49,7 @@ impl LB {
 }
 
 // Rate limiter
-static RATE_LIMITER: Lazy<Rate> = Lazy::new(|| Rate::new(Duration::from_secs(1)));
+static RATE_LIMITER: LazyLock<Rate> = LazyLock::new(|| Rate::new(Duration::from_secs(1)));
 
 // max request per second per client
 static MAX_REQ_PER_SEC: isize = 1;

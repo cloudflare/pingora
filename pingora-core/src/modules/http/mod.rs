@@ -26,13 +26,13 @@ pub mod grpc_web;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
-use once_cell::sync::OnceCell;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 /// The trait an HTTP traffic module needs to implement
 #[async_trait]
@@ -101,7 +101,7 @@ pub type ModuleBuilder = Box<dyn HttpModuleBuilder + 'static + Send + Sync>;
 /// The object to hold multiple http modules
 pub struct HttpModules {
     modules: Vec<ModuleBuilder>,
-    module_index: OnceCell<Arc<HashMap<TypeId, usize>>>,
+    module_index: OnceLock<Arc<HashMap<TypeId, usize>>>,
 }
 
 impl HttpModules {
@@ -109,7 +109,7 @@ impl HttpModules {
     pub fn new() -> Self {
         HttpModules {
             modules: vec![],
-            module_index: OnceCell::new(),
+            module_index: OnceLock::new(),
         }
     }
 

@@ -93,7 +93,7 @@ impl Listener {
                 digest
                     .peer_addr
                     .set(Some(peer_addr.into()))
-                    .expect("newly created OnceCell must be empty");
+                    .expect("newly created OnceLock must be empty");
                 s.set_socket_digest(digest);
                 // TODO: if listening on a specific bind address, we could save
                 // an extra syscall looking up the local_addr later if we can pass
@@ -110,7 +110,7 @@ impl Listener {
                 digest
                     .peer_addr
                     .set(addr)
-                    .expect("newly created OnceCell must be empty");
+                    .expect("newly created OnceLock must be empty");
                 s.set_socket_digest(digest);
                 s
             }),

@@ -25,6 +25,3 @@ pingora-error = { version = "0.8.0", path = "../pingora-error" }
 log = { workspace = true }
 parking_lot = "0"
 pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
-
-[dev-dependencies]
-once_cell = { workspace = true }

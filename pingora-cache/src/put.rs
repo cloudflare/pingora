@@ -241,7 +241,7 @@ impl<C: CachePut> CachePutCtx<C> {
 mod test {
     use super::*;
     use crate::trace::Span;
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
 
     struct TestCachePut();
     impl CachePut for TestCachePut {
@@ -253,7 +253,7 @@ mod test {
     }
 
     type TestCachePutCtx = CachePutCtx<TestCachePut>;
-    static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+    static CACHE_BACKEND: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 
     #[tokio::test]
     async fn test_cache_put() {
