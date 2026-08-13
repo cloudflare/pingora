@@ -24,7 +24,9 @@ pingora-prometheus = "0.8.0"
 The simplest way to use it is to have [static metrics](https://docs.rs/prometheus/latest/prometheus/#static-metrics).
 
 ```rust
-static MY_COUNTER: Lazy<IntGauge> = Lazy::new(|| {
+use std::sync::LazyLock;
+
+static MY_COUNTER: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("my_counter", "my counter").unwrap()
 });
 

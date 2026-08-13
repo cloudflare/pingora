@@ -971,12 +971,12 @@ fn test_will_decompress_agrees_with_response_header_filter() {
     }
 }
 
-use once_cell::sync::Lazy;
 use regex::Regex;
+use std::sync::LazyLock;
 
 // Allow text, application, font, a few image/ MIME types and binary/octet-stream
 // TODO: fine tune this list
-static MIME_CHECK: Lazy<Regex> = Lazy::new(|| {
+static MIME_CHECK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:text/|application/|font/|image/(?:x-icon|svg\+xml|nd\.microsoft\.icon)|binary/octet-stream)")
         .unwrap()
 });
