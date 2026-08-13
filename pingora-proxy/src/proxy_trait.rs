@@ -95,8 +95,13 @@ pub trait ProxyHttp {
     /// In this phase, users can parse, validate, rate limit, perform access control and/or
     /// return a response for this request.
     ///
-    /// If the user already sent a response to this request, an `Ok(true)` should be returned so that
-    /// the proxy would exit. The proxy continues to the next phases when `Ok(false)` is returned.
+    /// After sending a response, return `Ok(true)` so that the proxy stops processing the request.
+    /// Return `Ok(false)` to continue to the remaining phases.
+    ///
+    /// Returning `Ok(true)` and setting `end_of_stream` on a write do not add HTTP message framing.
+    /// Before returning, the response must indicate where its body ends. For a response with no
+    /// body, set `Content-Length: 0` or disable downstream keep-alive with
+    /// `session.set_keepalive(None)`.
     ///
     /// By default this filter does nothing and returns `Ok(false)`.
     async fn request_filter(&self, _session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
