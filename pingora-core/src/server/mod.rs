@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 #[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
 pub use pingora_runtime::Dial9S3UploadOpts;
 use pingora_runtime::{BlockingPoolOpts, Runtime, RuntimeBuilder};
+#[cfg(feature = "dial9-cpu-profiling")]
+pub use pingora_runtime::{CpuProfilingConfig, EventSource, SchedEventConfig};
 #[cfg(feature = "dial9")]
 pub use pingora_runtime::{
     Dial9RuntimeOpts, DEFAULT_DIAL9_MAX_FILE_SIZE, DEFAULT_DIAL9_MAX_TOTAL_SIZE,

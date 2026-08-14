@@ -35,6 +35,25 @@ use thread_local::ThreadLocal;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 
+/// Linux perf event source used by [`CpuProfilingConfig`].
+#[cfg(feature = "dial9-cpu-profiling")]
+pub use dial9_perf_self_profile::EventSource;
+/// Configuration options for Dial9 CPU profiling.
+///
+/// For usable stack traces, the binary must be built with
+/// `-C force-frame-pointers=yes`. Profiling uses Linux perf events when
+/// permitted. If perf access is blocked, including by `EACCES`, `EPERM`,
+/// `ENOSYS`, or `EOPNOTSUPP`, Dial9 falls back to timer sampling; if profiling
+/// still cannot be initialized, runtime startup continues without it.
+#[cfg(feature = "dial9-cpu-profiling")]
+pub use dial9_tokio_telemetry::telemetry::cpu_profile::CpuProfilingConfig;
+/// Configuration options for Dial9 scheduler event capture.
+///
+/// Scheduler event capture uses Linux perf events and fails open when the host
+/// does not permit per-thread context-switch sampling.
+#[cfg(feature = "dial9-cpu-profiling")]
+pub use dial9_tokio_telemetry::telemetry::cpu_profile::SchedEventConfig;
+
 /// Default maximum size of a dial9 trace segment file.
 #[cfg(feature = "dial9")]
 pub const DEFAULT_DIAL9_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
@@ -105,6 +124,21 @@ pub struct Dial9RuntimeOpts {
     pub task_tracking: bool,
     /// How often the background worker checks for sealed trace segments.
     pub worker_poll_interval: Option<Duration>,
+    /// Attempt to enable Linux perf-based CPU profiling with this configuration.
+    ///
+    /// For usable stack traces, the binary must be built with
+    /// `-C force-frame-pointers=yes`. If perf access is blocked, including by
+    /// `EACCES`, `EPERM`, `ENOSYS`, or `EOPNOTSUPP`, Dial9 falls back to timer
+    /// sampling. Runtime initialization continues without profiling if
+    /// profiling still cannot be initialized.
+    #[cfg(feature = "dial9-cpu-profiling")]
+    pub cpu_profiling: Option<CpuProfilingConfig>,
+    /// Attempt to enable Linux perf-based scheduler event capture.
+    ///
+    /// Runtime initialization continues without scheduler events if the host
+    /// does not permit per-thread context-switch sampling.
+    #[cfg(feature = "dial9-cpu-profiling")]
+    pub sched_events: Option<SchedEventConfig>,
     /// Upload sealed trace segments to S3-compatible storage.
     #[cfg(feature = "dial9-worker-s3")]
     pub s3_upload: Option<Dial9S3UploadOpts>,
@@ -121,6 +155,10 @@ impl Dial9RuntimeOpts {
             rotation_period: None,
             task_tracking: true,
             worker_poll_interval: None,
+            #[cfg(feature = "dial9-cpu-profiling")]
+            cpu_profiling: None,
+            #[cfg(feature = "dial9-cpu-profiling")]
+            sched_events: None,
             #[cfg(feature = "dial9-worker-s3")]
             s3_upload: None,
         }
@@ -153,6 +191,29 @@ impl Dial9RuntimeOpts {
     /// Set how often the background worker checks for sealed trace segments.
     pub fn with_worker_poll_interval(mut self, worker_poll_interval: Duration) -> Self {
         self.worker_poll_interval = Some(worker_poll_interval);
+        self
+    }
+
+    /// Attempt to enable Linux perf-based CPU profiling.
+    ///
+    /// For usable stack traces, the binary must be built with
+    /// `-C force-frame-pointers=yes`. If perf access is blocked, including by
+    /// `EACCES`, `EPERM`, `ENOSYS`, or `EOPNOTSUPP`, Dial9 falls back to timer
+    /// sampling. Runtime initialization continues without profiling if
+    /// profiling still cannot be initialized.
+    #[cfg(feature = "dial9-cpu-profiling")]
+    pub fn with_cpu_profiling(mut self, cpu_profiling: CpuProfilingConfig) -> Self {
+        self.cpu_profiling = Some(cpu_profiling);
+        self
+    }
+
+    /// Attempt to enable Linux perf-based scheduler event capture.
+    ///
+    /// Runtime initialization continues without scheduler events if the host
+    /// does not permit per-thread context-switch sampling.
+    #[cfg(feature = "dial9-cpu-profiling")]
+    pub fn with_sched_events(mut self, sched_events: SchedEventConfig) -> Self {
+        self.sched_events = Some(sched_events);
         self
     }
 
@@ -357,6 +418,14 @@ fn build_dial9_runtime(
         .with_task_tracking(opts.task_tracking);
     if let Some(worker_poll_interval) = opts.worker_poll_interval {
         traced = traced.with_worker_poll_interval(worker_poll_interval);
+    }
+    #[cfg(feature = "dial9-cpu-profiling")]
+    if let Some(cpu_profiling) = opts.cpu_profiling.clone() {
+        traced = traced.with_cpu_profiling(cpu_profiling);
+    }
+    #[cfg(feature = "dial9-cpu-profiling")]
+    if let Some(sched_events) = opts.sched_events.clone() {
+        traced = traced.with_sched_events(sched_events);
     }
 
     #[cfg(feature = "dial9-worker-s3")]
@@ -779,4 +848,18 @@ fn test_dial9_zero_worker_poll_interval_is_rejected() {
         err.to_string(),
         "dial9 worker_poll_interval must be greater than zero"
     );
+}
+
+#[cfg(feature = "dial9-cpu-profiling")]
+#[test]
+fn test_dial9_cpu_profiling_opts_default_to_disabled() {
+    let opts = Dial9RuntimeOpts::new("trace");
+    assert!(opts.cpu_profiling.is_none());
+    assert!(opts.sched_events.is_none());
+
+    let opts = opts
+        .with_cpu_profiling(CpuProfilingConfig::default())
+        .with_sched_events(SchedEventConfig::default());
+    assert!(opts.cpu_profiling.is_some());
+    assert!(opts.sched_events.is_some());
 }
