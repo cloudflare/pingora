@@ -21,7 +21,7 @@
 //! eviction results from these methods. Evicted items are instead handled
 //! by the [`AsyncEvictionCallback`] provided at construction time.
 
-use super::{CacheEntryKey, EvictionManager};
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
 #[cfg(test)]
 use crate::key::CompactCacheKey;
 
@@ -306,8 +306,8 @@ impl<const N: usize> EvictionManager for Manager<N> {
     /// Remove a cache key from the LRU. Fire-and-forget — enqueued on the
     /// shard's unbounded channel, so the message is never dropped (it fails
     /// only if the actor is gone, i.e. during shutdown).
-    fn remove(&self, item: &CacheEntryKey) {
-        self.lru.remove(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        self.lru.remove(&item);
     }
 
     /// Record an access to a cache key. If the key already exists it is

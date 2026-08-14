@@ -15,7 +15,7 @@
 //! Cache backend storage abstraction
 
 use super::{CacheKey, CacheMeta};
-use crate::eviction::{CacheEntryId, CacheEntryKey};
+use crate::eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
 use crate::key::CompactCacheKey;
 use crate::trace::SpanHandle;
 
@@ -34,18 +34,20 @@ pub enum PurgeType {
 }
 
 /// The entry a [`Storage::purge`] call should remove.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PurgeTarget {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeTarget<'a> {
     /// Remove storage's current entry for this logical cache key.
     ///
     /// This targets one entry. Storage that retains multiple generations for a logical key does
     /// not need to remove inactive generations.
-    Active(CompactCacheKey),
+    Active(&'a CompactCacheKey),
     /// Remove this exact cache entry.
-    Exact(CacheEntryKey),
+    ///
+    /// Storage must match the complete identity, including any [`CacheEntryId`].
+    Exact(&'a CacheEntryKey),
 }
 
-impl Display for PurgeTarget {
+impl Display for PurgeTarget<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Active(key) => write!(f, "active entry for {key}"),
@@ -54,12 +56,23 @@ impl Display for PurgeTarget {
     }
 }
 
-impl PurgeTarget {
+impl<'a> PurgeTarget<'a> {
     /// Return the target's logical cache key.
-    pub fn key(&self) -> &CompactCacheKey {
+    pub fn key(self) -> &'a CompactCacheKey {
         match self {
             Self::Active(key) => key,
             Self::Exact(entry) => entry.key(),
+        }
+    }
+
+    /// Return a borrowed identity for the removed entry.
+    ///
+    /// `id` supplies identity discovered while resolving a [`PurgeTarget::Active`] target. An
+    /// [`PurgeTarget::Exact`] target already contains the complete identity.
+    pub fn removed_entry(self, id: Option<CacheEntryId>) -> CacheEntryKeyRef<'a> {
+        match self {
+            Self::Active(key) => CacheEntryKeyRef::new(key, id),
+            Self::Exact(entry) => entry.into(),
         }
     }
 }
@@ -69,8 +82,10 @@ impl PurgeTarget {
 pub enum PurgeOutcome {
     /// Storage did not find the target entry.
     NotFound,
-    /// Storage removed this exact entry.
-    Purged(CacheEntryKey),
+    /// Storage removed an entry, with the ID selected for an active target, if any.
+    ///
+    /// Exact targets already contain the complete identity and need not repeat their ID here.
+    Purged(Option<CacheEntryId>),
 }
 
 /// Cache storage interface
@@ -120,13 +135,14 @@ pub trait Storage {
     /// does not request removal of every retained generation. [`PurgeTarget::Exact`] identifies the
     /// exact entry to remove.
     ///
-    /// On success, storage must return the complete identity of the entry it actually removed in
-    /// [`PurgeOutcome::Purged`]. If [`HandleHit::entry_id`] or [`HandleMiss::entry_id`] returns
-    /// `Some`, this identity must contain the corresponding [`CacheEntryId`]. Returning a key-only
-    /// identity would leave the identified entry tracked by the eviction manager.
+    /// When resolving an active target, storage must return the storage-defined ID of the entry it
+    /// actually removed in [`PurgeOutcome::Purged`]. If [`HandleHit::entry_id`] or
+    /// [`HandleMiss::entry_id`] returns `Some`, an active purge outcome must contain that
+    /// [`CacheEntryId`]. Returning `None` would leave the identified entry tracked by the eviction
+    /// manager. Exact targets already contain the complete identity.
     async fn purge(
         &'static self,
-        target: &PurgeTarget,
+        target: PurgeTarget<'_>,
         purge_type: PurgeType,
         trace: &SpanHandle,
     ) -> Result<PurgeOutcome>;

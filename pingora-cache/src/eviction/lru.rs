@@ -14,7 +14,7 @@
 
 //! A shared LRU cache manager
 
-use super::{CacheEntryKey, EvictionManager};
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
 #[cfg(test)]
 use crate::key::CompactCacheKey;
 
@@ -176,7 +176,7 @@ impl<'de, const N: usize> serde::de::Visitor<'de> for InsertToManager<'_, N> {
 }
 
 #[inline]
-fn u64key(key: &CacheEntryKey) -> u64 {
+fn u64key(key: &impl Hash) -> u64 {
     // note that std hash is not uniform, I'm not sure if ahash is also the case
     let mut hasher = ahash::AHasher::default();
     key.hash(&mut hasher);
@@ -231,8 +231,8 @@ impl<const N: usize> EvictionManager for Manager<N> {
             .collect()
     }
 
-    fn remove(&self, item: &CacheEntryKey) {
-        let key = u64key(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        let key = u64key(&item);
         self.0.remove(key);
     }
 
@@ -299,7 +299,7 @@ impl<const N: usize> Manager<N> {
     }
 
     fn remove(&self, item: &CompactCacheKey) {
-        EvictionManager::remove(self, &CacheEntryKey::key_only(item.clone()));
+        EvictionManager::remove(self, CacheEntryKeyRef::new(item, None));
     }
 
     fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {

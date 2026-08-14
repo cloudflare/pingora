@@ -155,6 +155,66 @@ impl CacheEntryKey {
     }
 }
 
+/// A borrowed cache entry identity used for exact eviction-manager lookups.
+///
+/// This type hashes identically to the equivalent owned [`CacheEntryKey`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheEntryKeyRef<'a> {
+    /// An entry identified only by its logical cache key.
+    KeyOnly(&'a CompactCacheKey),
+    /// An entry with additional storage-defined identity.
+    Identified {
+        /// The logical cache key.
+        key: &'a CompactCacheKey,
+        /// The storage-defined entry ID.
+        id: CacheEntryId,
+    },
+}
+
+impl<'a> CacheEntryKeyRef<'a> {
+    /// Construct a borrowed entry identity from its logical key and storage-defined ID, if any.
+    ///
+    /// The ID must match the entry originally admitted to an eviction manager. A different ID is a
+    /// different entry and will not remove or otherwise match the admitted entry.
+    pub fn new(key: &'a CompactCacheKey, id: Option<CacheEntryId>) -> Self {
+        match id {
+            Some(id) => Self::Identified { key, id },
+            None => Self::KeyOnly(key),
+        }
+    }
+
+    /// Return the underlying cache key.
+    pub fn key(self) -> &'a CompactCacheKey {
+        match self {
+            Self::KeyOnly(key) | Self::Identified { key, .. } => key,
+        }
+    }
+
+    /// Return the storage-defined entry ID, if present.
+    pub fn entry_id(self) -> Option<CacheEntryId> {
+        match self {
+            Self::KeyOnly(_) => None,
+            Self::Identified { id, .. } => Some(id),
+        }
+    }
+}
+
+impl Display for CacheEntryKeyRef<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.key())?;
+        if let Some(id) = self.entry_id() {
+            write!(f, ", entry ID: {:x}", id.get())?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> From<&'a CacheEntryKey> for CacheEntryKeyRef<'a> {
+    fn from(entry: &'a CacheEntryKey) -> Self {
+        Self::new(entry.key(), entry.entry_id())
+    }
+}
+
 /// The trait that a cache eviction algorithm needs to implement.
 ///
 /// NOTE: these trait methods require &self not &mut self, which means concurrency should
@@ -208,8 +268,10 @@ pub trait EvictionManager: Send + Sync {
 
     /// Remove an item from the eviction manager.
     ///
-    /// The size of the item will be deducted.
-    fn remove(&self, item: &CacheEntryKey);
+    /// The size of the item will be deducted. Implementations must require the complete identity to
+    /// match the originally admitted entry; a key-only identity must not match an identified entry
+    /// with the same logical key.
+    fn remove(&self, item: CacheEntryKeyRef<'_>);
 
     /// Access an item that should already be in cache.
     ///
@@ -265,5 +327,31 @@ mod tests {
         let deserialized = rmp_serde::from_slice(&serialized).unwrap();
 
         assert_eq!(entry, deserialized);
+    }
+
+    #[test]
+    fn owned_and_borrowed_entry_keys_hash_identically() {
+        use ahash::AHasher;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // This compares structural identity through each hasher, not hash stability across versions.
+        let key = CacheKey::new("entry", "1").to_compact();
+        for entry in [
+            CacheEntryKey::key_only(key.clone()),
+            CacheEntryKey::identified(key, CacheEntryId::new(7)),
+        ] {
+            let mut owned = DefaultHasher::new();
+            entry.hash(&mut owned);
+            let mut borrowed = DefaultHasher::new();
+            CacheEntryKeyRef::from(&entry).hash(&mut borrowed);
+            assert_eq!(owned.finish(), borrowed.finish());
+
+            let mut owned = AHasher::default();
+            entry.hash(&mut owned);
+            let mut borrowed = AHasher::default();
+            CacheEntryKeyRef::from(&entry).hash(&mut borrowed);
+            assert_eq!(owned.finish(), borrowed.finish());
+        }
     }
 }

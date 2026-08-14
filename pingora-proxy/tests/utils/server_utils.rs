@@ -527,7 +527,7 @@ impl Storage for FinishFailCache {
 
     async fn purge(
         &'static self,
-        _target: &pingora_cache::PurgeTarget,
+        _target: pingora_cache::PurgeTarget<'_>,
         _purge_type: PurgeType,
         _trace: &pingora_cache::trace::SpanHandle,
     ) -> Result<pingora_cache::storage::PurgeOutcome> {

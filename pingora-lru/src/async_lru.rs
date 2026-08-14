@@ -610,7 +610,10 @@ where
     /// The message is enqueued on the shard's unbounded channel, so it is
     /// never dropped (it fails only if the actor is gone, i.e. during
     /// shutdown).
-    pub fn remove(&self, key: &K) {
+    ///
+    /// `Q` must hash identically to the `K` originally inserted. Its hash selects both the shard
+    /// and the entry within that shard.
+    pub fn remove<Q: Hash>(&self, key: &Q) {
         let key_hash = hash_key(key);
         let shard = get_shard(key, N);
         send_msg(&self.shards[shard].tx, LruMsg::Remove { key_hash });

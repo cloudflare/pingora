@@ -389,7 +389,7 @@ impl Storage for MemCache {
 
     async fn purge(
         &'static self,
-        target: &PurgeTarget,
+        target: PurgeTarget<'_>,
         _type: PurgeType,
         _trace: &SpanHandle,
     ) -> Result<PurgeOutcome> {
@@ -403,11 +403,8 @@ impl Storage for MemCache {
         let temp_removed = self.temp.write().remove(&hash).is_some();
         let cache_removed = self.cached.write().remove(&hash).is_some();
         if temp_removed || cache_removed {
-            let entry = match target {
-                PurgeTarget::Active(key) => CacheEntryKey::key_only(key.clone()),
-                PurgeTarget::Exact(entry) => entry.clone(),
-            };
-            Ok(PurgeOutcome::Purged(entry))
+            // MemCache does not assign entry IDs, so active purges select key-only entries.
+            Ok(PurgeOutcome::Purged(None))
         } else {
             Ok(PurgeOutcome::NotFound)
         }
@@ -627,7 +624,7 @@ mod test {
 
         let result = cache
             .purge(
-                &crate::storage::PurgeTarget::Active(key),
+                crate::storage::PurgeTarget::Active(&key),
                 PurgeType::Invalidation,
                 &Span::inactive().handle(),
             )
@@ -659,7 +656,7 @@ mod test {
 
         let result = cache
             .purge(
-                &crate::storage::PurgeTarget::Active(key),
+                crate::storage::PurgeTarget::Active(&key),
                 PurgeType::Invalidation,
                 &Span::inactive().handle(),
             )
@@ -682,16 +679,44 @@ mod test {
                 body: Arc::new(Vec::new()),
             },
         );
-        let target = crate::storage::PurgeTarget::Exact(
-            crate::eviction::CacheEntryKey::identified(key, crate::eviction::CacheEntryId::new(1)),
-        );
+        let entry =
+            crate::eviction::CacheEntryKey::identified(key, crate::eviction::CacheEntryId::new(1));
+        let target = crate::storage::PurgeTarget::Exact(&entry);
 
         let outcome = cache
-            .purge(&target, PurgeType::Eviction, &Span::inactive().handle())
+            .purge(target, PurgeType::Eviction, &Span::inactive().handle())
             .await
             .unwrap();
 
         assert_eq!(outcome, crate::storage::PurgeOutcome::NotFound);
         assert!(cache.cached.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_exact_key_only_purge_succeeds_and_removes_entry() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+        let key = CacheKey::new("key-only", "1").to_compact();
+        let hash = key.combined();
+        cache.cached.write().insert(
+            hash,
+            CacheObject {
+                meta: (Vec::new(), Vec::new()),
+                body: Arc::new(Vec::new()),
+            },
+        );
+
+        let entry = CacheEntryKey::key_only(key);
+        let outcome = cache
+            .purge(
+                crate::storage::PurgeTarget::Exact(&entry),
+                PurgeType::Eviction,
+                &Span::inactive().handle(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::storage::PurgeOutcome::Purged(None));
+        assert!(cache.cached.read().is_empty());
     }
 }

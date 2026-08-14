@@ -144,8 +144,8 @@ impl<C: CachePut> CachePutCtx<C> {
             let storage = self.storage;
             tokio::task::spawn(async move {
                 for item in evicted {
-                    let target = crate::storage::PurgeTarget::Exact(item);
-                    if let Err(e) = storage.purge(&target, PurgeType::Eviction, &trace).await {
+                    let target = crate::storage::PurgeTarget::Exact(&item);
+                    if let Err(e) = storage.purge(target, PurgeType::Eviction, &trace).await {
                         warn!("Failed to purge {target} during eviction for cache put: {e}");
                     }
                 }

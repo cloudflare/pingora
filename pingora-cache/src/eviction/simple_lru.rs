@@ -14,7 +14,7 @@
 
 //! A simple LRU cache manager built on top of the `lru` crate
 
-use super::{CacheEntryKey, EvictionManager};
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
 #[cfg(test)]
 use crate::key::CompactCacheKey;
 
@@ -207,7 +207,7 @@ impl<'de> serde::de::Visitor<'de> for InsertToManager<'_> {
 }
 
 #[inline]
-fn u64key(key: &CacheEntryKey) -> u64 {
+fn u64key(key: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
@@ -259,8 +259,8 @@ impl EvictionManager for Manager {
         self.evict()
     }
 
-    fn remove(&self, item: &CacheEntryKey) {
-        let key = u64key(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        let key = u64key(&item);
         let node = self.lru.write().pop(&key);
         if let Some(n) = node {
             self.used.fetch_sub(n.size, Ordering::Relaxed);
@@ -366,7 +366,7 @@ impl Manager {
     }
 
     fn remove(&self, item: &CompactCacheKey) {
-        EvictionManager::remove(self, &CacheEntryKey::key_only(item.clone()));
+        EvictionManager::remove(self, CacheEntryKeyRef::new(item, None));
     }
 
     fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {

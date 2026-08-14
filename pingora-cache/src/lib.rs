@@ -46,7 +46,7 @@ mod variance;
 
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
-pub use eviction::{CacheEntryId, CacheEntryKey};
+pub use eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
@@ -1105,9 +1105,9 @@ impl HttpCache {
                     let storage = inner_enabled.storage;
                     tokio::task::spawn(async move {
                         for item in evicted {
-                            let target = storage::PurgeTarget::Exact(item);
+                            let target = storage::PurgeTarget::Exact(&item);
                             if let Err(e) =
-                                storage.purge(&target, PurgeType::Eviction, &handle).await
+                                storage.purge(target, PurgeType::Eviction, &handle).await
                             {
                                 warn!(
                                     "Failed to purge {target} during eviction for finish miss handler: {e}"
@@ -1835,15 +1835,15 @@ impl HttpCache {
         key: &CompactCacheKey,
         mut span: Span,
     ) -> Result<bool> {
-        let target = storage::PurgeTarget::Active(key.clone());
+        let target = storage::PurgeTarget::Active(key);
         let result = storage
-            .purge(&target, PurgeType::Invalidation, &span.handle())
+            .purge(target, PurgeType::Invalidation, &span.handle())
             .await;
         let purged = match result.as_ref() {
             Ok(storage::PurgeOutcome::NotFound) | Err(_) => false,
-            Ok(storage::PurgeOutcome::Purged(entry)) => {
+            Ok(storage::PurgeOutcome::Purged(entry_id)) => {
                 if let Some(eviction) = eviction {
-                    eviction.remove(entry);
+                    eviction.remove(target.removed_entry(*entry_id));
                 }
                 true
             }
@@ -2030,11 +2030,11 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _target: &storage::PurgeTarget,
+            _target: storage::PurgeTarget<'_>,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
         ) -> Result<storage::PurgeOutcome> {
-            Ok(storage::PurgeOutcome::NotFound)
+            Ok(storage::PurgeOutcome::Purged(None))
         }
 
         async fn update_meta(
@@ -2077,17 +2077,15 @@ mod tests {
 
         async fn purge(
             &'static self,
-            target: &storage::PurgeTarget,
+            target: storage::PurgeTarget<'_>,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
         ) -> Result<storage::PurgeOutcome> {
-            let entry = match target {
-                storage::PurgeTarget::Active(key) => {
-                    eviction::CacheEntryKey::identified(key.clone(), eviction::CacheEntryId::new(1))
-                }
-                storage::PurgeTarget::Exact(entry) => entry.clone(),
+            let entry_id = match target {
+                storage::PurgeTarget::Active(_) => Some(eviction::CacheEntryId::new(1)),
+                storage::PurgeTarget::Exact(_) => None,
             };
-            Ok(storage::PurgeOutcome::Purged(entry))
+            Ok(storage::PurgeOutcome::Purged(entry_id))
         }
 
         async fn update_meta(
@@ -2142,8 +2140,11 @@ mod tests {
             Vec::new()
         }
 
-        fn remove(&self, item: &eviction::CacheEntryKey) {
-            *self.removed.lock().unwrap() = Some(item.clone());
+        fn remove(&self, item: eviction::CacheEntryKeyRef<'_>) {
+            *self.removed.lock().unwrap() = Some(eviction::CacheEntryKey::from_entry_id(
+                item.key().clone(),
+                item.entry_id(),
+            ));
         }
 
         fn access(
@@ -2199,7 +2200,7 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _target: &storage::PurgeTarget,
+            _target: storage::PurgeTarget<'_>,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
         ) -> Result<storage::PurgeOutcome> {
@@ -2429,6 +2430,29 @@ mod tests {
         assert!(recording.accessed.lock().unwrap().is_none());
         assert!(recording.admitted.lock().unwrap().is_none());
         assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_removes_key_only_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("key-only-purge", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &UPDATE_OK_STORAGE,
+            Some(recording),
+            &key,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("purge should remove the key-only entry");
+        assert_eq!(removed, eviction::CacheEntryKey::key_only(key));
     }
 
     #[test]
