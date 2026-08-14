@@ -1,0 +1,31 @@
+pingora-proxy/tests/utils/server_utils.rs
+  s_6ab27ee70805bc::t_b62c6e3970d676 368-372
+pingora-proxy/tests/test_upstream.rs
+  s_6ab27ee70805bc::t_c56b3c13b7ba32 586-631
+pingora-proxy/src/proxy_h1.rs
+  s_6ab27ee70805bc::t_797e54b58c0848 83
+pingora-proxy/src/proxy_common.rs
+  s_6ab27ee70805bc::t_ce86c6562678e8 226-227,539-540,545
+  s_6ab27ee70805bc::t_797e54b58c0848 16,181,185-187,195-225,228-234,236-242,245,248
+  s_6ab27ee70805bc::t_e99cd427033458 523,527,533,536,538,541-544
+pingora-core/src/protocols/http/authority.rs
+  s_6ab27ee70805bc::t_19cfc242819448 180-181,223,389,397,405
+pingora-proxy/src/proxy_h2.rs
+  s_6ab27ee70805bc::t_797e54b58c0848 174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b1a4a5353ccb0cedc61b3b415ea8a0d937a0f3d2",
+  "prompts": {},
+  "sessions": {
+    "s_6ab27ee70805bc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00386272fffeJ4jtmTn0a8EqYZ",
+        "model": "gpt-5.6"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
