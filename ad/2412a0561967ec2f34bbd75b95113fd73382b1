@@ -1,0 +1,19 @@
+pingora-core/src/server/transfer_fd/mod.rs
+  s_559961136e300e::t_a05751a12cbd73 28,191-197,200-203,205,208,401,483-566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ad2412a0561967ec2f34bbd75b95113fd73382b1",
+  "prompts": {},
+  "sessions": {
+    "s_559961136e300e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a00128-5c5f-72f0-82b6-1bfaa49121f1",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
