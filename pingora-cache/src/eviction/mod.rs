@@ -176,7 +176,7 @@ impl<'a> CacheEntryKeyRef<'a> {
     ///
     /// The ID must match the entry originally admitted to an eviction manager. A different ID is a
     /// different entry and will not remove or otherwise match the admitted entry.
-    pub fn new(key: &'a CompactCacheKey, id: Option<CacheEntryId>) -> Self {
+    pub fn from_entry_id(key: &'a CompactCacheKey, id: Option<CacheEntryId>) -> Self {
         match id {
             Some(id) => Self::Identified { key, id },
             None => Self::KeyOnly(key),
@@ -211,7 +211,7 @@ impl Display for CacheEntryKeyRef<'_> {
 
 impl<'a> From<&'a CacheEntryKey> for CacheEntryKeyRef<'a> {
     fn from(entry: &'a CacheEntryKey) -> Self {
-        Self::new(entry.key(), entry.entry_id())
+        Self::from_entry_id(entry.key(), entry.entry_id())
     }
 }
 

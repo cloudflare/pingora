@@ -366,7 +366,7 @@ impl Manager {
     }
 
     fn remove(&self, item: &CompactCacheKey) {
-        EvictionManager::remove(self, CacheEntryKeyRef::new(item, None));
+        EvictionManager::remove(self, CacheEntryKeyRef::from_entry_id(item, None));
     }
 
     fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {

@@ -34,7 +34,7 @@ pub enum PurgeType {
 }
 
 /// The entry a [`Storage::purge`] call should remove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum PurgeTarget<'a> {
     /// Remove storage's current entry for this logical cache key.
     ///
@@ -71,14 +71,14 @@ impl<'a> PurgeTarget<'a> {
     /// [`PurgeTarget::Exact`] target already contains the complete identity.
     pub fn removed_entry(self, id: Option<CacheEntryId>) -> CacheEntryKeyRef<'a> {
         match self {
-            Self::Active(key) => CacheEntryKeyRef::new(key, id),
+            Self::Active(key) => CacheEntryKeyRef::from_entry_id(key, id),
             Self::Exact(entry) => entry.into(),
         }
     }
 }
 
 /// Outcome of a successful [`Storage::purge`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeOutcome {
     /// Storage did not find the target entry.
     NotFound,
