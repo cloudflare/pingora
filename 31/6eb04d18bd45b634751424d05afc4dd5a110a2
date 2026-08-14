@@ -1,0 +1,19 @@
+Cargo.toml
+  s_b3c6928d3372f9::t_3b53ea79cb1502 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "316eb04d18bd45b634751424d05afc4dd5a110a2",
+  "prompts": {},
+  "sessions": {
+    "s_b3c6928d3372f9": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ffe2673c2ffe2c7f8u2z5D2Lwa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "mariiaiurchenko <mariia@cloudflare.com>"
+    }
+  }
+}
