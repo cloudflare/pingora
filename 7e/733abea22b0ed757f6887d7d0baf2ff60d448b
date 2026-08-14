@@ -1,0 +1,22 @@
+pingora-proxy/src/proxy_custom.rs
+  s_84899e5a2de5c3::t_aa4b7c40d3728e 1204-1205
+  s_84899e5a2de5c3::t_0e2c4cfcf467dc 266-267,955-962,1198-1199,1215-1326,1342-1371
+  s_84899e5a2de5c3::t_881c02dfad04a7 268-269
+  s_84899e5a2de5c3::t_bf05a2148c03e3 1207,1372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7e733abea22b0ed757f6887d7d0baf2ff60d448b",
+  "prompts": {},
+  "sessions": {
+    "s_84899e5a2de5c3": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffe3e-e4df-7d40-9158-ee7c9a7f8e2a",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
