@@ -1,0 +1,27 @@
+pingora-proxy/src/subrequest/pipe.rs
+  s_2ed936a373e940::t_b0c0380ccdc776 45-49,203,218-224,226-248,254,281,290-294,520,655,669,672-675,691
+  s_2ed936a373e940::t_ffd1a2d7805fc1 661,680-683
+  s_2ed936a373e940::t_78207685e2162c 36,209,517-519
+  s_2ed936a373e940::t_2468da6bbeb195 39-44,194-202,204-208,210-217,225,258,653-654,656-660,662-668,670-671,676-679,684-690
+  s_2ed936a373e940::t_15338c1ea87018 692-694
+pingora-cache/src/lib.rs
+  s_2ed936a373e940::t_2468da6bbeb195 1807-1810,1826,1833-1846,1929,2452-2462,2468-2483,2488
+  s_2ed936a373e940::t_78207685e2162c 26-29,1813,1816,2463-2467,2484-2487
+  s_2ed936a373e940::t_eddec7f2c95e24 2489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30ed9403b2a56c9caa4db16e5990b4c26c8042fa",
+  "prompts": {},
+  "sessions": {
+    "s_2ed936a373e940": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f956b-6642-7001-9bce-483a7e631d50",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
