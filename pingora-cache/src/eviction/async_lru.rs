@@ -398,6 +398,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn remove_requires_complete_identity() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let manager = Manager::<1>::builder(
+            100,
+            Arc::new(|_key: CacheEntryKey, _weight| async {}),
+            shutdown_rx,
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let key = CacheKey::new("identified", "1").to_compact();
+        let id = crate::eviction::CacheEntryId::new(42);
+
+        let _ = EvictionManager::admit(
+            &manager,
+            CacheEntryKey::identified(key.clone(), id),
+            1,
+            SystemTime::now(),
+        );
+        // A shard query waits for the actor to process preceding messages on its FIFO channel.
+        manager.shard_weight(0).await;
+
+        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, None));
+        manager.shard_weight(0).await;
+        assert_eq!(manager.total_size(), 1);
+
+        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, Some(id)));
+        manager.shard_weight(0).await;
+        assert_eq!(manager.total_size(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn save_returns_error_when_all_shards_fail() {
         let dir = std::env::temp_dir().join(format!(
             "pingora-async-lru-total-save-failure-{}-{}",

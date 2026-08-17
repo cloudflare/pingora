@@ -34,12 +34,14 @@ pub enum PurgeType {
 }
 
 /// The entry a [`Storage::purge`] call should remove.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeTarget<'a> {
     /// Remove storage's current entry for this logical cache key.
     ///
     /// This targets one entry. Storage that retains multiple generations for a logical key does
-    /// not need to remove inactive generations.
+    /// not need to remove inactive generations. Storage must not remove an entry with a different
+    /// logical key. When storage retains multiple generations, it may select which identity to
+    /// remove.
     Active(&'a CompactCacheKey),
     /// Remove this exact cache entry.
     ///

@@ -1911,7 +1911,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
 
-    struct UpdateOkStorage;
+    /// Storage fixture with successful metadata updates and configurable purge results.
+    struct UpdateOkStorage {
+        purge_ok: bool,
+    }
     struct IdentifiedEntryStorage {
         append: bool,
     }
@@ -1934,7 +1937,8 @@ mod tests {
         incremented: Mutex<Option<(eviction::CacheEntryKey, usize, Option<usize>)>>,
     }
 
-    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
+    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage { purge_ok: false };
+    static PURGE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage { purge_ok: true };
     static IDENTIFIED_CREATED_STORAGE: IdentifiedEntryStorage =
         IdentifiedEntryStorage { append: false };
     static IDENTIFIED_APPENDED_STORAGE: IdentifiedEntryStorage =
@@ -2034,7 +2038,11 @@ mod tests {
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
         ) -> Result<storage::PurgeOutcome> {
-            Ok(storage::PurgeOutcome::Purged(None))
+            Ok(if self.purge_ok {
+                storage::PurgeOutcome::Purged(None)
+            } else {
+                storage::PurgeOutcome::NotFound
+            })
         }
 
         async fn update_meta(
@@ -2438,7 +2446,7 @@ mod tests {
         let key = CacheKey::new("key-only-purge", "").to_compact();
 
         assert!(HttpCache::purge_impl(
-            &UPDATE_OK_STORAGE,
+            &PURGE_OK_STORAGE,
             Some(recording),
             &key,
             trace::Span::inactive(),
