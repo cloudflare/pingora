@@ -1,0 +1,24 @@
+pingora-core/src/protocols/http/v1/client.rs
+  s_8608d6365995db::t_ea7766fade04fa 508-517
+  s_8608d6365995db::t_4fa96093e95caf 1619-1662
+pingora-proxy/src/lib.rs
+  s_8608d6365995db::t_ddbdc25fcde911 503-508
+pingora-proxy/src/proxy_h1.rs
+  s_8608d6365995db::t_7784fd0c7da9b1 209-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "46699222679a202d3a0171754312d71452974d95",
+  "prompts": {},
+  "sessions": {
+    "s_8608d6365995db": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0309f75eaffeD5ae8DHhHJ1FVC",
+        "model": "claude-opus-5"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
