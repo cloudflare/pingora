@@ -21,6 +21,7 @@ use pingora_error::Result;
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
 pub mod async_lru;
@@ -48,7 +49,7 @@ impl CacheEntryId {
 /// Identified entries combine a logical cache key with storage-defined entry identity. Eviction
 /// managers paired with storage that returns identified entries must preserve and compare the
 /// complete key. Managers that use only the compact key cannot correctly account for such storage.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CacheEntryKey {
     /// An entry identified only by its logical cache key.
     KeyOnly(CompactCacheKey),
@@ -59,6 +60,12 @@ pub enum CacheEntryKey {
         /// The storage-defined entry ID.
         id: CacheEntryId,
     },
+}
+
+impl Hash for CacheEntryKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        CacheEntryKeyRef::from(self).hash(state);
+    }
 }
 
 impl Serialize for CacheEntryKey {

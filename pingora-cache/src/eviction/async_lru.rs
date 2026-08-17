@@ -307,7 +307,7 @@ impl<const N: usize> EvictionManager for Manager<N> {
     /// shard's unbounded channel, so the message is never dropped (it fails
     /// only if the actor is gone, i.e. during shutdown).
     fn remove(&self, item: CacheEntryKeyRef<'_>) {
-        self.lru.remove(&item);
+        self.lru.remove_by_hash(hash_key(&item));
     }
 
     /// Record an access to a cache key. If the key already exists it is

@@ -67,13 +67,44 @@ impl<'a> PurgeTarget<'a> {
 
     /// Return a borrowed identity for the removed entry.
     ///
-    /// `id` supplies identity discovered while resolving a [`PurgeTarget::Active`] target. An
-    /// [`PurgeTarget::Exact`] target already contains the complete identity.
+    /// `id` supplies identity discovered while resolving a [`PurgeTarget::Active`] target. It is
+    /// ignored for a [`PurgeTarget::Exact`] target, which already contains the complete identity;
+    /// if supplied, it must match that identity.
     pub fn removed_entry(self, id: Option<CacheEntryId>) -> CacheEntryKeyRef<'a> {
         match self {
             Self::Active(key) => CacheEntryKeyRef::from_entry_id(key, id),
-            Self::Exact(entry) => entry.into(),
+            Self::Exact(entry) => {
+                debug_assert!(
+                    id.is_none() || id == entry.entry_id(),
+                    "purge outcome ID {id:?} must match exact target ID {:?}",
+                    entry.entry_id()
+                );
+                entry.into()
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_removed_entry_accepts_absent_or_matching_id() {
+        let id = CacheEntryId::new(42);
+        let entry = CacheEntryKey::identified(CompactCacheKey::default(), id);
+        let target = PurgeTarget::Exact(&entry);
+
+        assert_eq!(target.removed_entry(None), (&entry).into());
+        assert_eq!(target.removed_entry(Some(id)), (&entry).into());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must match exact target ID")]
+    fn exact_removed_entry_rejects_mismatched_id() {
+        let entry = CacheEntryKey::identified(CompactCacheKey::default(), CacheEntryId::new(42));
+        PurgeTarget::Exact(&entry).removed_entry(Some(CacheEntryId::new(43)));
     }
 }
 
