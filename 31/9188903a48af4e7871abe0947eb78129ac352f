@@ -1,0 +1,25 @@
+pingora-cache/src/eviction/lru.rs
+  s_41ac1538fa5982::t_985712906521ad 302
+pingora-cache/src/eviction/simple_lru.rs
+  s_41ac1538fa5982::t_985712906521ad 369
+pingora-cache/src/eviction/mod.rs
+  s_41ac1538fa5982::t_985712906521ad 179,214
+pingora-cache/src/storage.rs
+  s_41ac1538fa5982::t_985712906521ad 37,74,81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "319188903a48af4e7871abe0947eb78129ac352f",
+  "prompts": {},
+  "sessions": {
+    "s_41ac1538fa5982": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00e8128ebffeJK4AsuaDkAKlk2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
