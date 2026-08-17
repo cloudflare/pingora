@@ -1,0 +1,21 @@
+pingora-cache/src/put.rs
+  s_9b18be52d241a5::t_5011f46fbfa71f 151-153
+pingora-cache/src/lib.rs
+  s_9b18be52d241a5::t_5011f46fbfa71f 1116-1118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b331486410881848a8bc400e344e61bd65d5ff24",
+  "prompts": {},
+  "sessions": {
+    "s_9b18be52d241a5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a002f6-56d5-7e10-b8a0-c859cd9607a7",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}

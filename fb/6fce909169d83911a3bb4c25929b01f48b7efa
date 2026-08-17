@@ -1,0 +1,29 @@
+pingora-cache/src/eviction/async_lru.rs
+  s_41ac1538fa5982::t_08798a895bb4cc 419
+  s_41ac1538fa5982::t_e47a52859503b3 411
+  s_41ac1538fa5982::t_670133998a79dd 401-410,412-418,420-430
+  s_41ac1538fa5982::t_dc0a6dd86748b4 400
+pingora-cache/src/storage.rs
+  s_41ac1538fa5982::t_08798a895bb4cc 43-44
+  s_41ac1538fa5982::t_670133998a79dd 37,42
+pingora-cache/src/lib.rs
+  s_41ac1538fa5982::t_670133998a79dd 1915-1917,1940-1941,2041-2045
+  s_41ac1538fa5982::t_08798a895bb4cc 1914
+  s_41ac1538fa5982::t_e47a52859503b3 2449
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb6fce909169d83911a3bb4c25929b01f48b7efa",
+  "prompts": {},
+  "sessions": {
+    "s_41ac1538fa5982": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00e8128ebffeJK4AsuaDkAKlk2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    }
+  }
+}
