@@ -1,0 +1,69 @@
+pingora-core/src/protocols/http/v2/client.rs
+  s_6ab27ee70805bc::t_6553464db980dd 704-705
+  s_6ab27ee70805bc::t_536c754af14c6b 42-43,45,47-48,107-114,121-123,687-703,706-707,709-714
+  s_6ab27ee70805bc::t_5bf9f41911c42a 708
+  s_6ab27ee70805bc::t_e542444c530e2d 41,44
+  s_6ab27ee70805bc::t_2fc7680da8df05 46
+  s_6ab27ee70805bc::t_d0a627d452a7e4 124-126,130
+  s_6ab27ee70805bc::t_774d4a6cdb0c52 715
+pingora-core/src/protocols/http/authority.rs
+  s_6ab27ee70805bc::t_5bf9f41911c42a 404-405
+  s_6ab27ee70805bc::t_eac15770d79b4f 38
+  s_6ab27ee70805bc::t_091a3500d072d5 132
+  s_6ab27ee70805bc::t_93a9ed057fa388 155-156,379,381-383,389-390,393-394
+  s_6ab27ee70805bc::t_5d52c08ecf7f0d 391-392,403,406
+  s_6ab27ee70805bc::t_caa48192bb2c7f 39-40
+  s_6ab27ee70805bc::t_e542444c530e2d 41
+  s_6ab27ee70805bc::t_e404d2e309781a 157-163,165-167
+  s_6ab27ee70805bc::t_c88b76469127be 366,373-378,380
+pingora-proxy/tests/test_upstream.rs
+  s_6ab27ee70805bc::t_f2d5c6fe9b63c5 430-434,445,532,558,564-586
+  s_6ab27ee70805bc::t_6ef9a4dd294a2b 547-551,561-563
+  s_6ab27ee70805bc::t_8d4fee368f3f9b 664-678
+pingora-proxy/src/proxy_h2.rs
+  s_6ab27ee70805bc::t_a21481e293345f 95,161,221,1375,1383
+  s_6ab27ee70805bc::t_3586182e65f544 1283-1286,1288-1289,1291-1294,1296-1297,1302-1305,1307-1308,1365-1374,1376-1382,1384-1386
+  s_6ab27ee70805bc::t_179fdb8566d27b 1357,1359
+  s_6ab27ee70805bc::t_db6b44928fcfa0 90,92-93,96-111,199-205
+  s_6ab27ee70805bc::t_d57c43c89139bd 1287,1295,1306,1310,1358
+  s_6ab27ee70805bc::t_16c510a9598be5 222-224
+  s_6ab27ee70805bc::t_cc91db0937bddd 229-234,1280-1281,1299-1300,1314-1315,1317-1318,1326-1327,1334-1335,1341-1342,1349-1350
+  s_6ab27ee70805bc::t_13155b63c116ce 27-30,118
+  s_6ab27ee70805bc::t_c896bb3ef50518 94,119,159,198
+pingora-core/src/protocols/http/server.rs
+  s_6ab27ee70805bc::t_eac15770d79b4f 126
+pingora-core/src/protocols/http/v2/server.rs
+  s_6ab27ee70805bc::t_6b5e416a78cfec 457
+  s_6ab27ee70805bc::t_1c2dfbc7b3eb23 1665-1709
+pingora-proxy/src/proxy_common.rs
+  s_6ab27ee70805bc::t_a21481e293345f 32,38,48-49
+  s_6ab27ee70805bc::t_cfb80868fa4a07 47,50
+  s_6ab27ee70805bc::t_f1592fe68d3655 189-190
+  s_6ab27ee70805bc::t_e284724809846b 561-564,568-569
+  s_6ab27ee70805bc::t_cc91db0937bddd 565-567
+  s_6ab27ee70805bc::t_61959bbb9982d1 596-609
+  s_6ab27ee70805bc::t_a07ccc45d39dba 26-31,33-37,39-46,51-52,209-218,220
+  s_6ab27ee70805bc::t_26ef6d25dc7c1c 219
+  s_6ab27ee70805bc::t_2329348c0ac8d6 221
+pingora-proxy/src/proxy_h1.rs
+  s_6ab27ee70805bc::t_a21481e293345f 55
+  s_6ab27ee70805bc::t_45c47f329275bb 48,53-54,56-57,89
+  s_6ab27ee70805bc::t_2ddb10634c56d4 49,91-92
+  s_6ab27ee70805bc::t_8c4f718b44aaa2 90,93-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4e0aa3d5140cb3bcb92f5bd9900ecb0803cc5908",
+  "prompts": {},
+  "sessions": {
+    "s_6ab27ee70805bc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00386272fffeJ4jtmTn0a8EqYZ",
+        "model": "gpt-5.6"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
