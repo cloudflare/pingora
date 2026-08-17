@@ -1,0 +1,19 @@
+pingora-proxy/tests/test_upstream.rs
+  s_6ab27ee70805bc::t_c1d53b1d69a698 575,583-584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fa1343e501e93fc90f96b218bcf252f9b7653f6f",
+  "prompts": {},
+  "sessions": {
+    "s_6ab27ee70805bc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00386272fffeJ4jtmTn0a8EqYZ",
+        "model": "gpt-5.6"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
