@@ -505,6 +505,14 @@ impl HttpSession {
         self.body_recv
     }
 
+    /// Request body bytes written to the upstream (payload only; excludes headers/framing).
+    ///
+    /// Counts what the body writer accepted, not what the caller offered, so it can be
+    /// compared against the request `Content-Length` to detect a truncated request body.
+    pub fn body_bytes_sent(&self) -> usize {
+        self.bytes_sent
+    }
+
     /// Whether there is no more body to read.
     pub fn is_body_done(&mut self) -> bool {
         self.init_body_reader();
@@ -1604,6 +1612,50 @@ mod tests_stream {
             .unwrap();
         let res = http_stream.write_body(body).await;
         assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
+    }
+
+    #[tokio::test]
+    async fn body_bytes_sent_content_length() {
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+        let mock_io = Builder::new()
+            .write(&header[..])
+            .write(b"ab")
+            .write(b"cde")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "5").unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // the request header must not be counted
+        assert_eq!(http_stream.body_bytes_sent(), 0);
+        http_stream.write_body(b"ab").await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 2);
+        http_stream.write_body(b"cde").await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 5);
+    }
+
+    #[tokio::test]
+    async fn body_bytes_sent_truncated_write() {
+        // Content-Length declares 5 but only 2 bytes are ever written, which is the shape
+        // `body_bytes_sent` exists to detect.
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+        let mock_io = Builder::new().write(&header[..]).write(b"ab").build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "5").unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        http_stream.write_body(b"ab").await.unwrap();
+
+        assert_eq!(http_stream.body_bytes_sent(), 2);
     }
 
     #[cfg(feature = "patched_http1")]

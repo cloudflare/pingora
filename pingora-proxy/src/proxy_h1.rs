@@ -206,6 +206,10 @@ where
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
+        // Record request body bytes written to the upstream (payload only) for logging consumers.
+        // Only HTTP/1.x tracks this; see `Session::upstream_body_bytes_sent`.
+        session.set_upstream_body_bytes_sent(client_session.body_bytes_sent());
+
         // Record upstream write pending time for this session only (delta from baseline).
         let current_write_pending = client_session.stream().get_write_pending_time();
         let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);

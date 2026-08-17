@@ -500,6 +500,12 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Request body bytes written to the upstream (payload only). Set by proxy layer.
+    ///
+    /// `None` when the proxy layer does not track it (HTTP/2 and custom upstreams), which is
+    /// deliberately distinct from `Some(0)` so that "not measured" cannot be mistaken for
+    /// "a request body was dropped".
+    upstream_body_bytes_sent: Option<usize>,
     /// Whether proxy task filtering has seen a downstream 101 upgrade header.
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
@@ -529,6 +535,7 @@ impl Session {
             #[cfg(feature = "upstream_modules")]
             upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
@@ -836,6 +843,20 @@ impl Session {
     /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
         self.upstream_body_bytes_received = n;
+    }
+
+    /// Get the request body bytes written to the upstream (payload only) recorded by the proxy
+    /// layer.
+    ///
+    /// Returns `None` when the proxy layer does not track it (HTTP/2 and custom upstreams).
+    pub fn upstream_body_bytes_sent(&self) -> Option<usize> {
+        self.upstream_body_bytes_sent
+    }
+
+    /// Set the request body bytes written to the upstream (payload only). Intended for internal
+    /// use by proxy layer.
+    pub(crate) fn set_upstream_body_bytes_sent(&mut self, n: usize) {
+        self.upstream_body_bytes_sent = Some(n);
     }
 
     /// Get the upstream write pending time recorded by the proxy layer. Returns [`Duration::ZERO`] for HTTP/2.
