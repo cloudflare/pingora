@@ -1,0 +1,34 @@
+pingora-proxy/src/proxy_h1.rs
+  s_8608d6365995db::t_7784fd0c7da9b1 209-212
+pingora-proxy/src/lib.rs
+  s_8608d6365995db::t_ddbdc25fcde911 503-508,850
+  s_41ac1538fa5982::t_847f697df7f343 538,848-849,851-861
+pingora-core/src/protocols/http/v1/client.rs
+  s_8608d6365995db::t_4fa96093e95caf 1617-1660
+  s_8608d6365995db::t_b42563f6a6b3f2 510-511
+  s_8608d6365995db::t_ea7766fade04fa 508-509,512-515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "02e5bd3f8b831f7d5b32b3086a2e6a7ac5ddd814",
+  "prompts": {},
+  "sessions": {
+    "s_41ac1538fa5982": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00e8128ebffeJK4AsuaDkAKlk2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "ewang <ewang@cloudflare.com>"
+    },
+    "s_8608d6365995db": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0309f75eaffeD5ae8DHhHJ1FVC",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    }
+  }
+}
