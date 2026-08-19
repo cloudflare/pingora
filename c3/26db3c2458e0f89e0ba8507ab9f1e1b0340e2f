@@ -1,0 +1,37 @@
+pingora-core/src/protocols/http/authority.rs
+  s_ebfcf1b383f593::t_2739865636e9fe 122-123
+  s_ebfcf1b383f593::t_ecf1b2a9820ad0 252
+  s_ebfcf1b383f593::t_2aa570078c04d6 53,165,254,261,302,313,328,332,669,673,677,689
+  s_ebfcf1b383f593::t_5716b1b29aaa2f 186-190
+  s_ebfcf1b383f593::t_2687e5648bc436 143-144
+  s_ebfcf1b383f593::t_0f4e4ebde1f418 62,308,310-312,326-327,331,341-342,344,694-709
+  s_ebfcf1b383f593::t_d244796f72c7f3 275-276
+  s_ebfcf1b383f593::t_6c63fe9d378f1c 277-290,298
+  s_ebfcf1b383f593::t_edd9de636f1a16 320-325,329-330
+  s_ebfcf1b383f593::t_0996d73791ddf2 132,159
+  s_ebfcf1b383f593::t_0d90878322225e 274,295,318-319
+  s_ebfcf1b383f593::t_4f3b13f488814a 299-300
+  s_ebfcf1b383f593::t_f3adb876bbc907 253
+pingora-proxy/src/proxy_h2.rs
+  s_ebfcf1b383f593::t_2aa570078c04d6 53
+pingora-core/src/protocols/http/v2/server.rs
+  s_ebfcf1b383f593::t_2aa570078c04d6 355
+pingora-proxy/src/proxy_common.rs
+  s_ebfcf1b383f593::t_2aa570078c04d6 271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c326db3c2458e0f89e0ba8507ab9f1e1b0340e2f",
+  "prompts": {},
+  "sessions": {
+    "s_ebfcf1b383f593": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fe8d953a0ffe8fdWuSCOh3G1Oi",
+        "model": "gpt-5.6"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
