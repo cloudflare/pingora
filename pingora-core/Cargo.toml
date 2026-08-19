@@ -94,7 +94,13 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 rstest = "0.23.0"
-rustls = "0.23"
+# Only used for types in tests; the crypto provider arrives through
+# pingora-rustls, so no provider feature is selected here.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+] }
 
 [[bench]]
 name = "h1_pipelining"
