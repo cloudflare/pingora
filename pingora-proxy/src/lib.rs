@@ -67,6 +67,7 @@ use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
+use pingora_core::protocols::http::ReusableHttpStream;
 use pingora_core::protocols::http::ServerSession as HttpSession;
 use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
@@ -1080,12 +1081,10 @@ where
                     if let Some(uc) = self.inner.persist_connection_context(&session, &ctx) {
                         persistent_settings.set_user_context(uc);
                     }
-                    return session
-                        .downstream_session
-                        .finish()
+                    return self
+                        .inner
+                        .finish_downstream_session(session.downstream_session, &mut ctx)
                         .await
-                        .ok()
-                        .flatten()
                         .map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings));
                 }
                 /* else continue */
