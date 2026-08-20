@@ -191,6 +191,13 @@ where
                         }
                     }
                     None => {
+                        /* recheck the cache before becoming the writer: another lookup may have
+                         * populated it and removed its lock between our initial miss and
+                         * acquiring this write lock */
+                        let (result, _) = self.inner.get(key);
+                        if let Some(result) = result {
+                            return (Ok(result), CacheStatus::LockHit);
+                        }
                         let new_lock = CacheLock::new_arc();
                         let new_lock2 = new_lock.clone();
                         lockers.insert(hashed_key, new_lock2);
