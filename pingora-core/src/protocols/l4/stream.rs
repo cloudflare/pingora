@@ -630,14 +630,20 @@ impl AsRawSocket for Stream {
 #[cfg(unix)]
 impl UniqueID for Stream {
     fn id(&self) -> UniqueIDType {
-        self.as_raw_fd()
+        match &self.stream().get_ref().stream {
+            RawStream::Virtual(s) => s.id(),
+            _ => self.as_raw_fd(),
+        }
     }
 }
 
 #[cfg(windows)]
 impl UniqueID for Stream {
     fn id(&self) -> usize {
-        self.as_raw_socket() as usize
+        match &self.stream().get_ref().stream {
+            RawStream::Virtual(s) => s.id(),
+            _ => self.as_raw_socket() as usize,
+        }
     }
 }
 

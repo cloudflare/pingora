@@ -2,12 +2,14 @@
 
 use std::{
     pin::Pin,
+    sync::atomic::{AtomicU32, Ordering},
     task::{Context, Poll},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::ext::TcpKeepalive;
+use crate::protocols::UniqueIDType;
 
 /// A limited set of socket options that can be set on a [`VirtualSocket`].
 #[non_exhaustive]
@@ -27,17 +29,49 @@ pub trait VirtualSocket: AsyncRead + AsyncWrite + Unpin + Send + Sync + std::fmt
 #[derive(Debug)]
 pub struct VirtualSocketStream {
     pub(crate) socket: Box<dyn VirtualSocket>,
+    id: UniqueIDType,
 }
 
 impl VirtualSocketStream {
     pub fn new(socket: Box<dyn VirtualSocket>) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            id: next_id(),
+        }
     }
 
     #[inline]
     pub fn set_socket_option(&self, opt: VirtualSockOpt) -> std::io::Result<()> {
         self.socket.set_socket_option(opt)
     }
+
+    /// The unique ID of this stream.
+    ///
+    /// Virtual streams have no real fd, so IDs are allocated from a range no
+    /// real fd or socket handle can occupy. This keeps pooled virtual streams
+    /// distinguishable from each other and from real connections.
+    pub fn id(&self) -> UniqueIDType {
+        self.id
+    }
+}
+
+/// Allocate IDs counting down from -2: real fds are non-negative and -1 is the
+/// "no fd" sentinel, so this range can never collide with either.
+#[cfg(unix)]
+fn next_id() -> UniqueIDType {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // stay within [0, i32::MAX - 1] so the ID below stays within [i32::MIN, -2]
+    let n = NEXT.fetch_add(1, Ordering::Relaxed) % (i32::MAX as u32);
+    -2 - (n as i32)
+}
+
+/// Allocate IDs counting down from usize::MAX - 1: real socket handles are
+/// small values and usize::MAX is INVALID_SOCKET, so this range can never
+/// collide with either.
+#[cfg(windows)]
+fn next_id() -> UniqueIDType {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    usize::MAX - 1 - (NEXT.fetch_add(1, Ordering::Relaxed) as usize)
 }
 
 impl AsyncRead for VirtualSocketStream {
