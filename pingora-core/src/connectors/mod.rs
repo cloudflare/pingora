@@ -261,12 +261,25 @@ impl TransportConnector {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
-                        if peer.matches_fd(stream.id())
-                            && test_reusable_stream(&mut stream, &self.unexpected_data_conn_count)
                         {
-                            Some(stream)
-                        } else {
-                            None
+                            let id = stream.id();
+                            // Virtual streams have negative IDs and no real fd to getpeername(),
+                            // so compare the peer address recorded in their socket digest instead.
+                            let peer_match = if id < 0 {
+                                virtual_stream_peer_match(&stream, peer)
+                            } else {
+                                peer.matches_fd(id)
+                            };
+                            if peer_match
+                                && test_reusable_stream(
+                                    &mut stream,
+                                    &self.unexpected_data_conn_count,
+                                )
+                            {
+                                Some(stream)
+                            } else {
+                                None
+                            }
                         }
                         #[cfg(windows)]
                         {
@@ -470,6 +483,36 @@ impl PreferredHttpVersion {
 
 use futures::future::FutureExt;
 use tokio::io::AsyncReadExt;
+
+/// Test whether a pooled virtual stream is connected to the given peer.
+///
+/// Virtual streams have no real fd for a `getpeername()` check, so this compares the peer
+/// address recorded in the stream's socket digest when it was created. Streams without a
+/// recorded peer address are never reused.
+#[cfg(unix)]
+fn virtual_stream_peer_match<P: Peer>(stream: &Stream, peer: &P) -> bool {
+    let Some(digest) = stream.get_socket_digest() else {
+        debug!("Pooled virtual stream has no socket digest, not reusable");
+        return false;
+    };
+    match digest.peer_addr() {
+        Some(addr) if addr == peer.address() => {
+            debug!("Virtual stream to {addr} is reusable");
+            true
+        }
+        Some(addr) => {
+            error!(
+                "Crit: virtual stream mismatch: stream: {addr}, peer: {}",
+                peer.address()
+            );
+            false
+        }
+        None => {
+            debug!("Pooled virtual stream has no peer address, not reusable");
+            false
+        }
+    }
+}
 
 /// Test whether a stream is already closed or not reusable (server sent unexpected data)
 fn test_reusable_stream(stream: &mut Stream, unexpected_data_conn_count: &AtomicU64) -> bool {
@@ -835,5 +878,113 @@ mod tests {
             1,
             "unexpected_data_connection_count should have incremented"
         );
+    }
+
+    #[cfg(unix)]
+    mod virtual_stream_reuse {
+        use super::*;
+        use crate::protocols::l4::stream::Stream as L4Stream;
+        use crate::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+        use crate::protocols::{SocketDigest, UniqueID};
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+        /// A virtual socket that stays idle: reads park forever and writes succeed.
+        #[derive(Debug)]
+        struct IdleVirtualSocket;
+
+        impl AsyncRead for IdleVirtualSocket {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+
+        impl AsyncWrite for IdleVirtualSocket {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl VirtualSocket for IdleVirtualSocket {
+            fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn new_virtual_stream(peer: Option<&BasicPeer>) -> Stream {
+            let mut stream = L4Stream::from(VirtualSocketStream::new(Box::new(IdleVirtualSocket)));
+            if let Some(peer) = peer {
+                let digest = SocketDigest::from_raw_fd(-1);
+                digest.peer_addr.set(Some(peer.address().clone())).unwrap();
+                stream.set_socket_digest(digest);
+            }
+            Box::new(stream)
+        }
+
+        #[test]
+        fn test_virtual_stream_ids_are_unique() {
+            let s1 = new_virtual_stream(None);
+            let s2 = new_virtual_stream(None);
+            assert!(s1.id() < -1);
+            assert!(s2.id() < -1);
+            assert_ne!(s1.id(), s2.id());
+        }
+
+        #[tokio::test]
+        async fn test_virtual_stream_reuse() {
+            let connector = TransportConnector::new(None);
+            let peer = BasicPeer::new("192.0.2.1:80");
+
+            let stream = new_virtual_stream(Some(&peer));
+            connector.release_stream(stream, peer.reuse_hash(), None);
+            assert!(connector.reused_stream(&peer).await.is_some());
+            // the stream was taken out of the pool
+            assert!(connector.reused_stream(&peer).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_virtual_stream_wrong_peer_not_reused() {
+            let connector = TransportConnector::new(None);
+            let peer = BasicPeer::new("192.0.2.1:80");
+            let other = BasicPeer::new("192.0.2.2:80");
+
+            // pool a stream to `peer` under `other`'s key, as a reuse_hash collision would
+            let stream = new_virtual_stream(Some(&peer));
+            connector.release_stream(stream, other.reuse_hash(), None);
+            assert!(connector.reused_stream(&other).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_virtual_stream_without_digest_not_reused() {
+            let connector = TransportConnector::new(None);
+            let peer = BasicPeer::new("192.0.2.1:80");
+
+            let stream = new_virtual_stream(None);
+            connector.release_stream(stream, peer.reuse_hash(), None);
+            assert!(connector.reused_stream(&peer).await.is_none());
+        }
     }
 }
