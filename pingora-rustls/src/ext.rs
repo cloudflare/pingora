@@ -29,10 +29,8 @@ pub fn ssl_export_keying_material(
     label: &str,
     context: Option<&[u8]>,
 ) -> Result<(), Error> {
-    let output = out.to_vec();
-    let result = conn.export_keying_material(output, label.as_bytes(), context)?;
-    out.copy_from_slice(&result);
-    Ok(())
+    conn.export_keying_material(out, label.as_bytes(), context)
+        .map(|_| ())
 }
 
 /// Export keying material from a TLS server connection
@@ -46,10 +44,8 @@ pub fn ssl_export_keying_material_server(
     label: &str,
     context: Option<&[u8]>,
 ) -> Result<(), Error> {
-    let output = out.to_vec();
-    let result = conn.export_keying_material(output, label.as_bytes(), context)?;
-    out.copy_from_slice(&result);
-    Ok(())
+    conn.export_keying_material(out, label.as_bytes(), context)
+        .map(|_| ())
 }
 
 #[cfg(test)]
