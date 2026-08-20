@@ -18,6 +18,10 @@ Pingora HTTP proxy APIs and traits.
 name = "pingora_proxy"
 path = "src/lib.rs"
 
+[[bench]]
+name = "shutdown_signal"
+harness = false
+
 [dependencies]
 pingora-error = { version = "0.8.0", path = "../pingora-error" }
 pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
