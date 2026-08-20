@@ -59,6 +59,10 @@ mod tests {
         // This test verifies that ssl_export_keying_material function exists
         // and has the correct signature. Actual functional testing requires
         // an established TLS connection.
+        // The config builder uses the process-level crypto provider, which is
+        // ambiguous when both ring and aws-lc-rs are enabled via feature
+        // unification, so install one explicitly.
+        crate::install_default_crypto_provider();
         let root_store = RootCertStore::empty();
         let config = Arc::new(
             ClientConfig::builder()
@@ -79,6 +83,7 @@ mod tests {
         // This test verifies that ssl_export_keying_material_server function exists
         // and has the correct signature. Actual functional testing requires
         // an established TLS connection.
+        crate::install_default_crypto_provider();
         let config = Arc::new(
             ServerConfig::builder()
                 .with_no_client_auth()
