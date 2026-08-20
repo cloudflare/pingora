@@ -44,11 +44,13 @@ use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
+use std::future::{poll_fn, Future};
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc,
 };
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
@@ -77,6 +79,9 @@ use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
+
+/// Caps per-proxy padding and one-time shutdown fan-out on very large hosts.
+const MAX_SHUTDOWN_NOTIFY_SHARDS: usize = 256;
 
 type DownstreamCustomMessageReader =
     Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
@@ -108,6 +113,68 @@ pub type ProcessCustomSession<SV, C> = Arc<
         + 'static,
 >;
 
+/// Shutdown [`Notify`] sharded by worker thread.
+///
+/// Every request that parks in `read_request()` registers a shutdown waiter and
+/// unregisters it when the read completes. Both operations lock the `Notify`'s
+/// internal mutex, so a single `Notify` shared across the whole proxy becomes a
+/// contention hot spot on many-core machines. Sharding keeps waiter
+/// registration on a (mostly) thread-local shard while shutdown notifies every
+/// shard.
+struct ShardedNotify {
+    shards: Box<[NotifyShard]>,
+}
+
+/// Align each shard so its [`Notify`] state and waiter-list mutex do not share a
+/// cache line with an adjacent shard. Without padding, writes made while adding
+/// or removing waiters can falsely share a cache line with an independent shard,
+/// forcing cache-coherence protocols such as MESI to transfer or invalidate that
+/// line between cores. These transfers are especially expensive when they cross
+/// the interconnect between sockets on a NUMA system.
+///
+/// The 128-byte alignment separates adjacent shards on systems with common
+/// 64- or 128-byte cache lines. This trades bounded padding for avoiding false
+/// sharing between shards; waiters assigned to the same shard can still contend.
+#[repr(align(128))]
+struct NotifyShard(Notify);
+
+impl ShardedNotify {
+    /// Create enough shards for the configured worker threads, rounded up
+    /// to preserve mask-based indexing and bounded by [`MAX_SHUTDOWN_NOTIFY_SHARDS`].
+    fn new(worker_threads: usize) -> Self {
+        let shards = worker_threads
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(MAX_SHUTDOWN_NOTIFY_SHARDS)
+            .min(MAX_SHUTDOWN_NOTIFY_SHARDS);
+        ShardedNotify {
+            shards: (0..shards).map(|_| NotifyShard(Notify::new())).collect(),
+        }
+    }
+
+    /// Return the shard assigned to the current thread.
+    ///
+    /// A task can migrate after registering, but its [`Notified`](tokio::sync::futures::Notified)
+    /// future remains bound to this shard and shutdown notifies every shard.
+    fn local(&self) -> &Notify {
+        static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static THREAD_ID: usize = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        let id = THREAD_ID.with(|id| *id);
+        // the shard count is a power of two
+        &self.shards[id & (self.shards.len() - 1)].0
+    }
+
+    /// Notify waiters on every shard, including tasks polled by a different
+    /// worker after registering.
+    fn notify_waiters(&self) {
+        for shard in self.shards.iter() {
+            shard.0.notify_waiters();
+        }
+    }
+}
+
 /// The concrete type that holds the user defined HTTP proxy.
 ///
 /// Users don't need to interact with this object directly.
@@ -117,7 +184,7 @@ where
 {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector<C>,
-    shutdown: Notify,
+    shutdown: ShardedNotify,
     shutdown_flag: Arc<AtomicBool>,
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
@@ -153,7 +220,7 @@ impl<SV> HttpProxy<SV, ()> {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
             h2_options: None,
@@ -189,7 +256,7 @@ where
         HttpProxy {
             inner,
             client_upstream,
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
@@ -230,6 +297,28 @@ where
         self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
+    /// Resolve when `http_cleanup()` has been called.
+    ///
+    /// The waiter is registered on the current thread's shard before
+    /// `shutdown_flag` is checked, so a shutdown firing in between cannot be
+    /// missed: either the flag load sees the store, or the registered waiter
+    /// receives the notification.
+    async fn await_shutdown(&self) {
+        let notified = self.shutdown.local().notified();
+        tokio::pin!(notified);
+
+        poll_fn(|context| {
+            if notified.as_mut().poll(context).is_ready()
+                || self.shutdown_flag.load(Ordering::Acquire)
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
     async fn handle_new_request(
         &self,
         mut downstream_session: Box<HttpSession>,
@@ -243,7 +332,7 @@ where
         let res = tokio::select! {
             biased; // biased select is cheaper, and we don't want to drop already buffered requests
             res = downstream_session.read_request() => { res }
-            _ = self.shutdown.notified() => {
+            _ = self.await_shutdown() => {
                 // service shutting down, dropping the connection to stop more req from coming in
                 return None;
             }
@@ -2438,5 +2527,104 @@ mod tests {
         assert!(called.load(Ordering::Acquire));
         let written = written.lock().unwrap().clone();
         assert_raw_upgrade_payload(&written);
+    }
+
+    /// A socket whose reads never complete, like an idle keep-alive connection
+    /// waiting for its next request.
+    #[derive(Debug)]
+    struct PendingVirtualSocket;
+
+    impl AsyncRead for PendingVirtualSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingVirtualSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl VirtualSocket for PendingVirtualSocket {
+        fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopProxy;
+
+    #[async_trait]
+    impl ProxyHttp for NoopProxy {
+        type CTX = ();
+        fn new_ctx(&self) -> Self::CTX {}
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            Err(Error::new(InternalError))
+        }
+    }
+
+    fn pending_session() -> Box<HttpSession> {
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(PendingVirtualSocket)));
+        Box::new(HttpSession::new_http1(Box::new(stream)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_wakes_parked_read_requests() {
+        let conf = ServerConf {
+            threads: 4,
+            ..ServerConf::default()
+        };
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(conf)));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let proxy = proxy.clone();
+                tokio::spawn(async move { proxy.handle_new_request(pending_session()).await })
+            })
+            .collect();
+        // let the tasks park in read_request()
+        time::sleep(Duration::from_millis(50)).await;
+        proxy.http_cleanup().await;
+        for handle in handles {
+            let session = time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("shutdown did not wake the parked read")
+                .unwrap();
+            assert!(session.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_read_request_parks_returns_immediately() {
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(ServerConf::default())));
+        proxy.http_cleanup().await;
+        // a request that parks after notify_waiters() already fired must not
+        // wait for a notification that will never come
+        let session = time::timeout(
+            Duration::from_secs(5),
+            proxy.handle_new_request(pending_session()),
+        )
+        .await
+        .expect("read_request parked after shutdown");
+        assert!(session.is_none());
     }
 }
