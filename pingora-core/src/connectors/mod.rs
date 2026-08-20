@@ -656,7 +656,7 @@ mod tests {
         // make a new connection to mock uds
         let mut stream = connector.new_stream(&peer).await.unwrap();
         let mut buf = [0; 9];
-        let _ = stream.read(&mut buf).await.unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"it works!");
 
         // Test connection reuse by releasing and getting the stream back
