@@ -639,6 +639,42 @@ async fn test_hostless_non_utf8_h1_target_is_rejected_before_h2_serialization() 
 }
 
 #[tokio::test]
+async fn test_h1_absolute_form_to_h2_upstream_sends_path_and_query() {
+    init();
+
+    // An H1 upstream receives the absolute-form target verbatim from raw_path(), but
+    // `:path` carries only the path and query (RFC 9113 section 8.3.1), so the two
+    // upstreams see different request targets for the same downstream request.
+    //
+    // The other two absolute-form H2 tests drive a host-override filter and a hostless
+    // target; this is the plain shape, with a matching Host and a query.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        let _ = tx.send(request.uri().clone());
+        respond
+            .send_response(http::Response::new(()), true)
+            .unwrap();
+        let _ = timeout(Duration::from_millis(100), connection.accept()).await;
+    });
+
+    let request = concat!(
+        "GET http://client.example/test?q=1 HTTP/1.1\r\n",
+        "Host: client.example\r\n",
+        "x-port: {port}\r\n",
+        "x-h2: true\r\n",
+        "\r\n",
+    );
+    assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let uri = rx.await.unwrap();
+    assert_eq!(uri.path_and_query().unwrap(), "/test?q=1");
+}
+
+#[tokio::test]
 async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
     init();
 

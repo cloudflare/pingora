@@ -1364,3 +1364,28 @@ fn test_update_h2_scheme_authority() {
     );
     assert_eq!(header.raw_path(), raw_target);
 }
+
+#[test]
+fn test_h2_path_is_rooted_for_targets_with_no_authority() {
+    // Targets with no absolute-form authority carry no absolute path, so :path is rooted
+    // rather than forwarding bytes that are invalid there (RFC 9113 section 8.3.1).
+    // Forwarding them would also concatenate against the authority, rendering as
+    // "http://example.comfoo/bar".
+    for target in [&b"foo/bar"[..], b"myproto:opaque", b"foo?q=1"] {
+        let mut header = RequestHeader::build("GET", target, None).unwrap();
+        let label = String::from_utf8_lossy(target);
+        // The H1 wire serializes these bytes; only the H2 rewrite below discards them.
+        assert_eq!(target, header.raw_path(), "{label}");
+
+        let path_and_query = h2_path_and_query(&header).unwrap();
+        assert_eq!("/", path_and_query.as_str(), "{label}");
+
+        update_h2_scheme_authority(&mut header, b"example.com", false, path_and_query).unwrap();
+        assert_eq!("http://example.com/", header.uri.to_string(), "{label}");
+        assert_eq!(
+            Some("example.com"),
+            header.uri.authority().map(|authority| authority.as_str()),
+            "{label}"
+        );
+    }
+}

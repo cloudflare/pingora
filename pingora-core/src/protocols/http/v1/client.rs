@@ -2863,6 +2863,15 @@ mod test_sync {
             request_line("CONNECT", b"www.example.com:80#x")
         );
         assert_eq!("GET /a HTTP/1.1", request_line("GET", b"/a#frag"));
+
+        // Stripping a fragment can leave nothing behind. An empty request-target would
+        // serialize as "GET  HTTP/1.1", which is malformed and which our own H1 parser
+        // rejects, so it has to fall back to the root instead.
+        assert_eq!("GET / HTTP/1.1", request_line("GET", b"#frag"));
+        assert_eq!("GET / HTTP/1.1", request_line("GET", b""));
+        // Asterisk-form and query-only targets keep their form through the strip.
+        assert_eq!("OPTIONS * HTTP/1.1", request_line("OPTIONS", b"*#frag"));
+        assert_eq!("GET ?q=1 HTTP/1.1", request_line("GET", b"?q=1#frag"));
     }
 
     /// Deterministic, parser-independent test of the request-line delimiter
