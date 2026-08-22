@@ -2939,8 +2939,13 @@ mod tests_stream {
         let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
+        let err = http_stream.read_request().await.unwrap_err();
+        assert_eq!(&InvalidHTTPHeader, err.etype());
+        // InvalidHTTPHeader covers every authority rejection, so pin the reason as well.
+        assert!(
+            format!("{err}").contains("Host header differs from request-target authority"),
+            "rejected for the wrong reason: {err}"
+        );
     }
 
     #[tokio::test]

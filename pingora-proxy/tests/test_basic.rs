@@ -832,7 +832,6 @@ async fn test_connect_proxying_allowed_h1() {
     assert!(resp.ends_with("ok"));
 }
 
-#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_allowed_h1_without_host() {
     init();
