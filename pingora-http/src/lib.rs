@@ -37,6 +37,8 @@ pub use http::status::StatusCode;
 pub use http::version::Version;
 pub use http::HeaderMap as HMap;
 
+pub mod authority;
+
 mod case_header_name;
 use case_header_name::CaseHeaderName;
 pub use case_header_name::IntoCaseHeaderName;
