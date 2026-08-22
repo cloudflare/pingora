@@ -1,0 +1,24 @@
+pingora-http/src/lib.rs
+  s_f7268f5f784188::t_7970006ce09428 366,408,688-689,703,712,758
+  s_f7268f5f784188::t_9b85f9d34ea4b1 146,292-294,319-322
+  s_f7268f5f784188::t_0f57ece09b786b 349,361,395
+  s_f7268f5f784188::t_81dc8c510c0fad 1396,1402,1411-1414,1416-1419,1423-1426,1430,1433-1438,1444
+  s_f7268f5f784188::t_57252e6190b22c 87,92-123
+  s_f7268f5f784188::t_4b542587324cfe 124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "651c7b842273d4218c5ce7cf5f5f8a637977d077",
+  "prompts": {},
+  "sessions": {
+    "s_f7268f5f784188": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fdf00dd6cffew0487lWn6Y9Pmh",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
