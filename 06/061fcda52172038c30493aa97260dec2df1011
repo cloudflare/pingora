@@ -1,0 +1,19 @@
+Makefile
+  s_380fa8f786b086::t_986f31971ddc71 21-31,33-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "06061fcda52172038c30493aa97260dec2df1011",
+  "prompts": {},
+  "sessions": {
+    "s_380fa8f786b086": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fe993e13dffeX1mgO8A7iw7gQG",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}

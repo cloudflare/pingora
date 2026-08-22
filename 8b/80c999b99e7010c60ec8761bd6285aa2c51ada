@@ -1,0 +1,25 @@
+pingora-http/src/lib.rs
+  s_f7268f5f784188::t_1d39f2d4dfbdf5 40-41
+pingora-core/src/protocols/http/mod.rs
+  s_f7268f5f784188::t_9724fd0a61071d 30-34
+pingora-http/src/authority.rs
+  s_f7268f5f784188::t_ec6c5c48b095ad 17
+  s_f7268f5f784188::t_46703158157db8 22,24,29,35,38,190,193,211-215,244
+  s_f7268f5f784188::t_056d5d58e9b829 87-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8b80c999b99e7010c60ec8761bd6285aa2c51ada",
+  "prompts": {},
+  "sessions": {
+    "s_f7268f5f784188": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fdf00dd6cffew0487lWn6Y9Pmh",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}

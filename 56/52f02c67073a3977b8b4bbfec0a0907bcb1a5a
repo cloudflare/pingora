@@ -1,0 +1,54 @@
+pingora-proxy/src/proxy_h2.rs
+  s_ebfcf1b383f593::t_93aa9983c194f0 38,44,91,142-152,200-206,1268-1272,1279,1281,1283,1285,1287,1289,1293,1295,1300,1305,1312,1319,1324,1328,1337
+  s_ebfcf1b383f593::t_9b85cd32b4089c 1301,1304,1311,1325,1327
+  s_ebfcf1b383f593::t_960106071a74a4 36-37,39-43,49,53,88,113,230-231,1273,1278,1280,1284,1286,1290,1294,1296,1299,1302-1303,1307,1313-1316,1318,1320,1323,1326,1334-1336,1338-1343
+  s_ebfcf1b383f593::t_fbd3bd5c9e1795 47
+  s_ebfcf1b383f593::t_3856d9093a0552 223-225
+  s_ebfcf1b383f593::t_3766dbf51ece68 207
+pingora-proxy/src/proxy_common.rs
+  s_ebfcf1b383f593::t_fbd3bd5c9e1795 208
+  s_ebfcf1b383f593::t_095af69fb13dbc 18
+  s_ebfcf1b383f593::t_fca8ea0efd0b1f 200,210
+  s_ebfcf1b383f593::t_960106071a74a4 186,189-191,196-199,201,207,211,616-625
+pingora-proxy/tests/test_basic.rs
+  s_ebfcf1b383f593::t_2a524493a53448 839-859
+  s_ebfcf1b383f593::t_407616d41486cb 767-772,774-779,860
+  s_ebfcf1b383f593::t_bcf5333a380d10 861-863
+pingora-proxy/tests/utils/server_utils.rs
+  s_ebfcf1b383f593::t_960106071a74a4 372-378
+pingora-http/src/lib.rs
+  s_ebfcf1b383f593::t_93aa9983c194f0 322-328,1046,1061
+pingora-proxy/tests/test_upstream.rs
+  s_ebfcf1b383f593::t_960106071a74a4 646,695-713
+  s_ebfcf1b383f593::t_f6ecc4a8017462 596-599,601,624-645,694
+  s_ebfcf1b383f593::t_9d1ff327a720e0 647
+pingora-core/src/protocols/http/authority.rs
+  s_ebfcf1b383f593::t_59e9080fd60ba2 517-520,546,574
+  s_ebfcf1b383f593::t_4417ddffeb4259 49,121-124,193-195,229-238,273-277,425,439-450,469,571-572
+  s_ebfcf1b383f593::t_e4849faacf53c9 31-40
+  s_ebfcf1b383f593::t_48f3d100ba284d 128,130,140-145,159-164,175,177
+  s_ebfcf1b383f593::t_3856d9093a0552 436-438,511-516
+  s_ebfcf1b383f593::t_dbd5352285c81d 26-28,137-139
+  s_ebfcf1b383f593::t_ac41ccaf7c0715 129,171
+  s_ebfcf1b383f593::t_e5b47493ba67cb 394-403,543-545
+  s_ebfcf1b383f593::t_aa3db9d0e7dc14 573
+pingora-proxy/src/proxy_h1.rs
+  s_ebfcf1b383f593::t_960106071a74a4 24,95-96,98
+  s_ebfcf1b383f593::t_fca8ea0efd0b1f 23,97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5652f02c67073a3977b8b4bbfec0a0907bcb1a5a",
+  "prompts": {},
+  "sessions": {
+    "s_ebfcf1b383f593": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fe8d953a0ffe8fdWuSCOh3G1Oi",
+        "model": "gpt-5.6"
+      },
+      "human_author": "Andrew Hauck <ahauck@cloudflare.com>"
+    }
+  }
+}
