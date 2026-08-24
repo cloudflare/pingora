@@ -228,6 +228,40 @@ where
         false
     }
 
+    /// Hold the final upstream response header until the application commits it.
+    ///
+    /// Called once per request, after [`Self::request_filter`]. When it returns
+    /// `true`, the cache is bypassed and each final header is held after
+    /// [`Self::response_filter`]. While it is held,
+    /// [`Self::upstream_response_body_filter`] takes each chunk from `body` and
+    /// buffers it in `ctx`. On a verdict, change the header with
+    /// [`Session::held_response_header_mut`] if needed and pass the body to
+    /// [`Session::commit_held_response_header`], leaving `body` as `None`, or
+    /// return an error for [`Self::fail_to_proxy`] to write. Body, end of
+    /// stream, trailers or a response write that reach the proxy before commit
+    /// fail the request.
+    ///
+    /// The body filters do not always see a whole body. A 206 to a Range request
+    /// is partial. 101 tunnels and header-only responses, including HTTP/1
+    /// `Content-Length: 0`, pass through unheld. On HTTP/2, a `Content-Length: 0`
+    /// response sent with an empty END_STREAM DATA frame is held, and the body
+    /// filter sees an empty end of stream. The body stays content-encoded unless
+    /// upstream decompression is enabled. For a whole-body verdict, strip Range
+    /// and If-Range in [`Self::upstream_request_filter`] or reject 206 responses.
+    /// After commit, later chunks pass unheld; to replace the body before end of
+    /// stream, drop them in [`Self::upstream_response_body_filter`] or return an
+    /// error. On custom sessions, custom messages are not held.
+    ///
+    /// Hold time and buffering are the application's responsibility. On HTTP/2
+    /// and custom upstreams, a response that ends with trailers delivers end of
+    /// stream to [`Self::upstream_response_trailer_filter`], which commits the
+    /// same way.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    fn hold_response_header(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is
