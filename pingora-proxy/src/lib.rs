@@ -95,6 +95,7 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod response_hold;
 pub mod subrequest;
 #[cfg(test)]
 mod test_support;
@@ -104,6 +105,7 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
+pub use response_hold::HeldResponse;
 
 pub mod prelude {
     pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
@@ -569,11 +571,17 @@ where
                 None
             }
             HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                if session.response_header_held() {
+                    return self.held_body_filter(session, data, *eos, ctx).await;
+                }
                 self.inner
                     .upstream_response_body_filter(session, data, *eos, ctx)
                     .await?
             }
             HttpTask::Trailer(Some(trailers)) => {
+                if session.response_header_held() {
+                    return self.held_trailer_filter(session, trailers, ctx).await;
+                }
                 self.inner
                     .upstream_response_trailer_filter(session, trailers, ctx)
                     .await?;
@@ -682,6 +690,7 @@ where
     handles_downstream_abandonment: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    response_hold: response_hold::ResponseHoldState,
 }
 
 impl<DS> Session<DS>
@@ -713,6 +722,7 @@ where
             upstream_write_pending_time: Duration::ZERO,
             handles_downstream_abandonment: false,
             shutdown_flag,
+            response_hold: response_hold::ResponseHoldState::Immediate,
         }
     }
 
@@ -1458,6 +1468,7 @@ where
             }
         }
 
+        session.arm_response_hold(self.inner.hold_response_header(&session, &ctx));
         if let Some((reuse, err)) = self.proxy_cache(&mut session, &mut ctx).await {
             // cache hit
             return self.finish(session, &mut ctx, reuse, err).await;
@@ -1516,6 +1527,8 @@ where
                     .await;
             }
         }
+        // proxy_upstream_filter may have re-enabled caching.
+        session.bypass_cache_for_response_hold();
 
         let mut retries: usize = 0;
 
@@ -1525,12 +1538,16 @@ where
         while retries < self.max_retries {
             retries += 1;
 
-            let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
+            let (mut reuse, mut e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
+            if e.is_none() {
+                e = session.unfinished_hold_error();
+                reuse &= e.is_none();
+            }
             server_reuse = reuse;
 
             match e {
                 Some(mut error) => {
-                    if !session.cache_fill_retry_allowed() {
+                    if !session.cache_fill_retry_allowed() || session.response_hold_blocks_retry() {
                         error.set_retry(false);
                     }
                     let retry = error.retry();
@@ -1555,6 +1572,7 @@ where
                     if !retry {
                         break;
                     }
+                    session.rearm_response_hold();
                 }
                 None => {
                     proxy_error = None;

@@ -228,6 +228,35 @@ where
         false
     }
 
+    /// Hold the final upstream response header until a held filter releases it.
+    ///
+    /// Called once per request, after [`Self::request_filter`]. When it returns
+    /// `true`, the cache is bypassed and each final header is held after
+    /// [`Self::response_filter`]. Until it is released, the body goes to
+    /// [`Self::held_upstream_response_body_filter`] instead of
+    /// [`Self::upstream_response_body_filter`].
+    ///
+    /// The held filters do not always see a whole body. A 206 to a Range request
+    /// is partial. 101 tunnels and header-only responses, including HTTP/1
+    /// `Content-Length: 0`, pass through unheld. On HTTP/2, a `Content-Length: 0`
+    /// response sent with an empty END_STREAM DATA frame is held, and the body
+    /// filter sees an empty end of stream. The body stays content-encoded unless
+    /// upstream decompression is enabled. For a whole-body verdict, strip Range
+    /// and If-Range in [`Self::upstream_request_filter`] or reject 206 responses.
+    /// After release, later chunks pass unheld; to replace the body before end of
+    /// stream, drop them in [`Self::upstream_response_body_filter`] or return an
+    /// error. On custom sessions, custom messages are not held.
+    ///
+    /// Hold time and buffering are the application's responsibility. On HTTP/2
+    /// and custom upstreams, a response that ends with trailers delivers end of
+    /// stream to [`Self::held_upstream_response_trailer_filter`], not the body
+    /// filter.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    fn hold_response_header(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is
@@ -553,6 +582,51 @@ where
         Self::CTX: Send + Sync,
     {
         Ok(None)
+    }
+
+    /// Called instead of [`Self::upstream_response_body_filter`] while the final
+    /// header is held (see [`Self::hold_response_header`]).
+    ///
+    /// `body` is the upstream chunk. The filter keeps or drops it; the only way
+    /// to send body bytes is [`HeldResponse::release`], which must be called by
+    /// end of stream. The released bytes and later chunks go through the normal
+    /// downstream body filters. A returned duration delays the next upstream read.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    async fn held_upstream_response_body_filter(
+        &self,
+        _response: HeldResponse<'_, DS>,
+        _body: Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "hold_response_header requires held_upstream_response_body_filter",
+        )
+    }
+
+    /// Called instead of [`Self::upstream_response_trailer_filter`] while the
+    /// final header is held. It must release the response; the released body
+    /// goes through [`Self::response_body_filter`] and out before the trailers.
+    ///
+    /// Experimental: this API may change or be removed until indicated otherwise.
+    async fn held_upstream_response_trailer_filter(
+        &self,
+        _response: HeldResponse<'_, DS>,
+        _upstream_trailers: &mut header::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Error::e_explain(
+            InternalError,
+            "hold_response_header requires held_upstream_response_trailer_filter",
+        )
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers

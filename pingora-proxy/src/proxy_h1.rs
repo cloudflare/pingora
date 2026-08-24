@@ -437,7 +437,11 @@ where
                     continue;
                 }
             }
-            filtered_tasks.push(task);
+            if session.response_hold_gated() {
+                session.push_held_task(task, &mut filtered_tasks).await?;
+            } else {
+                filtered_tasks.push(task);
+            }
         }
 
         if !serve_from_cache.should_write_response(session.downstream_abandoned_during_cache_fill())
@@ -1032,6 +1036,9 @@ where
 
                 // before it can mark it as cacheable again.
                 let mut data = range_body_filter.filter_body(data);
+                if session.response_header_held() {
+                    return Ok(HttpTask::Body(data, end));
+                }
                 if let Some(duration) = self
                     .inner
                     .response_body_filter(session, &mut data, end, ctx)
