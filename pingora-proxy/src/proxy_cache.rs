@@ -1153,6 +1153,10 @@ pub mod range_filter {
                     continue;
                 }
             };
+            if range.start >= range.end {
+                // Skip zero-length or unsatisfiable range specifications per RFC 9110 §14.1.2
+                continue;
+            }
             // For now we stick to non-overlapping, ascending ranges for simplicity
             // and parity with nginx
             if range.start < last_range_end {
@@ -1214,6 +1218,11 @@ pub mod range_filter {
             parse_range_header(b"bytes=-12", 10, None),
             RangeType::new_single(0, 10)
         );
+        assert_eq!(
+            parse_range_header(b"bytes=-0", 10, None),
+            RangeType::Invalid
+        );
+        assert_eq!(parse_range_header(b"bytes=-5", 0, None), RangeType::Invalid);
         assert_eq!(parse_range_header(b"bytes=-", 10, None), RangeType::Invalid);
         assert_eq!(parse_range_header(b"bytes=", 10, None), RangeType::Invalid);
         assert_eq!(
@@ -1647,6 +1656,26 @@ pub mod range_filter {
         assert!(resp.headers.get("accept-ranges").is_none());
         assert!(resp.headers.get("content-encoding").is_none());
         assert!(resp.headers.get("transfer-encoding").is_none());
+    }
+
+    #[test]
+    fn test_range_filter_zero_length_suffix() {
+        let req = RequestHeader::build(http::Method::GET, b"/", Some(1)).unwrap();
+        let mut req_range = req.clone();
+        req_range.insert_header("Range", "bytes=-5").unwrap();
+
+        // 0-byte resource with 200 OK
+        let mut resp = ResponseHeader::build(200, Some(1)).unwrap();
+        resp.append_header("Content-Length", "0").unwrap();
+
+        let range_type = range_header_filter(&req_range, &mut resp, None);
+        assert_eq!(RangeType::Invalid, range_type);
+        assert_eq!(resp.status.as_u16(), 416);
+        assert_eq!(resp.headers.get("content-length").unwrap().as_bytes(), b"0");
+        assert_eq!(
+            resp.headers.get("content-range").unwrap().as_bytes(),
+            b"bytes */0"
+        );
     }
 
     // Multipart Tests
