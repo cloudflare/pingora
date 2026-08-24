@@ -1082,7 +1082,9 @@ pub(crate) async fn send_body_to1(
         match task {
             HttpTask::Body(data, end) => {
                 body_done = end;
-                if let Some(d) = data {
+                // HTTP/1 has no zero-length payload frame. finish_body() owns the
+                // end-of-body framing and content-length validation.
+                if let Some(d) = data.filter(|d| !d.is_empty()) {
                     let m = client_session.write_body(&d).await;
                     match m {
                         Ok(m) => match m {
@@ -1103,7 +1105,7 @@ pub(crate) async fn send_body_to1(
                 client_session.maybe_upgrade_body_writer();
 
                 body_done = end;
-                if let Some(d) = data {
+                if let Some(d) = data.filter(|d| !d.is_empty()) {
                     let m = client_session.write_body(&d).await;
                     match m {
                         Ok(m) => {
@@ -1161,7 +1163,7 @@ pub(crate) async fn send_body_to1(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct ResponseFilter101;
 
@@ -1267,5 +1269,96 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    async fn send_body_tasks_to_wire(request: RequestHeader, tasks: Vec<HttpTask>) -> Vec<u8> {
+        let (upstream_io, mut wire_io) = tokio::io::duplex(1024);
+        let mut client_session = HttpSessionV1::new(Box::new(upstream_io) as Stream);
+
+        client_session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        for task in tasks {
+            let expected_end = task.is_end();
+            let actual_end = send_body_to1(&mut client_session, Some(task))
+                .await
+                .unwrap();
+            assert_eq!(expected_end, actual_end);
+        }
+
+        drop(client_session);
+
+        let mut wire = Vec::new();
+        wire_io.read_to_end(&mut wire).await.unwrap();
+        wire
+    }
+
+    #[tokio::test]
+    async fn empty_final_body_task_does_not_change_sized_body_framing() {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header(header::HOST, "example.com").unwrap();
+        request.insert_header(header::CONTENT_LENGTH, "3").unwrap();
+
+        let wire = send_body_tasks_to_wire(
+            request,
+            vec![
+                HttpTask::Body(Some(Bytes::from_static(b"abc")), false),
+                HttpTask::Body(Some(Bytes::new()), true),
+            ],
+        )
+        .await;
+
+        let body_start = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request headers are terminated")
+            + 4;
+        assert_eq!(b"abc", &wire[body_start..]);
+    }
+
+    #[tokio::test]
+    async fn empty_final_body_task_writes_one_chunked_terminator() {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header(header::HOST, "example.com").unwrap();
+        request
+            .insert_header(header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+
+        let wire =
+            send_body_tasks_to_wire(request, vec![HttpTask::Body(Some(Bytes::new()), true)]).await;
+
+        let body_start = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request headers are terminated")
+            + 4;
+        assert_eq!(b"0\r\n\r\n", &wire[body_start..]);
+    }
+
+    #[tokio::test]
+    async fn empty_non_final_body_task_does_not_terminate_chunked_body() {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header(header::HOST, "example.com").unwrap();
+        request
+            .insert_header(header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+
+        let wire = send_body_tasks_to_wire(
+            request,
+            vec![
+                HttpTask::Body(Some(Bytes::new()), false),
+                HttpTask::Body(Some(Bytes::from_static(b"abc")), true),
+            ],
+        )
+        .await;
+
+        let body_start = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request headers are terminated")
+            + 4;
+        assert_eq!(b"3\r\nabc\r\n0\r\n\r\n", &wire[body_start..]);
     }
 }
