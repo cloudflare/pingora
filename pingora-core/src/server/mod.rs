@@ -25,7 +25,7 @@ use async_trait::async_trait;
 #[cfg(unix)]
 use daemon::daemonize;
 use daggy::NodeIndex;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use parking_lot::Mutex;
 #[cfg(all(feature = "dial9", feature = "dial9-worker-s3"))]
 pub use pingora_runtime::Dial9S3UploadOpts;
@@ -40,7 +40,7 @@ use pingora_timeout::fast_timeout;
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 #[cfg(unix)]
 use tokio::signal::unix;
 use tokio::sync::{broadcast, watch};
@@ -832,17 +832,22 @@ impl Server {
             .map(|(rt, name)| {
                 info!("Waiting for runtimes to exit!");
                 let join = thread::spawn(move || {
+                    let start = Instant::now();
                     rt.shutdown_timeout(shutdown_timeout);
+                    start.elapsed()
                 });
                 (join, name)
             })
             .collect();
         for (shutdown, name) in shutdowns {
-            info!("Waiting for service runtime {} to exit", name);
-            if let Err(e) = shutdown.join() {
-                error!("Failed to shutdown service runtime {}: {:?}", name, e);
+            info!("Waiting for service runtime {name} to exit");
+            match shutdown.join() {
+                Ok(elapsed) if !shutdown_timeout.is_zero() && elapsed >= shutdown_timeout => {
+                    warn!("Service runtime {name} did not exit within {shutdown_timeout:?}")
+                }
+                Ok(elapsed) => info!("Service runtime {name} exited after {elapsed:?}"),
+                Err(e) => error!("Failed to shutdown service runtime {name}: {e:?}"),
             }
-            debug!("Service runtime {} has exited", name);
         }
         info!("All runtimes exited, exiting now");
 
