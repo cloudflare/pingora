@@ -2,6 +2,10 @@ on: [push, pull_request]
 
 name: build
 
+env:
+  OPENRESTY_VERSION: 1.27.1.2
+  OPENRESTY_SHA256: 74f076f7e364b2a99a6c5f9bb531c27610c78985abe956b442b192a2295f7548
+
 jobs:
   pingora:
     strategy:
@@ -9,7 +13,7 @@ jobs:
       matrix:
         # nightly, msrv, and latest stable
         toolchain: [nightly, 1.85.0, 1.97.1]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -22,12 +26,43 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt update
-          sudo apt install -y cmake libclang-dev wget gnupg ca-certificates lsb-release --no-install-recommends
-          # openresty is used for convenience in tests as a server.
-          wget -O - https://openresty.org/package/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openresty.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/openresty.gpg] http://openresty.org/package/ubuntu $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/openresty.list > /dev/null
-          sudo apt update
-          sudo apt install -y openresty --no-install-recommends
+          sudo apt install -y cmake libclang-dev ca-certificates curl --no-install-recommends
+
+      - name: Cache OpenResty
+        if: matrix.toolchain != '1.85.0'
+        id: cache-openresty
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.local/openresty
+          key: openresty-${{ runner.os }}-${{ runner.arch }}-${{ env.OPENRESTY_VERSION }}-${{ env.OPENRESTY_SHA256 }}-v1
+
+      - name: Build OpenResty
+        if: matrix.toolchain != '1.85.0' && steps.cache-openresty.outputs.cache-hit != 'true'
+        run: |
+          sudo apt install -y build-essential libpcre2-dev libssl-dev zlib1g-dev --no-install-recommends
+
+          archive="$RUNNER_TEMP/openresty-$OPENRESTY_VERSION.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 5 --retry-all-errors \
+            "https://github.com/openresty/openresty/releases/download/v$OPENRESTY_VERSION/openresty-$OPENRESTY_VERSION.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$OPENRESTY_SHA256" "$archive" | sha256sum --check --strict
+
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openresty-$OPENRESTY_VERSION"
+          ./configure \
+            --prefix="$HOME/.local/openresty" \
+            --with-http_ssl_module \
+            --with-http_v2_module
+          make -j"$(nproc)"
+          make install
+
+      - name: Add OpenResty to PATH
+        if: matrix.toolchain != '1.85.0'
+        run: |
+          test -x "$HOME/.local/openresty/bin/openresty"
+          echo "$HOME/.local/openresty/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/openresty/bin/openresty" -V
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
