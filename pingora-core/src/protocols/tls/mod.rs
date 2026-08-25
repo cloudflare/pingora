@@ -23,10 +23,10 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 mod rustls;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 pub use rustls::*;
 
 #[cfg(feature = "s2n")]
@@ -174,7 +174,7 @@ impl ALPN {
         }
     }
 
-    #[cfg(feature = "rustls")]
+    #[cfg(feature = "rustls_derived")]
     pub(crate) fn to_wire_protocols(&self) -> Vec<Vec<u8>> {
         match self {
             ALPN::H1 => vec![b"http/1.1".to_vec()],

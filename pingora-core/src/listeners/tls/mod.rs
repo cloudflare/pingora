@@ -18,10 +18,10 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 mod rustls;
 
-#[cfg(feature = "rustls")]
+#[cfg(feature = "rustls_derived")]
 pub use rustls::*;
 
 #[cfg(feature = "s2n")]
