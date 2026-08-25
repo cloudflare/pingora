@@ -452,21 +452,14 @@ impl HealthRegistry {
     /// Run one active health-check pass over the union of all registered views.
     ///
     /// When `parallel` is true, all targets are checked concurrently.
+    ///
+    /// Dropping the returned future cancels the pass: outstanding per-target
+    /// checks are aborted rather than left running to completion, so targets
+    /// not yet reported keep their previous health.
     pub async fn run_health_check(&self, parallel: bool) {
         use crate::health_check::HealthCheck;
         use log::{info, warn};
         use pingora_runtime::current_handle;
-        use tokio::task::AbortHandle;
-
-        struct AbortOnDrop(Vec<AbortHandle>);
-
-        impl Drop for AbortOnDrop {
-            fn drop(&mut self) {
-                for handle in &self.0 {
-                    handle.abort();
-                }
-            }
-        }
 
         async fn check_and_report(
             backend: &Backend,
@@ -496,20 +489,33 @@ impl HealthRegistry {
         let state = self.state.load_full();
         if parallel {
             let runtime = current_handle();
-            let jobs = state.targets.iter().map(|backend| {
+            // A `JoinSet` aborts every task it still owns when it is dropped, so
+            // abandoning this pass mid-flight cancels the outstanding checks
+            // instead of leaving them detached on the runtime.
+            let mut jobs = tokio::task::JoinSet::new();
+            for backend in state.targets.iter() {
                 let backend = backend.clone();
                 let key = self.health_key(&backend);
                 let check = Arc::clone(&health_check);
                 let state = Arc::clone(&state);
-                runtime.spawn(async move {
-                    if let Some(health) = state.health.get(&key) {
-                        check_and_report(&backend, &check, health).await;
-                    }
-                })
-            });
-            let jobs = Vec::from_iter(jobs);
-            let _abort_on_drop = AbortOnDrop(jobs.iter().map(|job| job.abort_handle()).collect());
-            futures::future::join_all(jobs).await;
+                jobs.spawn_on(
+                    async move {
+                        if let Some(health) = state.health.get(&key) {
+                            check_and_report(&backend, &check, health).await;
+                        }
+                    },
+                    &runtime,
+                );
+            }
+            // Drained one at a time rather than with `JoinSet::join_all`, which
+            // resumes a task panic in this caller. One backend's check panicking
+            // should not abort the checks for every other backend.
+            while let Some(joined) = jobs.join_next().await {
+                if let Err(error) = joined {
+                    // That backend keeps its previous health for this pass.
+                    warn!("health check task failed: {error}");
+                }
+            }
         } else {
             for backend in state.targets.iter() {
                 if let Some(health) = state.health.get(&self.health_key(backend)) {
@@ -837,6 +843,9 @@ impl Backends {
     }
 
     /// Run one health-check pass for this view's entire registry.
+    ///
+    /// Dropping the returned future cancels the pass, as described on
+    /// [`HealthRegistry::run_health_check`].
     pub async fn run_health_check(&self, parallel: bool) {
         self.health_registry.run_health_check(parallel).await;
     }
@@ -2429,6 +2438,79 @@ mod test {
         assert!(backends.ready(&good1));
         assert!(backends.ready(&good2));
         assert!(!backends.ready(&bad));
+    }
+
+    /// Health check that panics for one backend and, for every other backend,
+    /// blocks on `release` before reporting a failure.
+    ///
+    /// Signalling `panicked` before the panic lets a test hold the other check
+    /// in flight until the pass has already had to handle the panic.
+    struct PanickingHealthCheck {
+        panic_addr: SocketAddr,
+        panicked: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl health_check::HealthCheck for PanickingHealthCheck {
+        async fn check(&self, target: &Backend) -> Result<()> {
+            if target.addr == self.panic_addr {
+                self.panicked.notify_one();
+                panic!("intentional health check panic");
+            }
+            self.release.notified().await;
+            Err(pingora_error::Error::new(ErrorType::InternalError))
+        }
+
+        fn health_threshold(&self, _success: bool) -> usize {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_health_check_isolates_a_panicking_check() {
+        let discovery = discovery::Static::default();
+        let panics = Backend::new("127.0.0.1:79").unwrap();
+        let reports = Backend::new("1.1.1.1:80").unwrap();
+        discovery.add(panics.clone());
+        discovery.add(reports.clone());
+
+        let panicked = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut backends = Backends::new(Box::new(discovery));
+        backends.set_health_check(Box::new(PanickingHealthCheck {
+            panic_addr: panics.addr.clone(),
+            panicked: Arc::clone(&panicked),
+            release: Arc::clone(&release),
+        }));
+        backends.update(|_| {}).await.unwrap();
+        let backends = Arc::new(backends);
+
+        // Backends start out healthy, so the flip asserted below can only have
+        // come from this pass.
+        assert!(backends.ready(&reports));
+
+        let pass = tokio::spawn({
+            let backends = Arc::clone(&backends);
+            async move { backends.run_health_check(true).await }
+        });
+
+        // Release the other check only once the panic has happened, so the pass
+        // has to carry a still-unfinished check past it.
+        panicked.notified().await;
+        release.notify_one();
+
+        // Expect the panic message in the test output: the panicking task's
+        // `JoinError` is discarded here rather than resumed in the pass.
+        tokio::time::timeout(Duration::from_secs(5), pass)
+            .await
+            .expect("a panicking check must not stall the pass")
+            .expect("a panicking check must not be resumed in the pass");
+
+        assert!(
+            !backends.ready(&reports),
+            "the other backend's panic cancelled this check before it was reported"
+        );
     }
 
     #[tokio::test]

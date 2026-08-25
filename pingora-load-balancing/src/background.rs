@@ -14,6 +14,7 @@
 
 //! Implement [BackgroundService] for [LoadBalancer]
 
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use super::{BackendIter, BackendSelection, HealthCheckService, LoadBalancer, LoadBalancerGroup};
@@ -23,11 +24,69 @@ use pingora_core::{
     services::{background::BackgroundService, ServiceReadyNotifier},
 };
 
-async fn shutdown_changed(shutdown: &mut ShutdownWatch) -> bool {
+/// Why a [`ShutdownWatch`] woke a service loop.
+enum WatchChange {
+    /// Shutdown was signaled.
+    ShuttingDown,
+    /// The watch changed to a non-shutdown value. Nothing needs to stop.
+    Spurious,
+    /// Every sender was dropped, so shutdown can never be signaled from here.
+    ///
+    /// Distinct from [`WatchChange::ShuttingDown`] on purpose. Treating a
+    /// dropped sender as shutdown would make a service abandon work that
+    /// nothing is ever going to ask it to stop doing.
+    Closed,
+}
+
+/// Await the next change to `shutdown` and classify it.
+async fn shutdown_changed(shutdown: &mut ShutdownWatch) -> WatchChange {
     match shutdown.changed().await {
-        Ok(()) => *shutdown.borrow(),
-        Err(_) => true,
+        // Read the latest value rather than the one that triggered the change,
+        // so a `false` immediately followed by a `true` still stops the service.
+        Ok(()) if *shutdown.borrow() => WatchChange::ShuttingDown,
+        Ok(()) => WatchChange::Spurious,
+        Err(_) => WatchChange::Closed,
     }
+}
+
+/// The outcome of racing a unit of background work against shutdown.
+///
+/// Returned by [`race_shutdown`]. Matching this exhaustively keeps each service
+/// loop explicit about both outcomes.
+enum Raced<T> {
+    /// The work ran to completion, yielding its output.
+    Completed(T),
+    /// Shutdown was signaled. The work was dropped mid-flight and the service
+    /// loop should return.
+    ShuttingDown,
+}
+
+/// Run `work`, returning early if shutdown is signaled.
+///
+/// Shutdown is polled first, but [`tokio::sync::watch::Receiver::changed`] only
+/// reports versions this receiver has not already seen, so callers must check
+/// `*shutdown.borrow()` themselves as well.
+///
+/// A shutdown drops `work` mid-flight, cancelling an in-flight discovery or
+/// health check. Any other outcome resumes the *same* `work` future rather than
+/// restarting it, so repeated watch changes can neither starve it nor repeat
+/// effects it already applied.
+async fn race_shutdown<F: Future>(shutdown: &mut ShutdownWatch, work: F) -> Raced<F::Output> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            change = shutdown_changed(&mut *shutdown) => match change {
+                WatchChange::ShuttingDown => return Raced::ShuttingDown,
+                WatchChange::Spurious => continue,
+                // Nothing can signal shutdown any more, so stop racing
+                // altogether and let the work finish.
+                WatchChange::Closed => break,
+            },
+            output = &mut work => return Raced::Completed(output),
+        }
+    }
+    Raced::Completed(work.await)
 }
 
 /// Timing state shared by update and health-check loops.
@@ -159,18 +218,9 @@ where
 
             if schedule.update_is_due(now) {
                 // TODO: log err
-                tokio::select! {
-                    biased;
-                    is_shutdown = shutdown_changed(&mut shutdown) => {
-                        if is_shutdown {
-                            return;
-                        }
-                        continue;
-                    }
-                    update = self.update() => {
-                        let _ = update;
-                        schedule.update_finished_at(now);
-                    }
+                match race_shutdown(&mut shutdown, self.update()).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(_) => schedule.update_finished_at(now),
                 }
             }
 
@@ -181,17 +231,10 @@ where
             }
 
             if schedule.health_check_is_due(now) {
-                tokio::select! {
-                    biased;
-                    is_shutdown = shutdown_changed(&mut shutdown) => {
-                        if is_shutdown {
-                            return;
-                        }
-                        continue;
-                    }
-                    _ = self.backends.run_health_check(self.parallel_health_check) => {
-                        schedule.health_check_finished_at(now);
-                    }
+                let health_check = self.backends.run_health_check(self.parallel_health_check);
+                match race_shutdown(&mut shutdown, health_check).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(()) => schedule.health_check_finished_at(now),
                 }
             }
 
@@ -199,14 +242,9 @@ where
                 return;
             }
             let to_wake = schedule.next(now);
-            tokio::select! {
-                biased;
-                is_shutdown = shutdown_changed(&mut shutdown) => {
-                    if is_shutdown {
-                        return;
-                    }
-                }
-                _ = tokio::time::sleep_until(to_wake.into()) => {}
+            match race_shutdown(&mut shutdown, tokio::time::sleep_until(to_wake.into())).await {
+                Raced::ShuttingDown => return,
+                Raced::Completed(()) => {}
             }
             now = Instant::now();
         }
@@ -264,30 +302,21 @@ where
             }
 
             if schedule.update_is_due(now) {
-                tokio::select! {
-                    biased;
-                    is_shutdown = shutdown_changed(&mut shutdown) => {
-                        if is_shutdown {
-                            return;
+                match race_shutdown(&mut shutdown, self.update()).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(Ok(())) => {
+                        // Until readiness is signaled, always target the latest
+                        // backend generation. Pinning to the first successful
+                        // update would let a burst of updates satisfy readiness
+                        // with selectors that are already stale relative to the
+                        // current membership.
+                        if ready_opt.is_some() {
+                            ready_generation = Some(self.backend_generation());
                         }
-                        continue;
+                        schedule.update_finished_at(now);
                     }
-                    update = self.update() => {
-                        match update {
-                            Ok(()) => {
-                                // Until readiness is signaled, always target the latest
-                                // backend generation. Pinning to the first successful
-                                // update would let a burst of updates satisfy readiness
-                                // with selectors that are already stale relative to the
-                                // current membership.
-                                if ready_opt.is_some() {
-                                    ready_generation = Some(self.backend_generation());
-                                }
-                            }
-                            Err(error) => {
-                                log::error!("load balancer group update failed: {error}");
-                            }
-                        }
+                    Raced::Completed(Err(error)) => {
+                        log::error!("load balancer group update failed: {error}");
                         schedule.update_finished_at(now);
                     }
                 }
@@ -302,17 +331,10 @@ where
             }
 
             if schedule.health_check_is_due(now) {
-                tokio::select! {
-                    biased;
-                    is_shutdown = shutdown_changed(&mut shutdown) => {
-                        if is_shutdown {
-                            return;
-                        }
-                        continue;
-                    }
-                    _ = self.backends().run_health_check(self.parallel_health_check) => {
-                        schedule.health_check_finished_at(now);
-                    }
+                let health_check = self.backends().run_health_check(self.parallel_health_check);
+                match race_shutdown(&mut shutdown, health_check).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(()) => schedule.health_check_finished_at(now),
                 }
             }
 
@@ -327,10 +349,15 @@ where
             let to_wake = schedule.next(now);
             // Selector completion may satisfy startup readiness before the next
             // scheduled task. After readiness, rebuilds no longer wake this loop.
-            tokio::select! {
-                _ = tokio::time::sleep_until(to_wake.into()) => {}
-                _ = self.rebuild_notified(), if ready_opt.is_some() => {} // re-trigger loop to notify waiters
-                _ = shutdown.changed() => return, // exit on shutdown
+            let wake = async {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(to_wake.into()) => {}
+                    _ = self.rebuild_notified(), if ready_opt.is_some() => {} // re-trigger loop to notify waiters
+                }
+            };
+            match race_shutdown(&mut shutdown, wake).await {
+                Raced::ShuttingDown => return,
+                Raced::Completed(()) => {}
             }
             now = Instant::now();
         }
@@ -366,9 +393,11 @@ impl HealthCheckService {
         if !self.registry.has_health_check() {
             log::error!("HealthCheckService requires a configured HealthRegistry health check");
             // Keep the notifier alive so dependents cannot observe a false-ready
-            // signal from its Drop implementation.
+            // signal from its Drop implementation. A non-shutdown change must
+            // not release it early; a closed watch has no server left to
+            // mislead, so parking on it would only leak this task.
             if ready_opt.is_some() && !*shutdown.borrow() {
-                _ = shutdown.changed().await;
+                while let WatchChange::Spurious = shutdown_changed(&mut shutdown).await {}
             }
             return;
         }
@@ -386,26 +415,22 @@ impl HealthCheckService {
             // published afterwards. Periodic mode instead signals ready eagerly
             // and relies on later passes to pick up newly published targets.
             if schedule.health_check_is_once() && self.registry.target_count() == 0 {
-                tokio::select! {
-                    _ = self.registry.wait_for_targets() => {}
-                    _ = shutdown.changed() => return,
+                match race_shutdown(&mut shutdown, self.registry.wait_for_targets()).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(()) => {}
                 }
-                // Both branches can become ready together; do not start a check
-                // if `select!` chose the target while shutdown was also signaled.
+                // A shutdown already observed by an earlier `changed()` will not
+                // wake the race above, so re-check the current value before
+                // starting a pass.
                 if *shutdown.borrow() {
                     return;
                 }
             }
 
-            tokio::select! {
-                biased;
-                is_shutdown = shutdown_changed(&mut shutdown) => {
-                    if is_shutdown {
-                        return;
-                    }
-                    continue;
-                }
-                _ = self.registry.run_health_check(self.parallel_health_check) => {
+            let health_check = self.registry.run_health_check(self.parallel_health_check);
+            match race_shutdown(&mut shutdown, health_check).await {
+                Raced::ShuttingDown => return,
+                Raced::Completed(()) => {
                     if let Some(ready) = ready_opt.take() {
                         // The initial health pass completed, so services depending on
                         // this registry can start receiving traffic.
@@ -421,11 +446,19 @@ impl HealthCheckService {
             };
             loop {
                 let has_targets = self.registry.target_count() > 0;
-                tokio::select! {
-                    _ = self.registry.wait_for_targets(), if !has_targets => break,
-                    _ = tokio::time::sleep_until(next_health_check.into()), if has_targets => break,
-                    _ = self.registry.wait_for_view_removal() => {},
-                    _ = shutdown.changed() => return,
+                // `true` means the next pass is due; a view removal only
+                // re-evaluates whether the registry still has targets.
+                let wake = async {
+                    tokio::select! {
+                        _ = self.registry.wait_for_targets(), if !has_targets => true,
+                        _ = tokio::time::sleep_until(next_health_check.into()), if has_targets => true,
+                        _ = self.registry.wait_for_view_removal() => false,
+                    }
+                };
+                match race_shutdown(&mut shutdown, wake).await {
+                    Raced::ShuttingDown => return,
+                    Raced::Completed(true) => break,
+                    Raced::Completed(false) => {}
                 }
             }
         }
@@ -619,6 +652,63 @@ mod tests {
         lb.update_frequency = Some(Duration::from_secs(60));
 
         assert_run_exits_on_shutdown(lb, notify).await;
+    }
+
+    #[tokio::test]
+    async fn run_updates_when_no_shutdown_sender_remains() {
+        let notify = Arc::new(Notify::new());
+        let discovery = NotifyingDiscovery {
+            notify: notify.clone(),
+        };
+        let mut lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(Box::new(
+            discovery,
+        )));
+        lb.update_frequency = Some(Duration::from_secs(60));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // No sender remains, so shutdown can never be signaled. That must not
+        // be read as "already shutting down": the service would return before
+        // ever running discovery, and its dropped notifier would signal ready.
+        drop(shutdown_tx);
+
+        let handle = tokio::spawn(async move { lb.run(shutdown_rx, None).await });
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("discovery should still run with no shutdown sender left");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_continues_after_a_non_shutdown_watch_change() {
+        let notify = Arc::new(Notify::new());
+        let discovery = NotifyingDiscovery {
+            notify: notify.clone(),
+        };
+        let mut lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(Box::new(
+            discovery,
+        )));
+        lb.update_frequency = Some(Duration::from_secs(60));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { lb.run(shutdown_rx, None).await });
+
+        // Let the first update land so the loop is parked in the sleep race.
+        notify.notified().await;
+        shutdown_tx.send(false).unwrap();
+
+        // Yield generously so a service that was going to return has run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "a non-shutdown watch change stopped the service"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("a real shutdown should still stop the service")
+            .expect("background service task should not panic");
     }
 
     #[tokio::test]
