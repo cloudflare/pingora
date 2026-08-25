@@ -46,6 +46,9 @@ pub trait HealthCheck {
     /// Check the given backend.
     ///
     /// `Ok(())`` if the check passes, otherwise the check fails.
+    ///
+    /// A health-check pass drops this future to cancel the check on shutdown,
+    /// so an implementation must not rely on running to completion once polled.
     async fn check(&self, target: &Backend) -> Result<()>;
 
     /// Called when the health changes for a [Backend].
