@@ -1,0 +1,25 @@
+[package]
+name = "pingora-test-utils"
+version = "0.9.0"
+authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+description = """
+Test utilities for Pingora services and libraries.
+"""
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

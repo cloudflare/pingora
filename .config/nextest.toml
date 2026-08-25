@@ -1,0 +1,11 @@
+# These integration binaries bind fixed ports in each nextest process.
+[test-groups]
+pingora-fixed-port-integration = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(pingora-core) & binary(test_basic)'
+test-group = 'pingora-fixed-port-integration'
+
+[[profile.default.overrides]]
+filter = 'package(pingora-proxy) & (binary(test_basic) | binary(test_upstream))'
+test-group = 'pingora-fixed-port-integration'
