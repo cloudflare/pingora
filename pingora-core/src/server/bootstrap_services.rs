@@ -290,19 +290,35 @@ impl BackgroundService for BootstrapService {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn expected_addresses_prune_already_loaded_fds() {
         let (execution_phase_watch, _) = broadcast::channel(1);
         let mut bootstrap = Bootstrap::new(&None, &ServerConf::default(), &execution_phase_watch);
-        let keep_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        let drop_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(keep_fd >= 0 && drop_fd >= 0);
+
+        // Closure is observed by reading the other end of a socket pair, which
+        // reports end-of-file exactly when its peer is gone. Checking the
+        // descriptor *number* would be racy: numbers are process-wide and
+        // reassigned lowest-free-first, so a concurrent test in this binary can
+        // be handed the number just closed and make it valid again first.
+        // Observing ends are non-blocking, so a descriptor that wrongly stayed
+        // open fails an assertion rather than hanging.
+        //
+        // A second owning handle would turn a wrongly closed descriptor into an
+        // I/O safety abort of the whole binary, so `Fds` gets raw numbers.
+        let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
+        let (mut drop_peer, drop_local) = UnixStream::pair().unwrap();
+        keep_peer.set_nonblocking(true).unwrap();
+        drop_peer.set_nonblocking(true).unwrap();
+        let keep_fd = keep_local.into_raw_fd();
 
         {
             let mut fds = bootstrap.listen_fds.lock();
             fds.add("127.0.0.1:80".to_string(), keep_fd);
-            fds.add("127.0.0.1:9090".to_string(), drop_fd);
+            fds.add("127.0.0.1:9090".to_string(), drop_local.into_raw_fd());
         }
 
         bootstrap.set_expected_listen_addrs(["127.0.0.1:80".to_string()].into_iter().collect());
@@ -311,8 +327,17 @@ mod tests {
         assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
         assert!(fds.get("127.0.0.1:9090").is_none());
         drop(fds);
-        assert_eq!(unsafe { libc::fcntl(drop_fd, libc::F_GETFD) }, -1);
-        assert_ne!(unsafe { libc::fcntl(keep_fd, libc::F_GETFD) }, -1);
-        unsafe { libc::close(keep_fd) };
+        assert!(
+            matches!(drop_peer.read(&mut [0u8; 1]), Ok(0)),
+            "the pruned descriptor was not closed"
+        );
+        assert!(
+            matches!(keep_peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the expected descriptor was closed"
+        );
+
+        // `Fds` does not close on drop.
+        // SAFETY: asserted open just above, and no other owner remains.
+        drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
     }
 }

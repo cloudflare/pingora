@@ -667,16 +667,32 @@ mod tests {
 mod close_unclaimed_tests {
     use super::Fds;
     use std::collections::HashSet;
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    // Closure is observed by reading the other end of a socket pair, which
+    // reports end-of-file exactly when its peer is gone. Checking the descriptor
+    // *number* would be racy: numbers are process-wide and reassigned
+    // lowest-free-first, so a concurrent test in this binary can be handed the
+    // number just closed and make it valid again first. Observing ends are
+    // non-blocking, so a descriptor that wrongly stayed open fails an assertion
+    // rather than hanging.
+    //
+    // A second owning handle would turn a wrongly closed descriptor into an I/O
+    // safety abort of the whole binary, so `Fds` gets raw numbers.
 
     #[test]
     fn closes_only_unclaimed_fds() {
-        let keep_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        let drop_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(keep_fd >= 0 && drop_fd >= 0);
+        let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
+        let (mut drop_peer, drop_local) = UnixStream::pair().unwrap();
+        keep_peer.set_nonblocking(true).unwrap();
+        drop_peer.set_nonblocking(true).unwrap();
+        let keep_fd = keep_local.into_raw_fd();
 
         let mut fds = Fds::new();
         fds.add("127.0.0.1:80".to_string(), keep_fd);
-        fds.add("127.0.0.1:9090".to_string(), drop_fd);
+        fds.add("127.0.0.1:9090".to_string(), drop_local.into_raw_fd());
 
         let keep: HashSet<String> = ["127.0.0.1:80".to_string()].into_iter().collect();
         let closed = fds.close_unclaimed(&keep);
@@ -685,32 +701,37 @@ mod close_unclaimed_tests {
         assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
         assert!(fds.get("127.0.0.1:9090").is_none());
 
-        assert_eq!(unsafe { libc::fcntl(drop_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        // Dropping the map entry is not enough: the descriptor itself has to be
+        // closed, which is the leak this function exists to prevent.
+        assert!(
+            matches!(drop_peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
         );
-        assert_ne!(unsafe { libc::fcntl(keep_fd, libc::F_GETFD) }, -1);
+        assert!(
+            matches!(keep_peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the claimed descriptor was closed"
+        );
 
-        unsafe { libc::close(keep_fd) };
+        // `Fds` does not close on drop.
+        // SAFETY: asserted open just above, and no other owner remains.
+        drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
     }
 
     #[test]
     fn empty_keep_set_closes_everything() {
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(fd >= 0);
+        let (mut peer, local) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
 
         let mut fds = Fds::new();
-        fds.add("127.0.0.1:9090".to_string(), fd);
+        fds.add("127.0.0.1:9090".to_string(), local.into_raw_fd());
 
         let closed = fds.close_unclaimed(&HashSet::new());
 
         assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
         assert!(fds.is_empty());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        assert!(
+            matches!(peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
         );
     }
 }
