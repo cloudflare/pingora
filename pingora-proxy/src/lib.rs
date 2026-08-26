@@ -1790,6 +1790,7 @@ mod tests {
     use pingora_core::modules::http::{HttpModule, HttpModuleBuilder};
     use pingora_core::protocols::l4::stream::Stream as L4Stream;
     use pingora_core::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+    use pingora_error::RetryType;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1798,15 +1799,15 @@ mod tests {
 
     #[derive(Debug)]
     struct StaticVirtualSocket {
-        read_buf: &'static [u8],
+        read_buf: Vec<u8>,
         read_pos: usize,
         write_buf: Arc<Mutex<Vec<u8>>>,
     }
 
     impl StaticVirtualSocket {
-        fn new(read_buf: &'static [u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
+        fn new(read_buf: &[u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
             Self {
-                read_buf,
+                read_buf: read_buf.to_vec(),
                 read_pos: 0,
                 write_buf,
             }
@@ -1854,15 +1855,146 @@ mod tests {
         }
     }
 
-    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
-        let socket = StaticVirtualSocket::new(
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-            written,
-        );
+    async fn new_request_session(request: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Session {
+        let socket = StaticVirtualSocket::new(request, written);
         let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
         let mut session = Session::new_h1(Box::new(stream));
         session.read_request().await.unwrap();
         session
+    }
+
+    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
+        new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written,
+        )
+        .await
+    }
+
+    struct DefaultRetryProxy;
+
+    #[async_trait]
+    impl ProxyHttp for DefaultRetryProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!()
+        }
+    }
+
+    fn default_policy_would_retry_for_session(
+        session: &mut Session,
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut error = Error::new_up(ReadError);
+        error.retry = retry;
+
+        DefaultRetryProxy
+            .error_while_proxy(
+                &HttpPeer::new("127.0.0.1:80", false, "".to_string()),
+                session,
+                error,
+                &mut (),
+                client_reused,
+            )
+            .retry()
+    }
+
+    async fn default_policy_would_retry(
+        request: &[u8],
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        default_policy_would_retry_for_session(&mut session, retry, client_reused)
+    }
+
+    async fn buffered_put_session(body_len: usize) -> Session {
+        let mut request =
+            format!("PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body_len}\r\n\r\n")
+                .into_bytes();
+        request.resize(request.len() + body_len, b'a');
+
+        let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
+        session.enable_retry_buffering();
+        while session.read_request_body().await.unwrap().is_some() {}
+        session
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_idempotent_method() {
+        let decided_retry = RetryType::Decided(true);
+        assert!(
+            default_policy_would_retry(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            default_policy_would_retry(
+                b"PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"PATCH / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_resolves_reused_only() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assert!(default_policy_would_retry(request, RetryType::ReusedOnly, true).await);
+        assert!(!default_policy_would_retry(request, RetryType::ReusedOnly, false).await);
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_untruncated_body_buffer() {
+        let mut complete = buffered_put_session(64 * 1024).await;
+        assert!(!complete.retry_buffer_truncated());
+        assert!(default_policy_would_retry_for_session(
+            &mut complete,
+            RetryType::Decided(true),
+            false,
+        ));
+
+        let mut truncated = buffered_put_session(64 * 1024 + 1).await;
+        assert!(truncated.retry_buffer_truncated());
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::Decided(true),
+            false,
+        ));
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::ReusedOnly,
+            true,
+        ));
     }
 
     fn upgrade_response_header() -> ResponseHeader {

@@ -576,6 +576,14 @@ pub trait ProxyHttp {
 
     /// This filter is called when there is an error **after** a connection is established (or reused)
     /// to the upstream.
+    ///
+    /// By default, this hook forces retry to false, regardless of the incoming retry state, when
+    /// the request method is non-idempotent or the body retry buffer was truncated. For eligible
+    /// requests, [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused
+    /// connection.
+    ///
+    /// Implementations that override this hook replace the default policy and are responsible for
+    /// deciding when a retry is safe.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -585,9 +593,12 @@ pub trait ProxyHttp {
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        // only reused client connections where retry buffer is not truncated
-        e.retry
-            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        if !session.req_header().method.is_idempotent() || session.as_ref().retry_buffer_truncated()
+        {
+            e.set_retry(false);
+        } else {
+            e.retry.decide_reuse(client_reused);
+        }
         e
     }
 
