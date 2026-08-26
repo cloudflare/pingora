@@ -426,9 +426,8 @@ async fn test_dropped_conn_post_empty_body() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.text().await.unwrap();
-    assert_eq!(body, "dog!\n");
+    // Non-idempotent requests are not retried by the default policy.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
 async fn test_dropped_conn_post_body() {
@@ -455,12 +454,11 @@ async fn test_dropped_conn_post_body() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.text().await.unwrap();
-    assert_eq!(body, "cat!\n");
+    // Non-idempotent requests are not retried even when the body was buffered.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
-async fn test_dropped_conn_post_body_over() {
+async fn test_dropped_conn_put_body_over() {
     init();
     let client = reqwest::Client::new();
     let port = "8001"; // special port to avoid unexpected connection reuse from other tests
@@ -478,15 +476,15 @@ async fn test_dropped_conn_post_body_over() {
     }
 
     let res = client
-        .post("http://127.0.0.1:6147/bad_lb")
+        .put("http://127.0.0.1:6147/bad_lb")
         .header("x-port", port)
         .body(large_body)
         .send()
         .await
         .unwrap();
 
-    // 502, body larger than buffer limit
-    assert_eq!(res.status(), StatusCode::from_u16(502).unwrap());
+    // The body is larger than the retry buffer limit.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]
@@ -496,7 +494,7 @@ async fn test_dropped_conn() {
     test_dropped_conn_get().await;
     test_dropped_conn_post_empty_body().await;
     test_dropped_conn_post_body().await;
-    test_dropped_conn_post_body_over().await;
+    test_dropped_conn_put_body_over().await;
 }
 
 // currently not supported with Rustls implementation
