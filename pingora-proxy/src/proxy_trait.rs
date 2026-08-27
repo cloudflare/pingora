@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedFreshness, HitHandler,
+    CacheKey, CacheMeta, ForcedFreshness, HitHandler, PurgeAction,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -721,6 +721,16 @@ pub trait ProxyHttp {
     /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
+    }
+
+    /// What a purge request should do to the cached asset.
+    ///
+    /// Only consulted when [`ProxyHttp::is_purge`] returns `true`. The default deletes the asset.
+    /// Returning [`PurgeAction::Expire`] asks to keep it and mark it stale instead, so it
+    /// revalidates against the origin rather than being refetched in full. Storage that cannot
+    /// mark an entry stale falls back to deleting it.
+    fn purge_action(&self, _session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        PurgeAction::Delete
     }
 
     /// This filter is called after the proxy cache generates the downstream response to the purge

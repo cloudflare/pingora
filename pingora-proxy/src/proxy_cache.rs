@@ -144,10 +144,18 @@ where
                                 }
                             }
                             Ok(Some(ForcedFreshness::ForceExpired)) => {
-                                // force expired asset should not be serve as stale
-                                // because force expire is usually to remove data
+                                // this variant exists to take data out of service, so the
+                                // stale body must not be served while it revalidates
                                 meta.disable_serve_stale();
                                 HitStatus::ForceExpired
+                            }
+                            Ok(Some(ForcedFreshness::ForceExpiredServeStale { expired_at })) => {
+                                // this variant keeps the serve stale windows, so they run
+                                // from when the asset went out of service, not its deadline
+                                if let Some(expired_at) = expired_at {
+                                    meta.expire_at(expired_at);
+                                }
+                                HitStatus::ForceExpiredServeStale
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
                             Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,

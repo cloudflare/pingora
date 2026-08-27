@@ -33,6 +33,19 @@ pub enum PurgeType {
     Invalidation,
 }
 
+/// What a purge is asked to do to the entry it targets.
+///
+/// This is separate from [`PurgeType`], which says why the purge happened rather than what it
+/// does to the entry, and from [`PurgeOutcome`], which is what storage actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeAction {
+    /// Remove the entry, so the next read for its key is a miss.
+    Delete,
+    /// Keep the entry but mark it stale, so it revalidates against the origin instead of being
+    /// refetched, reusing the stored body when the origin answers 304.
+    Expire,
+}
+
 /// The entry a [`Storage::purge`] call should remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeTarget<'a> {
@@ -110,7 +123,7 @@ mod tests {
     }
 }
 
-/// Outcome of a successful [`Storage::purge`] call.
+/// Outcome of a successful [`Storage::purge`] or [`Storage::expire`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeOutcome {
     /// Storage did not find the target entry.
@@ -119,6 +132,11 @@ pub enum PurgeOutcome {
     ///
     /// Exact targets already contain the complete identity and need not repeat their ID here.
     Purged(Option<CacheEntryId>),
+    /// Storage kept the entry and marked it stale.
+    ///
+    /// Only [`Storage::expire`] returns this. The entry is still stored, so the eviction manager
+    /// keeps tracking it.
+    Expired,
 }
 
 /// Cache storage interface
@@ -179,6 +197,39 @@ pub trait Storage {
         purge_type: PurgeType,
         trace: &SpanHandle,
     ) -> Result<PurgeOutcome>;
+
+    /// Mark one cached entry stale so it revalidates, keeping the entry stored.
+    ///
+    /// Targets resolve the same way as [`Storage::purge`]. Once this returns
+    /// [`PurgeOutcome::Expired`], the entry that was stored when the call ran must not be served
+    /// as a fresh hit, and its body should stay usable so a revalidation can reuse it on a 304.
+    ///
+    /// Stale is not the same as unusable. Whether a reader is served the stale body while it
+    /// revalidates is up to the entry's serve stale windows, which this does not touch.
+    /// How that is recorded is up to storage: rewriting the stored freshness and applying it on
+    /// read both satisfy the contract.
+    ///
+    /// This is deliberately not [`Storage::update_meta`]. That call needs a full [`CacheKey`] and
+    /// a [`CacheMeta`] the caller already holds from a hit, and a purge has neither. It would also
+    /// pin the recording strategy to rewriting the stored meta, turning this into a read modify
+    /// write that a concurrent revalidation can clobber.
+    ///
+    /// The guarantee covers the stored entry, not a fill already in flight. A miss handler that
+    /// commits after this returns may replace the entry with a fresh one, which is the same race
+    /// [`Storage::purge`] has and is expected to be resolved by whatever serializes writes for
+    /// that key.
+    ///
+    /// The default deletes the entry instead. Storage that cannot mark an entry stale must still
+    /// keep the next read from serving it, and deleting gives that guarantee at the cost of a
+    /// full refetch. It reports [`PurgeOutcome::Purged`] so the caller knows the entry is gone
+    /// and the eviction manager stops tracking it.
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.purge(target, PurgeType::Invalidation, trace).await
+    }
 
     /// Update cache header and metadata for the already stored asset.
     async fn update_meta(

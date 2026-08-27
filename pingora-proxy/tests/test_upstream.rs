@@ -2215,6 +2215,255 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_purge_expire_revalidates_instead_of_refetching() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_purge_expire/revalidate_now";
+        let client = reqwest::Client::new();
+        // The default test TTL is 1s, which this test would outlive: the asset would go stale on
+        // its own and the final assertions would pass whether or not the purge did anything.
+        let get = || {
+            client
+                .get(url)
+                .header("x-set-cache-control", "public, max-age=60")
+                .send()
+        };
+
+        let res = get().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        let stored_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // still fresh, so anything stale later is the purge's doing rather than the clock's
+        let res = get().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), url)
+            .header("x-purge-action", "expire")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // the asset is stale rather than gone, so this revalidates against the origin and
+        // reuses the stored body on the 304
+        let res = get().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(headers["x-upstream-status"], "304");
+        assert_eq!(
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap(),
+            stored_epoch,
+            "expiring must keep the stored asset, not replace it"
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    /// The counterpart to the test above. With a serve stale window configured, an expiring
+    /// purge must leave it open: the asset goes out of cache immediately and refreshes behind
+    /// the request instead of making the reader wait on the origin.
+    #[tokio::test]
+    async fn test_purge_expire_keeps_serving_stale_while_it_revalidates() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_purge_expire_stale/revalidate_now";
+        let client = reqwest::Client::new();
+        // The window has to come from the response, and serving stale needs the cache lock.
+        let get = || {
+            client
+                .get(url)
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=600",
+                )
+                .header("x-lock", "true")
+                .send()
+        };
+
+        let res = get().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        let stored_epoch = res.headers()["x-epoch"]
+            .to_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // still fresh, so anything stale later is the purge's doing rather than the clock's
+        let res = get().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), url)
+            .header("x-purge-action", "expire")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // served out of cache without waiting on the origin, where the test above blocks on a
+        // revalidation because it has no window to serve from
+        let res = get().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "stale-updating");
+        assert_eq!(
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap(),
+            stored_epoch,
+            "the stale body has to be the one that was stored"
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // and the revalidation running behind it clears the expiry
+        sleep(Duration::from_millis(100)).await;
+        let res = get().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_purge_expire_reports_a_missing_asset_as_not_found() {
+        init();
+        let res = reqwest::Client::new()
+            .request(
+                reqwest::Method::from_bytes(b"PURGE").unwrap(),
+                "http://127.0.0.1:6148/unique/test_purge_expire_absent/never_cached",
+            )
+            .header("x-purge-action", "expire")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_hit_filter_force_expire_serve_stale_serves_the_stale_body() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_force_expire_serve_stale/revalidate_now";
+        let client = reqwest::Client::new();
+        // The window has to come from the response, and serving stale needs the cache lock.
+        let get = || {
+            client
+                .get(url)
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=600",
+                )
+                .header("x-lock", "true")
+        };
+
+        let res = get().send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        let stored_epoch = res.headers()["x-epoch"]
+            .to_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // still fresh, so the staleness below is the forced expiry rather than the clock
+        let res = get().send().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = get()
+            .header("x-force-expire-serve-stale", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "stale-updating");
+        assert_eq!(
+            headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap(),
+            stored_epoch,
+            "the stale body has to be the one that was stored"
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    /// The window runs from the expiry, not from the asset's original deadline. This asset
+    /// has 60s of freshness left and a 2s window, so an expiry 5s back leaves nothing to
+    /// serve even though it is still nowhere near its own deadline.
+    #[tokio::test]
+    async fn test_hit_filter_force_expire_serve_stale_measures_the_window_from_the_expiry() {
+        init();
+        let url =
+            "http://127.0.0.1:6148/unique/test_force_expire_serve_stale_window/revalidate_now";
+        let client = reqwest::Client::new();
+        let get = || {
+            client
+                .get(url)
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=2",
+                )
+                .header("x-lock", "true")
+        };
+
+        let res = get().send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = get().send().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = get()
+            .header("x-force-expire-serve-stale", "1")
+            .header("x-expired-secs-ago", "5")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()["x-cache-status"],
+            "revalidated",
+            "the window closed 3s before this request, so it has to wait on the origin"
+        );
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_hit_filter_force_expire_waits_on_the_revalidation() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_force_expire_blocking/revalidate_now";
+        let client = reqwest::Client::new();
+        // Same generous window as the serve-stale case, so the only difference is the variant.
+        let get = || {
+            client
+                .get(url)
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=600",
+                )
+                .header("x-lock", "true")
+        };
+
+        let res = get().send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = get().send().await.unwrap();
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // closing the windows leaves nothing to serve, so this one has to wait for the origin
+        let res = get().header("x-force-expire", "1").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "revalidated");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_cache_miss_convert() {
         init();
 
