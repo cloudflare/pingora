@@ -658,6 +658,10 @@ impl HttpSession {
     /// If the connection cannot be reused, the underlying stream will be closed and `None` will be
     /// returned.
     pub async fn reuse(mut self) -> Option<Stream> {
+        if !self.body_reader.body_complete() || self.body_reader.has_bytes_overread() {
+            self.set_keepalive(None);
+        }
+
         // TODO: this function is unnecessarily slow for keepalive case
         // because that case does not need async
         match self.keepalive_timeout {
@@ -2362,6 +2366,40 @@ hello\r\n\
 
         // HTTP/1.1 should allow keepalive by default
         assert!(http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn test_malformed_chunked_response_is_not_reusable() {
+        let input = b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let task = http_stream.read_response_task().await.unwrap();
+        assert!(matches!(task, HttpTask::Header(_, false)));
+        assert!(http_stream.read_response_task().await.is_err());
+        assert!(http_stream.is_body_done());
+        assert!(!http_stream.body_reader.body_complete());
+
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+        assert!(http_stream.reuse().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reuse_rechecks_overread_after_early_keepalive() {
+        let input =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\nextra";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+
+        while http_stream.read_body_bytes().await.unwrap().is_some() {}
+        assert!(http_stream.body_reader.body_complete());
+        assert!(http_stream.body_reader.has_bytes_overread());
+        assert!(http_stream.reuse().await.is_none());
     }
 
     #[tokio::test]
