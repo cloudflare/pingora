@@ -316,8 +316,9 @@ where
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
-                            // Downstream should consume all remaining data and handle the error
-                            return Ok(upstream_can_reuse)
+                            // A response read error means the HTTP/1 message boundary was not
+                            // established successfully, so the connection cannot be reused.
+                            return Ok(false)
                         }
                     }
                 },

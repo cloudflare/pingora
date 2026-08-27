@@ -83,6 +83,7 @@ mod tests {
     use crate::upstreams::peer::Peer;
     use pingora_http::RequestHeader;
     use std::fmt::{Display, Formatter, Result as FmtResult};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn get_http(http: &mut HttpSession, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());
@@ -114,6 +115,44 @@ mod tests {
         connector.release_http_session(http, &peer, None).await;
         let (_, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(reused);
+    }
+
+    #[tokio::test]
+    async fn malformed_response_is_not_returned_to_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\n\
+Transfer-Encoding: chunked\r\n\
+\r\n\
+ZZ\r\n",
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+        let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        http.write_request_header(Box::new(request)).await.unwrap();
+        assert!(matches!(
+            http.read_response_task().await.unwrap(),
+            crate::protocols::http::HttpTask::Header(_, false)
+        ));
+        assert!(http.read_response_task().await.is_err());
+
+        connector.release_http_session(http, &peer, None).await;
+        assert!(connector.reused_http_session(&peer).await.is_none());
+        server.abort();
     }
 
     #[cfg(unix)]
