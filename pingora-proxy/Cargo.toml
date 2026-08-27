@@ -56,6 +56,7 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+criterion = "0.5"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
@@ -81,6 +82,10 @@ trace = ["pingora-cache/trace"]
 [[example]]
 name = "connection_filter"
 required-features = ["connection_filter"]
+
+[[bench]]
+name = "noop_body_filter"
+harness = false
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

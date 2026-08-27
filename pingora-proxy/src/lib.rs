@@ -406,9 +406,11 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
                     .upstream_response_trailer_filter(session, trailers, ctx)?;
@@ -1836,6 +1838,67 @@ mod tests {
         let mut session = Session::new_h1(Box::new(stream));
         session.read_request().await.unwrap();
         session
+    }
+
+    struct AsyncBodyFilter;
+
+    #[async_trait]
+    impl ProxyHttp for AsyncBodyFilter {
+        type CTX = bool;
+
+        fn new_ctx(&self) -> Self::CTX {
+            false
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("not used by this test")
+        }
+
+        async fn upstream_response_body_filter(
+            &self,
+            _session: &mut Session,
+            body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            fail: &mut Self::CTX,
+        ) -> Result<Option<Duration>> {
+            tokio::task::yield_now().await;
+            if *fail {
+                return Error::e_explain(InternalError, "async body filter failed");
+            }
+            *body = Some(Bytes::from_static(b"filtered"));
+            Ok(Some(Duration::from_millis(7)))
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_filter_awaits_response_body_filter() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written).await;
+        let proxy = HttpProxy::new(AsyncBodyFilter, Arc::new(ServerConf::default()));
+        let mut task = HttpTask::Body(Some(Bytes::from_static(b"original")), true);
+        let mut fail = false;
+
+        let delay = proxy
+            .upstream_filter(&mut session, &mut task, &mut fail)
+            .await
+            .unwrap();
+
+        assert_eq!(delay, Some(Duration::from_millis(7)));
+        let HttpTask::Body(body, end) = &task else {
+            panic!("expected a body task");
+        };
+        assert_eq!(body.as_deref(), Some(b"filtered".as_slice()));
+        assert!(*end);
+
+        fail = true;
+        assert!(proxy
+            .upstream_filter(&mut session, &mut task, &mut fail)
+            .await
+            .is_err());
     }
 
     fn upgrade_response_header() -> ResponseHeader {

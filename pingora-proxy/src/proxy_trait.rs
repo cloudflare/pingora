@@ -448,13 +448,21 @@ pub trait ProxyHttp {
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
-    fn upstream_response_body_filter(
+    ///
+    /// Like [Self::request_body_filter()], the async nature of this function allows executing
+    /// heavy computation logic (e.g. scanning or transforming response content) on offloaded
+    /// threads, or awaiting external services, without blocking the threads who process the
+    /// requests themselves.
+    async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>> {
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(None)
     }
 
