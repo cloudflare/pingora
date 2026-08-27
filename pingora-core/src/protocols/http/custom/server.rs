@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
@@ -26,25 +25,40 @@ use crate::protocols::{http::HttpTask, l4::socket::SocketAddr, Digest};
 use super::CustomMessageWrite;
 
 #[doc(hidden)]
-#[async_trait]
+/// A concrete custom downstream session.
+///
+/// Async operations return concrete `Send` futures so dispatch does not require
+/// an allocation per call. Implementations may use `async fn` to satisfy these
+/// methods. This trait is intentionally not dyn-compatible.
 pub trait Session: Send + Sync + Unpin + 'static {
     fn req_header(&self) -> &RequestHeader;
 
     fn req_header_mut(&mut self) -> &mut RequestHeader;
 
-    async fn read_body_bytes(&mut self) -> Result<Option<Bytes>>;
+    fn read_body_bytes(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
-    async fn drain_request_body(&mut self) -> Result<()>;
+    fn drain_request_body(&mut self) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_response_header(&mut self, resp: Box<ResponseHeader>, end: bool) -> Result<()>;
+    fn write_response_header(
+        &mut self,
+        resp: Box<ResponseHeader>,
+        end: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_response_header_ref(&mut self, resp: &ResponseHeader, end: bool) -> Result<()>;
+    fn write_response_header_ref(
+        &mut self,
+        resp: &ResponseHeader,
+        end: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()>;
+    fn write_body(&mut self, data: Bytes, end: bool) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()>;
+    fn write_trailers(&mut self, trailers: HeaderMap) -> impl Future<Output = Result<()>> + Send;
 
-    async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
+    fn response_duplex_vec(
+        &mut self,
+        tasks: Vec<HttpTask>,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     /// Whether the cancel-safe proxy task API is enabled for this session.
     fn proxy_tasks_enabled(&self) -> bool {
@@ -72,8 +86,8 @@ pub trait Session: Send + Sync + Unpin + 'static {
     ///
     /// # Panics
     /// Panics if the Custom session does not implement the proxy task API.
-    async fn write_proxy_tasks(&mut self) -> Result<bool> {
-        panic!("Custom proxy task API not implemented")
+    fn write_proxy_tasks(&mut self) -> impl Future<Output = Result<bool>> + Send {
+        async { panic!("Custom proxy task API not implemented") }
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
@@ -92,7 +106,7 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_written(&self) -> Option<&ResponseHeader>;
 
-    async fn shutdown(&mut self, code: u32, ctx: &str);
+    fn shutdown(&mut self, code: u32, ctx: &str) -> impl Future<Output = ()> + Send;
 
     /// Abandon the response mid-message, in a way the peer can tell apart from a
     /// response that was completed.
@@ -106,17 +120,22 @@ pub trait Session: Send + Sync + Unpin + 'static {
     /// implementations that predate this method. Implementations whose protocol
     /// can distinguish an abandoned message from a completed one should override
     /// this; otherwise a peer may read the abandoned message as successful.
-    async fn abandon(&mut self, ctx: &str) {
-        self.shutdown(0, ctx).await;
+    fn abandon(&mut self, ctx: &str) -> impl Future<Output = ()> + Send {
+        async move {
+            self.shutdown(0, ctx).await;
+        }
     }
 
     fn is_body_done(&mut self) -> bool;
 
-    async fn finish(&mut self) -> Result<()>;
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     fn is_body_empty(&mut self) -> bool;
 
-    async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>>;
+    fn read_body_or_idle(
+        &mut self,
+        no_body_expected: bool,
+    ) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
     fn body_bytes_sent(&self) -> usize;
 
@@ -138,7 +157,7 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn get_retry_buffer(&self) -> Option<Bytes>;
 
-    async fn finish_custom(&mut self) -> Result<()>;
+    fn finish_custom(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     fn take_custom_message_reader(
         &mut self,
@@ -169,7 +188,6 @@ pub trait Session: Send + Sync + Unpin + 'static {
 }
 
 #[doc(hidden)]
-#[async_trait]
 impl Session for () {
     fn req_header(&self) -> &RequestHeader {
         unreachable!("server session: req_header")
