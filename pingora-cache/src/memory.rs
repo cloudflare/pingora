@@ -410,6 +410,30 @@ impl Storage for MemCache {
         }
     }
 
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        _trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        // This test store does not retain entry IDs, so it cannot safely match identified entries.
+        if matches!(target, PurgeTarget::Exact(CacheEntryKey::Identified { .. })) {
+            return Ok(PurgeOutcome::NotFound);
+        }
+        let hash = target.key().combined();
+        // Unlike purge this leaves `temp` alone. An in-flight miss has no committed meta to
+        // rewrite, and expiring what it is about to store would discard a fresh response.
+        // The guard covers the whole read-modify-write so concurrent expires cannot clobber
+        // each other.
+        let mut cached = self.cached.write();
+        let Some(obj) = cached.get_mut(&hash) else {
+            return Ok(PurgeOutcome::NotFound);
+        };
+        let mut meta = CacheMeta::deserialize(&obj.meta.0, &obj.meta.1)?;
+        meta.expire_at(SystemTime::now());
+        obj.meta = meta.serialize()?;
+        Ok(PurgeOutcome::Expired)
+    }
+
     async fn update_meta(
         &'static self,
         key: &CacheKey,
@@ -664,6 +688,72 @@ mod test {
         assert!(result.is_ok());
 
         assert!(!cache.cached.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn expiring_keeps_the_entry_but_makes_it_stale() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+
+        let key = CacheKey::new("expire-me", "1");
+        let compact = key.to_compact();
+        let hash = compact.combined();
+        let body = vec![1, 2, 3];
+        let fresh = CacheMeta::new(
+            SystemTime::now() + std::time::Duration::from_secs(300),
+            SystemTime::now(),
+            30,
+            30,
+            ResponseHeader::build(200, None).unwrap(),
+        );
+        cache.cached.write().insert(
+            hash.clone(),
+            CacheObject {
+                meta: fresh.serialize().unwrap(),
+                body: Arc::new(body.clone()),
+            },
+        );
+
+        let outcome = cache
+            .expire(
+                crate::storage::PurgeTarget::Active(&compact),
+                &Span::inactive().handle(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::storage::PurgeOutcome::Expired);
+        let (meta, mut hit) = cache
+            .lookup(&key, &Span::inactive().handle())
+            .await
+            .unwrap()
+            .expect("the entry is still stored");
+        assert!(!meta.is_fresh(SystemTime::now() + std::time::Duration::from_secs(1)));
+        assert!(
+            meta.serve_stale_while_revalidate(SystemTime::now()),
+            "expiring must not close the serve stale windows the response set"
+        );
+        assert_eq!(
+            hit.read_body().await.unwrap().as_deref(),
+            Some(body.as_slice()),
+            "the body stays readable so a revalidation can reuse it"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiring_an_absent_entry_finds_nothing() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let key = CacheKey::new("never-stored", "1").to_compact();
+
+        let outcome = MEM_CACHE
+            .expire(
+                crate::storage::PurgeTarget::Active(&key),
+                &Span::inactive().handle(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::storage::PurgeOutcome::NotFound);
     }
 
     #[tokio::test]

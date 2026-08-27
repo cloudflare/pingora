@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use pingora_cache::PurgeAction;
 use pingora_core::protocols::http::error_resp;
 use std::borrow::Cow;
 
@@ -73,7 +74,11 @@ where
         SV::CTX: Send + Sync,
     {
         let purge_status = if session.cache.enabled() {
-            match session.cache.purge().await {
+            let purged = match self.inner.purge_action(session, ctx) {
+                PurgeAction::Delete => session.cache.purge().await,
+                PurgeAction::Expire => session.cache.expire().await,
+            };
+            match purged {
                 Ok(found) => {
                     if found {
                         PurgeStatus::Found

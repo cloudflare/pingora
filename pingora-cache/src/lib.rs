@@ -52,7 +52,9 @@ use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills,
 pub use memory::MemCache;
 pub use meta::{set_compression_dict_content, set_compression_dict_path};
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, PurgeOutcome, PurgeTarget, PurgeType, Storage};
+pub use storage::{
+    HitHandler, MissHandler, PurgeAction, PurgeOutcome, PurgeTarget, PurgeType, Storage,
+};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -247,8 +249,22 @@ impl RespCacheable {
 /// For example, should an existing fresh asset be revalidated or re-retrieved altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForcedFreshness {
-    /// Indicates the asset should be considered stale and revalidated
+    /// Indicates the asset should be considered stale and revalidated, with its
+    /// stale-while-revalidate and stale-if-error windows closed so that readers wait
+    /// on the revalidation
     ForceExpired,
+
+    /// Indicates the asset should be considered stale, leaving its
+    /// stale-while-revalidate and stale-if-error windows to decide whether the stale
+    /// body can still be served while it revalidates
+    ///
+    /// `expired_at` is when the asset went out of service, such as the timestamp a purge was
+    /// recorded at. [`CacheMeta::expire_at`] applies it and explains why it has to be that
+    /// point rather than the time of the lookup.
+    ///
+    /// `None` when the asset is out of service but the caller does not know when it went out,
+    /// which leaves the windows measured from the asset's own deadline.
+    ForceExpiredServeStale { expired_at: Option<SystemTime> },
 
     /// Indicates the asset should be considered absent and treated like a miss
     /// instead of a hit
@@ -269,6 +285,10 @@ pub enum HitStatus {
 
     /// The asset was marked as expired, and should be treated as stale
     ForceExpired,
+
+    /// The asset was marked as expired without closing its serve stale windows, so
+    /// the stale body may still be served while it revalidates
+    ForceExpiredServeStale,
 
     /// The asset was marked as absent, and should be treated as a miss
     ForceMiss,
@@ -819,7 +839,9 @@ impl HttpCache {
 
         self.phase = match hit_status {
             HitStatus::Fresh | HitStatus::ForceFresh => CachePhase::Hit,
-            HitStatus::Expired | HitStatus::ForceExpired => CachePhase::Stale,
+            HitStatus::Expired | HitStatus::ForceExpired | HitStatus::ForceExpiredServeStale => {
+                CachePhase::Stale
+            }
             HitStatus::FailedHitFilter | HitStatus::ForceMiss => self.phase,
         };
 
@@ -1789,13 +1811,35 @@ impl HttpCache {
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
     pub async fn purge(&self) -> Result<bool> {
+        self.purge_action(PurgeAction::Delete).await
+    }
+
+    /// Mark the asset stale in the cache storage so the next read revalidates it.
+    ///
+    /// Storage that cannot mark an asset stale deletes it instead, so this never leaves a
+    /// fresh asset behind.
+    ///
+    /// # Panic
+    /// Need to be called after the cache key is set. Panic otherwise.
+    pub async fn expire(&self) -> Result<bool> {
+        self.purge_action(PurgeAction::Expire).await
+    }
+
+    async fn purge_action(&self, action: PurgeAction) -> Result<bool> {
         match self.phase {
             CachePhase::CacheKey => {
                 let inner = self.inner();
                 let inner_enabled = self.inner_enabled();
                 let span = inner_enabled.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                Self::purge_impl(inner_enabled.storage, inner_enabled.eviction, &key, span).await
+                Self::purge_impl(
+                    inner_enabled.storage,
+                    inner_enabled.eviction,
+                    &key,
+                    action,
+                    span,
+                )
+                .await
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
@@ -1819,7 +1863,7 @@ impl HttpCache {
         let storage = inner_enabled.storage;
         let eviction = inner_enabled.eviction;
         tokio::task::spawn(async move {
-            Self::purge_impl(storage, eviction, &key, span)
+            Self::purge_impl(storage, eviction, &key, PurgeAction::Delete, span)
                 .await
                 .map_err(|e| {
                     warn!("Failed to purge {key} (context: {context}): {e}");
@@ -1833,12 +1877,18 @@ impl HttpCache {
         storage: &'static (dyn storage::Storage + Sync),
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
         key: &CompactCacheKey,
+        action: PurgeAction,
         mut span: Span,
     ) -> Result<bool> {
         let target = storage::PurgeTarget::Active(key);
-        let result = storage
-            .purge(target, PurgeType::Invalidation, &span.handle())
-            .await;
+        let result = match action {
+            PurgeAction::Delete => {
+                storage
+                    .purge(target, PurgeType::Invalidation, &span.handle())
+                    .await
+            }
+            PurgeAction::Expire => storage.expire(target, &span.handle()).await,
+        };
         let purged = match result.as_ref() {
             Ok(storage::PurgeOutcome::NotFound) | Err(_) => false,
             Ok(storage::PurgeOutcome::Purged(entry_id)) => {
@@ -1847,8 +1897,23 @@ impl HttpCache {
                 }
                 true
             }
+            // the entry is still stored, so the eviction manager keeps tracking it
+            Ok(storage::PurgeOutcome::Expired) => true,
         };
         span.set_tag(|| trace::Tag::new("purged", purged));
+        // `purged` alone cannot tell an expiry apart from storage falling back to deleting, so
+        // record what actually happened to the entry.
+        span.set_tag(|| {
+            trace::Tag::new(
+                "purge_outcome",
+                match result.as_ref() {
+                    Ok(storage::PurgeOutcome::NotFound) => "not_found",
+                    Ok(storage::PurgeOutcome::Purged(_)) => "deleted",
+                    Ok(storage::PurgeOutcome::Expired) => "expired",
+                    Err(_) => "error",
+                },
+            )
+        });
         result?;
         Ok(purged)
     }
@@ -1921,6 +1986,11 @@ mod tests {
     struct OneShotLookupStorage {
         entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
     }
+    /// Storage that can mark an entry stale, recording the target it was asked to expire. Its
+    /// `purge` is unreachable so a test fails loudly if expiry is routed to deletion instead.
+    struct ExpiringStorage {
+        expired: Mutex<Option<CompactCacheKey>>,
+    }
     struct EmptyHitHandler {
         entry_id: Option<u64>,
     }
@@ -1947,6 +2017,9 @@ mod tests {
     // and clear any entries they push.
     static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
         entries: Mutex::new(Vec::new()),
+    };
+    static EXPIRING_STORAGE: ExpiringStorage = ExpiringStorage {
+        expired: Mutex::new(None),
     };
     static RAW_MISS_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
     static VALID_AFTER_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
@@ -2043,6 +2116,57 @@ mod tests {
             } else {
                 storage::PurgeOutcome::NotFound
             })
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for ExpiringStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _target: storage::PurgeTarget<'_>,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            unreachable!("storage that can expire must not be asked to delete")
+        }
+
+        async fn expire(
+            &'static self,
+            target: storage::PurgeTarget<'_>,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            *self.expired.lock().unwrap() = Some(target.key().clone());
+            Ok(storage::PurgeOutcome::Expired)
         }
 
         async fn update_meta(
@@ -2420,6 +2544,7 @@ mod tests {
             &IDENTIFIED_CREATED_STORAGE,
             Some(recording),
             &key,
+            PurgeAction::Delete,
             trace::Span::inactive(),
         )
         .await
@@ -2449,6 +2574,7 @@ mod tests {
             &PURGE_OK_STORAGE,
             Some(recording),
             &key,
+            PurgeAction::Delete,
             trace::Span::inactive(),
         )
         .await
@@ -2461,6 +2587,74 @@ mod tests {
             .take()
             .expect("purge should remove the key-only entry");
         assert_eq!(removed, eviction::CacheEntryKey::key_only(key));
+    }
+
+    #[tokio::test]
+    async fn expiring_an_entry_keeps_it_tracked_by_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-keeps-entry", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &EXPIRING_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(
+            EXPIRING_STORAGE.expired.lock().unwrap().take(),
+            Some(key),
+            "storage should have been asked to expire the target"
+        );
+        assert!(
+            recording.removed.lock().unwrap().is_none(),
+            "the entry is still stored, so eviction must keep tracking it"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiring_falls_back_to_deleting_when_storage_cannot_mark_stale() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-falls-back", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &PURGE_OK_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the fallback deletes, so eviction must stop tracking the entry");
+        assert_eq!(removed, eviction::CacheEntryKey::key_only(key));
+    }
+
+    #[tokio::test]
+    async fn the_expire_fallback_reports_nothing_purged_for_an_absent_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-absent", "").to_compact();
+
+        assert!(!HttpCache::purge_impl(
+            &UPDATE_OK_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        assert!(recording.removed.lock().unwrap().is_none());
     }
 
     #[test]
@@ -2492,6 +2686,31 @@ mod tests {
         assert!(recording.removed.lock().unwrap().is_none());
         assert!(recording.admitted.lock().unwrap().is_none());
         assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_forced_expiry_that_serves_stale_is_stale_with_its_windows_intact() {
+        let mut cache = HttpCache::new();
+        cache.enable(&IDENTIFIED_CREATED_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("force-expired-serve-stale", ""));
+        cache.cache_found(
+            test_meta(SystemTime::now()),
+            Box::new(EmptyHitHandler { entry_id: None }),
+            HitStatus::ForceExpiredServeStale,
+        );
+
+        assert_eq!(cache.phase(), CachePhase::Stale);
+        assert_eq!(cache.cache_meta().stale_while_revalidate_sec(), 30);
+        assert_eq!(cache.cache_meta().stale_if_error_sec(), 30);
+    }
+
+    #[test]
+    fn a_forced_expiry_that_serves_stale_is_neither_fresh_nor_a_miss() {
+        let status = HitStatus::ForceExpiredServeStale;
+
+        assert!(!status.is_fresh());
+        assert!(!status.is_treated_as_miss());
+        assert_eq!(status.as_str(), "force_expired_serve_stale");
     }
 
     #[tokio::test]
@@ -2690,6 +2909,30 @@ mod tests {
         assert_eq!(cache.cache_meta().created(), created);
         assert_eq!(cache.cache_meta().updated(), revalidated_at);
         assert_eq!(cache.cache_meta().provenance(), family_start);
+    }
+
+    #[tokio::test]
+    async fn revalidating_an_expired_meta_makes_it_fresh_again() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let expired_at = created + Duration::from_secs(30);
+        let revalidated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        // An expiry has to be undone by revalidation, or a soft purge would leave the asset
+        // stale forever. It comes back because revalidation replaces the whole meta rather than
+        // merging into the expired one.
+        let mut old_meta = test_meta(created);
+        old_meta.expire_at(expired_at);
+        assert!(!old_meta.is_fresh(expired_at + Duration::from_secs(1)));
+
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("revalidate-expired", ""));
+        cache
+            .revalidate_cache_meta(test_meta(revalidated_at))
+            .await
+            .unwrap();
+
+        let meta = cache.cache_meta();
+        assert!(meta.is_fresh(revalidated_at));
+        assert_eq!(meta.fresh_until(), revalidated_at + Duration::from_secs(60));
     }
 
     #[test]
