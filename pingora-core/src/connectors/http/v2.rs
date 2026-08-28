@@ -87,12 +87,37 @@ impl ConnectionRef {
             release_lock: Arc::new(Mutex::new(())),
         }))
     }
-
+    // TODO: Migrate callers of `more_streams_allowed()` to
+    // `can_accept_streams(1)`, then deprecate/remove the duplicate legacy method.
+    // The unified predicate should reject closed and shutting-down connections;
+    // it remains advisory and does not reserve stream capacity.
     pub fn more_streams_allowed(&self) -> bool {
         let current = self.0.current_streams.load(Ordering::Relaxed);
         !self.is_shutting_down()
             && self.0.max_streams > current
             && self.0.connection_stub.0.current_max_send_streams() > current
+    }
+
+    /// Return the number of additional streams this connection can currently accept.
+    ///
+    /// This is an advisory snapshot and does not reserve capacity. Concurrent stream creation,
+    /// connection closure, or a peer settings update can invalidate it immediately.
+    pub fn free_stream_slots(&self) -> usize {
+        if self.is_closed() || self.is_shutting_down() {
+            return 0;
+        }
+
+        let current = self.0.current_streams.load(Ordering::Relaxed);
+        let limit = self
+            .0
+            .max_streams
+            .min(self.0.connection_stub.0.current_max_send_streams());
+        limit.saturating_sub(current)
+    }
+
+    /// Return whether this connection can currently accept `streams` additional streams.
+    pub fn can_accept_streams(&self, streams: usize) -> bool {
+        streams > 0 && self.free_stream_slots() >= streams
     }
 
     pub fn is_idle(&self) -> bool {
@@ -838,6 +863,34 @@ mod tests {
 
         assert!(conn.is_shutting_down());
         assert!(!conn.more_streams_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_free_stream_slots() {
+        let (client_io, _server_io) = tokio::io::duplex(65536);
+        let (send_req, _connection) = h2::client::Builder::new()
+            .initial_max_send_streams(3)
+            .handshake(client_io)
+            .await
+            .unwrap();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 4, Digest::default());
+
+        assert_eq!(conn.free_stream_slots(), 3);
+        assert!(conn.can_accept_streams(3));
+        assert!(!conn.can_accept_streams(4));
+        assert!(!conn.can_accept_streams(0));
+
+        conn.0.current_streams.store(1, Ordering::Relaxed);
+        assert_eq!(conn.free_stream_slots(), 2);
+
+        closed_tx.send(true).unwrap();
+        assert_eq!(conn.free_stream_slots(), 0);
+
+        closed_tx.send(false).unwrap();
+        conn.mark_shutdown();
+        assert_eq!(conn.free_stream_slots(), 0);
     }
 
     #[cfg(all(feature = "any_tls", unix))]
