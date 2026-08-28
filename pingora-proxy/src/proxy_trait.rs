@@ -448,27 +448,42 @@ pub trait ProxyHttp {
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
+    ///
+    /// The async nature of this function allows implementations to await I/O or offload expensive
+    /// work without blocking the task processing the request.
     async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>> {
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(None)
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers
+    ///
+    /// The async nature of this function allows implementations to await I/O or offload expensive
+    /// work without blocking the task processing the request.
     async fn upstream_response_trailer_filter(
         &self,
         _session: &mut Session,
         _upstream_trailers: &mut header::HeaderMap,
         _ctx: &mut Self::CTX,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks
+    ///
+    /// The async nature of this function allows implementations to await I/O or offload expensive
+    /// work without blocking the task processing the request.
     async fn response_body_filter(
         &self,
         _session: &mut Session,
