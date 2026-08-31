@@ -3,7 +3,7 @@ name: Security Audit
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       - "**/Cargo.toml"
   schedule:
