@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use once_cell::sync::Lazy;
 use pingora_error::{Error, ErrorType};
 use regex::bytes::Regex;
+use std::fmt;
 use std::num::IntErrorKind;
 use std::slice;
 use std::str;
@@ -47,8 +48,148 @@ pub const DELTA_SECONDS_OVERFLOW_VALUE: u32 = i32::MAX as u32;
 pub const DELTA_SECONDS_OVERFLOW_DURATION: Duration =
     Duration::from_secs(DELTA_SECONDS_OVERFLOW_VALUE as u64);
 
-/// Cache control directive key type
-pub type DirectiveKey = String;
+/// Cache-Control directive key.
+///
+/// Known RFC 9111 (and common extension) directives are represented as enum variants,
+/// avoiding a heap allocation for every parsed directive. Unknown or extension
+/// directives are preserved via the [`Unknown`](Self::Unknown) variant.
+///
+/// Directive keys are always stored in lowercase, matching the case-insensitive
+/// comparison required by the HTTP specification.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DirectiveKey {
+    /// `max-age`
+    MaxAge,
+    /// `s-maxage`
+    SMaxAge,
+    /// `no-cache`
+    NoCache,
+    /// `no-store`
+    NoStore,
+    /// `private`
+    Private,
+    /// `public`
+    Public,
+    /// `must-revalidate`
+    MustRevalidate,
+    /// `proxy-revalidate`
+    ProxyRevalidate,
+    /// `must-understand`
+    MustUnderstand,
+    /// `no-transform`
+    NoTransform,
+    /// `immutable`
+    Immutable,
+    /// `stale-while-revalidate`
+    StaleWhileRevalidate,
+    /// `stale-if-error`
+    StaleIfError,
+    /// `only-if-cached`
+    OnlyIfCached,
+    /// An unknown or extension directive, stored as the original (lowercased) name.
+    Unknown(String),
+}
+
+impl DirectiveKey {
+    /// Return the wire-format name of this directive as a `&str`.
+    ///
+    /// Known variants return a `&'static str`; [`Unknown`](Self::Unknown)
+    /// returns a borrow of the inner `String`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::MaxAge => "max-age",
+            Self::SMaxAge => "s-maxage",
+            Self::NoCache => "no-cache",
+            Self::NoStore => "no-store",
+            Self::Private => "private",
+            Self::Public => "public",
+            Self::MustRevalidate => "must-revalidate",
+            Self::ProxyRevalidate => "proxy-revalidate",
+            Self::MustUnderstand => "must-understand",
+            Self::NoTransform => "no-transform",
+            Self::Immutable => "immutable",
+            Self::StaleWhileRevalidate => "stale-while-revalidate",
+            Self::StaleIfError => "stale-if-error",
+            Self::OnlyIfCached => "only-if-cached",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    /// Construct a [`DirectiveKey`] from a **lowercase** `&str`.
+    ///
+    /// Known directive names are mapped to their enum variant (zero allocation).
+    /// Anything else produces [`Unknown`](Self::Unknown) with an owned copy of
+    /// the string.
+    ///
+    /// The caller is responsible for lowercasing the input first; this function
+    /// does **not** perform case folding.
+    ///
+    /// See also [`from_lowercase_owned`](Self::from_lowercase_owned) to avoid a
+    /// re-allocation when the caller already has an owned `String`.
+    pub fn from_lowercase(s: &str) -> Self {
+        match s {
+            "max-age" => Self::MaxAge,
+            "s-maxage" => Self::SMaxAge,
+            "no-cache" => Self::NoCache,
+            "no-store" => Self::NoStore,
+            "private" => Self::Private,
+            "public" => Self::Public,
+            "must-revalidate" => Self::MustRevalidate,
+            "proxy-revalidate" => Self::ProxyRevalidate,
+            "must-understand" => Self::MustUnderstand,
+            "no-transform" => Self::NoTransform,
+            "immutable" => Self::Immutable,
+            "stale-while-revalidate" => Self::StaleWhileRevalidate,
+            "stale-if-error" => Self::StaleIfError,
+            "only-if-cached" => Self::OnlyIfCached,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
+    /// Construct a [`DirectiveKey`] from a **lowercase** owned `String`.
+    ///
+    /// Behaves identically to [`from_lowercase`](Self::from_lowercase) but
+    /// takes ownership of the `String`, avoiding a re-allocation when the
+    /// input maps to [`Unknown`](Self::Unknown).
+    pub fn from_lowercase_owned(s: String) -> Self {
+        // Check against known names first (the string is borrowed for matching).
+        match s.as_str() {
+            "max-age" => Self::MaxAge,
+            "s-maxage" => Self::SMaxAge,
+            "no-cache" => Self::NoCache,
+            "no-store" => Self::NoStore,
+            "private" => Self::Private,
+            "public" => Self::Public,
+            "must-revalidate" => Self::MustRevalidate,
+            "proxy-revalidate" => Self::ProxyRevalidate,
+            "must-understand" => Self::MustUnderstand,
+            "no-transform" => Self::NoTransform,
+            "immutable" => Self::Immutable,
+            "stale-while-revalidate" => Self::StaleWhileRevalidate,
+            "stale-if-error" => Self::StaleIfError,
+            "only-if-cached" => Self::OnlyIfCached,
+            _ => Self::Unknown(s),
+        }
+    }
+}
+
+impl fmt::Display for DirectiveKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for DirectiveKey {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for DirectiveKey {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
 
 /// Cache control directive value type
 #[derive(Debug)]
@@ -235,11 +376,13 @@ impl CacheControl {
         for line in headers {
             for captures in RE_CACHE_DIRECTIVE.captures_iter(line.as_bytes()) {
                 // directive key
-                // header values don't have to be utf-8, but we store keys as strings for case-insensitive hashing
+                // header values don't have to be utf-8, but we store keys as
+                // strings for case-insensitive matching. Known directive names
+                // are mapped to enum variants (zero allocation).
                 let key = captures.get(1).and_then(|cap| {
                     str::from_utf8(cap.as_bytes())
                         .ok()
-                        .map(|token| token.to_lowercase())
+                        .map(|token| DirectiveKey::from_lowercase_owned(token.to_lowercase()))
                 });
                 if key.is_none() {
                     continue;
@@ -298,17 +441,30 @@ impl CacheControl {
     }
 
     /// Whether the given directive is in the cache control.
+    ///
+    /// Accepts a string for convenience; known directive names are matched
+    /// without allocation. Prefer [`has_directive`](Self::has_directive) when
+    /// you already have a [`DirectiveKey`].
+    ///
+    /// **Note:** `key` must already be lowercase (e.g. `"max-age"`, not
+    /// `"Max-Age"`). Directive names are stored in wire-format lowercase;
+    /// a mixed-case input will silently miss.
     pub fn has_key(&self, key: &str) -> bool {
+        self.has_directive(&DirectiveKey::from_lowercase(key))
+    }
+
+    /// Whether the given [`DirectiveKey`] is in the cache control.
+    pub fn has_directive(&self, key: &DirectiveKey) -> bool {
         self.directives.contains_key(key)
     }
 
     /// Whether the `public` directive is in the cache control.
     pub fn public(&self) -> bool {
-        self.has_key("public")
+        self.has_directive(&DirectiveKey::Public)
     }
 
     /// Whether the given directive exists, and it has no value.
-    fn has_key_without_value(&self, key: &str) -> bool {
+    fn has_key_without_value(&self, key: &DirectiveKey) -> bool {
         matches!(self.directives.get(key), Some(None))
     }
 
@@ -319,35 +475,35 @@ impl CacheControl {
     // It must be a boolean form (no value) to apply to the whole response.
     // https://datatracker.ietf.org/doc/html/rfc7234#section-5.2.2.6
     pub fn private(&self) -> bool {
-        self.has_key_without_value("private")
+        self.has_key_without_value(&DirectiveKey::Private)
     }
 
-    fn get_field_names(&self, key: &str) -> Option<ListValueIter<'_>> {
+    fn get_field_names(&self, key: &DirectiveKey) -> Option<ListValueIter<'_>> {
         let value = self.directives.get(key)?.as_ref()?;
         Some(ListValueIter::from(value))
     }
 
     /// Get the values of `private=`
     pub fn private_field_names(&self) -> Option<ListValueIter<'_>> {
-        self.get_field_names("private")
+        self.get_field_names(&DirectiveKey::Private)
     }
 
     /// Whether the standalone `no-cache` exists in the cache control
     pub fn no_cache(&self) -> bool {
-        self.has_key_without_value("no-cache")
+        self.has_key_without_value(&DirectiveKey::NoCache)
     }
 
     /// Get the values of `no-cache=`
     pub fn no_cache_field_names(&self) -> Option<ListValueIter<'_>> {
-        self.get_field_names("no-cache")
+        self.get_field_names(&DirectiveKey::NoCache)
     }
 
     /// Whether `no-store` exists.
     pub fn no_store(&self) -> bool {
-        self.has_key("no-store")
+        self.has_directive(&DirectiveKey::NoStore)
     }
 
-    fn parse_delta_seconds(&self, key: &str) -> Result<Option<u32>> {
+    fn parse_delta_seconds(&self, key: &DirectiveKey) -> Result<Option<u32>> {
         if let Some(Some(dir_value)) = self.directives.get(key) {
             let value = if self.allow_float_seconds {
                 dir_value.parse_as_delta_seconds_floor()?
@@ -362,37 +518,37 @@ impl CacheControl {
 
     /// Return the `max-age` seconds
     pub fn max_age(&self) -> Result<Option<u32>> {
-        self.parse_delta_seconds("max-age")
+        self.parse_delta_seconds(&DirectiveKey::MaxAge)
     }
 
     /// Return the `s-maxage` seconds
     pub fn s_maxage(&self) -> Result<Option<u32>> {
-        self.parse_delta_seconds("s-maxage")
+        self.parse_delta_seconds(&DirectiveKey::SMaxAge)
     }
 
     /// Return the `stale-while-revalidate` seconds
     pub fn stale_while_revalidate(&self) -> Result<Option<u32>> {
-        self.parse_delta_seconds("stale-while-revalidate")
+        self.parse_delta_seconds(&DirectiveKey::StaleWhileRevalidate)
     }
 
     /// Return the `stale-if-error` seconds
     pub fn stale_if_error(&self) -> Result<Option<u32>> {
-        self.parse_delta_seconds("stale-if-error")
+        self.parse_delta_seconds(&DirectiveKey::StaleIfError)
     }
 
     /// Whether `must-revalidate` exists.
     pub fn must_revalidate(&self) -> bool {
-        self.has_key("must-revalidate")
+        self.has_directive(&DirectiveKey::MustRevalidate)
     }
 
     /// Whether `proxy-revalidate` exists.
     pub fn proxy_revalidate(&self) -> bool {
-        self.has_key("proxy-revalidate")
+        self.has_directive(&DirectiveKey::ProxyRevalidate)
     }
 
     /// Whether `only-if-cached` exists.
     pub fn only_if_cached(&self) -> bool {
-        self.has_key("only-if-cached")
+        self.has_directive(&DirectiveKey::OnlyIfCached)
     }
 }
 
@@ -401,7 +557,10 @@ impl InterpretCacheControl for CacheControl {
         if self.no_store() || self.private() {
             return Cacheable::No;
         }
-        if self.has_key("s-maxage") || self.has_key("max-age") || self.public() {
+        if self.has_directive(&DirectiveKey::SMaxAge)
+            || self.has_directive(&DirectiveKey::MaxAge)
+            || self.public()
+        {
             return Cacheable::Yes;
         }
         Cacheable::Default
@@ -411,7 +570,7 @@ impl InterpretCacheControl for CacheControl {
         // RFC 7234 https://datatracker.ietf.org/doc/html/rfc7234#section-3
         // "MUST NOT" store requests with Authorization header
         // unless response contains one of these directives
-        self.must_revalidate() || self.public() || self.has_key("s-maxage")
+        self.must_revalidate() || self.public() || self.has_directive(&DirectiveKey::SMaxAge)
     }
 
     fn fresh_duration(&self) -> Option<Duration> {
@@ -431,7 +590,10 @@ impl InterpretCacheControl for CacheControl {
     fn serve_stale_while_revalidate_duration(&self) -> Option<Duration> {
         // RFC 7234: these directives forbid serving stale.
         // https://datatracker.ietf.org/doc/html/rfc7234#section-4.2.4
-        if self.must_revalidate() || self.proxy_revalidate() || self.has_key("s-maxage") {
+        if self.must_revalidate()
+            || self.proxy_revalidate()
+            || self.has_directive(&DirectiveKey::SMaxAge)
+        {
             return Some(Duration::ZERO);
         }
         self.stale_while_revalidate()
@@ -440,7 +602,10 @@ impl InterpretCacheControl for CacheControl {
     }
 
     fn serve_stale_if_error_duration(&self) -> Option<Duration> {
-        if self.must_revalidate() || self.proxy_revalidate() || self.has_key("s-maxage") {
+        if self.must_revalidate()
+            || self.proxy_revalidate()
+            || self.has_directive(&DirectiveKey::SMaxAge)
+        {
             return Some(Duration::ZERO);
         }
         self.stale_if_error()

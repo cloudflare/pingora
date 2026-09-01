@@ -121,16 +121,19 @@ impl<C: CachePut> CachePutCtx<C> {
             // no miss_handler, uncacheable
             return Ok(());
         };
+        // Save the entry ID before `finish` consumes the miss handler.
+        let entry_id = miss_handler.entry_id();
         let finish = miss_handler.finish().await?;
         if let Some(eviction) = self.eviction.as_ref() {
             let cache_key = self.key.to_compact();
             let meta = self.meta.as_ref().unwrap();
+            let entry_key = crate::eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
             let evicted = match finish {
                 MissFinishType::Appended(delta, max_size) => {
-                    eviction.increment_weight(&cache_key, delta, max_size)
+                    eviction.increment_weight(&entry_key, delta, max_size)
                 }
                 MissFinishType::Created(size) => {
-                    eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                    eviction.admit(entry_key, size, meta.0.internal.fresh_until)
                 }
             };
             // actual eviction can be done async
@@ -141,8 +144,9 @@ impl<C: CachePut> CachePutCtx<C> {
             let storage = self.storage;
             tokio::task::spawn(async move {
                 for item in evicted {
-                    if let Err(e) = storage.purge(&item, PurgeType::Eviction, &trace).await {
-                        warn!("Failed to purge {item} during eviction for cache put: {e}");
+                    let target = crate::storage::PurgeTarget::Exact(&item);
+                    if let Err(e) = storage.purge(target, PurgeType::Eviction, &trace).await {
+                        warn!("Failed to purge {target} during eviction for cache put: {e}");
                     }
                 }
             });
@@ -257,7 +261,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -291,7 +295,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_uncacheable() {
-        let key = CacheKey::new("", "a", "1");
+        let key = CacheKey::new("a", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -312,7 +316,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_204_invalid_body() {
-        let key = CacheKey::new("", "b", "1");
+        let key = CacheKey::new("b", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -352,7 +356,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache_put_extra_body() {
-        let key = CacheKey::new("", "c", "1");
+        let key = CacheKey::new("c", "1");
         let span = Span::inactive();
         let put = TestCachePut();
         let mut ctx = TestCachePutCtx::new(put, key.clone(), &*CACHE_BACKEND, None, span);
@@ -521,7 +525,8 @@ mod parse_response {
             for header in resp.headers {
                 // TODO: consider hold a Bytes and all header values can be Bytes referencing the
                 // original buffer without reallocation
-                response.append_header(header.name.to_owned(), header.value.to_owned())?;
+                let header_value = pingora_http::header_value_from_slice(header.value);
+                response.append_header(header.name.to_owned(), header_value)?;
             }
             // TODO: see above, we can make header value `Bytes` referencing header_bytes
             let header_bytes = self.buf.split_to(split_to).freeze();

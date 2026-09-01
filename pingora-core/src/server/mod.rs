@@ -375,6 +375,17 @@ impl Server {
         self.bootstrap.lock().get_fds()
     }
 
+    /// Collect the listening bind addresses across all registered services.
+    #[cfg(unix)]
+    fn collect_listen_addresses(&self) -> Option<std::collections::HashSet<String>> {
+        self.services
+            .values()
+            .try_fold(std::collections::HashSet::new(), |mut addrs, wrapper| {
+                addrs.extend(wrapper.service.listen_addresses()?);
+                Some(addrs)
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_service(
         mut service: Box<dyn ServiceWithDependents>,
@@ -678,6 +689,12 @@ impl Server {
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
 
+        // Set this before the bootstrap service loads inherited fds.
+        #[cfg(unix)]
+        if let Some(expected) = self.collect_listen_addresses() {
+            self.bootstrap.lock().set_expected_listen_addrs(expected);
+        }
+
         // Get services in topological order (dependencies first)
         let startup_order = match self.dependencies.lock().topological_sort() {
             Ok(order) => order,
@@ -847,5 +864,29 @@ impl Server {
             .blocking_pool_opts(blocking_opts)
             .runtime_opts(runtime_opts)
             .build()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod listen_address_tests {
+    use super::*;
+
+    struct UnknownService;
+
+    #[async_trait]
+    impl crate::services::Service for UnknownService {
+        fn name(&self) -> &str {
+            "unknown"
+        }
+    }
+
+    #[test]
+    fn unknown_service_disables_inherited_fd_cleanup() {
+        let mut server = Server::new_with_opt_and_conf(None, ServerConf::default());
+        server.bootstrap_as_a_service();
+        assert_eq!(server.collect_listen_addresses(), Some(Default::default()));
+
+        server.add_service(UnknownService);
+        assert_eq!(server.collect_listen_addresses(), None);
     }
 }

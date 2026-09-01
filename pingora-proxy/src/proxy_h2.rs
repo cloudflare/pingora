@@ -90,13 +90,18 @@ where
         let mut req = session.req_header().clone();
 
         if req.version != Version::HTTP_2 || session.downstream_session.is_custom() {
+            if let Err(e) =
+                sanitize_h2_upstream_request(&mut req, peer.options.http_upstream_request_policy)
+            {
+                return (false, Some(e.into_down()));
+            }
             /* remove H1 specific headers */
             // https://github.com/hyperium/h2/blob/d3b9f1e36aadc1a7a6804e2f8e86d3fe4a244b4f/src/proto/streams/send.rs#L72
             req.remove_header(&http::header::TRANSFER_ENCODING);
             req.remove_header(&http::header::CONNECTION);
             req.remove_header(&http::header::UPGRADE);
-            req.remove_header("keep-alive");
-            req.remove_header("proxy-connection");
+            req.remove_header(KEEP_ALIVE);
+            req.remove_header(PROXY_CONNECTION);
         }
 
         /* turn it into h2 */
@@ -170,6 +175,14 @@ where
             .downstream_session
             .as_custom_mut()
             .and_then(|c| c.take_custom_message_writer());
+        // Keep the reader in this caller so it is restored even if retryable
+        // upstream errors make try_join! cancel the downstream future.
+        let mut downstream_custom_message_reader = match session
+            .take_downstream_custom_message_reader(&mut downstream_custom_message_writer)
+        {
+            Ok(reader) => reader,
+            Err(e) => return (false, Some(e)),
+        };
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
@@ -184,6 +197,10 @@ where
 
         session.as_mut().enable_retry_buffering();
 
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
@@ -193,9 +210,11 @@ where
                 rx,
                 ctx,
                 write_timeout,
-                &mut downstream_custom_message_writer
+                &mut downstream_custom_message_writer,
+                &mut downstream_custom_message_reader,
+                pipe_state.clone(),
             ),
-            pipe_up_to_down_response(client_session, tx)
+            pipe_up_to_down_response(client_session, tx, pipe_state)
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -208,19 +227,35 @@ where
                     }
                 }
             }
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                match custom_session.restore_custom_message_reader(downstream_custom_message_reader)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, Some(e));
+                    }
+                }
+            }
         }
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                let upstream_read_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let downstream_error = e.esource == ErrorSource::Downstream;
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out
+                // we know we have not received END_STREAM at this point since we read timed out.
+                // Also cancel the upstream stream when downstream goes away/resets so the
+                // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
-                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
-                    // Mark the underlying H2 connection for shutdown so it's not used
-                    // for new streams in case it is hung.
-                    client_session.conn.mark_shutdown();
+                    if upstream_read_timeout {
+                        // Mark the underlying H2 connection for shutdown so it's not used
+                        // for new streams in case it is hung.
+                        client_session.conn.mark_shutdown();
+                    }
                 }
                 (false, Some(e))
             }
@@ -281,7 +316,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -349,6 +386,7 @@ where
     }
 
     // returns whether server (downstream) session can be reused
+    #[allow(clippy::too_many_arguments)]
     async fn bidirection_down_to_up(
         &self,
         session: &mut Session,
@@ -357,6 +395,10 @@ where
         ctx: &mut SV::CTX,
         write_timeout: Option<Duration>,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+        downstream_custom_message_reader: &mut Option<
+            Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+        >,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -368,16 +410,16 @@ where
             mut downstream_custom_write,
             downstream_custom_message_custom_forwarding,
             mut downstream_custom_message_inject_rx,
-            mut downstream_custom_message_reader,
         ) = if downstream_custom_message_writer.is_some() {
-            let reader = session.downstream_custom_message()?;
             let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx), reader)
+            (true, true, Some(inject_tx), Some(inject_rx))
         } else {
-            (false, false, None, None, None)
+            (false, false, None, None)
         };
 
         if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            // Custom handles are owned by the caller so an early error here still
+            // lets the caller restore them before retrying another upstream.
             self.inner
                 .custom_forwarding(session, ctx, None, custom_forwarding)
                 .await?;
@@ -469,6 +511,35 @@ where
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
+                        },
+                        Err(e) if e.esource == ErrorSource::Downstream => {
+                            // Downstream reset/errored while the upstream write was blocked
+                            // (e.g. on upstream flow control). Same policy as the read error
+                            // handling above: ignore the downstream error if the upstream
+                            // response is being admitted to cache, otherwise fail so the
+                            // downstream stream handles are dropped promptly.
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if !wait_for_cache_fill {
+                                return Err(e);
+                            }
+                            // ignore downstream error so that upstream can continue to write cache
+                            downstream_state.to_errored();
+                            if !self.inner.suppress_proxy_warn_log(
+                                session,
+                                ctx,
+                                &e,
+                                ProxyWarnLogContext::DownstreamCache,
+                            ) {
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                            }
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session anyway.
+                            session.downstream_session.on_proxy_failure(e);
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
@@ -589,10 +660,14 @@ where
                 // "Gate" branch: ready(()) resolves immediately, so the guard controls
                 // whether we enter. This is not a busy-loop because every path through
                 // the inner select either (a) drains all pending tasks via
-                // write_downstream_proxy_tasks (making the guard false), (b) stores an
-                // upstream task in next_upstream_task (making the guard false), or
-                // (c) blocks on real I/O inside the nested select.
-                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
                     tokio::select! {
                         // Try to write downstream proxy tasks (cancel-safe)
                         write_result = session.write_downstream_proxy_tasks() => {
@@ -684,14 +759,6 @@ where
             }
         }
 
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
-                custom_session
-                    .restore_custom_message_reader(downstream_custom_message_reader)
-                    .expect("downstream restore_custom_message_reader should be empty");
-            }
-        }
-
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
@@ -704,6 +771,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
@@ -897,15 +967,42 @@ where
             return Ok(false);
         }
 
-        if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+        let (data, end) = match data {
+            Some(data) => {
+                debug!("Write {} bytes body to h2 upstream", data.len());
+                (data, end_of_body)
+            }
+            None => {
+                debug!("Read downstream body done");
+                /* send a standalone END_STREAM flag */
+                (Bytes::new(), true)
+            }
+        };
+
+        /* For H2 downstreams, race the upstream write against downstream stream
+         * closure. A write blocked on upstream flow control would otherwise keep the
+         * downstream stream handles referenced while a downstream RST_STREAM goes
+         * unobserved, pinning the downstream connection window credit until the
+         * write completes. */
+        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+            tokio::select! {
+                biased;
+                res = write_body(client_body, data, end, write_timeout) => {
+                    res.map_err(|e| e.into_up())?;
+                }
+                close_result = stream_close => {
+                    return match close_result {
+                        Ok(reason) => Error::e_explain(
+                            H2Error,
+                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+                        ),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| e.into_down());
+                }
+            }
         } else {
-            debug!("Read downstream body done");
-            /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true, write_timeout)
+            write_body(client_body, data, end, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
@@ -918,6 +1015,7 @@ where
 pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
+    pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
     client
         .read_response_header()
@@ -1004,19 +1102,17 @@ pub(crate) async fn pipe_up_to_down_response(
                      * misread as the terminating chunk */
                     continue;
                 }
-                let sent = tx
-                    .send(HttpTask::Body(Some(data), eos))
-                    .await
-                    .or_err(InternalError, "sending h2 body to pipe");
-                // If the response with content-length is sent to an HTTP1 downstream,
-                // bidirection_down_to_up() could decide that the body has finished and exit without
-                // waiting for this function to signal the eos. In this case tx being closed is not
-                // a sign of error. It should happen if the only thing left for the h2 to send is
-                // an empty data frame with eos set.
-                if sent.is_err() && eos && empty {
+                // A send failure is benign only when the downstream half signaled it
+                // completed (e.g. an H1 downstream finished by Content-Length before the
+                // H2 stream signaled end-of-stream): stop reading the upstream stream.
+                // Otherwise the closure is unexpected, so surface the original error.
+                let send_result = tx.send(HttpTask::Body(Some(data), eos)).await;
+                if send_result.is_err()
+                    && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+                {
                     return Ok(());
                 }
-                sent?;
+                send_result.or_err(InternalError, "sending h2 body to pipe")?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
@@ -1026,11 +1122,18 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    // If the channel is already closed, downstream is finished
-    // TODO: note that this does skip trailers/done, but downstream
-    // has already finished so no more is in theory necessary to send
+    // If the channel is already closed, the downstream half is finished. This
+    // skips trailers/done, but the downstream half has already finished so there
+    // is nothing more to send. Benign only if the downstream half signaled
+    // completion; otherwise the closure is unexpected, so surface it.
     if tx.is_closed() {
-        return Ok(());
+        if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+        return Error::e_explain(
+            InternalError,
+            "h2 task pipe closed unexpectedly before trailers",
+        );
     }
 
     // attempt to get trailers, racing against channel close
@@ -1046,21 +1149,35 @@ pub(crate) async fn pipe_up_to_down_response(
             }
         }
         _ = tx.closed() => {
-            return Ok(());
+            // Benign only if the downstream half signaled completion; otherwise
+            // the closure is unexpected, so surface it.
+            if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
+                return Ok(());
+            }
+            return Error::e_explain(InternalError, "h2 task pipe closed unexpectedly while reading trailers");
         }
     };
 
     let trailers = trailers.map(Box::new);
 
     if trailers.is_some() {
-        tx.send(HttpTask::Trailer(trailers))
-            .await
-            .or_err(InternalError, "sending h2 trailer to pipe")?;
+        // Benign only if the downstream signaled completion, same as the body sends above.
+        let send_result = tx.send(HttpTask::Trailer(trailers)).await;
+        if send_result.is_err()
+            && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        send_result.or_err(InternalError, "sending h2 trailer to pipe")?;
     }
 
-    tx.send(HttpTask::Done)
-        .await
-        .unwrap_or_else(|_| debug!("h2 to h1 channel closed!"));
+    let send_result = tx.send(HttpTask::Done).await;
+    if send_result.is_err() && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+    {
+        debug!("h2 to h1 channel closed!");
+        return Ok(());
+    }
+    send_result.or_err(InternalError, "sending h2 done to pipe")?;
 
     Ok(())
 }

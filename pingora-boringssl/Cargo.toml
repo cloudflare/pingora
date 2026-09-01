@@ -17,8 +17,8 @@ name = "pingora_boringssl"
 path = "src/lib.rs"
 
 [dependencies]
-boring = { version = "4.5", features = ["pq-experimental"] }
-boring-sys = "4.5"
+boring = "5" # PQ is always enabled in 5
+boring-sys = "5"
 futures-util = { version = "0.3", default-features = false }
 tokio = { workspace = true, features = ["io-util", "net", "macros", "rt-multi-thread"] }
 libc = "0.2.70"
@@ -32,5 +32,3 @@ tokio = { workspace = true, features = ["full"] }
 [features]
 default = []
 pq_use_second_keyshare = []
-# waiting for boring-rs release
-read_uninit = []

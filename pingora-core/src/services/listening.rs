@@ -332,4 +332,8 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             .as_ref()
             .and_then(|override_fn| override_fn(global))
     }
+
+    fn listen_addresses(&self) -> Option<Vec<String>> {
+        Some(self.listeners.addresses())
+    }
 }

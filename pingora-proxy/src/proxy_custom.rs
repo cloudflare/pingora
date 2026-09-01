@@ -13,15 +13,19 @@
 // limitations under the License.
 
 use futures::StreamExt;
+use pingora_cache::CachePhase;
 use pingora_core::{
-    protocols::http::custom::{
-        client::Session as CustomSession, is_informational_except_101, BodyWrite,
-        CustomMessageWrite, CUSTOM_MESSAGE_QUEUE_SIZE,
+    protocols::http::{
+        custom::{
+            client::Session as CustomSession, is_informational_except_101, BodyWrite,
+            CustomMessageWrite, CUSTOM_MESSAGE_QUEUE_SIZE,
+        },
+        v1::common::is_upgrade_req as is_h1_upgrade_req,
     },
     ImmutStr,
 };
 use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
-use proxy_common::{DownstreamStateMachine, ResponseStateMachine};
+use proxy_common::{DownstreamStateMachine, PipeState, ResponseStateMachine};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -80,6 +84,9 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        client_session.set_read_timeout(peer.options.read_timeout);
+        client_session.set_write_timeout(peer.options.write_timeout);
+
         let mut req = session.req_header().clone();
 
         if session.cache.enabled() {
@@ -101,6 +108,8 @@ where
             }
         }
 
+        session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
+
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
 
@@ -110,9 +119,6 @@ where
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
             return (false, Some(e.into_up()));
         }
-
-        client_session.set_read_timeout(peer.options.read_timeout);
-        client_session.set_write_timeout(peer.options.write_timeout);
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
@@ -191,6 +197,32 @@ where
         let (cancel_downstream_reader_tx, cancel_downstream_reader_rx) = oneshot::channel();
         let (_cancel_upstream_reader_tx, cancel_upstream_reader_rx) = oneshot::channel();
 
+        if let Err(e) = self
+            .inner
+            .custom_forwarding(
+                session,
+                ctx,
+                Some(upstream_custom_message_inject_tx),
+                downstream_custom_message_inject_tx,
+            )
+            .await
+        {
+            if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+                if let Err(restore_error) =
+                    custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    return (false, Some(restore_error));
+                }
+
+                if let Err(restore_error) =
+                    custom_session.restore_custom_message_reader(downstream_custom_message_reader)
+                {
+                    return (false, Some(restore_error));
+                }
+            }
+            return (false, Some(e));
+        }
+
         let upstream_custom_message_forwarder = CustomMessageForwarder {
             ctx: "down_to_up".into(),
             reader: &mut downstream_custom_message_reader,
@@ -209,18 +241,9 @@ where
             cancel: cancel_upstream_reader_rx,
         };
 
-        if let Err(e) = self
-            .inner
-            .custom_forwarding(
-                session,
-                ctx,
-                Some(upstream_custom_message_inject_tx),
-                downstream_custom_message_inject_tx,
-            )
-            .await
-        {
-            return (false, Some(e));
-        }
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
 
         /* read downstream body and upstream response at the same time */
         let ret = tokio::try_join!(
@@ -233,8 +256,9 @@ where
                 downstream_custom_message_filter_rx,
                 downstream_custom_final_hop,
                 cancel_downstream_reader_tx,
+                pipe_state.clone(),
             ),
-            custom_pipe_up_to_down_response(client_session, tx),
+            custom_pipe_up_to_down_response(client_session, tx, pipe_state),
             upstream_custom_message_forwarder.proxy(),
             downstream_custom_message_forwarder.proxy(),
         );
@@ -273,7 +297,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -358,6 +384,7 @@ where
         )>,
         downstream_custom_final_hop: bool,
         cancel_downstream_reader_tx: oneshot::Sender<()>,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -558,10 +585,14 @@ where
                 // "Gate" branch: ready(()) resolves immediately, so the guard controls
                 // whether we enter. This is not a busy-loop because every path through
                 // the inner select either (a) drains all pending tasks via
-                // write_downstream_proxy_tasks (making the guard false), (b) stores an
-                // upstream task in next_upstream_task (making the guard false), or
-                // (c) blocks on real I/O inside the nested select.
-                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
                     tokio::select! {
                         // Try to write downstream proxy tasks (cancel-safe)
                         write_result = session.write_downstream_proxy_tasks() => {
@@ -656,7 +687,9 @@ where
             }
         }
 
-        // Re-raise the error then the loop is finished.
+        // Re-raise the error then the loop is finished. This returns without
+        // signaling PipeState::DownstreamComplete, so the upstream half treats
+        // the resulting task-pipe closure as unexpected and surfaces the error.
         if downstream_state.is_errored() {
             let err = Error::e_explain(WriteError, "downstream_state is_errored");
             error!("custom_bidirection_down_to_up: downstream_state.is_errored",);
@@ -677,6 +710,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
@@ -695,6 +731,11 @@ where
     {
         if !from_cache {
             self.upstream_filter(session, &mut task, ctx).await?;
+
+            if let HttpTask::Header(header, _) = &task {
+                reject_mismatched_h1_upgrade_101(session, header, "custom_upstream_filter")
+                    .map_err(|e| e.into_up())?;
+            }
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -724,7 +765,12 @@ where
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        match task {
+        let track_max_cache_size = matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+
+        let res = match task {
             HttpTask::Header(mut header, eos) => {
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
@@ -747,6 +793,11 @@ where
                     .await?;
                 /* Downgrade the version so that write_response_header won't panic */
                 header.set_version(Version::HTTP_11);
+                if !from_cache {
+                    // Re-check after response_filter in case it changed the final status to 101.
+                    reject_mismatched_h1_upgrade_101(session, &header, "custom_response_filter")
+                        .map_err(|e| e.into_in())?;
+                }
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
                 let no_body = session.req_header().method == "HEAD"
@@ -763,6 +814,12 @@ where
                 Ok(HttpTask::Header(header, eos))
             }
             HttpTask::Body(data, eos) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
@@ -774,6 +831,12 @@ where
                 Ok(HttpTask::Body(data, eos))
             }
             HttpTask::UpgradedBody(mut data, eos) => {
+                if track_max_cache_size {
+                    session
+                        .cache
+                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
+                }
+
                 // range body filter doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
@@ -817,7 +880,17 @@ where
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
+        };
+        if let Ok(task) = res.as_ref() {
+            if track_max_cache_size
+                && task.is_end()
+                && !matches!(task, HttpTask::Failed(_))
+                && !session.cache.exceeded_max_file_size()
+            {
+                session.cache.response_became_cacheable();
+            }
         }
+        res
     }
 
     async fn send_body_to_custom(
@@ -879,6 +952,7 @@ where
 async fn custom_pipe_up_to_down_response<S: CustomSession>(
     client: &mut S,
     tx: mpsc::Sender<HttpTask>,
+    pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
     let mut is_informational = true;
     while is_informational {
@@ -938,19 +1012,17 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
                 } else {
                     HttpTask::Body(Some(data), eos)
                 };
-                let sent = tx
-                    .send(body_task)
-                    .await
-                    .or_err(InternalError, "sending custom body to pipe");
-                // If the if the response with content-length is sent to an HTTP1 downstream,
-                // custom_bidirection_down_to_up() could decide that the body has finished and exit without
-                // waiting for this function to signal the eos. In this case tx being closed is not
-                // an sign of error. It should happen if the only thing left for the custom to send is
-                // an empty data frame with eos set.
-                if sent.is_err() && eos && empty {
+                // A send failure is benign only when the downstream half signaled it
+                // completed (it finished the response by its own framing and dropped the
+                // task pipe): stop reading the upstream. Otherwise the closure is
+                // unexpected, so surface the original error.
+                let send_result = tx.send(body_task).await;
+                if send_result.is_err()
+                    && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+                {
                     return Ok(());
                 }
-                sent?;
+                send_result.or_err(InternalError, "sending custom body to pipe")?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
@@ -973,14 +1045,23 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
     let trailers = trailers.map(Box::new);
 
     if trailers.is_some() {
-        tx.send(HttpTask::Trailer(trailers))
-            .await
-            .or_err(InternalError, "sending custom trailer to pipe")?;
+        // Benign only if the downstream signaled completion, same as the body sends above.
+        let send_result = tx.send(HttpTask::Trailer(trailers)).await;
+        if send_result.is_err()
+            && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        send_result.or_err(InternalError, "sending custom trailer to pipe")?;
     }
 
-    tx.send(HttpTask::Done)
-        .await
-        .unwrap_or_else(|_| debug!("custom channel closed!"));
+    let send_result = tx.send(HttpTask::Done).await;
+    if send_result.is_err() && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+    {
+        debug!("custom channel closed!");
+        return Ok(());
+    }
+    send_result.or_err(InternalError, "sending custom done to pipe")?;
 
     Ok(())
 }
@@ -1096,5 +1177,122 @@ impl CustomMessageForwarder<'_> {
             },
             ret = forwarder => ret
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        predictor::{CacheablePredictor, Predictor},
+        CacheKey, MemCache,
+    };
+    use std::sync::{Arc, LazyLock};
+    use tokio::io::AsyncWriteExt;
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls custom_response_filter directly")
+        }
+    }
+
+    async fn predicted_too_large_session(key: CacheKey, max_file_size: usize) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+        CACHE_PREDICTOR.mark_uncacheable(&key, NoCacheReason::OriginNotCache);
+        session
+            .cache
+            .disable(NoCacheReason::PredictedResponseTooLarge);
+        session
+    }
+
+    async fn filter_task(session: &mut Session, task: HttpTask) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .custom_response_filter(
+                session,
+                task,
+                &mut (),
+                &mut ServeFromCache::new(),
+                &mut RangeBodyFilter::new(),
+                false,
+            )
+            .await
+            .expect("response task should pass filters");
+    }
+
+    #[tokio::test]
+    async fn completed_response_under_limit_clears_predictor() {
+        let key = CacheKey::new("/custom-under-limit", "");
+        let mut session = predicted_too_large_session(key.clone(), 10).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"small")), true),
+        )
+        .await;
+
+        assert!(CACHE_PREDICTOR.cacheable_prediction(&key));
+    }
+
+    #[tokio::test]
+    async fn completed_response_over_limit_keeps_predictor() {
+        let key = CacheKey::new("/custom-over-limit", "");
+        let mut session = predicted_too_large_session(key.clone(), 4).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"large")), true),
+        )
+        .await;
+
+        assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
+    }
+
+    #[tokio::test]
+    async fn failed_response_keeps_predictor() {
+        let key = CacheKey::new("/custom-failed", "");
+        let mut session = predicted_too_large_session(key.clone(), 10).await;
+
+        filter_task(
+            &mut session,
+            HttpTask::Body(Some(Bytes::from_static(b"small")), false),
+        )
+        .await;
+        filter_task(
+            &mut session,
+            HttpTask::Failed(Error::explain(InternalError, "test failure")),
+        )
+        .await;
+
+        assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
     }
 }

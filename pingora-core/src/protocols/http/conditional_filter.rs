@@ -69,20 +69,6 @@ pub fn not_modified_filter(req: &RequestHeader, resp: &ResponseHeader) -> bool {
     false
 }
 
-// Trim ASCII whitespace bytes from the start of the slice.
-// This is pretty much copied from the nightly API.
-// TODO: use `trim_ascii_start` when it stabilizes https://doc.rust-lang.org/std/primitive.slice.html#method.trim_ascii_start
-fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = bytes {
-        if first.is_ascii_whitespace() {
-            bytes = rest;
-        } else {
-            break;
-        }
-    }
-    bytes
-}
-
 /// Search for an ETag matching `target_etag` from the input header, using
 /// [weak comparison](https://datatracker.ietf.org/doc/html/rfc9110#section-8.8.3.2).
 /// Multiple ETags can exist in the header as a comma-separated list.
@@ -128,7 +114,7 @@ pub fn weak_validate_etag(input_etag_header: &[u8], target_etag: &[u8]) -> bool 
             remaining = &remaining[target_etag.len()..];
             // check if there's any content after the matched substring
             // skip any whitespace
-            remaining = trim_ascii_start(remaining);
+            remaining = remaining.trim_ascii_start();
             if matches!(remaining.first(), None | Some(b',')) {
                 // we are either at the end of the header, or at a comma delimiter
                 // which means this is a match

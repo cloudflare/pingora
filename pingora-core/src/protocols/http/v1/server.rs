@@ -79,8 +79,9 @@ pub struct HttpSession {
     buf: Bytes,
     /// A slice reference to `buf` which points to the exact range of request header
     raw_header: Option<BufRef>,
-    /// A slice reference to `buf` which points to the range of a portion of request body if any
-    preread_body: Option<BufRef>,
+    /// Request bytes read beyond the header, owned separately so they can move through the body
+    /// reader and into the next pipelined session without copying.
+    preread_body: Option<BytesMut>,
     /// A state machine to track how to read the request body
     body_reader: BodyReader,
     /// A state machine to track how to write the response body
@@ -275,8 +276,16 @@ impl HttpSession {
         const MAX_ERR_BUF_LEN: usize = 2048;
 
         self.buf.clear();
-        let mut buf = BytesMut::with_capacity(INIT_HEADER_BUF_SIZE);
-        let mut already_read: usize = 0;
+        // Account parsing a fully buffered request against Tokio's cooperative task budget. Do
+        // this before taking the prefix so cancellation cannot discard bytes between sessions.
+        if self
+            .pipelined_prefix
+            .as_ref()
+            .is_some_and(|prefix| !prefix.is_empty())
+        {
+            tokio::task::consume_budget().await;
+        }
+
         // If the caller (e.g. the proxy layer completing a pipelined request on
         // a reused keep-alive connection) handed us bytes that were read past
         // the end of the previous request's body, pre-fill our parse buffer so
@@ -284,17 +293,14 @@ impl HttpSession {
         // below tries to parse first when we already have pipelined bytes —
         // a pipelined prefix can contain a complete request header, in which
         // case we must NOT issue another stream read (which would block).
-        let mut skip_next_read = false;
-        if let Some(prefix) = self
+        let mut buf = self
             .pipelined_prefix
             .take()
             .filter(|prefix| !prefix.is_empty())
-        {
-            buf.reserve(prefix.len());
-            buf.extend_from_slice(&prefix);
-            already_read = prefix.len();
-            skip_next_read = true;
-        }
+            .unwrap_or_else(|| BytesMut::with_capacity(INIT_HEADER_BUF_SIZE));
+        let mut already_read = buf.len();
+        let mut skip_next_read = already_read != 0;
+        let mut detached_suffix = None;
         loop {
             if already_read > MAX_HEADER_SIZE {
                 /* NOTE: this check only blocks second read. The first large read is allowed
@@ -328,7 +334,6 @@ impl HttpSession {
                 match parsed {
                     HeaderParseState::Complete(s) => {
                         self.raw_header = Some(BufRef(0, s));
-                        self.preread_body = Some(BufRef(s, already_read));
 
                         // We have the header name and values we parsed to be just 0 copy Bytes
                         // referencing the original buf. That requires we convert the buf from
@@ -354,6 +359,24 @@ impl HttpSession {
                             _ => Version::HTTP_09,
                         });
 
+                        // Detach bytes beyond the header in O(1). Keeping them as owned BytesMut
+                        // allows body parsing and subsequent pipelined sessions to continue
+                        // splitting the same allocation instead of copying the shrinking suffix.
+                        let preread_body = if s == buf.len() {
+                            // Keep the common no-body/no-overread path on BytesMut's Vec-backed
+                            // representation. split_off() would promote it to shared storage.
+                            detached_suffix.take().unwrap_or_default()
+                        } else {
+                            let mut rest = buf.split_off(s);
+                            if let Some(suffix) = detached_suffix.take() {
+                                // The URI-escape path below detaches everything past the first
+                                // CRLFCRLF, but httparse also accepts bare LF line endings, so the
+                                // header can end before that. Stitch the leftover bytes back in
+                                // front of the suffix instead of dropping them.
+                                rest.unsplit(suffix);
+                            }
+                            rest
+                        };
                         let buf = buf.freeze();
 
                         for header in header_refs {
@@ -388,6 +411,7 @@ impl HttpSession {
                         }
 
                         self.buf = buf;
+                        self.preread_body = Some(preread_body);
                         self.request_header = Some(request_header);
 
                         self.body_reader.reinit();
@@ -408,6 +432,19 @@ impl HttpSession {
                     }
                     HeaderParseState::Invalid(e) => match e {
                         httparse::Error::Token | httparse::Error::Version => {
+                            // URI escaping rebuilds the current header. Detach any request body or
+                            // pipelined suffix first so normalization never copies queued requests.
+                            // `separator_start` is the index of the blank line itself, so the
+                            // header ends just past it.
+                            if detached_suffix.is_none() {
+                                if let Some(header_end) =
+                                    buf.find(HEADER_SECTION_END).map(|separator_start| {
+                                        separator_start + HEADER_SECTION_END.len()
+                                    })
+                                {
+                                    detached_suffix = Some(buf.split_off(header_end));
+                                }
+                            }
                             // try to escape URI
                             if let Some(new_buf) = escape_illegal_request_line(&buf) {
                                 buf = new_buf;
@@ -444,8 +481,11 @@ impl HttpSession {
     pub fn validate_request(&self) -> Result<()> {
         let req_header = self.req_header();
 
-        // ad-hoc checks
-        super::common::check_dup_content_length(&req_header.headers)?;
+        // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
+        // parity): identical duplicates and comma-combined identical values are
+        // accepted and collapsed; differing or unparseable values are rejected.
+        // This is a no-op when Transfer-Encoding is present (TE overrides CL).
+        super::common::validate_content_length(&req_header.headers)?;
 
         if req_header.headers.contains_key(TRANSFER_ENCODING) {
             // Per [RFC 9112 Section 6.1-16](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-16),
@@ -463,8 +503,6 @@ impl HttpSession {
                 return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
             }
         }
-        // validate content-length value if present to avoid ambiguous framing
-        self.get_content_length()?;
 
         Ok(())
     }
@@ -1068,10 +1106,7 @@ impl HttpSession {
     }
 
     fn get_content_length(&self) -> Result<Option<usize>> {
-        buf_to_content_length(
-            self.get_header(header::CONTENT_LENGTH)
-                .map(|v| v.as_bytes()),
-        )
+        content_length_for_framing(&self.req_header().headers)
     }
 
     fn init_body_reader(&mut self) {
@@ -1082,29 +1117,29 @@ impl HttpSession {
             }
 
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
-            let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
+            let preread_body = self.preread_body.take().unwrap_or_default();
 
             if self.was_upgraded() {
                 // if upgraded _post_ 101 (and body was not init yet)
                 // treat as upgraded body (pass through until closed)
-                self.body_reader.init_close_delimited(preread_body);
+                self.body_reader.init_close_delimited_owned(preread_body);
             } else if self.is_chunked_encoding() {
                 // if chunked encoding, content-length should be ignored
-                self.body_reader.init_chunked(preread_body);
+                self.body_reader.init_chunked_owned(preread_body);
             } else {
                 // At this point, validate_request() should have already been called,
                 // so get_content_length() should not return an error for invalid values
                 let cl = self.get_content_length().unwrap_or(None);
                 match cl {
                     Some(i) => {
-                        self.body_reader.init_content_length(i, preread_body);
+                        self.body_reader.init_content_length_owned(i, preread_body);
                     }
                     None => {
                         // https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
                         // "Request messages are never close-delimited because they are
                         // always explicitly framed by length or transfer coding, with the absence of
                         // both implying the request ends immediately after the header section."
-                        self.body_reader.init_content_length(0, preread_body);
+                        self.body_reader.init_content_length_owned(0, preread_body);
                     }
                 }
             }
@@ -4285,5 +4320,214 @@ mod test_pipelining {
             .unwrap()
             .expect("pipelined request must parse");
         assert_eq!(b.req_header().uri.path(), "/two");
+    }
+
+    #[tokio::test]
+    async fn bodyless_pipeline_transfers_prefix_without_copying() {
+        init_log();
+        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
+        prefix.extend_from_slice(req1);
+        prefix.extend_from_slice(req2);
+        let base = prefix.as_ptr();
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (_, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
+        assert_eq!(prefix.as_ref(), req2);
+    }
+
+    #[tokio::test]
+    async fn content_length_pipeline_transfers_prefix_without_copying() {
+        init_log();
+        let req1 = b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 4\r\n\r\nbody";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
+        prefix.extend_from_slice(req1);
+        prefix.extend_from_slice(req2);
+        let base = prefix.as_ptr();
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (_, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
+        assert_eq!(prefix.as_ref(), req2);
+    }
+
+    #[tokio::test]
+    async fn chunked_pipeline_with_trailers_transfers_prefix_without_copying() {
+        init_log();
+        let req1 = b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Test: one\r\n\r\n";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
+        prefix.extend_from_slice(req1);
+        prefix.extend_from_slice(req2);
+        let base = prefix.as_ptr();
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (_, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
+        assert_eq!(prefix.as_ref(), req2);
+    }
+
+    #[tokio::test]
+    async fn escaped_uri_pipeline_does_not_copy_following_requests() {
+        init_log();
+        let req1 = b"GET /one?q=a b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
+        prefix.extend_from_slice(req1);
+        prefix.extend_from_slice(req2);
+        let req2_ptr = unsafe { prefix.as_ptr().add(req1.len()) };
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+        assert_eq!(session.get_path(), b"/one?q=a%20b");
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (_, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ptr(), req2_ptr);
+        assert_eq!(prefix.as_ref(), req2);
+    }
+
+    /// `do_read_chunked_body` splits the post-last-chunk tail to the front of the body buffer,
+    /// and `do_read_chunked_body_final` may then need several reads to find the end of the
+    /// trailer section. Only the first of those passes may reuse the split buffer; the later
+    /// ones reset it for fresh IO. This drives both passes with a pipelined request behind the
+    /// trailers to prove neither the trailers nor the queued request are lost.
+    #[tokio::test]
+    async fn chunked_trailers_across_reads_keep_pipelined_request() {
+        init_log();
+        let req1_head =
+            b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // Ends mid trailer section: the final CRLF that terminates it is still on the wire.
+        let req1_tail = b"1\r\na\r\n0\r\nX-Test: one\r\n";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut rest = BytesMut::from(&b"\r\n"[..]);
+        rest.extend_from_slice(req2);
+
+        let mut prefix = BytesMut::with_capacity(req1_head.len() + req1_tail.len());
+        prefix.extend_from_slice(req1_head);
+        prefix.extend_from_slice(req1_tail);
+
+        let mock_io = Builder::new().read(&rest).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+        assert_eq!(session.req_header().uri.path(), "/one");
+
+        let mut body = BytesMut::new();
+        while let Some(chunk) = session.read_body_bytes().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body.as_ref(), b"a");
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (stream, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ref(), req2);
+
+        let mut next = HttpSession::new(stream);
+        next.set_pipelining_enabled(true);
+        next.set_pipelined_prefix(prefix);
+        next.read_request()
+            .await
+            .unwrap()
+            .expect("pipelined request must parse");
+        assert_eq!(next.req_header().uri.path(), "/two");
+    }
+
+    /// The URI-escape path detaches everything past the first CRLFCRLF, but httparse also
+    /// accepts bare LF line endings, so the real header can end earlier than that. The detached
+    /// suffix must be stitched back behind the leftover bytes, otherwise the queued request is
+    /// silently dropped (or, worse, mis-attributed) instead of being served.
+    #[tokio::test]
+    async fn escaped_uri_with_bare_lf_keeps_all_pipelined_bytes() {
+        init_log();
+        let req1 = b"GET /one?q=a b HTTP/1.1\nHost: pingora.org\n\n";
+        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
+        prefix.extend_from_slice(req1);
+        prefix.extend_from_slice(req2);
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_pipelined_prefix(prefix);
+        session.read_request().await.unwrap();
+        assert_eq!(session.get_path(), b"/one?q=a%20b");
+
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (stream, prefix) = reused.into_parts();
+        let prefix = prefix.expect("second request remains buffered");
+        assert_eq!(prefix.as_ref(), req2);
+
+        let mut next = HttpSession::new(stream);
+        next.set_pipelining_enabled(true);
+        next.set_pipelined_prefix(prefix);
+        next.read_request()
+            .await
+            .unwrap()
+            .expect("pipelined request must parse");
+        assert_eq!(next.req_header().uri.path(), "/two");
+    }
+
+    #[tokio::test]
+    async fn long_bodyless_pipeline_keeps_one_allocation() {
+        init_log();
+        const REQUESTS: usize = 256;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|i| format!("GET /{i} HTTP/1.1\r\nHost: pingora.org\r\n\r\n"))
+            .collect();
+        let mut prefix = BytesMut::with_capacity(requests.iter().map(String::len).sum());
+        for request in &requests {
+            prefix.extend_from_slice(request.as_bytes());
+        }
+        let mut expected_ptr = prefix.as_ptr();
+        let mock_io = Builder::new().build();
+        let mut stream: Stream = Box::new(mock_io);
+
+        for (i, request) in requests.iter().enumerate() {
+            assert_eq!(prefix.as_ptr(), expected_ptr);
+            let mut session = HttpSession::new(stream);
+            session.set_pipelining_enabled(true);
+            session.set_pipelined_prefix(prefix);
+            session.read_request().await.unwrap();
+            assert_eq!(session.req_header().uri.path(), format!("/{i}"));
+
+            let reused = session.reuse().await.unwrap().expect("connection reusable");
+            let (next_stream, next_prefix) = reused.into_parts();
+            stream = next_stream;
+            expected_ptr = unsafe { expected_ptr.add(request.len()) };
+            prefix = next_prefix.unwrap_or_default();
+        }
+
+        assert!(prefix.is_empty());
     }
 }

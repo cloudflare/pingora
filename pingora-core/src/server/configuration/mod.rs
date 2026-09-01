@@ -116,6 +116,14 @@ pub struct ServerConf {
     /// See [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_connect_offload_thread_per_pool: Option<usize>,
+    /// Number of dedicated thread pools to use for downstream TLS handshakes.
+    /// See [`TlsSettings::set_offload_threadpool_from_server_conf`](crate::listeners::tls::TlsSettings::set_offload_threadpool_from_server_conf).
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub downstream_tls_offload_threadpools: Option<usize>,
+    /// Number of threads per dedicated downstream TLS handshake pool.
+    /// See [`TlsSettings::set_offload_threadpool_from_server_conf`](crate::listeners::tls::TlsSettings::set_offload_threadpool_from_server_conf).
+    /// Note: this is an _unstable_ field that may be renamed or removed in the future.
+    pub downstream_tls_offload_thread_per_pool: Option<usize>,
     /// When enabled allows TLS keys to be written to a file specified by the SSLKEYLOG
     /// env variable. This can be used by tools like Wireshark to decrypt upstream traffic
     /// for debugging purposes.
@@ -232,6 +240,8 @@ impl Default for ServerConf {
             upstream_keepalive_pool_size: 128,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            downstream_tls_offload_threadpools: None,
+            downstream_tls_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -381,6 +391,28 @@ impl ServerConf {
         Ok(self)
     }
 
+    /// Return the upstream connection offload setting from this configuration.
+    ///
+    /// Both `upstream_connect_offload_threadpools` and
+    /// `upstream_connect_offload_thread_per_pool` must be set and greater than
+    /// zero. Otherwise, upstream connection offload remains disabled.
+    pub fn upstream_connect_offload_threadpool(&self) -> Option<(usize, usize)> {
+        self.upstream_connect_offload_threadpools
+            .zip(self.upstream_connect_offload_thread_per_pool)
+            .filter(|(pools, threads)| *pools > 0 && *threads > 0)
+    }
+
+    /// Return the downstream TLS handshake offload setting from this configuration.
+    ///
+    /// Both `downstream_tls_offload_threadpools` and
+    /// `downstream_tls_offload_thread_per_pool` must be set and greater than
+    /// zero. Otherwise, downstream TLS handshake offload remains disabled.
+    pub fn downstream_tls_offload_threadpool(&self) -> Option<(usize, usize)> {
+        self.downstream_tls_offload_threadpools
+            .zip(self.downstream_tls_offload_thread_per_pool)
+            .filter(|(pools, threads)| *pools > 0 && *threads > 0)
+    }
+
     /// Build the default runtime options derived from this server configuration.
     pub fn runtime_opts(&self) -> RuntimeOpts {
         RuntimeOpts {
@@ -455,6 +487,8 @@ mod tests {
             upstream_keepalive_pool_size: 4,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
+            downstream_tls_offload_threadpools: None,
+            downstream_tls_offload_thread_per_pool: None,
             grace_period_seconds: None,
             graceful_shutdown_timeout_seconds: None,
             max_retries: 1,
@@ -525,6 +559,40 @@ runtime_enable_alt_timer: true
 
         let conf = ServerConf::from_yaml(conf_str).unwrap();
         assert!(conf.runtime_enable_alt_timer);
+    }
+
+    #[test]
+    fn test_offload_threadpool_config() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+upstream_connect_offload_threadpools: 2
+upstream_connect_offload_thread_per_pool: 3
+downstream_tls_offload_threadpools: 4
+downstream_tls_offload_thread_per_pool: 5
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(Some((2, 3)), conf.upstream_connect_offload_threadpool());
+        assert_eq!(Some((4, 5)), conf.downstream_tls_offload_threadpool());
+    }
+
+    #[test]
+    fn test_offload_threadpool_config_zero_disables() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+upstream_connect_offload_threadpools: 2
+upstream_connect_offload_thread_per_pool: 0
+downstream_tls_offload_threadpools: 0
+downstream_tls_offload_thread_per_pool: 5
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(None, conf.upstream_connect_offload_threadpool());
+        assert_eq!(None, conf.downstream_tls_offload_threadpool());
     }
 
     #[test]

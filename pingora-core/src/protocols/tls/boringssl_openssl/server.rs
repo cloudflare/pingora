@@ -14,7 +14,7 @@
 
 //! TLS server specific implementation
 
-use crate::listeners::TlsAcceptCallbacks;
+use crate::listeners::TlsAccept;
 use crate::protocols::tls::SslStream;
 use crate::protocols::{Shutdown, IO};
 use crate::tls::ext;
@@ -49,7 +49,7 @@ pub async fn handshake<S: IO>(ssl_acceptor: &SslAcceptor, io: S) -> Result<SslSt
 pub async fn handshake_with_callback<S: IO>(
     ssl_acceptor: &SslAcceptor,
     io: S,
-    callbacks: &TlsAcceptCallbacks,
+    callbacks: &(dyn TlsAccept + Send + Sync),
 ) -> Result<SslStream<S>> {
     // Capture the downstream socket fd before `io` is moved into the stream,
     // then stash it on the SSL so the certificate callback can recover the
@@ -204,7 +204,7 @@ mod tests {
 
         tokio::spawn(client_task(client));
 
-        handshake_with_callback(&acceptor, server, &cb)
+        handshake_with_callback(&acceptor, server, cb.as_ref())
             .await
             .unwrap();
     }
@@ -244,7 +244,7 @@ mod tests {
 
         tokio::spawn(client_task(client));
 
-        let stream = handshake_with_callback(&acceptor, server, &cb)
+        let stream = handshake_with_callback(&acceptor, server, cb.as_ref())
             .await
             .unwrap();
         let ssl_digest = stream.ssl_digest().unwrap();

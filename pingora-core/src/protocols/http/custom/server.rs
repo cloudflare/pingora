@@ -46,6 +46,36 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
 
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    fn proxy_tasks_enabled(&self) -> bool {
+        false
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    fn set_proxy_tasks_enabled(&mut self, _enabled: bool) {}
+
+    /// Queue a proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if the Custom session does not implement the proxy task API.
+    #[track_caller]
+    fn send_proxy_task(&mut self, _task: HttpTask) {
+        panic!("Custom proxy task API not implemented")
+    }
+
+    /// Whether there are pending proxy tasks queued for writing.
+    fn has_pending_proxy_tasks(&self) -> bool {
+        false
+    }
+
+    /// Write queued proxy tasks in a cancel-safe manner.
+    ///
+    /// # Panics
+    /// Panics if the Custom session does not implement the proxy task API.
+    async fn write_proxy_tasks(&mut self) -> Result<bool> {
+        panic!("Custom proxy task API not implemented")
+    }
+
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
 
     fn get_read_timeout(&self) -> Option<Duration>;
@@ -63,6 +93,22 @@ pub trait Session: Send + Sync + Unpin + 'static {
     fn response_written(&self) -> Option<&ResponseHeader>;
 
     async fn shutdown(&mut self, code: u32, ctx: &str);
+
+    /// Abandon the response mid-message, in a way the peer can tell apart from a
+    /// response that was completed.
+    ///
+    /// Callers use this to signal that the message they were sending cannot be
+    /// finished, so the peer must not treat what it has already received as a
+    /// whole message. It is the counterpart of [`Session::finish`], which ends a
+    /// message that *is* complete.
+    ///
+    /// Defaults to [`Session::shutdown`], preserving the behavior of
+    /// implementations that predate this method. Implementations whose protocol
+    /// can distinguish an abandoned message from a completed one should override
+    /// this; otherwise a peer may read the abandoned message as successful.
+    async fn abandon(&mut self, ctx: &str) {
+        self.shutdown(0, ctx).await;
+    }
 
     fn is_body_done(&mut self) -> bool;
 

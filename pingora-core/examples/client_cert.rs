@@ -115,7 +115,7 @@ impl TlsAccept for MyTlsCallbacks {
         // Extract Common Name (CN) from the client certificate
         let common_name = tls_ref.peer_certificate().and_then(|cert| {
             let cn = cert.subject_name().entries_by_nid(Nid::COMMONNAME).next()?;
-            Some(cn.data().as_utf8().ok()?.to_string())
+            Some(String::from_utf8_lossy(cn.data().as_slice()).into_owned())
         });
 
         let tls_info = MyTlsInfo {

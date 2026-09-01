@@ -22,7 +22,7 @@ use pingora_error::{ErrorType::*, OrErr, Result};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(feature = "boringssl")]
@@ -63,7 +63,9 @@ where
     /// Connect to the remote TLS server as a client
     pub async fn connect(&mut self) -> Result<(), ssl::Error> {
         Self::clear_error();
+        let handshake_start = Instant::now();
         Pin::new(&mut self.ssl).connect().await?;
+        self.timing.establishment_duration = Some(handshake_start.elapsed());
         self.timing.established_ts = SystemTime::now();
         self.digest = Some(Arc::new(SslDigest::from_ssl(self.ssl())));
         Ok(())
@@ -72,7 +74,9 @@ where
     /// Finish the TLS handshake from client as a server
     pub async fn accept(&mut self) -> Result<(), ssl::Error> {
         Self::clear_error();
+        let handshake_start = Instant::now();
         Pin::new(&mut self.ssl).accept().await?;
+        self.timing.establishment_duration = Some(handshake_start.elapsed());
         self.timing.established_ts = SystemTime::now();
         self.digest = Some(Arc::new(SslDigest::from_ssl(self.ssl())));
         Ok(())

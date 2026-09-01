@@ -174,24 +174,64 @@ impl BodyReader {
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
-        let mut body_buf = BytesMut::with_capacity(self.body_buf_size);
+        let mut body_buf = BytesMut::with_capacity(self.body_buf_size.max(buf_to_rewind.len()));
         if !buf_to_rewind.is_empty() {
             self.rewind_buf_len = buf_to_rewind.len();
             // TODO: this is still 1 copy. Make it zero
             body_buf.put_slice(buf_to_rewind);
         }
-        if self.body_buf_size > buf_to_rewind.len() {
-            //body_buf.resize(self.body_buf_size, 0);
-            unsafe {
-                body_buf.set_len(self.body_buf_size);
-            }
-        }
         self.body_buf = Some(body_buf);
+    }
+
+    /// Adopt `buf_to_rewind` as the body buffer instead of copying it.
+    ///
+    /// Unlike [`Self::prepare_buf`] this keeps the caller's allocation, so bytes that were read
+    /// past the end of a request header stay in place all the way through body parsing and, for
+    /// pipelined connections, into the next request's buffer.
+    fn prepare_owned_buf(&mut self, buf_to_rewind: BytesMut) {
+        self.rewind_buf_len = buf_to_rewind.len();
+        self.body_buf = Some(buf_to_rewind);
+    }
+
+    /// Empty the body buffer and return it with room for at least `read_size` more bytes,
+    /// ready to be filled by [`AsyncReadExt::read_buf`].
+    ///
+    /// This **discards** whatever the buffer currently holds, so callers must only use it once
+    /// every previously buffered byte has been parsed and handed to the caller. Paths that still
+    /// need the buffered bytes (a pending rewind, a partial chunk head, or the trailer tail left
+    /// behind by [`Self::do_read_chunked_body`]) must reuse the existing buffer instead.
+    fn prepare_buf_for_io(&mut self, read_size: usize) -> &mut BytesMut {
+        let body_buf = self.body_buf.get_or_insert_default();
+        body_buf.clear();
+        body_buf.reserve(read_size);
+        body_buf
+    }
+
+    /// Grow the body buffer so it has room for `body_buf_size` bytes in total without discarding
+    /// what it already holds.
+    ///
+    /// Used by the partial chunk head path, which must keep the bytes it has already buffered
+    /// while making room to read the rest of the head.
+    fn reserve_buf_for_io(&mut self) {
+        let body_buf = self.body_buf.get_or_insert_default();
+        if body_buf.len() < self.body_buf_size {
+            body_buf.reserve(self.body_buf_size - body_buf.len());
+        }
     }
 
     pub fn init_chunked(&mut self, buf_to_rewind: &[u8]) {
         self.body_state = PS::Chunked(0, 0, 0, 0);
         self.prepare_buf(buf_to_rewind);
+    }
+
+    /// Zero-copy variant of [`Self::init_chunked`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer rather than copied into a fresh one, so any
+    /// bytes the header parser read past the end of the header (the start of the body, and
+    /// possibly of following pipelined requests) keep their original allocation.
+    pub fn init_chunked_owned(&mut self, buf_to_rewind: BytesMut) {
+        self.body_state = PS::Chunked(0, 0, 0, 0);
+        self.prepare_owned_buf(buf_to_rewind);
     }
 
     pub fn init_content_length(&mut self, cl: usize, buf_to_rewind: &[u8]) {
@@ -212,8 +252,34 @@ impl BodyReader {
         }
     }
 
+    /// Zero-copy variant of [`Self::init_content_length`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer (or, when `cl` is 0, as the overread buffer)
+    /// rather than copied into a fresh one. See [`Self::init_chunked_owned`].
+    pub fn init_content_length_owned(&mut self, cl: usize, buf_to_rewind: BytesMut) {
+        match cl {
+            0 => {
+                self.body_state = PS::Complete(0);
+                self.body_buf_overread = (!buf_to_rewind.is_empty()).then_some(buf_to_rewind);
+            }
+            _ => {
+                self.prepare_owned_buf(buf_to_rewind);
+                self.body_state = PS::Partial(0, cl);
+            }
+        }
+    }
+
     pub fn init_close_delimited(&mut self, buf_to_rewind: &[u8]) {
         self.prepare_buf(buf_to_rewind);
+        self.body_state = PS::UntilClose(0);
+    }
+
+    /// Zero-copy variant of [`Self::init_close_delimited`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer rather than copied into a fresh one. See
+    /// [`Self::init_chunked_owned`].
+    pub fn init_close_delimited_owned(&mut self, buf_to_rewind: BytesMut) {
+        self.prepare_owned_buf(buf_to_rewind);
         self.body_state = PS::UntilClose(0);
     }
 
@@ -230,9 +296,8 @@ impl BodyReader {
         if self.rewind_buf_len == 0 {
             // take any extra bytes and send them as-is,
             // reset body counter
-            let extra = self.body_buf_overread.take();
-            let buf = extra.as_deref().unwrap_or_default();
-            self.prepare_buf(buf);
+            let extra = self.body_buf_overread.take().unwrap_or_default();
+            self.prepare_owned_buf(extra);
         } // if rewind_buf_len is not 0, body read has not yet been polled
         self.body_state = PS::UntilClose(0);
     }
@@ -327,21 +392,22 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let mut body_buf = self.body_buf.as_deref_mut().unwrap();
+        // we only need to read rewind data once
         let mut n = self.rewind_buf_len;
-        self.rewind_buf_len = 0; // we only need to read rewind data once
+        self.rewind_buf_len = 0;
+
+        // downstream should not discard remaining data if peer sent more, so cap the read at what
+        // is left of this body and leave anything past it on the stream
+        let read_size = match self.body_state {
+            PS::Partial(_, remaining) if !self.upstream => remaining.min(self.body_buf_size),
+            _ => self.body_buf_size,
+        };
         if n == 0 {
-            // downstream should not discard remaining data if peer sent more.
-            if !self.upstream {
-                if let PS::Partial(_, to_read) = self.body_state {
-                    if to_read < body_buf.len() {
-                        body_buf = &mut body_buf[..to_read];
-                    }
-                }
-            }
             /* Need to actually read */
+            let body_buf = self.prepare_buf_for_io(read_size);
             n = stream
-                .read(body_buf)
+                .take(read_size as u64)
+                .read_buf(body_buf)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -359,11 +425,17 @@ impl BodyReader {
                     ))
                 } else if n >= to_read {
                     if n > to_read {
-                        warn!(
-                            "Peer sent more data then expected: extra {}\
-                               bytes, discarding them",
-                            n - to_read
-                        )
+                        let extra = n - to_read;
+                        // The extra bytes are not dropped here: finish_body_buf() moves them to
+                        // the overread buffer. Downstream they are the start of a pipelined
+                        // request and get handed to the next session, which is ordinary traffic
+                        // and must not warn on every request. Whether they are actually usable
+                        // is decided by the caller, which logs when it has to drop them.
+                        if self.upstream {
+                            warn!("Peer sent more data than expected: extra {extra} bytes");
+                        } else {
+                            debug!("Peer sent {extra} bytes past the end of the request body");
+                        }
                     }
                     self.body_state = PS::Complete(read + to_read);
                     self.finish_body_buf(to_read, n);
@@ -381,13 +453,15 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
             /* Need to actually read */
+            let read_size = self.body_buf_size;
+            let body_buf = self.prepare_buf_for_io(read_size);
             n = stream
-                .read(body_buf)
+                .take(read_size as u64)
+                .read_buf(body_buf)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -417,14 +491,15 @@ impl BodyReader {
                 mut expecting_from_io,
             ) => {
                 if existing_buf_start == 0 {
-                    // read a new buf from IO
-                    let body_buf = self.body_buf.as_deref_mut().unwrap();
                     if existing_buf_end == 0 {
                         existing_buf_end = self.rewind_buf_len;
                         self.rewind_buf_len = 0; // we only need to read rewind data once
                         if existing_buf_end == 0 {
+                            let read_size = self.body_buf_size;
+                            let body_buf = self.prepare_buf_for_io(read_size);
                             existing_buf_end = stream
-                                .read(body_buf)
+                                .take(read_size as u64)
+                                .read_buf(body_buf)
                                 .await
                                 .or_err(ReadError, "when reading body")?;
                         }
@@ -433,11 +508,31 @@ impl BodyReader {
                         /* copy the #expecting_from_io bytes until index existing_buf_end
                          * to the front and read more to form a valid chunk head.
                          * existing_buf_end is the end of the partial head and
-                         * expecting_from_io is the len of it */
-                        body_buf
-                            .copy_within(existing_buf_end - expecting_from_io..existing_buf_end, 0);
+                         * expecting_from_io is the len of it.
+                         * Unlike the pipeline handoff this compacts in place rather than
+                         * split_off()-ing at the head. The head is capped at
+                         * PARTIAL_CHUNK_HEAD_LIMIT and is normally a few bytes, so the move is
+                         * bounded and cheap, while split_off() would leave only
+                         * capacity - partial_head_start of room behind it and force the reserve
+                         * below to move the same bytes anyway (or reallocate) to fit the read. */
+                        self.reserve_buf_for_io();
+                        let body_buf = self
+                            .body_buf
+                            .as_mut()
+                            .expect("body buf exists once a partial chunk head was buffered");
+                        let partial_head_start = existing_buf_end - expecting_from_io;
+                        if partial_head_start != 0 {
+                            body_buf.copy_within(partial_head_start..existing_buf_end, 0);
+                        }
+                        body_buf.truncate(expecting_from_io);
+                        // Commit the compacted offsets before awaiting so cancellation leaves the
+                        // parser and buffer in a state that the next call can safely resume.
+                        self.body_state = self
+                            .body_state
+                            .partial_chunk_head(expecting_from_io, expecting_from_io);
                         let new_bytes = stream
-                            .read(&mut body_buf[expecting_from_io..])
+                            .take((self.body_buf_size - expecting_from_io) as u64)
+                            .read_buf(body_buf)
                             .await
                             .or_err(ReadError, "when reading body")?;
                         if new_bytes == 0 {
@@ -534,14 +629,20 @@ impl BodyReader {
                     if buf_res.is_some() {
                         if let Some(idx) = last_chunk_size_end {
                             // just read the last 0 + CRLF, but not final end CRLF
-                            // copy the rest of the buffer to the start of the body_buf
-                            // so we can parse the remaining bytes as trailers / end
-                            let body_buf = self.body_buf.as_deref_mut().unwrap();
+                            // Split the rest of the buffer to the start in O(1) so trailers and
+                            // any following pipelined request remain in the same allocation.
+                            // `do_read_chunked_body_final` must not reset this buffer, see the
+                            // `existing_buf_end` handling there.
+                            let mut body_buf = self
+                                .body_buf
+                                .take()
+                                .expect("body buf exists once a chunk was parsed out of it");
                             trace!(
                                 "last chunk size end buf {:?}",
-                                &body_buf[..existing_buf_end].escape_ascii(),
+                                body_buf[..existing_buf_end].escape_ascii(),
                             );
-                            body_buf.copy_within(idx..existing_buf_end, 0);
+                            body_buf.truncate(existing_buf_end);
+                            self.body_buf = Some(body_buf.split_off(idx));
                         }
                     }
                     Ok(buf_res)
@@ -565,18 +666,32 @@ impl BodyReader {
             Ok(status) => {
                 match status {
                     httparse::Status::Complete((payload_index, chunk_size)) => {
-                        // TODO: Check chunk_size overflow
                         trace!(
                             "Got size {chunk_size}, payload_index: {payload_index}, chunk: {:?}",
                             String::from_utf8_lossy(buf).escape_default(),
                         );
-                        let chunk_size = chunk_size as usize;
+                        let chunk_size = match usize::try_from(chunk_size) {
+                            Ok(chunk_size) => chunk_size,
+                            Err(_) => {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk size overflows usize",
+                                );
+                            }
+                        };
                         // https://github.com/seanmonstar/httparse/issues/149
                         // httparse does not treat zero-size chunk differently, it does not check
                         // that terminating chunk is 0 + double CRLF
                         if chunk_size == 0 {
                             /* terminating chunk, also need to handle trailer. */
-                            let chunk_end_index = payload_index + 2;
+                            let Some(chunk_end_index) = payload_index.checked_add(2) else {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk terminator overflows buffer index",
+                                );
+                            };
                             return if chunk_end_index <= buf.len()
                                 && buf[payload_index..chunk_end_index] == CRLF[..]
                             {
@@ -603,8 +718,20 @@ impl BodyReader {
                             };
                         }
                         // chunk-size CRLF [payload_index] byte*[chunk_size] CRLF
-                        let data_end_index = payload_index + chunk_size;
-                        let chunk_end_index = data_end_index + 2;
+                        let Some(data_end_index) = payload_index.checked_add(chunk_size) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk size overflows buffer index",
+                            );
+                        };
+                        let Some(chunk_end_index) = data_end_index.checked_add(2) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk terminator overflows buffer index",
+                            );
+                        };
                         if chunk_end_index >= buf.len() {
                             // no multi chunk in this buf
                             let actual_size = if data_end_index > buf.len() {
@@ -685,21 +812,25 @@ impl BodyReader {
         // Really we are just waiting for a consecutive CRLF + CRLF to end the body.
         match self.body_state {
             PS::ChunkedFinal(read, trailers_read, existing_buf_end, end_read) => {
-                let body_buf = self.body_buf.as_deref_mut().unwrap();
-                let (buf, n) = if existing_buf_end != 0 {
-                    // finish rest of buf that was read with Chunked state
-                    // existing_buf_end is non-zero only once
+                let n = if existing_buf_end != 0 {
+                    // Finish the rest of the buf that was read while in the Chunked state.
+                    // `do_read_chunked_body` split that tail to the front of `body_buf`, so it
+                    // must be parsed in place: resetting the buffer here would discard both the
+                    // trailers and any pipelined request bytes sitting behind them.
+                    // existing_buf_end is non-zero only once.
                     self.body_state = PS::ChunkedFinal(read, trailers_read, 0, end_read);
-                    (&body_buf[..existing_buf_end], existing_buf_end)
+                    existing_buf_end
                 } else {
-                    let n = stream
-                        .read(body_buf)
+                    // Every previously buffered byte has already been parsed by the loop below
+                    // (it only exits once `start` reaches `n`), so the buffer can be reset.
+                    let read_size = self.body_buf_size;
+                    let body_buf = self.prepare_buf_for_io(read_size);
+                    stream
+                        .take(read_size as u64)
+                        .read_buf(body_buf)
                         .await
-                        .or_err(ReadError, "when reading trailers end")?;
-
-                    (&body_buf[..n], n)
+                        .or_err(ReadError, "when reading trailers end")?
                 };
-
                 if n == 0 {
                     self.body_state = PS::Done(read);
                     return Error::e_explain(
@@ -710,6 +841,12 @@ impl BodyReader {
                         ),
                     );
                 }
+
+                // Re-borrow just the buffer field so `self.body_state` stays assignable below.
+                let buf = &self
+                    .body_buf
+                    .as_deref()
+                    .expect("body buf is initialized before reading trailers")[..n];
 
                 let mut start = 0;
                 // try to find end within the current IO buffer
@@ -1008,6 +1145,19 @@ impl<C: Buf> Buf for WriteBuf<C> {
         match self {
             WriteBuf::Simple(b) => b.advance(cnt),
             WriteBuf::Chained(c) => c.advance(cnt),
+        }
+    }
+
+    // Forward to the inner buffer so callers (e.g. tokio's `write_all_buf`)
+    // see every constituent slice. The default [`Buf::chunks_vectored`]
+    // impl only populates one slot, which collapses a multi-piece chained
+    // buffer (such as a chunked-encoding frame's size + payload + CRLF)
+    // into a single-slice vectored write — issuing one syscall per inner
+    // piece instead of one `writev` covering the whole frame.
+    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
+        match self {
+            WriteBuf::Simple(b) => b.chunks_vectored(dst),
+            WriteBuf::Chained(c) => c.chunks_vectored(dst),
         }
     }
 }
@@ -1880,6 +2030,32 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
+    #[test]
+    fn content_length_zero_owned_rewind_becomes_overread_without_copying() {
+        let rewind = BytesMut::from(&b"next request"[..]);
+        let rewind_ptr = rewind.as_ptr();
+        let mut body_reader = BodyReader::new(false);
+
+        body_reader.init_content_length_owned(0, rewind);
+
+        let overread = body_reader.take_body_overread().unwrap();
+        assert_eq!(overread.as_ptr(), rewind_ptr);
+        assert_eq!(overread.as_ref(), b"next request");
+    }
+
+    #[tokio::test]
+    async fn partial_owned_body_allocates_only_remaining_content_length() {
+        let mut mock_io = Builder::new().read(b"bc").build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_content_length_owned(3, BytesMut::from(&b"a"[..]));
+
+        let first = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.get_body(&first), b"a");
+        let second = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.get_body(&second), b"bc");
+        assert!(body_reader.body_buf.as_ref().unwrap().capacity() < BODY_BUFFER_SIZE);
+    }
+
     #[tokio::test]
     async fn read_with_body_content_length() {
         init_log();
@@ -2044,6 +2220,32 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(0));
         assert_eq!(body_reader.get_body_overread(), None);
+    }
+
+    #[tokio::test]
+    async fn read_with_body_overflowing_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFE\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_max_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFF\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
@@ -2478,6 +2680,30 @@ mod tests {
         assert_eq!(res, BufRef::new(0, 0));
         assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
         let _res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_chunk_head_read_resumes_after_cancellation() {
+        init_log();
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .read(b"\na\r\n0\r\n\r\n")
+            .build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.body_state = ParseState::Chunked(0, 0, 8, 2);
+        body_reader.body_buf = Some(BytesMut::from(&b"unused1\r"[..]));
+
+        tokio::select! {
+            result = body_reader.read_body(&mut mock_io) => {
+                panic!("body read unexpectedly completed before cancellation: {result:?}");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+
+        assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
+        assert_eq!(body_reader.body_buf.as_deref().unwrap(), b"1\r");
+
+        body_reader.read_body(&mut mock_io).await.unwrap();
     }
 
     #[tokio::test]
@@ -4038,20 +4264,13 @@ mod test_poll_body_writer {
 
     #[test]
     fn chunked_write_uses_vectored_path() {
-        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-chunk
-        // WriteBuf::Chained. Note: the WriteBuf type uses the default
-        // Buf::chunks_vectored impl, which only ever populates one IoSlice,
-        // so tokio's write_all_buf issues 3 separate single-slice
-        // poll_write_vectored calls (one per inner Bytes chunk).
+        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-piece
+        // WriteBuf::Chained (size header + payload + trailing CRLF).
+        // The `WriteBuf::chunks_vectored` override forwards to the inner
+        // chain so tokio's `write_all_buf` sees all 3 IoSlices and issues
+        // a single `poll_write_vectored` covering the whole frame.
         let payload = b"hello";
-        let mut mock = MockWriter::new(
-            true,
-            vec![
-                Poll::Ready(Ok(3)), // "5\r\n"
-                Poll::Ready(Ok(5)), // "hello"
-                Poll::Ready(Ok(2)), // "\r\n"
-            ],
-        );
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(10))]);
         let mut bw = BodyWriter::new();
         bw.init_chunked();
         bw.send_body_task(Bytes::from_static(payload), None);
@@ -4059,21 +4278,23 @@ mod test_poll_body_writer {
         let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
         assert!(matches!(res, Ok(Some(5)))); // application bytes
         assert_eq!(mock.written, b"5\r\nhello\r\n");
+        // Exactly one vectored call — no leftover scripted results.
+        assert!(mock.next.is_empty());
     }
 
     #[test]
     fn chunked_write_resumes_on_short_write() {
-        // Exercise the restart path: short-write on the first chunk
-        // (Ok(2) for "5\r\n"), then completion (Ok(1) for "\n"), then the
-        // remaining two inner chunks.
+        // Exercise the restart path under the vectored fast-path: first
+        // `poll_write_vectored` covers all 3 IoSlices but only reports
+        // Ok(2) (the kernel accepted "5\r"); after advancing 2 bytes the
+        // buffer still has 8 bytes ("\n" + "hello" + "\r\n") and the next
+        // call covers them in one vectored write.
         let payload = b"hello";
         let mut mock = MockWriter::new(
             true,
             vec![
                 Poll::Ready(Ok(2)), // partial "5\r"
-                Poll::Ready(Ok(1)), // remaining "\n"
-                Poll::Ready(Ok(5)), // "hello"
-                Poll::Ready(Ok(2)), // "\r\n"
+                Poll::Ready(Ok(8)), // remaining "\n" + "hello" + "\r\n"
             ],
         );
         let mut bw = BodyWriter::new();
@@ -4083,6 +4304,7 @@ mod test_poll_body_writer {
         let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
         assert!(matches!(res, Ok(Some(5))));
         assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
     }
 
     #[test]
@@ -4112,5 +4334,104 @@ mod test_poll_body_writer {
         assert!(res.is_ok());
         assert_eq!(mock.written, b"0\r\n\r\n");
         assert!(matches!(bw.body_mode, BodyMode::Complete(5)));
+    }
+
+    #[test]
+    fn chunked_write_non_vectored_writer() {
+        // When the underlying writer does not support vectored I/O,
+        // `write_all_buf` walks the buffer one `Buf::chunk()` at a time —
+        // i.e. one `poll_write` per inner piece of the 3-piece chained
+        // frame. The `chunks_vectored` override does not participate in
+        // this path; this test pins the existing non-vectored behavior so
+        // a future refactor cannot silently break it.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            false,
+            vec![
+                Poll::Ready(Ok(3)), // "5\r\n"
+                Poll::Ready(Ok(5)), // "hello"
+                Poll::Ready(Ok(2)), // "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_resumes_after_pending() {
+        // Vectored fast-path Pending-then-resume: an initial `Poll::Pending`
+        // must not lose buffer progress, and the next iteration must still
+        // present all 3 IoSlices in one `poll_write_vectored` call. This is
+        // the chunked counterpart to
+        // `content_length_write_resumes_after_pending_and_short_write`.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Pending,
+                Poll::Ready(Ok(10)), // full frame in one vectored call
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_two_frames_in_sequence() {
+        // Two consecutive `send_body_task` calls must each be served by
+        // their own freshly-constructed `WriteBuf::Chained`. Catches state-
+        // machine bugs where the second frame inherits stale buffer state
+        // (or where the vectored fast-path leaks slices across frames).
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(10)), // "5\r\nhello\r\n"
+                Poll::Ready(Ok(10)), // "5\r\nworld\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+
+        bw.send_body_task(Bytes::from_static(b"hello"), None);
+        let res1 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res1, Ok(Some(5))));
+
+        bw.send_body_task(Bytes::from_static(b"world"), None);
+        let res2 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res2, Ok(Some(5))));
+
+        assert_eq!(mock.written, b"5\r\nhello\r\n5\r\nworld\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn content_length_write_uses_vectored_path() {
+        // Content-Length writes go through `WriteBuf::Simple` (a single
+        // contiguous `Bytes`). Exercises the `Simple` arm of the
+        // `chunks_vectored` override: a single-piece buffer reports one
+        // IoSlice, so tokio issues one `poll_write_vectored` for the
+        // whole payload.
+        let data = b"hello";
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+        assert!(mock.next.is_empty());
     }
 }

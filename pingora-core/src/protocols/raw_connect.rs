@@ -155,7 +155,7 @@ impl std::fmt::Display for ConnectProxyError {
         write!(
             f,
             "Failed CONNECT Response: status {}, proxy-status {reason}",
-            &self.response.status
+            self.response.status
         )
     }
 }

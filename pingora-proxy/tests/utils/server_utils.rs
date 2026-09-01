@@ -16,14 +16,16 @@
 use super::cert;
 use async_trait::async_trait;
 use clap::Parser;
-use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
+use http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE, VARY};
 use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
+use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
+use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
@@ -39,7 +41,7 @@ use pingora_core::protocols::{
 };
 use pingora_core::server::configuration::Opt;
 use pingora_core::services::{Service, ServiceWithDependents};
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamRequestPolicy};
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -340,6 +342,61 @@ impl ProxyHttp for ExampleProxyHttp {
         response_filter_common(session, upstream_response, ctx)
     }
 
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-discard-body")
+        {
+            *body = None;
+        }
+        Ok(())
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        req: &mut RequestHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Test-only hook: deliberately declare a larger outbound body than the valid
+        // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
+        // a client that directly ended a shorter-than-declared body; this hook lets tests
+        // exercise defense in depth for downstream sessions that do not report incomplete
+        // body errors or upstream request mutations that reach that state.
+        if let Some(content_length) = session
+            .req_header()
+            .headers
+            .get("x-upstream-content-length")
+        {
+            req.insert_header(CONTENT_LENGTH, content_length.clone())?;
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-strip-framing")
+        {
+            req.remove_header(&CONTENT_LENGTH);
+            req.remove_header(&TRANSFER_ENCODING);
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-add-upgrade")
+        {
+            req.insert_header(CONNECTION, "Upgrade")?;
+            req.insert_header(UPGRADE, "websocket")?;
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -368,6 +425,19 @@ impl ProxyHttp for ExampleProxyHttp {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+        }
+
+        if req
+            .headers
+            .contains_key("x-preserve-upstream-request-headers")
+        {
+            peer.options.http_upstream_request_policy = HttpUpstreamRequestPolicy::preserve();
+        } else if req.headers.contains_key("x-preserve-upstream-upgrade") {
+            peer.options.http_upstream_request_policy.h1_upgrade = H1UpgradePolicy::Preserve;
+        } else if req.headers.contains_key("x-preserve-connection-nominated") {
+            peer.options
+                .http_upstream_request_policy
+                .strip_connection_nominated = false;
         }
 
         if let Some(ms) = req
@@ -414,15 +484,82 @@ impl ProxyHttp for ExampleProxyHttp {
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_FINISH_FAIL_BACKEND: FinishFailCache = FinishFailCache;
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
 static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
 static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
     Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static DEFER_ADMISSION_POLICY: DeferAdmissionPolicy = DeferAdmissionPolicy;
 // Example of how one might restrict which fields can be varied on.
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
+
+struct DeferAdmissionPolicy;
+
+impl AdmissionPolicy for DeferAdmissionPolicy {
+    fn observe(&self, _key: &CacheKey) -> Decision {
+        Decision::Defer { observed: 1 }
+    }
+}
+
+struct FinishFailCache;
+
+#[async_trait]
+impl Storage for FinishFailCache {
+    async fn lookup(
+        &'static self,
+        _key: &CacheKey,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        Ok(None)
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        Ok(Box::new(FinishFailMissHandler))
+    }
+
+    async fn purge(
+        &'static self,
+        _target: pingora_cache::PurgeTarget<'_>,
+        _purge_type: PurgeType,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        Ok(pingora_cache::storage::PurgeOutcome::NotFound)
+    }
+
+    async fn update_meta(
+        &'static self,
+        _key: &CacheKey,
+        _meta: &CacheMeta,
+        _trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct FinishFailMissHandler;
+
+#[async_trait]
+impl HandleMiss for FinishFailMissHandler {
+    async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        Error::e_explain(FileWriteError, "cache miss finalization failed")
+    }
+}
 
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
@@ -430,6 +567,17 @@ pub struct CacheCTX {
 }
 
 pub struct ExampleProxyCache {}
+
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the cache proxy has reported a downstream error that it ignored in order
+/// to let a cache fill finish.
+///
+/// Tests use this to wait for the proxy to actually observe a downstream error instead of
+/// sleeping for an arbitrary duration.
+pub fn downstream_cache_warn_log_calls() -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
@@ -515,13 +663,31 @@ impl ProxyHttp for ExampleProxyCache {
             .map(|_| CACHE_LOCK.as_ref());
         let mut overrides = CacheOptionOverrides::default();
         overrides.wait_timeout = Some(Duration::from_secs(2));
+        let storage = if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-finish")
+        {
+            &CACHE_FINISH_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else {
+            &*CACHE_BACKEND as &'static (dyn Storage + Sync)
+        };
+
         session.cache.enable(
-            &*CACHE_BACKEND,
+            storage,
             eviction,
             Some(&*CACHE_PREDICTOR),
             lock,
             Some(overrides),
         );
+
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-defer-cache-admission")
+        {
+            session.cache.set_admission_policy(&DEFER_ADMISSION_POLICY);
+        }
 
         if let Some(max_file_size_hdr) = session
             .req_header()
@@ -562,7 +728,6 @@ impl ProxyHttp for ExampleProxyCache {
             .unwrap_or("/");
 
         Ok(CacheKey::new(
-            String::new(),
             format!("{host}{path_and_query}"),
             String::new(),
         ))
@@ -812,6 +977,20 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if context == ProxyWarnLogContext::DownstreamCache {
+            DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // only observing, keep the logging behavior unchanged
+        false
     }
 }
 

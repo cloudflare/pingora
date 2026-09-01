@@ -14,7 +14,8 @@
 
 //! A simple LRU cache manager built on top of the `lru` crate
 
-use super::EvictionManager;
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
+#[cfg(test)]
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
@@ -34,7 +35,7 @@ use std::time::SystemTime;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Node {
-    key: CompactCacheKey,
+    key: CacheEntryKey,
     size: usize,
 }
 
@@ -78,7 +79,7 @@ impl Manager {
         }
     }
 
-    fn insert(&self, hash_key: u64, node: CompactCacheKey, size: usize, reverse: bool) {
+    fn insert(&self, hash_key: u64, node: CacheEntryKey, size: usize, reverse: bool) {
         use std::cmp::Ordering::*;
         let node = Node { key: node, size };
         let old = {
@@ -102,13 +103,18 @@ impl Manager {
         }
     }
 
-    fn increase_weight(&self, key: u64, delta: usize) {
+    fn increase_weight(&self, key: u64, delta: usize, max_weight: Option<usize>) -> bool {
         let mut lru = self.lru.write();
         let Some(node) = lru.get_key_value_mut(&key) else {
-            return;
+            return false;
         };
-        node.1.size += delta;
-        self.used.fetch_add(delta, Ordering::Relaxed);
+        let incremented = node.1.size.saturating_add(delta);
+        let new_size = max_weight.map_or(incremented, |m| incremented.min(m).max(node.1.size));
+        debug_assert!(new_size >= node.1.size);
+        self.used
+            .fetch_add(new_size - node.1.size, Ordering::Relaxed);
+        node.1.size = new_size;
+        true
     }
 
     #[inline]
@@ -120,7 +126,7 @@ impl Manager {
     }
 
     // evict items until the used capacity is below the size limit and watermark count
-    fn evict(&self) -> Vec<CompactCacheKey> {
+    fn evict(&self) -> Vec<CacheEntryKey> {
         if self.used.load(Ordering::Relaxed) <= self.limit
             && self
                 .items_watermark
@@ -201,7 +207,7 @@ impl<'de> serde::de::Visitor<'de> for InsertToManager<'_> {
 }
 
 #[inline]
-fn u64key(key: &CompactCacheKey) -> u64 {
+fn u64key(key: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
@@ -226,10 +232,10 @@ impl EvictionManager for Manager {
 
     fn admit(
         &self,
-        item: CompactCacheKey,
+        item: CacheEntryKey,
         size: usize,
         _fresh_until: SystemTime,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(&item);
         self.insert(key, item, size, false);
         self.evict()
@@ -237,17 +243,24 @@ impl EvictionManager for Manager {
 
     fn increment_weight(
         &self,
-        item: &CompactCacheKey,
+        item: &CacheEntryKey,
         delta: usize,
-        _max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey> {
+        max_weight: Option<usize>,
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(item);
-        self.increase_weight(key, delta);
+        if !self.increase_weight(key, delta, max_weight) {
+            self.insert(
+                key,
+                item.clone(),
+                max_weight.map_or(delta, |m| delta.min(m)).max(1),
+                false,
+            );
+        }
         self.evict()
     }
 
-    fn remove(&self, item: &CompactCacheKey) {
-        let key = u64key(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        let key = u64key(&item);
         let node = self.lru.write().pop(&key);
         if let Some(n) = node {
             self.used.fetch_sub(n.size, Ordering::Relaxed);
@@ -255,7 +268,7 @@ impl EvictionManager for Manager {
         }
     }
 
-    fn access(&self, item: &CompactCacheKey, size: usize, _fresh_until: SystemTime) -> bool {
+    fn access(&self, item: &CacheEntryKey, size: usize, _fresh_until: SystemTime) -> bool {
         let key = u64key(item);
         if self.lru.write().get(&key).is_none() {
             self.insert(key, item.clone(), size, false);
@@ -265,7 +278,7 @@ impl EvictionManager for Manager {
         }
     }
 
-    fn peek(&self, item: &CompactCacheKey) -> bool {
+    fn peek(&self, item: &CacheEntryKey) -> bool {
         let key = u64key(item);
         self.lru.read().peek(&key).is_some()
     }
@@ -322,6 +335,55 @@ impl EvictionManager for Manager {
 }
 
 #[cfg(test)]
+impl Manager {
+    fn admit(
+        &self,
+        item: CompactCacheKey,
+        size: usize,
+        fresh_until: SystemTime,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::admit(self, CacheEntryKey::key_only(item), size, fresh_until)
+            .into_iter()
+            .map(CacheEntryKey::into_key)
+            .collect()
+    }
+
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::increment_weight(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            delta,
+            max_weight,
+        )
+        .into_iter()
+        .map(CacheEntryKey::into_key)
+        .collect()
+    }
+
+    fn remove(&self, item: &CompactCacheKey) {
+        EvictionManager::remove(self, CacheEntryKeyRef::from_entry_id(item, None));
+    }
+
+    fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {
+        EvictionManager::access(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            size,
+            fresh_until,
+        )
+    }
+
+    fn peek(&self, item: &CompactCacheKey) -> bool {
+        EvictionManager::peek(self, &CacheEntryKey::key_only(item.clone()))
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::CacheKey;
@@ -329,20 +391,20 @@ mod test {
     #[test]
     fn test_admission() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
         // lru si full (4) now
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         // need to reduce used by at least 2, both key1 and key2 are evicted to make room for 3
         assert_eq!(v.len(), 2);
@@ -351,16 +413,28 @@ mod test {
     }
 
     #[test]
+    fn test_identified_entries_are_distinct() {
+        let lru = Manager::new(1);
+        let key = CacheKey::new("a", "1").to_compact();
+        let first = CacheEntryKey::identified(key.clone(), crate::CacheEntryId::new(1));
+        let second = CacheEntryKey::identified(key, crate::CacheEntryId::new(2));
+        let until = SystemTime::now();
+
+        assert!(EvictionManager::admit(&lru, first.clone(), 1, until).is_empty());
+        assert_eq!(EvictionManager::admit(&lru, second, 1, until), vec![first]);
+    }
+
+    #[test]
     fn test_access() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -369,7 +443,7 @@ mod test {
         lru.access(&key1, 1, until);
         assert_eq!(v.len(), 0);
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -378,14 +452,14 @@ mod test {
     #[test]
     fn test_remove() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -394,7 +468,7 @@ mod test {
         lru.remove(&key1);
 
         // key2 is the least recently used one now
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -405,14 +479,14 @@ mod test {
         let lru = Manager::new(4);
         let until = SystemTime::now(); // unused value as a placeholder
 
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         lru.access(&key1, 1, until);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         lru.access(&key2, 2, until);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         lru.access(&key3, 2, until);
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4, 2, until);
         // need to reduce used by at least 2, both key1 and key2 are evicted to make room for 3
         assert_eq!(v.len(), 2);
@@ -421,16 +495,49 @@ mod test {
     }
 
     #[test]
+    fn test_increment_weight_adds_missing_item() {
+        let lru = Manager::new(4);
+        let key1 = CacheKey::new("a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 2, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 2);
+        assert_eq!(lru.total_items(), 1);
+
+        let key2 = CacheKey::new("b", "1").to_compact();
+        let evicted = lru.increment_weight(&key2, 100, Some(3));
+        assert_eq!(evicted, vec![key1]);
+        assert!(lru.peek(&key2));
+        assert_eq!(lru.total_size(), 3);
+        assert_eq!(lru.total_items(), 1);
+    }
+
+    #[test]
+    fn test_increment_weight_admits_zero_and_does_not_shrink() {
+        let lru = Manager::new(10);
+
+        let key1 = CacheKey::new("a", "1").to_compact();
+        assert!(lru.increment_weight(&key1, 0, None).is_empty());
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.total_size(), 1);
+
+        let key2 = CacheKey::new("b", "1").to_compact();
+        assert!(lru.increment_weight(&key2, 3, None).is_empty());
+        assert!(lru.increment_weight(&key2, 100, Some(2)).is_empty());
+        assert_eq!(lru.total_size(), 4);
+        assert_eq!(lru.total_items(), 2);
+    }
+
+    #[test]
     fn test_admit_update() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -440,7 +547,7 @@ mod test {
         assert_eq!(v.len(), 0);
 
         // lru is not full anymore
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru.admit(key4.clone(), 1, until);
         assert_eq!(v.len(), 0);
 
@@ -454,14 +561,14 @@ mod test {
     #[test]
     fn test_serde() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -475,7 +582,7 @@ mod test {
         let lru2 = Manager::new(4);
         lru2.deserialize(&ser).unwrap();
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -484,14 +591,14 @@ mod test {
     #[tokio::test]
     async fn test_save_to_disk() {
         let lru = Manager::new(4);
-        let key1 = CacheKey::new("", "a", "1").to_compact();
+        let key1 = CacheKey::new("a", "1").to_compact();
         let until = SystemTime::now(); // unused value as a placeholder
         let v = lru.admit(key1.clone(), 1, until);
         assert_eq!(v.len(), 0);
-        let key2 = CacheKey::new("", "b", "1").to_compact();
+        let key2 = CacheKey::new("b", "1").to_compact();
         let v = lru.admit(key2.clone(), 2, until);
         assert_eq!(v.len(), 0);
-        let key3 = CacheKey::new("", "c", "1").to_compact();
+        let key3 = CacheKey::new("c", "1").to_compact();
         let v = lru.admit(key3, 1, until);
         assert_eq!(v.len(), 0);
 
@@ -505,7 +612,7 @@ mod test {
         let lru2 = Manager::new(4);
         lru2.load("/tmp/test_simple_lru_save").await.unwrap();
 
-        let key4 = CacheKey::new("", "d", "1").to_compact();
+        let key4 = CacheKey::new("d", "1").to_compact();
         let v = lru2.admit(key4, 2, until);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], key2);
@@ -519,7 +626,7 @@ mod test {
 
         // admit 6 items of size 1
         for name in ["a", "b", "c", "d", "e", "f"] {
-            let key = CacheKey::new("", name, "1").to_compact();
+            let key = CacheKey::new(name, "1").to_compact();
             let _ = lru.admit(key, 1, until);
         }
 

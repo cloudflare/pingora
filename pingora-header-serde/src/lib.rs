@@ -199,7 +199,18 @@ fn buf_to_http_header(buf: &[u8]) -> Result<ResponseHeader> {
     let mut headers = vec![httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
 
-    match resp.parse(buf) {
+    // Match the leniency of the wire parser (see
+    // `pingora-core/src/protocols/http/v1/client.rs`): allow spaces between
+    // header name and colon, and accept obsolete line folding ("obs-fold").
+    // Without these, headers that were already accepted from the origin
+    // fail to round-trip through the cache header serde, surfacing as parse
+    // errors on cache hits. The obs-fold sequences themselves are collapsed
+    // to single spaces downstream by `header_value_from_slice`.
+    let mut parser = httparse::ParserConfig::default();
+    parser.allow_spaces_after_header_name_in_responses(true);
+    parser.allow_obsolete_multiline_headers_in_responses(true);
+
+    match parser.parse_response(&mut resp, buf) {
         Ok(s) => match s {
             httparse::Status::Complete(_size) => parsed_to_header(&resp),
             // we always feed the but that contains the entire header to parse
@@ -224,7 +235,8 @@ fn parsed_to_header(parsed: &httparse::Response) -> Result<ResponseHeader> {
     let mut resp = ResponseHeader::build(parsed.code.unwrap(), Some(parsed.headers.len()))?;
 
     for header in parsed.headers.iter() {
-        resp.append_header(header.name.to_string(), header.value)?;
+        let header_value = pingora_http::header_value_from_slice(header.value);
+        resp.append_header(header.name.to_string(), header_value)?;
     }
 
     Ok(resp)
@@ -291,5 +303,63 @@ mod tests {
         // Test that httparse can handle this
         let parsed = buf_to_http_header(&buf).unwrap();
         assert_eq!(parsed.status.as_u16(), 200);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_multiline_header() {
+        let serde = HeaderSerde::new(None);
+
+        let multiline_response = b"HTTP/1.1 200 OK\r\n\
+Content-Security-Policy: default-src 'self';\r\n \
+       script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:;\r\n \
+       connect-src 'self' wss:;\r\n \
+       img-src 'self' data: blob:\r\n\
+Content-Type: text/html\r\n\
+\r\n";
+
+        let header1 = buf_to_http_header(multiline_response).unwrap();
+        let compressed = serde.serialize(&header1).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+
+        assert_eq!(header1.status, header2.status);
+        // After obs-fold normalization the parsed and the round-tripped
+        // values must agree byte-for-byte.
+        assert_eq!(header1.headers, header2.headers);
+
+        let csp = header1.headers.get("content-security-policy").unwrap();
+        let csp_bytes = csp.as_bytes();
+        // No CR or LF must survive normalization — that's the whole point.
+        assert!(!csp_bytes.contains(&b'\r'));
+        assert!(!csp_bytes.contains(&b'\n'));
+        // Each fold collapses to a single SP between the joined segments.
+        let csp_str = std::str::from_utf8(csp_bytes).unwrap();
+        assert_eq!(
+            csp_str,
+            "default-src 'self'; \
+             script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; \
+             connect-src 'self' wss:; \
+             img-src 'self' data: blob:"
+        );
+    }
+
+    #[test]
+    fn test_parsing_multiline_header() {
+        let multiline_response = b"HTTP/1.1 200 OK\r\n\
+X-Custom: foo\r\n \
+       bar\r\n \
+       baz\r\n\
+\r\n";
+
+        let header = buf_to_http_header(multiline_response).unwrap();
+
+        assert!(header.headers.contains_key("x-custom"));
+        assert_eq!(header.headers.len(), 1);
+
+        let custom = header.headers.get("x-custom").unwrap();
+        let custom_bytes = custom.as_bytes();
+        assert!(!custom_bytes.contains(&b'\r'));
+        assert!(!custom_bytes.contains(&b'\n'));
+        // "foo\r\n <ws>bar\r\n <ws>baz" -> "foo bar baz" (each fold a single SP).
+        assert_eq!(custom_bytes, b"foo bar baz");
     }
 }

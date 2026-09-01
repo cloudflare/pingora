@@ -16,7 +16,7 @@ use super::*;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
-use pingora_cache::lock::LockStatus;
+use pingora_cache::lock::LockWaitOutcome;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
@@ -24,6 +24,8 @@ use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
+
+const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -81,8 +83,8 @@ where
         }
 
         // cache lookup logic
+        let mut cache_lock_retries = 0;
         loop {
-            // for cache lock, TODO: cap the max number of loops
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
@@ -118,7 +120,8 @@ where
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        let now = SystemTime::now();
+                        let is_fresh = meta.is_fresh(now);
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
@@ -147,7 +150,7 @@ where
                                 HitStatus::ForceExpired
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
-                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -158,10 +161,20 @@ where
 
                     if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
-                        if session.cache.is_cache_locked() {
+                        if !session.cache.enabled() {
+                            // An admission policy may have disabled caching during cache_lookup().
+                            break None;
+                        } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
-                            let lock_status = session.cache.cache_lock_wait().await;
-                            if self.handle_lock_status(session, ctx, lock_status) {
+                            let outcome = session.cache.cache_lock_wait().await;
+                            if self.handle_lock_wait_outcome(session, ctx, outcome) {
+                                if self.cache_lock_retry_limit_exceeded(
+                                    session,
+                                    ctx,
+                                    &mut cache_lock_retries,
+                                ) {
+                                    break None;
+                                }
                                 continue;
                             } else {
                                 break None;
@@ -194,8 +207,15 @@ where
                             let will_serve_stale = session.cache.can_serve_stale_updating()
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if !will_serve_stale {
-                                let lock_status = session.cache.cache_lock_wait().await;
-                                if self.handle_lock_status(session, ctx, lock_status) {
+                                let outcome = session.cache.cache_lock_wait().await;
+                                if self.handle_lock_wait_outcome(session, ctx, outcome) {
+                                    if self.cache_lock_retry_limit_exceeded(
+                                        session,
+                                        ctx,
+                                        &mut cache_lock_retries,
+                                    ) {
+                                        break None;
+                                    }
                                     continue;
                                 } else {
                                     break None;
@@ -367,7 +387,7 @@ where
             if !range_filter.is_multipart_range() || !hit_handler.can_seek_multipart() {
                 return Ok(false);
             }
-            let r = range_filter.next_cache_multipart_range();
+            let r = range_filter.next_cache_multipart_range()?;
             hit_handler.seek_multipart(r.start, Some(r.end))?;
             // we still need RangeBodyFilter's help to transform the byte
             // range into a multipart response.
@@ -541,6 +561,19 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
+    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    where
+        SV: ProxyHttp,
+    {
+        if let Err(e) = session.cache.finish_miss_handler().await {
+            warn!(
+                "Failed to finish cache miss admission: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+            session.cache.disable(NoCacheReason::StorageError);
+        }
+    }
+
     pub(crate) async fn cache_http_task(
         &self,
         session: &mut Session,
@@ -570,13 +603,20 @@ where
                     Cacheable(meta) => {
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
-                            // The cache might have been bypassed because the response exceeded the
-                            // maximum cacheable asset size. If that looks like the case (there
-                            // is a maximum file size configured and we don't know the content
-                            // length up front), attempting to re-enable the cache now would cause
-                            // the request to fail when the chunked response exceeds the maximum
-                            // file size again.
-                            if session.cache.max_file_size_bytes().is_some()
+                            // Only hold this request back if the predictor bypassed it over size.
+                            // Re-enabling the cache without a known content length would fail the
+                            // request mid-body if the response exceeds the maximum file size
+                            // again, so wait for the body to finish and let the response filters
+                            // re-admit the key. Every other bypass reason says nothing about size
+                            // and must not be reported as PredictedResponseTooLarge.
+                            let bypassed_over_size =
+                                match session.cache.predicted_uncacheable_reason() {
+                                    Some(reason) => reason == NoCacheReason::ResponseTooLarge,
+                                    // unknown reason, stay conservative
+                                    None => true,
+                                };
+                            if bypassed_over_size
+                                && session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
                                 session
@@ -649,7 +689,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
@@ -695,13 +735,13 @@ where
 
                             miss_handler.write_body(d.clone(), *end_stream).await?;
                             if *end_stream {
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
                     None => {
                         if session.cache.enabled() && *end_stream {
-                            session.cache.finish_miss_handler().await?;
+                            self.finish_miss_handler_best_effort(session, ctx).await;
                         }
                     }
                 }
@@ -709,7 +749,7 @@ where
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    session.cache.finish_miss_handler().await?;
+                    self.finish_miss_handler_best_effort(session, ctx).await;
                 }
             }
             HttpTask::Failed(_) => {
@@ -900,30 +940,34 @@ where
     }
 
     // helper function to check when to continue to retry lock (true) or give up (false)
-    fn handle_lock_status(
+    fn handle_lock_wait_outcome(
         &self,
         session: &mut Session,
         ctx: &SV::CTX,
-        lock_status: LockStatus,
+        outcome: LockWaitOutcome,
     ) -> bool
     where
         SV: ProxyHttp,
     {
-        debug!("cache unlocked {lock_status:?}");
-        match lock_status {
+        debug!("cache unlocked {outcome:?}");
+        match outcome {
             // should lookup the cached asset again
-            LockStatus::Done => true,
+            LockWaitOutcome::Done => true,
             // should compete to be a new writer
-            LockStatus::TransientError => true,
-            // the request is uncacheable, go ahead to fetch from the origin
-            LockStatus::GiveUp => {
-                // TODO: It will be nice for the writer to propagate the real reason
+            LockWaitOutcome::TransientError => true,
+            // the writer found no lock was needed; every reader goes upstream
+            LockWaitOutcome::GiveUp => {
                 session.cache.disable(NoCacheReason::CacheLockGiveUp);
-                // not cacheable, just go to the origin.
+                false
+            }
+            // this reader alone stopped waiting, over a fill it cannot use; the
+            // cause travels with the outcome, so there is nothing to look up
+            LockWaitOutcome::Abandoned { reason, .. } => {
+                session.cache.disable(reason);
                 false
             }
             // treat this the same as TransientError
-            LockStatus::Dangling => {
+            LockWaitOutcome::Dangling => {
                 // software bug, but request can recover from this
                 warn!(
                     "Dangling cache lock, {}",
@@ -933,7 +977,7 @@ where
             }
             // If this reader has spent too long waiting on locks, let the request
             // through while disabling cache (to avoid amplifying disk writes).
-            LockStatus::WaitTimeout => {
+            LockWaitOutcome::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -945,10 +989,34 @@ where
             // When a singular cache lock has been held for too long,
             // we should allow requests to recompete for the lock
             // to protect upstreams from load.
-            LockStatus::AgeTimeout => true,
-            // software bug, this status should be impossible to reach
-            LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+            LockWaitOutcome::AgeTimeout => true,
         }
+    }
+
+    fn cache_lock_retry_limit_exceeded(
+        &self,
+        session: &mut Session,
+        ctx: &SV::CTX,
+        cache_lock_retries: &mut usize,
+    ) -> bool
+    where
+        SV: ProxyHttp,
+    {
+        *cache_lock_retries += 1;
+        let max_retries = session
+            .cache
+            .cache_lock_max_retries()
+            .unwrap_or(DEFAULT_MAX_CACHE_LOCK_RETRIES);
+        if *cache_lock_retries <= max_retries {
+            return false;
+        }
+
+        warn!(
+            "Cache lock retry limit exceeded, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session.cache.disable(NoCacheReason::CacheLockRetryLimit);
+        true
     }
 }
 
@@ -1525,7 +1593,7 @@ pub mod range_filter {
 
         // no range, try HEAD
         let mut req = gen_req();
-        req.method = Method::HEAD;
+        req.set_method(Method::HEAD);
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
@@ -1818,23 +1886,43 @@ pub mod range_filter {
         }
 
         /// Returns the next multipart range to seek for the cache body reader.
-        pub fn next_cache_multipart_range(&mut self) -> Range<usize> {
-            match &self.range {
-                RangeType::Multi(multipart_info) => {
-                    match self.cache_multipart_idx.as_mut() {
-                        Some(v) => *v += 1,
-                        None => self.cache_multipart_idx = Some(0),
-                    }
-                    let cache_multipart_idx = self.cache_multipart_idx.expect("set above");
-                    let multipart_idx = self.multipart_idx.expect("must be set on multirange");
-                    // NOTE: currently this assumes once we start seeking multipart from the hit
-                    // handler, it will continue to return can_seek_multipart true.
-                    assert_eq!(multipart_idx, cache_multipart_idx,
-                        "cache multipart idx should match multipart idx, or there is a hit handler bug");
-                    multipart_info.ranges[cache_multipart_idx].clone()
-                }
-                _ => panic!("tried to advance multipart idx on non-multipart range"),
+        ///
+        /// The body filter and seekable cache reader must advance through each
+        /// part together. If they diverge, the response body cannot be served
+        /// correctly; report an internal error rather than panic.
+        pub fn next_cache_multipart_range(&mut self) -> Result<Range<usize>> {
+            let RangeType::Multi(multipart_info) = &self.range else {
+                return Error::e_explain(
+                    InternalError,
+                    "tried to advance cache multipart range on a non-multipart response",
+                );
+            };
+
+            let cache_multipart_idx = self.cache_multipart_idx.map_or(0, |idx| idx + 1);
+            let Some(multipart_idx) = self.multipart_idx else {
+                return Error::e_explain(
+                    InternalError,
+                    "multipart response is missing body filter progress state",
+                );
+            };
+            if multipart_idx != cache_multipart_idx {
+                return Error::e_explain(
+                    InternalError,
+                    format!(
+                        "cache multipart progress mismatch: body_filter_idx={multipart_idx}, cache_reader_idx={cache_multipart_idx}, ranges={}",
+                        multipart_info.ranges.len(),
+                    ),
+                );
             }
+
+            let Some(range) = multipart_info.ranges.get(cache_multipart_idx).cloned() else {
+                return Error::e_explain(
+                    InternalError,
+                    "cache multipart reader advanced past the final requested range",
+                );
+            };
+            self.cache_multipart_idx = Some(cache_multipart_idx);
+            Ok(range)
         }
 
         pub fn set_current_cursor(&mut self, current: usize) {
@@ -2208,6 +2296,51 @@ pub mod range_filter {
             "Missing final boundary"
         );
     }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_ends_part_early() {
+        let ranges = vec![0..10, 20..30];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..10);
+        body_filter.set_current_cursor(first.start);
+
+        // The cache reader yielded only a prefix of the selected part before
+        // reporting EOF. The filter therefore has not advanced past part 0.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"01234")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=0, cache_reader_idx=1"));
+    }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_overreads_part() {
+        let ranges = vec![0..2, 4..6, 8..10];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..2);
+        body_filter.set_current_cursor(first.start);
+
+        // A seekable reader is expected to stop at the selected part's end.
+        // This chunk spans all requested parts and advances the filter beyond
+        // what the reader's seek state records.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"0123456789")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=3, cache_reader_idx=1"));
+    }
 }
 
 // a state machine for proxy logic to tell when to use cache in the case of
@@ -2400,19 +2533,17 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                // safety: called only if the async_body_reader exists
-                if cache.miss_body_reader().unwrap().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
-                    cache
-                        .miss_body_reader()
-                        .unwrap()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            // safety: called only if the async_body_reader exists
+            RangeType::Multi(_info) if cache.miss_body_reader().unwrap().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .miss_body_reader()
+                    .unwrap()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }
@@ -2438,21 +2569,215 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                if cache.hit_handler().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
-                    cache
-                        .hit_handler()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            RangeType::Multi(_info) if cache.hit_handler().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .hit_handler()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }
         *self = Self::CacheBody(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        predictor::{CacheablePredictor, Predictor},
+        CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
+    };
+    use pingora_http::ResponseHeader;
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Stands in for a caller-defined `NoCacheReason::Custom` that has nothing to do with size.
+    const AUTHORIZATION_HEADER: &str = "AuthorizationHeader";
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test drives cache_http_task directly")
+        }
+
+        fn response_cache_filter(
+            &self,
+            _session: &Session,
+            resp: &ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<RespCacheable> {
+            let now = SystemTime::now();
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                now + Duration::from_secs(60),
+                now,
+                0,
+                0,
+                resp.clone(),
+            )))
+        }
+    }
+
+    /// Build a session that the predictor has bypassed, exactly as `proxy_cache` would:
+    /// the key is remembered as uncacheable for `reason`, so lookup is skipped.
+    async fn bypassed_session(
+        key: CacheKey,
+        reason: NoCacheReason,
+        max_file_size: usize,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+
+        CACHE_PREDICTOR.mark_uncacheable(&key, reason);
+        assert!(
+            !session.cache.cacheable_prediction(),
+            "predictor should bypass a key it just marked uncacheable"
+        );
+        session.cache.bypass();
+        session
+    }
+
+    /// A cacheable 200 with no `Content-Length`, i.e. an origin that chunks the body.
+    fn chunked_cacheable_response() -> ResponseHeader {
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.insert_header(http::header::CACHE_CONTROL, "max-age=60")
+            .unwrap();
+        resp
+    }
+
+    async fn run_header_task(session: &mut Session, resp: ResponseHeader) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(resp), true),
+                &mut (),
+                &mut ServeFromCache::new(),
+            )
+            .await
+            .expect("cache_http_task should succeed");
+    }
+
+    /// A predictor bypass that had nothing to do with size must not be reported as
+    /// PredictedResponseTooLarge, and must not cost the request a wasted bypass.
+    #[tokio::test]
+    async fn non_size_bypass_admits_and_clears_predictor() {
+        for reason in [
+            NoCacheReason::Custom(AUTHORIZATION_HEADER),
+            NoCacheReason::OriginNotCache,
+        ] {
+            let key = CacheKey::new(format!("/non-size-bypass/{}", reason.as_str()), "");
+            let mut session = bypassed_session(key.clone(), reason, 1024).await;
+
+            run_header_task(&mut session, chunked_cacheable_response()).await;
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Miss,
+                "bypass remembered for {reason:?} should admit this response, got {:?}",
+                session.cache.phase()
+            );
+            assert!(
+                CACHE_PREDICTOR.cacheable_prediction(&key),
+                "bypass remembered for {reason:?} should be cleared once the response came back cacheable"
+            );
+        }
+    }
+
+    /// The deferral only exists to protect against a response that already blew the size
+    /// limit once. That case still defers, and still reports the reason it acted on.
+    #[tokio::test]
+    async fn size_bypass_defers_when_length_is_unknown() {
+        let key = CacheKey::new("/size-bypass-chunked", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+        assert!(
+            !CACHE_PREDICTOR.cacheable_prediction(&key),
+            "the response body has not been measured yet, so the key stays marked"
+        );
+    }
+
+    /// With a Content-Length the size is known up front, so even a size bypass can admit.
+    #[tokio::test]
+    async fn size_bypass_admits_when_length_is_known() {
+        let key = CacheKey::new("/size-bypass-with-length", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        let mut resp = chunked_cacheable_response();
+        resp.insert_header(CONTENT_LENGTH, "5").unwrap();
+        run_header_task(&mut session, resp).await;
+
+        assert_eq!(session.cache.phase(), CachePhase::Miss);
+    }
+
+    /// Without a predictor reason there is nothing to act on, so the conservative
+    /// deferral stays in place.
+    #[tokio::test]
+    async fn unknown_bypass_reason_stays_conservative() {
+        let key = CacheKey::new("/unknown-bypass-reason", "");
+        // Bypass without the predictor remembering anything, e.g. a caller that bypassed
+        // for its own reasons.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key);
+        session.cache.set_max_file_size_bytes(1024);
+        session.cache.bypass();
+        assert_eq!(session.cache.predicted_uncacheable_reason(), None);
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
     }
 }

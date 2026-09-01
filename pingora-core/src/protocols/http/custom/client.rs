@@ -46,6 +46,17 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn shutdown(&mut self, code: u32, ctx: &str);
 
+    /// Abandon the request mid-message, in a way the peer can tell apart from a
+    /// request that was completed.
+    ///
+    /// The client-side counterpart of
+    /// [`server::Session::abandon`](super::server::Session::abandon); see that
+    /// method for the full contract. Defaults to [`Session::shutdown`],
+    /// preserving the behavior of implementations that predate this method.
+    async fn abandon(&mut self, ctx: &str) {
+        self.shutdown(0, ctx).await;
+    }
+
     fn response_header(&self) -> Option<&ResponseHeader>;
 
     fn was_upgraded(&self) -> bool;

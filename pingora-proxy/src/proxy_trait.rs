@@ -310,10 +310,15 @@ pub trait ProxyHttp {
         )
     }
 
-    /// Modify the request before it is sent to the upstream
+    /// Modify the request before it is sent to the upstream.
     ///
-    /// Unlike [Self::request_filter()], this filter allows to change the request headers to send
-    /// to the upstream.
+    /// Unlike [Self::request_filter()], this filter allows changing the request headers sent to
+    /// the upstream. Automatic upstream request-header policy configured on the selected peer is
+    /// applied before this callback. Headers deliberately added by this callback are treated as
+    /// application-controlled upstream behavior, including framing and protocol-upgrade fields.
+    /// For an HTTP/1 upstream, if the downstream request has a non-empty body and this callback
+    /// leaves neither `Content-Length` nor `Transfer-Encoding`, Pingora adds
+    /// `Transfer-Encoding: chunked`.
     async fn upstream_request_filter(
         &self,
         _session: &mut Session,

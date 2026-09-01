@@ -19,7 +19,9 @@ use super::*;
 use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
-use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
+use pingora_core::protocols::http::{
+    custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
+};
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -42,24 +44,23 @@ where
         // phase 2 send to upstream
 
         let mut req = session.req_header().clone();
+        req.set_version(Version::HTTP_11);
 
-        // Convert HTTP2 headers to H1
-        if req.version == Version::HTTP_2 {
-            req.set_version(Version::HTTP_11);
-            // if client has body but has no content length, add chunked encoding
-            // https://datatracker.ietf.org/doc/html/rfc9112#name-message-body
-            // "The presence of a message body in a request is signaled by a Content-Length or Transfer-Encoding header field."
-            if !session.is_body_empty() && session.get_header(header::CONTENT_LENGTH).is_none() {
-                req.insert_header(header::TRANSFER_ENCODING, "chunked")
-                    .unwrap();
-            }
-            if session.get_header(header::HOST).is_none() {
-                // H2 is required to set :authority, but no necessarily header
-                // most H1 server expect host header, so convert
-                let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
-                req.insert_header(header::HOST, host).unwrap();
-            }
-            // TODO: Add keepalive header for connection reuse, but this is not required per RFC
+        // H2 is required to set :authority, but not necessarily Host; most H1 servers expect a
+        // Host header, so convert it when sending to H1.
+        if session.req_header().version == Version::HTTP_2
+            && session.get_header(header::HOST).is_none()
+        {
+            let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
+            req.insert_header(header::HOST, host).unwrap();
+        }
+
+        if let Err(e) = sanitize_h1_upstream_request(
+            &mut req,
+            peer.options.http_upstream_request_policy,
+            session.req_header().version == Version::HTTP_11,
+        ) {
+            return (false, true, Some(e.into_down()));
         }
 
         if session.cache.enabled() {
@@ -81,6 +82,12 @@ where
             }
         }
 
+        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
+            return (false, true, Some(e));
+        }
+
+        session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -96,11 +103,23 @@ where
             .downstream_session
             .as_custom_mut()
             .and_then(|c| c.take_custom_message_writer());
+        // Keep the reader in this caller so it is restored even if retryable
+        // upstream errors make try_join! cancel the downstream future.
+        let mut downstream_custom_message_reader = match session
+            .take_downstream_custom_message_reader(&mut downstream_custom_message_writer)
+        {
+            Ok(reader) => reader,
+            Err(e) => return (false, false, Some(e)),
+        };
 
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
         session.as_mut().enable_retry_buffering();
+
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
 
         // start bi-directional streaming
         let ret = tokio::try_join!(
@@ -109,9 +128,11 @@ where
                 tx_downstream,
                 rx_upstream,
                 ctx,
-                &mut downstream_custom_message_writer
+                &mut downstream_custom_message_writer,
+                &mut downstream_custom_message_reader,
+                pipe_state.clone(),
             ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream),
+            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -124,10 +145,21 @@ where
                     }
                 }
             }
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                match custom_session.restore_custom_message_reader(downstream_custom_message_reader)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, false, Some(e));
+                    }
+                }
+            }
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
+            Ok((downstream_can_reuse, upstream_can_reuse)) => {
+                (downstream_can_reuse, upstream_can_reuse, None)
+            }
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -187,13 +219,15 @@ where
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
-    ) -> Result<()>
+        pipe_state: Arc<AtomicU8>,
+    ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
         let mut request_done = false;
         let mut response_done = false;
+        let mut upstream_can_reuse = true;
         let mut send_error = None;
         let mut upgraded = false;
 
@@ -225,7 +259,26 @@ where
                             // So that this function could read the rest events from rx including
                             // the closure, then exit.
                             if result.is_err() && !client_session.was_upgraded() {
-                                return result;
+                                if PipeState::is_downstream_complete(
+                                    pipe_state.load(Ordering::Acquire),
+                                ) {
+                                    // The downstream half finished the response by its own framing
+                                    // and dropped the task pipe, so this send failure is benign.
+                                    if response_done {
+                                        // The whole upstream response was already read off the
+                                        // socket. Keep looping so the request side can finish; the
+                                        // natural loop exit then decides reuse from both directions
+                                        // (the connection is reusable only if the request was also
+                                        // fully sent, which a premature response can leave undone).
+                                        continue;
+                                    }
+                                    // We stopped mid-response, so the upstream connection has
+                                    // unread bytes and is unsafe to reuse.
+                                    return Ok(false);
+                                }
+                                // The pipe closed but the downstream half did not signal completion:
+                                // this is an unexpected closure, so surface the original send error.
+                                return Err(result.expect_err("send failure already checked via is_err() above"));
                             }
                         },
                         Err(e) => {
@@ -233,7 +286,7 @@ where
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
                             // Downstream should consume all remaining data and handle the error
-                            return Ok(())
+                            return Ok(upstream_can_reuse)
                         }
                     }
                 },
@@ -251,6 +304,13 @@ where
                            warn!("send error, draining read buf: {e}");
                            request_done = true;
 
+                           // Built-in HTTP downstream sessions are expected to reject
+                           // incomplete bodies before reaching this state. A downstream
+                           // session that does not report such an error or an upstream request
+                           // mutation that creates inconsistent framing can still reach it.
+                           // A complete response can be forwarded, but the partially written
+                           // HTTP/1 request makes this connection unsafe to reuse.
+                           upstream_can_reuse = false;
                            send_error = Some(e);
                            continue
                         }
@@ -264,7 +324,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(upstream_can_reuse)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -283,7 +343,9 @@ where
         SV::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
-            // just drain, do we need to do anything else?
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
             return Ok(None);
         }
 
@@ -346,6 +408,7 @@ where
 
     // todo use this function to replace bidirection_1to2()
     // returns whether this server (downstream) session can be reused
+    #[allow(clippy::too_many_arguments)]
     async fn proxy_handle_downstream(
         &self,
         session: &mut Session,
@@ -353,6 +416,10 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+        downstream_custom_message_reader: &mut Option<
+            Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+        >,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
         SV: ProxyHttp + Send + Sync,
@@ -364,16 +431,16 @@ where
             mut downstream_custom_write,
             downstream_custom_message_custom_forwarding,
             mut downstream_custom_message_inject_rx,
-            mut downstream_custom_message_reader,
         ) = if downstream_custom_message_writer.is_some() {
-            let reader = session.downstream_custom_message()?;
             let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx), reader)
+            (true, true, Some(inject_tx), Some(inject_rx))
         } else {
-            (false, false, None, None, None)
+            (false, false, None, None)
         };
 
         if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            // Custom handles are owned by the caller so an early error here still
+            // lets the caller restore them before retrying another upstream.
             self.inner
                 .custom_forwarding(session, ctx, None, custom_forwarding)
                 .await?;
@@ -632,10 +699,14 @@ where
                 // "Gate" branch: ready(()) resolves immediately, so the guard controls
                 // whether we enter. This is not a busy-loop because every path through
                 // the inner select either (a) drains all pending tasks via
-                // write_downstream_proxy_tasks (making the guard false), (b) stores an
-                // upstream task in next_upstream_task (making the guard false), or
-                // (c) blocks on real I/O inside the nested select.
-                _ = std::future::ready(()), if session.has_pending_downstream_tasks() && next_upstream_task.is_none() => {
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
                     tokio::select! {
                         // Try to write downstream proxy tasks (cancel-safe)
                         write_result = session.write_downstream_proxy_tasks() => {
@@ -730,14 +801,6 @@ where
             }
         }
 
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
-                custom_session
-                    .restore_custom_message_reader(downstream_custom_message_reader)
-                    .expect("downstream restore_custom_message_reader should be empty");
-            }
-        }
-
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
@@ -750,6 +813,9 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
@@ -771,6 +837,11 @@ where
             if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
+            }
+
+            if let HttpTask::Header(header, _) = &task {
+                reject_mismatched_h1_upgrade_101(session, header, "h1_upstream_filter")
+                    .map_err(|e| e.into_up())?;
             }
 
             // cache the original response before any downstream transformation
@@ -849,10 +920,15 @@ where
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
 
-                match self.inner.response_filter(session, &mut header, ctx).await {
-                    Ok(_) => Ok(HttpTask::Header(header, end)),
-                    Err(e) => Err(e),
+                self.inner
+                    .response_filter(session, &mut header, ctx)
+                    .await?;
+                if !from_cache {
+                    // Re-check after response_filter in case it changed the final status to 101.
+                    reject_mismatched_h1_upgrade_101(session, &header, "h1_response_filter")
+                        .map_err(|e| e.into_in())?;
                 }
+                Ok(HttpTask::Header(header, end))
             }
             HttpTask::Body(data, end) => {
                 if track_max_cache_size {
@@ -1046,5 +1122,118 @@ pub(crate) async fn send_body_to1(
         }
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    struct ResponseFilter101;
+
+    #[async_trait]
+    impl ProxyHttp for ResponseFilter101 {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls h1_response_filter directly")
+        }
+
+        async fn response_filter(
+            &self,
+            _session: &mut Session,
+            response: &mut ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            response.set_status(http::StatusCode::SWITCHING_PROTOCOLS)?;
+            response.set_version(Version::HTTP_11);
+            Ok(())
+        }
+    }
+
+    async fn upgrade_request_session() -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+    }
+
+    #[tokio::test]
+    async fn h1_response_filter_rejects_filter_created_101_with_upgrade_mismatch() {
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let mut session = upgrade_request_session().await;
+        session.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(false),
+        };
+
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let task = HttpTask::Header(Box::new(ResponseHeader::build(200, Some(0)).unwrap()), true);
+
+        let err = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+    }
+
+    #[tokio::test]
+    async fn h1_response_filter_rejects_upstream_101_upgrade_mismatch_as_upstream() {
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let mut session = upgrade_request_session().await;
+        session.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(false),
+        };
+
+        let mut ctx = ();
+        let mut serve_from_cache = ServeFromCache::new();
+        let mut range_body_filter = RangeBodyFilter::new();
+        let mut response =
+            ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, Some(0)).unwrap();
+        response.set_version(Version::HTTP_11);
+        let task = HttpTask::Header(Box::new(response), true);
+
+        let err = proxy
+            .h1_response_filter(
+                &mut session,
+                task,
+                &mut ctx,
+                &mut serve_from_cache,
+                &mut range_body_filter,
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Upstream);
     }
 }

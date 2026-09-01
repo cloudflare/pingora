@@ -46,7 +46,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -77,6 +77,9 @@ use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
+
+type DownstreamCustomMessageReader =
+    Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
 
 mod proxy_cache;
 mod proxy_common;
@@ -255,7 +258,10 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!("Fail to proxy: {e}");
+                error!(
+                    "Fail to proxy: {e}, downstream session type: {}",
+                    downstream_session.session_type()
+                );
                 if matches!(e.etype, InvalidHTTPHeader) {
                     downstream_session
                         .respond_error(400)
@@ -479,6 +485,8 @@ pub struct Session {
     pub ignore_downstream_range: bool,
     /// Were the upstream request headers modified?
     pub upstream_headers_mutated_for_cache: bool,
+    /// Upstream predicate for whether this HTTP/1 request is an upgrade.
+    h1_upgrade_request_status: H1UpgradeRequestStatus,
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
@@ -492,6 +500,8 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Whether proxy task filtering has seen a downstream 101 upgrade header.
+    downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
@@ -512,12 +522,14 @@ impl Session {
             upstream_compression: ResponseCompressionCtx::new(0, false, false),
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
+            h1_upgrade_request_status: H1UpgradeRequestStatus::default(),
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
             #[cfg(feature = "upstream_modules")]
             upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
         }
@@ -664,20 +676,42 @@ impl Session {
     ) -> Result<()> {
         match task {
             HttpTask::Header(resp, end) => {
+                if *seen_upgraded {
+                    return reject_unexpected_task_after_h1_upgrade(self, "header", *seen_upgraded);
+                }
                 self.downstream_modules_ctx
                     .response_header_filter(resp, *end)
                     .await?;
+                reject_mismatched_h1_upgrade_101(self, resp, "downstream_module_header_filter")
+                    .map_err(|e| e.into_in())?;
+                if resp.status == http::StatusCode::SWITCHING_PROTOCOLS
+                    && self.downstream_session.is_upgrade(resp) == Some(true)
+                {
+                    *seen_upgraded = true;
+                }
             }
             HttpTask::Body(data, end) => {
+                if *seen_upgraded {
+                    return reject_unexpected_task_after_h1_upgrade(self, "body", *seen_upgraded);
+                }
                 self.downstream_modules_ctx
                     .response_body_filter(data, *end)?;
             }
             HttpTask::UpgradedBody(data, end) => {
-                *seen_upgraded = true;
+                if !*seen_upgraded {
+                    return reject_unexpected_upgraded_body_before_h1_upgrade(self, *seen_upgraded);
+                }
                 self.downstream_modules_ctx
                     .response_body_filter(data, *end)?;
             }
             HttpTask::Trailer(trailers) => {
+                if *seen_upgraded {
+                    return reject_unexpected_task_after_h1_upgrade(
+                        self,
+                        "trailer",
+                        *seen_upgraded,
+                    );
+                }
                 if let Some(buf) = self
                     .downstream_modules_ctx
                     .response_trailer_filter(trailers)?
@@ -696,16 +730,17 @@ impl Session {
                 // of response if not already done via trailers or body with
                 // end flag set.
                 // If the filter returns body bytes on Done,
-                // write them into the response.
+                // write them into the response. After a 101, those bytes are
+                // already in the upgraded protocol and must not be HTTP-framed.
                 //
                 // Note, this will not work if end of stream has already
                 // been seen or we've written content-length bytes.
                 if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                    if *seen_upgraded {
-                        *task = HttpTask::UpgradedBody(Some(buf), true);
+                    *task = if *seen_upgraded {
+                        HttpTask::UpgradedBody(Some(buf), true)
                     } else {
-                        *task = HttpTask::Body(Some(buf), true);
-                    }
+                        HttpTask::Body(Some(buf), true)
+                    };
                 }
             }
             _ => { /* Failed */ }
@@ -717,15 +752,16 @@ impl Session {
     /// downstream module filters. This allows decoupling cache writes from
     /// downstream writes.
     ///
-    /// Only works with sessions that support the proxy task API (currently H1).
+    /// Only works with sessions that support the proxy task API.
     ///
     /// # Panics
     /// Panics if the session doesn't support the proxy task API.
     /// Use `write_response_tasks()` for sessions that don't support the proxy task API.
     pub async fn send_downstream_proxy_task(&mut self, mut task: HttpTask) -> Result<()> {
-        let mut seen_upgraded = self.was_upgraded();
+        let mut seen_upgraded = self.downstream_task_seen_upgraded || self.was_upgraded();
         self.downstream_response_task_filter(&mut task, &mut seen_upgraded)
             .await?;
+        self.downstream_task_seen_upgraded = seen_upgraded;
         self.downstream_session.send_downstream_proxy_task(task);
         Ok(())
     }
@@ -759,11 +795,12 @@ impl Session {
     }
 
     pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        let mut seen_upgraded = self.was_upgraded();
+        let mut seen_upgraded = self.downstream_task_seen_upgraded || self.was_upgraded();
         for task in tasks.iter_mut() {
             self.downstream_response_task_filter(task, &mut seen_upgraded)
                 .await?;
         }
+        self.downstream_task_seen_upgraded = seen_upgraded;
         self.downstream_session.response_duplex_vec(tasks).await
     }
 
@@ -776,6 +813,19 @@ impl Session {
     /// Check whether the upstream headers were marked as mutated during the request.
     pub fn upstream_headers_mutated_for_cache(&self) -> bool {
         self.upstream_headers_mutated_for_cache
+    }
+
+    fn set_upstream_h1_upgrade_request_status(&mut self, upstream_is_upgrade_req: bool) {
+        self.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(upstream_is_upgrade_req),
+        };
+    }
+
+    fn h1_upgrade_request_snapshot(&self) -> H1UpgradeRequestSnapshot {
+        H1UpgradeRequestSnapshot {
+            downstream: self.downstream_session.is_upgrade_req(),
+            upstream: self.h1_upgrade_request_status.upstream,
+        }
     }
 
     /// Get the total upstream response body bytes received (payload only) recorded by the proxy layer.
@@ -803,11 +853,7 @@ impl Session {
         self.shutdown_flag.load(Ordering::Acquire)
     }
 
-    pub fn downstream_custom_message(
-        &mut self,
-    ) -> Result<
-        Option<Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>>,
-    > {
+    pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
         if let Some(custom_session) = self.downstream_session.as_custom_mut() {
             custom_session
                 .take_custom_message_reader()
@@ -820,6 +866,123 @@ impl Session {
             Ok(None)
         }
     }
+
+    fn take_downstream_custom_message_reader(
+        &mut self,
+        downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+    ) -> Result<Option<DownstreamCustomMessageReader>> {
+        if downstream_custom_message_writer.is_none() {
+            return Ok(None);
+        }
+
+        let Some(custom_session) = self.downstream_session.as_custom_mut() else {
+            return Ok(None);
+        };
+
+        let Some(reader) = custom_session.take_custom_message_reader() else {
+            if let Some(writer) = downstream_custom_message_writer.take() {
+                custom_session.restore_custom_message_writer(writer)?;
+            }
+            return Err(Error::explain(
+                ReadError,
+                "can't extract custom reader from downstream",
+            ));
+        };
+
+        Ok(Some(reader))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct H1UpgradeRequestStatus {
+    upstream: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct H1UpgradeRequestSnapshot {
+    downstream: bool,
+    upstream: Option<bool>,
+}
+
+impl H1UpgradeRequestSnapshot {
+    fn mismatch(self) -> bool {
+        // No upstream predicate means this helper cannot prove a mismatch. The
+        // current proxy paths record it before upstream responses can be handled.
+        matches!(self.upstream, Some(upstream) if self.downstream != upstream)
+    }
+}
+
+/// Rejects a 101 response when the downstream and upstream H1 upgrade state differs.
+///
+/// Upstream and downstream must agree that this request is an upgrade before a
+/// 101 can establish a tunnel. Otherwise one side changes protocol while the
+/// other stays in HTTP handling, allowing tunneled traffic to bypass request
+/// processing or corrupt the connection state.
+fn reject_mismatched_h1_upgrade_101(
+    session: &Session,
+    header: &ResponseHeader,
+    stage: &'static str,
+) -> Result<()> {
+    if header.status != http::StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(());
+    }
+
+    let status = session.h1_upgrade_request_snapshot();
+    if status.mismatch() {
+        return Error::e_explain(
+            InvalidHTTPHeader,
+            format!(
+                "received 101 response with mismatched upstream/downstream upgrade status: stage={stage}, downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, response_version={:?}, response_upgrade_header_present={}, response_connection_header_present={}",
+                status.downstream,
+                status.upstream,
+                session.was_upgraded(),
+                session.downstream_task_seen_upgraded,
+                header.version,
+                header.headers.get(http::header::UPGRADE).is_some(),
+                header.headers.get(http::header::CONNECTION).is_some(),
+            ),
+        );
+    }
+    Ok(())
+}
+
+fn reject_unexpected_task_after_h1_upgrade(
+    session: &Session,
+    task: &'static str,
+    task_filter_seen_upgraded: bool,
+) -> Result<()> {
+    let status = session.h1_upgrade_request_snapshot();
+    Error::e_explain(
+        InvalidHTTPHeader,
+        format!(
+            "received {task} task after downstream 101 upgrade: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
+            status.downstream,
+            status.upstream,
+            session.was_upgraded(),
+            session.downstream_task_seen_upgraded,
+            task_filter_seen_upgraded
+        ),
+    )
+    .map_err(|e| e.into_in())
+}
+
+fn reject_unexpected_upgraded_body_before_h1_upgrade(
+    session: &Session,
+    task_filter_seen_upgraded: bool,
+) -> Result<()> {
+    let status = session.h1_upgrade_request_snapshot();
+    Error::e_explain(
+        InvalidHTTPHeader,
+        format!(
+            "received upgraded body task before downstream 101 upgrade: downstream_upgrade_req={}, upstream_upgrade_req={:?}, downstream_was_upgraded={}, downstream_task_seen_upgraded={}, task_filter_seen_upgraded={}",
+            status.downstream,
+            status.upstream,
+            session.was_upgraded(),
+            session.downstream_task_seen_upgraded,
+            task_filter_seen_upgraded
+        ),
+    )
+    .map_err(|e| e.into_in())
 }
 
 impl AsRef<HttpSession> for Session {
@@ -1591,5 +1754,530 @@ where
             service.set_runtime_opts_override(runtime_opts_override);
         }
         service
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_core::modules::http::{HttpModule, HttpModuleBuilder};
+    use pingora_core::protocols::l4::stream::Stream as L4Stream;
+    use pingora_core::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Debug)]
+    struct StaticVirtualSocket {
+        read_buf: &'static [u8],
+        read_pos: usize,
+        write_buf: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl StaticVirtualSocket {
+        fn new(read_buf: &'static [u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self {
+                read_buf,
+                read_pos: 0,
+                write_buf,
+            }
+        }
+    }
+
+    impl AsyncRead for StaticVirtualSocket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let remaining = self.read_buf.len() - self.read_pos;
+            let to_read = remaining.min(buf.remaining());
+            if to_read > 0 {
+                buf.put_slice(&self.read_buf[self.read_pos..self.read_pos + to_read]);
+                self.read_pos += to_read;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StaticVirtualSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_buf.lock().unwrap().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl VirtualSocket for StaticVirtualSocket {
+        fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written,
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut session = Session::new_h1(Box::new(stream));
+        session.read_request().await.unwrap();
+        session
+    }
+
+    fn upgrade_response_header() -> ResponseHeader {
+        let mut header =
+            ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, Some(2)).unwrap();
+        header
+            .insert_header(http::header::UPGRADE, "websocket")
+            .unwrap();
+        header
+            .insert_header(http::header::CONNECTION, "Upgrade")
+            .unwrap();
+        header
+    }
+
+    struct SwitchTo101Module;
+
+    #[async_trait]
+    impl HttpModule for SwitchTo101Module {
+        async fn response_header_filter(
+            &mut self,
+            resp: &mut ResponseHeader,
+            _end_of_stream: bool,
+        ) -> Result<()> {
+            resp.set_status(http::StatusCode::SWITCHING_PROTOCOLS)?;
+            resp.set_version(Version::HTTP_11);
+            Ok(())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    struct SwitchTo101ModuleBuilder;
+
+    impl HttpModuleBuilder for SwitchTo101ModuleBuilder {
+        fn init(&self) -> pingora_core::modules::http::Module {
+            Box::new(SwitchTo101Module)
+        }
+    }
+
+    struct DoneBytesModule {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl HttpModule for DoneBytesModule {
+        fn response_done_filter(&mut self) -> Result<Option<Bytes>> {
+            self.called.store(true, Ordering::Release);
+            Ok(Some(Bytes::from_static(b"hello")))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    struct DoneBytesModuleBuilder {
+        called: Arc<AtomicBool>,
+    }
+
+    impl HttpModuleBuilder for DoneBytesModuleBuilder {
+        fn init(&self) -> pingora_core::modules::http::Module {
+            Box::new(DoneBytesModule {
+                called: self.called.clone(),
+            })
+        }
+    }
+
+    struct DoneEmptyModule {
+        called: Arc<AtomicBool>,
+    }
+
+    impl HttpModule for DoneEmptyModule {
+        fn response_done_filter(&mut self) -> Result<Option<Bytes>> {
+            self.called.store(true, Ordering::Release);
+            Ok(None)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    struct DoneEmptyModuleBuilder {
+        called: Arc<AtomicBool>,
+    }
+
+    impl HttpModuleBuilder for DoneEmptyModuleBuilder {
+        fn init(&self) -> pingora_core::modules::http::Module {
+            Box::new(DoneEmptyModule {
+                called: self.called.clone(),
+            })
+        }
+    }
+
+    fn assert_raw_upgrade_payload(written: &[u8]) {
+        assert!(
+            written.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+            "unexpected response: {:?}",
+            String::from_utf8_lossy(written)
+        );
+        assert!(
+            written.ends_with(b"\r\n\r\nhello"),
+            "upgrade payload should be written as raw tunneled bytes: {:?}",
+            String::from_utf8_lossy(written)
+        );
+        assert!(
+            !written
+                .windows(b"\r\n5\r\nhello".len())
+                .any(|w| w == b"\r\n5\r\nhello"),
+            "upgrade payload must not be chunk framed: {:?}",
+            String::from_utf8_lossy(written)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_body_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+
+        let err = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(upgrade_response_header()), false),
+                HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            ])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_allows_upgraded_body_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+
+        let response_done = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(upgrade_response_header()), false),
+                HttpTask::UpgradedBody(Some(Bytes::from_static(b"hello")), true),
+            ])
+            .await
+            .unwrap();
+
+        assert!(response_done);
+        let written = written.lock().unwrap().clone();
+        assert_raw_upgrade_payload(&written);
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_upgraded_body_before_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+        session.set_upstream_h1_upgrade_request_status(true);
+
+        let err = session
+            .write_response_tasks(vec![HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                true,
+            )])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_trailer_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+
+        let err = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(upgrade_response_header()), false),
+                HttpTask::Trailer(Some(Box::new(http::HeaderMap::new()))),
+            ])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_runs_done_filter_after_101_as_upgraded_body() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let called = Arc::new(AtomicBool::new(false));
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written.clone(),
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut modules = HttpModules::new();
+        modules.add_module(Box::new(DoneBytesModuleBuilder {
+            called: called.clone(),
+        }));
+
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+
+        let response_done = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(upgrade_response_header()), false),
+                HttpTask::Done,
+            ])
+            .await
+            .unwrap();
+
+        assert!(response_done);
+        assert!(called.load(Ordering::Acquire));
+        let written = written.lock().unwrap().clone();
+        assert_raw_upgrade_payload(&written);
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_allows_empty_done_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let called = Arc::new(AtomicBool::new(false));
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written.clone(),
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut modules = HttpModules::new();
+        modules.add_module(Box::new(DoneEmptyModuleBuilder {
+            called: called.clone(),
+        }));
+
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+
+        let response_done = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(upgrade_response_header()), false),
+                HttpTask::Done,
+            ])
+            .await
+            .unwrap();
+
+        assert!(response_done);
+        assert!(called.load(Ordering::Acquire));
+        let written = written.lock().unwrap().clone();
+        assert!(
+            written.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+            "unexpected response: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+        assert!(
+            written.ends_with(b"\r\n\r\n"),
+            "empty Done filter should only finish the upgraded response: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_module_created_101_with_upgrade_mismatch() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written.clone(),
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut modules = HttpModules::new();
+        modules.add_module(Box::new(SwitchTo101ModuleBuilder));
+
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+        session.h1_upgrade_request_status = H1UpgradeRequestStatus {
+            upstream: Some(false),
+        };
+
+        let err = session
+            .write_response_tasks(vec![
+                HttpTask::Header(
+                    Box::new(ResponseHeader::build(200, Some(0)).unwrap()),
+                    false,
+                ),
+                HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            ])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_module_created_101_before_body() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written.clone(),
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut modules = HttpModules::new();
+        modules.add_module(Box::new(SwitchTo101ModuleBuilder));
+
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+
+        let err = session
+            .write_response_tasks(vec![
+                HttpTask::Header(
+                    Box::new(ResponseHeader::build(200, Some(0)).unwrap()),
+                    false,
+                ),
+                HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            ])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_downstream_proxy_task_rejects_body_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+        session.set_proxy_tasks_enabled(true);
+
+        session
+            .send_downstream_proxy_task(HttpTask::Header(
+                Box::new(upgrade_response_header()),
+                false,
+            ))
+            .await
+            .unwrap();
+        let err = session
+            .send_downstream_proxy_task(HttpTask::Body(Some(Bytes::from_static(b"hello")), true))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_downstream_proxy_task_allows_upgraded_body_after_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+        session.set_proxy_tasks_enabled(true);
+
+        session
+            .send_downstream_proxy_task(HttpTask::Header(
+                Box::new(upgrade_response_header()),
+                false,
+            ))
+            .await
+            .unwrap();
+        session
+            .send_downstream_proxy_task(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                true,
+            ))
+            .await
+            .unwrap();
+
+        let response_done = session.write_downstream_proxy_tasks().await.unwrap();
+
+        assert!(response_done);
+        let written = written.lock().unwrap().clone();
+        assert_raw_upgrade_payload(&written);
+    }
+
+    #[tokio::test]
+    async fn send_downstream_proxy_task_rejects_upgraded_body_before_101() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_upgrade_request_session(written.clone()).await;
+        session.set_upstream_h1_upgrade_request_status(true);
+        session.set_proxy_tasks_enabled(true);
+
+        let err = session
+            .send_downstream_proxy_task(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                true,
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert_eq!(err.esource(), &ErrorSource::Internal);
+        assert!(!session.has_pending_downstream_tasks());
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_downstream_proxy_task_runs_done_filter_after_101_as_upgraded_body() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let called = Arc::new(AtomicBool::new(false));
+        let socket = StaticVirtualSocket::new(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written.clone(),
+        );
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let mut modules = HttpModules::new();
+        modules.add_module(Box::new(DoneBytesModuleBuilder {
+            called: called.clone(),
+        }));
+
+        let mut session = Session::new_h1_with_modules(Box::new(stream), &modules);
+        session.read_request().await.unwrap();
+        session.set_proxy_tasks_enabled(true);
+
+        session
+            .send_downstream_proxy_task(HttpTask::Header(
+                Box::new(upgrade_response_header()),
+                false,
+            ))
+            .await
+            .unwrap();
+        session
+            .send_downstream_proxy_task(HttpTask::Done)
+            .await
+            .unwrap();
+
+        let response_done = session.write_downstream_proxy_tasks().await.unwrap();
+
+        assert!(response_done);
+        assert!(called.load(Ordering::Acquire));
+        let written = written.lock().unwrap().clone();
+        assert_raw_upgrade_payload(&written);
     }
 }

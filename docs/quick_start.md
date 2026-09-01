@@ -80,7 +80,11 @@ impl ProxyHttp for LB {
 
         println!("upstream peer is: {upstream:?}");
 
-        // Set SNI to one.one.one.one
+        // `HttpPeer::new(address, tls, sni)`:
+        // - `true` enables TLS, because the 1.1.1.1 demo backends are served over HTTPS.
+        //   Use `false` for a plain-HTTP upstream (e.g. a local server).
+        // - the SNI `one.one.one.one` must match the upstream's TLS certificate.
+        //   When TLS is disabled the SNI is unused, so pass an empty string instead.
         let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
         Ok(peer)
     }
@@ -162,6 +166,34 @@ upstream peer is: Backend { addr: Inet(1.0.0.1:443), weight: 1 }
 Well done! At this point you have a functional load balancer. It is a _very_ 
 basic load balancer though, so the next section will walk you through how to
 make it more robust with some built-in pingora tooling.
+
+### Adapt it to your needs
+
+The example above is tuned for the 1.1.1.1 demo backends, which are served over
+HTTPS. To point the load balancer at your own upstreams, two things usually need
+to change:
+
+- The backend addresses passed to `LoadBalancer::try_from_iter` in `main()`.
+- How the `HttpPeer` is built in `upstream_peer()`.
+
+For example, to balance across two local plain-HTTP servers on `127.0.0.1:9000`
+and `127.0.0.1:9001`, list them as the upstreams:
+
+```rust
+    let upstreams =
+        LoadBalancer::try_from_iter(["127.0.0.1:9000", "127.0.0.1:9001"]).unwrap();
+```
+
+Then disable TLS when constructing the peer. A plain-HTTP upstream has no
+certificate, so leaving TLS enabled (as in the demo) causes the connection to
+fail with a `502`. Pass `false` for the `tls` argument and an empty SNI:
+
+```rust
+        let peer = Box::new(HttpPeer::new(upstream, false, String::new()));
+```
+
+Finally, the `Host` header set in `upstream_request_filter()` is specific to the
+1.1.1.1 backends. Update or remove it to match what your upstream expects.
 
 ## Add functionality
 

@@ -272,10 +272,7 @@ impl<S> ConnectionPool<S> {
 
     /// Get a connection from this pool under the same group key
     pub fn get(&self, key: &GroupKey) -> Option<S> {
-        let pool_node = match self.pools.get(key) {
-            Some(v) => v.value().clone(),
-            None => return None,
-        };
+        let pool_node = self.pools.get(key)?.value().clone();
 
         if let Some((id, connection)) = pool_node.get_any() {
             self.lru.pop(&id); // the notified is not needed

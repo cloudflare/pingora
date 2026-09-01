@@ -23,9 +23,14 @@ use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use pingora_http::ResponseHeader;
 use reqwest::{StatusCode, Version};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
@@ -157,6 +162,82 @@ async fn test_close_on_response_before_downstream_finish() {
 }
 
 #[tokio::test]
+async fn test_h1_upstream_not_reused_after_request_body_finish_error() {
+    init();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = Arc::clone(&accepted);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let connection_number = server_accepted.fetch_add(1, Ordering::SeqCst);
+
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+
+                if connection_number == 0 {
+                    // Respond before the declared request body is complete. The connection must
+                    // not receive another request after the proxy fails to finish this body.
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let url = "http://127.0.0.1:6147/request-body-finish-error";
+
+    let first = client
+        .post(url)
+        .header("x-port", origin_port.to_string())
+        // The downstream body is valid; the test-only upstream filter deliberately makes its
+        // outbound Content-Length larger in order to exercise defense in depth.
+        .header("x-upstream-content-length", "32")
+        .body("short")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.text().await.unwrap(), "first");
+
+    let second = timeout(
+        Duration::from_secs(2),
+        client
+            .get(url)
+            .header("x-port", origin_port.to_string())
+            .send(),
+    )
+    .await
+    .expect("second request should use a new upstream connection")
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.text().await.unwrap(), "second");
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn test_ws_server_ends_conn() {
     init();
     let _ = *WS_ECHO;
@@ -275,6 +356,819 @@ async fn read_response(
     let (response_header, body) = read_response_header(stream).await;
     let body = read_response_body(stream, body, expected_body_len).await;
     (response_header, body)
+}
+
+async fn capture_upstream_request(
+    request_end: &'static [u8],
+    response: &'static [u8],
+) -> (u16, oneshot::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        while !request.windows(request_end.len()).any(|w| w == request_end) {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        tx.send(request).unwrap();
+        stream.write_all(response).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    (port, rx)
+}
+
+async fn send_raw_request_to_test_proxy(request: String) -> ResponseHeader {
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    timeout(Duration::from_secs(5), read_response_header(&mut stream))
+        .await
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+async fn test_h1_upstream_strips_hop_by_hop_and_connection_nominated_headers() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: keep-alive, X-Private-Hop\r\n",
+            "Keep-Alive: timeout=5\r\n",
+            "Proxy-Connection: keep-alive\r\n",
+            "Proxy-Authenticate: Basic realm=test\r\n",
+            "Proxy-Authorization: Basic dGVzdA==\r\n",
+            "TE: trailers\r\n",
+            "Trailer: X-Trailer\r\n",
+            "X-Private-Hop: secret\r\n",
+            "X-Regular: keep\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\nconnection:"));
+    assert!(!upstream.contains("\r\nkeep-alive:"));
+    assert!(!upstream.contains("\r\nproxy-connection:"));
+    assert!(!upstream.contains("\r\nproxy-authenticate:"));
+    assert!(!upstream.contains("\r\nproxy-authorization:"));
+    assert!(!upstream.contains("\r\nte:"));
+    assert!(!upstream.contains("\r\ntrailer:"));
+    assert!(!upstream.contains("\r\nx-private-hop:"));
+    assert!(upstream.contains("\r\nx-regular: keep\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_rejects_sensitive_fields_nominated_by_connection() {
+    init();
+    for nominated in [
+        "Host",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+        ":authority",
+    ] {
+        let (port, received) =
+            capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+
+        let req = format!(
+            concat!(
+                "GET / HTTP/1.1\r\n",
+                "Host: intended.example\r\n",
+                "X-Port: {port}\r\n",
+                "X-Forwarded-For: 198.51.100.1\r\n",
+                "X-Forwarded-Host: intended.example\r\n",
+                "X-Forwarded-Proto: https\r\n",
+                "Connection: {nominated}\r\n",
+                "\r\n",
+            ),
+            port = port,
+            nominated = nominated,
+        );
+
+        assert_eq!(
+            send_raw_request_to_test_proxy(req).await.status,
+            400,
+            "nominated {nominated}"
+        );
+        let upstream = timeout(Duration::from_secs(1), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            upstream.is_empty(),
+            "a request nominating {nominated} must not be sent upstream"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_h1_upstream_rejects_excessive_connection_nominations() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: X-1, X-2, X-3, X-4, X-5, X-6, X-7, X-8, X-9, X-10\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 400);
+    assert!(received.await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_h1_upstream_preserves_chunked_framing_after_sanitizing_headers() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Transfer-Encoding, X-Private-Hop\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "X-Private-Hop: secret\r\n",
+            "\r\n",
+            "5\r\nhello\r\n0\r\n\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
+    let upstream_lower = upstream.to_ascii_lowercase();
+    assert!(!upstream_lower.contains("\r\nconnection:"));
+    assert!(!upstream_lower.contains("\r\nx-private-hop:"));
+    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
+    assert!(upstream.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_synthesizes_chunked_when_content_length_is_nominated() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Content-Length\r\n",
+            "Content-Length: 5\r\n",
+            "\r\n",
+            "hello",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
+    let upstream_lower = upstream.to_ascii_lowercase();
+    assert!(!upstream_lower.contains("\r\nconnection:"));
+    assert!(!upstream_lower.contains("\r\ncontent-length:"));
+    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
+    assert!(upstream.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_forwards_only_normalized_websocket_upgrade_metadata() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: keep-alive, Upgrade, X-Private-Hop\r\n",
+            "Upgrade: websocket\r\n",
+            "X-Private-Hop: secret\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 101);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nconnection: upgrade\r\n"));
+    assert!(upstream.contains("\r\nupgrade: websocket\r\n"));
+    assert!(!upstream.contains("\r\nx-private-hop:"));
+    assert!(!upstream.contains("keep-alive"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_normalizes_websocket_upgrade_without_connection_token() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Upgrade: websocket\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 101);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nconnection: upgrade\r\n"));
+    assert!(upstream.contains("\r\nupgrade: websocket\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_normalizes_mixed_case_websocket_upgrade() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Upgrade: WebSocket\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 101);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nconnection: upgrade\r\n"));
+    assert!(upstream.contains("\r\nupgrade: websocket\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_does_not_upgrade_http10_websocket_request() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.0\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Upgrade: websocket\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\nconnection: upgrade\r\n"));
+    assert!(!upstream.contains("\r\nupgrade: websocket\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_denies_h2c_upgrade_metadata_by_default() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Upgrade, HTTP2-Settings\r\n",
+            "Upgrade: h2c\r\n",
+            "HTTP2-Settings: AAQAAP__\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\nconnection:"));
+    assert!(!upstream.contains("\r\nupgrade:"));
+    assert!(!upstream.contains("\r\nhttp2-settings:"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_denied_upgrade_does_not_tunnel_unsolicited_101_body() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: h2c\r\n\r\ntunneled",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Upgrade, HTTP2-Settings\r\n",
+            "Upgrade: h2c\r\n",
+            "HTTP2-Settings: AAQAAP__\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let (response, mut downstream_body) =
+        timeout(Duration::from_secs(5), read_response_header(&mut stream))
+            .await
+            .unwrap();
+    assert_eq!(response.status, 502);
+
+    if downstream_body.is_empty() {
+        let mut buf = [0; 32];
+        if let Ok(Ok(n)) = timeout(Duration::from_millis(200), stream.read(&mut buf)).await {
+            downstream_body.extend_from_slice(&buf[..n]);
+        }
+    }
+    assert!(
+        downstream_body.is_empty(),
+        "a denied upgrade must not switch to tunneled body forwarding"
+    );
+
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\nupgrade:"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_accepts_101_when_neither_side_requested_upgrade() {
+    init();
+    let (port, _received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 101 Switching Protocols\r\n\r\n").await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 101);
+}
+
+#[tokio::test]
+async fn test_h1_upstream_rejects_101_when_filter_adds_upgrade_without_downstream_upgrade() {
+    init();
+    let (port, _received) = capture_upstream_request(
+        b"\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Upstream-Add-Upgrade: true\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 502);
+}
+
+#[tokio::test]
+async fn test_h1_upstream_normalizes_transfer_coding_to_chunked_when_sanitizing() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Transfer-Encoding\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "\r\n",
+            "5\r\ncoded\r\n0\r\n\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
+    let upstream_lower = upstream.to_ascii_lowercase();
+    assert!(!upstream_lower.contains("\r\nconnection:"));
+    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
+    assert!(!upstream_lower.contains("\r\ntransfer-encoding: gzip, chunked\r\n"));
+    assert!(upstream.ends_with("\r\n\r\n5\r\ncoded\r\n0\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_synthesizes_chunked_after_filter_removes_framing() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Upstream-Strip-Framing: true\r\n",
+            "Content-Length: 5\r\n",
+            "\r\n",
+            "hello",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
+    let upstream_lower = upstream.to_ascii_lowercase();
+    assert!(!upstream_lower.contains("\r\ncontent-length:"));
+    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
+    assert!(upstream.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_does_not_synthesize_framing_for_empty_body() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "Connection: Content-Length\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\ncontent-length:"));
+    assert!(!upstream.contains("\r\ntransfer-encoding:"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_does_not_synthesize_framing_without_downstream_body_headers() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\ncontent-length:"));
+    assert!(!upstream.contains("\r\ntransfer-encoding:"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_finishes_chunked_body_when_filter_discards_body() {
+    init();
+    let (port, received) = capture_upstream_request(
+        b"0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+
+    let req = format!(
+        concat!(
+            "POST / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Upstream-Strip-Framing: true\r\n",
+            "X-Upstream-Discard-Body: true\r\n",
+            "Content-Length: 5\r\n",
+            "\r\n",
+            "hello",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
+    let upstream_lower = upstream.to_ascii_lowercase();
+    assert!(!upstream_lower.contains("\r\ncontent-length:"));
+    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
+    assert!(
+        upstream.ends_with("\r\n\r\n0\r\n\r\n"),
+        "upstream request: {upstream:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_h1_upstream_can_retain_connection_nominated_fields_separately() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Preserve-Connection-Nominated: true\r\n",
+            "Connection: X-Private-Hop\r\n",
+            "X-Private-Hop: retained\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!upstream.contains("\r\nconnection:"));
+    assert!(upstream.contains("\r\nx-private-hop: retained\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_does_not_validate_nominations_when_removal_disabled() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: intended.example\r\n",
+            "X-Port: {port}\r\n",
+            "X-Preserve-Connection-Nominated: true\r\n",
+            "Connection: Host\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nhost: intended.example\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_always_sends_http11_request_version() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.0\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    assert!(String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .starts_with("GET / HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_legacy_preset_preserves_upgrade_and_nominated_fields() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Preserve-Upstream-Request-Headers: true\r\n",
+            "Connection: Upgrade, HTTP2-Settings, X-Private-Hop\r\n",
+            "Upgrade: h2c\r\n",
+            "HTTP2-Settings: AAQAAP__\r\n",
+            "X-Private-Hop: retained\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nconnection: upgrade, http2-settings, x-private-hop\r\n"));
+    assert!(upstream.contains("\r\nupgrade: h2c\r\n"));
+    assert!(upstream.contains("\r\nhttp2-settings: aaqaap__\r\n"));
+    assert!(upstream.contains("\r\nx-private-hop: retained\r\n"));
+}
+
+#[tokio::test]
+async fn test_h1_upstream_preserve_upgrade_retains_complete_handshake_metadata() {
+    init();
+    let (port, received) =
+        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await;
+
+    let req = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-Preserve-Upstream-Upgrade: true\r\n",
+            "Connection: Upgrade, HTTP2-Settings, X-Upgrade-Param\r\n",
+            "Upgrade: h2c\r\n",
+            "HTTP2-Settings: AAQAAP__\r\n",
+            "X-Upgrade-Param: retained\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+
+    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
+    let upstream = String::from_utf8(received.await.unwrap())
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(upstream.contains("\r\nconnection: upgrade, http2-settings, x-upgrade-param\r\n"));
+    assert!(upstream.contains("\r\nupgrade: h2c\r\n"));
+    assert!(upstream.contains("\r\nhttp2-settings: aaqaap__\r\n"));
+    assert!(upstream.contains("\r\nx-upgrade-param: retained\r\n"));
+}
+
+#[tokio::test]
+async fn test_h2_upstream_strips_connection_nominated_fields() {
+    init();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+        tx.send(request.headers().clone()).unwrap();
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        respond.send_response(response, true).unwrap();
+        let _ = timeout(Duration::from_millis(100), connection.accept()).await;
+    });
+
+    let request = format!(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-H2: true\r\n",
+            "Connection: X-Private-Hop\r\n",
+            "X-Private-Hop: secret\r\n",
+            "\r\n",
+        ),
+        port = port,
+    );
+    assert_eq!(send_raw_request_to_test_proxy(request).await.status, 200);
+
+    let headers = rx.await.unwrap();
+    assert!(headers.get("connection").is_none());
+    assert!(headers.get("x-private-hop").is_none());
+}
+
+#[tokio::test]
+async fn test_h2_upstream_rejects_sensitive_fields_nominated_by_connection() {
+    init();
+    for nominated in ["Host", "X-Forwarded-For", ":authority"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(tcp).await.unwrap();
+            let received_request =
+                match timeout(Duration::from_millis(200), connection.accept()).await {
+                    Ok(Some(Ok((_request, mut respond)))) => {
+                        let response = http::Response::builder().status(200).body(()).unwrap();
+                        respond.send_response(response, true).unwrap();
+                        true
+                    }
+                    _ => false,
+                };
+            tx.send(received_request).unwrap();
+        });
+
+        let request = format!(
+            concat!(
+                "GET / HTTP/1.1\r\n",
+                "Host: intended.example\r\n",
+                "X-Port: {port}\r\n",
+                "X-H2: true\r\n",
+                "X-Forwarded-For: 198.51.100.1\r\n",
+                "Connection: {nominated}\r\n",
+                "\r\n",
+            ),
+            port = port,
+            nominated = nominated,
+        );
+        assert_eq!(
+            send_raw_request_to_test_proxy(request).await.status,
+            400,
+            "nominated {nominated}"
+        );
+        assert!(
+            !rx.await.unwrap(),
+            "request nominating {nominated} must not be sent upstream"
+        );
+    }
 }
 
 #[tokio::test]
@@ -657,6 +1551,58 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         assert!(cache_expired_epoch > cache_hit_epoch);
+    }
+
+    #[tokio::test]
+    async fn test_deferred_cache_admission_fetches_from_upstream() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_deferred_cache_admission/now";
+        let client = reqwest::Client::new();
+
+        for _ in 0..2 {
+            let res = client
+                .get(url)
+                .header("x-defer-cache-admission", "true")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["x-cache-status"], "deferred");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        }
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        let cache_miss_epoch = res.headers()["x-epoch"].to_str().unwrap().to_owned();
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "hit");
+        assert_eq!(res.headers()["x-epoch"], cache_miss_epoch);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_cache_miss_finish_error_does_not_break_response() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_miss_finish_error/now";
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(url)
+            .header("x-cache-fail-finish", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = client.get(url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
     #[tokio::test]
@@ -1802,6 +2748,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1816,6 +2763,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1834,6 +2782,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -1863,6 +2812,10 @@ mod test_cache {
         let res = reqwest::Client::new()
             .get(url)
             .header("x-no-stale-revalidate", "true")
+            .header(
+                "x-set-cache-control",
+                "public, max-age=1, stale-while-revalidate=0",
+            )
             .send()
             .await
             .unwrap();
@@ -1878,6 +2831,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1893,6 +2850,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -1906,6 +2867,10 @@ mod test_cache {
                 .get(url)
                 .header("x-lock", "true")
                 .header("x-no-stale-revalidate", "true")
+                .header(
+                    "x-set-cache-control",
+                    "public, max-age=60, stale-while-revalidate=0",
+                )
                 .send()
                 .await
                 .unwrap();
@@ -2133,6 +3098,105 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_lock_retry_respects_force_fresh() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_retry_respects_force_fresh.txt";
+        let cache_control = "public, max-age=0, stale-while-revalidate=0";
+
+        let writer = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "0.2")
+                .header("x-set-cache-control", cache_control)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0.2")
+            .header("x-set-cache-control", cache_control)
+            .header("x-force-fresh", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert!(headers.get("x-cache-lock-time-ms").is_some());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cache_lock_retry_respects_force_miss() {
+        init();
+        let url = "http://127.0.0.1:6148/sleep/test_cache_lock_retry_respects_force_miss.txt";
+        let cache_control = "public, max-age=60";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0")
+            .header("x-set-cache-control", cache_control)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let writer = tokio::spawn(async move {
+            let res = reqwest::Client::new()
+                .get(url)
+                .header("x-lock", "true")
+                .header("x-set-sleep", "0.2")
+                .header("x-set-cache-control", cache_control)
+                .header("x-force-miss", "1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let headers = res.headers();
+            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(headers["x-upstream-status"], "200");
+            assert_eq!(res.text().await.unwrap(), "hello world");
+        });
+
+        sleep(Duration::from_millis(50)).await;
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-lock", "true")
+            .header("x-set-sleep", "0.2")
+            .header("x-set-cache-control", cache_control)
+            .header("x-force-miss", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert!(headers.get("x-cache-lock-time-ms").is_some());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_cache_serve_stale_network_error() {
         init();
         let url = "http://127.0.0.1:6148/sleep/test_cache_serve_stale_network_error.txt";
@@ -2340,6 +3404,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2356,6 +3421,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2382,6 +3448,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2800,6 +3867,7 @@ mod test_cache {
             let res = reqwest::Client::new()
                 .get(url)
                 .header("x-lock", "true")
+                .header("x-set-cache-control", "public, max-age=60")
                 .send()
                 .await
                 .unwrap();
@@ -2814,6 +3882,7 @@ mod test_cache {
         let res = reqwest::Client::new()
             .get(url)
             .header("x-lock", "true")
+            .header("x-set-cache-control", "public, max-age=60")
             .send()
             .await
             .unwrap();
@@ -3533,6 +4602,43 @@ mod test_cache {
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    /// A predictor bypass that had nothing to do with size must not be treated as one.
+    ///
+    /// `/test3` is chunked, so the cache cannot confirm the body size from the response
+    /// header. That used to be enough to report `PredictedResponseTooLarge` and burn a
+    /// bypass on every recovery, no matter why the key was bypassed in the first place.
+    #[tokio::test]
+    async fn test_cache_max_file_size_chunked_non_size_bypass() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_non_size_bypass_chunked/test3";
+
+        // origin says private, so the key is remembered as uncacheable for OriginNotCache
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-cache-max-file-size-bytes", "1000")
+            .header("x-set-cache-control", "private, max-age=0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "no-cache");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        // same key, now cacheable. The bypass was never about size, so this request fills
+        // the cache rather than spending itself confirming the body fits.
+        let res = send_max_file_size_req(url, 1000, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = send_max_file_size_req(url, 1000, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["x-cache-status"], "hit");
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 

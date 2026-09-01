@@ -2,11 +2,15 @@
 # aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
 # dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
 # our usage because this is TLS client use only and does not parse CRLs.
-# Remove once the upstream aws-s3-transfer-manager-rs fix ships.
+# Remove once Pingora migrates to the Dial9 release line that removed
+# aws-sdk-s3-transfer-manager.
 
 [advisories]
 ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    # h2 0.3.27 is pulled in only by the optional worker-s3 dependency chain.
+    # The feature is disabled by default, but users who enable it remain affected.
+    "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
 ]

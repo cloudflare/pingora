@@ -19,6 +19,7 @@ use crate::protocols::IO;
 use pingora_error::ErrorType::TLSHandshakeFailure;
 use pingora_error::{Error, Result};
 use pingora_s2n::TlsConnector;
+use std::time::Instant;
 
 // Perform the TLS handshake for the given connection with the given configuration
 pub async fn handshake<S: IO>(
@@ -30,6 +31,7 @@ pub async fn handshake<S: IO>(
     // s2n-tls doesn't invoke flush after writing to the connection. This would result in
     // the handshake hanging and timing on streams with write buffering.
     let auto_flushable_stream = AutoFlushableStream::new(stream, true);
+    let handshake_start = Instant::now();
     let mut s2n_stream = connector
         .connect(domain, auto_flushable_stream)
         .await
@@ -39,6 +41,7 @@ pub async fn handshake<S: IO>(
         })?;
 
     // Disable auto-flush to not interfere with write buffering going forward.
+    let handshake_duration = handshake_start.elapsed();
     s2n_stream.get_mut().set_auto_flush(false);
-    Ok(TlsStream::from_s2n_stream(s2n_stream))
+    Ok(TlsStream::from_s2n_stream(s2n_stream, handshake_duration))
 }

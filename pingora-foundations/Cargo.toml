@@ -1,0 +1,46 @@
+[package]
+name = "pingora-foundations"
+version = "0.8.0"
+authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.88"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["async", "telemetry", "logging", "pingora"]
+description = """
+Foundations telemetry integration for pingora services.
+"""
+
+[lib]
+name = "pingora_foundations"
+path = "src/lib.rs"
+
+[dependencies]
+pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false, optional = true }
+# Adopt Foundations minor releases deliberately because they may raise the effective MSRV.
+foundations = { version = "~5.6.5", default-features = false }
+async-trait = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+parking_lot = { version = "0.12", optional = true }
+sentry = { version = "0.36", default-features = false, optional = true }
+slog = { version = "2", optional = true }
+slog-stdlog = { version = "4", optional = true }
+slog-scope = { version = "4", optional = true }
+
+[features]
+default = ["service", "telemetry-server"]
+logging = ["foundations/logging", "dep:slog", "dep:slog-stdlog", "dep:slog-scope"]
+memory-profiling = ["foundations/memory-profiling", "telemetry-server"]
+metrics = ["foundations/metrics"]
+sentry = ["foundations/sentry", "dep:sentry", "pingora-core?/sentry"]
+service = ["dep:async-trait", "dep:log", "dep:parking_lot", "dep:pingora-core"]
+tracing = ["foundations/tracing"]
+telemetry-server = ["foundations/telemetry-server", "metrics"]
+full = ["logging", "memory-profiling", "sentry", "service", "tracing", "telemetry-server"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

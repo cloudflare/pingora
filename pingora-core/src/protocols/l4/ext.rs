@@ -21,13 +21,14 @@ use libc::socklen_t;
 #[cfg(target_os = "linux")]
 use libc::{c_int, c_ulonglong, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use socket2::Socket;
 use std::io::{self, ErrorKind};
 use std::mem;
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, RawSocket};
+use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -473,6 +474,120 @@ pub fn get_original_dest(_sock: RawSocket) -> Result<Option<SocketAddr>> {
     Ok(None)
 }
 
+/// The underlying error (if any) and local address from a failed connection attempt.
+#[derive(Debug)]
+pub(crate) struct ConnectErrorDetails {
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    local_addr: Option<SocketAddr>,
+}
+
+impl ConnectErrorDetails {
+    pub(crate) fn new<E>(source: E, local_addr: Option<SocketAddr>) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self {
+            source: Some(source.into()),
+            local_addr,
+        }
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+}
+
+impl std::fmt::Display for ConnectErrorDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => source.fmt(f),
+            // No wrapped error (e.g. a TLS handshake failure, whose detail stays in the parent's
+            // context): surface the local address so the chain still carries useful information.
+            None => match self.local_addr {
+                Some(local_addr) => write!(f, "local address {local_addr}"),
+                None => Ok(()),
+            },
+        }
+    }
+}
+
+impl std::error::Error for ConnectErrorDetails {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Internal helper backing [`crate::connectors::l4::ConnectErrorExt::connect_local_addr`].
+pub(crate) fn connect_error_local_addr(error: &Error) -> Option<SocketAddr> {
+    error
+        .root_cause()
+        .downcast_ref::<ConnectErrorDetails>()
+        .and_then(ConnectErrorDetails::local_addr)
+}
+
+/// Attaches the local address to an error from a stage after the socket connected (e.g. a TLS
+/// handshake failure) so it stays recoverable via
+/// [`crate::connectors::l4::ConnectErrorExt::connect_local_addr`]. Returns `e` unchanged when
+/// `local_addr` is `None`.
+pub(crate) fn attach_connect_local_addr(
+    mut e: Box<Error>,
+    local_addr: Option<SocketAddr>,
+) -> Box<Error> {
+    if let Some(local_addr) = local_addr {
+        // Wrap any existing cause and take over as the root cause; the error's own type, retry
+        // semantics, and context are left in place.
+        e.cause = Some(Box::new(ConnectErrorDetails {
+            source: e.cause.take(),
+            local_addr: Some(local_addr),
+        }));
+    }
+    e
+}
+
+/// State retained across a connection timeout to preserve the assigned local address.
+#[derive(Default)]
+pub(crate) struct ConnectAttempt {
+    local_addr: Option<SocketAddr>,
+}
+
+impl ConnectAttempt {
+    fn clear(&mut self) {
+        self.local_addr = None;
+    }
+
+    fn record_local_addr(&mut self, socket: &Socket) {
+        self.local_addr = socket.local_addr().ok().and_then(|addr| addr.as_socket());
+    }
+
+    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+}
+
+#[cfg(unix)]
+fn into_socket2(socket: TcpSocket) -> Socket {
+    // SAFETY: `into_raw_fd()` transfers sole ownership of the descriptor to `Socket`.
+    unsafe { Socket::from_raw_fd(socket.into_raw_fd()) }
+}
+
+#[cfg(windows)]
+fn into_socket2(socket: TcpSocket) -> Socket {
+    // SAFETY: `into_raw_socket()` transfers sole ownership of the socket to `Socket`.
+    unsafe { Socket::from_raw_socket(socket.into_raw_socket()) }
+}
+
+#[cfg(unix)]
+fn connect_in_progress(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::EINPROGRESS)
+}
+
+#[cfg(windows)]
+fn connect_in_progress(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock
+}
+
 /// connect() to the given address while optionally binding to the specific source address and port range.
 ///
 /// The `set_socket` callback can be used to tune the socket before `connect()` is called.
@@ -487,22 +602,36 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
     bind_to: Option<&BindTo>,
     set_socket: F,
 ) -> Result<TcpStream> {
+    let mut attempt = ConnectAttempt::default();
+    connect_with_attempt(addr, bind_to, set_socket, &mut attempt).await
+}
+
+/// Connects like [`connect_with`] while recording the assigned local address in `attempt`.
+///
+/// The caller can inspect [`ConnectAttempt::local_addr`] after this future is cancelled by an
+/// external timeout.
+pub(crate) async fn connect_with_attempt<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
+    addr: &SocketAddr,
+    bind_to: Option<&BindTo>,
+    set_socket: F,
+    attempt: &mut ConnectAttempt,
+) -> Result<TcpStream> {
     if bind_to.as_ref().is_some_and(|b| b.will_fallback()) {
         // if we see an EADDRNOTAVAIL error clear the port range and try again
-        let connect_result = inner_connect_with(addr, bind_to, set_socket.clone()).await;
+        let connect_result = inner_connect_with(addr, bind_to, set_socket.clone(), attempt).await;
         if let Err(e) = connect_result.as_ref() {
             if matches!(e.etype(), BindError) {
                 let mut new_bind_to = BindTo::default();
                 new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
                 // reset the port range
                 new_bind_to.set_port_range(None).unwrap();
-                return inner_connect_with(addr, Some(&new_bind_to), set_socket).await;
+                return inner_connect_with(addr, Some(&new_bind_to), set_socket, attempt).await;
             }
         }
         connect_result
     } else {
         // not retryable
-        inner_connect_with(addr, bind_to, set_socket).await
+        inner_connect_with(addr, bind_to, set_socket, attempt).await
     }
 }
 
@@ -510,7 +639,9 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     addr: &SocketAddr,
     bind_to: Option<&BindTo>,
     set_socket: F,
+    attempt: &mut ConnectAttempt,
 ) -> Result<TcpStream> {
+    attempt.clear();
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -551,10 +682,39 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
 
     set_socket(&socket)?;
 
-    socket
-        .connect(*addr)
+    let socket = into_socket2(socket);
+    if let Err(error) = socket.connect(&(*addr).into()) {
+        attempt.record_local_addr(&socket);
+        if !connect_in_progress(&error) {
+            return Err(wrap_os_connect_error(
+                error,
+                format!("Fail to connect to {}", *addr),
+                attempt.local_addr(),
+            ));
+        }
+    } else {
+        attempt.record_local_addr(&socket);
+    }
+
+    let stream = TcpStream::from_std(socket.into())
+        .or_err(SocketError, "failed to register connecting socket")?;
+    stream
+        .writable()
         .await
-        .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", *addr)))
+        .or_err(ConnectError, "failed to wait for connecting socket")?;
+
+    if let Some(error) = stream
+        .take_error()
+        .or_err(SocketError, "failed to get connecting socket error")?
+    {
+        return Err(wrap_os_connect_error(
+            error,
+            format!("Fail to connect to {}", *addr),
+            attempt.local_addr(),
+        ));
+    }
+
+    Ok(stream)
 }
 
 /// connect() to the given address while optionally binding to the specific source address.
@@ -568,25 +728,33 @@ pub async fn connect(addr: &SocketAddr, bind_to: Option<&BindTo>) -> Result<TcpS
 /// connect() to the given Unix domain socket
 #[cfg(unix)]
 pub async fn connect_uds(path: &std::path::Path) -> Result<UnixStream> {
-    UnixStream::connect(path)
-        .await
-        .map_err(|e| wrap_os_connect_error(e, format!("Fail to connect to {}", path.display())))
+    UnixStream::connect(path).await.map_err(|e| {
+        wrap_os_connect_error(e, format!("Fail to connect to {}", path.display()), None)
+    })
 }
 
-fn wrap_os_connect_error(e: std::io::Error, context: String) -> Box<Error> {
-    match e.kind() {
-        ErrorKind::ConnectionRefused => Error::because(ConnectRefused, context, e),
-        ErrorKind::TimedOut => Error::because(ConnectTimedout, context, e),
-        ErrorKind::AddrNotAvailable => Error::because(BindError, context, e),
-        ErrorKind::PermissionDenied | ErrorKind::AddrInUse => {
-            Error::because(InternalError, context, e)
-        }
+fn wrap_os_connect_error(
+    e: std::io::Error,
+    context: String,
+    local_addr: Option<SocketAddr>,
+) -> Box<Error> {
+    let etype = match e.kind() {
+        ErrorKind::ConnectionRefused => ConnectRefused,
+        ErrorKind::TimedOut => ConnectTimedout,
+        ErrorKind::AddrNotAvailable => BindError,
+        ErrorKind::PermissionDenied | ErrorKind::AddrInUse => InternalError,
         _ => match e.raw_os_error() {
-            Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => {
-                Error::because(ConnectNoRoute, context, e)
-            }
-            _ => Error::because(ConnectError, context, e),
+            Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => ConnectNoRoute,
+            _ => ConnectError,
         },
+    };
+    match local_addr {
+        Some(local_addr) => Error::because(
+            etype,
+            context,
+            ConnectErrorDetails::new(e, Some(local_addr)),
+        ),
+        None => Error::because(etype, context, e),
     }
 }
 
@@ -651,6 +819,22 @@ mod test {
             // kernel doubles whatever is set
             assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
         }
+    }
+
+    #[tokio::test]
+    async fn test_failed_connect_records_local_addr() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote_addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let mut bind_to = BindTo::default();
+        bind_to.addr = Some("127.0.0.1:0".parse().unwrap());
+        let error = connect(&remote_addr, Some(&bind_to)).await.unwrap_err();
+        let local_addr =
+            connect_error_local_addr(&error).expect("local address should be captured");
+
+        assert_eq!(local_addr.ip(), bind_to.addr.unwrap().ip());
+        assert_ne!(local_addr.port(), 0);
     }
 
     #[cfg(target_os = "linux")]

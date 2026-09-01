@@ -20,7 +20,7 @@ use nix::sys::socket::{self, AddressFamily, Backlog, RecvMsg, SockFlag, SockType
 #[cfg(target_os = "linux")]
 use nix::sys::stat;
 use nix::{Error, NixPath};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
@@ -86,6 +86,29 @@ impl Fds {
         let keys = deserialize_vec_string(&de_buf[..bytes])?;
         self.deserialize(keys, fds);
         Ok(())
+    }
+
+    /// Close and remove inherited listening fds whose bind addresses are absent from `keep`.
+    ///
+    /// An unclaimed `SO_REUSEPORT` socket remains active without an acceptor and can black-hole
+    /// connections. Removing it also prevents it from being transferred to the next process.
+    /// Returns the addresses removed from the table.
+    #[cfg(unix)]
+    pub fn close_unclaimed(&mut self, keep: &HashSet<String>) -> Vec<String> {
+        let mut closed = Vec::new();
+        self.map.retain(|bind, fd| {
+            if keep.contains(bind) {
+                return true;
+            }
+            if let Err(e) = nix::unistd::close(*fd) {
+                log::warn!(
+                    "Failed to close orphaned inherited listening socket fd {fd} ({bind}): {e}"
+                );
+            }
+            closed.push(bind.clone());
+            false
+        });
+        closed
     }
 }
 
@@ -540,6 +563,58 @@ mod tests {
             elapsed.as_secs() < 4,
             "Expected less than 4 seconds, got {:?}",
             elapsed
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod close_unclaimed_tests {
+    use super::Fds;
+    use std::collections::HashSet;
+
+    #[test]
+    fn closes_only_unclaimed_fds() {
+        let keep_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        let drop_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(keep_fd >= 0 && drop_fd >= 0);
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:80".to_string(), keep_fd);
+        fds.add("127.0.0.1:9090".to_string(), drop_fd);
+
+        let keep: HashSet<String> = ["127.0.0.1:80".to_string()].into_iter().collect();
+        let closed = fds.close_unclaimed(&keep);
+
+        assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
+        assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
+        assert!(fds.get("127.0.0.1:9090").is_none());
+
+        assert_eq!(unsafe { libc::fcntl(drop_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_ne!(unsafe { libc::fcntl(keep_fd, libc::F_GETFD) }, -1);
+
+        unsafe { libc::close(keep_fd) };
+    }
+
+    #[test]
+    fn empty_keep_set_closes_everything() {
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:9090".to_string(), fd);
+
+        let closed = fds.close_unclaimed(&HashSet::new());
+
+        assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
+        assert!(fds.is_empty());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
         );
     }
 }
