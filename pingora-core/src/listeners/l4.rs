@@ -455,12 +455,7 @@ impl ListenerEndpoint {
         self.listen_addr.as_ref()
     }
 
-    /// Return the local address this endpoint is bound to.
-    ///
-    /// Useful when the listener was bound to port 0 (OS-assigned) to
-    /// discover the actual port.
-    #[cfg(test)]
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn local_addr(&self) -> std::io::Result<crate::protocols::l4::socket::SocketAddr> {
         self.listener.local_addr()
     }
 
@@ -558,7 +553,7 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
-        let addr = listener.local_addr().unwrap();
+        let addr = *listener.local_addr().unwrap().as_inet().unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -586,7 +581,7 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
-        let port = listener.local_addr().unwrap().port();
+        let port = listener.local_addr().unwrap().as_inet().unwrap().port();
 
         tokio::spawn(async move {
             // just try to accept twice
@@ -611,6 +606,15 @@ mod test {
         builder.listen_addr(ServerAddress::Uds(addr.into(), None));
 
         let listener = builder.listen(None).await.unwrap();
+        assert_eq!(
+            listener
+                .local_addr()
+                .unwrap()
+                .as_unix()
+                .unwrap()
+                .as_pathname(),
+            Some(std::path::Path::new(addr))
+        );
 
         tokio::spawn(async move {
             // just try to accept once

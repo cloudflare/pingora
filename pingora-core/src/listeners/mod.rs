@@ -316,6 +316,10 @@ impl TransportStack {
         self.l4.as_str()
     }
 
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.l4.local_addr()
+    }
+
     pub async fn accept(&self) -> Result<UninitializedStream> {
         let stream = self.l4.accept().await?;
         Ok(UninitializedStream {
@@ -592,7 +596,7 @@ mod test {
         assert_eq!(listeners.len(), 2);
         let addrs: Vec<_> = listeners
             .iter()
-            .map(|s| s.l4.local_addr().unwrap())
+            .map(|s| *s.local_addr().unwrap().as_inet().unwrap())
             .collect();
         for listener in listeners {
             tokio::spawn(async move {
@@ -897,8 +901,18 @@ mod test {
         let second_key = second.fd_transfer_keys().remove(0);
         let first_endpoints = first.build(Some(fds.clone())).await.unwrap();
         let second_endpoints = second.build(Some(fds.clone())).await.unwrap();
-        let first_addr = first_endpoints[0].l4.local_addr().unwrap();
-        let second_addr = second_endpoints[0].l4.local_addr().unwrap();
+        let first_addr = *first_endpoints[0]
+            .l4
+            .local_addr()
+            .unwrap()
+            .as_inet()
+            .unwrap();
+        let second_addr = *second_endpoints[0]
+            .l4
+            .local_addr()
+            .unwrap()
+            .as_inet()
+            .unwrap();
         assert_ne!(first_addr, second_addr);
         assert_tags(
             first_endpoints[0].clone(),
@@ -930,8 +944,14 @@ mod test {
             .unwrap();
         let first_after = first_after.pop().unwrap();
         let second_after = second_after.pop().unwrap();
-        assert_eq!(first_after.l4.local_addr().unwrap(), first_addr);
-        assert_eq!(second_after.l4.local_addr().unwrap(), second_addr);
+        assert_eq!(
+            first_after.l4.local_addr().unwrap().as_inet(),
+            Some(&first_addr)
+        );
+        assert_eq!(
+            second_after.l4.local_addr().unwrap().as_inet(),
+            Some(&second_addr)
+        );
         assert_tags(first_after, first_addr, second_after, second_addr).await;
     }
 

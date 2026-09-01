@@ -25,6 +25,7 @@ use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
     ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
 };
+use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::Stream;
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -39,9 +40,13 @@ use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// Override the runtime options used to run a listening service.
 pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
+
+/// A receiver for the addresses of a service's bound listeners.
+pub type BoundAddressWatch = watch::Receiver<Option<Vec<SocketAddr>>>;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -51,6 +56,7 @@ pub struct Service<A> {
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
+    bound_addresses: watch::Sender<Option<Vec<SocketAddr>>>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -64,6 +70,7 @@ impl<A> Service<A> {
             app_logic: Some(app_logic),
             threads: None,
             runtime_opts_override: None,
+            bound_addresses: watch::channel(None).0,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -78,6 +85,7 @@ impl<A> Service<A> {
             app_logic: Some(app_logic),
             threads: None,
             runtime_opts_override: None,
+            bound_addresses: watch::channel(None).0,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -127,6 +135,17 @@ impl<A> Service<A> {
     /// Get the [`Listeners`], mostly to add more endpoints.
     pub fn endpoints(&mut self) -> &mut Listeners {
         &mut self.listeners
+    }
+
+    /// Subscribe to the addresses after all of this service's listeners bind.
+    ///
+    /// The addresses are published once, in endpoint insertion order, before
+    /// accept loops start. The watch closes without a value if startup fails.
+    ///
+    /// During graceful upgrade, a TCP port-0 endpoint with a stable
+    /// [`ListenerConfig::fd_transfer_id`] retains its assigned port.
+    pub fn watch_bound_addresses(&self) -> BoundAddressWatch {
+        self.bound_addresses.subscribe()
     }
 
     // the follow add* function has no effect if the server is already started
@@ -291,6 +310,13 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             )
             .await
             .expect("Failed to build listeners");
+
+        let bound_addresses = endpoints
+            .iter()
+            .map(TransportStack::local_addr)
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("Failed to get bound listener addresses");
+        self.bound_addresses.send_replace(Some(bound_addresses));
 
         let app_logic = self
             .app_logic
