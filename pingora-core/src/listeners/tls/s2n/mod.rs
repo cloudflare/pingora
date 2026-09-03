@@ -232,8 +232,10 @@ impl Acceptor {
                 acceptor: self.acceptor.clone(),
                 offload: None,
             };
-            let rt = offload.get_runtime(stream.id() as u64);
-            rt.spawn(async move { handshake(&acceptor, stream).await })
+            offload
+                .spawn_abort_on_drop(stream.id() as u64, async move {
+                    handshake(&acceptor, stream).await
+                })
                 .await
                 .or_err(InternalError, "TLS offload runtime failure")?
         } else {
