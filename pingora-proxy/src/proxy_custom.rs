@@ -362,11 +362,6 @@ where
         Ok(Some(response_done))
     }
 
-    // TODO: pre-existing inconsistency with proxy_h1/proxy_h2 to address in a follow-up:
-    // upstream task rx.recv() branch is missing
-    // downstream_state.maybe_finished(session.is_body_done()) after processing. proxy_h1 has
-    // this because upgrade responses can force the body done — since custom upstreams can
-    // serve H1 downstreams that support upgrades, the same may be needed here.
     // Returns whether server (downstream) session can be reused
     #[allow(clippy::too_many_arguments)]
     async fn custom_bidirection_down_to_up(
@@ -433,7 +428,12 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
+                // Unlike the H1 relay, custom upstream request and response directions can
+                // complete independently. Re-polling a completed upgraded request treats its
+                // downstream half-close as premature while the response may still be draining.
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
+                    if downstream_state.can_poll()
+                        && !(upgraded && downstream_state.is_done()) => {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
@@ -498,6 +498,7 @@ where
                             continue;
                         };
                         response_state.maybe_set_upstream_done(response_done);
+                        downstream_state.maybe_finished(session.is_body_done());
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -527,6 +528,7 @@ where
                             downstream_state.reset();
                         }
                         response_state.maybe_set_upstream_done(response_done);
+                        downstream_state.maybe_finished(session.is_body_done());
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -1190,13 +1192,53 @@ mod tests {
         predictor::{CacheablePredictor, Predictor},
         CacheKey, MemCache,
     };
-    use std::sync::{Arc, LazyLock};
-    use tokio::io::AsyncWriteExt;
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, LazyLock,
+        },
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
     static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
 
     struct TestProxy;
+
+    struct TestBodyWriter {
+        cleanup_called: Arc<AtomicBool>,
+        finish_notify: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    struct CompletedResponse {
+        result: Result<bool>,
+        response: Vec<u8>,
+        cleanup_called: bool,
+        downstream_complete: bool,
+    }
+
+    #[async_trait]
+    impl BodyWrite for TestBodyWriter {
+        async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()> {
+            *data = Bytes::new();
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            if let Some(notify) = self.finish_notify.as_ref() {
+                notify.notify_one();
+            }
+            Ok(())
+        }
+
+        async fn cleanup(&mut self) -> Result<()> {
+            self.cleanup_called.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn upgrade_body_writer(&mut self) {}
+    }
 
     #[async_trait]
     impl ProxyHttp for TestProxy {
@@ -1209,7 +1251,7 @@ mod tests {
             _session: &mut Session,
             _ctx: &mut Self::CTX,
         ) -> Result<Box<HttpPeer>> {
-            unreachable!("test calls custom_response_filter directly")
+            unreachable!("test does not select an upstream peer")
         }
     }
 
@@ -1250,6 +1292,298 @@ mod tests {
             )
             .await
             .expect("response task should pass filters");
+    }
+
+    async fn run_completed_response(upgraded: bool) -> CompletedResponse {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let request: &[u8] = if upgraded {
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        } else {
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        };
+        client
+            .write_all(request)
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session.set_upstream_h1_upgrade_request_status(upgraded);
+
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let mut client_body: Box<dyn BodyWrite> = Box::new(TestBodyWriter {
+            cleanup_called: cleanup_called.clone(),
+            finish_notify: None,
+        });
+
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let status = if upgraded {
+            http::StatusCode::SWITCHING_PROTOCOLS
+        } else {
+            http::StatusCode::OK
+        };
+        let mut response_header =
+            ResponseHeader::build(status, Some(2)).expect("response should build");
+        if upgraded {
+            response_header
+                .insert_header(http::header::UPGRADE, "websocket")
+                .expect("upgrade header should be valid");
+            response_header
+                .insert_header(http::header::CONNECTION, "Upgrade")
+                .expect("connection header should be valid");
+        }
+        response_tx
+            .send(HttpTask::Header(Box::new(response_header), !upgraded))
+            .await
+            .expect("response header should be queued");
+        if upgraded {
+            response_tx
+                .send(HttpTask::UpgradedBody(
+                    Some(Bytes::from_static(b"hello")),
+                    true,
+                ))
+                .await
+                .expect("upgraded body should be queued");
+        }
+        drop(response_tx);
+
+        let (upstream_custom_tx, upstream_custom_rx) = mpsc::channel(1);
+        let (downstream_custom_tx, downstream_custom_rx) = mpsc::channel(1);
+        let (release_custom_tx, release_custom_rx) = oneshot::channel();
+        let response_marker: &[u8] = if upgraded { b"hello" } else { b"\r\n\r\n" };
+        let client_task = tokio::spawn(async move {
+            let mut response = Vec::new();
+            let mut buf = [0; 1024];
+            while !response
+                .windows(response_marker.len())
+                .any(|part| part == response_marker)
+            {
+                let read = client
+                    .read(&mut buf)
+                    .await
+                    .expect("response should be readable");
+                assert!(read > 0, "response ended before expected data arrived");
+                response.extend_from_slice(&buf[..read]);
+            }
+
+            client
+                .write_all(b"late")
+                .await
+                .expect("late downstream bytes should be written");
+            if !upgraded {
+                let _ = release_custom_rx.await;
+            }
+            drop(upstream_custom_tx);
+            drop(downstream_custom_tx);
+            response
+        });
+
+        let (cancel_downstream_reader_tx, _cancel_downstream_reader_rx) = oneshot::channel();
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.custom_bidirection_down_to_up(
+                &mut session,
+                &mut client_body,
+                response_rx,
+                &mut (),
+                upstream_custom_rx,
+                downstream_custom_rx,
+                true,
+                cancel_downstream_reader_tx,
+                pipe_state.clone(),
+            ),
+        )
+        .await
+        .expect("custom proxy should finish after custom channels close");
+
+        let _ = release_custom_tx.send(());
+        let response = client_task.await.expect("client task should finish");
+        let cleanup_called = cleanup_called.load(Ordering::Acquire);
+        let downstream_complete =
+            PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire));
+        CompletedResponse {
+            result,
+            response,
+            cleanup_called,
+            downstream_complete,
+        }
+    }
+
+    #[tokio::test]
+    async fn upgraded_response_completion_stops_downstream_body_poll() {
+        let CompletedResponse {
+            result,
+            response,
+            cleanup_called,
+            downstream_complete,
+        } = run_completed_response(true).await;
+
+        assert!(
+            result.is_ok(),
+            "completed upgraded response should not poll downstream again: {result:?}"
+        );
+        assert!(
+            response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+            "unexpected response: {:?}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(cleanup_called);
+        assert!(downstream_complete);
+    }
+
+    #[tokio::test]
+    async fn upgraded_request_completion_stops_body_poll_while_response_open() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session.set_upstream_h1_upgrade_request_status(true);
+
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let finish_notify = Arc::new(tokio::sync::Notify::new());
+        let mut client_body: Box<dyn BodyWrite> = Box::new(TestBodyWriter {
+            cleanup_called: cleanup_called.clone(),
+            finish_notify: Some(finish_notify.clone()),
+        });
+
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut response_header =
+            ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, Some(2))
+                .expect("upgrade response should build");
+        response_header
+            .insert_header(http::header::UPGRADE, "websocket")
+            .expect("upgrade header should be valid");
+        response_header
+            .insert_header(http::header::CONNECTION, "Upgrade")
+            .expect("connection header should be valid");
+        response_tx
+            .send(HttpTask::Header(Box::new(response_header), false))
+            .await
+            .expect("response header should be queued");
+
+        let (upstream_custom_tx, upstream_custom_rx) = mpsc::channel(1);
+        let (downstream_custom_tx, downstream_custom_rx) = mpsc::channel(1);
+        let (cancel_downstream_reader_tx, _cancel_downstream_reader_rx) = oneshot::channel();
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let mut ctx = ();
+        let proxy_result = proxy.custom_bidirection_down_to_up(
+            &mut session,
+            &mut client_body,
+            response_rx,
+            &mut ctx,
+            upstream_custom_rx,
+            downstream_custom_rx,
+            true,
+            cancel_downstream_reader_tx,
+            pipe_state.clone(),
+        );
+        tokio::pin!(proxy_result);
+
+        let mut client_task = tokio::spawn(async move {
+            let mut response = Vec::new();
+            let mut buf = [0; 1024];
+            while !response.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = client
+                    .read(&mut buf)
+                    .await
+                    .expect("response should be readable");
+                assert!(read > 0, "response ended before headers arrived");
+                response.extend_from_slice(&buf[..read]);
+            }
+            client
+                .shutdown()
+                .await
+                .expect("downstream write side should close");
+            client
+        });
+
+        let mut client = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                client = &mut client_task => client.expect("client task should finish"),
+                result = &mut proxy_result => panic!("proxy ended before downstream half-close: {result:?}"),
+            }
+        })
+        .await
+        .expect("downstream should receive response headers");
+        let request_finished = finish_notify.notified();
+        tokio::pin!(request_finished);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                () = &mut request_finished => {},
+                result = &mut proxy_result => panic!("proxy ended while finishing upgraded request: {result:?}"),
+            }
+        })
+        .await
+        .expect("custom request body writer should finish");
+
+        match futures::poll!(&mut proxy_result) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(result) => {
+                panic!("proxy repolled completed upgraded request: {result:?}");
+            }
+        }
+
+        response_tx
+            .send(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"hello")),
+                true,
+            ))
+            .await
+            .expect("final upgraded body should be queued");
+        drop(response_tx);
+        drop(upstream_custom_tx);
+        drop(downstream_custom_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut proxy_result)
+            .await
+            .expect("custom proxy should finish after response and custom channels close");
+        assert!(
+            result.is_ok(),
+            "custom proxy should finish cleanly: {result:?}"
+        );
+
+        let mut body = [0; 5];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut body))
+            .await
+            .expect("final upgraded body should arrive")
+            .expect("final upgraded body should be readable");
+        assert_eq!(&body, b"hello");
+        assert!(cleanup_called.load(Ordering::Acquire));
+        assert!(PipeState::is_downstream_complete(
+            pipe_state.load(Ordering::Acquire)
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_http_response_rejects_late_downstream_data() {
+        let CompletedResponse {
+            result,
+            cleanup_called,
+            downstream_complete,
+            ..
+        } = run_completed_response(false).await;
+        let error = result.expect_err("late downstream data should remain an error");
+        assert!(
+            format!("{error:?}").contains("Sent data after end of body"),
+            "unexpected error: {error:?}"
+        );
+        assert!(!cleanup_called);
+        assert!(!downstream_complete);
     }
 
     #[tokio::test]
