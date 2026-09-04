@@ -626,24 +626,7 @@ pub trait ProxyHttp {
     where
         Self::CTX: Send + Sync,
     {
-        let code = match e.etype() {
-            HTTPStatus(code) => *code,
-            _ => {
-                match e.esource() {
-                    ErrorSource::Upstream => 502,
-                    ErrorSource::Downstream => {
-                        match e.etype() {
-                            WriteError | ReadError | ConnectionClosed => {
-                                /* conn already dead */
-                                0
-                            }
-                            _ => 400,
-                        }
-                    }
-                    ErrorSource::Internal | ErrorSource::Unset => 500,
-                }
-            }
-        };
+        let code = default_fail_to_proxy_status(e);
         if code > 0 {
             session.respond_error(code).await.unwrap_or_else(|e| {
                 error!("failed to send error response to downstream: {e}");
@@ -733,4 +716,64 @@ pub trait ProxyHttp {
 pub struct FailToProxy {
     pub error_code: u16,
     pub can_reuse_downstream: bool,
+}
+
+/// Helper function to determine the default HTTP status code for a proxy error.
+///
+/// Maps upstream timeouts ([`ConnectTimedout`], [`TLSHandshakeTimedout`], [`ReadTimedout`],
+/// [`WriteTimedout`]) to `504 Gateway Timeout` per RFC 9110 §15.6.6. Other upstream errors map to
+/// `502 Bad Gateway`. Client write/read errors map to `0` (connection already dead) or `400 Bad Request`.
+/// Internal errors map to `500 Internal Server Error`.
+pub fn default_fail_to_proxy_status(e: &Error) -> u16 {
+    match e.etype() {
+        HTTPStatus(code) => *code,
+        _ => match e.esource() {
+            ErrorSource::Upstream => match e.etype() {
+                ConnectTimedout | TLSHandshakeTimedout | ReadTimedout | WriteTimedout => 504,
+                _ => 502,
+            },
+            ErrorSource::Downstream => match e.etype() {
+                WriteError | ReadError | ConnectionClosed => {
+                    /* conn already dead */
+                    0
+                }
+                _ => 400,
+            },
+            ErrorSource::Internal | ErrorSource::Unset => 500,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_fail_to_proxy_status() {
+        // Upstream timeouts -> 504 Gateway Timeout (RFC 9110 §15.6.6)
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectTimedout)), 504);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(TLSHandshakeTimedout)), 504);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ReadTimedout)), 504);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(WriteTimedout)), 504);
+
+        // Other upstream errors -> 502 Bad Gateway
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectRefused)), 502);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectNoRoute)), 502);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(InvalidH2)), 502);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_up(InvalidCert)), 502);
+
+        // Downstream errors
+        assert_eq!(default_fail_to_proxy_status(&Error::new_down(WriteError)), 0);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_down(ReadError)), 0);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_down(ConnectionClosed)), 0);
+        assert_eq!(default_fail_to_proxy_status(&Error::new_down(InvalidHTTPHeader)), 400);
+
+        // Internal and unset errors -> 500
+        assert_eq!(default_fail_to_proxy_status(&Error::new_in(InternalError)), 500);
+        assert_eq!(default_fail_to_proxy_status(&Error::new(InternalError)), 500);
+
+        // Explicit HTTPStatus preservation
+        assert_eq!(default_fail_to_proxy_status(&Error::new(HTTPStatus(403))), 403);
+        assert_eq!(default_fail_to_proxy_status(&Error::new(HTTPStatus(429))), 429);
+    }
 }
