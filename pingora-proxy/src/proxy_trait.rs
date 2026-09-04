@@ -751,29 +751,71 @@ mod tests {
     #[test]
     fn test_default_fail_to_proxy_status() {
         // Upstream timeouts -> 504 Gateway Timeout (RFC 9110 §15.6.6)
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectTimedout)), 504);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(TLSHandshakeTimedout)), 504);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ReadTimedout)), 504);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(WriteTimedout)), 504);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(ConnectTimedout)),
+            504
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(TLSHandshakeTimedout)),
+            504
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(ReadTimedout)),
+            504
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(WriteTimedout)),
+            504
+        );
 
         // Other upstream errors -> 502 Bad Gateway
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectRefused)), 502);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(ConnectNoRoute)), 502);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(ConnectRefused)),
+            502
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(ConnectNoRoute)),
+            502
+        );
         assert_eq!(default_fail_to_proxy_status(&Error::new_up(InvalidH2)), 502);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_up(InvalidCert)), 502);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_up(InvalidCert)),
+            502
+        );
 
         // Downstream errors
-        assert_eq!(default_fail_to_proxy_status(&Error::new_down(WriteError)), 0);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_down(WriteError)),
+            0
+        );
         assert_eq!(default_fail_to_proxy_status(&Error::new_down(ReadError)), 0);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_down(ConnectionClosed)), 0);
-        assert_eq!(default_fail_to_proxy_status(&Error::new_down(InvalidHTTPHeader)), 400);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_down(ConnectionClosed)),
+            0
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_down(InvalidHTTPHeader)),
+            400
+        );
 
         // Internal and unset errors -> 500
-        assert_eq!(default_fail_to_proxy_status(&Error::new_in(InternalError)), 500);
-        assert_eq!(default_fail_to_proxy_status(&Error::new(InternalError)), 500);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new_in(InternalError)),
+            500
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new(InternalError)),
+            500
+        );
 
         // Explicit HTTPStatus preservation
-        assert_eq!(default_fail_to_proxy_status(&Error::new(HTTPStatus(403))), 403);
-        assert_eq!(default_fail_to_proxy_status(&Error::new(HTTPStatus(429))), 429);
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new(HTTPStatus(403))),
+            403
+        );
+        assert_eq!(
+            default_fail_to_proxy_status(&Error::new(HTTPStatus(429))),
+            429
+        );
     }
 }
