@@ -420,7 +420,7 @@ fn build_daemonize(conf: &ServerConf) -> Daemonize<()> {
             let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as i32) };
             #[cfg(target_os = "freebsd")]
             let group_id = unsafe { gid_for_username(&user_cstr).map(|gid| gid as u32) };
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "illumos", target_os = "solaris"))]
             let group_id = unsafe { gid_for_username(&user_cstr) };
 
             daemonize
