@@ -50,6 +50,29 @@ pub mod prelude {
     pub use crate::ResponseHeader;
 }
 
+/// HTTP/1 parsing configuration and backend capabilities.
+///
+/// Byte parsing and backend-specific storage remain implementation details of
+/// the parser compatibility layer.
+pub mod h1 {
+    pub use pingora_http_parser::{
+        capabilities as parser_capabilities, Capabilities as ParserCapabilities, HeaderLimit,
+        ResponseParserConfig,
+    };
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parser_configuration_is_reexported() {
+            let _: ParserCapabilities = parser_capabilities();
+            let _ = HeaderLimit::default();
+            let _ = ResponseParserConfig::default();
+        }
+    }
+}
+
 /* an ordered header map to store the original case of each header name
 HMap({
     "foo": ["Foo", "foO", "FoO"]

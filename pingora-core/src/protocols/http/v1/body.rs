@@ -666,11 +666,11 @@ impl BodyReader {
         buf_index_end: usize,
     ) -> Result<(Option<BufRef>, Option<usize>)> {
         let buf = &self.body_buf.as_ref().unwrap()[buf_index_start..buf_index_end];
-        let chunk_status = httparse::parse_chunk_size(buf);
+        let chunk_status = pingora_http_parser::parse_chunk_size(buf);
         match chunk_status {
             Ok(status) => {
                 match status {
-                    httparse::Status::Complete((payload_index, chunk_size)) => {
+                    pingora_http_parser::Status::Complete(payload_index, chunk_size) => {
                         trace!(
                             "Got size {chunk_size}, payload_index: {payload_index}, chunk: {:?}",
                             String::from_utf8_lossy(buf).escape_default(),
@@ -779,7 +779,7 @@ impl BodyReader {
                             None,
                         ))
                     }
-                    httparse::Status::Partial => {
+                    pingora_http_parser::Status::Partial => {
                         if buf.len() > PARTIAL_CHUNK_HEAD_LIMIT {
                             // https://datatracker.ietf.org/doc/html/rfc9112#name-chunk-extensions
                             // "A server ought to limit the total length of chunk extensions received"

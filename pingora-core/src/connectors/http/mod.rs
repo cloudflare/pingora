@@ -18,7 +18,6 @@ use crate::connectors::http::custom::Connection;
 use crate::connectors::ConnectorOptions;
 use crate::listeners::ALPN;
 use crate::protocols::http::client::HttpSession;
-use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
 use std::sync::atomic::AtomicU64;
@@ -91,10 +90,7 @@ where
                 }
                 // Negotiated ALPN is not custom, create a new H1 session
                 Connection::Stream(s) => {
-                    return Ok((
-                        HttpSession::H1(Http1Session::new_with_options(s, peer)),
-                        false,
-                    ));
+                    return Ok((HttpSession::H1(self.h1.new_http_session(s, peer)), false));
                 }
             }
         }

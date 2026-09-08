@@ -16,6 +16,7 @@ use super::HttpSession;
 use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, TransportConnector};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
+use crate::protocols::http::v1::ResponseParserConfig;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
@@ -307,6 +308,7 @@ pub struct Connector {
     // the pool of h2 connections that have ongoing streams
     in_use_pool: InUsePool,
     pool_callback: Option<PoolCallback>,
+    h1_response_parser_config: ResponseParserConfig,
 }
 
 impl Connector {
@@ -318,12 +320,18 @@ impl Connector {
         let pool_callback = options
             .as_ref()
             .and_then(|o| o.keepalive_pool_callback.clone());
+        let h1_response_parser_config = options
+            .as_ref()
+            .map_or_else(ResponseParserConfig::default, |options| {
+                options.h1_response_parser_config
+            });
         // connection offload is handled by the [TransportConnector]
         Connector {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
             pool_callback,
+            h1_response_parser_config,
         }
     }
 
@@ -353,9 +361,9 @@ impl Connector {
             Some(ALPN::H2) => { /* continue */ }
             Some(_) => {
                 // H2 not supported
-                return Ok(HttpSession::H1(Http1Session::new_with_options(
-                    stream, peer,
-                )));
+                let mut session = Http1Session::new_with_options(stream, peer);
+                session.set_response_parser_config(self.h1_response_parser_config);
+                return Ok(HttpSession::H1(session));
             }
             None => {
                 // if tls but no ALPN, default to h1
@@ -365,9 +373,9 @@ impl Connector {
                         .get_peer_options()
                         .is_none_or(|o| o.alpn.get_min_http_version() == 1)
                 {
-                    return Ok(HttpSession::H1(Http1Session::new_with_options(
-                        stream, peer,
-                    )));
+                    let mut session = Http1Session::new_with_options(stream, peer);
+                    session.set_response_parser_config(self.h1_response_parser_config);
+                    return Ok(HttpSession::H1(session));
                 }
                 // else: min http version=H2 over plaintext, there is no ALPN anyways, we trust
                 // the caller that the server speaks h2c
@@ -675,6 +683,7 @@ mod tests {
     use bytes::Bytes;
     use http::{Response, StatusCode};
     use pingora_http::RequestHeader;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
@@ -725,6 +734,48 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_parser_config_is_applied_to_h1_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nServer : pingora\r\n folded\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut options = ConnectorOptions::new(1);
+        options.h1_response_parser_config = ResponseParserConfig::default()
+            .with_spaces_after_header_name_in_responses(true)
+            .with_obsolete_multiline_headers_in_responses(true);
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(address, false, "".into());
+        peer.options.set_http_version(2, 1);
+
+        let session = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
+        let HttpSession::H1(mut session) = session else {
+            panic!("expect h1");
+        };
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+        session.read_response().await.unwrap();
+        assert_eq!(session.get_header("server").unwrap(), "pingora folded");
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

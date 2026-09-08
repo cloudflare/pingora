@@ -50,8 +50,11 @@ pub use eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
-pub use meta::{set_compression_dict_content, set_compression_dict_path};
+pub use meta::{
+    set_compression_dict_content, set_compression_dict_path, set_header_serde_parser_config,
+};
 pub use meta::{CacheMeta, CacheMetaDefaults};
+pub use pingora_http::h1::{HeaderLimit, ResponseParserConfig};
 pub use storage::{
     HitHandler, MissHandler, PurgeAction, PurgeOutcome, PurgeTarget, PurgeType, Storage,
 };

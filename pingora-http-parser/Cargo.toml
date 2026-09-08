@@ -1,0 +1,20 @@
+[package]
+name = "pingora-http-parser"
+version = "0.9.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["network-programming", "parser-implementations"]
+keywords = ["http", "parser", "pingora"]
+description = "HTTP/1 parser compatibility layer for Pingora."
+
+[dependencies]
+httparse = { workspace = true }
+
+[features]
+default = []
+patched_http1 = []
+
+[lints]
+workspace = true

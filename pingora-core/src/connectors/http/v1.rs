@@ -14,6 +14,8 @@
 
 use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession;
+use crate::protocols::http::v1::ResponseParserConfig;
+use crate::protocols::Stream;
 use crate::upstreams::peer::Peer;
 
 use pingora_error::Result;
@@ -23,13 +25,26 @@ use std::time::Duration;
 
 pub struct Connector {
     transport: TransportConnector,
+    response_parser_config: ResponseParserConfig,
 }
 
 impl Connector {
     pub fn new(options: Option<ConnectorOptions>) -> Self {
+        let response_parser_config = options
+            .as_ref()
+            .map_or_else(ResponseParserConfig::default, |options| {
+                options.h1_response_parser_config
+            });
         Connector {
             transport: TransportConnector::new(options),
+            response_parser_config,
         }
+    }
+
+    pub(super) fn new_http_session<P: Peer>(&self, stream: Stream, peer: &P) -> HttpSession {
+        let mut http = HttpSession::new_with_options(stream, peer);
+        http.set_response_parser_config(self.response_parser_config);
+        http
     }
 
     pub async fn get_http_session<P: Peer + Send + Sync + 'static>(
@@ -37,7 +52,7 @@ impl Connector {
         peer: &P,
     ) -> Result<(HttpSession, bool)> {
         let (stream, reused) = self.transport.get_stream(peer).await?;
-        let http = HttpSession::new_with_options(stream, peer);
+        let http = self.new_http_session(stream, peer);
         Ok((http, reused))
     }
 
@@ -46,7 +61,7 @@ impl Connector {
         peer: &P,
     ) -> Option<HttpSession> {
         let stream = self.transport.reused_stream(peer).await?;
-        let http = HttpSession::new_with_options(stream, peer);
+        let http = self.new_http_session(stream, peer);
         Some(http)
     }
 
@@ -153,6 +168,42 @@ ZZ\r\n",
         connector.release_http_session(http, &peer, None).await;
         assert!(connector.reused_http_session(&peer).await.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_parser_config_is_applied_to_new_sessions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nServer : pingora\r\n folded\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut options = ConnectorOptions::new(1);
+        options.h1_response_parser_config = ResponseParserConfig::default()
+            .with_spaces_after_header_name_in_responses(true)
+            .with_obsolete_multiline_headers_in_responses(true);
+        let connector = Connector::new(Some(options));
+        let peer = HttpPeer::new(address, false, "".into());
+        let (mut session, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+        session.read_response().await.unwrap();
+        assert_eq!(session.get_header("server").unwrap(), "pingora folded");
+
+        server.await.unwrap();
     }
 
     #[cfg(unix)]
