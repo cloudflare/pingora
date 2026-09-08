@@ -378,6 +378,15 @@ where
         }
     }
 
+    /// Set the maximum number of fields accepted in an HTTP/1 request head.
+    ///
+    /// This is a no-op for non-HTTP/1 sessions.
+    pub fn set_h1_header_count_limit(&mut self, limit: super::v1::HeaderLimit) {
+        if let Self::H1(session) = self {
+            session.set_header_count_limit(limit);
+        }
+    }
+
     /// Set user-defined context to carry across requests on the same keepalive connection.
     ///
     /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.

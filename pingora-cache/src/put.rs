@@ -84,6 +84,26 @@ impl<C: CachePut> CachePutCtx<C> {
         self.max_file_size_tracker = Some(MaxFileSizeTracker::new(max_file_size_bytes));
     }
 
+    /// Set the maximum number of fields accepted in the response head.
+    ///
+    /// When cache puts consume a response independently from an upstream
+    /// [`ConnectorOptions`](pingora_core::connectors::ConnectorOptions), keep
+    /// this limit aligned with
+    /// [`ConnectorOptions::h1_response_parser_config`](pingora_core::connectors::ConnectorOptions::h1_response_parser_config).
+    pub fn set_header_count_limit(&mut self, limit: crate::HeaderLimit) {
+        self.parser.set_header_count_limit(limit);
+    }
+
+    /// Set the HTTP/1 response parser configuration.
+    ///
+    /// When cache puts consume a response independently from an upstream
+    /// [`ConnectorOptions`](pingora_core::connectors::ConnectorOptions), keep
+    /// this configuration aligned with
+    /// [`ConnectorOptions::h1_response_parser_config`](pingora_core::connectors::ConnectorOptions::h1_response_parser_config).
+    pub fn set_response_parser_config(&mut self, config: crate::ResponseParserConfig) {
+        self.parser.set_response_parser_config(config);
+    }
+
     async fn put_header(&mut self, meta: CacheMeta) -> Result<()> {
         #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut trace = self.trace.child("cache put header", |o| o.start());
@@ -402,16 +422,34 @@ mod parse_response {
     use super::*;
     use bstr::ByteSlice;
     use bytes::BytesMut;
-    use httparse::Status;
     use pingora_error::{
         Error,
         ErrorType::{self, *},
     };
+    use pingora_http::h1::{HeaderLimit, ResponseParserConfig};
+    use pingora_http_parser::{
+        parse_response, Error as ParseError, HeaderStorage, Status as ParseStatus,
+    };
 
     pub const INCOMPLETE_BODY: ErrorType = ErrorType::new("IncompleteHttpBody");
 
-    const MAX_HEADERS: usize = 256;
     const INIT_HEADER_BUF_SIZE: usize = 4096;
+    const MAX_HEADER_SIZE: usize = 1_048_575;
+
+    fn response_header_exceeds_size_limit(buf: &[u8]) -> bool {
+        if buf.len() <= MAX_HEADER_SIZE {
+            return false;
+        }
+
+        let bounded = &buf[..MAX_HEADER_SIZE];
+        !bounded.iter().enumerate().any(|(index, &byte)| {
+            byte == b'\n'
+                && matches!(
+                    bounded.get(index + 1..),
+                    Some([b'\n', ..]) | Some([b'\r', b'\n', ..])
+                )
+        })
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum ParseState {
@@ -420,7 +458,8 @@ mod parse_response {
         PartialBodyContentLength(usize, usize),
         PartialBody(usize),
         Done(usize),
-        Invalid(httparse::Error),
+        Invalid(ParseError),
+        InvalidHeaderSize,
     }
 
     impl ParseState {
@@ -442,15 +481,29 @@ mod parse_response {
         state: ParseState,
         buf: BytesMut,
         header_bytes: Bytes,
+        parser_config: ResponseParserConfig,
     }
 
     impl ResponseParse {
         pub fn new() -> Self {
+            Self::new_with_parser_config(ResponseParserConfig::default())
+        }
+
+        pub fn new_with_parser_config(parser_config: ResponseParserConfig) -> Self {
             ResponseParse {
                 state: ParseState::Init,
                 buf: BytesMut::with_capacity(INIT_HEADER_BUF_SIZE),
                 header_bytes: Bytes::new(),
+                parser_config,
             }
+        }
+
+        pub fn set_header_count_limit(&mut self, limit: HeaderLimit) {
+            self.parser_config.header_limit = limit;
+        }
+
+        pub fn set_response_parser_config(&mut self, config: ResponseParserConfig) {
+            self.parser_config = config;
         }
 
         pub fn inject_data(&mut self, data: &[u8]) -> Result<Vec<HttpTask>> {
@@ -487,20 +540,23 @@ mod parse_response {
 
         fn put_data(&mut self, data: &[u8]) {
             use ParseState::*;
-            if matches!(self.state, Done(_) | Invalid(_)) {
+            if matches!(self.state, Done(_) | Invalid(_) | InvalidHeaderSize) {
                 panic!("Wrong phase {:?}", self.state);
             }
             self.buf.extend_from_slice(data);
         }
 
         fn parse_header(&mut self) -> Result<Option<ResponseHeader>> {
-            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-            let mut resp = httparse::Response::new(&mut headers);
-            let mut parser = httparse::ParserConfig::default();
-            parser.allow_spaces_after_header_name_in_responses(true);
-            parser.allow_obsolete_multiline_headers_in_responses(true);
+            if response_header_exceeds_size_limit(&self.buf) {
+                self.state = ParseState::InvalidHeaderSize;
+                return Error::e_explain(
+                    InvalidHTTPHeader,
+                    format!("Response header larger than {MAX_HEADER_SIZE}"),
+                );
+            }
 
-            let res = parser.parse_response(&mut resp, &self.buf);
+            let mut storage = HeaderStorage::new();
+            let res = parse_response(&mut storage, &self.buf, self.parser_config);
             let res = match res {
                 Ok(res) => res,
                 Err(e) => {
@@ -513,17 +569,26 @@ mod parse_response {
                 }
             };
 
-            let split_to = match res {
-                Status::Complete(s) => s,
-                Status::Partial => {
+            let (split_to, resp) = match res {
+                ParseStatus::Complete(s, response) => {
+                    if s > MAX_HEADER_SIZE {
+                        self.state = ParseState::InvalidHeaderSize;
+                        return Error::e_explain(
+                            InvalidHTTPHeader,
+                            format!("Response header larger than {MAX_HEADER_SIZE}"),
+                        );
+                    }
+                    (s, response)
+                }
+                ParseStatus::Partial => {
                     self.state = ParseState::PartialHeader;
                     return Ok(None);
                 }
             };
             // safe to unwrap, valid response always has code set.
             let mut response =
-                ResponseHeader::build(resp.code.unwrap(), Some(resp.headers.len())).unwrap();
-            for header in resp.headers {
+                ResponseHeader::build(resp.code().unwrap(), Some(resp.header_count())).unwrap();
+            for header in resp.headers() {
                 // TODO: consider hold a Bytes and all header values can be Bytes referencing the
                 // original buffer without reallocation
                 let header_value = pingora_http::header_value_from_slice(header.value);
@@ -543,7 +608,7 @@ mod parse_response {
                 return Ok(None);
             }
             match self.state {
-                Init | PartialHeader | Invalid(_) => {
+                Init | PartialHeader | Invalid(_) | InvalidHeaderSize => {
                     panic!("Wrong phase {:?}", self.state);
                 }
                 Done(_) => Ok(None),
@@ -664,9 +729,103 @@ mod parse_response {
             // header is not complete
             assert!(output.is_err());
             match parser.state {
-                ParseState::Invalid(httparse::Error::Version) => {}
+                ParseState::Invalid(ParseError::Version) => {}
                 _ => panic!("should have failed to parse"),
             }
+        }
+
+        #[test]
+        fn test_many_response_headers() {
+            let mut input = b"HTTP/1.1 200 OK\r\n".to_vec();
+            for i in 0..4096 {
+                input.extend_from_slice(format!("x-{i}: value-{i}\r\n").as_bytes());
+            }
+            input.extend_from_slice(b"\r\n");
+
+            let mut parser = ResponseParse::new_with_parser_config(ResponseParserConfig::new(
+                HeaderLimit::Limited(4096),
+            ));
+            let output = parser.inject_data(&input).unwrap();
+            let HttpTask::Header(header, _) = &output[0] else {
+                panic!("{output:?}");
+            };
+            assert_eq!(header.headers.len(), 4096);
+            assert_eq!(header.headers["x-4095"], "value-4095");
+        }
+
+        #[test]
+        fn test_partial_response_header_size_limit() {
+            let mut input = b"HTTP/1.1 200 OK\r\nx-large: ".to_vec();
+            input.resize(MAX_HEADER_SIZE + 1, b'a');
+            let mut parser = ResponseParse::new_with_parser_config(ResponseParserConfig::new(
+                HeaderLimit::Unlimited,
+            ));
+
+            let error = parser.inject_data(&input).unwrap_err();
+            assert_eq!(error.etype(), &InvalidHTTPHeader);
+            assert_eq!(parser.state, ParseState::InvalidHeaderSize);
+        }
+
+        #[test]
+        fn test_complete_response_header_size_limit() {
+            let mut input = b"HTTP/1.1 200 OK\r\n".to_vec();
+            for i in 0..4096 {
+                input.extend_from_slice(format!("x-{i}: value-{i}\r\n").as_bytes());
+            }
+            input.extend_from_slice(b"x-large: ");
+            input.resize(MAX_HEADER_SIZE - 3, b'a');
+            input.extend_from_slice(b"\r\n\r\nbody");
+
+            let mut parser = ResponseParse::new_with_parser_config(ResponseParserConfig::new(
+                HeaderLimit::Unlimited,
+            ));
+            let error = parser.inject_data(&input).unwrap_err();
+            assert_eq!(error.etype(), &InvalidHTTPHeader);
+            assert_eq!(parser.state, ParseState::InvalidHeaderSize);
+        }
+
+        #[test]
+        fn test_response_header_at_size_limit() {
+            let mut input = b"HTTP/1.1 200 OK\r\nx-large: ".to_vec();
+            input.resize(MAX_HEADER_SIZE - 4, b'a');
+            input.extend_from_slice(b"\r\n\r\nbody");
+
+            let mut parser = ResponseParse::new_with_parser_config(ResponseParserConfig::new(
+                HeaderLimit::Unlimited,
+            ));
+            let output = parser.inject_data(&input).unwrap();
+            assert!(matches!(output[0], HttpTask::Header(..)));
+            assert!(matches!(output[1], HttpTask::Body(..)));
+        }
+
+        #[test]
+        fn test_large_body_does_not_count_toward_header_size_limit() {
+            let mut input = b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n".to_vec();
+            input.resize(input.len() + MAX_HEADER_SIZE + 1, b'a');
+
+            let mut parser = ResponseParse::new();
+            let output = parser.inject_data(&input).unwrap();
+            assert_eq!(output.len(), 2);
+            assert!(matches!(output[0], HttpTask::Header(..)));
+            assert!(matches!(output[1], HttpTask::Body(..)));
+        }
+
+        #[test]
+        fn test_response_compatibility_syntax_is_opt_in() {
+            let input =
+                b"HTTP/1.1 200 OK\r\nServer : pingora\r\n folded\r\nContent-Length: 0\r\n\r\n";
+            let mut parser = ResponseParse::new();
+            assert!(parser.inject_data(input).is_err());
+
+            let config = ResponseParserConfig::default()
+                .with_spaces_after_header_name_in_responses(true)
+                .with_obsolete_multiline_headers_in_responses(true);
+            let mut parser = ResponseParse::new_with_parser_config(config);
+            let output = parser.inject_data(input).unwrap();
+            let HttpTask::Header(header, _) = &output[0] else {
+                panic!("{output:?}");
+            };
+            assert_eq!(header.headers["server"], "pingora folded");
         }
 
         #[test]
