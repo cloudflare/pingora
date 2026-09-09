@@ -372,6 +372,40 @@ impl Session {
         }
     }
 
+    /// Set the maximum size of request headers (in bytes) allowed for HTTP/1.x downstream sessions.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_max_header_size(&mut self, max: Option<usize>) {
+        if let Self::H1(s) = self {
+            s.set_max_header_size(max);
+        }
+    }
+
+    /// Return the configured maximum size of HTTP/1 request headers, if set.
+    pub fn max_header_size(&self) -> Option<usize> {
+        match self {
+            Self::H1(s) => s.max_header_size(),
+            _ => None,
+        }
+    }
+
+    /// Set the maximum number of request headers allowed for HTTP/1.x downstream sessions.
+    ///
+    /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
+    pub fn set_max_headers(&mut self, max: Option<usize>) {
+        if let Self::H1(s) = self {
+            s.set_max_headers(max);
+        }
+    }
+
+    /// Return the configured maximum number of HTTP/1 request headers, if set.
+    pub fn max_headers(&self) -> Option<usize> {
+        match self {
+            Self::H1(s) => s.max_headers(),
+            _ => None,
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///

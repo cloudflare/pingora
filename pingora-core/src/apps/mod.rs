@@ -89,6 +89,35 @@ pub struct HttpServerOptions {
     ///
     /// Default: `None`
     pub h2_idle_timeout: Option<Duration>,
+
+    /// Maximum size of HTTP/1 request headers in bytes (including the request line).
+    ///
+    /// When unset, Pingora's default limit of 1,048,575 bytes (~1 MiB) applies.
+    pub max_header_size: Option<usize>,
+
+    /// Maximum number of HTTP/1 request headers allowed.
+    ///
+    /// When unset, Pingora's default limit of 256 headers applies.
+    pub max_headers: Option<usize>,
+}
+
+impl HttpServerOptions {
+    /// Validate that the options are valid.
+    pub fn validate(&self) -> pingora_error::Result<()> {
+        if let Some(0) = self.max_header_size {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::InvalidHTTPHeader,
+                "max_header_size must be greater than 0",
+            );
+        }
+        if let Some(0) = self.max_headers {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::InvalidHTTPHeader,
+                "max_headers must be greater than 0",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -356,10 +385,18 @@ where
                 self.server_options()
                     .and_then(|opts| opts.keepalive_request_limit),
             );
+            if let Some(opts) = self.server_options() {
+                session.set_max_header_size(opts.max_header_size);
+                session.set_max_headers(opts.max_headers);
+            }
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
                 let mut session = ServerSession::new_http1(stream);
+                if let Some(opts) = self.server_options() {
+                    session.set_max_header_size(opts.max_header_size);
+                    session.set_max_headers(opts.max_headers);
+                }
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
                 }
@@ -425,5 +462,30 @@ mod tests {
         assert!(session2.take_connection_user_context().is_none());
         // Keepalive should still work
         assert_eq!(session2.get_keepalive(), Some(30));
+    }
+
+    #[test]
+    fn test_http_server_options_validation() {
+        let default_opts = HttpServerOptions::default();
+        assert!(default_opts.validate().is_ok());
+
+        let valid_opts = HttpServerOptions {
+            max_header_size: Some(8192),
+            max_headers: Some(64),
+            ..Default::default()
+        };
+        assert!(valid_opts.validate().is_ok());
+
+        let zero_size_opts = HttpServerOptions {
+            max_header_size: Some(0),
+            ..Default::default()
+        };
+        assert!(zero_size_opts.validate().is_err());
+
+        let zero_headers_opts = HttpServerOptions {
+            max_headers: Some(0),
+            ..Default::default()
+        };
+        assert!(zero_headers_opts.validate().is_err());
     }
 }

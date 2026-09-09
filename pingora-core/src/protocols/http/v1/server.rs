@@ -155,6 +155,8 @@ pub struct HttpSession {
     /// [`super::super::HttpPersistentSettings`] into the next session.
     /// Scoped narrowly so it cannot affect FIN / `abort_on_close` semantics.
     pipelined_idle_bytes_stashed: bool,
+    max_header_size: Option<usize>,
+    max_headers: Option<usize>,
 }
 
 impl HttpSession {
@@ -203,6 +205,8 @@ impl HttpSession {
             pipelining_enabled: false,
             pipelined_prefix: None,
             pipelined_idle_bytes_stashed: false,
+            max_header_size: None,
+            max_headers: None,
         }
     }
 
@@ -286,6 +290,10 @@ impl HttpSession {
             tokio::task::consume_budget().await;
         }
 
+        let max_header_size = self.max_header_size.unwrap_or(MAX_HEADER_SIZE);
+        let max_headers = self.max_headers.unwrap_or(MAX_HEADERS).min(MAX_HEADERS);
+        let init_buf_size = INIT_HEADER_BUF_SIZE.min(max_header_size);
+
         // If the caller (e.g. the proxy layer completing a pipelined request on
         // a reused keep-alive connection) handed us bytes that were read past
         // the end of the previous request's body, pre-fill our parse buffer so
@@ -297,18 +305,18 @@ impl HttpSession {
             .pipelined_prefix
             .take()
             .filter(|prefix| !prefix.is_empty())
-            .unwrap_or_else(|| BytesMut::with_capacity(INIT_HEADER_BUF_SIZE));
+            .unwrap_or_else(|| BytesMut::with_capacity(init_buf_size));
         let mut already_read = buf.len();
         let mut skip_next_read = already_read != 0;
         let mut detached_suffix = None;
         loop {
-            if already_read > MAX_HEADER_SIZE {
+            if already_read > max_header_size {
                 /* NOTE: this check only blocks second read. The first large read is allowed
                 since the buf is already allocated. The goal is to avoid slowly bloating
                 this buffer */
                 return Error::e_explain(
                     InvalidHTTPHeader,
-                    format!("Request header larger than {MAX_HEADER_SIZE}"),
+                    format!("Request header larger than {max_header_size}"),
                 );
             }
 
@@ -329,10 +337,16 @@ impl HttpSession {
             // Use loop as GOTO to retry escaped request buffer, not a real loop
             loop {
                 let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-                let mut req = httparse::Request::new(&mut headers);
+                let mut req = httparse::Request::new(&mut headers[..max_headers]);
                 let parsed = parse_req_buffer(&mut req, &buf);
                 match parsed {
                     HeaderParseState::Complete(s) => {
+                        if s > max_header_size {
+                            return Error::e_explain(
+                                InvalidHTTPHeader,
+                                format!("Request header larger than {max_header_size}"),
+                            );
+                        }
                         self.raw_header = Some(BufRef(0, s));
 
                         // We have the header name and values we parsed to be just 0 copy Bytes
@@ -742,6 +756,30 @@ impl HttpSession {
     /// persisted by the previous request.
     pub fn take_connection_user_context(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
         self.connection_user_context.take()
+    }
+
+    /// Set the maximum size of HTTP/1 request headers (including request line) in bytes.
+    ///
+    /// When set to `None`, Pingora's default limit of 1,048,575 bytes (~1 MiB) applies.
+    pub fn set_max_header_size(&mut self, max: Option<usize>) {
+        self.max_header_size = max;
+    }
+
+    /// Return the configured maximum size of HTTP/1 request headers, if set.
+    pub fn max_header_size(&self) -> Option<usize> {
+        self.max_header_size
+    }
+
+    /// Set the maximum number of HTTP/1 request headers allowed.
+    ///
+    /// When set to `None`, Pingora's default limit of 256 headers applies.
+    pub fn set_max_headers(&mut self, max: Option<usize>) {
+        self.max_headers = max;
+    }
+
+    /// Return the configured maximum number of HTTP/1 request headers, if set.
+    pub fn max_headers(&self) -> Option<usize> {
+        self.max_headers
     }
 
     /// Return whether the session will be keepalived for connection reuse.
@@ -4529,5 +4567,120 @@ mod test_pipelining {
         }
 
         assert!(prefix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_within_limit() {
+        init_log();
+        let input = b"GET /hello HTTP/1.1\r\nHost: example.com\r\nX-Foo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(512));
+        assert_eq!(session.max_header_size(), Some(512));
+
+        let res = session.read_request().await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), Some(input.len()));
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_exceeded_multi_chunk() {
+        init_log();
+        // 2 chunks: total 300 bytes, limit 150
+        let chunk1 = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Custom-1: ";
+        let chunk2 = b"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\r\n\r\n";
+        let mock_io = Builder::new().read(&chunk1[..]).read(&chunk2[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(100));
+
+        let res = session.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_exceeded_single_chunk() {
+        init_log();
+        // Single chunk of exactly 101 bytes with limit 100:
+        // Request line (16) + Host (19) + "X-Long: " (8) + value (54) + "\r\n\r\n" (4) = 101 bytes.
+        let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Long: 123456789012345678901234567890123456789012345678901234\r\n\r\n";
+        assert_eq!(input.len(), 101);
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(100));
+
+        let res = session.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_pipelined_prefix() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Header: some-long-value-that-exceeds-limit\r\n\r\n";
+        let mut prefix = BytesMut::new();
+        prefix.extend_from_slice(input);
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(50));
+        session.set_pipelined_prefix(prefix);
+
+        let res = session.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_headers_within_limit() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nH1: 1\r\nH2: 2\r\nH3: 3\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_headers(Some(10));
+        assert_eq!(session.max_headers(), Some(10));
+
+        let res = session.read_request().await;
+        assert!(res.is_ok());
+        assert_eq!(session.req_header().headers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_max_headers_exceeded() {
+        init_log();
+        // 6 headers, limit is 3
+        let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nH1: 1\r\nH2: 2\r\nH3: 3\r\nH4: 4\r\nH5: 5\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_headers(Some(3));
+
+        let res = session.read_request().await;
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_limits_preserved() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        assert!(session.max_header_size().is_none());
+        assert!(session.max_headers().is_none());
+
+        let res = session.read_request().await;
+        assert!(res.is_ok());
     }
 }
