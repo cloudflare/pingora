@@ -2,6 +2,119 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0](https://github.com/cloudflare/pingora/compare/0.8.0...0.9.0) - 2026-09-04
+
+### ✨ Highlights
+
+- Reworked connection pooling with sharded storage and a true global LRU, addressing stale entries and race windows.
+- Added an upstream module system that applies before upstream compression.
+- More handling of HTTP parsing and framing edge cases, including non-origin-form request-target preservation, and hop-by-hop header sanitization, obsolete line-fold normalization, stricter request-target validation, and bounded default HTTP/2 limits.
+- Split Prometheus integration into the pingora-prometheus crate and made Prometheus optional.
+- Improved graceful shutdown and upgrade behavior, including responsive load-balancer shutdown, descriptor lifecycle fixes, and lower shutdown-notification contention.
+
+### ⚠️ Potential Breaking Changes
+
+- Minimum supported Rust version moves to 1.85 for some crates. pingora-foundations declares an MSRV of 1.88.
+- RequestHeader and ResponseHeader no longer implement DerefMut because unrestricted mutation could violate internal invariants.
+- Removed async_write_vec APIs; consumers should use tokio::io::AsyncWriteExt::write_all_buf.
+- Prometheus integration moved from pingora-core to the separate pingora-prometheus crate; Prometheus is optional.
+- tracing is now optional in pingora-cache.
+- Upgraded to the boring-rs 5.x API.
+- PeerOptions::curve now uses Cow.
+- Upstream requests strip hop-by-hop and Connection-nominated headers by default; legacy behavior requires explicit compatibility settings.
+- Default HTTP/2 server limits are bounded rather than unbounded.
+- Removed the unused LruShard Default implementation and lifted Default bounds on sharded cache structures.
+- Removed the CacheKey namespace parameter.
+- PurgeOutcome enum gains an Expired variant.
+- ForcedFreshness and hit-status reporting gain ForceExpiredServeStale variant.
+
+### 🚀 Features — Proxy & Sessions
+
+- Add abort-on-close session configurability.
+- Support HTTP/1.1 downstream request pipelining.
+- Add cancel-safe body and header writer primitives (proxy tasks) to prevent stalled cache misses from applying backpressure.
+- Add an upstream module system and allow modules to adjust after receiving upstream response headers.
+- Add proxy warning-log suppression hooks.
+- Add keepalive-pool callbacks for tracking connection ages.
+- Expose HTTP/1.x request-body bytes accepted by the upstream writer.
+- Report point-in-time available HTTP/2 stream capacity.
+
+### 🚀 Features — TLS
+
+- Add ability to configure an offload thread pool for downstream TLS handshakes.
+- Add Acceptor::from_server_config for runtime-built rustls ServerConfig values and in-memory key material.
+- Export TLS keying material, including from pingora-s2n.
+- Add per-peer CA configuration.
+- Add a pre-TLS callback for PROXY protocol support.
+- Expose the rustls certificate type.
+- Add curve and second-keyshare settings to HttpPeer hashing.
+- Avoid compiling aws-lc-rs when the ring provider is selected.
+
+### 🚀 Features — Server, Runtime & Load Balancing
+
+- Allow sharing backends across load-balancing selectors.
+- Add graceful-upgrade signalling between old and new processes.
+- Add per-listener L4 buffer configuration and socket send/receive buffer settings.
+- Add Tokio blocking-pool configuration, poll-time histograms, and an alternative timer runtime knob.
+- Allow proxy services to override runtime options.
+- Add a working-directory option for daemon mode.
+- Enable adding user context between sessions on the same connection with HttpPersistentSettings.
+- Add socket-cookie access and TCP/TLS establishment timing fields.
+- Make HTTP/2 stream and connection windows configurable.
+
+### 🚀 Features — Caching (alpha)
+
+- Add deferred cache-admission policy hooks.
+- Implement DCZ dictionary compression and vary on available-dictionary.
+- Add CacheMeta freshness updates and expiration-at-time support.
+- Support optionally flooring fractional delta-seconds for RFC 9111 handling.
+- Preserve Vary provenance across stale refreshes.
+- Make cache-lock retries configurable and bounded.
+- Add an opt-in purge mode that expires an asset while retaining its body for conditional revalidation and stale serving.
+- Use power-of-two selection for eviction balancing.
+- Add peek_lru, update_or_admit, and non-promoting set_weight operations in lru.
+- Allow adjusting LRU weight limits and reserving capacity.
+
+### 🔒 Security & Hardening
+
+- HTTP ambiguity hardening: centralize raw request-target classification so path and authority validation share one parser; reject ambiguous request authorities on ingress and egress; reject forbidden CR/LF bytes in HTTP/2 :path; and reject delimiter bytes in request lines as defense in depth.
+- Sanitize hop-by-hop upstream request headers.
+- Preserve non-origin-form request targets without mangling the URI.
+- Normalize forwarded responses with obsolete HTTP/1.1 response-header line folding.
+- Bound default HTTP/2 server limits to reduce memory-exhaustion exposure.
+- Avoid a process abort while appending oversized header maps by returning an InvalidHTTPHeader error.
+- Fix some unchecked integer conversions.
+- Explicitly prevent reuse of HTTP/1 connections after incomplete responses.
+- Update Prometheus for a security advisory.
+- Replaced unmaintained daemonize crate with daemonix and updated nix to 0.31.x.
+
+### 🐛 Bug Fixes
+
+- Fix connection-pool and PoolNode race windows and remove empty entries.
+- Fixed a potential stall on HTTP/1 response-header reads upon forwarding request bodies via a cancel safety fix.
+- Stop waiting on HTTP/2 upstream work after the downstream ends and close timed-out HTTP/2 connections.
+- Drain in-flight HTTP/2 streams during shutdown and retry stream creation on a fresh connection when appropriate.
+- Prevent HTTP/1 upstream reuse after failed writes or incomplete responses.
+- Discard retry buffers after truncation and avoid unnecessary HTTP/2 accept allocations.
+- Skip h2c preface detection on TLS streams.
+- Do not initialize a body reader for HEAD informational responses.
+- Correct HTTP/1 session body-byte accounting.
+- Fix listener-fd inheritance and close transfer sockets during graceful upgrade; mark received listener fds close-on-exec.
+- Remove the duplicate graceful-shutdown sleep and improve load-balancer shutdown responsiveness.
+- Shard proxy shutdown notifications to reduce lock contention and close a lost-wakeup race during graceful shutdown.
+
+### ⚙️ Miscellaneous
+
+- pingora-timeout now uses Tokio timeouts for (configurably) long intervals to avoid memory accumulation.
+- Split pingora-prometheus into a separate crate.
+- Forward WriteBuf::chunks_vectored to the wrapped buffer.
+- Replace custom ASCII-trimming helpers with stabilized standard-library methods.
+- Update the MSRV lane and use cargo check for MSRV validation.
+- Improve documentation examples for connection tracing and basic setup.
+- Preserve bound ports in digests after TLS failures.
+- Return an error for divergent multipart cache progress and remove a panic from maybe_cache_meta.
+- Various flaky test fixes.
+
 ## [0.8.0](https://github.com/cloudflare/pingora/compare/0.7.0...0.8.0) - 2026-03-02
 
 
