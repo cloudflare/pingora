@@ -139,6 +139,21 @@ impl Rate {
         self.current(self.red_or_blue()).incr(key, events)
     }
 
+    /// Return the estimated number of events observed in the current interval without modifying the counter.
+    pub fn peek<T: Hash>(&self, key: &T) -> isize {
+        let past_ms = self.maybe_reset();
+        if past_ms >= self.reset_interval_ms * 2 {
+            return 0;
+        }
+        self.current(self.red_or_blue()).get(key)
+    }
+
+    /// Return the proportional rate estimation per second over the sliding interval using
+    /// [`PROPORTIONAL_RATE_ESTIMATE_CALC_FN`].
+    pub fn proportional_rate<T: Hash>(&self, key: &T) -> f64 {
+        self.rate_with(key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN)
+    }
+
     // reset if needed, return the time since last reset for other fn to use
     fn maybe_reset(&self) -> u64 {
         // should be short enough not to overflow
@@ -343,5 +358,22 @@ mod tests {
         // second: 3
         sleep(Duration::from_secs(1));
         assert_eq!(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 0f64);
+    }
+
+    #[test]
+    fn test_peek_and_proportional_rate() {
+        let r = Rate::new(Duration::from_secs(1));
+        let key = "client_ip_1";
+
+        assert_eq!(r.peek(&key), 0);
+        assert_eq_ish(r.proportional_rate(&key), 0.);
+
+        r.observe(&key, 5);
+        assert_eq!(r.peek(&key), 5);
+        assert_eq_ish(r.proportional_rate(&key), 5.);
+
+        r.observe(&key, 3);
+        assert_eq!(r.peek(&key), 8);
+        assert_eq_ish(r.proportional_rate(&key), 8.);
     }
 }
