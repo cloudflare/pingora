@@ -470,6 +470,7 @@ where
                         match self
                             .inner
                             .response_body_filter(session, &mut body, end, ctx)
+                            .await
                         {
                             Ok(Some(duration)) => {
                                 trace!("delaying response for {duration:?}");
