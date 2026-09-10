@@ -99,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect() {
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         // make a new connection to 1.1.1.1
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
@@ -195,7 +195,7 @@ ZZ\r\n",
         }
 
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
         let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         get_http(&mut http, 301).await;

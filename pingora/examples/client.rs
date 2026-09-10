@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
 
     // create the HTTP session
     let peer_addr = "1.1.1.1:443";
-    let mut peer = HttpPeer::new(peer_addr, true, "one.one.one.one".into());
+    let mut peer = HttpPeer::new(peer_addr, true, "one.one.one.one".into()).unwrap();
     peer.options.set_http_version(2, 1);
     let (mut http, _reused) = connector.get_http_session(&peer).await?;
 
