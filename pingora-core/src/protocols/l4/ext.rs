@@ -186,6 +186,16 @@ fn ip_bind_addr_no_port(_fd: RawFd, _val: bool) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn set_ip_transparent(fd: RawFd, ipv6: bool, val: bool) -> io::Result<()> {
+    let (level, name) = if ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_TRANSPARENT)
+    };
+    set_opt(fd, level, name, val as c_int)
+}
+
 /// IP_LOCAL_PORT_RANGE is only supported on Linux 6.3 and higher,
 /// ip_local_port_range() is a no-op on unsupported versions.
 /// See the [man page](https://man7.org/linux/man-pages/man7/ip.7.html) for more details.

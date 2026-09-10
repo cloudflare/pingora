@@ -36,6 +36,8 @@ use super::connection_filter::ConnectionFilter;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 
+#[cfg(target_os = "linux")]
+use crate::protocols::l4::ext::set_ip_transparent;
 use crate::protocols::l4::ext::{set_dscp, set_recv_buf, set_snd_buf, set_tcp_fastopen_backlog};
 use crate::protocols::l4::listener::Listener;
 pub use crate::protocols::l4::stream::Stream;
@@ -113,6 +115,14 @@ pub struct TcpSocketOptions {
     /// This is useful for load balancing across multiple worker processes.
     /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
     pub so_reuseport: Option<bool>,
+    /// Enable transparent proxying with `IP_TRANSPARENT` (IPv4) or
+    /// `IPV6_TRANSPARENT` (IPv6) on Linux.
+    ///
+    /// Setting this to `true` requires `CAP_NET_ADMIN` or `CAP_NET_RAW`, plus
+    /// the routing/firewall configuration needed to deliver transparent
+    /// traffic. Inherited listener fds keep their existing socket options.
+    #[cfg(target_os = "linux")]
+    pub ip_transparent: Option<bool>,
     /// Set the send buffer size for accepted connections. See
     /// [SO_SNDBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
     pub tcp_snd_buf: Option<usize>,
@@ -180,7 +190,11 @@ mod uds {
 }
 
 // currently, these options can only apply on sockets prior to calling bind()
-fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) -> Result<()> {
+fn apply_tcp_socket_options(
+    sock: &TcpSocket,
+    _addr: &SocketAddr,
+    opt: Option<&TcpSocketOptions>,
+) -> Result<()> {
     let Some(opt) = opt else {
         return Ok(());
     };
@@ -198,6 +212,14 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
         socket_ref
             .set_reuse_port(reuseport)
             .or_err(BindError, "failed to set SO_REUSEPORT")?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(transparent) = opt.ip_transparent {
+        set_ip_transparent(sock.as_raw_fd(), _addr.is_ipv6(), transparent).or_err(
+            BindError,
+            "failed to set IP_TRANSPARENT (enabling it requires CAP_NET_ADMIN or CAP_NET_RAW)",
+        )?;
     }
 
     #[cfg(unix)]
@@ -262,7 +284,7 @@ async fn bind_tcp(addr: &str, opt: Option<TcpSocketOptions>) -> Result<Listener>
             .set_reuseaddr(true)
             .or_err(BindError, "fail to set_reuseaddr(true)")?;
 
-        apply_tcp_socket_options(&listener_socket, opt.as_ref())?;
+        apply_tcp_socket_options(&listener_socket, &sock_addr, opt.as_ref())?;
 
         match listener_socket.bind(sock_addr) {
             Ok(()) => {
@@ -583,6 +605,21 @@ mod test {
         tokio::net::UnixStream::connect(addr)
             .await
             .expect("can connect to UDS listener");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tcp_ip_transparent_false() {
+        let options = TcpSocketOptions {
+            ip_transparent: Some(false),
+            ..Default::default()
+        };
+        let v4 = TcpSocket::new_v4().unwrap();
+        apply_tcp_socket_options(&v4, &"127.0.0.1:0".parse().unwrap(), Some(&options)).unwrap();
+
+        if let Ok(v6) = TcpSocket::new_v6() {
+            apply_tcp_socket_options(&v6, &"[::1]:0".parse().unwrap(), Some(&options)).unwrap();
+        }
     }
 
     #[cfg(unix)]
