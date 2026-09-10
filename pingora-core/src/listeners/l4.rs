@@ -16,6 +16,7 @@
 use log::debug;
 use log::warn;
 use pingora_error::{
+    Error,
     ErrorType::{AcceptError, BindError},
     OrErr, Result,
 };
@@ -47,14 +48,14 @@ use crate::server::ListenFds;
 #[cfg(unix)]
 use std::sync::LazyLock;
 
-/// Per-address async lock map for serializing the check-bind-insert sequence
+/// Per-key async lock map for serializing the check-bind-insert sequence
 /// in [`ListenerEndpointBuilder::listen`].
 ///
 /// With `ListenFds` using a synchronous `parking_lot::Mutex`, the lock cannot
 /// be held across `bind().await`. This global map ensures that only one task at
 /// a time can be in the process of looking up, binding, and inserting a given
-/// address — preventing two concurrent callers from both seeing "not found" and
-/// racing to bind the same address.
+/// key — preventing two concurrent callers from both seeing "not found" and
+/// racing to bind the same key.
 #[cfg(unix)]
 static BIND_LOCKS: LazyLock<flurry::HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
     LazyLock::new(flurry::HashMap::new);
@@ -88,6 +89,11 @@ impl ServerAddress {
             Self::Tcp(_, op) => op.into(),
             _ => None,
         }
+    }
+
+    pub(crate) fn fd_transfer_key(&self, id: Option<&str>) -> String {
+        let addr = self.as_ref();
+        id.map_or_else(|| addr.to_string(), |id| format!("{addr}#id={id}"))
     }
 }
 
@@ -307,6 +313,8 @@ pub struct ListenerEndpoint {
 #[derive(Default)]
 pub struct ListenerEndpointBuilder {
     listen_addr: Option<ServerAddress>,
+    #[cfg(unix)]
+    fd_transfer_key: Option<String>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
@@ -315,6 +323,8 @@ impl ListenerEndpointBuilder {
     pub fn new() -> ListenerEndpointBuilder {
         Self {
             listen_addr: None,
+            #[cfg(unix)]
+            fd_transfer_key: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: None,
         }
@@ -322,6 +332,12 @@ impl ListenerEndpointBuilder {
 
     pub fn listen_addr(&mut self, addr: ServerAddress) -> &mut Self {
         self.listen_addr = Some(addr);
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn fd_transfer_key(&mut self, key: String) -> &mut Self {
+        self.fd_transfer_key = Some(key);
         self
     }
 
@@ -338,36 +354,56 @@ impl ListenerEndpointBuilder {
             .expect("Tried to listen with no addr specified");
 
         let listener = if let Some(fds_table) = fds {
-            let addr_str = listen_addr.as_ref();
-
-            // Acquire a per-address async lock so that only one task at a
+            let key = self
+                .fd_transfer_key
+                .as_deref()
+                .unwrap_or_else(|| listen_addr.as_ref());
+            // Acquire a per-key async lock so that only one task at a
             // time can go through the check-bind-insert sequence for a given
-            // address. The flurry guard is dropped before the await so its
+            // key. The flurry guard is dropped before the await so its
             // !Send pointer does not cross an await point.
-            let addr_lock = {
+            let key_lock = {
                 let guard = BIND_LOCKS.pin();
-                match guard.get(addr_str) {
+                match guard.get(key) {
                     Some(existing) => existing.clone(),
                     None => {
-                        let new_lock = Arc::new(tokio::sync::Mutex::new(()));
-                        match guard.try_insert(addr_str.to_string(), new_lock.clone()) {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        match guard.try_insert(key.to_string(), lock.clone()) {
                             Ok(inserted) => inserted.clone(),
                             Err(e) => e.current.clone(),
                         }
                     }
                 }
             };
-            let _guard = addr_lock.lock().await;
+            let _guard = key_lock.lock().await;
 
-            let existing_fd = fds_table.lock().get(addr_str).copied();
+            let existing_fd = {
+                let fds = fds_table.lock();
+                if fds.is_local(key) {
+                    return Error::e_explain(
+                        BindError,
+                        format!("duplicate listener transfer identity {key}"),
+                    );
+                }
+                fds.get(key).copied()
+            };
 
             if let Some(fd) = existing_fd {
-                from_raw_fd(&listen_addr, fd)?
+                let listener = from_raw_fd(&listen_addr, fd)?;
+                fds_table.lock().mark_local(key);
+                listener
             } else {
                 let listener = bind(&listen_addr).await?;
-                fds_table
+                if fds_table
                     .lock()
-                    .add(addr_str.to_string(), listener.as_raw_fd());
+                    .try_add(key.to_string(), listener.as_raw_fd())
+                    .is_err()
+                {
+                    return Error::e_explain(
+                        BindError,
+                        format!("duplicate listener transfer identity {key}"),
+                    );
+                }
                 listener
             }
         } else {
@@ -419,12 +455,7 @@ impl ListenerEndpoint {
         self.listen_addr.as_ref()
     }
 
-    /// Return the local address this endpoint is bound to.
-    ///
-    /// Useful when the listener was bound to port 0 (OS-assigned) to
-    /// discover the actual port.
-    #[cfg(test)]
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn local_addr(&self) -> std::io::Result<crate::protocols::l4::socket::SocketAddr> {
         self.listener.local_addr()
     }
 
@@ -522,7 +553,7 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
-        let addr = listener.local_addr().unwrap();
+        let addr = *listener.local_addr().unwrap().as_inet().unwrap();
 
         tokio::spawn(async move {
             // just try to accept once
@@ -550,7 +581,7 @@ mod test {
         #[cfg(windows)]
         let listener = builder.listen().await.unwrap();
 
-        let port = listener.local_addr().unwrap().port();
+        let port = listener.local_addr().unwrap().as_inet().unwrap().port();
 
         tokio::spawn(async move {
             // just try to accept twice
@@ -575,6 +606,15 @@ mod test {
         builder.listen_addr(ServerAddress::Uds(addr.into(), None));
 
         let listener = builder.listen(None).await.unwrap();
+        assert_eq!(
+            listener
+                .local_addr()
+                .unwrap()
+                .as_unix()
+                .unwrap()
+                .as_pathname(),
+            Some(std::path::Path::new(addr))
+        );
 
         tokio::spawn(async move {
             // just try to accept once

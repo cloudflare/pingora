@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 use crate::protocols::digest::{GetSocketDigest, SocketDigest};
+use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
 
 /// The type for generic listener for both TCP and Unix domain socket
@@ -68,16 +69,11 @@ impl AsRawSocket for Listener {
 
 impl Listener {
     /// Return the local address this listener is bound to.
-    ///
-    /// For TCP listeners this is the resolved address (including the
-    /// OS-assigned port when the listener was bound to port 0).
-    /// Returns `None` for non-TCP listeners (e.g. Unix domain sockets).
-    #[cfg(test)]
-    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
-            Self::Tcp(l) => l.local_addr().ok(),
+            Self::Tcp(listener) => listener.local_addr().map(Into::into),
             #[cfg(unix)]
-            Self::Unix(_) => None,
+            Self::Unix(listener) => listener.local_addr()?.try_into().map_err(io::Error::other),
         }
     }
 

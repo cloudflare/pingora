@@ -80,7 +80,7 @@ use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 use crate::server::ListenFds;
 
 use async_trait::async_trait;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::BindError, Result};
 use std::{any::Any, fs::Permissions, sync::Arc};
 
 use l4::{ListenerEndpoint, Stream as L4Stream};
@@ -165,6 +165,7 @@ struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
     l4_buffer: L4BufferSettings,
+    fd_transfer_id: Option<String>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
     pre_tls_callback: Option<PreTlsCallback>,
@@ -175,9 +176,21 @@ impl TransportStackBuilder {
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
     ) -> Result<TransportStack> {
+        if self
+            .fd_transfer_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || id.bytes().any(|byte| byte.is_ascii_whitespace()))
+        {
+            return Error::e_explain(
+                BindError,
+                "fd transfer ID must be non-empty and contain no ASCII whitespace",
+            );
+        }
         let mut builder = ListenerEndpoint::builder();
 
         builder.listen_addr(self.l4.clone());
+        #[cfg(unix)]
+        builder.fd_transfer_key(self.l4.fd_transfer_key(self.fd_transfer_id.as_deref()));
 
         #[cfg(feature = "connection_filter")]
         if let Some(filter) = &self.connection_filter {
@@ -208,6 +221,7 @@ pub struct ListenerConfig {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
     l4_buffer: L4BufferSettings,
+    fd_transfer_id: Option<String>,
 }
 
 impl ListenerConfig {
@@ -217,6 +231,7 @@ impl ListenerConfig {
             l4: ServerAddress::Tcp(addr.into(), None),
             tls: None,
             l4_buffer: L4BufferSettings::default(),
+            fd_transfer_id: None,
         }
     }
 
@@ -227,6 +242,7 @@ impl ListenerConfig {
             l4: ServerAddress::Uds(addr.into(), None),
             tls: None,
             l4_buffer: L4BufferSettings::default(),
+            fd_transfer_id: None,
         }
     }
 
@@ -264,6 +280,16 @@ impl ListenerConfig {
         self
     }
 
+    /// Set an fd-transfer ID to distinguish listeners sharing a configured address,
+    /// such as repeated port 0 or `SO_REUSEPORT` listeners.
+    ///
+    /// Keep the ID stable across upgrades. Mixed-version upgrades may rebind the listener.
+    /// IDs must be non-empty without ASCII whitespace, or listener binding fails.
+    pub fn fd_transfer_id(mut self, id: impl Into<String>) -> Self {
+        self.fd_transfer_id = Some(id.into());
+        self
+    }
+
     /// Set TLS settings for this endpoint.
     pub fn tls(mut self, settings: TlsSettings) -> Self {
         self.tls = Some(settings);
@@ -288,6 +314,10 @@ pub(crate) struct TransportStack {
 impl TransportStack {
     pub fn as_str(&self) -> &str {
         self.l4.as_str()
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.l4.local_addr()
     }
 
     pub async fn accept(&self) -> Result<UninitializedStream> {
@@ -434,6 +464,13 @@ impl Listeners {
             .collect()
     }
 
+    pub(crate) fn fd_transfer_keys(&self) -> Vec<String> {
+        self.stacks
+            .iter()
+            .map(|stack| stack.l4.fd_transfer_key(stack.fd_transfer_id.as_deref()))
+            .collect()
+    }
+
     /// Set a connection filter for all endpoints in this listener collection
     #[cfg(feature = "connection_filter")]
     pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
@@ -450,11 +487,17 @@ impl Listeners {
 
     /// Add the given listener endpoint to `self`.
     pub fn add_listener(&mut self, endpoint: ListenerConfig) {
-        let ListenerConfig { l4, tls, l4_buffer } = endpoint;
+        let ListenerConfig {
+            l4,
+            tls,
+            l4_buffer,
+            fd_transfer_id,
+        } = endpoint;
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
             l4_buffer,
+            fd_transfer_id,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
@@ -496,6 +539,7 @@ impl Listeners {
             l4,
             tls,
             l4_buffer: L4BufferSettings::default(),
+            fd_transfer_id: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
@@ -552,7 +596,7 @@ mod test {
         assert_eq!(listeners.len(), 2);
         let addrs: Vec<_> = listeners
             .iter()
-            .map(|s| s.l4.local_addr().unwrap())
+            .map(|s| *s.local_addr().unwrap().as_inet().unwrap())
             .collect();
         for listener in listeners {
             tokio::spawn(async move {
@@ -747,6 +791,168 @@ mod test {
             assert_eq!(request.await.unwrap(), reqwest::StatusCode::OK);
         }
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    fn port_zero_listener(id: &str) -> Listeners {
+        let mut listeners = Listeners::new();
+        listeners.add_listener(ListenerConfig::tcp("127.0.0.1:0").fd_transfer_id(id));
+        listeners
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_tags(
+        first: TransportStack,
+        first_addr: std::net::SocketAddr,
+        second: TransportStack,
+        second_addr: std::net::SocketAddr,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let first_server = tokio::spawn(async move {
+            let mut stream = first.accept().await.unwrap().handshake().await.unwrap();
+            stream.write_all(b"a").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let second_server = tokio::spawn(async move {
+            let mut stream = second.accept().await.unwrap().handshake().await.unwrap();
+            stream.write_all(b"b").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let mut first_client = TcpStream::connect(first_addr).await.unwrap();
+        let mut second_client = TcpStream::connect(second_addr).await.unwrap();
+        let mut first_tag = [0];
+        let mut second_tag = [0];
+        first_client.read_exact(&mut first_tag).await.unwrap();
+        second_client.read_exact(&mut second_tag).await.unwrap();
+        assert_eq!(first_tag, *b"a");
+        assert_eq!(second_tag, *b"b");
+        first_server.await.unwrap();
+        second_server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_transfer_keys_preserve_legacy_addresses() {
+        let mut listeners = Listeners::new();
+        listeners.add_tcp("127.0.0.1:8080");
+        listeners.add_uds("/tmp/pingora-transfer-key.sock", None);
+        listeners.add_tcp("127.0.0.1:0");
+        listeners.add_listener(ListenerConfig::tcp("127.0.0.1:0").fd_transfer_id("proxy"));
+
+        assert_eq!(
+            listeners.fd_transfer_keys(),
+            [
+                "127.0.0.1:8080",
+                "/tmp/pingora-transfer-key.sock",
+                "127.0.0.1:0",
+                "127.0.0.1:0#id=proxy",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn whitespace_fd_transfer_id_fails_to_build() {
+        let mut listeners = Listeners::new();
+        listeners.add_listener(ListenerConfig::tcp("127.0.0.1:0").fd_transfer_id("not valid"));
+
+        let error = match listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("invalid transfer ID unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.etype(), &BindError);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn duplicate_fd_transfer_ids_fail() {
+        use crate::server::{Fds, ListenFds};
+        use parking_lot::Mutex;
+
+        let fds: ListenFds = Arc::new(Mutex::new(Fds::new()));
+        let mut first = port_zero_listener("duplicate");
+        let mut second = port_zero_listener("duplicate");
+        let _first = first.build(Some(fds.clone())).await.unwrap();
+        let error = match second.build(Some(fds)).await {
+            Ok(_) => panic!("duplicate transfer ID unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("duplicate listener transfer identity"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stable_ids_survive_fd_transfer() {
+        use crate::server::{Fds, ListenFds};
+        use parking_lot::Mutex;
+
+        let fds: ListenFds = Arc::new(Mutex::new(Fds::new()));
+        let mut first = port_zero_listener("first");
+        let mut second = port_zero_listener("second");
+        let first_key = first.fd_transfer_keys().remove(0);
+        let second_key = second.fd_transfer_keys().remove(0);
+        let first_endpoints = first.build(Some(fds.clone())).await.unwrap();
+        let second_endpoints = second.build(Some(fds.clone())).await.unwrap();
+        let first_addr = *first_endpoints[0]
+            .l4
+            .local_addr()
+            .unwrap()
+            .as_inet()
+            .unwrap();
+        let second_addr = *second_endpoints[0]
+            .l4
+            .local_addr()
+            .unwrap()
+            .as_inet()
+            .unwrap();
+        assert_ne!(first_addr, second_addr);
+        assert_tags(
+            first_endpoints[0].clone(),
+            first_addr,
+            second_endpoints[0].clone(),
+            second_addr,
+        )
+        .await;
+
+        let path = format!("/tmp/pingora-port-zero-{}.sock", rand::random::<u64>());
+        let receiver_path = path.clone();
+        let receiver = std::thread::spawn(move || {
+            let mut received = Fds::new();
+            received.get_from_sock(receiver_path.as_str()).unwrap();
+            received
+        });
+        fds.lock().send_to_sock(path.as_str()).unwrap();
+        let received: ListenFds = Arc::new(Mutex::new(receiver.join().unwrap()));
+        assert!(received.lock().get(&first_key).is_some());
+        assert!(received.lock().get(&second_key).is_some());
+
+        let mut first_after = port_zero_listener("first")
+            .build(Some(received.clone()))
+            .await
+            .unwrap();
+        let mut second_after = port_zero_listener("second")
+            .build(Some(received))
+            .await
+            .unwrap();
+        let first_after = first_after.pop().unwrap();
+        let second_after = second_after.pop().unwrap();
+        assert_eq!(
+            first_after.l4.local_addr().unwrap().as_inet(),
+            Some(&first_addr)
+        );
+        assert_eq!(
+            second_after.l4.local_addr().unwrap().as_inet(),
+            Some(&second_addr)
+        );
+        assert_tags(first_after, first_addr, second_after, second_addr).await;
     }
 
     #[cfg(feature = "connection_filter")]
