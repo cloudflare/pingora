@@ -310,10 +310,10 @@ impl HttpSession {
         let mut skip_next_read = already_read != 0;
         let mut detached_suffix = None;
         loop {
-            if already_read > max_header_size {
-                /* NOTE: this check only blocks second read. The first large read is allowed
-                since the buf is already allocated. The goal is to avoid slowly bloating
-                this buffer */
+            if !skip_next_read && already_read > max_header_size {
+                /* NOTE: this check only blocks subsequent reads. The first read is allowed
+                since the buf is already allocated or pre-filled. The goal is to avoid slowly
+                bloating this buffer when an incomplete header exceeds limits. */
                 return Error::e_explain(
                     InvalidHTTPHeader,
                     format!("Request header larger than {max_header_size}"),
@@ -442,6 +442,12 @@ impl HttpSession {
                         return Ok(Some(s));
                     }
                     HeaderParseState::Partial => {
+                        if buf.len() > max_header_size {
+                            return Error::e_explain(
+                                InvalidHTTPHeader,
+                                format!("Request header larger than {max_header_size}"),
+                            );
+                        }
                         break; /* continue the read loop */
                     }
                     HeaderParseState::Invalid(e) => match e {
@@ -761,8 +767,11 @@ impl HttpSession {
     /// Set the maximum size of HTTP/1 request headers (including request line) in bytes.
     ///
     /// When set to `None`, Pingora's default limit of 1,048,575 bytes (~1 MiB) applies.
-    pub fn set_max_header_size(&mut self, max: Option<usize>) {
+    /// Returns an error if `max` is `Some(0)` or exceeds `MAX_HEADER_SIZE`.
+    pub fn set_max_header_size(&mut self, max: Option<usize>) -> Result<()> {
+        validate_max_header_size(max)?;
         self.max_header_size = max;
+        Ok(())
     }
 
     /// Return the configured maximum size of HTTP/1 request headers, if set.
@@ -773,8 +782,11 @@ impl HttpSession {
     /// Set the maximum number of HTTP/1 request headers allowed.
     ///
     /// When set to `None`, Pingora's default limit of 256 headers applies.
-    pub fn set_max_headers(&mut self, max: Option<usize>) {
+    /// Returns an error if `max` is `Some(0)` or exceeds `MAX_HEADERS`.
+    pub fn set_max_headers(&mut self, max: Option<usize>) -> Result<()> {
+        validate_max_headers(max)?;
         self.max_headers = max;
+        Ok(())
     }
 
     /// Return the configured maximum number of HTTP/1 request headers, if set.
@@ -4575,7 +4587,7 @@ mod test_pipelining {
         let input = b"GET /hello HTTP/1.1\r\nHost: example.com\r\nX-Foo: Bar\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_header_size(Some(512));
+        session.set_max_header_size(Some(512)).unwrap();
         assert_eq!(session.max_header_size(), Some(512));
 
         let res = session.read_request().await;
@@ -4591,7 +4603,7 @@ mod test_pipelining {
         let chunk2 = b"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\r\n\r\n";
         let mock_io = Builder::new().read(&chunk1[..]).read(&chunk2[..]).build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_header_size(Some(100));
+        session.set_max_header_size(Some(100)).unwrap();
 
         let res = session.read_request().await;
         assert!(res.is_err());
@@ -4610,7 +4622,7 @@ mod test_pipelining {
         assert_eq!(input.len(), 101);
         let mock_io = Builder::new().read(&input[..]).build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_header_size(Some(100));
+        session.set_max_header_size(Some(100)).unwrap();
 
         let res = session.read_request().await;
         assert!(res.is_err());
@@ -4629,11 +4641,77 @@ mod test_pipelining {
 
         let mock_io = Builder::new().build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_header_size(Some(50));
+        session.set_max_header_size(Some(50)).unwrap();
         session.set_pipelined_prefix(prefix);
 
         let res = session.read_request().await;
         assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_pipelined_prefix_with_large_suffix() {
+        init_log();
+        // Positive test: Header is 42 bytes, well within the limit of 100 bytes.
+        // Pipelined prefix contains header + 500 bytes of body / following data (total 542 bytes).
+        // Must be accepted, and the 500-byte suffix preserved.
+        let header = b"GET /first HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        assert_eq!(header.len(), 42);
+        let suffix = [b'x'; 500];
+        let mut prefix = BytesMut::with_capacity(header.len() + suffix.len());
+        prefix.extend_from_slice(header);
+        prefix.extend_from_slice(&suffix);
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_max_header_size(Some(100)).unwrap();
+        session.set_pipelined_prefix(prefix);
+
+        let res = session.read_request().await;
+        assert!(
+            res.is_ok(),
+            "within-limit header must be accepted despite large pipelined suffix"
+        );
+        assert_eq!(res.unwrap(), Some(header.len()));
+        assert_eq!(session.req_header().uri.path(), "/first");
+
+        // Verify the 500-byte suffix was preserved and not lost
+        let reused = session.reuse().await.unwrap().expect("connection reusable");
+        let (_, next_prefix) = reused.into_parts();
+        let next_prefix = next_prefix.expect("suffix remains buffered");
+        assert_eq!(next_prefix.as_ref(), &suffix[..]);
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_pipelined_prefix_over_limit_header() {
+        init_log();
+        // Negative test: Header itself is 150 bytes, exceeding limit of 100 bytes.
+        // Followed by 200 bytes of body/suffix (total 350 bytes).
+        let mut header = Vec::from(&b"GET / HTTP/1.1\r\nHost: pingora.org\r\nX-Long: "[..]);
+        header.resize(146, b'a');
+        header.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(header.len(), 150);
+
+        let suffix = [b'y'; 200];
+        let mut prefix = BytesMut::with_capacity(header.len() + suffix.len());
+        prefix.extend_from_slice(&header);
+        prefix.extend_from_slice(&suffix);
+
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_pipelining_enabled(true);
+        session.set_max_header_size(Some(100)).unwrap();
+        session.set_pipelined_prefix(prefix);
+
+        let res = session.read_request().await;
+        assert!(
+            res.is_err(),
+            "genuinely over-limit header in pipelined prefix must be rejected"
+        );
         assert_eq!(
             res.unwrap_err().etype(),
             &pingora_error::ErrorType::InvalidHTTPHeader
@@ -4646,7 +4724,7 @@ mod test_pipelining {
         let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nH1: 1\r\nH2: 2\r\nH3: 3\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_headers(Some(10));
+        session.set_max_headers(Some(10)).unwrap();
         assert_eq!(session.max_headers(), Some(10));
 
         let res = session.read_request().await;
@@ -4661,7 +4739,7 @@ mod test_pipelining {
         let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nH1: 1\r\nH2: 2\r\nH3: 3\r\nH4: 4\r\nH5: 5\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_max_headers(Some(3));
+        session.set_max_headers(Some(3)).unwrap();
 
         let res = session.read_request().await;
         assert!(res.is_err());
@@ -4669,6 +4747,34 @@ mod test_pipelining {
             res.unwrap_err().etype(),
             &pingora_error::ErrorType::InvalidHTTPHeader
         );
+    }
+
+    #[test]
+    fn test_direct_setters_bounds_validation() {
+        let mock_io = Builder::new().build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        // max_header_size bounds
+        assert!(session.set_max_header_size(Some(0)).is_err());
+        assert!(session
+            .set_max_header_size(Some(MAX_HEADER_SIZE + 1))
+            .is_err());
+        assert!(session.set_max_header_size(Some(MAX_HEADER_SIZE)).is_ok());
+        assert_eq!(session.max_header_size(), Some(MAX_HEADER_SIZE));
+        assert!(session.set_max_header_size(Some(1)).is_ok());
+        assert_eq!(session.max_header_size(), Some(1));
+        assert!(session.set_max_header_size(None).is_ok());
+        assert_eq!(session.max_header_size(), None);
+
+        // max_headers bounds
+        assert!(session.set_max_headers(Some(0)).is_err());
+        assert!(session.set_max_headers(Some(MAX_HEADERS + 1)).is_err());
+        assert!(session.set_max_headers(Some(MAX_HEADERS)).is_ok());
+        assert_eq!(session.max_headers(), Some(MAX_HEADERS));
+        assert!(session.set_max_headers(Some(1)).is_ok());
+        assert_eq!(session.max_headers(), Some(1));
+        assert!(session.set_max_headers(None).is_ok());
+        assert_eq!(session.max_headers(), None);
     }
 
     #[tokio::test]

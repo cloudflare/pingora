@@ -104,18 +104,8 @@ pub struct HttpServerOptions {
 impl HttpServerOptions {
     /// Validate that the options are valid.
     pub fn validate(&self) -> pingora_error::Result<()> {
-        if let Some(0) = self.max_header_size {
-            return pingora_error::Error::e_explain(
-                pingora_error::ErrorType::InvalidHTTPHeader,
-                "max_header_size must be greater than 0",
-            );
-        }
-        if let Some(0) = self.max_headers {
-            return pingora_error::Error::e_explain(
-                pingora_error::ErrorType::InvalidHTTPHeader,
-                "max_headers must be greater than 0",
-            );
-        }
+        crate::protocols::http::v1::common::validate_max_header_size(self.max_header_size)?;
+        crate::protocols::http::v1::common::validate_max_headers(self.max_headers)?;
         Ok(())
     }
 }
@@ -386,16 +376,16 @@ where
                     .and_then(|opts| opts.keepalive_request_limit),
             );
             if let Some(opts) = self.server_options() {
-                session.set_max_header_size(opts.max_header_size);
-                session.set_max_headers(opts.max_headers);
+                let _ = session.set_max_header_size(opts.max_header_size);
+                let _ = session.set_max_headers(opts.max_headers);
             }
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
                 let mut session = ServerSession::new_http1(stream);
                 if let Some(opts) = self.server_options() {
-                    session.set_max_header_size(opts.max_header_size);
-                    session.set_max_headers(opts.max_headers);
+                    let _ = session.set_max_header_size(opts.max_header_size);
+                    let _ = session.set_max_headers(opts.max_headers);
                 }
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
@@ -487,5 +477,25 @@ mod tests {
             ..Default::default()
         };
         assert!(zero_headers_opts.validate().is_err());
+
+        // Test upper bounds
+        let max_size_opts = HttpServerOptions {
+            max_header_size: Some(crate::protocols::http::v1::common::MAX_HEADER_SIZE),
+            max_headers: Some(crate::protocols::http::v1::common::MAX_HEADERS),
+            ..Default::default()
+        };
+        assert!(max_size_opts.validate().is_ok());
+
+        let over_max_size_opts = HttpServerOptions {
+            max_header_size: Some(crate::protocols::http::v1::common::MAX_HEADER_SIZE + 1),
+            ..Default::default()
+        };
+        assert!(over_max_size_opts.validate().is_err());
+
+        let over_max_headers_opts = HttpServerOptions {
+            max_headers: Some(crate::protocols::http::v1::common::MAX_HEADERS + 1),
+            ..Default::default()
+        };
+        assert!(over_max_headers_opts.validate().is_err());
     }
 }
