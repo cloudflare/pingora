@@ -15,6 +15,7 @@
 use foreign_types::ForeignTypeRef;
 use libc::*;
 use openssl::error::ErrorStack;
+use openssl::ex_data::Index;
 use openssl::pkey::{HasPrivate, PKeyRef};
 use openssl::ssl::{Ssl, SslAcceptor, SslRef};
 use openssl::x509::store::X509StoreRef;
@@ -26,6 +27,40 @@ use openssl_sys::{
 };
 use std::ffi::CString;
 use std::os::raw;
+use std::sync::OnceLock;
+
+// The downstream socket identifier, matching pingora-core's `UniqueIDType`
+// (`RawFd` on unix, `RawSocket`-as-usize on Windows). Mirrored here because
+// this crate sits below pingora-core and cannot import that alias; the two
+// resolve to the same concrete type, so `handshake_with_callback` passes
+// `io.id()` straight through with no cast.
+#[cfg(unix)]
+type DownstreamFd = i32;
+#[cfg(windows)]
+type DownstreamFd = usize;
+
+// Carry the downstream socket fd across the handshake so an async certificate
+// callback can recover the connection's identity via getsockopt. The fd is
+// stashed on the SSL by `handshake_with_callback` (see
+// pingora-core boringssl_openssl/server.rs) just before the callback runs, and
+// read back by the callback.
+fn downstream_fd_index() -> Index<Ssl, DownstreamFd> {
+    // One process-wide ex_data slot, shared between setter and getter. A second
+    // `new_ex_index()` would allocate a *different* slot and never match.
+    static IDX: OnceLock<Index<Ssl, DownstreamFd>> = OnceLock::new();
+    *IDX.get_or_init(|| Ssl::new_ex_index().expect("alloc ssl ex_index for downstream fd"))
+}
+
+/// Stash the downstream socket fd on the SSL so an async certificate callback
+/// can recover the connection's identity (e.g. getsockopt) during the handshake.
+pub fn set_downstream_fd(ssl: &mut SslRef, fd: DownstreamFd) {
+    ssl.set_ex_data(downstream_fd_index(), fd);
+}
+
+/// Recover the downstream fd stashed by [`set_downstream_fd`], if any.
+pub fn get_downstream_fd(ssl: &SslRef) -> Option<DownstreamFd> {
+    ssl.ex_data(downstream_fd_index()).copied()
+}
 
 fn cvt(r: c_long) -> Result<c_long, ErrorStack> {
     if r != 1 {
@@ -241,6 +276,24 @@ mod tests {
 
         // Invalid input (contains null byte)
         assert!(ssl_set_groups_list(ssl_ref, "P-256\0P-384").is_err());
+    }
+
+    #[test]
+    fn test_downstream_fd_round_trips() {
+        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        let ssl = Ssl::new(&ctx_builder.build()).unwrap();
+        let ssl_ref = unsafe { ssl_mut(&ssl) };
+
+        // Nothing stashed yet.
+        assert_eq!(get_downstream_fd(ssl_ref), None);
+
+        // A stashed fd reads back through the shared ex_data slot.
+        set_downstream_fd(ssl_ref, 42);
+        assert_eq!(get_downstream_fd(ssl_ref), Some(42));
+
+        // Overwriting replaces the previous value.
+        set_downstream_fd(ssl_ref, 7);
+        assert_eq!(get_downstream_fd(ssl_ref), Some(7));
     }
 
     #[test]
