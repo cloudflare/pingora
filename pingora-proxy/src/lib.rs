@@ -352,8 +352,8 @@ where
                         "Fail to proxy: {e}, downstream session type: {}",
                         downstream_session.session_type()
                     );
-                    downstream_session
-                        .respond_error(400)
+                    self.inner
+                        .request_error_filter(&mut downstream_session, &e)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
@@ -1891,6 +1891,7 @@ mod tests {
         read_buf: Vec<u8>,
         read_pos: usize,
         write_buf: Arc<Mutex<Vec<u8>>>,
+        shutdown: Arc<AtomicBool>,
     }
 
     impl StaticVirtualSocket {
@@ -1899,6 +1900,7 @@ mod tests {
                 read_buf: read_buf.to_vec(),
                 read_pos: 0,
                 write_buf,
+                shutdown: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -1934,6 +1936,7 @@ mod tests {
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdown.store(true, Ordering::Relaxed);
             Poll::Ready(Ok(()))
         }
     }
@@ -1975,6 +1978,229 @@ mod tests {
         ) -> Result<Box<HttpPeer>> {
             unreachable!()
         }
+    }
+
+    fn unread_request_session(
+        request: &[u8],
+    ) -> (HttpSession, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let socket = StaticVirtualSocket::new(request, written.clone());
+        let shutdown = socket.shutdown.clone();
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        (HttpSession::new_http1(Box::new(stream)), written, shutdown)
+    }
+
+    const MALFORMED_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nBad Header: value\r\n\r\n";
+    const INVALID_REQUEST: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+    const CUSTOM_ERROR_BODY: &[u8] = b"bad request\n";
+
+    enum RequestErrorAction {
+        Respond,
+        Close,
+        Fail,
+        RespondThenFail,
+    }
+
+    struct RequestErrorProxy {
+        calls: AtomicUsize,
+        action: RequestErrorAction,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for RequestErrorProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {
+            panic!("rejected requests must not create a proxy context");
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("rejected requests must not reach upstream selection");
+        }
+
+        async fn request_filter(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<bool> {
+            unreachable!("rejected requests must not reach request filters");
+        }
+
+        async fn logging(&self, _session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {
+            unreachable!("rejected requests must not reach normal logging");
+        }
+
+        async fn request_error_filter(&self, session: &mut HttpSession, e: &Error) -> Result<()> {
+            assert_eq!(e.etype(), &InvalidHTTPHeader);
+            assert_eq!(e.esource(), &ErrorSource::Downstream);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            // These accessors are usable even if parsing failed before a header was created.
+            let _ = session.client_addr();
+            let _ = session.digest();
+            if matches!(self.action, RequestErrorAction::Close) {
+                return Ok(());
+            }
+            if matches!(self.action, RequestErrorAction::Fail) {
+                return Err(Error::new(WriteError));
+            }
+            let mut response = ResponseHeader::build(422, Some(2))?;
+            response.set_content_length(CUSTOM_ERROR_BODY.len())?;
+            response.insert_header(header::CONTENT_TYPE, "text/plain")?;
+            session
+                .write_error_response(response, Bytes::from_static(CUSTOM_ERROR_BODY))
+                .await?;
+            if matches!(self.action, RequestErrorAction::RespondThenFail) {
+                return Err(Error::new(WriteError));
+            }
+            Ok(())
+        }
+    }
+
+    fn request_error_proxy(action: RequestErrorAction) -> Arc<HttpProxy<RequestErrorProxy>> {
+        Arc::new(HttpProxy::new(
+            RequestErrorProxy {
+                calls: AtomicUsize::new(0),
+                action,
+            },
+            Arc::new(ServerConf::default()),
+        ))
+    }
+
+    fn assert_rejection_response(
+        written: &Mutex<Vec<u8>>,
+        status: u16,
+        body: &[u8],
+        content_length: usize,
+    ) {
+        let written = written.lock().unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut response = httparse::Response::new(&mut headers);
+        let httparse::Status::Complete(header_len) = response.parse(&written).unwrap() else {
+            panic!("incomplete error response");
+        };
+        assert_eq!(response.code, Some(status));
+        let header = |name: &str| {
+            response
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .map(|h| h.value)
+        };
+        assert_eq!(header("connection"), Some(b"close".as_slice()));
+        assert_eq!(
+            header("content-length"),
+            Some(content_length.to_string().as_bytes())
+        );
+        if status == 422 {
+            assert_eq!(header("content-type"), Some(b"text/plain".as_slice()));
+            assert!(header("server").is_none());
+        } else {
+            assert!(header("server").is_some());
+        }
+        // Also rules out an appended fallback response or a response to pipelined input.
+        assert_eq!(&written[header_len..], body);
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_defaults_to_400() {
+        let proxy = HttpProxy::new(DefaultRetryProxy, Arc::new(ServerConf::default()));
+        for request in [MALFORMED_REQUEST, INVALID_REQUEST] {
+            let (session, written, shutdown) = unread_request_session(request);
+            assert!(proxy.handle_new_request(Box::new(session)).await.is_none());
+            assert!(shutdown.load(Ordering::Relaxed));
+            assert_rejection_response(&written, 400, b"", 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_customizes_rejected_requests_before_context_creation() {
+        for request in [MALFORMED_REQUEST, INVALID_REQUEST] {
+            let proxy = request_error_proxy(RequestErrorAction::Respond);
+            let (session, written, closed) = unread_request_session(request);
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            assert!(proxy.process_new_http(session, &shutdown).await.is_none());
+            assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 1);
+            assert!(closed.load(Ordering::Relaxed));
+            assert_rejection_response(&written, 422, CUSTOM_ERROR_BODY, CUSTOM_ERROR_BODY.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_preserves_head_body_suppression() {
+        let request = b"HEAD / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n";
+        let proxy = request_error_proxy(RequestErrorAction::Respond);
+        let (session, written, shutdown) = unread_request_session(request);
+        assert!(proxy.handle_new_request(Box::new(session)).await.is_none());
+        assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 1);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert_rejection_response(&written, 422, b"", CUSTOM_ERROR_BODY.len());
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_closes_without_a_fallback_response() {
+        for action in [RequestErrorAction::Close, RequestErrorAction::Fail] {
+            let proxy = request_error_proxy(action);
+            let (session, written, shutdown) = unread_request_session(MALFORMED_REQUEST);
+            assert!(proxy.handle_new_request(Box::new(session)).await.is_none());
+            assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 1);
+            assert!(shutdown.load(Ordering::Relaxed));
+            assert!(written.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_does_not_append_a_response_after_callback_failure() {
+        let proxy = request_error_proxy(RequestErrorAction::RespondThenFail);
+        let (session, written, shutdown) = unread_request_session(MALFORMED_REQUEST);
+        assert!(proxy.handle_new_request(Box::new(session)).await.is_none());
+        assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 1);
+        assert!(shutdown.load(Ordering::Relaxed));
+        assert_rejection_response(&written, 422, CUSTOM_ERROR_BODY, CUSTOM_ERROR_BODY.len());
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_does_not_process_pipelined_input_after_rejection() {
+        let mut request = MALFORMED_REQUEST.to_vec();
+        request.extend_from_slice(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let proxy = request_error_proxy(RequestErrorAction::Respond);
+        let (session, written, closed) = unread_request_session(&request);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        assert!(proxy.process_new_http(session, &shutdown).await.is_none());
+        assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 1);
+        assert!(closed.load(Ordering::Relaxed));
+        assert_rejection_response(&written, 422, CUSTOM_ERROR_BODY, CUSTOM_ERROR_BODY.len());
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_skips_valid_requests_and_connection_errors() {
+        for request in [
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".as_slice(),
+            b"",
+            b"GET / HTTP/1.1\r\nHost:",
+        ] {
+            let proxy = request_error_proxy(RequestErrorAction::Respond);
+            let (session, written, shutdown) = unread_request_session(request);
+            let result = proxy.handle_new_request(Box::new(session)).await;
+            assert_eq!(result.is_some(), request.ends_with(b"\r\n\r\n"));
+            assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 0);
+            assert!(written.lock().unwrap().is_empty());
+            if request.ends_with(b"Host:") {
+                assert!(shutdown.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_error_filter_skips_shutdown() {
+        let proxy = request_error_proxy(RequestErrorAction::Respond);
+        proxy.http_cleanup().await;
+        assert!(proxy.handle_new_request(pending_session()).await.is_none());
+        assert_eq!(proxy.inner.calls.load(Ordering::Relaxed), 0);
     }
 
     fn default_policy_would_retry_for_session(
