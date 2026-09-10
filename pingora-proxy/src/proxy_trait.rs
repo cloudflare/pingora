@@ -302,6 +302,17 @@ pub trait ProxyHttp {
     /// Unlike [`Self::request_body_filter()`], this callback explicitly runs before any
     /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
     ///
+    /// Modify the current chunk through `body`. Set `*body = None` to discard it; do this on every
+    /// invocation to discard the entire body. After the buffering loop finishes, Pingora
+    /// assembles the chunks your filter leaves in place and stores the result. Do not call
+    /// [`Session::set_buffered_body()`] from this callback because that assembled result may
+    /// overwrite it. To replace the fully assembled body, call [`Session::set_buffered_body()`]
+    /// later from [`Self::request_filter()`].
+    ///
+    /// When filtering changes the body length, update `Content-Length` and `Transfer-Encoding`
+    /// before forwarding. Pingora emits HTTP/2 stream termination itself based on the downstream
+    /// request rather than the chunks retained by this filter.
+    ///
     /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
     ///
     /// Requires the `early_body_buffer` feature.

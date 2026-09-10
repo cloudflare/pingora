@@ -19,13 +19,17 @@
 //!
 //! 1. **Stream**: process each body chunk as it arrives in
 //!    `early_request_body_filter()` — before any header-phase filters run.
-//!    The example logs each chunk's byte count to show the streaming nature.
+//!    The example logs each chunk's byte count to show the streaming nature. Modify
+//!    the current chunk through the callback's `body` argument, or set it to `None`
+//!    to discard the chunk.
 //!
 //! 2. **Peek**: read the assembled buffered body with `get_buffered_body()`
 //!    in `request_filter()` to make routing decisions.
 //!
 //! 3. **Mutate**: replace the buffered body with `set_buffered_body()` so
-//!    the upstream receives the modified version.
+//!    the upstream receives the modified version. Do this from `request_filter()`,
+//!    after Pingora has assembled the chunks, rather than from
+//!    `early_request_body_filter()`.
 //!
 //! Uses httpbin.org as the upstream — its `/post` endpoint echoes back the
 //! request body, so you can verify mutations in the response.
@@ -85,6 +89,9 @@ impl ProxyHttp for MyProxy {
     /// Stream: process each body chunk as it arrives during early buffering.
     ///
     /// This fires per-chunk, BEFORE request_filter sees the assembled body.
+    /// Mutate the chunk through `body`; setting `*body = None` discards it. To
+    /// discard the entire body, do that on every invocation and reconcile the
+    /// request framing before forwarding.
     async fn early_request_body_filter(
         &self,
         _session: &mut Session,

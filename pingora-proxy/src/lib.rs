@@ -1002,10 +1002,20 @@ impl Session {
     /// The body is retained and replayed across upstream retries. `None` marks the request body as
     /// fully consumed and empty.
     ///
+    /// When automatic early buffering is enabled, call this from
+    /// [`ProxyHttp::request_filter()`], after Pingora has assembled the filtered chunks. Do not
+    /// call it from [`ProxyHttp::early_request_body_filter()`]; that callback must modify its
+    /// `body` argument, and the buffering loop may overwrite the body you set when it stores the
+    /// assembled result.
+    ///
     /// Application code calling this directly must first fully consume the downstream body and
-    /// handle `Expect: 100-continue` before reading. It must also update request framing
-    /// (`Content-Length`, `Transfer-Encoding`, and H2 end-of-stream behavior) to describe the
-    /// supplied body.
+    /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
+    /// `Transfer-Encoding` to describe the supplied body.
+    ///
+    /// For HTTP/2, a body cannot currently be added to a request that arrived without one.
+    /// Pingora determines stream termination from the downstream body state, so it may terminate
+    /// the upstream stream before the subsequent write of the buffered body, causing that write
+    /// to fail.
     #[cfg(feature = "early_body_buffer")]
     pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
         self.body_buffered = true;

@@ -66,10 +66,16 @@ This phase runs during early body buffering, **before** `request_filter()` and `
 
 Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
 
+Modify or discard each chunk through the callback's `body` argument. Set `*body = None` on every invocation to discard the entire body. After the buffering loop finishes, Pingora assembles the filtered chunks and stores the result, so do not call `session.set_buffered_body()` from `early_request_body_filter()`. To replace the fully assembled body, call it later from `request_filter()`.
+
+Whenever filtering or replacement changes the body length, update `Content-Length` and `Transfer-Encoding` before forwarding. In particular, leaving the original `Content-Length` after discarding bytes can leave an HTTP/1.1 upstream waiting for data that will never arrive. Pingora emits HTTP/2 stream termination itself based on the downstream request rather than the chunks retained by this filter.
+
 Pingora answers an HTTP/1.1 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
 
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.
+
+Use `session.set_buffered_body()` here to replace the assembled body. For HTTP/2, it cannot currently add a body to a request that arrived without one; see its API documentation for details.
 
 ### `request_body_filter()`
 This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received. This runs during the upstream forwarding phase, after `upstream_peer()` and connection establishment.
