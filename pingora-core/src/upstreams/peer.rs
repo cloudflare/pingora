@@ -500,8 +500,21 @@ pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
     pub total_connection_timeout: Option<Duration>,
+    /// Maximum duration of a single read from an upstream HTTP response.
+    ///
+    /// This applies while reading response headers and each response body chunk. It does not
+    /// limit the total response time. `None` disables the per-read timeout.
     pub read_timeout: Option<Duration>,
+    /// How long a reusable upstream connection may remain idle in the connection pool.
+    ///
+    /// The timer starts after a completed HTTP session is released back to the pool. For HTTP/2,
+    /// the connection must also have no active streams. This does not time out an active session;
+    /// use [`Self::read_timeout`] or [`Self::write_timeout`] for active I/O.
     pub idle_timeout: Option<Duration>,
+    /// Maximum duration of a single write to an upstream HTTP request.
+    ///
+    /// This applies while writing request headers and each request body chunk. It does not limit
+    /// the total request time. `None` disables the per-write timeout.
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
     pub verify_hostname: bool,
@@ -521,7 +534,9 @@ pub struct PeerOptions {
     pub s2n_security_policy: Option<S2NPolicy>,
     #[cfg(feature = "s2n")]
     pub max_blinding_delay: Option<u32>,
-    /// How many concurrent h2 streams are allowed in the same connection.
+    /// Local limit on concurrent HTTP/2 streams opened on one upstream connection.
+    ///
+    /// The upstream's advertised limit may reduce the actual concurrency. The default is `1`.
     pub max_h2_streams: usize,
     /// Initial per-stream H2 receive window size in bytes.
     /// If `None`, the default of 8MB is used.
@@ -543,11 +558,21 @@ pub struct PeerOptions {
     pub allow_h1_response_invalid_content_length: bool,
     /// Controls automatically forwarded request headers sent to HTTP upstreams.
     pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
+    /// Additional headers to include in an HTTP `CONNECT` request to a configured proxy.
+    ///
+    /// These entries are appended to the headers in [`Proxy::headers`]. Values contain the raw
+    /// header bytes.
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
-    /// The list of curves the tls connection should advertise
-    /// if `None`, the default curves will be used
+    /// OpenSSL-format list of TLS curves or groups to advertise for this peer.
+    ///
+    /// `None` uses the connector's default group list. This option applies to OpenSSL-based TLS
+    /// connectors.
     pub curves: Option<Cow<'static, str>>,
-    /// see ssl_use_second_key_share
+    /// Whether to send a non-post-quantum key share alongside the first configured post-quantum
+    /// key share in the TLS ClientHello.
+    ///
+    /// The default is `true`. This option is only effective in BoringSSL builds that expose the
+    /// post-quantum second-key-share extension; other TLS backends ignore it.
     pub second_keyshare: bool,
     /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
