@@ -372,6 +372,48 @@ impl Session {
         }
     }
 
+    /// Set the maximum size of request headers (in bytes) allowed for HTTP/1.x downstream sessions.
+    ///
+    /// When set to `None`, Pingora's default limit of 1,048,575 bytes (~1 MiB) applies.
+    /// Returns an error if `max` is `Some(0)` or exceeds `MAX_HEADER_SIZE`.
+    /// For non-HTTP/1.x connections (h2, subrequest, custom), validates the bounds and returns `Ok(())`.
+    pub fn set_max_header_size(&mut self, max: Option<usize>) -> Result<()> {
+        if let Self::H1(s) = self {
+            s.set_max_header_size(max)
+        } else {
+            crate::protocols::http::v1::common::validate_max_header_size(max)
+        }
+    }
+
+    /// Return the configured maximum size of HTTP/1 request headers, if set.
+    pub fn max_header_size(&self) -> Option<usize> {
+        match self {
+            Self::H1(s) => s.max_header_size(),
+            _ => None,
+        }
+    }
+
+    /// Set the maximum number of request headers allowed for HTTP/1.x downstream sessions.
+    ///
+    /// When set to `None`, Pingora's default limit of 256 headers applies.
+    /// Returns an error if `max` is `Some(0)` or exceeds `MAX_HEADERS`.
+    /// For non-HTTP/1.x connections (h2, subrequest, custom), validates the bounds and returns `Ok(())`.
+    pub fn set_max_headers(&mut self, max: Option<usize>) -> Result<()> {
+        if let Self::H1(s) = self {
+            s.set_max_headers(max)
+        } else {
+            crate::protocols::http::v1::common::validate_max_headers(max)
+        }
+    }
+
+    /// Return the configured maximum number of HTTP/1 request headers, if set.
+    pub fn max_headers(&self) -> Option<usize> {
+        match self {
+            Self::H1(s) => s.max_headers(),
+            _ => None,
+        }
+    }
+
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
@@ -1280,5 +1322,40 @@ mod tests {
         ) -> Result<()> {
             unreachable!("not used by proxy task dispatch test")
         }
+    }
+
+    #[tokio::test]
+    async fn test_server_session_header_limits_bounds() {
+        use crate::protocols::http::v1::common::{MAX_HEADERS, MAX_HEADER_SIZE};
+        use tokio_test::io::Builder;
+
+        let mock_io = Builder::new().build();
+        let mut session = Session::new_http1(Box::new(mock_io));
+
+        // Valid bounds
+        assert!(session.set_max_header_size(Some(MAX_HEADER_SIZE)).is_ok());
+        assert_eq!(session.max_header_size(), Some(MAX_HEADER_SIZE));
+        assert!(session.set_max_header_size(Some(1)).is_ok());
+        assert_eq!(session.max_header_size(), Some(1));
+        assert!(session.set_max_header_size(None).is_ok());
+        assert_eq!(session.max_header_size(), None);
+
+        // Invalid bounds
+        assert!(session.set_max_header_size(Some(0)).is_err());
+        assert!(session
+            .set_max_header_size(Some(MAX_HEADER_SIZE + 1))
+            .is_err());
+
+        // Header count bounds
+        assert!(session.set_max_headers(Some(MAX_HEADERS)).is_ok());
+        assert_eq!(session.max_headers(), Some(MAX_HEADERS));
+        assert!(session.set_max_headers(Some(1)).is_ok());
+        assert_eq!(session.max_headers(), Some(1));
+        assert!(session.set_max_headers(None).is_ok());
+        assert_eq!(session.max_headers(), None);
+
+        // Invalid header counts
+        assert!(session.set_max_headers(Some(0)).is_err());
+        assert!(session.set_max_headers(Some(MAX_HEADERS + 1)).is_err());
     }
 }
