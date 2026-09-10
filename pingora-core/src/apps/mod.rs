@@ -286,6 +286,13 @@ where
         mut stream: Stream,
         shutdown: &ShutdownWatch,
     ) -> Option<Stream> {
+        if let Some(opts) = self.server_options() {
+            if let Err(e) = opts.validate() {
+                error!("Invalid HttpServerOptions: {e}");
+                return None;
+            }
+        }
+
         let mut h2c = self.server_options().as_ref().map_or(false, |o| o.h2c);
         let custom = self
             .server_options()
@@ -376,16 +383,28 @@ where
                     .and_then(|opts| opts.keepalive_request_limit),
             );
             if let Some(opts) = self.server_options() {
-                let _ = session.set_max_header_size(opts.max_header_size);
-                let _ = session.set_max_headers(opts.max_headers);
+                if let Err(e) = session.set_max_header_size(opts.max_header_size) {
+                    error!("Failed to set max_header_size: {e}");
+                    return None;
+                }
+                if let Err(e) = session.set_max_headers(opts.max_headers) {
+                    error!("Failed to set max_headers: {e}");
+                    return None;
+                }
             }
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
                 let mut session = ServerSession::new_http1(stream);
                 if let Some(opts) = self.server_options() {
-                    let _ = session.set_max_header_size(opts.max_header_size);
-                    let _ = session.set_max_headers(opts.max_headers);
+                    if let Err(e) = session.set_max_header_size(opts.max_header_size) {
+                        error!("Failed to set max_header_size on reused session: {e}");
+                        return None;
+                    }
+                    if let Err(e) = session.set_max_headers(opts.max_headers) {
+                        error!("Failed to set max_headers on reused session: {e}");
+                        return None;
+                    }
                 }
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
@@ -497,5 +516,57 @@ mod tests {
             ..Default::default()
         };
         assert!(over_max_headers_opts.validate().is_err());
+    }
+
+    struct MockAppWithInvalidOptions {
+        opts: HttpServerOptions,
+    }
+
+    #[async_trait]
+    impl HttpServerApp for MockAppWithInvalidOptions {
+        async fn process_new_http(
+            self: &Arc<Self>,
+            _session: ServerSession,
+            _shutdown: &ShutdownWatch,
+        ) -> Option<ReusedHttpStream> {
+            panic!("Should not be called when options are invalid!");
+        }
+
+        fn server_options(&self) -> Option<&HttpServerOptions> {
+            Some(&self.opts)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fail_closed_activation_with_invalid_server_options() {
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        for invalid_opts in [
+            HttpServerOptions {
+                max_header_size: Some(0),
+                ..Default::default()
+            },
+            HttpServerOptions {
+                max_headers: Some(0),
+                ..Default::default()
+            },
+            HttpServerOptions {
+                max_header_size: Some(crate::protocols::http::v1::common::MAX_HEADER_SIZE + 1),
+                ..Default::default()
+            },
+            HttpServerOptions {
+                max_headers: Some(crate::protocols::http::v1::common::MAX_HEADERS + 1),
+                ..Default::default()
+            },
+        ] {
+            let app = Arc::new(MockAppWithInvalidOptions { opts: invalid_opts });
+            let mock_io = Builder::new().build();
+            let stream = Box::new(mock_io);
+            let res = app.process_new(stream, &shutdown_rx).await;
+            assert!(
+                res.is_none(),
+                "Must fail closed (return None) when server options are invalid"
+            );
+        }
     }
 }

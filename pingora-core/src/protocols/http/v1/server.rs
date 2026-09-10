@@ -214,9 +214,19 @@ impl HttpSession {
         &mut self,
         buf: &mut BytesMut,
         already_read: usize,
+        max_header_size: usize,
     ) -> Result<Option<usize>> {
+        let remaining = max_header_size.saturating_sub(already_read);
+        if remaining == 0 {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                format!("Request header larger than {max_header_size}"),
+            );
+        }
+
         let read_result = {
-            let read_event = self.underlying_stream.read_buf(buf);
+            let mut limited_stream = (&mut self.underlying_stream).take(remaining as u64);
+            let read_event = limited_stream.read_buf(buf);
             match self.keepalive_timeout {
                 KeepaliveStatus::Timeout(d) => match timeout(d, read_event).await {
                     Ok(res) => res,
@@ -310,7 +320,7 @@ impl HttpSession {
         let mut skip_next_read = already_read != 0;
         let mut detached_suffix = None;
         loop {
-            if !skip_next_read && already_read > max_header_size {
+            if !skip_next_read && already_read >= max_header_size {
                 /* NOTE: this check only blocks subsequent reads. The first read is allowed
                 since the buf is already allocated or pre-filled. The goal is to avoid slowly
                 bloating this buffer when an incomplete header exceeds limits. */
@@ -328,7 +338,10 @@ impl HttpSession {
             // this request and is waiting for our response).
             if skip_next_read {
                 skip_next_read = false;
-            } else if let Some(n) = self.read_request_buf(&mut buf, already_read).await? {
+            } else if let Some(n) = self
+                .read_request_buf(&mut buf, already_read, max_header_size)
+                .await?
+            {
                 already_read += n;
             } else {
                 return Ok(None);
@@ -442,7 +455,7 @@ impl HttpSession {
                         return Ok(Some(s));
                     }
                     HeaderParseState::Partial => {
-                        if buf.len() > max_header_size {
+                        if buf.len() >= max_header_size {
                             return Error::e_explain(
                                 InvalidHTTPHeader,
                                 format!("Request header larger than {max_header_size}"),
@@ -4598,11 +4611,13 @@ mod test_pipelining {
     #[tokio::test]
     async fn test_max_header_size_exceeded_multi_chunk() {
         init_log();
-        // 2 chunks: total 300 bytes, limit 150
+        // 2 chunks: total 148 bytes, limit 100
         let chunk1 = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Custom-1: ";
         let chunk2 = b"abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\r\n\r\n";
-        let mock_io = Builder::new().read(&chunk1[..]).read(&chunk2[..]).build();
-        let mut session = HttpSession::new(Box::new(mock_io));
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&chunk1[..]).await.unwrap();
+        client.write_all(&chunk2[..]).await.unwrap();
+        let mut session = HttpSession::new(Box::new(server));
         session.set_max_header_size(Some(100)).unwrap();
 
         let res = session.read_request().await;
@@ -4620,8 +4635,9 @@ mod test_pipelining {
         // Request line (16) + Host (19) + "X-Long: " (8) + value (54) + "\r\n\r\n" (4) = 101 bytes.
         let input = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Long: 123456789012345678901234567890123456789012345678901234\r\n\r\n";
         assert_eq!(input.len(), 101);
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut session = HttpSession::new(Box::new(mock_io));
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&input[..]).await.unwrap();
+        let mut session = HttpSession::new(Box::new(server));
         session.set_max_header_size(Some(100)).unwrap();
 
         let res = session.read_request().await;
@@ -4788,5 +4804,99 @@ mod test_pipelining {
 
         let res = session.read_request().await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_exact_limit_complete_success() {
+        init_log();
+        // Construct a complete request header of exactly 100 bytes
+        let mut input = Vec::from(&b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: "[..]);
+        input.resize(96, b'a');
+        input.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(input.len(), 100);
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(100)).unwrap();
+
+        let res = session.read_request().await;
+        assert!(res.is_ok(), "exact-limit complete header must succeed");
+        assert_eq!(res.unwrap(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_exact_limit_partial_rejected_without_read() {
+        init_log();
+        // Construct an incomplete header of exactly 100 bytes (no ending CRLFCRLF)
+        let mut input = Vec::from(&b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: "[..]);
+        input.resize(100, b'a');
+        assert_eq!(input.len(), 100);
+
+        // Builder has only one read of 100 bytes. If read_request attempts another read,
+        // it would fail on mock_io. It must reject immediately on Partial at equality.
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(100)).unwrap();
+
+        let res = session.read_request().await;
+        assert!(
+            res.is_err(),
+            "exact-limit incomplete header must be rejected"
+        );
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_multi_read_bounded_by_remaining_budget() {
+        init_log();
+        // Test that a single read does not grow the buffer beyond the remaining budget.
+        // max_header_size = 100.
+        // Chunk 1: 90 bytes (incomplete header)
+        // Chunk 2: 50 bytes (would exceed budget if fully read into buffer)
+        let mut chunk1 = Vec::from(&b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: "[..]);
+        chunk1.resize(90, b'a');
+        assert_eq!(chunk1.len(), 90);
+
+        let chunk2 = [b'b'; 50];
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&chunk1).await.unwrap();
+        client.write_all(&chunk2).await.unwrap();
+        let mut session = HttpSession::new(Box::new(server));
+        session.set_max_header_size(Some(100)).unwrap();
+
+        let res = session.read_request().await;
+        assert!(res.is_err(), "multi-read exceeding budget must be rejected");
+        assert_eq!(
+            res.unwrap_err().etype(),
+            &pingora_error::ErrorType::InvalidHTTPHeader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_header_size_multi_read_exact_limit_success() {
+        init_log();
+        // Near-limit multi-read: total 100 bytes delivered across 2 chunks of 50 bytes
+        let mut full = Vec::from(&b"GET / HTTP/1.1\r\nHost: a\r\nX-Pad: "[..]);
+        full.resize(96, b'a');
+        full.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(full.len(), 100);
+
+        let chunk1 = &full[..50];
+        let chunk2 = &full[50..];
+
+        let mock_io = Builder::new().read(chunk1).read(chunk2).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_max_header_size(Some(100)).unwrap();
+
+        let res = session.read_request().await;
+        assert!(
+            res.is_ok(),
+            "near-limit multi-read completing at exact limit must succeed"
+        );
+        assert_eq!(res.unwrap(), Some(100));
     }
 }
