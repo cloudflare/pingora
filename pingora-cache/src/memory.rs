@@ -141,7 +141,7 @@ pub struct PartialHit {
 }
 
 impl PartialHit {
-    async fn read(&mut self) -> Option<Bytes> {
+    async fn read(&mut self) -> Result<Option<Bytes>> {
         loop {
             let bytes_written = *self.bytes_written.borrow_and_update();
             let bytes_end = match bytes_written {
@@ -149,7 +149,7 @@ impl PartialHit {
                 PartialState::Complete(c) => {
                     // no more data will arrive
                     if c == self.bytes_read {
-                        return None;
+                        return Ok(None);
                     }
                     c
                 }
@@ -161,14 +161,20 @@ impl PartialHit {
                 let new_bytes =
                     Bytes::copy_from_slice(&self.body.read()[self.bytes_read..bytes_end]);
                 self.bytes_read = bytes_end;
-                return Some(new_bytes);
+                return Ok(Some(new_bytes));
             }
 
             // wait for more data
             if self.bytes_written.changed().await.is_err() {
-                // err: sender dropped, body is finished
-                // FIXME: sender could drop because of an error
-                return None;
+                // The writer dropped without reaching EOF. Per the storage
+                // contract, a miss handler dropped without finish() means the
+                // write failed, so this partial body must not be reported as
+                // a clean end of body — the reader would otherwise serve a
+                // truncated response as if it were complete.
+                return Error::e_explain(
+                    ErrorType::InternalError,
+                    "partial cache writer aborted before EOF",
+                );
             }
         }
     }
@@ -179,7 +185,7 @@ impl HandleHit for MemHitHandler {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
         match self {
             Self::Complete(c) => Ok(c.get()),
-            Self::Partial(p) => Ok(p.read().await),
+            Self::Partial(p) => p.read().await,
         }
     }
     async fn finish(
@@ -265,6 +271,17 @@ impl HandleMiss for MemMissHandler {
     }
 
     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        // Mark the body as complete so partial readers observe a real EOF:
+        // finish() means the admission succeeded, even if the final
+        // write_body did not set eof=true. Readers then only see the sender
+        // drop while the state is still Partial when the writer was aborted.
+        // Copy the state out first: the borrow Ref must be dropped before
+        // send_replace, which takes the watch's internal write lock.
+        let state = *self.bytes_written.borrow();
+        if let PartialState::Partial(p) = state {
+            self.bytes_written.send_replace(PartialState::Complete(p));
+        }
+
         // safe, the temp object is inserted when the miss handler is created
         let cache_object = self
             .temp
@@ -625,6 +642,43 @@ mod test {
         assert!(data.is_none());
         let data = hit_handler2.read_body().await.unwrap();
         assert!(data.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_partial_reader_errors_on_aborted_writer() {
+        // A writer dropped without finish() and without reaching EOF means the
+        // cache admission failed; the partial reader must surface an error
+        // instead of a clean end-of-body, so the client never sees a truncated
+        // response as complete (issue #932).
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let span = &Span::inactive().handle();
+
+        let key1 = CacheKey::new("", "a", "1");
+        let cache_meta = gen_meta();
+
+        let miss_handler = MEM_CACHE
+            .get_miss_handler(&key1, &cache_meta, span)
+            .await
+            .unwrap();
+
+        // reader observes the partial body while the writer is still active
+        let (_, mut hit_handler) = MEM_CACHE.lookup(&key1, span).await.unwrap().unwrap();
+
+        let mut miss_handler = miss_handler;
+        miss_handler
+            .write_body(b"test1"[..].into(), false)
+            .await
+            .unwrap();
+        let data = hit_handler.read_body().await.unwrap().unwrap();
+        assert_eq!("test1", data);
+
+        // writer is cancelled before EOF and before finish(): the storage
+        // contract says the write failed
+        drop(miss_handler);
+
+        // the reader must error, not report clean EOF
+        let res = hit_handler.read_body().await;
+        assert!(res.is_err(), "aborted writer must not look like clean EOF");
     }
 
     #[tokio::test]
