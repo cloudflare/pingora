@@ -532,6 +532,11 @@ impl ResponseStateMachine {
 pub(crate) enum PipeState {
     Active = 0,
     DownstreamComplete = 1,
+    /// The downstream half aborted while running a response filter. The
+    /// upstream half drains the remaining response body so the connection
+    /// can still be reused (e.g. a 3xx redirect followed by the outer retry
+    /// loop after a `response_filter` error).
+    DownstreamFilterAborted = 2,
 }
 
 impl PipeState {
@@ -540,6 +545,11 @@ impl PipeState {
     /// comparison the upstream halves perform on a task-pipe closure.
     pub(crate) fn is_downstream_complete(raw: u8) -> bool {
         raw == PipeState::DownstreamComplete as u8
+    }
+
+    /// Whether `raw` is [`DownstreamFilterAborted`](Self::DownstreamFilterAborted).
+    pub(crate) fn is_downstream_filter_aborted(raw: u8) -> bool {
+        raw == PipeState::DownstreamFilterAborted as u8
     }
 }
 

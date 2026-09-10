@@ -149,18 +149,73 @@ where
         let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
 
         // start bi-directional streaming
-        let ret = tokio::try_join!(
-            self.proxy_handle_downstream(
-                session,
-                tx_downstream,
-                rx_upstream,
-                ctx,
-                &mut downstream_custom_message_writer,
-                &mut downstream_custom_message_reader,
-                pipe_state.clone(),
-            ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
-        );
+        // Unlike try_join!, an error from the downstream half does not cancel
+        // the upstream half: when the downstream half aborted in a response
+        // filter, the upstream half is allowed to drain the remaining
+        // response body so the connection can still be reused (issue #866).
+        let mut downstream = Box::pin(self.proxy_handle_downstream(
+            session,
+            tx_downstream,
+            rx_upstream,
+            ctx,
+            &mut downstream_custom_message_writer,
+            &mut downstream_custom_message_reader,
+            pipe_state.clone(),
+        ));
+        let mut upstream = Box::pin(self.proxy_handle_upstream(
+            client_session,
+            tx_upstream,
+            rx_downstream,
+            pipe_state.clone(),
+        ));
+
+        let (downstream_can_reuse, upstream_can_reuse, error) = tokio::select! {
+            r = &mut downstream => {
+                match r {
+                    Ok(downstream_can_reuse) => {
+                        match (&mut upstream).await {
+                            Ok(upstream_can_reuse) => (downstream_can_reuse, upstream_can_reuse, None),
+                            Err(e) => (false, false, Some(e)),
+                        }
+                    }
+                    Err(e) => {
+                        if PipeState::is_downstream_filter_aborted(
+                            pipe_state.load(Ordering::Acquire),
+                        ) {
+                            // The downstream half aborted in a response filter
+                            // (e.g. a 3xx redirect followed by the outer retry
+                            // loop). Let the upstream half drain the remaining
+                            // response body; the connection is reusable only if
+                            // the drain completed.
+                            match (&mut upstream).await {
+                                Ok(true) => (false, true, Some(e)),
+                                Ok(false) => (false, false, Some(e)),
+                                Err(up_e) => (false, false, Some(up_e)),
+                            }
+                        } else {
+                            // Fail fast, dropping the upstream half; the caller
+                            // closes the connection since client_reuse=false.
+                            (false, false, Some(e))
+                        }
+                    }
+                }
+            }
+            r = &mut upstream => {
+                match r {
+                    Ok(upstream_can_reuse) => {
+                        match (&mut downstream).await {
+                            Ok(downstream_can_reuse) => (downstream_can_reuse, upstream_can_reuse, None),
+                            Err(e) => (false, false, Some(e)),
+                        }
+                    }
+                    Err(e) => (false, false, Some(e)),
+                }
+            }
+        };
+        // Release the borrows held by the two halves before restoring the
+        // custom message handles below.
+        drop(downstream);
+        drop(upstream);
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -183,12 +238,7 @@ where
             }
         }
 
-        match ret {
-            Ok((downstream_can_reuse, upstream_can_reuse)) => {
-                (downstream_can_reuse, upstream_can_reuse, None)
-            }
-            Err(e) => (false, false, Some(e)),
-        }
+        (downstream_can_reuse, upstream_can_reuse, error)
     }
 
     pub(crate) async fn proxy_to_h1_upstream(
@@ -307,6 +357,15 @@ where
                                     // unread bytes and is unsafe to reuse.
                                     return Ok(false);
                                 }
+                                if PipeState::is_downstream_filter_aborted(
+                                    pipe_state.load(Ordering::Acquire),
+                                ) {
+                                    // The downstream half aborted in a response filter
+                                    // (e.g. a 3xx redirect followed by the outer retry
+                                    // loop). Drain the remaining upstream response so the
+                                    // connection can be returned to the pool (issue #866).
+                                    return self.drain_upstream_response(client_session).await;
+                                }
                                 // The pipe closed but the downstream half did not signal completion:
                                 // this is an unexpected closure, so surface the original send error.
                                 return Err(result.expect_err("send failure already checked via is_err() above"));
@@ -359,6 +418,48 @@ where
         Ok(upstream_can_reuse)
     }
 
+    /// Maximum number of bytes drained from an upstream response after the
+    /// downstream half aborted in a response filter. Larger responses abandon
+    /// the connection instead of being reused, bounding the drain cost.
+    const MAX_RESPONSE_DRAIN_BYTES: usize = 1024 * 1024;
+
+    /// Drains the remaining upstream response body after the downstream half
+    /// aborted in a response filter, so the connection can be reused. Returns
+    /// true when the response was fully consumed within the drain bound.
+    async fn drain_upstream_response(&self, client_session: &mut HttpSessionV1) -> Result<bool> {
+        if client_session.was_upgraded() {
+            // Upgraded bodies have no framing to drain; never reuse.
+            return Ok(false);
+        }
+        let mut drained = 0usize;
+        loop {
+            match client_session.read_response_task().await {
+                Ok(task) => {
+                    if task.is_end() {
+                        return Ok(true);
+                    }
+                    let data_len = match &task {
+                        HttpTask::Body(data, _) | HttpTask::UpgradedBody(data, _) => {
+                            data.as_ref().map_or(0, |d| d.len())
+                        }
+                        _ => 0,
+                    };
+                    drained += data_len;
+                    if drained > Self::MAX_RESPONSE_DRAIN_BYTES {
+                        warn!(
+                            "upstream response exceeds drain bound after filter abort; not reusing connection"
+                        );
+                        return Ok(false);
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to drain upstream response after filter abort: {e}");
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn process_upstream_tasks(
         &self,
@@ -369,6 +470,7 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
         response_state: &mut ResponseStateMachine,
+        pipe_state: &AtomicU8,
     ) -> Result<Option<bool>>
     where
         SV: ProxyHttp + Send + Sync,
@@ -412,9 +514,20 @@ where
             #[cfg(feature = "upstream_modules")]
             session.upstream_modules_filter_task(&mut t).await?;
             session.upstream_compression.response_filter(&mut t);
-            let task = self
+            let task = match self
                 .h1_response_filter(session, t, ctx, serve_from_cache, range_body_filter, false)
-                .await?;
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    // A response_filter error (e.g. a 3xx redirect followed by
+                    // the outer retry loop) aborts the downstream half. Signal
+                    // the upstream half to drain the remaining response body so
+                    // the connection can still be reused (issue #866).
+                    pipe_state.store(PipeState::DownstreamFilterAborted as u8, Ordering::Release);
+                    return Err(e);
+                }
+            };
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
             }
@@ -628,6 +741,7 @@ where
                             &mut serve_from_cache,
                             &mut range_body_filter,
                             &mut response_state,
+                            &pipe_state,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
@@ -653,6 +767,7 @@ where
                             &mut serve_from_cache,
                             &mut range_body_filter,
                             &mut response_state,
+                            &pipe_state,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
