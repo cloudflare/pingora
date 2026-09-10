@@ -391,6 +391,17 @@ impl RequestHeader {
         self.base.version = version;
     }
 
+    /// Return the host from the request.
+    ///
+    /// Checks (in order): `:authority` pseudo-header (HTTP/2), `Host` header (HTTP/1), URI host.
+    pub fn host(&self) -> Option<&str> {
+        self.headers
+            .get(":authority")
+            .or_else(|| self.headers.get(http::header::HOST))
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| self.uri.host())
+    }
+
     /// Clone `self` into [http::request::Parts].
     ///
     /// [ReqParts] has nowhere to keep a request-target that does not round-trip through the
