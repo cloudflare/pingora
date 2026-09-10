@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::header::{CONTENT_LENGTH, LOCATION};
 use log::info;
 use prometheus::register_int_counter;
 
@@ -39,6 +40,16 @@ impl ProxyHttp for MyGateway {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        if session.req_header().uri.path() == "/redirect" {
+            let mut response = ResponseHeader::build(302, Some(2))?;
+            response.insert_header(LOCATION, "/family/")?;
+            response.insert_header(CONTENT_LENGTH, "0")?;
+            session
+                .write_response_header(Box::new(response), true)
+                .await?;
+            return Ok(true);
+        }
+
         if session.req_header().uri.path().starts_with("/login")
             && !check_login(session.req_header())
         {
@@ -108,6 +119,7 @@ impl ProxyHttp for MyGateway {
 // RUST_LOG=INFO cargo run --example gateway
 // curl 127.0.0.1:6191 -H "Host: one.one.one.one"
 // curl 127.0.0.1:6190/family/ -H "Host: one.one.one.one"
+// curl --max-redirs 0 127.0.0.1:6191/redirect -H "Host: one.one.one.one" -v
 // curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: password"
 // curl 127.0.0.1:6191/login/ -H "Host: one.one.one.one" -I -H "Authorization: bad"
 // For metrics
