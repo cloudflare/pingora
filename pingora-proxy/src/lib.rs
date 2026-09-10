@@ -1011,11 +1011,6 @@ impl Session {
     /// Application code calling this directly must first fully consume the downstream body and
     /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
     /// `Transfer-Encoding` to describe the supplied body.
-    ///
-    /// For HTTP/2, a body cannot currently be added to a request that arrived without one.
-    /// Pingora determines stream termination from the downstream body state, so it may terminate
-    /// the upstream stream before the subsequent write of the buffered body, causing that write
-    /// to fail.
     #[cfg(feature = "early_body_buffer")]
     pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
         self.body_buffered = true;

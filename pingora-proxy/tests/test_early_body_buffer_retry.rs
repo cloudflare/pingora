@@ -24,6 +24,7 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use pingora_core::apps::HttpServerOptions;
 use pingora_core::prelude::HttpPeer;
 use pingora_core::protocols::ALPN;
 use pingora_core::server::configuration::ServerConf;
@@ -243,6 +244,7 @@ struct EarlyBufferProxy {
     buffer_in_request_filter: bool,
     buffer_timeout: Option<Duration>,
     drop_body_in_early_filter: bool,
+    replacement_body: Option<&'static str>,
     body_filter_calls: Arc<AtomicUsize>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
     use_h2_upstream: bool,
@@ -292,6 +294,14 @@ impl ProxyHttp for EarlyBufferProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Ctx) -> Result<bool> {
+        if let Some(replacement) = self.replacement_body {
+            session.set_buffered_body(Some(Bytes::from_static(replacement.as_bytes())));
+            session
+                .req_header_mut()
+                .insert_header(http::header::CONTENT_LENGTH, replacement.len().to_string())?;
+            return Ok(false);
+        }
+
         if !self.buffer_in_request_filter {
             return Ok(false);
         }
@@ -409,7 +419,9 @@ struct HarnessConfig {
     buffer_in_request_filter: bool,
     buffer_timeout: Option<Duration>,
     drop_body_in_early_filter: bool,
+    replacement_body: Option<&'static str>,
     fail_first: bool,
+    use_h2_downstream: bool,
     use_h2_upstream: bool,
 }
 
@@ -443,12 +455,18 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
                 buffer_in_request_filter: config.buffer_in_request_filter,
                 buffer_timeout: config.buffer_timeout,
                 drop_body_in_early_filter: config.drop_body_in_early_filter,
+                replacement_body: config.replacement_body,
                 body_filter_calls: app_body_filter_calls,
                 upstream_filter_expect_seen: app_expect_seen,
                 use_h2_upstream: config.use_h2_upstream,
                 max_attempts: app_attempts,
             },
         );
+        if config.use_h2_downstream {
+            let mut options = HttpServerOptions::default();
+            options.h2c = true;
+            service.app_logic_mut().unwrap().server_options = Some(options);
+        }
         service.add_tcp(&format!("127.0.0.1:{proxy_port}"));
         server.add_service(service);
         server.run_forever();
@@ -594,6 +612,28 @@ async fn post_empty(port: u16) -> String {
     })
     .await
     .expect("proxy did not answer the empty request")
+}
+
+async fn post_empty_h2(port: u16) -> String {
+    tokio::time::timeout(CLIENT_TIMEOUT, async {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (client, connection) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{port}/echo"))
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .unwrap();
+        let mut client = client.ready().await.unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        response.await.unwrap().status().as_u16().to_string()
+    })
+    .await
+    .expect("proxy did not answer the empty H2 request")
 }
 
 async fn post_with_expect_continue(port: u16, body: &str) -> (String, String) {
@@ -855,5 +895,110 @@ async fn originally_empty_body_does_not_end_h2_upstream_stream_twice() {
         harness.recorder.bodies(),
         vec![String::new()],
         "H2 origin should observe the body completed by the HEADERS frame"
+    );
+}
+
+#[tokio::test]
+async fn empty_h1_request_body_can_be_replaced_for_h1_upstream() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![REPLACEMENT.to_string()],
+        "H1 origin should receive the application-supplied body"
+    );
+}
+
+#[tokio::test]
+async fn empty_h1_request_body_can_be_replaced_for_h2_upstream() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            use_h2_upstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![REPLACEMENT.to_string()],
+        "H2 origin should receive the application-supplied body"
+    );
+}
+
+#[tokio::test]
+async fn empty_h2_request_body_can_be_replaced_for_h1_upstream() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            use_h2_downstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty_h2(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![REPLACEMENT.to_string()],
+        "H1 origin should receive the application-supplied body"
+    );
+}
+
+#[tokio::test]
+async fn empty_h2_request_body_can_be_replaced_for_h2_upstream() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            use_h2_downstream: true,
+            use_h2_upstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty_h2(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![REPLACEMENT.to_string()],
+        "H2 origin should receive the application-supplied body"
+    );
+}
+
+#[tokio::test]
+async fn explicit_empty_buffer_does_not_write_after_h2_end_stream() {
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(""),
+            use_h2_downstream: true,
+            use_h2_upstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty_h2(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![String::new()],
+        "H2 origin should observe the explicit empty buffer"
     );
 }

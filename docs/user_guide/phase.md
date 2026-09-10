@@ -75,7 +75,7 @@ Pingora answers an HTTP/1.1 `Expect: 100-continue` request locally before readin
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.
 
-Use `session.set_buffered_body()` here to replace the assembled body. For HTTP/2, it cannot currently add a body to a request that arrived without one; see its API documentation for details.
+Use `session.set_buffered_body()` here to replace the assembled body.
 
 ### `request_body_filter()`
 This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received. This runs during the upstream forwarding phase, after `upstream_peer()` and connection establishment.

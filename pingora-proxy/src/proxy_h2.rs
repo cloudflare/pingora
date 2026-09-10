@@ -232,6 +232,13 @@ where
         let host = req.remove_header(&http::header::HOST);
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
@@ -571,9 +578,9 @@ where
             .await?;
         }
 
-        // The caller already ended the stream for an empty downstream body on HEADERS or empty DATA.
+        // The caller already ended an empty buffered body on HEADERS or empty DATA.
         #[cfg(feature = "early_body_buffer")]
-        if buffer.is_some() || (session.is_body_buffered() && !upstream_body_finished) {
+        if !upstream_body_finished && (buffer.is_some() || session.is_body_buffered()) {
             self.send_body_to2(
                 session,
                 buffer,
