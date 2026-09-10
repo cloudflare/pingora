@@ -1300,6 +1300,70 @@ mod tests_stream {
         session_from_input(input.as_bytes()).await
     }
 
+    #[rstest]
+    #[case::content_length(true, false)]
+    #[case::until_close(false, false)]
+    #[case::upgraded(false, true)]
+    #[tokio::test]
+    async fn cancelled_legacy_finish_can_retry(
+        #[case] content_length: bool,
+        #[case] upgraded: bool,
+    ) {
+        let (mut session, mut handle) = if upgraded {
+            build_upgrade_req("websocket", "upgrade").await
+        } else {
+            build_req().await
+        };
+        let mut response = test_header(if upgraded {
+            StatusCode::SWITCHING_PROTOCOLS
+        } else {
+            StatusCode::OK
+        });
+        if content_length {
+            response.insert_header("Content-Length", "3").unwrap();
+        }
+        session.write_response_header_ref(&response).await.unwrap();
+        for body in ["a", "b", "c"] {
+            assert_eq!(
+                session.write_body(Bytes::from(body)).await.unwrap(),
+                Some(1)
+            );
+        }
+        let body_mode = session.body_writer.body_mode.clone();
+
+        // The header and three body tasks fill the channel. Poll once to reach
+        // backpressure, then drop the future without relying on a timer.
+        assert!(futures::poll!(Box::pin(session.finish())).is_pending());
+        assert_eq!(session.body_writer.body_mode, body_mode);
+        assert_eq!(session.body_bytes_sent(), 3);
+        if upgraded {
+            assert!(!session.is_body_done());
+        }
+
+        assert!(matches!(recv_task(&mut handle.rx), HttpTask::Header(..)));
+        assert_eq!(session.finish().await.unwrap(), Some(3));
+        assert_eq!(session.body_writer.body_mode, BodyMode::Complete(3));
+        if upgraded {
+            assert!(session.is_body_done());
+        }
+        // A completed finish must be a no-op even when Done fills the last slot.
+        assert!(matches!(
+            futures::poll!(Box::pin(session.finish())),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        for expected in ["a", "b", "c"] {
+            match recv_task(&mut handle.rx) {
+                HttpTask::Body(Some(body), false) => assert_eq!(body, expected),
+                task => panic!("unexpected task {task:?}"),
+            }
+        }
+        assert!(matches!(recv_task(&mut handle.rx), HttpTask::Done));
+        assert_eq!(
+            handle.rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Empty
+        );
+    }
+
     #[tokio::test]
     async fn read_basic() {
         init_log();

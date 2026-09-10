@@ -318,17 +318,22 @@ impl BodyWriter {
     async fn do_finish_body(&mut self, tx: &mut mpsc::Sender<HttpTask>) -> Result<Option<usize>> {
         match self.body_mode {
             BM::ContentLength(total, written) => {
-                self.body_mode = BM::Complete(written);
                 if written < total {
+                    self.body_mode = BM::Complete(written);
                     return Error::e_explain(
                         PREMATURE_BODY_END,
                         format!("Content-length: {total} bytes written: {written} (subrequest)"),
                     );
                 }
-                tx.send(HttpTask::Done).await.or_err(
-                    WriteError,
-                    "while sending done task to downstream (subrequest)",
-                )?;
+                // Cancellation while waiting for capacity must leave finish retryable.
+                let permit = tx.reserve().await;
+                self.body_mode = BM::Complete(written);
+                permit
+                    .or_err(
+                        WriteError,
+                        "while sending done task to downstream (subrequest)",
+                    )?
+                    .send(HttpTask::Done);
                 Ok(Some(written))
             }
             _ => panic!("wrong body mode: {:?} (subrequest)", self.body_mode),
@@ -341,11 +346,15 @@ impl BodyWriter {
     ) -> Result<Option<usize>> {
         match self.body_mode {
             BM::UntilClose(written) => {
+                // Commit completion only after the cancellable wait has returned.
+                let permit = tx.reserve().await;
                 self.body_mode = BM::Complete(written);
-                tx.send(HttpTask::Done).await.or_err(
-                    WriteError,
-                    "while sending done task to downstream (subrequest)",
-                )?;
+                permit
+                    .or_err(
+                        WriteError,
+                        "while sending done task to downstream (subrequest)",
+                    )?
+                    .send(HttpTask::Done);
                 Ok(Some(written))
             }
             _ => panic!("wrong body mode: {:?} (subrequest)", self.body_mode),
@@ -369,12 +378,117 @@ impl BodyWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
     }
 
     const TASK_BUFFER_SIZE: usize = 4;
+
+    #[rstest]
+    #[case::content_length(BodyMode::ContentLength(3, 3), 3)]
+    #[case::until_close(BodyMode::UntilClose(3), 3)]
+    #[case::empty_content_length(BodyMode::ContentLength(0, 0), 0)]
+    #[case::empty_until_close(BodyMode::UntilClose(0), 0)]
+    #[tokio::test]
+    async fn finish_once(#[case] body_mode: BodyMode, #[case] written: usize) {
+        let (mut tx, mut rx) = mpsc::channel(1);
+        let mut writer = BodyWriter { body_mode };
+        assert_eq!(writer.finish(&mut tx).await.unwrap(), Some(written));
+        assert_eq!(writer.body_mode, BodyMode::Complete(written));
+        assert!(matches!(
+            futures::poll!(Box::pin(writer.finish(&mut tx))),
+            std::task::Poll::Ready(Ok(None))
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), HttpTask::Done));
+        assert_eq!(rx.try_recv().unwrap_err(), mpsc::error::TryRecvError::Empty);
+    }
+
+    #[rstest]
+    #[case::unselected(BodyMode::ToSelect)]
+    #[case::complete(BodyMode::Complete(3))]
+    #[tokio::test]
+    async fn finish_noop(#[case] body_mode: BodyMode) {
+        let (mut tx, mut rx) = mpsc::channel(1);
+        tx.try_send(HttpTask::Body(None, false)).unwrap();
+        let mut writer = BodyWriter {
+            body_mode: body_mode.clone(),
+        };
+        for closed in [false, true] {
+            if closed {
+                rx.close();
+            }
+            assert!(matches!(
+                futures::poll!(Box::pin(writer.finish(&mut tx))),
+                std::task::Poll::Ready(Ok(None))
+            ));
+            assert_eq!(writer.body_mode, body_mode);
+        }
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HttpTask::Body(None, false)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_premature_body_does_not_wait() {
+        let (mut tx, mut rx) = mpsc::channel(1);
+        tx.try_send(HttpTask::Body(None, false)).unwrap();
+        let mut writer = BodyWriter {
+            body_mode: BodyMode::ContentLength(3, 1),
+        };
+        let std::task::Poll::Ready(Err(error)) = futures::poll!(Box::pin(writer.finish(&mut tx)))
+        else {
+            panic!("premature finish should fail immediately");
+        };
+        assert_eq!(error.etype(), &PREMATURE_BODY_END);
+        assert_eq!(writer.body_mode, BodyMode::Complete(1));
+        assert_eq!(writer.finish(&mut tx).await.unwrap(), None);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HttpTask::Body(None, false)
+        ));
+        assert_eq!(rx.try_recv().unwrap_err(), mpsc::error::TryRecvError::Empty);
+    }
+
+    #[rstest]
+    #[case::content_length(BodyMode::ContentLength(3, 3))]
+    #[case::until_close(BodyMode::UntilClose(3))]
+    #[tokio::test]
+    async fn finish_closed_receiver(
+        #[case] body_mode: BodyMode,
+        #[values(false, true)] pending: bool,
+        #[values(false, true)] cancel: bool,
+    ) {
+        let (mut tx, mut rx) = mpsc::channel(1);
+        tx.try_send(HttpTask::Body(None, false)).unwrap();
+        let mut writer = BodyWriter { body_mode };
+        let mut finish = Box::pin(writer.finish(&mut tx));
+        if pending {
+            assert!(futures::poll!(&mut finish).is_pending());
+        }
+        let error = if cancel {
+            drop(finish);
+            rx.close();
+            writer.finish(&mut tx).await.unwrap_err()
+        } else {
+            rx.close();
+            finish.await.unwrap_err()
+        };
+        assert_eq!(error.etype(), &WriteError);
+        assert_eq!(writer.body_mode, BodyMode::Complete(3));
+        assert_eq!(writer.finish(&mut tx).await.unwrap(), None);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            HttpTask::Body(None, false)
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap_err(),
+            mpsc::error::TryRecvError::Disconnected
+        );
+    }
 
     #[tokio::test]
     async fn read_with_body_content_length() {
