@@ -89,8 +89,10 @@ pub fn fast_timeout_to_tokio_threshold() -> Option<Duration> {
 pub struct FastTimeout(Duration);
 
 impl ToTimeout for FastTimeout {
-    fn timeout(&self) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
-        Box::pin(TIMER_MANAGER.register_timer(self.0).poll())
+    type Fut = TimerStubFuture;
+
+    fn timeout(&self) -> Self::Fut {
+        TIMER_MANAGER.register_timer(self.0).poll()
     }
 
     fn create(d: Duration) -> Self {

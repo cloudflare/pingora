@@ -49,6 +49,32 @@ async fn bench_fast_timeout() -> u32 {
     n
 }
 
+async fn bench_tokio_timeout_pending_once() -> u32 {
+    let mut n = 0;
+    for _ in 0..LOOP_SIZE {
+        let fut = async {
+            tokio::task::yield_now().await;
+            1
+        };
+        let to = tokio_timeout(Duration::from_secs(1), fut);
+        n += to.await.unwrap();
+    }
+    n
+}
+
+async fn bench_fast_timeout_pending_once() -> u32 {
+    let mut n = 0;
+    for _ in 0..LOOP_SIZE {
+        let fut = async {
+            tokio::task::yield_now().await;
+            1
+        };
+        let to = fast_timeout::fast_timeout(Duration::from_secs(1), fut);
+        n += to.await.unwrap();
+    }
+    n
+}
+
 fn bench_tokio_timer() {
     let mut list = Vec::with_capacity(LOOP_SIZE as usize);
     let before = Instant::now();
@@ -151,6 +177,24 @@ async fn main() {
     let elapsed = before.elapsed();
     println!(
         "tokio timeout {:?} total, {:?} avg per iteration",
+        elapsed,
+        elapsed / LOOP_SIZE
+    );
+
+    let before = Instant::now();
+    bench_fast_timeout_pending_once().await;
+    let elapsed = before.elapsed();
+    println!(
+        "pingora timeout pending-once {:?} total, {:?} avg per iteration",
+        elapsed,
+        elapsed / LOOP_SIZE
+    );
+
+    let before = Instant::now();
+    bench_tokio_timeout_pending_once().await;
+    let elapsed = before.elapsed();
+    println!(
+        "tokio timeout pending-once {:?} total, {:?} avg per iteration",
         elapsed,
         elapsed / LOOP_SIZE
     );
