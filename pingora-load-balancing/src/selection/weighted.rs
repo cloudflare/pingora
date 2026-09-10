@@ -88,8 +88,11 @@ impl<H: SelectionAlgorithm> BackendIter for WeightedIterator<H> {
 
         if self.first {
             // initial hash, select from the weighted list
-            self.first = false;
             let len = self.backend.weighted.len();
+            if len == 0 {
+                return None;
+            }
+            self.first = false;
             let index = self.backend.weighted[self.index as usize % len];
             Some(&self.backend.backends[index as usize])
         } else {
@@ -148,6 +151,18 @@ mod test {
         assert_eq!(iter.next(), Some(&b2));
         let mut iter = hash.iter(b"test7");
         assert_eq!(iter.next(), Some(&b2));
+    }
+
+    #[test]
+    fn weighted_all_zero_weight_returns_none_instead_of_panicking() {
+        let b1 = Backend::new_with_weight("1.1.1.1:80", 0).unwrap();
+        let b2 = Backend::new_with_weight("1.0.0.1:80", 0).unwrap();
+        let backends = BTreeSet::from_iter([b1, b2]);
+        let hash: Arc<Weighted<FnvHasher>> = Arc::new(Weighted::build(&backends));
+
+        let mut iter = hash.iter(b"test");
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
