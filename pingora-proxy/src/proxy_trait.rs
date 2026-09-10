@@ -620,6 +620,43 @@ pub trait ProxyHttp {
         e
     }
 
+    /// Handle a request header rejected with [`InvalidHTTPHeader`].
+    ///
+    /// This runs before a proxy [`Session`] or [`Self::CTX`] is created. It covers
+    /// the malformed-header rejection in the HTTP/1 request-reading path, not all
+    /// protocol errors. The default implementation sends a 400 response.
+    ///
+    /// The request header may be unavailable or invalid. Request-dependent methods,
+    /// including `req_header()` and body-reading methods, may panic and must not be
+    /// called here. Connection metadata such as `client_addr()` and `digest()` can
+    /// be used with `e` for logging. Normal request filters and [`Self::logging()`]
+    /// are not called for this rejected request.
+    ///
+    /// Override this callback to write a custom response with
+    /// [`HttpSession::write_error_response()`], setting `Content-Length` to match
+    /// the body, or return `Ok(())` without writing to close silently. The connection
+    /// is closed after this callback returns, including on error. A returned error
+    /// is logged without attempting a fallback response.
+    ///
+    /// For example, a callback can replace the default response headers and body:
+    ///
+    /// ```
+    /// # use bytes::Bytes;
+    /// # use pingora_core::protocols::http::ServerSession;
+    /// # use pingora_error::Result;
+    /// # use pingora_http::ResponseHeader;
+    /// # async fn custom_error(session: &mut ServerSession) -> Result<()> {
+    /// let body = Bytes::from_static(b"Invalid request\n");
+    /// let mut response = ResponseHeader::build(400, Some(2))?;
+    /// response.set_content_length(body.len())?;
+    /// response.insert_header("Content-Type", "text/plain")?;
+    /// session.write_error_response(response, body).await
+    /// # }
+    /// ```
+    async fn request_error_filter(&self, session: &mut HttpSession, _e: &Error) -> Result<()> {
+        session.respond_error(400).await
+    }
+
     /// This filter is called when the request encounters a fatal error.
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
