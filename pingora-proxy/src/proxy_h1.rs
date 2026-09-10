@@ -20,7 +20,9 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::{
-    custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
+    authority::{raw_target_authority, validate_request_authority},
+    custom::CUSTOM_MESSAGE_QUEUE_SIZE,
+    v1::common::is_upgrade_req as is_h1_upgrade_req,
 };
 
 impl<SV, C> HttpProxy<SV, C>
@@ -44,15 +46,20 @@ where
         // phase 2 send to upstream
 
         let mut req = session.req_header().clone();
+        let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
+        let downstream_had_host = req.headers.contains_key(http::header::HOST);
         req.set_version(Version::HTTP_11);
 
-        // H2 is required to set :authority, but not necessarily Host; most H1 servers expect a
-        // Host header, so convert it when sending to H1.
-        if session.req_header().version == Version::HTTP_2
-            && session.get_header(header::HOST).is_none()
-        {
-            let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
-            req.insert_header(header::HOST, host).unwrap();
+        // H2 requires :authority but not Host; most H1 servers expect Host, so synthesize it when
+        // sending an H2 downstream request to an H1 upstream.
+        if session.req_header().version == Version::HTTP_2 {
+            let result = match authority_policy {
+                AuthorityPolicy::Standard => set_h1_host_from_authority(&mut req),
+                AuthorityPolicy::Custom => set_h1_host_from_authority_if_absent(&mut req),
+            };
+            if let Err(e) = result {
+                return (false, true, Some(e.into_down()));
+            }
         }
 
         if let Err(e) = sanitize_h1_upstream_request(
@@ -85,6 +92,26 @@ where
         #[cfg(feature = "early_body_buffer")]
         if session.is_body_buffered() {
             req.remove_header(&header::EXPECT);
+        }
+
+        // Reconcile and revalidate after request filters, which can mutate Host, URI, or target.
+        if authority_policy.is_standard() {
+            if let Err(e) = reconcile_upstream_authority(&mut req) {
+                return (false, true, Some(e.into_in()));
+            }
+            // A filter may delete Host. Restore it for requests that originally carried one or
+            // whose URI or absolute-form target has an authority, without adding a new empty Host
+            // to Host-less HTTP/1.0 origin-form.
+            let target_has_authority = raw_target_authority(req.raw_path()).authority().is_some();
+            if downstream_had_host || req.uri.authority().is_some() || target_has_authority {
+                if let Err(e) = set_h1_host_from_authority(&mut req) {
+                    return (false, true, Some(e.into_in()));
+                }
+            }
+            if let Err(e) = validate_request_authority(&req) {
+                // The final filter-produced request is invalid, so classify this as internal.
+                return (false, true, Some(e.into_in()));
+            }
         }
 
         if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
@@ -211,6 +238,10 @@ where
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
+        // Record request body bytes written to the upstream (payload only) for logging consumers.
+        // Only HTTP/1.x tracks this; see `Session::upstream_body_bytes_sent`.
+        session.set_upstream_body_bytes_sent(client_session.body_bytes_sent());
+
         // Record upstream write pending time for this session only (delta from baseline).
         let current_write_pending = client_session.stream().get_write_pending_time();
         let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);
@@ -290,8 +321,9 @@ where
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
-                            // Downstream should consume all remaining data and handle the error
-                            return Ok(upstream_can_reuse)
+                            // A response read error means the HTTP/1 message boundary was not
+                            // established successfully, so the connection cannot be reused.
+                            return Ok(false)
                         }
                     }
                 },

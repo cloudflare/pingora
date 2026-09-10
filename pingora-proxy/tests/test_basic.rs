@@ -22,7 +22,6 @@ use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
-#[cfg(feature = "patched_http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -427,9 +426,8 @@ async fn test_dropped_conn_post_empty_body() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.text().await.unwrap();
-    assert_eq!(body, "dog!\n");
+    // Non-idempotent requests are not retried by the default policy.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
 async fn test_dropped_conn_post_body() {
@@ -456,12 +454,11 @@ async fn test_dropped_conn_post_body() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.text().await.unwrap();
-    assert_eq!(body, "cat!\n");
+    // Non-idempotent requests are not retried even when the body was buffered.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
-async fn test_dropped_conn_post_body_over() {
+async fn test_dropped_conn_put_body_over() {
     init();
     let client = reqwest::Client::new();
     let port = "8001"; // special port to avoid unexpected connection reuse from other tests
@@ -479,15 +476,15 @@ async fn test_dropped_conn_post_body_over() {
     }
 
     let res = client
-        .post("http://127.0.0.1:6147/bad_lb")
+        .put("http://127.0.0.1:6147/bad_lb")
         .header("x-port", port)
         .body(large_body)
         .send()
         .await
         .unwrap();
 
-    // 502, body larger than buffer limit
-    assert_eq!(res.status(), StatusCode::from_u16(502).unwrap());
+    // The body is larger than the retry buffer limit.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]
@@ -497,7 +494,7 @@ async fn test_dropped_conn() {
     test_dropped_conn_get().await;
     test_dropped_conn_post_empty_body().await;
     test_dropped_conn_post_body().await;
-    test_dropped_conn_post_body_over().await;
+    test_dropped_conn_put_body_over().await;
 }
 
 // currently not supported with Rustls implementation
@@ -757,22 +754,24 @@ async fn test_connect_close() {
     assert_eq!(body, "Hello World!\n");
 }
 
-// Authority-form CONNECT request targets require patched HTTP/1 parsing until
-// general request-target form support is available.
-#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_disallowed_h1() {
     init();
 
-    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
-    let request = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
-    stream.write_all(request).await.unwrap();
+    for request in [
+        b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n".as_slice(),
+        b"CONNECT pingora.org:443 HTTP/1.1\r\n\r\n".as_slice(),
+        b"CONNECT /ws?token=a@b.com HTTP/1.1\r\nHost: other.example\r\n\r\n".as_slice(),
+    ] {
+        let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+        stream.write_all(request).await.unwrap();
 
-    let mut buf = [0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
-    let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 405 "));
+        let mut buf = [0u8; 1024];
+        let read = stream.read(&mut buf).await.unwrap();
+        let resp = std::str::from_utf8(&buf[..read]).unwrap();
+        let status_line = resp.lines().next().unwrap_or("");
+        assert!(status_line.contains(" 405 "), "{status_line}");
+    }
 }
 
 #[tokio::test]
@@ -798,7 +797,6 @@ async fn test_connect_proxying_disallowed_h2() {
     }
 }
 
-#[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_connect_proxying_allowed_h1() {
     init();
@@ -830,6 +828,89 @@ async fn test_connect_proxying_allowed_h1() {
     let status_line = resp.lines().next().unwrap_or("");
     assert!(status_line.contains(" 200 "));
     assert!(resp.ends_with("ok"));
+}
+
+#[tokio::test]
+async fn test_connect_proxying_allowed_h1_without_host() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
+}
+
+/// Read a complete HTTP/1 header block. A single `read()` can return a partial
+/// request line, so responding or asserting on one risks a flaky failure.
+async fn read_h1_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.unwrap();
+        assert_ne!(0, read, "connection closed before end of headers");
+        head.extend_from_slice(&buf[..read]);
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+#[tokio::test]
+async fn test_absolute_form_request_target_h1() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_h1_head(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = socket.shutdown().await;
+        request
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let request = format!(
+        "GET http://pingora.org/absolute?q=1 HTTP/1.1\r\nHost: pingora.org\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let resp = read_h1_head(&mut stream).await;
+    assert!(resp.lines().next().unwrap().contains(" 200 "));
+
+    // RFC 9112 §3.2.2: absolute-form is accepted inbound and forwarded verbatim.
+    // Rewriting it to origin-form is the proxy layer's call, since only it knows
+    // whether the next hop is an origin server (§3.2.1) or another proxy (§3.2.2).
+    let upstream_request = upstream.await.unwrap();
+    assert_eq!(
+        "GET http://pingora.org/absolute?q=1 HTTP/1.1",
+        upstream_request.lines().next().unwrap()
+    );
 }
 
 #[tokio::test]

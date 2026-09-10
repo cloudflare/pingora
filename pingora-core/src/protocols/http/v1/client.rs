@@ -505,6 +505,14 @@ impl HttpSession {
         self.body_recv
     }
 
+    /// Request body bytes written to the upstream (payload only; excludes headers/framing).
+    ///
+    /// Counts what the body writer accepted, not what the caller offered, so it can be
+    /// compared against the request `Content-Length` to detect a truncated request body.
+    pub fn body_bytes_sent(&self) -> usize {
+        self.bytes_sent
+    }
+
     /// Whether there is no more body to read.
     pub fn is_body_done(&mut self) -> bool {
         self.init_body_reader();
@@ -650,6 +658,10 @@ impl HttpSession {
     /// If the connection cannot be reused, the underlying stream will be closed and `None` will be
     /// returned.
     pub async fn reuse(mut self) -> Option<Stream> {
+        if !self.body_reader.body_complete() || self.body_reader.has_bytes_overread() {
+            self.set_keepalive(None);
+        }
+
         // TODO: this function is unnecessarily slow for keepalive case
         // because that case does not need async
         match self.keepalive_timeout {
@@ -1606,6 +1618,50 @@ mod tests_stream {
         assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
     }
 
+    #[tokio::test]
+    async fn body_bytes_sent_content_length() {
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+        let mock_io = Builder::new()
+            .write(&header[..])
+            .write(b"ab")
+            .write(b"cde")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "5").unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        // the request header must not be counted
+        assert_eq!(http_stream.body_bytes_sent(), 0);
+        http_stream.write_body(b"ab").await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 2);
+        http_stream.write_body(b"cde").await.unwrap();
+        assert_eq!(http_stream.body_bytes_sent(), 5);
+    }
+
+    #[tokio::test]
+    async fn body_bytes_sent_truncated_write() {
+        // Content-Length declares 5 but only 2 bytes are ever written, which is the shape
+        // `body_bytes_sent` exists to detect.
+        let header = b"POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+        let mock_io = Builder::new().write(&header[..]).write(b"ab").build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let mut new_request = RequestHeader::build("POST", b"/test", None).unwrap();
+        new_request.insert_header("Content-Length", "5").unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+        http_stream.write_body(b"ab").await.unwrap();
+
+        assert_eq!(http_stream.body_bytes_sent(), 2);
+    }
+
     #[cfg(feature = "patched_http1")]
     #[tokio::test]
     async fn write_invalid_path() {
@@ -2313,6 +2369,40 @@ hello\r\n\
     }
 
     #[tokio::test]
+    async fn test_malformed_chunked_response_is_not_reusable() {
+        let input = b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let task = http_stream.read_response_task().await.unwrap();
+        assert!(matches!(task, HttpTask::Header(_, false)));
+        assert!(http_stream.read_response_task().await.is_err());
+        assert!(http_stream.is_body_done());
+        assert!(!http_stream.body_reader.body_complete());
+
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+        assert!(http_stream.reuse().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reuse_rechecks_overread_after_early_keepalive() {
+        let input =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\nextra";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+
+        while http_stream.read_body_bytes().await.unwrap().is_some() {}
+        assert!(http_stream.body_reader.body_complete());
+        assert!(http_stream.body_reader.has_bytes_overread());
+        assert!(http_stream.reuse().await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_response_multiple_transfer_encoding_headers() {
         init_log();
         // Multiple TE headers should be treated as comma-separated
@@ -2759,6 +2849,67 @@ mod test_sync {
         assert_eq!("/", req.path.unwrap());
         assert_eq!(b"Foo", headers[0].name.as_bytes());
         assert_eq!(b"Bar", headers[0].value);
+    }
+
+    #[test]
+    fn test_absolute_form_and_connect_to_wire() {
+        // The request-line written to the upstream is built from raw_path(), so both
+        // the absolute-form target (RFC 9112 §3.2.2) and the CONNECT authority-form
+        // (§3.2.3) are sent verbatim. Choosing origin-form instead is a decision for
+        // the proxy layer, which knows whether the next hop is an origin or a proxy.
+        let request_line = |method: &str, target: &[u8]| -> String {
+            let req = RequestHeader::build(method, target, None).unwrap();
+            let wire = http_req_header_to_wire(&req).unwrap();
+            let line = wire.as_ref().split(|&b| b == b'\r').next().unwrap();
+            String::from_utf8(line.to_vec()).unwrap()
+        };
+
+        // §3.2.2 example request-target.
+        assert_eq!(
+            "GET http://www.example.org/pub/WWW/TheProject.html HTTP/1.1",
+            request_line("GET", b"http://www.example.org/pub/WWW/TheProject.html")
+        );
+        assert_eq!(
+            "GET http://host?q=1 HTTP/1.1",
+            request_line("GET", b"http://host?q=1")
+        );
+        assert_eq!(
+            "GET http://host HTTP/1.1",
+            request_line("GET", b"http://host")
+        );
+        // §3.2.3 example CONNECT request-target.
+        assert_eq!(
+            "CONNECT www.example.com:80 HTTP/1.1",
+            request_line("CONNECT", b"www.example.com:80")
+        );
+        // Origin-form is unaffected.
+        assert_eq!("GET /a?q=1 HTTP/1.1", request_line("GET", b"/a?q=1"));
+
+        // A fragment is not part of the request-target (§3.2) and never reaches the
+        // wire, so it cannot be used to desync what a cache or a filter in front of us
+        // sees from what the upstream receives.
+        assert_eq!(
+            "GET http://host/a HTTP/1.1",
+            request_line("GET", b"http://host/a#frag")
+        );
+        assert_eq!(
+            "GET http://host HTTP/1.1",
+            request_line("GET", b"http://host#@evil.example/")
+        );
+        assert_eq!(
+            "CONNECT www.example.com:80 HTTP/1.1",
+            request_line("CONNECT", b"www.example.com:80#x")
+        );
+        assert_eq!("GET /a HTTP/1.1", request_line("GET", b"/a#frag"));
+
+        // Stripping a fragment can leave nothing behind. An empty request-target would
+        // serialize as "GET  HTTP/1.1", which is malformed and which our own H1 parser
+        // rejects, so it has to fall back to the root instead.
+        assert_eq!("GET / HTTP/1.1", request_line("GET", b"#frag"));
+        assert_eq!("GET / HTTP/1.1", request_line("GET", b""));
+        // Asterisk-form and query-only targets keep their form through the strip.
+        assert_eq!("OPTIONS * HTTP/1.1", request_line("OPTIONS", b"*#frag"));
+        assert_eq!("GET ?q=1 HTTP/1.1", request_line("GET", b"?q=1#frag"));
     }
 
     /// Deterministic, parser-independent test of the request-line delimiter

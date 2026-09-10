@@ -44,11 +44,13 @@ use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
+use std::future::{poll_fn, Future};
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc,
 };
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
@@ -82,6 +84,9 @@ use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
 
+/// Caps per-proxy padding and one-time shutdown fan-out on very large hosts.
+const MAX_SHUTDOWN_NOTIFY_SHARDS: usize = 256;
+
 type DownstreamCustomMessageReader =
     Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
 
@@ -112,6 +117,68 @@ pub type ProcessCustomSession<SV, C> = Arc<
         + 'static,
 >;
 
+/// Shutdown [`Notify`] sharded by worker thread.
+///
+/// Every request that parks in `read_request()` registers a shutdown waiter and
+/// unregisters it when the read completes. Both operations lock the `Notify`'s
+/// internal mutex, so a single `Notify` shared across the whole proxy becomes a
+/// contention hot spot on many-core machines. Sharding keeps waiter
+/// registration on a (mostly) thread-local shard while shutdown notifies every
+/// shard.
+struct ShardedNotify {
+    shards: Box<[NotifyShard]>,
+}
+
+/// Align each shard so its [`Notify`] state and waiter-list mutex do not share a
+/// cache line with an adjacent shard. Without padding, writes made while adding
+/// or removing waiters can falsely share a cache line with an independent shard,
+/// forcing cache-coherence protocols such as MESI to transfer or invalidate that
+/// line between cores. These transfers are especially expensive when they cross
+/// the interconnect between sockets on a NUMA system.
+///
+/// The 128-byte alignment separates adjacent shards on systems with common
+/// 64- or 128-byte cache lines. This trades bounded padding for avoiding false
+/// sharing between shards; waiters assigned to the same shard can still contend.
+#[repr(align(128))]
+struct NotifyShard(Notify);
+
+impl ShardedNotify {
+    /// Create enough shards for the configured worker threads, rounded up
+    /// to preserve mask-based indexing and bounded by [`MAX_SHUTDOWN_NOTIFY_SHARDS`].
+    fn new(worker_threads: usize) -> Self {
+        let shards = worker_threads
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(MAX_SHUTDOWN_NOTIFY_SHARDS)
+            .min(MAX_SHUTDOWN_NOTIFY_SHARDS);
+        ShardedNotify {
+            shards: (0..shards).map(|_| NotifyShard(Notify::new())).collect(),
+        }
+    }
+
+    /// Return the shard assigned to the current thread.
+    ///
+    /// A task can migrate after registering, but its [`Notified`](tokio::sync::futures::Notified)
+    /// future remains bound to this shard and shutdown notifies every shard.
+    fn local(&self) -> &Notify {
+        static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static THREAD_ID: usize = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        let id = THREAD_ID.with(|id| *id);
+        // the shard count is a power of two
+        &self.shards[id & (self.shards.len() - 1)].0
+    }
+
+    /// Notify waiters on every shard, including tasks polled by a different
+    /// worker after registering.
+    fn notify_waiters(&self) {
+        for shard in self.shards.iter() {
+            shard.0.notify_waiters();
+        }
+    }
+}
+
 /// The concrete type that holds the user defined HTTP proxy.
 ///
 /// Users don't need to interact with this object directly.
@@ -121,7 +188,7 @@ where
 {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector<C>,
-    shutdown: Notify,
+    shutdown: ShardedNotify,
     shutdown_flag: Arc<AtomicBool>,
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
@@ -157,7 +224,7 @@ impl<SV> HttpProxy<SV, ()> {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
             h2_options: None,
@@ -193,7 +260,7 @@ where
         HttpProxy {
             inner,
             client_upstream,
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
@@ -234,6 +301,28 @@ where
         self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
+    /// Resolve when `http_cleanup()` has been called.
+    ///
+    /// The waiter is registered on the current thread's shard before
+    /// `shutdown_flag` is checked, so a shutdown firing in between cannot be
+    /// missed: either the flag load sees the store, or the registered waiter
+    /// receives the notification.
+    async fn await_shutdown(&self) {
+        let notified = self.shutdown.local().notified();
+        tokio::pin!(notified);
+
+        poll_fn(|context| {
+            if notified.as_mut().poll(context).is_ready()
+                || self.shutdown_flag.load(Ordering::Acquire)
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
     async fn handle_new_request(
         &self,
         mut downstream_session: Box<HttpSession>,
@@ -247,7 +336,7 @@ where
         let res = tokio::select! {
             biased; // biased select is cheaper, and we don't want to drop already buffered requests
             res = downstream_session.read_request() => { res }
-            _ = self.shutdown.notified() => {
+            _ = self.await_shutdown() => {
                 // service shutting down, dropping the connection to stop more req from coming in
                 return None;
             }
@@ -262,18 +351,24 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!(
-                    "Fail to proxy: {e}, downstream session type: {}",
-                    downstream_session.session_type()
-                );
                 if matches!(e.etype, InvalidHTTPHeader) {
+                    debug!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
                     downstream_session
                         .respond_error(400)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
                         });
-                } // otherwise the connection must be broken, no need to send anything
+                } else {
+                    // otherwise the connection must be broken, no need to send anything
+                    error!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
+                }
                 downstream_session.shutdown().await;
                 return None;
             }
@@ -504,6 +599,12 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Request body bytes written to the upstream (payload only). Set by proxy layer.
+    ///
+    /// `None` when the proxy layer does not track it (HTTP/2 and custom upstreams), which is
+    /// deliberately distinct from `Some(0)` so that "not measured" cannot be mistaken for
+    /// "a request body was dropped".
+    upstream_body_bytes_sent: Option<usize>,
     /// Whether proxy task filtering has seen a downstream 101 upgrade header.
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
@@ -543,6 +644,7 @@ impl Session {
             #[cfg(feature = "upstream_modules")]
             upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
@@ -854,6 +956,20 @@ impl Session {
     /// Set the total upstream response body bytes received (payload only). Intended for internal use by proxy layer.
     pub(crate) fn set_upstream_body_bytes_received(&mut self, n: usize) {
         self.upstream_body_bytes_received = n;
+    }
+
+    /// Get the request body bytes written to the upstream (payload only) recorded by the proxy
+    /// layer.
+    ///
+    /// Returns `None` when the proxy layer does not track it (HTTP/2 and custom upstreams).
+    pub fn upstream_body_bytes_sent(&self) -> Option<usize> {
+        self.upstream_body_bytes_sent
+    }
+
+    /// Set the request body bytes written to the upstream (payload only). Intended for internal
+    /// use by proxy layer.
+    pub(crate) fn set_upstream_body_bytes_sent(&mut self, n: usize) {
+        self.upstream_body_bytes_sent = Some(n);
     }
 
     /// Get the upstream write pending time recorded by the proxy layer. Returns [`Duration::ZERO`] for HTTP/2.
@@ -2011,6 +2127,7 @@ mod tests {
     use pingora_core::modules::http::{HttpModule, HttpModuleBuilder};
     use pingora_core::protocols::l4::stream::Stream as L4Stream;
     use pingora_core::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+    use pingora_error::RetryType;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -2019,15 +2136,15 @@ mod tests {
 
     #[derive(Debug)]
     struct StaticVirtualSocket {
-        read_buf: &'static [u8],
+        read_buf: Vec<u8>,
         read_pos: usize,
         write_buf: Arc<Mutex<Vec<u8>>>,
     }
 
     impl StaticVirtualSocket {
-        fn new(read_buf: &'static [u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
+        fn new(read_buf: &[u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
             Self {
-                read_buf,
+                read_buf: read_buf.to_vec(),
                 read_pos: 0,
                 write_buf,
             }
@@ -2075,15 +2192,146 @@ mod tests {
         }
     }
 
-    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
-        let socket = StaticVirtualSocket::new(
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-            written,
-        );
+    async fn new_request_session(request: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Session {
+        let socket = StaticVirtualSocket::new(request, written);
         let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
         let mut session = Session::new_h1(Box::new(stream));
         session.read_request().await.unwrap();
         session
+    }
+
+    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
+        new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written,
+        )
+        .await
+    }
+
+    struct DefaultRetryProxy;
+
+    #[async_trait]
+    impl ProxyHttp for DefaultRetryProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!()
+        }
+    }
+
+    fn default_policy_would_retry_for_session(
+        session: &mut Session,
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut error = Error::new_up(ReadError);
+        error.retry = retry;
+
+        DefaultRetryProxy
+            .error_while_proxy(
+                &HttpPeer::new("127.0.0.1:80", false, "".to_string()),
+                session,
+                error,
+                &mut (),
+                client_reused,
+            )
+            .retry()
+    }
+
+    async fn default_policy_would_retry(
+        request: &[u8],
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        default_policy_would_retry_for_session(&mut session, retry, client_reused)
+    }
+
+    async fn buffered_put_session(body_len: usize) -> Session {
+        let mut request =
+            format!("PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body_len}\r\n\r\n")
+                .into_bytes();
+        request.resize(request.len() + body_len, b'a');
+
+        let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
+        session.enable_retry_buffering();
+        while session.read_request_body().await.unwrap().is_some() {}
+        session
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_idempotent_method() {
+        let decided_retry = RetryType::Decided(true);
+        assert!(
+            default_policy_would_retry(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            default_policy_would_retry(
+                b"PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"PATCH / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_resolves_reused_only() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assert!(default_policy_would_retry(request, RetryType::ReusedOnly, true).await);
+        assert!(!default_policy_would_retry(request, RetryType::ReusedOnly, false).await);
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_untruncated_body_buffer() {
+        let mut complete = buffered_put_session(64 * 1024).await;
+        assert!(!complete.retry_buffer_truncated());
+        assert!(default_policy_would_retry_for_session(
+            &mut complete,
+            RetryType::Decided(true),
+            false,
+        ));
+
+        let mut truncated = buffered_put_session(64 * 1024 + 1).await;
+        assert!(truncated.retry_buffer_truncated());
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::Decided(true),
+            false,
+        ));
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::ReusedOnly,
+            true,
+        ));
     }
 
     fn upgrade_response_header() -> ResponseHeader {
@@ -2591,5 +2839,104 @@ mod tests {
             assert!(session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());
         }
+    }
+
+    /// A socket whose reads never complete, like an idle keep-alive connection
+    /// waiting for its next request.
+    #[derive(Debug)]
+    struct PendingVirtualSocket;
+
+    impl AsyncRead for PendingVirtualSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingVirtualSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl VirtualSocket for PendingVirtualSocket {
+        fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopProxy;
+
+    #[async_trait]
+    impl ProxyHttp for NoopProxy {
+        type CTX = ();
+        fn new_ctx(&self) -> Self::CTX {}
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            Err(Error::new(InternalError))
+        }
+    }
+
+    fn pending_session() -> Box<HttpSession> {
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(PendingVirtualSocket)));
+        Box::new(HttpSession::new_http1(Box::new(stream)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_wakes_parked_read_requests() {
+        let conf = ServerConf {
+            threads: 4,
+            ..ServerConf::default()
+        };
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(conf)));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let proxy = proxy.clone();
+                tokio::spawn(async move { proxy.handle_new_request(pending_session()).await })
+            })
+            .collect();
+        // let the tasks park in read_request()
+        time::sleep(Duration::from_millis(50)).await;
+        proxy.http_cleanup().await;
+        for handle in handles {
+            let session = time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("shutdown did not wake the parked read")
+                .unwrap();
+            assert!(session.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_read_request_parks_returns_immediately() {
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(ServerConf::default())));
+        proxy.http_cleanup().await;
+        // a request that parks after notify_waiters() already fired must not
+        // wait for a notification that will never come
+        let session = time::timeout(
+            Duration::from_secs(5),
+            proxy.handle_new_request(pending_session()),
+        )
+        .await
+        .expect("read_request parked after shutdown");
+        assert!(session.is_none());
     }
 }

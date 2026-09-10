@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedFreshness, HitHandler,
+    CacheKey, CacheMeta, ForcedFreshness, HitHandler, PurgeAction,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -655,6 +655,14 @@ pub trait ProxyHttp {
 
     /// This filter is called when there is an error **after** a connection is established (or reused)
     /// to the upstream.
+    ///
+    /// By default, this hook forces retry to false, regardless of the incoming retry state, when
+    /// the request method is non-idempotent and its body is not fully buffered, or when the body
+    /// retry buffer was truncated. For eligible requests,
+    /// [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused connection.
+    ///
+    /// Implementations that override this hook replace the default policy and are responsible for
+    /// deciding when a retry is safe.
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
@@ -664,9 +672,16 @@ pub trait ProxyHttp {
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        // only reused client connections where retry buffer is not truncated
-        e.retry
-            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        #[cfg(feature = "early_body_buffer")]
+        let body_replayable =
+            session.req_header().method.is_idempotent() || session.is_body_buffered();
+        #[cfg(not(feature = "early_body_buffer"))]
+        let body_replayable = session.req_header().method.is_idempotent();
+        if !body_replayable || session.as_ref().retry_buffer_truncated() {
+            e.set_retry(false);
+        } else {
+            e.retry.decide_reuse(client_reused);
+        }
         e
     }
 
@@ -789,6 +804,16 @@ pub trait ProxyHttp {
     /// - `false`: this request is a treated as a normal request
     fn is_purge(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
         false
+    }
+
+    /// What a purge request should do to the cached asset.
+    ///
+    /// Only consulted when [`ProxyHttp::is_purge`] returns `true`. The default deletes the asset.
+    /// Returning [`PurgeAction::Expire`] asks to keep it and mark it stale instead, so it
+    /// revalidates against the origin rather than being refetched in full. Storage that cannot
+    /// mark an entry stale falls back to deleting it.
+    fn purge_action(&self, _session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        PurgeAction::Delete
     }
 
     /// This filter is called after the proxy cache generates the downstream response to the purge

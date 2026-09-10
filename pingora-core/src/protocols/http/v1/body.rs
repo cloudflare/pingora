@@ -361,6 +361,11 @@ impl BodyReader {
         matches!(self.body_state, PS::Complete(_) | PS::Done(_))
     }
 
+    /// Whether the message body reached its framing-defined end without an error.
+    pub fn body_complete(&self) -> bool {
+        matches!(self.body_state, PS::Complete(_))
+    }
+
     pub fn body_empty(&self) -> bool {
         self.body_state == PS::Complete(0)
     }

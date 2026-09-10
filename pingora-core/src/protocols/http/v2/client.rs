@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use crate::connectors::http::v2::ConnectionRef;
+use crate::protocols::http::authority::validate_request_authority_fields;
 use crate::protocols::http::v1::common::validate_content_length_without_transfer_encoding;
 use crate::protocols::{Digest, SocketAddr, UniqueIDType};
 
@@ -94,8 +95,12 @@ impl Http2Session {
         }
     }
 
+    /// Prepare H2 authority fields and reject userinfo ([RFC 9113 section 8.3.1]).
+    ///
+    /// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
     fn sanitize_request_header(req: &mut RequestHeader) -> Result<()> {
         req.set_version(http::Version::HTTP_2);
+        validate_request_authority_fields(req)?;
         if req.uri.authority().is_some() {
             return Ok(());
         }
@@ -103,10 +108,13 @@ impl Http2Session {
         let Some(authority) = req.headers.get(http::header::HOST).map(|v| v.as_bytes()) else {
             return Error::e_explain(InvalidHTTPHeader, "no authority header for h2");
         };
+        let Some(path_and_query) = req.uri.path_and_query() else {
+            return Error::e_explain(InvalidHTTPHeader, "no path and query for h2");
+        };
         let uri = http::uri::Builder::new()
             .scheme("https") // fixed for now
             .authority(authority)
-            .path_and_query(req.uri.path_and_query().as_ref().unwrap().as_str())
+            .path_and_query(path_and_query.as_str())
             .build();
         match uri {
             Ok(uri) => {
@@ -662,6 +670,44 @@ mod tests_h2 {
     use http::{Response, StatusCode};
     use tokio::io::duplex;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn sanitize_request_header_rejects_invalid_authority_fields() {
+        let mut host = RequestHeader::build_no_case("GET", b"/test", None).unwrap();
+        host.insert_header(http::header::HOST, "user@evil.example")
+            .unwrap();
+        assert!(Http2Session::sanitize_request_header(&mut host).is_err());
+
+        let mut uri = RequestHeader::from(
+            http::Request::builder()
+                .uri("https://user@evil.example/test")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        assert!(Http2Session::sanitize_request_header(&mut uri).is_err());
+
+        let mut mismatch = RequestHeader::from(
+            http::Request::builder()
+                .uri("https://authority.example/test")
+                .header(http::header::HOST, "other.example")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        assert!(Http2Session::sanitize_request_header(&mut mismatch).is_err());
+
+        let mut duplicate = RequestHeader::build_no_case("GET", b"/test", None).unwrap();
+        duplicate
+            .append_header(http::header::HOST, "authority.example")
+            .unwrap();
+        duplicate
+            .append_header(http::header::HOST, "authority.example")
+            .unwrap();
+        assert!(Http2Session::sanitize_request_header(&mut duplicate).is_err());
+    }
 
     async fn session_with_delayed_response() -> (
         Http2Session,

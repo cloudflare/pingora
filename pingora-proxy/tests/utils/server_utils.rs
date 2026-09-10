@@ -32,7 +32,7 @@ use pingora_cache::{
     NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
-    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
+    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeAction, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
@@ -365,6 +365,18 @@ impl ProxyHttp for ExampleProxyHttp {
         req: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let host = session.get_header_bytes("host-override");
+        if !host.is_empty() {
+            req.insert_header("host", host)?;
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-delete-host")
+        {
+            req.remove_header(&http::header::HOST);
+        }
+
         // Test-only hook: deliberately declare a larger outbound body than the valid
         // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
         // a client that directly ended a shorter-than-declared body; this hook lets tests
@@ -757,6 +769,18 @@ impl ProxyHttp for ExampleProxyCache {
         if session.get_header_bytes("x-force-expire") != b"" {
             return Ok(Some(ForcedFreshness::ForceExpired));
         }
+
+        if session.get_header_bytes("x-force-expire-serve-stale") != b"" {
+            // `x-expired-secs-ago` backdates the expiry, which is how a test reaches an
+            // asset whose serve stale window has already run out at the point it expired.
+            let secs_ago = std::str::from_utf8(session.get_header_bytes("x-expired-secs-ago"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            return Ok(Some(ForcedFreshness::ForceExpiredServeStale {
+                expired_at: SystemTime::now().checked_sub(Duration::from_secs(secs_ago)),
+            }));
+        }
         Ok(None)
     }
 
@@ -977,6 +1001,14 @@ impl ProxyHttp for ExampleProxyCache {
 
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
+    }
+
+    fn purge_action(&self, session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        if session.get_header_bytes("x-purge-action") == b"expire" {
+            PurgeAction::Expire
+        } else {
+            PurgeAction::Delete
+        }
     }
 
     fn suppress_proxy_warn_log(

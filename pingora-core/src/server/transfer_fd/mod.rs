@@ -25,7 +25,7 @@ use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::{thread, time};
@@ -188,13 +188,24 @@ where
         }
     };
 
+    // The accepted connection is only needed for this transfer. Take ownership of it so
+    // that it is closed on every path out of this function, including the early return
+    // from `cmsgs()?` below; otherwise every graceful upgrade leaks one unix socket.
+    //
+    // SAFETY: `fd` was just returned by accept(2) and is not owned or closed anywhere else.
+    let conn = unsafe { OwnedFd::from_raw_fd(fd) };
+
     let mut io_vec = [IoSliceMut::new(payload); 1];
     let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS]);
+    // MSG_CMSG_CLOEXEC sets FD_CLOEXEC on the received descriptors atomically. These
+    // listening sockets are kept for the rest of the process's lifetime, so without it any
+    // subprocess an application built on pingora execs inherits them, and can keep the
+    // port bound after the server itself is gone.
     let msg: RecvMsg<UnixAddr> = socket::recvmsg(
-        fd,
+        conn.as_raw_fd(),
         &mut io_vec,
         Some(&mut cmsg_buf),
-        socket::MsgFlags::empty(),
+        socket::MsgFlags::MSG_CMSG_CLOEXEC,
     )
     .unwrap();
 
@@ -387,6 +398,7 @@ mod tests {
 
     use super::*;
     use log::{debug, error};
+    use nix::fcntl;
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -464,6 +476,90 @@ mod tests {
                 panic!()
             }
         }
+
+        child.join().unwrap();
+    }
+
+    /// How many fds in this process refer to a unix socket bound to `path`.
+    ///
+    /// Reads the socket inodes bound to `path` from /proc/net/unix, then scans
+    /// /proc/self/fd for descriptors pointing at them. Filtering by path keeps this
+    /// unaffected by unrelated descriptors opened by tests running in parallel.
+    fn unix_socket_fds_bound_to(path: &str) -> usize {
+        let unix = std::fs::read_to_string("/proc/net/unix").unwrap();
+        let inodes: HashSet<&str> = unix
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                let inode = cols.nth(6)?;
+                (cols.next() == Some(path)).then_some(inode)
+            })
+            .collect();
+        if inodes.is_empty() {
+            return 0;
+        }
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                target
+                    .to_str()
+                    .and_then(|t| t.strip_prefix("socket:["))
+                    .and_then(|t| t.strip_suffix(']'))
+                    .is_some_and(|inode| inodes.contains(inode))
+            })
+            .count()
+    }
+
+    #[test]
+    fn test_receive_does_not_leak_fds() {
+        init_log();
+        const SOCK: &str = "/tmp/pingora_fds_receive3.sock";
+
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        // receiver need to start in another thread since it is blocking
+        let child = thread::spawn(move || {
+            let mut buf: [u8; 32] = [0; 32];
+            let (fds, _) = get_fds_from(SOCK, &mut buf, None).unwrap();
+            assert_eq!(1, fds.len());
+
+            // The received listener is kept for the lifetime of the process, so it must
+            // not be inherited by unrelated children across exec().
+            let flags = fcntl::fcntl(
+                // SAFETY: the fd was just received and stays open for this call.
+                unsafe { BorrowedFd::borrow_raw(fds[0]) },
+                fcntl::FcntlArg::F_GETFD,
+            )
+            .unwrap();
+            assert!(
+                fcntl::FdFlag::from_bits_truncate(flags).contains(fcntl::FdFlag::FD_CLOEXEC),
+                "fd received over SCM_RIGHTS is missing FD_CLOEXEC"
+            );
+
+            // The accepted connection is only needed during the transfer itself.
+            assert_eq!(
+                0,
+                unix_socket_fds_bound_to(SOCK),
+                "the accepted transfer socket was left open"
+            );
+
+            // Don't leak the descriptors this test just received.
+            for fd in fds {
+                // SAFETY: received over SCM_RIGHTS just above and not owned anywhere else.
+                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        });
+
+        let fds = vec![dumb_fd.as_raw_fd()];
+        let buf: [u8; 32] = [1; 32];
+        send_fds_to(fds, &buf, SOCK, None).unwrap();
 
         child.join().unwrap();
     }
@@ -571,16 +667,32 @@ mod tests {
 mod close_unclaimed_tests {
     use super::Fds;
     use std::collections::HashSet;
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    // Closure is observed by reading the other end of a socket pair, which
+    // reports end-of-file exactly when its peer is gone. Checking the descriptor
+    // *number* would be racy: numbers are process-wide and reassigned
+    // lowest-free-first, so a concurrent test in this binary can be handed the
+    // number just closed and make it valid again first. Observing ends are
+    // non-blocking, so a descriptor that wrongly stayed open fails an assertion
+    // rather than hanging.
+    //
+    // A second owning handle would turn a wrongly closed descriptor into an I/O
+    // safety abort of the whole binary, so `Fds` gets raw numbers.
 
     #[test]
     fn closes_only_unclaimed_fds() {
-        let keep_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        let drop_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(keep_fd >= 0 && drop_fd >= 0);
+        let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
+        let (mut drop_peer, drop_local) = UnixStream::pair().unwrap();
+        keep_peer.set_nonblocking(true).unwrap();
+        drop_peer.set_nonblocking(true).unwrap();
+        let keep_fd = keep_local.into_raw_fd();
 
         let mut fds = Fds::new();
         fds.add("127.0.0.1:80".to_string(), keep_fd);
-        fds.add("127.0.0.1:9090".to_string(), drop_fd);
+        fds.add("127.0.0.1:9090".to_string(), drop_local.into_raw_fd());
 
         let keep: HashSet<String> = ["127.0.0.1:80".to_string()].into_iter().collect();
         let closed = fds.close_unclaimed(&keep);
@@ -589,32 +701,37 @@ mod close_unclaimed_tests {
         assert_eq!(*fds.get("127.0.0.1:80").unwrap(), keep_fd);
         assert!(fds.get("127.0.0.1:9090").is_none());
 
-        assert_eq!(unsafe { libc::fcntl(drop_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        // Dropping the map entry is not enough: the descriptor itself has to be
+        // closed, which is the leak this function exists to prevent.
+        assert!(
+            matches!(drop_peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
         );
-        assert_ne!(unsafe { libc::fcntl(keep_fd, libc::F_GETFD) }, -1);
+        assert!(
+            matches!(keep_peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the claimed descriptor was closed"
+        );
 
-        unsafe { libc::close(keep_fd) };
+        // `Fds` does not close on drop.
+        // SAFETY: asserted open just above, and no other owner remains.
+        drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
     }
 
     #[test]
     fn empty_keep_set_closes_everything() {
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(fd >= 0);
+        let (mut peer, local) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
 
         let mut fds = Fds::new();
-        fds.add("127.0.0.1:9090".to_string(), fd);
+        fds.add("127.0.0.1:9090".to_string(), local.into_raw_fd());
 
         let closed = fds.close_unclaimed(&HashSet::new());
 
         assert_eq!(closed, vec!["127.0.0.1:9090".to_string()]);
         assert!(fds.is_empty());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
+        assert!(
+            matches!(peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unclaimed descriptor was not closed"
         );
     }
 }

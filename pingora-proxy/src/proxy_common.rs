@@ -13,14 +13,48 @@
 // limitations under the License.
 
 use http::header::{self, HeaderName};
+use pingora_core::protocols::http::authority::{raw_target_authority, RawTargetAuthority};
 use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpUpstreamRequestPolicy};
-use pingora_error::{Error, ErrorType::InvalidHTTPHeader, Result};
+use pingora_error::{Error, ErrorType::InvalidHTTPHeader, OrErr, Result};
 use pingora_http::RequestHeader;
 
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
 pub(crate) const KEEP_ALIVE: &str = "keep-alive";
 pub(crate) const PROXY_CONNECTION: &str = "proxy-connection";
 pub(crate) const HTTP2_SETTINGS: &str = "http2-settings";
+
+/// Authority handling that avoids imposing standard HTTP semantics on custom downstream sessions.
+///
+/// - `Standard`:
+///   - Reconciles `Host`, URI authority, and absolute-form authority.
+///   - Revalidates after filters.
+///   - Rejects conflicting or ambiguous representations.
+/// - `Custom`:
+///   - Preserves authority relationships defined by the custom protocol.
+///   - Enforces only the chosen H1/H2 upstream protocol's wire requirements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityPolicy {
+    Standard,
+    Custom,
+}
+
+impl AuthorityPolicy {
+    pub(crate) fn from(custom: bool) -> Self {
+        if custom {
+            Self::Custom
+        } else {
+            Self::Standard
+        }
+    }
+
+    pub(crate) fn is_standard(self) -> bool {
+        self == Self::Standard
+    }
+
+    pub(crate) fn is_custom(self) -> bool {
+        self == Self::Custom
+    }
+}
 
 /// Whether `byte` is a `tchar`, the character set of an HTTP `token` (RFC 9110 §5.6.2). Checked
 /// here because `HeaderName::from_bytes` may accept bytes outside the `token` set.
@@ -152,6 +186,145 @@ fn strip_standard_hop_by_hop_headers(req: &mut RequestHeader) {
     req.remove_header(&header::CONNECTION);
     req.remove_header(&header::UPGRADE);
     req.remove_header(HTTP2_SETTINGS);
+}
+
+/// Set H1 `Host` from the URI or absolute-form authority.
+///
+/// A single matching `Host` is preserved; others are replaced ([RFC 9113 section 8.3.1]). Without
+/// an authority, `Host` is preserved or inserted empty ([RFC 9112 section 3.2]).
+///
+/// # Errors
+///
+/// Returns `InvalidHTTPHeader` when the authority contains userinfo or cannot be represented as a
+/// `Host` field value.
+///
+/// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+pub(crate) fn set_h1_host_from_authority(req: &mut RequestHeader) -> Result<()> {
+    let authority = req
+        .uri
+        .authority()
+        .map(|authority| authority.as_str().as_bytes())
+        .or_else(|| raw_target_authority(req.raw_path()).authority());
+
+    let Some(authority) = authority else {
+        // No authority, use Host header.
+        if req.headers.contains_key(header::HOST) {
+            return Ok(());
+        }
+        // H1.1 requires Host even when the target has no authority; the H1 caller skips this for
+        // Host-less HTTP/1.0 origin-form requests.
+        return req.insert_header(header::HOST, "");
+    };
+
+    if authority.contains(&b'@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in request authority");
+    }
+
+    // Avoid replacing the header-map entry when exactly one Host already matches the authority.
+    let mut hosts = req.headers.get_all(header::HOST).iter();
+    if hosts
+        .next()
+        .is_some_and(|host| host.as_bytes() == authority)
+        && hosts.next().is_none()
+    {
+        return Ok(());
+    }
+
+    let host = http::HeaderValue::from_bytes(authority)
+        .or_err(InvalidHTTPHeader, "invalid authority for Host header")?;
+
+    req.insert_header(header::HOST, host)
+}
+
+/// Preserve the historical Custom behavior by synthesizing Host only when it is absent.
+pub(crate) fn set_h1_host_from_authority_if_absent(req: &mut RequestHeader) -> Result<()> {
+    if req.headers.contains_key(header::HOST) {
+        return Ok(());
+    }
+    let host = req
+        .uri
+        .authority()
+        .map_or("", |authority| authority.as_str())
+        .to_owned();
+    req.insert_header(header::HOST, host)
+}
+
+/// Apply a filter-selected `Host` to the outbound authority.
+///
+/// Rewrites URI authority or H1 absolute-form; origin-form is unchanged.
+/// Ambiguous targets are also unchanged so final authority validation can reject them.
+///
+/// # Errors
+///
+/// Returns `InvalidHTTPHeader` when `Host` contains userinfo or an invalid authority, or when a URI
+/// rewrite would discard non-UTF-8 path bytes or produce an invalid URI.
+pub(crate) fn reconcile_upstream_authority(req: &mut RequestHeader) -> Result<()> {
+    let Some(host) = req.headers.get(header::HOST) else {
+        return Ok(());
+    };
+    if host.as_bytes().contains(&b'@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
+    }
+
+    if let Some(authority) = req.uri.authority() {
+        // Rebuilding via set_uri() clears the raw-byte fallback. Fail instead of replacing a
+        // non-UTF-8 path with the URI's lossy replacement characters.
+        if !req.raw_path_is_utf8() {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "non-UTF-8 path cannot be reconciled with URI authority",
+            );
+        }
+        if host.as_bytes() == authority.as_str().as_bytes() {
+            return Ok(());
+        }
+        let authority = parse_host_authority(host)?;
+        let mut parts = http::uri::Parts::default();
+        parts.scheme = req.uri.scheme().cloned();
+        parts.authority = Some(authority);
+        parts.path_and_query = req.uri.path_and_query().cloned();
+        let uri = http::Uri::from_parts(parts).map_err(|cause| {
+            Error::because(
+                InvalidHTTPHeader,
+                "failed to apply Host override to URI authority",
+                cause,
+            )
+        })?;
+        req.set_uri(uri);
+        return Ok(());
+    }
+
+    match raw_target_authority(req.raw_path()) {
+        RawTargetAuthority::None | RawTargetAuthority::AmbiguousAuthority => Ok(()),
+        RawTargetAuthority::Absolute {
+            scheme,
+            authority,
+            path_and_query,
+        } => {
+            if host.as_bytes() == authority {
+                return Ok(());
+            }
+            parse_host_authority(host)?;
+            let mut target =
+                Vec::with_capacity(scheme.len() + 3 + host.as_bytes().len() + path_and_query.len());
+            target.extend_from_slice(scheme);
+            target.extend_from_slice(b"://");
+            target.extend_from_slice(host.as_bytes());
+            target.extend_from_slice(path_and_query);
+            req.set_raw_path(&target)
+        }
+    }
+}
+
+fn parse_host_authority(host: &http::HeaderValue) -> Result<http::uri::Authority> {
+    http::uri::Authority::try_from(host.as_bytes()).map_err(|cause| {
+        Error::because(
+            InvalidHTTPHeader,
+            "invalid Host override for authority",
+            cause,
+        )
+    })
 }
 
 /// Apply automatic request policy before application upstream request filtering.
@@ -403,6 +576,111 @@ mod tests {
                 .unwrap();
         }
         request
+    }
+
+    #[test]
+    fn h1_host_is_copied_from_authority() {
+        let request_with_uri = |uri: &str, host: Option<&str>| {
+            let mut request = match host {
+                Some(host) => request_with_headers(&[("Host", host)]),
+                None => request_with_headers(&[]),
+            };
+            request.set_uri(uri.parse().unwrap());
+            request
+        };
+
+        // Absent Host is synthesized from :authority.
+        let mut request = request_with_uri("https://authority.example/test", None);
+        set_h1_host_from_authority(&mut request).unwrap();
+        assert_eq!(request.headers[header::HOST], "authority.example");
+
+        // A conflicting Host is replaced, so the upstream cannot disagree with the filters.
+        let mut request = request_with_uri("https://authority.example/test", Some("host.example"));
+        set_h1_host_from_authority(&mut request).unwrap();
+        assert_eq!(request.headers[header::HOST], "authority.example");
+        assert_eq!(request.headers.get_all(header::HOST).iter().count(), 1);
+
+        // No :authority: the existing Host is the only source and stands.
+        let mut request = request_with_uri("/test", Some("host.example"));
+        set_h1_host_from_authority(&mut request).unwrap();
+        assert_eq!(request.headers[header::HOST], "host.example");
+
+        // Neither present: the field is still required, with an empty value.
+        let mut request = request_with_uri("/test", None);
+        set_h1_host_from_authority(&mut request).unwrap();
+        assert_eq!(request.headers[header::HOST], "");
+
+        let mut request = request_with_uri("https://user@authority.example/test", None);
+        let err = set_h1_host_from_authority(&mut request).unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+
+        let mut custom = request_with_uri("https://user@authority.example/test", None);
+        set_h1_host_from_authority_if_absent(&mut custom).unwrap();
+        assert_eq!(custom.headers[header::HOST], "user@authority.example");
+        custom
+            .insert_header(header::HOST, "custom.example")
+            .unwrap();
+        set_h1_host_from_authority_if_absent(&mut custom).unwrap();
+        assert_eq!(custom.headers[header::HOST], "custom.example");
+    }
+
+    #[test]
+    fn filter_host_override_updates_outbound_authority() {
+        let mut request = request_with_headers(&[("Host", "origin.example")]);
+        request.set_uri("https://client.example/path?q=1".parse().unwrap());
+
+        reconcile_upstream_authority(&mut request).unwrap();
+        assert_eq!(request.uri.authority().unwrap(), "origin.example");
+        assert_eq!(request.uri.path_and_query().unwrap(), "/path?q=1");
+
+        let mut userinfo = request_with_headers(&[("Host", "user@evil.example")]);
+        userinfo.set_uri("https://client.example/path".parse().unwrap());
+        assert!(reconcile_upstream_authority(&mut userinfo).is_err());
+
+        let mut origin_form = request_with_headers(&[("Host", "origin.example")]);
+        reconcile_upstream_authority(&mut origin_form).unwrap();
+        assert!(origin_form.uri.authority().is_none());
+
+        let mut absolute =
+            RequestHeader::build("GET", b"http://client.example/path?q=1", None).unwrap();
+        absolute
+            .append_header(header::HOST, "origin.example")
+            .unwrap();
+        reconcile_upstream_authority(&mut absolute).unwrap();
+        assert_eq!(absolute.raw_path(), b"http://origin.example/path?q=1");
+
+        let mut non_utf8 =
+            RequestHeader::build("GET", b"http://client.example/\xff", None).unwrap();
+        non_utf8
+            .append_header(header::HOST, "origin.example")
+            .unwrap();
+        reconcile_upstream_authority(&mut non_utf8).unwrap();
+        assert_eq!(non_utf8.raw_path(), b"http://origin.example/\xff");
+        assert!(!non_utf8.raw_path_is_utf8());
+
+        let mut h2_deleted = request_with_headers(&[]);
+        h2_deleted.set_uri("https://client.example/path".parse().unwrap());
+        set_h1_host_from_authority(&mut h2_deleted).unwrap();
+        h2_deleted.remove_header(&header::HOST);
+        reconcile_upstream_authority(&mut h2_deleted).unwrap();
+        set_h1_host_from_authority(&mut h2_deleted).unwrap();
+        assert_eq!(h2_deleted.headers[header::HOST], "client.example");
+
+        let mut h1_deleted = request_with_headers(&[("Host", "client.example")]);
+        h1_deleted.remove_header(&header::HOST);
+        reconcile_upstream_authority(&mut h1_deleted).unwrap();
+        set_h1_host_from_authority(&mut h1_deleted).unwrap();
+        assert_eq!(h1_deleted.headers[header::HOST], "");
+
+        let mut absolute_deleted =
+            RequestHeader::build("GET", b"http://client.example/path", None).unwrap();
+        absolute_deleted
+            .append_header(header::HOST, "client.example")
+            .unwrap();
+        absolute_deleted.remove_header(&header::HOST);
+        reconcile_upstream_authority(&mut absolute_deleted).unwrap();
+        set_h1_host_from_authority(&mut absolute_deleted).unwrap();
+        assert_eq!(absolute_deleted.headers[header::HOST], "client.example");
     }
 
     #[test]
