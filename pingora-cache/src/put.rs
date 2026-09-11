@@ -20,7 +20,8 @@ use bytes::Bytes;
 use http::header;
 use log::warn;
 use pingora_core::protocols::http::{
-    v1::common::header_value_content_length, HttpTask, ServerSession,
+    custom::server::Session as DownstreamSession, v1::common::header_value_content_length,
+    HttpTask, ServerSession,
 };
 use pingora_error::Error;
 
@@ -216,9 +217,9 @@ impl<C: CachePut> CachePutCtx<C> {
     /// Return:
     /// - `Ok(None)` when the payload will be cache.
     /// - `Ok(Some(reason))` when the payload is not cacheable
-    pub async fn cache_put(
+    pub async fn cache_put<DS: DownstreamSession>(
         &mut self,
-        session: &mut ServerSession,
+        session: &mut ServerSession<DS>,
     ) -> Result<Option<NoCacheReason>> {
         let mut no_cache_reason = None;
         while let Some(data) = session.read_request_body().await? {

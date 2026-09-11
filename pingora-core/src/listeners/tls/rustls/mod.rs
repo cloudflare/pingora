@@ -251,16 +251,16 @@ impl Acceptor {
                 offload: None,
             };
             let callbacks = self.callbacks.clone();
-            let rt = offload.get_runtime(stream.id() as u64);
-            rt.spawn(async move {
-                if let Some(cb) = callbacks.as_ref() {
-                    handshake_with_callback(&acceptor, stream, cb.as_ref()).await
-                } else {
-                    handshake(&acceptor, stream).await
-                }
-            })
-            .await
-            .or_err(InternalError, "TLS offload runtime failure")?
+            offload
+                .spawn_abort_on_drop(stream.id() as u64, async move {
+                    if let Some(cb) = callbacks.as_ref() {
+                        handshake_with_callback(&acceptor, stream, cb.as_ref()).await
+                    } else {
+                        handshake(&acceptor, stream).await
+                    }
+                })
+                .await
+                .or_err(InternalError, "TLS offload runtime failure")?
         } else if let Some(cb) = self.callbacks.as_ref() {
             handshake_with_callback(self, stream, cb.as_ref()).await
         } else {

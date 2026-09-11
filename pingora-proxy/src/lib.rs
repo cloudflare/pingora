@@ -64,6 +64,7 @@ use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
+use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
@@ -109,8 +110,12 @@ pub mod prelude {
     pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
 }
 
-pub type ProcessCustomSession<SV, C> = Arc<
-    dyn Fn(Arc<HttpProxy<SV, C>>, Stream, &ShutdownWatch) -> BoxFuture<'static, Option<Stream>>
+/// Type-erased custom-connection callback.
+///
+/// The callback remains boxed once per accepted custom connection; the
+/// downstream session operations themselves use concrete futures.
+pub type ProcessCustomSession<SV, C, DS = ()> = Arc<
+    dyn Fn(Arc<HttpProxy<SV, C, DS>>, Stream, &ShutdownWatch) -> BoxFuture<'static, Option<Stream>>
         + Send
         + Sync
         + Unpin
@@ -182,9 +187,10 @@ impl ShardedNotify {
 /// The concrete type that holds the user defined HTTP proxy.
 ///
 /// Users don't need to interact with this object directly.
-pub struct HttpProxy<SV, C = ()>
+pub struct HttpProxy<SV, C = (), DS = ()>
 where
     C: custom::Connector, // Upstream custom connector
+    DS: DownstreamSession,
 {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector<C>,
@@ -196,10 +202,10 @@ where
     #[cfg(feature = "upstream_modules")]
     pub upstream_modules: HttpModules,
     max_retries: usize,
-    process_custom_session: Option<ProcessCustomSession<SV, C>>,
+    process_custom_session: Option<ProcessCustomSession<SV, C, DS>>,
 }
 
-impl<SV> HttpProxy<SV, ()> {
+impl<SV> HttpProxy<SV, (), ()> {
     /// Create a new [`HttpProxy`] with the given [`ProxyHttp`] implementation and [`ServerConf`].
     ///
     /// After creating an `HttpProxy`, you should call [`HttpProxy::handle_init_modules()`] to
@@ -237,21 +243,22 @@ impl<SV> HttpProxy<SV, ()> {
     }
 }
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     fn new_custom(
         inner: SV,
         conf: Arc<ServerConf>,
         connector: C,
-        on_custom: Option<ProcessCustomSession<SV, C>>,
+        on_custom: Option<ProcessCustomSession<SV, C, DS>>,
         server_options: Option<HttpServerOptions>,
         client_options: Option<ConnectorOptions>,
     ) -> Self
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let client_options =
             client_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
@@ -293,7 +300,7 @@ where
     /// this method is called automatically.
     pub fn handle_init_modules(&mut self)
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
         self.inner
             .init_downstream_modules(&mut self.downstream_modules);
@@ -325,11 +332,11 @@ where
 
     async fn handle_new_request(
         &self,
-        mut downstream_session: Box<HttpSession>,
-    ) -> Option<Box<HttpSession>>
+        mut downstream_session: Box<HttpSession<DS>>,
+    ) -> Option<Box<HttpSession<DS>>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // phase 1 read request header
 
@@ -404,12 +411,12 @@ where
     // return bool: server_session can be reused, and error if any
     async fn proxy_to_upstream(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let peer = match self.inner.upstream_peer(session, ctx).await {
             Ok(p) => p,
@@ -490,13 +497,13 @@ where
 
     async fn upstream_filter(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &mut HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Result<Option<Duration>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let duration = match task {
             HttpTask::Header(header, _eos) => {
@@ -505,12 +512,15 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
+                    .upstream_response_trailer_filter(session, trailers, ctx)
+                    .await?;
                 None
             }
             _ => {
@@ -524,14 +534,14 @@ where
 
     async fn finish(
         &self,
-        mut session: Session,
-        ctx: &mut SV::CTX,
+        mut session: Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         reuse: bool,
         error: Option<Box<Error>>,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         self.inner
             .logging(&mut session, error.as_deref(), ctx)
@@ -559,7 +569,7 @@ where
         }
     }
 
-    fn cleanup_sub_req(&self, session: &mut Session) {
+    fn cleanup_sub_req(&self, session: &mut Session<DS>) {
         if let Some(ctx) = session.subrequest_ctx.as_mut() {
             ctx.release_write_lock();
         }
@@ -573,9 +583,12 @@ use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 ///
 /// This object is what users interact with in order to access the request itself or change the proxy
 /// behavior.
-pub struct Session {
+pub struct Session<DS = ()>
+where
+    DS: DownstreamSession,
+{
     /// the HTTP session to downstream (the client)
-    pub downstream_session: Box<HttpSession>,
+    pub downstream_session: Box<HttpSession<DS>>,
     /// The interface to control HTTP caching
     pub cache: HttpCache,
     /// (de)compress responses coming into the proxy (from upstream)
@@ -589,7 +602,7 @@ pub struct Session {
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
-    pub subrequest_spawner: Option<SubrequestSpawner>,
+    pub subrequest_spawner: Option<SubrequestSpawner<DS>>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
     /// Upstream filter modules. These run before `upstream_compression` and see the raw
@@ -623,9 +636,12 @@ pub struct Session {
     body_buffered: bool,
 }
 
-impl Session {
+impl<DS> Session<DS>
+where
+    DS: DownstreamSession,
+{
     fn new(
-        downstream_session: impl Into<Box<HttpSession>>,
+        downstream_session: impl Into<Box<HttpSession<DS>>>,
         downstream_modules: &HttpModules,
         #[cfg(feature = "upstream_modules")] upstream_modules: &HttpModules,
         shutdown_flag: Arc<AtomicBool>,
@@ -653,35 +669,6 @@ impl Session {
             #[cfg(feature = "early_body_buffer")]
             body_buffered: false,
         }
-    }
-
-    /// Create a new [Session] from the given [Stream]
-    ///
-    /// This function is mostly used for testing and mocking, given the downstream modules and
-    /// shutdown flags will never be set.
-    pub fn new_h1(stream: Stream) -> Self {
-        let modules = HttpModules::new();
-        Self::new(
-            Box::new(HttpSession::new_http1(stream)),
-            &modules,
-            #[cfg(feature = "upstream_modules")]
-            &HttpModules::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-
-    /// Create a new [Session] from the given [Stream] with modules
-    ///
-    /// This function is mostly used for testing and mocking, given the shutdown flag will never be
-    /// set.
-    pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
-        Self::new(
-            Box::new(HttpSession::new_http1(stream)),
-            downstream_modules,
-            #[cfg(feature = "upstream_modules")]
-            &HttpModules::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
     }
 
     /// Run upstream module filters on the given [`HttpTask`].
@@ -719,11 +706,11 @@ impl Session {
         Ok(())
     }
 
-    pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
+    pub fn as_downstream_mut(&mut self) -> &mut HttpSession<DS> {
         &mut self.downstream_session
     }
 
-    pub fn as_downstream(&self) -> &HttpSession {
+    pub fn as_downstream(&self) -> &HttpSession<DS> {
         &self.downstream_session
     }
 
@@ -1090,6 +1077,37 @@ impl Session {
     }
 }
 
+impl Session<()> {
+    /// Create a new [Session] from the given [Stream]
+    ///
+    /// This function is mostly used for testing and mocking, given the downstream modules and
+    /// shutdown flags will never be set.
+    pub fn new_h1(stream: Stream) -> Self {
+        let modules = HttpModules::new();
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            &modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Create a new [Session] from the given [Stream] with modules
+    ///
+    /// This function is mostly used for testing and mocking, given the shutdown flag will never be
+    /// set.
+    pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            downstream_modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct H1UpgradeRequestStatus {
     upstream: Option<bool>,
@@ -1115,11 +1133,14 @@ impl H1UpgradeRequestSnapshot {
 /// 101 can establish a tunnel. Otherwise one side changes protocol while the
 /// other stays in HTTP handling, allowing tunneled traffic to bypass request
 /// processing or corrupt the connection state.
-fn reject_mismatched_h1_upgrade_101(
-    session: &Session,
+fn reject_mismatched_h1_upgrade_101<DS>(
+    session: &Session<DS>,
     header: &ResponseHeader,
     stage: &'static str,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     if header.status != http::StatusCode::SWITCHING_PROTOCOLS {
         return Ok(());
     }
@@ -1143,11 +1164,14 @@ fn reject_mismatched_h1_upgrade_101(
     Ok(())
 }
 
-fn reject_unexpected_task_after_h1_upgrade(
-    session: &Session,
+fn reject_unexpected_task_after_h1_upgrade<DS>(
+    session: &Session<DS>,
     task: &'static str,
     task_filter_seen_upgraded: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     let status = session.h1_upgrade_request_snapshot();
     Error::e_explain(
         InvalidHTTPHeader,
@@ -1163,10 +1187,13 @@ fn reject_unexpected_task_after_h1_upgrade(
     .map_err(|e| e.into_in())
 }
 
-fn reject_unexpected_upgraded_body_before_h1_upgrade(
-    session: &Session,
+fn reject_unexpected_upgraded_body_before_h1_upgrade<DS>(
+    session: &Session<DS>,
     task_filter_seen_upgraded: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     let status = session.h1_upgrade_request_snapshot();
     Error::e_explain(
         InvalidHTTPHeader,
@@ -1182,29 +1209,41 @@ fn reject_unexpected_upgraded_body_before_h1_upgrade(
     .map_err(|e| e.into_in())
 }
 
-impl AsRef<HttpSession> for Session {
-    fn as_ref(&self) -> &HttpSession {
+impl<DS> AsRef<HttpSession<DS>> for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    fn as_ref(&self) -> &HttpSession<DS> {
         &self.downstream_session
     }
 }
 
-impl AsMut<HttpSession> for Session {
-    fn as_mut(&mut self) -> &mut HttpSession {
+impl<DS> AsMut<HttpSession<DS>> for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    fn as_mut(&mut self) -> &mut HttpSession<DS> {
         &mut self.downstream_session
     }
 }
 
 use std::ops::{Deref, DerefMut};
 
-impl Deref for Session {
-    type Target = HttpSession;
+impl<DS> Deref for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    type Target = HttpSession<DS>;
 
     fn deref(&self) -> &Self::Target {
         &self.downstream_session
     }
 }
 
-impl DerefMut for Session {
+impl<DS> DerefMut for Session<DS>
+where
+    DS: DownstreamSession,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.downstream_session
     }
@@ -1222,18 +1261,19 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     resp
 });
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_request(
         self: &Arc<Self>,
-        mut session: Session,
-        mut ctx: <SV as ProxyHttp>::CTX,
+        mut session: Session<DS>,
+        mut ctx: <SV as ProxyHttp<DS>>::CTX,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if let Err(e) = self
             .inner
@@ -1458,14 +1498,14 @@ where
 
     async fn handle_error(
         &self,
-        mut session: Session,
-        ctx: &mut <SV as ProxyHttp>::CTX,
+        mut session: Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         e: Box<Error>,
         context: &str,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
         if !self.inner.suppress_error_log(&session, ctx, &e) {
@@ -1514,12 +1554,12 @@ where
     #[cfg(feature = "early_body_buffer")]
     async fn buffer_request_body_early(
         &self,
-        session: &mut Session,
-        ctx: &mut <SV as ProxyHttp>::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Result<()>
     where
-        SV: ProxyHttp + Send + Sync,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // check trait method for opt-in and size limit
         let Some(max_size) = self.inner.early_request_body_buffer_limit(session, ctx) else {
@@ -1555,13 +1595,13 @@ where
     #[cfg(feature = "early_body_buffer")]
     async fn buffer_request_body_early_inner(
         &self,
-        session: &mut Session,
-        ctx: &mut <SV as ProxyHttp>::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         max_size: usize,
     ) -> Result<()>
     where
-        SV: ProxyHttp + Send + Sync,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let content_length = header_value_content_length(
             session
@@ -1670,24 +1710,28 @@ error[E0391]: cycle detected when computing type of `proxy_cache::<impl at pingo
 
 */
 #[async_trait]
-pub trait Subrequest {
+pub trait Subrequest<DS = ()>
+where
+    DS: DownstreamSession,
+{
     async fn process_subrequest(
         self: Arc<Self>,
-        session: Box<HttpSession>,
+        session: Box<HttpSession<DS>>,
         sub_req_ctx: Box<SubrequestCtx>,
     );
 }
 
 #[async_trait]
-impl<SV, C> Subrequest for HttpProxy<SV, C>
+impl<SV, C, DS> Subrequest<DS> for HttpProxy<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    <SV as ProxyHttp>::CTX: Send + Sync,
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_subrequest(
         self: Arc<Self>,
-        session: Box<HttpSession>,
+        session: Box<HttpSession<DS>>,
         sub_req_ctx: Box<SubrequestCtx>,
     ) {
         debug!("starting subrequest");
@@ -1716,36 +1760,48 @@ where
 }
 
 /// A handle to the underlying HTTP proxy app that allows spawning subrequests.
-pub struct SubrequestSpawner {
-    app: Arc<dyn Subrequest + Send + Sync>,
+pub struct SubrequestSpawner<DS = ()>
+where
+    DS: DownstreamSession,
+{
+    app: Arc<dyn Subrequest<DS> + Send + Sync>,
 }
 
 /// A [`PreparedSubrequest`] that is ready to run.
-pub struct PreparedSubrequest {
-    app: Arc<dyn Subrequest + Send + Sync>,
-    session: Box<HttpSession>,
+pub struct PreparedSubrequest<DS = ()>
+where
+    DS: DownstreamSession,
+{
+    app: Arc<dyn Subrequest<DS> + Send + Sync>,
+    session: Box<HttpSession<DS>>,
     sub_req_ctx: Box<SubrequestCtx>,
 }
 
-impl PreparedSubrequest {
+impl<DS> PreparedSubrequest<DS>
+where
+    DS: DownstreamSession,
+{
     pub async fn run(self) {
         self.app
             .process_subrequest(self.session, self.sub_req_ctx)
             .await
     }
 
-    pub fn session(&self) -> &HttpSession {
+    pub fn session(&self) -> &HttpSession<DS> {
         self.session.as_ref()
     }
 
-    pub fn session_mut(&mut self) -> &mut HttpSession {
+    pub fn session_mut(&mut self) -> &mut HttpSession<DS> {
         self.session.deref_mut()
     }
 }
 
-impl SubrequestSpawner {
+impl<DS> SubrequestSpawner<DS>
+where
+    DS: DownstreamSession,
+{
     /// Create a new [`SubrequestSpawner`].
-    pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
+    pub fn new(app: Arc<dyn Subrequest<DS> + Send + Sync>) -> SubrequestSpawner<DS> {
         SubrequestSpawner { app }
     }
 
@@ -1753,7 +1809,7 @@ impl SubrequestSpawner {
     // TODO: allow configuring the subrequest session before use
     pub fn spawn_background_subrequest(
         &self,
-        session: &HttpSession,
+        session: &HttpSession<DS>,
         ctx: SubrequestCtx,
     ) -> tokio::task::JoinHandle<()> {
         let new_app = self.app.clone(); // Clone the Arc
@@ -1780,9 +1836,9 @@ impl SubrequestSpawner {
     // TODO: allow configuring the subrequest session before use
     pub fn create_subrequest(
         &self,
-        session: &HttpSession,
+        session: &HttpSession<DS>,
         ctx: SubrequestCtx,
-    ) -> (PreparedSubrequest, SubrequestHandle) {
+    ) -> (PreparedSubrequest<DS>, SubrequestHandle) {
         let new_app = self.app.clone(); // Clone the Arc
         let (mut session, handle) = subrequest::create_session(session);
         if ctx.body_mode() == BodyMode::NoBody {
@@ -1804,15 +1860,16 @@ impl SubrequestSpawner {
 }
 
 #[async_trait]
-impl<SV, C> HttpServerApp for HttpProxy<SV, C>
+impl<SV, C, DS> HttpServerApp<DS> for HttpProxy<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    <SV as ProxyHttp>::CTX: Send + Sync,
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_new_http(
         self: &Arc<Self>,
-        mut session: HttpSession,
+        mut session: HttpSession<DS>,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
         // Extract user context from the previous request before the session is moved into the Box
@@ -1946,26 +2003,47 @@ where
     Service::new(name.to_string(), proxy)
 }
 
-/// Create a [Service] from the user implemented [ProxyHttp].
+/// Create a [`Service`] with a custom upstream connector and standard HTTP downstream sessions.
 ///
-/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service_with_name_custom<SV, C>(
+/// The returned [`Service`] can be hosted by a [`pingora_core::server::Server`] directly.
+pub fn http_proxy_service_with_name_custom_connector<SV, C>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
     connector: C,
-    on_custom: ProcessCustomSession<SV, C>,
 ) -> Service<HttpProxy<SV, C>>
 where
     SV: ProxyHttp + Send + Sync + 'static,
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
+    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, None, None, None);
+    proxy.handle_init_modules();
+
+    Service::new(name.to_string(), proxy)
+}
+
+/// Create a [Service] from the user implemented [ProxyHttp].
+///
+/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service_with_name_custom<SV, C, DS>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+    name: &str,
+    connector: C,
+    on_custom: ProcessCustomSession<SV, C, DS>,
+) -> Service<HttpProxy<SV, C, DS>, DS>
+where
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+    DS: DownstreamSession,
+{
     let mut proxy =
         HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
-    Service::new(name.to_string(), proxy)
+    Service::<_, DS>::new_with_custom_session(name.to_string(), proxy)
 }
 
 /// A builder for a [Service] that can be used to create a [HttpProxy] instance
@@ -1973,27 +2051,22 @@ where
 /// The [ProxyServiceBuilder] can be used to construct a [HttpProxy] service with a custom name,
 /// connector, and custom session handler.
 ///
-pub struct ProxyServiceBuilder<SV, C>
+pub struct ProxyServiceBuilder<SV, C, DS = ()>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     conf: Arc<ServerConf>,
     inner: SV,
     name: String,
     connector: C,
-    custom: Option<ProcessCustomSession<SV, C>>,
+    custom: Option<ProcessCustomSession<SV, C, DS>>,
     server_options: Option<HttpServerOptions>,
     client_options: Option<ConnectorOptions>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
 }
 
-impl<SV> ProxyServiceBuilder<SV, ()>
-where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
-{
+impl<SV> ProxyServiceBuilder<SV, (), ()> {
     /// Create a new [ProxyServiceBuilder] with the given [ServerConf] and [ProxyHttp]
     /// implementation.
     ///
@@ -2017,11 +2090,10 @@ where
     }
 }
 
-impl<SV, C> ProxyServiceBuilder<SV, C>
+impl<SV, C, DS> ProxyServiceBuilder<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     /// Sets the name of the [HttpProxy] service.
     pub fn name(mut self, name: impl AsRef<str>) -> Self {
@@ -2037,11 +2109,15 @@ where
     /// between the proxy and the upstream server.
     ///
     /// Returns a new [ProxyServiceBuilder] with the custom connector and session handler.
-    pub fn custom<C2: custom::Connector>(
+    pub fn custom<C2, DS2>(
         self,
         connector: C2,
-        on_custom: ProcessCustomSession<SV, C2>,
-    ) -> ProxyServiceBuilder<SV, C2> {
+        on_custom: ProcessCustomSession<SV, C2, DS2>,
+    ) -> ProxyServiceBuilder<SV, C2, DS2>
+    where
+        C2: custom::Connector,
+        DS2: DownstreamSession,
+    {
         let Self {
             conf,
             inner,
@@ -2096,7 +2172,11 @@ where
     /// a fully initialized [HttpProxy].
     ///
     /// The returned [Service] is ready to be used by a [pingora_core::server::Server].
-    pub fn build(self) -> Service<HttpProxy<SV, C>> {
+    pub fn build(self) -> Service<HttpProxy<SV, C, DS>, DS>
+    where
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync + 'static,
+    {
         let Self {
             conf,
             inner,
@@ -2118,7 +2198,7 @@ where
         );
 
         proxy.handle_init_modules();
-        let mut service = Service::new(name, proxy);
+        let mut service = Service::<_, DS>::new_with_custom_session(name, proxy);
         if let Some(runtime_opts_override) = runtime_opts_override {
             service.set_runtime_opts_override(runtime_opts_override);
         }

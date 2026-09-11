@@ -53,31 +53,57 @@ impl ReusableHttpStream {
 }
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
-pub enum Session {
+pub enum Session<CS = ()>
+where
+    CS: SessionCustom,
+{
     H1(SessionV1),
     H2(SessionV2),
     Subrequest(SessionSubrequest),
-    Custom(Box<dyn SessionCustom>),
+    Custom(CS),
 }
 
-impl Session {
+impl Session<()> {
     /// Create a new [`Session`] from an established connection for HTTP/1.x
     pub fn new_http1(stream: Stream) -> Self {
-        Self::H1(SessionV1::new(stream))
+        Self::new_http1_with_custom_session(stream)
     }
 
     /// Create a new [`Session`] from an established HTTP/2 stream
     pub fn new_http2(session: SessionV2) -> Self {
-        Self::H2(session)
+        Self::new_http2_with_custom_session(session)
     }
 
     /// Create a new [`Session`] from a subrequest session
     pub fn new_subrequest(session: SessionSubrequest) -> Self {
+        Self::new_subrequest_with_custom_session(session)
+    }
+}
+
+impl<CS> Session<CS>
+where
+    CS: SessionCustom,
+{
+    /// Create a new [`Session`] with a concrete custom-session type from an
+    /// established connection for HTTP/1.x.
+    pub fn new_http1_with_custom_session(stream: Stream) -> Self {
+        Self::H1(SessionV1::new(stream))
+    }
+
+    /// Create a new [`Session`] with a concrete custom-session type from an
+    /// established HTTP/2 stream.
+    pub fn new_http2_with_custom_session(session: SessionV2) -> Self {
+        Self::H2(session)
+    }
+
+    /// Create a new [`Session`] with a concrete custom-session type from a
+    /// subrequest session.
+    pub fn new_subrequest_with_custom_session(session: SessionSubrequest) -> Self {
         Self::Subrequest(session)
     }
 
     /// Create a new [`Session`] from a custom session
-    pub fn new_custom(session: Box<dyn SessionCustom>) -> Self {
+    pub fn new_custom(session: CS) -> Self {
         Self::Custom(session)
     }
 
@@ -745,16 +771,16 @@ impl Session {
         }
     }
 
-    pub fn as_custom(&self) -> Option<&dyn SessionCustom> {
+    pub fn as_custom(&self) -> Option<&CS> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
-            Self::Custom(c) => Some(c.as_ref()),
+            Self::Custom(c) => Some(c),
         }
     }
 
-    pub fn as_custom_mut(&mut self) -> Option<&mut Box<dyn SessionCustom>> {
+    pub fn as_custom_mut(&mut self) -> Option<&mut CS> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,
@@ -1005,14 +1031,13 @@ impl Session {
 mod tests {
     use super::*;
     use crate::protocols::http::custom::CustomMessageWrite;
-    use async_trait::async_trait;
     use futures::Stream;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn custom_proxy_task_defaults_are_opted_out_and_fail_loudly() {
-        let mut session = Session::new_custom(Box::new(()));
+        let mut session = Session::new_custom(());
 
         assert!(!session.supports_proxy_task_api());
         session.set_proxy_tasks_enabled(true);
@@ -1030,7 +1055,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_proxy_task_methods_delegate_to_the_custom_session() {
-        let mut session = Session::new_custom(Box::new(ProxyTaskCustom::new()));
+        let mut session = Session::new_custom(ProxyTaskCustom::new());
 
         assert!(!session.supports_proxy_task_api());
         session.set_proxy_tasks_enabled(true);
@@ -1050,9 +1075,8 @@ mod tests {
     #[tokio::test]
     async fn custom_session_shutdown_signals_an_incomplete_message() {
         let shutdown_calls = Arc::new(Mutex::new(Vec::new()));
-        let mut session = Session::new_custom(Box::new(ProxyTaskCustom::with_shutdown_calls(
-            shutdown_calls.clone(),
-        )));
+        let mut session =
+            Session::new_custom(ProxyTaskCustom::with_shutdown_calls(shutdown_calls.clone()));
 
         session.shutdown().await;
 
@@ -1084,7 +1108,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl SessionCustom for ProxyTaskCustom {
         fn req_header(&self) -> &RequestHeader {
             &self.header

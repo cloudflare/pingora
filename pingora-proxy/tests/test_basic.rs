@@ -16,17 +16,18 @@ mod utils;
 
 use bytes::Bytes;
 use h2::client;
-use http::Request;
+use http::{Request, Response};
 use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
+use pingora_test_utils::http_origin::HttpOrigin;
 use reqwest::{header, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::{
-    downstream_cache_warn_log_calls, init, reset_suppress_proxy_warn_log_calls,
+    downstream_cache_warn_log_calls, init, init_proxy, reset_suppress_proxy_warn_log_calls,
     suppress_proxy_warn_log_calls,
 };
 
@@ -47,8 +48,23 @@ async fn test_origin_alive() {
 
 #[tokio::test]
 async fn test_simple_proxy() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:6147").await.unwrap();
+    init_proxy().await;
+    let origin = HttpOrigin::bind(|_request| async {
+        Response::builder()
+            .header(header::CONTENT_LENGTH, "13")
+            .body(Bytes::from_static(b"Hello World!\n"))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let origin_addr = origin.addr();
+
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147")
+        .header("x-port", origin_addr.port().to_string())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     let headers = res.headers();
@@ -62,7 +78,10 @@ async fn test_simple_proxy() {
     assert_eq!(sockaddr.ip().to_string(), "127.0.0.1");
     assert!(is_specified_port(sockaddr.port()));
 
-    assert_eq!(headers["x-upstream-server-addr"], "127.0.0.1:8000");
+    assert_eq!(
+        headers["x-upstream-server-addr"].to_str().unwrap(),
+        origin_addr.to_string()
+    );
     let sockaddr = headers["x-upstream-client-addr"]
         .to_str()
         .unwrap()
@@ -73,6 +92,7 @@ async fn test_simple_proxy() {
 
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
+    origin.shutdown().await;
 }
 
 #[tokio::test]
@@ -693,13 +713,23 @@ async fn test_upstream_compression() {
 
 #[tokio::test]
 async fn test_downstream_compression() {
-    init();
+    init_proxy().await;
+    let origin = HttpOrigin::bind(|_request| async {
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Bytes::from_static(b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let origin_port = origin.addr().port().to_string();
 
     // disable reqwest gzip support to check compression headers and body
     // otherwise reqwest will decompress and strip the headers
     let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
     let res = client
         .get("http://127.0.0.1:6147/no_compression")
+        .header("x-port", &origin_port)
         // tell the test proxy to use downstream compression module instead of upstream
         .header("x-downstream-compression", "1")
         .header("accept-encoding", "gzip")
@@ -715,6 +745,7 @@ async fn test_downstream_compression() {
     let client = reqwest::ClientBuilder::new().gzip(true).build().unwrap();
     let res = client
         .get("http://127.0.0.1:6147/no_compression")
+        .header("x-port", &origin_port)
         .header("accept-encoding", "gzip")
         .send()
         .await
@@ -722,15 +753,30 @@ async fn test_downstream_compression() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.bytes().await.unwrap();
     assert_eq!(body.as_ref(), &[b'B'; 32]);
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_connect_close() {
-    init();
+    init_proxy().await;
+    let origin = HttpOrigin::bind(|_request| async {
+        Response::builder()
+            .header(header::CONTENT_LENGTH, "13")
+            .body(Bytes::from_static(b"Hello World!\n"))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let origin_port = origin.addr().port().to_string();
 
     // default keep-alive
     let client = reqwest::ClientBuilder::new().build().unwrap();
-    let res = client.get("http://127.0.0.1:6147").send().await.unwrap();
+    let res = client
+        .get("http://127.0.0.1:6147")
+        .header("x-port", &origin_port)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "13");
@@ -742,6 +788,7 @@ async fn test_connect_close() {
     let client = reqwest::ClientBuilder::new().build().unwrap();
     let res = client
         .get("http://127.0.0.1:6147")
+        .header("x-port", &origin_port)
         .header("connection", "close")
         .send()
         .await
@@ -752,6 +799,7 @@ async fn test_connect_close() {
     assert_eq!(headers[header::CONNECTION], "close");
     let body = res.text().await.unwrap();
     assert_eq!(body, "Hello World!\n");
+    origin.shutdown().await;
 }
 
 #[tokio::test]

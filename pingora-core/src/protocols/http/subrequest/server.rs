@@ -46,6 +46,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::body::{BodyMode, BodyReader, BodyWriter, PREMATURE_BODY_END};
 use crate::protocols::http::{
     body_buffer::FixedBuffer,
+    custom::server::Session as CustomServerSession,
     server::Session as GenericHttpSession,
     subrequest::dummy::DummyIO,
     v1::common::{header_value_content_length, is_chunked_encoding_from_headers, BODY_BUF_LIMIT},
@@ -152,7 +153,10 @@ impl HttpSession {
     /// Create a new http server session for a subrequest.
     /// The created session needs to call [`Self::read_request()`] first before performing
     /// any other operations.
-    pub fn new_from_session(session: &GenericHttpSession) -> (Self, SubrequestHandle) {
+    pub fn new_from_session<DS>(session: &GenericHttpSession<DS>) -> (Self, SubrequestHandle)
+    where
+        DS: CustomServerSession,
+    {
         let v1_inner = SessionV1::new(Box::new(DummyIO::new(&session.to_h1_raw())));
         let digest = session.digest().cloned();
         // allow buffering a small number of tasks, otherwise exert backpressure
