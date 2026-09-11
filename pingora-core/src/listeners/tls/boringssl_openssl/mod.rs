@@ -185,16 +185,16 @@ impl Acceptor {
         if let Some(offload) = self.offload.as_ref() {
             let ssl_acceptor = self.ssl_acceptor.clone();
             let callbacks = self.callbacks.clone();
-            let rt = offload.get_runtime(stream.id() as u64);
-            rt.spawn(async move {
-                if let Some(cb) = callbacks.as_ref() {
-                    handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
-                } else {
-                    handshake(&ssl_acceptor, stream).await
-                }
-            })
-            .await
-            .or_err(InternalError, "TLS offload runtime failure")?
+            offload
+                .spawn_abort_on_drop(stream.id() as u64, async move {
+                    if let Some(cb) = callbacks.as_ref() {
+                        handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
+                    } else {
+                        handshake(&ssl_acceptor, stream).await
+                    }
+                })
+                .await
+                .or_err(InternalError, "TLS offload runtime failure")?
         } else if let Some(cb) = self.callbacks.as_ref() {
             handshake_with_callback(&self.ssl_acceptor, stream, cb.as_ref()).await
         } else {
@@ -266,5 +266,33 @@ mod alpn {
             Some(p) => Ok(p),
             _ => Err(AlpnError::ALERT_FATAL), // cannot agree
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn canceled_offloaded_handshake_drops_stream() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        settings.set_offload_threadpool(1, 1);
+        let acceptor = settings.build();
+        let (mut client, server) = tokio::io::duplex(1024);
+
+        let mut handshake = Box::pin(acceptor.tls_handshake(server));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        drop(handshake);
+
+        let mut buf = [0];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes_read, 0);
     }
 }

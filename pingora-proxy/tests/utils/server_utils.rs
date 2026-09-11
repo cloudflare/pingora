@@ -1127,6 +1127,18 @@ impl Server {
         let server_handle = thread::spawn(|| {
             test_main();
         });
+        let addr = "127.0.0.1:6147".parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test proxy failed to start within 10s"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         Server {
             handle: server_handle,
         }
@@ -1220,6 +1232,14 @@ pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
 #[cfg(feature = "s2n")]
 pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
+
+pub async fn init_proxy() {
+    tokio::task::spawn_blocking(|| {
+        let _ = *TEST_SERVER;
+    })
+    .await
+    .expect("test proxy startup task panicked");
+}
 
 pub fn init() {
     let _ = *TEST_SERVER;

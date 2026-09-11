@@ -14,7 +14,7 @@
 
 mod utils;
 
-use utils::server_utils::init;
+use utils::server_utils::{init, init_proxy};
 use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
 use bytes::Bytes;
@@ -22,6 +22,7 @@ use futures::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use pingora_http::ResponseHeader;
+use pingora_test_utils::http_origin::HttpOrigin;
 use reqwest::{StatusCode, Version};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -30,7 +31,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
@@ -386,6 +387,30 @@ async fn capture_upstream_request(
     (port, rx)
 }
 
+async fn capture_http_origin() -> (HttpOrigin, mpsc::UnboundedReceiver<http::Request<Bytes>>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let origin = HttpOrigin::bind(move |request| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(request);
+            http::Response::new(Bytes::new())
+        }
+    })
+    .await
+    .unwrap();
+
+    (origin, rx)
+}
+
+async fn receive_http_origin_request(
+    received: &mut mpsc::UnboundedReceiver<http::Request<Bytes>>,
+) -> http::Request<Bytes> {
+    timeout(Duration::from_secs(5), received.recv())
+        .await
+        .expect("upstream was never contacted")
+        .expect("origin stopped before receiving the request")
+}
+
 // Send h2c with independently controlled `:authority` and `Host`.
 // A direct h2 client is required because higher-level clients make them agree.
 async fn send_h2c_authority_request(
@@ -722,7 +747,8 @@ async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
 
 #[tokio::test]
 async fn test_h1_absolute_form_host_is_restored_after_filter_deletion() {
-    init();
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
 
     let request = concat!(
         "GET http://client.example/test HTTP/1.1\r\n",
@@ -731,13 +757,13 @@ async fn test_h1_absolute_form_host_is_restored_after_filter_deletion() {
         "x-port: {port}\r\n",
         "\r\n",
     );
-    let (port, received) = capture_h1_upstream().await;
+    let port = origin.addr().port();
     assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
-    let received = String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .to_ascii_lowercase();
-    assert!(received.starts_with("get http://client.example/test http/1.1\r\n"));
-    assert!(received.contains("\r\nhost: client.example\r\n"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+
+    assert_eq!(upstream.uri().to_string(), "http://client.example/test");
+    assert_eq!(upstream.headers()[http::header::HOST], "client.example");
 }
 
 #[tokio::test]
@@ -827,17 +853,18 @@ async fn test_hostless_h1_absolute_form_uses_target_authority() {
 
 #[tokio::test]
 async fn test_hostless_http10_request_remains_hostless_upstream() {
-    init();
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
 
-    let (port, received) = capture_h1_upstream().await;
+    let port = origin.addr().port();
     let request = "GET /test HTTP/1.0\r\nx-port: {port}\r\n\r\n";
     assert!(send_h1_raw_request(port, request).await.contains("200 OK"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
 
-    let received = String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .to_ascii_lowercase();
-    assert!(received.starts_with("get /test http/1.1\r\n"));
-    assert!(!received.contains("\r\nhost:"));
+    assert_eq!(upstream.uri(), "/test");
+    assert_eq!(upstream.version(), http::Version::HTTP_11);
+    assert!(!upstream.headers().contains_key(http::header::HOST));
 }
 
 // Ambiguous H1 authority must not reach upstream.
@@ -952,10 +979,9 @@ async fn send_raw_request_to_test_proxy(request: String) -> ResponseHeader {
 
 #[tokio::test]
 async fn test_h1_upstream_strips_hop_by_hop_and_connection_nominated_headers() {
-    init();
-    let (port, received) =
-        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
+    let port = origin.addr().port();
 
     let req = format!(
         concat!(
@@ -977,23 +1003,30 @@ async fn test_h1_upstream_strips_hop_by_hop_and_connection_nominated_headers() {
     );
 
     assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
-    let upstream = String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .to_ascii_lowercase();
-    assert!(!upstream.contains("\r\nconnection:"));
-    assert!(!upstream.contains("\r\nkeep-alive:"));
-    assert!(!upstream.contains("\r\nproxy-connection:"));
-    assert!(!upstream.contains("\r\nproxy-authenticate:"));
-    assert!(!upstream.contains("\r\nproxy-authorization:"));
-    assert!(!upstream.contains("\r\nte:"));
-    assert!(!upstream.contains("\r\ntrailer:"));
-    assert!(!upstream.contains("\r\nx-private-hop:"));
-    assert!(upstream.contains("\r\nx-regular: keep\r\n"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+
+    for removed in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "x-private-hop",
+    ] {
+        assert!(
+            !upstream.headers().contains_key(removed),
+            "{removed} reached the upstream"
+        );
+    }
+    assert_eq!(upstream.headers()["x-regular"], "keep");
 }
 
 #[tokio::test]
 async fn test_h1_upstream_rejects_sensitive_fields_nominated_by_connection() {
-    init();
+    init_proxy().await;
     for nominated in [
         "Host",
         "X-Forwarded-For",
@@ -1038,7 +1071,7 @@ async fn test_h1_upstream_rejects_sensitive_fields_nominated_by_connection() {
 
 #[tokio::test]
 async fn test_h1_upstream_rejects_excessive_connection_nominations() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1503,10 +1536,9 @@ async fn test_h1_upstream_finishes_chunked_body_when_filter_discards_body() {
 
 #[tokio::test]
 async fn test_h1_upstream_can_retain_connection_nominated_fields_separately() {
-    init();
-    let (port, received) =
-        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
+    let port = origin.addr().port();
 
     let req = format!(
         concat!(
@@ -1522,19 +1554,18 @@ async fn test_h1_upstream_can_retain_connection_nominated_fields_separately() {
     );
 
     assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
-    let upstream = String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .to_ascii_lowercase();
-    assert!(!upstream.contains("\r\nconnection:"));
-    assert!(upstream.contains("\r\nx-private-hop: retained\r\n"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+
+    assert!(!upstream.headers().contains_key(http::header::CONNECTION));
+    assert_eq!(upstream.headers()["x-private-hop"], "retained");
 }
 
 #[tokio::test]
 async fn test_h1_upstream_does_not_validate_nominations_when_removal_disabled() {
-    init();
-    let (port, received) =
-        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
+    let port = origin.addr().port();
 
     let req = format!(
         concat!(
@@ -1549,18 +1580,17 @@ async fn test_h1_upstream_does_not_validate_nominations_when_removal_disabled() 
     );
 
     assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
-    let upstream = String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .to_ascii_lowercase();
-    assert!(upstream.contains("\r\nhost: intended.example\r\n"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+
+    assert_eq!(upstream.headers()[http::header::HOST], "intended.example");
 }
 
 #[tokio::test]
 async fn test_h1_upstream_always_sends_http11_request_version() {
-    init();
-    let (port, received) =
-        capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
+    init_proxy().await;
+    let (origin, mut received) = capture_http_origin().await;
+    let port = origin.addr().port();
 
     let req = format!(
         concat!(
@@ -1573,9 +1603,10 @@ async fn test_h1_upstream_always_sends_http11_request_version() {
     );
 
     assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
-    assert!(String::from_utf8(received.await.unwrap())
-        .unwrap()
-        .starts_with("GET / HTTP/1.1\r\n"));
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+
+    assert_eq!(upstream.version(), http::Version::HTTP_11);
 }
 
 #[tokio::test]

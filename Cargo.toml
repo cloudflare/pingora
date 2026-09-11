@@ -27,6 +27,7 @@ members = [
     "pingora-memory-cache",
     "pingora-prometheus",
     "pingora-foundations",
+    "pingora-test-utils",
     "tinyufo",
 ]
 
@@ -34,6 +35,7 @@ members = [
 bstr = "1.12.0"
 tokio = "1"
 tokio-stream = { version = "0.1" }
+tokio-util = { version = "0.7.12", features = ["rt"] }
 async-trait = "0.1.42"
 httparse = "1"
 bytes = "1.0"

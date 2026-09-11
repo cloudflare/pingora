@@ -27,7 +27,7 @@
 
 use crate::proxy_common::{DownstreamStateMachine, ResponseStateMachine};
 use crate::subrequest::*;
-use crate::{PreparedSubrequest, Session};
+use crate::{DownstreamSession, PreparedSubrequest, Session};
 use bytes::Bytes;
 use futures::FutureExt;
 use log::{debug, warn};
@@ -178,14 +178,15 @@ impl std::convert::From<SavedBody> for InputBody {
     }
 }
 
-pub async fn pipe_subrequest<F>(
-    session: &mut Session,
-    mut subrequest: PreparedSubrequest,
+pub async fn pipe_subrequest<DS, F>(
+    session: &mut Session<DS>,
+    mut subrequest: PreparedSubrequest<DS>,
     subrequest_handle: SubrequestHandle,
     mut task_filter: F,
     input_body: InputBodyType,
 ) -> std::result::Result<PipeSubrequestState, PipeSubrequestError>
 where
+    DS: DownstreamSession,
     F: FnMut(HttpTask) -> Result<Option<HttpTask>>,
 {
     let (maybe_preset_body, saved_body) = match input_body {
@@ -375,13 +376,16 @@ where
 }
 
 // Mostly the same as proxy_common, but does not run proxy request_body_filter
-async fn send_body_to_pipe(
-    session: &mut Session,
+async fn send_body_to_pipe<DS>(
+    session: &mut Session<DS>,
     mut data: Option<Bytes>,
     end_of_body: bool,
     saved_body: Option<&mut SavedBody>,
     tx: mpsc::Permit<'_, HttpTask>,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    DS: DownstreamSession,
+{
     // None: end of body
     // this var is to signal if downstream finish sending the body, which shouldn't be
     // affected by the request_body_filter
