@@ -68,6 +68,10 @@ use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
+#[cfg(feature = "early_body_buffer")]
+use pingora_core::protocols::http::v1::common::{
+    header_value_content_length, is_expect_continue_req,
+};
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
@@ -620,6 +624,16 @@ where
     upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    /// Request body buffered early (before upstream connection) for auth/routing decisions.
+    /// When set, body forwarding will use this instead of re-reading from downstream. It must
+    /// outlive the first attempt so a retry can replay it.
+    /// Use accessor methods: `get_buffered_body()`, `set_buffered_body()`.
+    #[cfg(feature = "early_body_buffer")]
+    buffered_request_body: Option<Bytes>,
+    /// Whether body has been fully consumed for buffering.
+    /// Use accessor: `is_body_buffered()`.
+    #[cfg(feature = "early_body_buffer")]
+    body_buffered: bool,
 }
 
 impl<DS> Session<DS>
@@ -650,6 +664,10 @@ where
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
+            #[cfg(feature = "early_body_buffer")]
+            buffered_request_body: None,
+            #[cfg(feature = "early_body_buffer")]
+            body_buffered: false,
         }
     }
 
@@ -956,6 +974,69 @@ where
         self.shutdown_flag.load(Ordering::Acquire)
     }
 
+    /// Returns a reference to the fully buffered request body, if non-empty.
+    ///
+    /// The body may be buffered automatically when
+    /// [`ProxyHttp::early_request_body_buffer_limit()`] returns `Some(max_size)`, or supplied by
+    /// application code through [`Self::set_buffered_body()`].
+    #[cfg(feature = "early_body_buffer")]
+    pub fn get_buffered_body(&self) -> Option<&Bytes> {
+        self.buffered_request_body.as_ref()
+    }
+
+    /// Sets a fully consumed request body for upstream forwarding.
+    ///
+    /// The body is retained and replayed across upstream retries. `None` marks the request body as
+    /// fully consumed and empty.
+    ///
+    /// When automatic early buffering is enabled, call this from
+    /// [`ProxyHttp::request_filter()`], after Pingora has assembled the filtered chunks. Do not
+    /// call it from [`ProxyHttp::early_request_body_filter()`]; that callback must modify its
+    /// `body` argument, and the buffering loop may overwrite the body you set when it stores the
+    /// assembled result.
+    ///
+    /// Application code calling this directly must first fully consume the downstream body and
+    /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
+    /// `Transfer-Encoding` to describe the supplied body.
+    #[cfg(feature = "early_body_buffer")]
+    pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
+        self.body_buffered = true;
+        self.buffered_request_body = body;
+    }
+
+    /// Returns whether a body has been buffered (or confirmed empty).
+    ///
+    /// When `true`, the body has been fully read and is available via `get_buffered_body()`,
+    /// or the request has no body. Body forwarding will skip re-reading from downstream.
+    #[cfg(feature = "early_body_buffer")]
+    pub fn is_body_buffered(&self) -> bool {
+        self.body_buffered
+    }
+
+    /// Marks the body as buffered without setting a body.
+    ///
+    /// Used when buffering confirms that the request body is empty.
+    #[cfg(feature = "early_body_buffer")]
+    pub fn mark_body_buffered(&mut self) {
+        self.body_buffered = true;
+    }
+
+    /// Creates a Session from an H1 HttpSession (for testing only).
+    #[cfg(all(test, feature = "early_body_buffer"))]
+    pub fn new_h1_with_http_session(
+        http_session: pingora_core::protocols::http::v1::server::HttpSession,
+    ) -> Self {
+        use pingora_core::protocols::http::ServerSession;
+
+        Self::new(
+            Box::new(ServerSession::H1(http_session)),
+            &HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
     pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
         if let Some(custom_session) = self.downstream_session.as_custom_mut() {
             custom_session
@@ -1204,6 +1285,17 @@ where
                 .await;
         }
 
+        // early body buffering: read full request body before request_filter
+        // see https://github.com/cloudflare/pingora/issues/780
+        #[cfg(feature = "early_body_buffer")]
+        if !session.is_body_buffered() {
+            if let Err(e) = self.buffer_request_body_early(&mut session, &mut ctx).await {
+                return self
+                    .handle_error(session, &mut ctx, e, "Failed to buffer request body:")
+                    .await;
+            }
+        }
+
         if self.inner.allow_spawning_subrequest(&session, &ctx) {
             session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
@@ -1444,6 +1536,167 @@ where
         } else {
             None
         }
+    }
+
+    /// Buffer the entire request body before connecting to upstream.
+    ///
+    /// This enables early_request_body_filter to run BEFORE upstream_peer selection,
+    /// allowing auth signature verification and content-based routing.
+    ///
+    /// Buffering is controlled by the trait method `early_request_body_buffer_limit()`:
+    /// - Returns `None`: Skip buffering, stream body to upstream (default)
+    /// - Returns `Some(max_size)`: Buffer body with size limit enforcement
+    ///
+    /// Size limit enforcement:
+    /// - Content-Length checked first (fail fast before reading)
+    /// - Accumulated size checked during reading (streaming protection)
+    /// - Returns HTTP 413 (Payload Too Large) if exceeded
+    #[cfg(feature = "early_body_buffer")]
+    async fn buffer_request_body_early(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        // check trait method for opt-in and size limit
+        let Some(max_size) = self.inner.early_request_body_buffer_limit(session, ctx) else {
+            return Ok(());
+        };
+
+        // skip if already buffered
+        if session.is_body_buffered() {
+            return Ok(());
+        }
+
+        let total_timeout = self.inner.early_request_body_buffer_timeout(session, ctx);
+        if let Some(total_timeout) = total_timeout {
+            match pingora_timeout::timeout(
+                total_timeout,
+                self.buffer_request_body_early_inner(session, ctx, max_size),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Error::e_explain(
+                    ReadTimedout,
+                    format!("buffering request body, timeout: {total_timeout:?}"),
+                )
+                .map_err(|e| e.into_down()),
+            }
+        } else {
+            self.buffer_request_body_early_inner(session, ctx, max_size)
+                .await
+        }
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    async fn buffer_request_body_early_inner(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        max_size: usize,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        let content_length = header_value_content_length(
+            session
+                .downstream_session
+                .req_header()
+                .headers
+                .get(header::CONTENT_LENGTH),
+        );
+
+        // fail fast: reject before reading if Content-Length exceeds limit
+        if let Some(cl) = content_length {
+            if cl > max_size {
+                return Error::e_explain(
+                    HTTPStatus(413),
+                    format!(
+                        "Request body too large: Content-Length {} exceeds limit {} bytes",
+                        cl, max_size
+                    ),
+                );
+            }
+        }
+
+        // Content-Length: 0 means no body; for all other cases (no Content-Length,
+        // Transfer-Encoding, HTTP/2) attempt to read. read_request_body returns
+        // None immediately if there's nothing.
+        if content_length == Some(0) {
+            session.mark_body_buffered();
+            return Ok(());
+        }
+
+        if is_expect_continue_req(session.downstream_session.req_header()) {
+            session
+                .downstream_session
+                .write_continue_response()
+                .await
+                .map_err(|e| e.into_down())?;
+        }
+
+        let mut body_parts: Vec<Bytes> = Vec::new();
+        let mut total_size: usize = 0;
+
+        // read body chunks until end of stream
+        loop {
+            let body_chunk: Option<Bytes> =
+                match session.downstream_session.read_request_body().await {
+                    Ok(chunk) => chunk,
+                    Err(e) => return Err(e.into_down()),
+                };
+
+            // end of stream: None means no more data, or downstream reports done
+            let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
+
+            // run early body filter (not module filters, they haven't run header filter yet)
+            let mut filter_data = body_chunk;
+            self.inner
+                .early_request_body_filter(session, &mut filter_data, end_of_body, ctx)
+                .await?;
+
+            // accumulate the (possibly filtered) data
+            if let Some(filtered) = filter_data {
+                total_size += filtered.len();
+
+                // check size limit during accumulation
+                if total_size > max_size {
+                    return Error::e_explain(
+                        HTTPStatus(413),
+                        format!(
+                            "Request body exceeded limit: {} > {} bytes",
+                            total_size, max_size
+                        ),
+                    );
+                }
+
+                body_parts.push(filtered);
+            }
+
+            if end_of_body {
+                break;
+            }
+        }
+
+        if total_size == 0 {
+            session.mark_body_buffered();
+        } else if body_parts.len() == 1 {
+            // common case: a single chunk can be moved out without a second copy
+            session.set_buffered_body(body_parts.pop());
+        } else {
+            let mut combined = bytes::BytesMut::with_capacity(total_size);
+            for part in body_parts {
+                combined.extend_from_slice(&part);
+            }
+            session.set_buffered_body(Some(combined.freeze()));
+        }
+
+        Ok(())
     }
 }
 
@@ -2607,6 +2860,70 @@ mod tests {
         assert!(called.load(Ordering::Acquire));
         let written = written.lock().unwrap().clone();
         assert_raw_upgrade_payload(&written);
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    mod body_buffer {
+        use super::*;
+        use pingora_core::protocols::http::v1::server::HttpSession;
+        use tokio_test::io::Builder;
+
+        fn create_test_session() -> Session {
+            let mock_io = Builder::new().build();
+            let http_session = HttpSession::new(Box::new(mock_io));
+            Session::new_h1_with_http_session(http_session)
+        }
+
+        #[test]
+        fn test_initial_state() {
+            let session = create_test_session();
+            assert!(!session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[test]
+        fn test_set_and_get_buffered_body() {
+            let mut session = create_test_session();
+            let body = Bytes::from("test body");
+
+            session.set_buffered_body(Some(body.clone()));
+
+            assert!(session.is_body_buffered());
+            assert_eq!(session.get_buffered_body(), Some(&body));
+        }
+
+        #[test]
+        fn test_buffered_body_survives_repeated_reads() {
+            let mut session = create_test_session();
+            let body = Bytes::from("test body");
+
+            session.set_buffered_body(Some(body.clone()));
+
+            for _ in 0..3 {
+                assert_eq!(session.get_buffered_body(), Some(&body));
+                assert!(session.is_body_buffered());
+            }
+        }
+
+        #[test]
+        fn test_mark_body_buffered() {
+            let mut session = create_test_session();
+
+            assert!(!session.is_body_buffered());
+            session.mark_body_buffered();
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[test]
+        fn test_set_none_marks_empty_body_buffered() {
+            let mut session = create_test_session();
+
+            assert!(!session.is_body_buffered());
+            session.set_buffered_body(None);
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
     }
 
     /// A socket whose reads never complete, like an idle keep-alive connection

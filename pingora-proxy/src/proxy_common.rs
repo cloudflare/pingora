@@ -473,6 +473,23 @@ impl DownstreamStateMachine {
     }
 }
 
+/// Select an early-buffered body without consuming it, or lazily inspect downstream retry state.
+///
+/// The fallback must remain lazy because `is_body_done()` can initialize the H1 body reader.
+#[cfg(feature = "early_body_buffer")]
+pub(crate) fn select_upstream_body_source(
+    is_body_buffered: bool,
+    buffered_body: Option<bytes::Bytes>,
+    fallback: impl FnOnce() -> (bool, Option<bytes::Bytes>),
+) -> (DownstreamStateMachine, Option<bytes::Bytes>) {
+    if is_body_buffered {
+        (DownstreamStateMachine::ReadingFinished, buffered_body)
+    } else {
+        let (is_body_done, retry_buffer) = fallback();
+        (DownstreamStateMachine::new(is_body_done), retry_buffer)
+    }
+}
+
 /// Possible upstream states during request multiplexing
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponseStateMachine {
@@ -891,5 +908,59 @@ mod tests {
         ds.reset(); // must not overwrite Errored
         assert!(ds.is_errored());
         assert!(!ds.can_poll());
+    }
+
+    /// The selection logic shared by the h1 and h2 proxy loops. These tests cover that shared
+    /// logic only; neither protocol's proxy loop is executed here. End-to-end h1 behavior lives
+    /// in `tests/test_early_body_buffer_retry.rs`.
+    #[cfg(feature = "early_body_buffer")]
+    mod upstream_body_source {
+        use super::*;
+        use bytes::Bytes;
+
+        /// A pre-buffered body is always forwarded, never dropped in favor of downstream state.
+        /// Non-consumption is a property of the callers, which clone; this only checks that a
+        /// supplied body is returned as-is.
+        #[test]
+        fn prebuffered_body_is_forwarded() {
+            let body = Bytes::from("payload");
+            for _ in 0..3 {
+                let (state, buffer) = select_upstream_body_source(true, Some(body.clone()), || {
+                    panic!("must not consult downstream when a body was pre-buffered")
+                });
+                assert!(matches!(state, DownstreamStateMachine::ReadingFinished));
+                assert!(
+                    state.can_poll(),
+                    "finished bodies must still poll for downstream close"
+                );
+                assert_eq!(buffer, Some(body.clone()));
+            }
+        }
+
+        /// A request marked buffered but carrying no body is finished while still polling for
+        /// downstream close.
+        #[test]
+        fn prebuffered_empty_body_is_finished() {
+            let (state, buffer) = select_upstream_body_source(true, None, || {
+                panic!("must not consult downstream when the body was marked buffered")
+            });
+            assert!(matches!(state, DownstreamStateMachine::ReadingFinished));
+            assert!(state.can_poll());
+            assert_eq!(buffer, None);
+        }
+
+        /// Without early buffering the retry buffer is used and downstream state is preserved.
+        #[test]
+        fn falls_back_to_retry_buffer() {
+            let retry = Bytes::from("from retry buffer");
+            let (state, buffer) =
+                select_upstream_body_source(false, None, || (false, Some(retry.clone())));
+            assert!(state.is_reading());
+            assert_eq!(buffer, Some(retry));
+
+            let (state, buffer) = select_upstream_body_source(false, None, || (true, None));
+            assert!(state.is_done());
+            assert_eq!(buffer, None);
+        }
     }
 }

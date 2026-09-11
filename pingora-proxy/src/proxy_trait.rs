@@ -247,6 +247,96 @@ where
         Ok(true)
     }
 
+    /// Determine whether to buffer the entire request body before connecting to upstream.
+    ///
+    /// This is called after [`Self::early_request_filter()`] but before [`Self::request_filter()`]
+    /// and [`Self::upstream_peer()`]. The body can be accessed via
+    /// [`Session::get_buffered_body()`].
+    ///
+    /// # Returns
+    /// - `None`: Don't buffer, stream body to upstream (default)
+    /// - `Some(max_size)`: Buffer body with size limit, return 413 error if exceeded
+    ///
+    /// # Use Cases
+    /// - Auth signature verification (need full body before auth decision)
+    /// - Content-based routing decisions
+    /// - Body transformation before upstream selection
+    ///
+    /// # Size Limit Enforcement
+    /// When returning `Some(max_size)`:
+    /// - Content-Length header is checked first (fail fast before reading)
+    /// - Body size is checked during accumulation (streaming protection)
+    /// - If exceeded, returns HTTP 413 (Payload Too Large)
+    ///
+    /// Use [`Self::early_request_body_buffer_timeout()`] to apply a total deadline to this phase.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    fn early_request_body_buffer_limit(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> Option<usize> {
+        None // Default: stream body to upstream
+    }
+
+    /// Set a deadline for buffering the entire request body.
+    ///
+    /// The deadline includes local `100 Continue` handling, downstream reads, and
+    /// [`Self::early_request_body_filter()`] calls. When it expires, buffering fails with a
+    /// downstream read timeout. Returning `None` leaves total buffering time unbounded, although
+    /// protocol-specific per-read timeouts may still apply.
+    ///
+    /// This is only consulted when [`Self::early_request_body_buffer_limit()`] returns `Some`.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    fn early_request_body_buffer_timeout(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> Option<Duration> {
+        None
+    }
+
+    /// Handle each chunk of request body during early buffering.
+    ///
+    /// This is called while the body is buffered early (enabled by
+    /// [`Self::early_request_body_buffer_limit()`]) for each body chunk, **before**
+    /// [`Self::request_filter()`] and [`Self::upstream_peer()`]. Use this for processing that must
+    /// happen before header filters run (e.g., streaming decompression).
+    ///
+    /// Unlike [`Self::request_body_filter()`], this callback explicitly runs before any
+    /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
+    ///
+    /// Modify the current chunk through `body`. Set `*body = None` to discard it; do this on every
+    /// invocation to discard the entire body. After the buffering loop finishes, Pingora
+    /// assembles the chunks your filter leaves in place and stores the result. Do not call
+    /// [`Session::set_buffered_body()`] from this callback because that assembled result may
+    /// overwrite it. To replace the fully assembled body, call [`Session::set_buffered_body()`]
+    /// later from [`Self::request_filter()`].
+    ///
+    /// When filtering changes the body length, update `Content-Length` and `Transfer-Encoding`
+    /// before forwarding. Pingora emits HTTP/2 stream termination itself based on the downstream
+    /// request rather than the chunks retained by this filter.
+    ///
+    /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    async fn early_request_body_filter(
+        &self,
+        _session: &mut Session<DS>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
+    }
+
     /// Decide if the response is cacheable
     fn response_cache_filter(
         &self,
@@ -600,9 +690,9 @@ where
     /// to the upstream.
     ///
     /// By default, this hook forces retry to false, regardless of the incoming retry state, when
-    /// the request method is non-idempotent or the body retry buffer was truncated. For eligible
-    /// requests, [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused
-    /// connection.
+    /// the request method is non-idempotent and its body is not fully buffered, or when the body
+    /// retry buffer was truncated. For eligible requests,
+    /// [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused connection.
     ///
     /// Implementations that override this hook replace the default policy and are responsible for
     /// deciding when a retry is safe.
@@ -615,8 +705,12 @@ where
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        if !session.req_header().method.is_idempotent() || session.as_ref().retry_buffer_truncated()
-        {
+        #[cfg(feature = "early_body_buffer")]
+        let body_replayable =
+            session.req_header().method.is_idempotent() || session.is_body_buffered();
+        #[cfg(not(feature = "early_body_buffer"))]
+        let body_replayable = session.req_header().method.is_idempotent();
+        if !body_replayable || session.as_ref().retry_buffer_truncated() {
             e.set_retry(false);
         } else {
             e.retry.decide_reuse(client_reused);

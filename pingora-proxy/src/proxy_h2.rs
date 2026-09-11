@@ -183,6 +183,11 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&header::EXPECT);
+        }
+
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
                 return (false, Some(e.into_in()));
@@ -228,6 +233,13 @@ where
         let host = req.remove_header(&http::header::HOST);
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
@@ -310,6 +322,7 @@ where
                 rx,
                 ctx,
                 write_timeout,
+                body_empty,
                 &mut downstream_custom_message_writer,
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
@@ -494,6 +507,7 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
+        upstream_body_finished: bool,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
@@ -504,6 +518,9 @@ where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
+        #[cfg(not(feature = "early_body_buffer"))]
+        let _ = upstream_body_finished;
+
         // setup custom message forwarding, if downstream supports it
         let (
             mut downstream_custom_read,
@@ -525,13 +542,49 @@ where
                 .await?;
         }
 
+        #[cfg(not(feature = "early_body_buffer"))]
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        #[cfg(not(feature = "early_body_buffer"))]
+        let buffer = session.as_mut().get_retry_buffer();
+
+        #[cfg(feature = "early_body_buffer")]
+        let (mut downstream_state, buffer) = {
+            let is_body_buffered = session.is_body_buffered();
+            // Clone, never take: early buffering drains the body before
+            // enable_retry_buffering(), so this is the only copy a retry can replay.
+            let buffered_body = session.get_buffered_body().cloned();
+            crate::proxy_common::select_upstream_body_source(
+                is_body_buffered,
+                buffered_body,
+                || {
+                    (
+                        session.as_mut().is_body_done(),
+                        session.as_mut().get_retry_buffer(),
+                    )
+                },
+            )
+        };
+
+        #[cfg(not(feature = "early_body_buffer"))]
+        if let Some(buffer) = buffer {
             self.send_body_to2(
                 session,
                 Some(buffer),
+                downstream_state.is_done(),
+                client_body,
+                ctx,
+                write_timeout,
+            )
+            .await?;
+        }
+
+        // The caller already ended an empty buffered body on HEADERS or empty DATA.
+        #[cfg(feature = "early_body_buffer")]
+        if !upstream_body_finished && (buffer.is_some() || session.is_body_buffered()) {
+            self.send_body_to2(
+                session,
+                buffer,
                 downstream_state.is_done(),
                 client_body,
                 ctx,

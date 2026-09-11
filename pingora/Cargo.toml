@@ -30,7 +30,7 @@ pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", optional = true,
 pingora-cache = { version = "0.9.0", path = "../pingora-cache", optional = true, default-features = false }
 
 
-# Only used for documenting features, but doesn't work in any other dependency 
+# Only used for documenting features, but doesn't work in any other dependency
 # group :(
 document-features = { version = "0.2.10", optional = true }
 
@@ -38,7 +38,10 @@ document-features = { version = "0.2.10", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
 env_logger = "0.11"
-reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
+reqwest = { version = "0.12", features = [
+    "rustls-tls",
+    "http2",
+], default-features = false }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
@@ -75,7 +78,7 @@ openssl = [
     "openssl_derived",
 ]
 
-## Use [BoringSSL](https://crates.io/crates/boring) for tls 
+## Use [BoringSSL](https://crates.io/crates/boring) for tls
 ##
 ## Requires native boring libraries and build tooling
 boringssl = [
@@ -97,7 +100,7 @@ s2n = [
     "any_tls",
 ]
 
-## Use  [rustls](https://crates.io/crates/rustls) for tls 
+## Use  [rustls](https://crates.io/crates/rustls) for tls
 ##
 ## ⚠️ _Highly Experimental_! ⚠️ Try it, but don't rely on it (yet)
 rustls = [
@@ -155,6 +158,11 @@ connection_filter = [
     "pingora-proxy?/connection_filter",
 ]
 
+## Enable buffering the full request body before `upstream_peer`, via the
+## `early_request_body_buffer_limit`, `early_request_body_buffer_timeout`, and
+## `early_request_body_filter` trait hooks.
+early_body_buffer = ["pingora-proxy?/early_body_buffer"]
+
 
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
@@ -170,6 +178,7 @@ document-features = [
     "dial9",
     "dial9-worker-s3",
     "dial9-cpu-profiling",
-    "connection_filter"
+    "connection_filter",
+    "early_body_buffer"
 ]
 trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]
