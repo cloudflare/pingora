@@ -193,11 +193,20 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
             .or_err(BindError, "failed to set IPV6_V6ONLY")?;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "illumos", target_os = "solaris"))))]
     if let Some(reuseport) = opt.so_reuseport {
         socket_ref
             .set_reuse_port(reuseport)
             .or_err(BindError, "failed to set SO_REUSEPORT")?;
+    }
+
+    // illumos and Solaris have no SO_REUSEPORT; refuse rather than ignore the request.
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    if opt.so_reuseport.is_some() {
+        return pingora_error::Error::e_explain(
+            BindError,
+            "SO_REUSEPORT is not supported on this platform",
+        );
     }
 
     #[cfg(unix)]
