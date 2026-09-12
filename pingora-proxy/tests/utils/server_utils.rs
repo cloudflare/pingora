@@ -356,6 +356,18 @@ impl ProxyHttp for ExampleProxyHttp {
         {
             *body = None;
         }
+        // Test-only hook: hold the request body back so the upstream response is guaranteed
+        // to be read first. For an upgrade request the two orderings are otherwise picked by
+        // the scheduler, which makes the losing one reproducible only under load.
+        if let Some(delay) = session
+            .req_header()
+            .headers
+            .get("x-delay-request-body")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         Ok(())
     }
 
