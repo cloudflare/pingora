@@ -36,11 +36,42 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tls::TlsConnector;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Mutex;
+
+/// Holds a pooled [Stream] so it can be reclaimed by taking it out from
+/// behind the pool's lock rather than via `Arc::try_unwrap`.
+///
+/// `reused_stream` used to wait for the idle poller to drop its lock guard
+/// and then call `Arc::try_unwrap` on the strong count. That races with
+/// `OwnedMutexGuard::drop`, which releases the lock *before* dropping its own
+/// `Arc` clone of the mutex: the waiter can be woken and reach `try_unwrap`
+/// while the poller's clone is still alive, losing a perfectly healthy
+/// connection back to a fresh dial (see GH #998). Wrapping the stream in an
+/// `Option` and `take()`-ing it while holding the lock sidesteps the strong
+/// count entirely, so the race window no longer matters.
+struct ReusableStream(Option<Stream>);
+
+impl AsyncRead for ReusableStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.0.as_mut() {
+            Some(s) => Pin::new(s).poll_read(cx, buf),
+            // Only reachable if something polls after take(), which never
+            // happens: idle_poll exits for good once the stream is reused.
+            None => Poll::Ready(Ok(())),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdleConnection {
@@ -170,7 +201,7 @@ impl ConnectorOptions {
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
-    connection_pool: Arc<ConnectionPool<Arc<Mutex<Stream>>>>,
+    connection_pool: Arc<ConnectionPool<Arc<Mutex<ReusableStream>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
@@ -252,12 +283,13 @@ impl TransportConnector {
         match self.connection_pool.get(&peer.reuse_hash()) {
             Some(s) => {
                 debug!("find reusable stream, trying to acquire it");
-                {
-                    let _ = s.lock().await;
-                } // wait for the idle poll to release it
-                match Arc::try_unwrap(s) {
-                    Ok(l) => {
-                        let mut stream = l.into_inner();
+                // Wait for the idle poll to release it, and keep holding the
+                // guard: taking the stream out while we exclusively hold the
+                // lock is race-free regardless of when the poller's own Arc
+                // clone finishes dropping (see ReusableStream's doc comment).
+                let mut guard = s.lock().await;
+                match guard.0.take() {
+                    Some(mut stream) => {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
                         #[cfg(unix)]
@@ -289,7 +321,9 @@ impl TransportConnector {
                             }
                         }
                     }
-                    Err(_) => {
+                    // Should never happen: nothing else ever takes from this
+                    // Option, so it's still Some whenever the pool handed us `s`.
+                    None => {
                         error!("failed to acquire reusable stream");
                         None
                     }
@@ -321,7 +355,7 @@ impl TransportConnector {
         let id = stream.id();
         let meta = ConnectionMeta::new(key, id);
         debug!("Try to keepalive client session");
-        let stream = Arc::new(Mutex::new(stream));
+        let stream = Arc::new(Mutex::new(ReusableStream(Some(stream))));
         let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
         let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
         let idle_meta = IdleConnection::new(meta);
