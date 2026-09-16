@@ -122,6 +122,15 @@ where
         matches!(self, Self::Custom(_))
     }
 
+    /// Whether an upgraded session should keep polling after request-body completion.
+    ///
+    /// Custom transports can use the idle poll to observe an out-of-band reset after
+    /// request EOF. HTTP/1 and subrequest sessions must leave the completed request
+    /// unpolled because their idle read can treat a valid half-close as a disconnect.
+    pub fn poll_after_upgrade(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
     /// Return a stable, human-readable label for this downstream session type.
     pub fn session_type(&self) -> &'static str {
         match self {

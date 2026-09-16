@@ -428,12 +428,18 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                // Unlike the H1 relay, custom upstream request and response directions can
-                // complete independently. Re-polling a completed upgraded request treats its
-                // downstream half-close as premature while the response may still be draining.
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
-                    if downstream_state.can_poll()
-                        && !(upgraded && downstream_state.is_done()) => {
+                body = async {
+                    if upgraded
+                        && downstream_state.is_done()
+                        && !session.downstream_session.poll_after_upgrade()
+                    {
+                        // Preserve completed-upgrade suppression for H1 and subrequests.
+                        // H1 idle reads can treat a valid request half-close as a disconnect.
+                        std::future::pending().await
+                    } else {
+                        session.downstream_session.read_body_or_idle(downstream_state.is_done()).await
+                    }
+                }, if downstream_state.can_poll() => {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
@@ -1184,6 +1190,9 @@ impl CustomMessageForwarder<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod custom_session_tests;
 
 #[cfg(test)]
 mod tests {
