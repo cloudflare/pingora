@@ -132,6 +132,17 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn is_body_empty(&mut self) -> bool;
 
+    /// Read a request-body chunk, or watch for transport termination while idle.
+    ///
+    /// When `no_body_expected` is `false`, return body bytes or `Ok(None)` for EOF.
+    /// When it is `true`, no further request-body events are expected: remain pending
+    /// until a reset, disconnect, or other transport error can be returned as `Err`.
+    /// Do not return `Ok(None)` again or return additional body bytes in idle mode.
+    /// Implementations should reject either result as an internal error.
+    ///
+    /// This operation must be cancellation-safe: proxy loops may drop and recreate
+    /// its future when another request or response event becomes ready. Dropping
+    /// the future must not lose body bytes or a termination notification.
     fn read_body_or_idle(
         &mut self,
         no_body_expected: bool,
