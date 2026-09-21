@@ -396,6 +396,18 @@ impl<T, const N: usize> Lru<T, N> {
         self.units[get_shard(key, N)].read().peek(key).is_some()
     }
 
+    /// Inspect the data associated with a key without changing its position in
+    /// the LRU.
+    ///
+    /// The callback runs while holding the shard's read lock. Keep it brief and
+    /// do not call methods that would acquire the same shard's write lock.
+    pub fn peek_with<F>(&self, key: u64, inspect: F) -> bool
+    where
+        F: FnOnce(Option<&T>) -> bool,
+    {
+        inspect(self.units[get_shard(key, N)].read().peek(key))
+    }
+
     /// Check the weight of a key without changing the order in LRU.
     pub fn peek_weight(&self, key: u64) -> Option<usize> {
         self.units[get_shard(key, N)].read().peek_weight(key)
@@ -1069,6 +1081,15 @@ mod test_lru {
 
         assert_lru(&lru, &[4, 2], 0);
         assert_lru(&lru, &[3], 1);
+    }
+
+    #[test]
+    fn test_peek_with() {
+        let lru = Lru::<String, 1>::with_capacity(10, 10);
+        lru.admit(2, "value".to_owned(), 1);
+
+        assert!(lru.peek_with(2, |data| data.is_some_and(|value| value == "value")));
+        assert!(!lru.peek_with(3, |data| data.is_some()));
     }
 
     #[test]
