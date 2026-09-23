@@ -18,7 +18,6 @@ use crate::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use crate::*;
 use bytes::Bytes;
 use http::header;
-use log::warn;
 use pingora_core::protocols::http::{
     custom::server::Session as DownstreamSession, v1::common::header_value_content_length,
     HttpTask, ServerSession,
@@ -142,37 +141,25 @@ impl<C: CachePut> CachePutCtx<C> {
             // no miss_handler, uncacheable
             return Ok(());
         };
-        // Save the entry ID before `finish` consumes the miss handler.
-        let entry_id = miss_handler.entry_id();
-        let finish = miss_handler.finish().await?;
-        if let Some(eviction) = self.eviction.as_ref() {
-            let cache_key = self.key.to_compact();
-            let meta = self.meta.as_ref().unwrap();
-            let entry_key = crate::eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
-            let evicted = match finish {
-                MissFinishType::Appended(delta, max_size) => {
-                    eviction.increment_weight(&entry_key, delta, max_size)
-                }
-                MissFinishType::Created(size) => {
-                    eviction.admit(entry_key, size, meta.0.internal.fresh_until)
-                }
-            };
-            // actual eviction can be done async
-            let trace = self
-                .trace
-                .child("cache put eviction", |o| o.start())
-                .handle();
-            let storage = self.storage;
-            tokio::task::spawn(async move {
-                for item in evicted {
-                    let target = crate::storage::PurgeTarget::Exact(&item);
-                    if let Err(e) = storage.purge(target, PurgeType::Eviction, &trace).await {
-                        warn!("Failed to purge {target} during eviction for cache put: {e}");
-                    }
-                }
-            });
-        }
-
+        // Prepared before `finish` consumes the miss handler, which applies it to eviction once
+        // the write succeeds.
+        let completion = crate::storage::MissCompletion::new(
+            crate::eviction::CacheEntryKey::from_entry_id(
+                self.key.to_compact(),
+                miss_handler.entry_id(),
+            ),
+            self.meta
+                .as_ref()
+                .expect("meta set with the miss handler")
+                .0
+                .internal
+                .fresh_until,
+            self.eviction,
+            self.storage,
+            self.trace.handle(),
+            "cache put eviction",
+        );
+        miss_handler.finish_with_eviction(completion).await?;
         Ok(())
     }
 
@@ -265,8 +252,15 @@ impl<C: CachePut> CachePutCtx<C> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::eviction::CacheEntryKey;
+    use crate::tests::{
+        test_meta, DetachedMissHandler, PurgeRecordingStorage, RecordingEviction,
+        ScriptedMissHandler,
+    };
     use crate::trace::Span;
     use once_cell::sync::Lazy;
+    use pingora_error::ErrorType;
+    use tokio::sync::oneshot;
 
     struct TestCachePut();
     impl CachePut for TestCachePut {
@@ -279,6 +273,85 @@ mod test {
 
     type TestCachePutCtx = CachePutCtx<TestCachePut>;
     static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+
+    fn put_with_miss_handler(
+        handler: MissHandler,
+        eviction: Option<&'static RecordingEviction>,
+        storage: &'static PurgeRecordingStorage,
+    ) -> TestCachePutCtx {
+        let mut put = TestCachePutCtx::new(
+            TestCachePut(),
+            CacheKey::new("completed-put", ""),
+            storage,
+            eviction.map(|eviction| eviction as &'static (dyn eviction::EvictionManager + Sync)),
+            Span::inactive(),
+        );
+        put.miss_handler = Some(handler);
+        put.meta = Some(test_meta(SystemTime::now()));
+        put
+    }
+
+    #[tokio::test]
+    async fn put_completion_applies_only_successful_finishes() {
+        for finish in [
+            Ok(MissFinishType::Created(3)),
+            Ok(MissFinishType::Appended(2, Some(5))),
+            Err(Error::new(ErrorType::WriteError)),
+        ] {
+            let success = finish.is_ok();
+            let eviction = Box::leak(Box::new(RecordingEviction::default()));
+            let storage = Box::leak(Box::new(PurgeRecordingStorage::default()));
+            let handler = Box::new(ScriptedMissHandler(finish));
+            let mut put = put_with_miss_handler(handler, Some(eviction), storage);
+
+            assert_eq!(put.finish().await.is_ok(), success);
+            assert_eq!(eviction.updates(), usize::from(success));
+        }
+    }
+
+    /// Finishing a put needs a Tokio runtime only to purge what a successful write evicts.
+    #[test]
+    fn put_finishes_without_a_runtime_when_nothing_is_purged() {
+        let eviction: &'static RecordingEviction = Box::leak(Box::default());
+        for (eviction, finish) in [
+            (None, Ok(MissFinishType::Created(3))),
+            (Some(eviction), Err(Error::new(ErrorType::WriteError))),
+        ] {
+            let success = finish.is_ok();
+            let storage = Box::leak(Box::new(PurgeRecordingStorage::default()));
+            let handler = Box::new(ScriptedMissHandler(finish));
+            let mut put = put_with_miss_handler(handler, eviction, storage);
+
+            assert_eq!(futures::executor::block_on(put.finish()).is_ok(), success);
+        }
+    }
+
+    /// A put that its storage finishes on a worker keeps its accounting, and the purges of the
+    /// entries that accounting evicts, after the caller's future is dropped.
+    #[tokio::test]
+    async fn storage_completes_a_put_whose_caller_is_dropped() {
+        let victim = CacheEntryKey::key_only(CacheKey::new("victim", "").to_compact());
+        let eviction = Box::leak(Box::new(RecordingEviction::evicting(victim.clone())));
+        let storage = Box::leak(Box::new(PurgeRecordingStorage::default()));
+        let (release, released) = oneshot::channel();
+        let handler = Box::new(DetachedMissHandler {
+            release: released,
+            finish: MissFinishType::Appended(2, None),
+        });
+        let mut put = put_with_miss_handler(handler, Some(eviction), storage);
+        let mut finish = tokio_test::task::spawn(put.finish());
+
+        tokio_test::assert_pending!(finish.poll());
+        drop(finish);
+        assert_eq!(eviction.updates(), 0);
+        release.send(()).unwrap();
+        let purged = storage.purged(1).await;
+        assert_eq!(eviction.updates(), 1);
+        assert!(
+            matches!(purged.as_slice(), [(item, PurgeType::Eviction)] if *item == victim),
+            "{purged:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_cache_put() {

@@ -16,7 +16,7 @@
 
 use super::*;
 use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
-use pingora_cache::storage::{HandleMiss, MissFinishType};
+use pingora_cache::storage::{HandleMiss, MissCompleted, MissCompletion, MissFinishType};
 use pingora_cache::CacheFillCancellationWatcher;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -157,6 +157,16 @@ impl HandleMiss for CancellationWatchedMissHandler {
                 .remove_cancellation_if(&self.path, &self.cancellation);
         }
         result
+    }
+
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        let completed = self.inner.finish_with_eviction(completion).await?;
+        self.cache
+            .remove_cancellation_if(&self.path, &self.cancellation);
+        Ok(completed)
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {
