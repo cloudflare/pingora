@@ -126,6 +126,17 @@ mod noop {
     pub struct SpanHandle {
         _priv: (),
     }
+
+    impl SpanHandle {
+        /// No-op: create a child span.
+        #[inline]
+        pub fn child<F>(&self, _name: &'static str, _f: F) -> Span
+        where
+            F: FnOnce(SpanOptionsPlaceholder) -> SpanOptionsPlaceholder,
+        {
+            Span::inactive()
+        }
+    }
 }
 
 #[cfg(not(feature = "trace"))]

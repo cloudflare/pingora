@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use pingora_cache::storage::{HandleMiss, MissFinishType};
+use pingora_cache::storage::{HandleMiss, MissCompleted, MissCompletion, MissFinishType};
 use pingora_cache::trace::SpanHandle;
 use pingora_cache::{
     CacheEntryId, CacheFillCancellation, CacheFillCancellationWatcher, CacheKey, CacheMeta,
@@ -82,6 +82,13 @@ impl HandleMiss for WriterDemandMissHandler {
 
     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
         self.inner.finish().await
+    }
+
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        self.inner.finish_with_eviction(completion).await
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {
@@ -344,6 +351,21 @@ impl HandleMiss for CancellationWatchedMissHandler {
             storage.remove_if_current(&key, &cancellation);
         }
         result
+    }
+
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        let CancellationWatchedMissHandler {
+            inner,
+            cancellation,
+            storage,
+            key,
+        } = *self;
+        let completed = inner.finish_with_eviction(completion).await?;
+        storage.remove_if_current(&key, &cancellation);
+        Ok(completed)
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {

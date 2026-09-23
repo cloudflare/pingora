@@ -27,7 +27,9 @@ use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
-use pingora_cache::storage::{HandleHit, HandleMiss, MissFinishType, Storage};
+use pingora_cache::storage::{
+    HandleHit, HandleMiss, MissCompleted, MissCompletion, MissFinishType, Storage,
+};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
@@ -696,6 +698,18 @@ impl HandleMiss for FailingMissHandler {
         }
     }
 
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        match self.failure {
+            MissFailure::Write => self.inner.finish_with_eviction(completion).await,
+            MissFailure::Finish => {
+                Error::e_explain(FileWriteError, "cache miss finalization failed")
+            }
+        }
+    }
+
     fn streaming_write_tag(&self) -> Option<&[u8]> {
         self.inner.streaming_write_tag()
     }
@@ -940,6 +954,19 @@ impl HandleMiss for DemandCountingMissHandler {
         Ok(finished)
     }
 
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        let Self {
+            inner,
+            registration,
+        } = *self;
+        let completed = inner.finish_with_eviction(completion).await?;
+        registration.fill.0.lock().unwrap().finished = true;
+        Ok(completed)
+    }
+
     fn streaming_write_tag(&self) -> Option<&[u8]> {
         self.inner.streaming_write_tag()
     }
@@ -1145,21 +1172,22 @@ impl HandleMiss for FillCancellationMissHandler {
     }
 
     async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
-        let inner = self.inner.take().expect("finish runs once");
-        CACHE_FILL_CANCELLATION_OBSERVATIONS
-            .lock()
-            .unwrap()
-            .entry(self.cache_key.clone())
-            .or_default()
-            .finished += 1;
+        let inner = self.take_for_finish();
         let result = inner.finish().await;
         if result.is_ok() {
-            // The fill reached a terminal state: drop its cancellation so a later, unrelated
-            // fill of the same cache entry does not inherit it. See `FillCancellationCache`'s doc.
-            CACHE_FILL_CANCELLATION_BACKEND
-                .finish_cancellation(&self.cache_key, &self.cancellation);
+            self.end_cancellation();
         }
         result
+    }
+
+    async fn finish_with_eviction(
+        mut self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        let inner = self.take_for_finish();
+        let completed = inner.finish_with_eviction(completion).await?;
+        self.end_cancellation();
+        Ok(completed)
     }
 
     fn streaming_write_tag(&self) -> Option<&[u8]> {
@@ -1172,6 +1200,26 @@ impl HandleMiss for FillCancellationMissHandler {
 
     fn entry_id(&self) -> Option<pingora_cache::eviction::CacheEntryId> {
         self.inner.as_ref()?.entry_id()
+    }
+}
+
+impl FillCancellationMissHandler {
+    /// Takes the wrapped handler for its finish, which counts as one finish attempt.
+    fn take_for_finish(&mut self) -> pingora_cache::MissHandler {
+        let inner = self.inner.take().expect("finish runs once");
+        CACHE_FILL_CANCELLATION_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .entry(self.cache_key.clone())
+            .or_default()
+            .finished += 1;
+        inner
+    }
+
+    /// The fill reached a terminal state: drop its cancellation so a later, unrelated fill of the
+    /// same cache entry does not inherit it. See `FillCancellationCache`'s doc.
+    fn end_cancellation(&self) {
+        CACHE_FILL_CANCELLATION_BACKEND.finish_cancellation(&self.cache_key, &self.cancellation);
     }
 }
 
