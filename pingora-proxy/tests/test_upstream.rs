@@ -4729,9 +4729,14 @@ mod test_cache {
             .unwrap()
             .parse()
             .unwrap();
-        // the entire body should need 2 extra seconds, here the test shows that
-        // only the header is under cache lock and the body should be streamed
-        assert!(lock_time_ms > 900 && lock_time_ms < 1000);
+        // The origin writes its body in three chunks a second apart. The lock waiter gets in
+        // about a second after the first request started, long before the three seconds the
+        // whole body takes: the body is streamed, not held under the lock. Scheduling can push
+        // the wait a little past a second, so the upper bound only has to exclude the body.
+        assert!(
+            lock_time_ms > 900 && lock_time_ms < 2000,
+            "cache lock was held for {lock_time_ms} ms"
+        );
         assert_eq!(res.text().await.unwrap(), "hello world!");
     }
 
