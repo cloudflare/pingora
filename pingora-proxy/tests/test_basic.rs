@@ -23,7 +23,7 @@ use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, Uri};
 use pingora_test_utils::http_origin::HttpOrigin;
 use reqwest::{header, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::{
@@ -52,6 +52,60 @@ fn certificate_install_keeps_open_readers_on_complete_file() {
 
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
+}
+
+async fn read_h1_headers(stream: &mut BufReader<TcpStream>) -> Vec<u8> {
+    let mut headers = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = stream.read_until(b'\n', &mut line).await.unwrap();
+        assert_ne!(
+            bytes_read, 0,
+            "upstream closed before sending request headers"
+        );
+        let done = line == b"\r\n";
+        headers.extend_from_slice(&line);
+        if done {
+            return headers;
+        }
+    }
+}
+
+async fn read_h1_chunked_body(stream: &mut BufReader<TcpStream>) -> (Vec<u8>, Vec<u8>) {
+    let mut wire_body = Vec::new();
+    let mut decoded_body = Vec::new();
+    loop {
+        let mut size_line = Vec::new();
+        let bytes_read = stream.read_until(b'\n', &mut size_line).await.unwrap();
+        assert_ne!(bytes_read, 0, "upstream closed before chunked body ended");
+        wire_body.extend_from_slice(&size_line);
+
+        let size_text = std::str::from_utf8(&size_line[..size_line.len() - 2]).unwrap();
+        let size_text = size_text.split(';').next().unwrap();
+        let chunk_size = usize::from_str_radix(size_text, 16).unwrap();
+        if chunk_size == 0 {
+            loop {
+                let mut trailer = Vec::new();
+                let bytes_read = stream.read_until(b'\n', &mut trailer).await.unwrap();
+                assert_ne!(bytes_read, 0, "upstream closed before chunk trailers ended");
+                let done = trailer == b"\r\n";
+                wire_body.extend_from_slice(&trailer);
+                if done {
+                    return (wire_body, decoded_body);
+                }
+            }
+        }
+
+        let mut chunk = vec![0; chunk_size];
+        stream.read_exact(&mut chunk).await.unwrap();
+        wire_body.extend_from_slice(&chunk);
+        decoded_body.extend_from_slice(&chunk);
+
+        let mut chunk_end = [0; 2];
+        stream.read_exact(&mut chunk_end).await.unwrap();
+        assert_eq!(&chunk_end, b"\r\n");
+        wire_body.extend_from_slice(&chunk_end);
+    }
 }
 
 #[tokio::test]
@@ -220,6 +274,102 @@ async fn test_h2c_to_h2c() {
 
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
+async fn test_h2_to_h1_empty_end_stream_writes_one_terminator_and_reuses_origin() {
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let origin = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+
+        let first_headers = read_h1_headers(&mut stream).await;
+        assert!(String::from_utf8_lossy(&first_headers)
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"));
+        let (wire_body, decoded_body) = read_h1_chunked_body(&mut stream).await;
+        assert_eq!(decoded_body, b"body-data");
+        assert_eq!(
+            wire_body
+                .windows(b"0\r\n\r\n".len())
+                .filter(|window| *window == b"0\r\n\r\n")
+                .count(),
+            1,
+            "the chunked body must contain exactly one terminal chunk"
+        );
+
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        // This listener accepts only one socket. A second request here proves the
+        // proxy reused the same keep-alive origin connection.
+        let second_headers = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_h1_headers(&mut stream),
+        )
+        .await
+        .expect("no second request arrived on the pooled origin connection");
+        assert!(
+            String::from_utf8_lossy(&second_headers).starts_with("GET /second HTTP/1.1\r\n"),
+            "unexpected bytes before the follow-up request: {second_headers:?}"
+        );
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, connection) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://example.test/first")
+        .header("x-port", origin_port.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut body) = client.send_request(request, false).unwrap();
+    body.send_data(Bytes::from_static(b"body-data"), false)
+        .unwrap();
+    body.send_data(Bytes::new(), true).unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the first response")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://example.test/second")
+        .header("x-port", origin_port.to_string())
+        .body(())
+        .unwrap();
+    let (response, _) = client
+        .ready()
+        .await
+        .unwrap()
+        .send_request(request, true)
+        .unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the follow-up response")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), origin)
+        .await
+        .expect("origin test task did not finish")
+        .unwrap();
 }
 
 #[tokio::test]
