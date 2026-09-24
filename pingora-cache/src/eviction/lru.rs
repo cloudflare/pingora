@@ -125,7 +125,7 @@ impl<const N: usize> Manager<N> {
             .or_err(InternalError, "fail to serialize node")?;
         for node in nodes {
             seq.serialize_element(&node)
-                .or_err(InternalError, "fail to serialize node")?;
+                .or_err(InternalError, "fail to write to vec")?;
         }
 
         seq.end().or_err(InternalError, "when serializing LRU")?;
