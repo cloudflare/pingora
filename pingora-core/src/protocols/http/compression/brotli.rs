@@ -76,7 +76,7 @@ impl Encode for Decompressor {
 }
 
 pub struct Compressor {
-    compress: CompressorWriter<Vec<u8>>,
+    compress: Option<CompressorWriter<Vec<u8>>>,
     total_in: usize,
     total_out: usize,
     duration: Duration,
@@ -86,7 +86,7 @@ impl Compressor {
     pub fn new(level: u32) -> Self {
         Compressor {
             // buf_size:4096 , lgwin:19 TODO: fine tune these
-            compress: CompressorWriter::new(vec![], 4096, level, 19),
+            compress: Some(CompressorWriter::new(vec![], 4096, level, 19)),
             total_in: 0,
             total_out: 0,
             duration: Duration::new(0, 0),
@@ -102,21 +102,33 @@ impl Encode for Compressor {
         self.total_in += input.len();
 
         // reserve at most input size, cap at 16k, compressed output should be smaller
-        self.compress
+        let Some(compress) = self.compress.as_mut() else {
+            // The stream was already finished; nothing more to emit.
+            return Ok(Bytes::new());
+        };
+        compress
             .get_mut()
             .reserve(std::cmp::min(MAX_INIT_COMPRESSED_BUF_SIZE, input.len()));
-        self.compress
+        compress
             .write_all(input)
             .or_err(COMPRESSION_ERROR, "while compress Brotli")?;
         // write to vec will never fail.
-        if end {
-            self.compress
-                .flush()
-                .or_err(COMPRESSION_ERROR, "while compress Brotli")?;
+        if !end {
+            self.total_out += compress.get_ref().len();
+            self.duration += start.elapsed();
+            return Ok(std::mem::take(compress.get_mut()).into()); // into() Bytes will drop excess capacity
         }
-        self.total_out += self.compress.get_ref().len();
+
+        // Flushing only drains pending output; it does not emit the final
+        // ISLAST meta-block, which would be left in the writer and lost when
+        // it is dropped. Finish the stream via into_inner() (which runs
+        // BROTLI_OPERATION_FINISH) so the returned buffer is a complete
+        // brotli stream that strict decoders accept.
+        let writer = self.compress.take().unwrap();
+        let finished = writer.into_inner();
+        self.total_out += finished.len();
         self.duration += start.elapsed();
-        Ok(std::mem::take(self.compress.get_mut()).into()) // into() Bytes will drop excess capacity
+        Ok(finished.into()) // into() Bytes will drop excess capacity
     }
 
     fn stat(&self) -> (&'static str, usize, usize, Duration) {
@@ -149,12 +161,53 @@ mod tests_stream {
         let mut compressor = Compressor::new(11);
         let compressed = compressor.encode(&b"adcdefgabcdefgh\n"[..], true).unwrap();
 
+        // The finished stream now carries the final ISLAST meta-block, so the
+        // pinned bytes differ from the pre-fix truncated prefix (0x85, 0x07,
+        // ...): rust-brotli packs the flush and finish paths differently.
         assert_eq!(
             &compressed[..],
             &[
-                0x85, 0x07, 0x00, 0xf8, 0x45, 0x07, 0x87, 0x3e, 0x10, 0xfb, 0x55, 0x92, 0xec, 0x12,
+                0x15, 0x0f, 0x00, 0xf8, 0x45, 0x07, 0x87, 0x3e, 0x10, 0xfb, 0x55, 0x92, 0xec, 0x12,
                 0x09, 0xcc, 0x38, 0xdd, 0x51, 0x1e,
             ],
         );
+        // And the pinned stream must be complete for strict decoders.
+        assert_strict_roundtrip(&compressed, &b"adcdefgabcdefgh\n"[..]);
+    }
+
+    // Regression tests: the compressor must emit a COMPLETE brotli stream —
+    // including the final ISLAST meta-block — that a strict one-shot decoder
+    // accepts. A stream whose pending output was only flushed is an
+    // incomplete prefix and is rejected by strict decoders with an
+    // unexpected-EOF error.
+    fn assert_strict_roundtrip(encoded: &[u8], expected: &[u8]) {
+        let mut decoded = Vec::new();
+        brotli::BrotliDecompress(&mut &encoded[..], &mut decoded)
+            .expect("strict decoder must accept the stream as complete");
+        assert_eq!(&decoded[..], expected);
+    }
+
+    #[test]
+    fn compress_brotli_single_chunk_strict_roundtrip() {
+        let mut compressor = Compressor::new(5);
+        let compressed = compressor.encode(b"hello world", true).unwrap();
+        assert_strict_roundtrip(&compressed, b"hello world");
+    }
+
+    #[test]
+    fn compress_brotli_multi_chunk_strict_roundtrip() {
+        let mut compressor = Compressor::new(5);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(compressor.encode(b"hello ", false).unwrap().as_ref());
+        encoded.extend_from_slice(compressor.encode(b"world", false).unwrap().as_ref());
+        encoded.extend_from_slice(compressor.encode(b"", true).unwrap().as_ref());
+        assert_strict_roundtrip(&encoded, b"hello world");
+    }
+
+    #[test]
+    fn compress_brotli_empty_body_strict_roundtrip() {
+        let mut compressor = Compressor::new(5);
+        let compressed = compressor.encode(b"", true).unwrap();
+        assert_strict_roundtrip(&compressed, b"");
     }
 }
