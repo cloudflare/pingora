@@ -841,6 +841,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancelled_lookup_wakes_waiting_follower() {
+        let cache: Arc<RTCache<i32, i32, CancelledLookupCB, CancelledLookupOpt>> =
+            Arc::new(RTCache::new(10, None, None));
+        let opt = CancelledLookupOpt {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            used: Arc::new(AtomicI32::new(0)),
+        };
+        let writer_cache = cache.clone();
+        let writer_opt = opt.clone();
+        let writer =
+            tokio::spawn(async move { writer_cache.get(&1, None, Some(&writer_opt)).await });
+        tokio::time::timeout(Duration::from_secs(1), opt.entered.notified())
+            .await
+            .expect("writer must enter lookup before starting the follower");
+
+        let follower = cache.get(&1, None, Some(&opt));
+        tokio::pin!(follower);
+        // Poll the follower first so it registers on the writer's semaphore
+        // before cancellation. No lock timeout or age can wake it instead.
+        tokio::select! {
+            biased;
+            result = &mut follower => panic!("follower completed before cancellation: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(opt.used.load(atomic::Ordering::SeqCst), 1);
+
+        writer.abort();
+        assert!(writer.await.unwrap_err().is_cancelled());
+
+        let (res, _) = tokio::time::timeout(Duration::from_secs(1), &mut follower)
+            .await
+            .expect("cancelled writer must wake an already-waiting follower");
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(opt.used.load(atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn test_get_stale() {
         let ttl = Some(Duration::from_millis(100));
         let cache: RTCache<i32, i32, TestCB, ExtraOpt> = RTCache::new(10, None, None);
