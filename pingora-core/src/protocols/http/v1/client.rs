@@ -814,8 +814,8 @@ impl HttpSession {
             let end_of_body = self.is_body_done();
             debug!("Response header: {resp_header:?}");
             trace!(
-                "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
+                "Raw Response header: {}",
+                self.get_headers_raw().escape_ascii()
             );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
@@ -1209,6 +1209,20 @@ mod tests_stream {
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(http_stream.get_header("Server👍").unwrap(), "pingora");
         assert_eq!(resp.headers.get("Server👍").unwrap(), "pingora");
+    }
+
+    #[tokio::test]
+    async fn read_response_task_with_non_utf8_header() {
+        init_log();
+        // trace! only evaluates its arguments when the max level allows TRACE
+        log::set_max_level(log::LevelFilter::Trace);
+        let input = b"HTTP/1.1 200 OK\r\nServer: caf\xe9\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        match http_stream.read_response_task().await.unwrap() {
+            HttpTask::Header(h, _) => assert_eq!(h.headers["Server"].as_bytes(), b"caf\xe9"),
+            task => panic!("task {task:?} should be header"),
+        }
     }
 
     #[tokio::test]
