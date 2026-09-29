@@ -14,7 +14,7 @@
 
 use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use crate::connectors::tls::replace_leftmost_underscore;
 use crate::connectors::ConnectorOptions;
@@ -76,13 +76,19 @@ const SIGALG_LIST: &str = "ecdsa_secp256r1_sha256\
 #[cfg(feature = "boringssl")]
 const BORINGSSL_CURVES_LIST: &str = "X25519:P-256:P-384:P-521";
 
-static INIT_CA_ENV: Once = Once::new();
-fn init_ssl_cert_env_vars() {
-    // this sets env vars to pick up the root certs
-    // it is universal across openssl and boringssl
-    // safety: although impossible to prove safe we assume it's safe since the call is
-    // wrapped in a call_once and it's unlikely other threads are reading these vars
-    INIT_CA_ENV.call_once(|| unsafe { openssl_probe::init_openssl_env_vars() });
+fn load_default_verify_paths(builder: &mut crate::tls::ssl::SslConnectorBuilder) {
+    // Configure the discovered trust locations on this connector rather than setting
+    // process-wide environment variables. Connector::new can run after other threads
+    // have started, when mutating the environment is unsound.
+    let probe = openssl_probe::probe();
+    if probe.cert_file.is_some() || probe.cert_dir.is_some() {
+        builder
+            .load_verify_locations(probe.cert_file.as_deref(), probe.cert_dir.as_deref())
+            .unwrap();
+    } else {
+        // Preserve OpenSSL's built-in defaults when the probe finds no CA path.
+        builder.set_default_verify_paths().unwrap();
+    }
 }
 
 #[derive(Clone)]
@@ -110,9 +116,7 @@ impl Connector {
             if let Some(ca_file_path) = conf.ca_file.as_ref() {
                 builder.set_ca_file(ca_file_path).unwrap();
             } else {
-                init_ssl_cert_env_vars();
-                // load from default system wide trust location. (the name is misleading)
-                builder.set_default_verify_paths().unwrap();
+                load_default_verify_paths(&mut builder);
             }
             if let Some((cert, key)) = conf.cert_key_file.as_ref() {
                 builder.set_certificate_chain_file(cert).unwrap();
@@ -135,8 +139,7 @@ impl Connector {
                 }
             }
         } else {
-            init_ssl_cert_env_vars();
-            builder.set_default_verify_paths().unwrap();
+            load_default_verify_paths(&mut builder);
         }
 
         Connector {
