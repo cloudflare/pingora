@@ -139,6 +139,8 @@ This is also not a phase, but another callback.
 
 By default, once a request that `should_handle_downstream_abandonment()` opted in has had its downstream abandoned during a cache fill, this suppresses exactly the errors `pingora_cache::fill_cancellation::is_cache_fill_cancelled()` recognizes: `ERR_CACHE_FILL_CANCELLED`, including when another error wraps it. A cache fill the application itself asked to end early is expected control flow rather than a failure. The error still reaches `logging()`, so access logs are unaffected. For any other request or error the default suppresses nothing. Overriding this callback replaces the default entirely, including that suppression.
 
+Besides errors that reach `fail_to_proxy()`, it is offered the failure of a cache hit of an opted-in request whose client watch ended the hit because the client closed or reset its connection or stream. Every other failed cache hit is logged as it is without the opt-in.
+
 ### `downstream_abandoned_during_cache_fill()`
 This is also not a phase, but another callback.
 

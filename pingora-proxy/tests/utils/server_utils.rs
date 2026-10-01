@@ -22,6 +22,7 @@ use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
+use pingora_cache::fill_cancellation::is_cache_fill_cancelled;
 use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
@@ -520,6 +521,9 @@ static CACHE_DEMAND_COUNTING_BACKEND: DemandCountingCache = DemandCountingCache;
 static CACHE_FILL_CANCELLATION_BACKEND: FillCancellationCache = FillCancellationCache;
 static CACHE_CANCEL_FIRST_MISS_HANDLER_BACKEND: CancelFirstMissHandlerCache =
     CancelFirstMissHandlerCache;
+/// Readers of a fill whose writer is dropped unfinished fail instead of seeing the body end.
+static CACHE_FAIL_READERS_OF_DROPPED_WRITES_BACKEND: Lazy<MemCache> =
+    Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
@@ -1421,6 +1425,9 @@ static RECORDED_CACHE_REASONS: Lazy<Mutex<HashMap<String, Option<NoCacheReason>>
 /// `FailToProxy::error_code` reported by the cache proxy for instrumented requests.
 static RECORDED_FAIL_TO_PROXY_CODES: Lazy<Mutex<HashMap<String, u16>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// `suppress_error_log` calls for instrumented requests.
+static RECORDED_ERROR_LOG_OFFERS: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Upstream response hook calls recorded by the test proxy.
 pub struct UpstreamResponseHookCalls {
@@ -1556,6 +1563,17 @@ pub fn recorded_fail_to_proxy_code(path: &str) -> Option<u16> {
         .copied()
 }
 
+/// How many final errors of instrumented requests for this path were offered to
+/// `suppress_error_log`.
+pub fn recorded_error_log_offers(path: &str) -> usize {
+    RECORDED_ERROR_LOG_OFFERS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Upstream response hook calls recorded for this path.
 pub fn upstream_response_hook_calls(path: &str) -> UpstreamResponseHookCalls {
     UPSTREAM_RESPONSE_HOOK_CALLS
@@ -1661,6 +1679,9 @@ impl ProxyHttp for ExampleProxyCache {
         }
         if session.get_header_bytes("x-abort-on-close") == b"false" {
             session.downstream_session.set_abort_on_close(false);
+        }
+        if session.get_header_bytes("x-pipelining") == b"true" {
+            session.set_pipelining_enabled(true);
         }
         Ok(())
     }
@@ -1839,6 +1860,12 @@ impl ProxyHttp for ExampleProxyCache {
             .contains_key("x-cache-demand-counting")
         {
             &CACHE_DEMAND_COUNTING_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-readers-of-dropped-writes")
+        {
+            &*CACHE_FAIL_READERS_OF_DROPPED_WRITES_BACKEND as &'static (dyn Storage + Sync)
         } else {
             &*CACHE_BACKEND as &'static (dyn Storage + Sync)
         };
@@ -2425,6 +2452,22 @@ impl ProxyHttp for ExampleProxyCache {
                 .entry(path)
                 .or_default() += 1;
         }
+    }
+
+    /// Counts the final errors offered for instrumented requests and keeps the default answer.
+    fn suppress_error_log(&self, session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-request-lifecycle")
+        {
+            *RECORDED_ERROR_LOG_OFFERS
+                .lock()
+                .unwrap()
+                .entry(request_lifecycle_key(session.req_header()))
+                .or_default() += 1;
+        }
+        session.downstream_abandoned_during_cache_fill() && is_cache_fill_cancelled(error)
     }
 
     fn suppress_proxy_warn_log(

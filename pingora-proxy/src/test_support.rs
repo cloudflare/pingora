@@ -410,6 +410,22 @@ impl HeldCustomSenderObservations {
     }
 }
 
+/// How many turns [`run_ready_tasks`] gives the other tasks of a test.
+pub(crate) const READY_TASK_TURNS: usize = 128;
+
+/// Give the other tasks of a `#[tokio::test]` [`READY_TASK_TURNS`] turns to act on in-memory
+/// events, such as bytes written to a duplex stream, before the test goes on.
+///
+/// The default test runtime runs every task on the test's thread, so each yield lets every ready
+/// task run once more. Unlike a sleep, this does not depend on how fast the machine is. Events
+/// from real sockets or timers need their own waits. A task that keeps waking itself runs on
+/// every turn, so a spin shows up as that many polls.
+pub(crate) async fn run_ready_tasks() {
+    for _ in 0..READY_TASK_TURNS {
+        tokio::task::yield_now().await;
+    }
+}
+
 pub(crate) struct HeldCustomSenderProxy {
     sender: Mutex<Option<oneshot::Sender<mpsc::Sender<Bytes>>>>,
     observed: Arc<HeldCustomSenderObservations>,

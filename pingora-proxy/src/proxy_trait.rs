@@ -154,13 +154,29 @@ where
     /// `early_request_filter` put in the context. A subrequest does not inherit its parent's
     /// answer.
     ///
-    /// Returning `true` changes nothing while the client stays connected, except that a cache
-    /// failure caused by a fill cancellation is recorded as one (see below). A client that fails
-    /// after its response was completely written (see
+    /// Returning `true` changes nothing on a proxied response while the client stays connected,
+    /// except that a cache failure caused by a fill cancellation is recorded as one (see below).
+    /// A client that fails after its response was completely written (see
     /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete)),
     /// an HTTP/1 client that sends its next request before this response is complete, or a
     /// client whose request body read times out or is malformed, is handled exactly as without
-    /// this opt-in.
+    /// this opt-in. A watched cache hit, below, is the exception.
+    ///
+    /// A cache hit also watches its client while it waits for its cached body, until its
+    /// response is complete: an HTTP/2 client from the start, since waiting on its stream reads
+    /// nothing, and any other client only if its request body is complete when the hit starts,
+    /// since the hit never reads that body. A client that closes or resets its connection, or
+    /// resets its HTTP/2 stream, ends the hit even while its cache read stalls, so dropping the
+    /// request releases that reader; with `abort_on_close` disabled, a half-closed HTTP/1 client
+    /// keeps its response. A hit that ends this way is offered to [`Self::suppress_error_log`];
+    /// any other failed hit is logged as without this opt-in. An HTTP/1 next request sent early
+    /// follows the regular pipelining policy: with pipelining disabled it ends the hit with
+    /// `ConnectError`, which is not offered, and with it enabled it is kept for the next request,
+    /// as on a proxied response. Once the hit has kept that request's first byte, it no longer
+    /// reads its client, so a client that then closes or resets its connection goes unnoticed
+    /// until the hit ends or a response write fails, as in the proxy loops. A stale-if-error hit
+    /// keeps that path's logging: its caller offers every final error to
+    /// [`Self::suppress_error_log`], as without this opt-in.
     ///
     /// The rest applies only once a client leaves before its response is completely delivered,
     /// while a cache fill can still produce an entry (a miss with an active cache writer, or
