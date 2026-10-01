@@ -22,6 +22,7 @@ use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
+use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
@@ -31,6 +32,7 @@ use pingora_cache::{
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
     NoCacheReason, RespCacheable,
 };
+use pingora_cache::{CacheFillCancellation, CacheFillCancellationWatcher};
 use pingora_cache::{
     CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeAction, PurgeType, VarianceBuilder,
 };
@@ -515,6 +517,9 @@ static CACHE_STREAMING_FINISH_FAIL_BACKEND: FailingStreamingCache =
     FailingStreamingCache(MissFailure::Finish);
 static CACHE_WRITE_FAIL_BACKEND: FailingStreamingCache = FailingStreamingCache(MissFailure::Write);
 static CACHE_DEMAND_COUNTING_BACKEND: DemandCountingCache = DemandCountingCache;
+static CACHE_FILL_CANCELLATION_BACKEND: FillCancellationCache = FillCancellationCache;
+static CACHE_CANCEL_FIRST_MISS_HANDLER_BACKEND: CancelFirstMissHandlerCache =
+    CancelFirstMissHandlerCache;
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
@@ -1011,6 +1016,379 @@ impl HandleHit for DemandClaimingHitHandler {
     }
 }
 
+/// Storage whose miss handlers offer a [`CacheFillCancellationWatcher`], so tests can end an
+/// abandoned fill without waiting for the upstream to finish.
+///
+/// [`cancellation_for`](Self::cancellation_for) returns the cancellation for a request path,
+/// created on first use. The entry is removed once the fixture observes that path's fill reach
+/// a terminal state - its miss handler's `finish` returning `Ok` - so a later, unrelated fill of
+/// the same path starts from a fresh, uncancelled value instead of inheriting one a previous
+/// fill left behind. A miss handler dropped without `finish`, including one a cancellation
+/// ended, leaves the entry in place, so a retried upstream attempt of the same logical fill
+/// still shares one value; see [`HandleMiss::cancellation_watcher`].
+/// [`reset_cancellation`](Self::reset_cancellation) drops an entry unconditionally, for a test
+/// that wants to start a genuinely new logical fill right after one that was cancelled.
+struct FillCancellationCache;
+
+#[async_trait]
+impl Storage for FillCancellationCache {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND.lookup(key, trace).await
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        let inner = CACHE_BACKEND.get_miss_handler(key, meta, trace).await?;
+        let cache_key = cache_key_full(key);
+        let cancellation = self.cancellation_for(&cache_key);
+        CACHE_FILL_CANCELLATION_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .entry(cache_key.clone())
+            .or_default()
+            .handlers += 1;
+        Ok(Box::new(FillCancellationMissHandler {
+            inner: Some(inner),
+            cache_key,
+            cancellation,
+        }))
+    }
+
+    async fn purge(
+        &'static self,
+        target: pingora_cache::PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        CACHE_BACKEND.purge(target, purge_type, trace).await
+    }
+
+    async fn expire(
+        &'static self,
+        target: pingora_cache::PurgeTarget<'_>,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        CACHE_BACKEND.expire(target, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        CACHE_BACKEND.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+/// The full primary cache key (`{host}{path_and_query}`, see `cache_key_callback`). Keys state
+/// that identifies one cache entry, so two hosts serving the same path never share it.
+fn cache_key_full(key: &CacheKey) -> String {
+    key.primary_key_str()
+        .expect("test cache keys are UTF-8")
+        .to_owned()
+}
+
+struct FillCancellationMissHandler {
+    /// `None` once `finish` consumed it, which is how `Drop` tells an unfinished handler apart.
+    inner: Option<pingora_cache::MissHandler>,
+    /// The full primary cache key this fill's cancellation and observations are keyed under.
+    cache_key: String,
+    cancellation: Arc<CacheFillCancellation>,
+}
+
+#[async_trait]
+impl HandleMiss for FillCancellationMissHandler {
+    async fn write_body(&mut self, data: bytes::Bytes, eof: bool) -> Result<()> {
+        CACHE_FILL_CANCELLATION_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .entry(self.cache_key.clone())
+            .or_default()
+            .body_bytes += data.len();
+        self.inner
+            .as_mut()
+            .expect("write_body never follows finish")
+            .write_body(data, eof)
+            .await
+    }
+
+    async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
+        let inner = self.inner.take().expect("finish runs once");
+        CACHE_FILL_CANCELLATION_OBSERVATIONS
+            .lock()
+            .unwrap()
+            .entry(self.cache_key.clone())
+            .or_default()
+            .finished += 1;
+        let result = inner.finish().await;
+        if result.is_ok() {
+            // The fill reached a terminal state: drop its cancellation so a later, unrelated
+            // fill of the same cache entry does not inherit it. See `FillCancellationCache`'s doc.
+            CACHE_FILL_CANCELLATION_BACKEND
+                .finish_cancellation(&self.cache_key, &self.cancellation);
+        }
+        result
+    }
+
+    fn streaming_write_tag(&self) -> Option<&[u8]> {
+        self.inner.as_ref()?.streaming_write_tag()
+    }
+
+    fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+        Some(self.cancellation.watcher())
+    }
+
+    fn entry_id(&self) -> Option<pingora_cache::eviction::CacheEntryId> {
+        self.inner.as_ref()?.entry_id()
+    }
+}
+
+impl Drop for FillCancellationMissHandler {
+    fn drop(&mut self) {
+        if self.inner.is_some() {
+            CACHE_FILL_CANCELLATION_OBSERVATIONS
+                .lock()
+                .unwrap()
+                .entry(self.cache_key.clone())
+                .or_default()
+                .dropped_unfinished += 1;
+        }
+    }
+}
+
+#[derive(Default)]
+struct CacheFillCancellationObservations {
+    /// Miss handlers created by the cancellation-aware storage.
+    handlers: usize,
+    /// Body bytes written through those handlers.
+    body_bytes: usize,
+    /// Handlers that reached `finish`.
+    finished: usize,
+    /// Handlers dropped without `finish`, which storage treats as a failed write.
+    dropped_unfinished: usize,
+}
+
+/// Per-cache-entry fill observations (handlers created, bytes written, finishes, drops), keyed
+/// by the full primary cache key: two hosts filling the same path are different cache entries.
+static CACHE_FILL_CANCELLATION_OBSERVATIONS: Lazy<
+    Mutex<HashMap<String, CacheFillCancellationObservations>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Cancellations by full primary cache key, not by path alone — two hosts filling the same path
+/// are different cache entries and must never share one. Created on first use so a cancellation
+/// can be requested before the fill has a writer.
+static CACHE_FILL_CANCELLATIONS: Lazy<Mutex<HashMap<String, Arc<CacheFillCancellation>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+impl FillCancellationCache {
+    /// The cancellation for `cache_key`, created on first use so a cancellation can be requested
+    /// before the fill has a writer.
+    fn cancellation_for(&self, cache_key: &str) -> Arc<CacheFillCancellation> {
+        Arc::clone(
+            CACHE_FILL_CANCELLATIONS
+                .lock()
+                .unwrap()
+                .entry(cache_key.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Drop `cache_key`'s cancellation unconditionally. `finish` already clears an entry whose
+    /// fill reached a terminal state; this is for a test that wants a fresh, uncancelled value
+    /// after a fill that was cancelled and therefore never finished.
+    fn reset_cancellation(&self, cache_key: &str) {
+        CACHE_FILL_CANCELLATIONS.lock().unwrap().remove(cache_key);
+    }
+
+    /// Drop `cache_key`'s cancellation now that `cancellation`'s own fill has reached a terminal
+    /// state, so a later unrelated fill of the same cache entry starts out uncancelled.
+    ///
+    /// Removal is by identity, not by cache key: a second logical fill of the same cache entry
+    /// installs its own value, and removing that one here would leave it permanently
+    /// uncancellable. The lookup and the removal share one lock so the comparison cannot race
+    /// `cancellation_for`.
+    fn finish_cancellation(&self, cache_key: &str, cancellation: &Arc<CacheFillCancellation>) {
+        let mut cancellations = CACHE_FILL_CANCELLATIONS.lock().unwrap();
+        if cancellations
+            .get(cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+        {
+            cancellations.remove(cache_key);
+        }
+    }
+}
+
+/// The `Host` header the only current callers of the path-keyed accessors below send: see
+/// `tests/test_basic/cache_fill_abandonment/fill_cancellation.rs`. The accessors below keep
+/// taking a bare request path, matching `cache_key_callback`'s production-facing shape, but the
+/// maps underneath are keyed by the full primary cache key, so this reconstructs it. A caller
+/// under a different host needs its own accessor; nothing today does.
+const CANCELLATION_TEST_HOST: &str = "fill-cancellation.example";
+
+/// The full primary cache key `path` maps to for the accessors below (see
+/// `CANCELLATION_TEST_HOST`).
+fn cancellation_test_key(path: &str) -> String {
+    format!("{CANCELLATION_TEST_HOST}{path}")
+}
+
+/// Cancel the cache fill for this path. Returns `true` on the first request.
+pub fn cancel_cache_fill(path: &str) -> bool {
+    CACHE_FILL_CANCELLATION_BACKEND
+        .cancellation_for(&cancellation_test_key(path))
+        .cancel()
+}
+
+/// Drop `path`'s cancellation unconditionally, so a test can start a genuinely new logical
+/// fill of the same path after one that was cancelled.
+pub fn reset_cancellation(path: &str) {
+    CACHE_FILL_CANCELLATION_BACKEND.reset_cancellation(&cancellation_test_key(path));
+}
+
+/// Whether a cancellation was requested for this path's cache fill.
+pub fn cache_fill_cancellation_requested(path: &str) -> bool {
+    CACHE_FILL_CANCELLATIONS
+        .lock()
+        .unwrap()
+        .get(&cancellation_test_key(path))
+        .is_some_and(|cancellation| cancellation.is_cancelled())
+}
+
+fn cache_fill_cancellation_observation(
+    path: &str,
+    field: fn(&CacheFillCancellationObservations) -> usize,
+) -> usize {
+    CACHE_FILL_CANCELLATION_OBSERVATIONS
+        .lock()
+        .unwrap()
+        .get(&cancellation_test_key(path))
+        .map(field)
+        .unwrap_or_default()
+}
+
+/// How many miss handlers the cancellation-aware storage created for this path.
+pub fn cache_fill_cancellation_handlers(path: &str) -> usize {
+    cache_fill_cancellation_observation(path, |observations| observations.handlers)
+}
+
+/// How many body bytes the cancellation-aware storage received for this path.
+pub fn cache_fill_cancellation_body_bytes(path: &str) -> usize {
+    cache_fill_cancellation_observation(path, |observations| observations.body_bytes)
+}
+
+/// How many cancellation-aware miss handlers for this path finished their admission.
+pub fn cache_fill_cancellation_handlers_finished(path: &str) -> usize {
+    cache_fill_cancellation_observation(path, |observations| observations.finished)
+}
+
+/// How many cancellation-aware miss handlers for this path were dropped without finishing.
+pub fn cache_fill_cancellation_handlers_dropped_unfinished(path: &str) -> usize {
+    cache_fill_cancellation_observation(path, |observations| observations.dropped_unfinished)
+}
+
+/// Storage that fails the first [`Storage::get_miss_handler`] call for each cache key with
+/// [`ERR_CACHE_FILL_CANCELLED`] and otherwise delegates to the in-memory cache: a storage that
+/// cancels a fill while its writer still holds the cache lock.
+struct CancelFirstMissHandlerCache;
+
+/// Full primary cache keys whose first miss handler [`CancelFirstMissHandlerCache`] refused.
+static CANCELLED_FIRST_MISS_HANDLER_KEYS: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+#[async_trait]
+impl Storage for CancelFirstMissHandlerCache {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND.lookup(key, trace).await
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        if CANCELLED_FIRST_MISS_HANDLER_KEYS
+            .lock()
+            .unwrap()
+            .insert(cache_key_full(key))
+        {
+            return Error::e_explain(
+                ERR_CACHE_FILL_CANCELLED,
+                "storage cancelled the first fill of this cache key",
+            );
+        }
+        CACHE_BACKEND.get_miss_handler(key, meta, trace).await
+    }
+
+    async fn purge(
+        &'static self,
+        target: pingora_cache::PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        CACHE_BACKEND.purge(target, purge_type, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        CACHE_BACKEND.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
     upstream_status: Option<u16>,
@@ -1371,6 +1749,14 @@ impl ProxyHttp for ExampleProxyCache {
                 peer.options.max_h2_streams = max_streams;
             }
         }
+        if let Some(recv_buf) = req
+            .headers
+            .get("x-upstream-tcp-recv-buf")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+        {
+            peer.options.tcp_recv_buf = Some(recv_buf);
+        }
 
         Ok(peer)
     }
@@ -1418,6 +1804,18 @@ impl ProxyHttp for ExampleProxyCache {
             overrides.wait_timeout = Some(wait_timeout);
         }
         let storage = if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fill-cancellation-watch")
+        {
+            &CACHE_FILL_CANCELLATION_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-cancel-first-miss-handler")
+        {
+            &CACHE_CANCEL_FIRST_MISS_HANDLER_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
             .req_header()
             .headers
             .contains_key("x-cache-fail-write")
@@ -1915,6 +2313,13 @@ impl ProxyHttp for ExampleProxyCache {
                 .unwrap()
                 .insert(request_lifecycle_key(session.req_header()), code);
         }
+        if session.downstream_abandoned_during_cache_fill() {
+            // Nothing reaches a downstream that a cache fill abandoned.
+            return FailToProxy {
+                error_code: code,
+                can_reuse_downstream: false,
+            };
+        }
         if code > 0 {
             let mut resp = gen_error_response(code);
             // any relevant metadata headers to add
@@ -1966,6 +2371,24 @@ impl ProxyHttp for ExampleProxyCache {
     /// Records the call and, as an application whose storage tracks writer demand does, releases
     /// the active miss writer's demand. Storages that don't track demand ignore the release.
     fn downstream_abandoned_during_cache_fill(&self, session: &Session, _ctx: &mut Self::CTX) {
+        let key = session.cache.cache_key();
+        // Derived from the committed `CacheKey` rather than re-parsed from the request, so this
+        // always agrees with the cache key the miss handler cancels under (`cache_key_full`),
+        // even when the request carries a query string.
+        let cache_key = cache_key_full(key);
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-cancel-fill-on-abandon")
+        {
+            // The cancellation-aware storage keys its cancellation by full cache key, so this
+            // works before a miss handler exists too.
+            CACHE_FILL_CANCELLATION_BACKEND
+                .cancellation_for(&cache_key)
+                .cancel();
+        }
+        // Deliberately request-target-scoped, unlike the cancellation above: tests read this by
+        // path alone (`downstream_abandoned_during_cache_fill_calls`).
         let path = request_lifecycle_key(session.req_header());
         {
             let mut observations_by_path = DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS.lock().unwrap();

@@ -82,6 +82,8 @@ fn assert_cache_lock_was_free(headers: &http::HeaderMap) {
 mod cache_states;
 #[path = "cache_fill_abandonment/cache_storage_errors.rs"]
 mod cache_storage_errors;
+#[path = "cache_fill_abandonment/fill_cancellation.rs"]
+mod fill_cancellation;
 #[path = "cache_fill_abandonment/h1_early_request.rs"]
 mod h1_early_request;
 #[path = "cache_fill_abandonment/h1_pre_admission.rs"]
@@ -204,6 +206,17 @@ async fn wait_until(message: &str, mut condition: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !condition() {
         assert!(std::time::Instant::now() < deadline, "{message}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_cache_fill_abandonment(path: &str, previous: usize) {
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    while downstream_abandoned_during_cache_fill_calls(path) == previous {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "proxy did not report the abandoned downstream for {path}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }

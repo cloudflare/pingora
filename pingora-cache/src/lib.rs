@@ -31,6 +31,7 @@ use trace::{CacheTraceCTX, Span, Tag};
 pub mod admission;
 pub mod cache_control;
 pub mod eviction;
+pub mod fill_cancellation;
 pub mod filters;
 pub mod hashtable;
 pub mod key;
@@ -47,6 +48,7 @@ mod variance;
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
 pub use eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
+pub use fill_cancellation::{CacheFillCancellation, CacheFillCancellationWatcher};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
@@ -1121,6 +1123,14 @@ impl HttpCache {
             .is_some_and(|handler| handler.release_writer_demand())
     }
 
+    /// Return the current miss writer's cancellation watcher.
+    ///
+    /// Returns `None` when no miss writer is active or the storage does not cancel fills early;
+    /// see [`storage::HandleMiss::cancellation_watcher`].
+    pub fn miss_cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+        self.maybe_miss_handler()?.cancellation_watcher()
+    }
+
     /// Finish cache admission
     ///
     /// If [self] is dropped without calling this, the cache admission is considered incomplete and
@@ -2161,6 +2171,24 @@ mod tests {
         }
     }
 
+    /// Miss handler that offers a watcher of its fill's cancellation.
+    struct CancellationOfferingMissHandler(std::sync::Arc<CacheFillCancellation>);
+
+    #[async_trait]
+    impl storage::HandleMiss for CancellationOfferingMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            unreachable!("test only exercises the cancellation watcher")
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            unreachable!("test only exercises the cancellation watcher")
+        }
+
+        fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+            Some(self.0.watcher())
+        }
+    }
+
     #[async_trait]
     impl Storage for UpdateOkStorage {
         async fn lookup(
@@ -2843,6 +2871,45 @@ mod tests {
         assert!(cache.is_cache_admission_active());
         assert!(cache.release_miss_writer_demand());
         assert!(!cache.release_miss_writer_demand());
+    }
+
+    #[test]
+    fn miss_cancellation_watcher_follows_the_active_handler() {
+        let mut cache = HttpCache::new();
+        assert!(cache.miss_cancellation_watcher().is_none());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("cancellation-watcher", ""));
+        cache.cache_miss();
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "a miss without a writer has nothing to cancel"
+        );
+
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "a writer that does not cancel early offers no watcher"
+        );
+
+        let cancellation = std::sync::Arc::new(CacheFillCancellation::new());
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(CancellationOfferingMissHandler(
+            std::sync::Arc::clone(&cancellation),
+        )));
+        let watcher = cache
+            .miss_cancellation_watcher()
+            .expect("writer offers a watcher");
+        assert!(!watcher.is_cancelled());
+        assert!(cancellation.cancel());
+        assert!(watcher.is_cancelled());
+
+        cache.disable(NoCacheReason::InternalError);
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "disabling the cache drops the writer and its watcher"
+        );
     }
 
     #[tokio::test]

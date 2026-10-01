@@ -154,7 +154,8 @@ where
     /// `early_request_filter` put in the context. A subrequest does not inherit its parent's
     /// answer.
     ///
-    /// Returning `true` changes nothing while the client stays connected. A client that fails
+    /// Returning `true` changes nothing while the client stays connected, except that a cache
+    /// failure caused by a fill cancellation is recorded as one (see below). A client that fails
     /// after its response was completely written (see
     /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete)),
     /// an HTTP/1 client that sends its next request before this response is complete, or a
@@ -176,7 +177,17 @@ where
     ///   finish of the cache entry stays best-effort, as without this opt-in: the entry is not
     ///   admitted, and that failure does not itself fail the request;
     /// - a retry happens only if the request body was read to its end, caching is still
-    ///   enabled, and no cache writer is still active.
+    ///   enabled, and no cache writer is still active;
+    /// - the proxy watches the fill's active miss writer for a
+    ///   [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) and ends the fill with
+    ///   [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED)
+    ///   once it is cancelled; see [`Self::downstream_abandoned_during_cache_fill`];
+    /// - the default [`Self::suppress_error_log`] does not log that error.
+    ///
+    /// Whether or not the client left, a cache failure of an opted-in request that
+    /// `ERR_CACHE_FILL_CANCELLED` caused, wrapped or not, disables the cache with
+    /// [`REASON_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+    /// rather than [`NoCacheReason::StorageError`](pingora_cache::NoCacheReason::StorageError).
     ///
     /// Any other downstream failure is handled as it would be without this opt-in. When it
     /// returns `false`, the default, the proxy behaves as it did before this handling existed.
@@ -609,11 +620,22 @@ where
     ) {
     }
 
-    /// A value of true means that the log message will be suppressed. The default value is false.
+    /// A value of true means that the final proxy error log message will be suppressed.
+    ///
+    /// By default, once [`Session::downstream_abandoned_during_cache_fill`] is true, suppresses
+    /// exactly the cancelled cache fills
+    /// [`is_cache_fill_cancelled`](pingora_cache::fill_cancellation::is_cache_fill_cancelled)
+    /// recognizes, wrapped or not: the application asked to end an abandoned cache fill early via
+    /// [`Self::downstream_abandoned_during_cache_fill`], so it is expected control flow rather
+    /// than a failure. The error still reaches [`Self::logging`] unchanged, so access logs and
+    /// any custom accounting there are unaffected. For any other request or error the default is
+    /// false. An override replaces this default entirely and takes full control of what logs, in
+    /// both directions.
     ///
     /// See also: [`Self::suppress_proxy_warn_log`].
-    fn suppress_error_log(&self, _session: &Session<DS>, _ctx: &Self::CTX, _error: &Error) -> bool {
-        false
+    fn suppress_error_log(&self, session: &Session<DS>, _ctx: &Self::CTX, error: &Error) -> bool {
+        session.downstream_abandoned_during_cache_fill()
+            && pingora_cache::fill_cancellation::is_cache_fill_cancelled(error)
     }
 
     /// Called at most once when Pingora keeps processing a potential streaming cache fill after
@@ -636,6 +658,26 @@ where
     /// [`CacheMeta`](pingora_cache::CacheMeta) returned by [`Self::response_cache_filter`], and
     /// has [`Storage::get_miss_handler`](pingora_cache::storage::Storage::get_miss_handler)
     /// release the new writer's demand before returning it.
+    ///
+    /// The fill keeps running until the upstream completes unless a miss writer offers a
+    /// [`CacheFillCancellationWatcher`](pingora_cache::CacheFillCancellationWatcher) and its
+    /// [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) is cancelled. Cancelling
+    /// here, before any miss writer exists, is allowed and sticky; that type's documentation
+    /// explains when the proxy first acts on such a cancellation and why retries before then
+    /// ignore it.
+    /// From the point it applies the proxy ends the fill instead of waiting for more upstream data
+    /// and fails the request with
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED).
+    /// The cancellation is observed the next time the proxy asks for upstream data: data the
+    /// upstream already handed over is processed first, so a response whose final bytes have
+    /// already arrived is committed normally, and only a bounded amount of further data follows,
+    /// so an upstream that always has more ready cannot keep a cancelled fill running.
+    ///
+    /// A cancellation therefore cannot end an upstream that stalls before its response header:
+    /// it keeps readers waiting on the cache lock until their lock timeout, and keeps the
+    /// upstream connection until the peer's read timeout, which is unset by default. Set
+    /// [`PeerOptions::read_timeout`](pingora_core::upstreams::peer::PeerOptions::read_timeout)
+    /// and a cache lock timeout to bound both.
     fn downstream_abandoned_during_cache_fill(&self, _session: &Session<DS>, _ctx: &mut Self::CTX) {
     }
 

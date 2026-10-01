@@ -571,19 +571,43 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
+    /// Finish the cache admission. A failure disables the cache and the response goes on, unless
+    /// the storage failed it because an abandoned fill was cancelled.
     async fn finish_miss_handler_best_effort(
         &self,
         session: &mut Session<DS>,
         ctx: &<SV as ProxyHttp<DS>>::CTX,
-    ) where
+    ) -> Result<()>
+    where
         SV: ProxyHttp<DS>,
     {
-        if let Err(e) = session.cache.finish_miss_handler().await {
-            warn!(
-                "Failed to finish cache miss admission: {e}, {}",
-                self.inner.request_summary(session, ctx)
-            );
-            session.cache.disable(NoCacheReason::StorageError);
+        // The proxy itself does not look for a cancellation here: it is only observed when the
+        // loop next asks for upstream data, so once the final upstream task reaches this point
+        // the response is committed even if a cancellation was requested while that task was in
+        // flight. A storage that honors the cancellation can still fail the finish.
+        match session.cache.finish_miss_handler().await {
+            Ok(()) => Ok(()),
+            // An explicit cancellation of an abandoned fill ends the request, as it does when
+            // the loop observes it while waiting for upstream data.
+            Err(mut error)
+                if session.downstream_abandoned_during_cache_fill()
+                    && session.is_cache_fill_cancellation(&error) =>
+            {
+                session.cache.disable(NoCacheReason::Custom(
+                    pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED,
+                ));
+                error.set_retry(false);
+                Err(error)
+            }
+            Err(error) => {
+                warn!(
+                    "Failed to finish cache miss admission: {error}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
+                let reason = session.cache_failure_reason(&error, NoCacheReason::StorageError);
+                session.cache.disable(reason);
+                Ok(())
+            }
         }
     }
 
@@ -705,7 +729,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                self.finish_miss_handler_best_effort(session, ctx).await;
+                                self.finish_miss_handler_best_effort(session, ctx).await?;
                             }
                         }
                     }
@@ -751,13 +775,13 @@ where
 
                             miss_handler.write_body(d.clone(), *end_stream).await?;
                             if *end_stream {
-                                self.finish_miss_handler_best_effort(session, ctx).await;
+                                self.finish_miss_handler_best_effort(session, ctx).await?;
                             }
                         }
                     }
                     None => {
                         if session.cache.enabled() && *end_stream {
-                            self.finish_miss_handler_best_effort(session, ctx).await;
+                            self.finish_miss_handler_best_effort(session, ctx).await?;
                         }
                     }
                 }
@@ -765,7 +789,7 @@ where
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    self.finish_miss_handler_best_effort(session, ctx).await;
+                    self.finish_miss_handler_best_effort(session, ctx).await?;
                 }
             }
             HttpTask::Failed(_) => {
@@ -2650,7 +2674,9 @@ impl ServeFromCache {
 mod tests {
     use super::*;
     use pingora_cache::{
+        fill_cancellation::{ERR_CACHE_FILL_CANCELLED, REASON_CACHE_FILL_CANCELLED},
         predictor::{CacheablePredictor, Predictor},
+        storage::{HandleMiss, MissFinishType, PurgeOutcome, PurgeTarget, PurgeType, Storage},
         CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
     };
     use pingora_http::ResponseHeader;
@@ -2663,6 +2689,74 @@ mod tests {
 
     static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
     static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    /// Fails `finish` the way a storage that honors a fill cancellation might, wrapping
+    /// [`ERR_CACHE_FILL_CANCELLED`] in its own error.
+    static FINISH_CANCELLED_STORAGE: FinishFailStorage =
+        FinishFailStorage(Some(ERR_CACHE_FILL_CANCELLED));
+
+    /// Fails every miss handler's `finish` with a `FileWriteError`, caused by an error of the
+    /// given type if there is one.
+    struct FinishFailStorage(Option<ErrorType>);
+
+    #[async_trait]
+    impl Storage for FinishFailStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, pingora_cache::HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<pingora_cache::MissHandler> {
+            Ok(Box::new(FinishFailMissHandler(self.0.clone())))
+        }
+
+        async fn purge(
+            &'static self,
+            _target: PurgeTarget<'_>,
+            _purge_type: PurgeType,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<PurgeOutcome> {
+            Ok(PurgeOutcome::NotFound)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    struct FinishFailMissHandler(Option<ErrorType>);
+
+    #[async_trait]
+    impl HandleMiss for FinishFailMissHandler {
+        async fn write_body(&mut self, _data: Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            let context = "cache miss finalization failed";
+            match self.0 {
+                None => Error::e_explain(FileWriteError, context),
+                Some(cause) => Error::e_because(FileWriteError, context, Error::new(cause)),
+            }
+        }
+    }
 
     struct TestProxy;
 
@@ -2736,6 +2830,101 @@ mod tests {
         resp.insert_header(http::header::CACHE_CONTROL, "max-age=60")
             .unwrap();
         resp
+    }
+
+    async fn finish_fail_session_on(
+        path: &'static str,
+        storage: &'static FinishFailStorage,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.set_handles_downstream_abandonment(true);
+        session.read_request().await.unwrap();
+        session.cache.enable(storage, None, None, None, None);
+        session.cache.set_cache_key(CacheKey::new(path, ""));
+        session.cache.cache_miss();
+        session
+    }
+
+    async fn start_finish_fail_admission(
+        proxy: &HttpProxy<TestProxy>,
+        session: &mut Session,
+        serve_from_cache: &mut ServeFromCache,
+    ) {
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(chunked_cacheable_response()), false),
+                &mut (),
+                serve_from_cache,
+            )
+            .await
+            .unwrap();
+        assert!(session.cache.is_cache_admission_active());
+        assert!(session.mark_downstream_abandoned_during_cache_fill());
+    }
+
+    #[tokio::test]
+    async fn abandoned_finalization_cancellation_is_still_classified_as_cancelled() {
+        let mut session =
+            finish_fail_session_on("/finish-cancelled-abandoned", &FINISH_CANCELLED_STORAGE).await;
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        let mut serve_from_cache = ServeFromCache::new();
+        start_finish_fail_admission(&proxy, &mut session, &mut serve_from_cache).await;
+
+        let error = proxy
+            .cache_http_task(
+                &mut session,
+                &HttpTask::Done,
+                &mut (),
+                &mut serve_from_cache,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            session.cache_failure_reason(&error, NoCacheReason::StorageError),
+            NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED)
+        );
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_cancellation_is_classified_only_with_the_opt_in() {
+        for (handles_abandonment, expected) in [
+            (false, NoCacheReason::StorageError),
+            (true, NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED)),
+        ] {
+            let mut session =
+                finish_fail_session_on("/finish-cancelled-attached", &FINISH_CANCELLED_STORAGE)
+                    .await;
+            session.set_handles_downstream_abandonment(handles_abandonment);
+            let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+
+            proxy
+                .cache_http_task(
+                    &mut session,
+                    &HttpTask::Header(Box::new(chunked_cacheable_response()), true),
+                    &mut (),
+                    &mut ServeFromCache::new(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Disabled(expected),
+                "opt-in {handles_abandonment}"
+            );
+        }
     }
 
     async fn run_header_task(session: &mut Session, resp: ResponseHeader) {

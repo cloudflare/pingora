@@ -64,6 +64,7 @@ use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
+use pingora_core::protocols::http::custom::client::Session as _;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
@@ -502,9 +503,31 @@ where
                         (server_reused, error)
                     }
                     ClientSession::Custom(mut c) => {
+                        let mut request_write_attempted = false;
                         let (server_reused, error) = self
-                            .proxy_to_custom_upstream(session, &mut c, client_reused, &peer, ctx)
+                            .proxy_to_custom_upstream(
+                                session,
+                                &mut c,
+                                client_reused,
+                                &peer,
+                                ctx,
+                                &mut request_write_attempted,
+                            )
                             .await;
+                        if request_write_attempted
+                            && error.as_ref().is_some_and(|e| {
+                                session.downstream_abandoned_during_cache_fill()
+                                    || session.is_cache_fill_cancellation(e)
+                            })
+                        {
+                            // Once the downstream is abandoned, the attempt can stop reading
+                            // mid-response, where a connected request would have read on, and
+                            // leave the session with no signal of where it left off, so it must
+                            // not be reused. Abandon before releasing rather than skipping
+                            // release outright, so the connector's own bookkeeping still runs.
+                            // Any other failed attempt is released as without the opt-in.
+                            c.abandon("proxy attempt failed").await;
+                        }
                         let session = ClientSession::Custom(c);
                         self.client_upstream
                             .release_http_session(session, &*peer, peer.idle_timeout())
@@ -764,6 +787,36 @@ where
         self.handles_downstream_abandonment && self.cache.downstream_abandoned_during_cache_fill()
     }
 
+    /// Whether `error` is a cancelled cache fill of a request that
+    /// [`ProxyHttp::should_handle_downstream_abandonment`] opted in: its root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED),
+    /// wrapped or not. Always `false` for a request that did not opt in.
+    pub(crate) fn is_cache_fill_cancellation(&self, error: &Error) -> bool {
+        self.handles_downstream_abandonment
+            && pingora_cache::fill_cancellation::is_cache_fill_cancelled(error)
+    }
+
+    /// The no-cache reason for a cache failure that `error` caused.
+    ///
+    /// For a request that [`ProxyHttp::should_handle_downstream_abandonment`] opted in, an error whose
+    /// root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED)
+    /// gives
+    /// [`REASON_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED),
+    /// whether or not the downstream was abandoned. Any other error, and any error of a request
+    /// that did not opt in, gives `fallback`.
+    pub(crate) fn cache_failure_reason(
+        &self,
+        error: &Error,
+        fallback: NoCacheReason,
+    ) -> NoCacheReason {
+        if self.is_cache_fill_cancellation(error) {
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        } else {
+            fallback
+        }
+    }
+
     /// Whether this attempt's response work is done.
     ///
     /// A connected request follows downstream delivery. An abandoned request waits for the
@@ -810,6 +863,10 @@ where
     /// also never reads the abandoned downstream again, so it can only resend a request body
     /// whose framing completed successfully. It also must not start while this attempt's cache
     /// writer is still active, since a new admission cannot start on top of it.
+    ///
+    /// A requested fill cancellation is not an input here, and cannot be; see
+    /// [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) for why, and for what an
+    /// application that must stop sooner does instead.
     fn cache_fill_retry_allowed(&mut self) -> bool {
         !self.downstream_abandoned_during_cache_fill()
             || (self.downstream_session.is_body_complete()
@@ -1520,6 +1577,7 @@ where
                 } else {
                     NoCacheReason::InternalError
                 };
+                let reason = session.cache_failure_reason(e, reason);
                 session.cache.disable(reason);
             }
             let res = self.inner.fail_to_proxy(&mut session, e, &mut ctx).await;
@@ -2910,6 +2968,123 @@ mod tests {
         assert_eq!(opt_in_seen_by_request_filter(default).await, Some(false));
     }
 
+    mod suppress_error_log_default {
+        use super::*;
+        use crate::proxy_common::cache_fill_cancelled;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+
+        /// A session whose opted-in request's downstream was abandoned during a cache fill.
+        async fn abandoned_session(path: &str) -> Session {
+            cache_miss_session(path, &AbandonmentTiming::BeforeAttempt, true)
+                .await
+                .0
+        }
+
+        fn unrelated_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        /// Always answers `suppress_error_log` the same way, to prove an override wins over
+        /// the default regardless of the error's etype.
+        struct OverrideProxy(bool);
+
+        #[async_trait]
+        impl ProxyHttp for OverrideProxy {
+            type CTX = ();
+            fn new_ctx(&self) -> Self::CTX {}
+
+            async fn upstream_peer(
+                &self,
+                _session: &mut Session,
+                _ctx: &mut Self::CTX,
+            ) -> Result<Box<HttpPeer>> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn suppress_error_log(
+                &self,
+                _session: &Session,
+                _ctx: &Self::CTX,
+                _error: &Error,
+            ) -> bool {
+                self.0
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_cancellation_error_is_suppressed_by_default() {
+            let session = abandoned_session("/suppress-only-cancellation").await;
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an application-requested cancellation must not flood the error log"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &unrelated_error()),
+                "an unrelated error must still log at error level"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_override_replaces_the_default_in_both_directions() {
+            let session = abandoned_session("/suppress-override").await;
+            assert!(
+                OverrideProxy(true).suppress_error_log(&session, &(), &unrelated_error()),
+                "an override that suppresses everything must still suppress an unrelated error"
+            );
+            assert!(
+                !OverrideProxy(false).suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an override that suppresses nothing must still log the cancellation error"
+            );
+        }
+
+        #[tokio::test]
+        async fn nothing_is_suppressed_by_default_without_the_opt_in() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-without-opt-in",
+                &AbandonmentTiming::AfterAdmission,
+                false,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a request that did not opt in must keep logging every final error"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy, so a cancellation that
+        // reaches a connected request comes from elsewhere and is a failure worth logging.
+        #[tokio::test]
+        async fn a_connected_request_logs_its_cancellation() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-connected",
+                &AbandonmentTiming::AfterAdmission,
+                true,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a cancellation that failed a connected request was hidden from the error log"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wrapped_cancellation_is_still_suppressed_by_default() {
+            let session = abandoned_session("/suppress-wrapped").await;
+            let wrap = |cause: Box<Error>| {
+                Error::because(ErrorType::InternalError, "storage wrapped", cause)
+            };
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &wrap(cache_fill_cancelled())),
+                "wrapping the cancellation made it log at error level"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &wrap(unrelated_error())),
+                "a wrapped unrelated error must still log at error level"
+            );
+        }
+    }
+
     mod fail_to_proxy_default {
         use super::*;
         use crate::test_support::{cache_miss_session, AbandonmentTiming};
@@ -2980,5 +3155,97 @@ mod tests {
                 "the live downstream did not get the error response: {written:?}"
             );
         }
+
+        /// Run the default `fail_to_proxy` on a connected request's `error`.
+        async fn connected_fail_to_proxy_outcome(
+            path: &str,
+            mut handles_abandonment: bool,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(
+                path,
+                &AbandonmentTiming::AfterAdmission,
+                handles_abandonment,
+            )
+            .await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy
+                .fail_to_proxy(&mut session, &error, &mut handles_abandonment)
+                .await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        #[tokio::test]
+        async fn cancelled_error_keeps_the_old_mapping_without_the_opt_in() {
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-cancelled-without-opt-in",
+                false,
+                crate::proxy_common::cache_fill_cancelled(),
+            )
+            .await;
+            assert_eq!(
+                code, 400,
+                "a downstream error of a request that did not opt in keeps its old status"
+            );
+            assert!(
+                written.starts_with(b"HTTP/1.1 400 "),
+                "the error response must still be written: {written:?}"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy. A cancellation that fails a
+        // connected request, for example one a storage raised itself, still owes the client an
+        // error response.
+        #[tokio::test]
+        async fn a_connected_request_still_gets_an_error_response_for_a_cancellation() {
+            let storage_cancellation = Error::explain(
+                pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED,
+                "storage cancelled the fill",
+            );
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-connected-cancellation",
+                true,
+                storage_cancellation,
+            )
+            .await;
+            assert_eq!(code, 500);
+            assert!(
+                written.starts_with(b"HTTP/1.1 500 "),
+                "the connected client did not get an error response: {written:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_fill_classification_follows_the_opt_in() {
+        let cancelled = Error::because(
+            InternalError,
+            "storage wrapped",
+            proxy_common::cache_fill_cancelled(),
+        );
+        let mut session = new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "a request that did not opt in keeps the old no-cache reason"
+        );
+
+        session.set_handles_downstream_abandonment(true);
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        );
+        assert_eq!(
+            session.cache_failure_reason(&Error::new(InternalError), NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "only a cancelled fill changes the reason"
+        );
     }
 }

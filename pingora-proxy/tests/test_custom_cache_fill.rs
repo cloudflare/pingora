@@ -16,15 +16,18 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pingora_cache::{trace::Span, CacheKey, CacheMeta, MemCache, RespCacheable, Storage};
+use pingora_cache::{
+    trace::Span, CacheFillCancellation, CacheKey, CacheMeta, MemCache, RespCacheable, Storage,
+};
 use pingora_core::listeners::{L4BufferSettings, ListenerConfig};
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::tls::{CustomALPN, ALPN};
+use pingora_core::protocols::Digest;
 use pingora_core::server::{configuration::ServerConf, Fds, ListenFds};
 use pingora_core::services::Service;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType, Result};
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
     http_proxy_service_with_name_custom_connector, ProxyHttp, ProxyWarnLogContext, Session,
 };
@@ -46,11 +49,21 @@ use upstream::{CustomUpstream, StreamingConnector, FIRST_BODY, LAST_BODY, LATE_M
 #[path = "custom_cache_fill/cancellation.rs"]
 mod cancellation;
 
+#[path = "custom_cache_fill/failed_attempt.rs"]
+mod failed_attempt;
+
+#[path = "custom_cache_fill/final_error_log.rs"]
+mod final_error_log;
+
+#[path = "custom_cache_fill/fill_cancellation.rs"]
+mod fill_cancellation;
+
 /// Bound for each wait in these tests, which only a hang can exceed. It costs nothing while the
 /// suite passes, so it is generous.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Shared by every test in this binary. Each test requests its own path, which is its cache key.
+/// Shared by every test in this binary that doesn't need its own storage. Each test requests its
+/// own path, which is its cache key.
 static CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 
 #[derive(Default)]
@@ -63,12 +76,24 @@ struct Observations {
     completed: AtomicBool,
     expected_error: Option<ErrorType>,
     write_failure: Option<Arc<cancellation::WriteFailure>>,
+    /// Cancellation the abandonment callback requests, when a scenario cancels the fill from there.
+    cancel_in_hook: Option<Arc<CacheFillCancellation>>,
+    /// Hook that fails before the proxy writes the request to the custom upstream, if any.
+    pre_write_failure: Option<PreWriteFailure>,
     first_custom_message: Notify,
+    abandoned: Notify,
     downstream_error_ignored: Notify,
     finished: Notify,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreWriteFailure {
+    ConnectedHook,
+    RequestFilter,
+}
+
 struct CacheFillProxy {
+    cache: &'static (dyn Storage + Sync),
     observed: Arc<Observations>,
     handles_abandonment: bool,
 }
@@ -83,6 +108,33 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
         self.handles_abandonment
     }
 
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut Session<DS>,
+        _reused: bool,
+        _peer: &HttpPeer,
+        _fd: std::os::fd::RawFd,
+        _digest: Option<&Digest>,
+        _ctx: &mut (),
+    ) -> Result<()> {
+        if self.observed.pre_write_failure == Some(PreWriteFailure::ConnectedHook) {
+            return Error::e_explain(ErrorType::InternalError, "injected connection hook error");
+        }
+        Ok(())
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session<DS>,
+        _upstream_request: &mut RequestHeader,
+        _ctx: &mut (),
+    ) -> Result<()> {
+        if self.observed.pre_write_failure == Some(PreWriteFailure::RequestFilter) {
+            return Error::e_explain(ErrorType::InternalError, "injected request filter error");
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         _session: &mut Session<DS>,
@@ -94,7 +146,7 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
     }
 
     fn request_cache_filter(&self, session: &mut Session<DS>, _ctx: &mut ()) -> Result<()> {
-        session.cache.enable(&*CACHE, None, None, None, None);
+        session.cache.enable(self.cache, None, None, None, None);
         Ok(())
     }
 
@@ -161,6 +213,10 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
             .admitted_at_abandonment
             .store(session.cache.is_cache_admission_active(), Ordering::Relaxed);
         self.observed.callback_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(cancellation) = &self.observed.cancel_in_hook {
+            cancellation.cancel();
+        }
+        self.observed.abandoned.notify_one();
     }
 
     fn suppress_proxy_warn_log(
@@ -202,7 +258,11 @@ struct RunningProxy {
 }
 
 impl RunningProxy {
-    fn start(app: CacheFillProxy, connector: StreamingConnector) -> Self {
+    fn start<A>(app: A, connector: StreamingConnector) -> Self
+    where
+        A: ProxyHttp + Send + Sync + 'static,
+        A::CTX: Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -282,12 +342,12 @@ async fn read_initial_response(client: &mut BufReader<TcpStream>) {
     assert_eq!(body, FIRST_BODY);
 }
 
-async fn read_cached_body(path: &str) -> Option<Vec<u8>> {
+async fn read_cached_body(cache: &'static MemCache, path: &str) -> Option<Vec<u8>> {
     let key = CacheKey::new(path, "");
     let span = Span::inactive();
     let (_meta, mut hit) = within(
         "cache lookup did not finish",
-        CACHE.lookup(&key, &span.handle()),
+        cache.lookup(&key, &span.handle()),
     )
     .await
     .unwrap()?;
@@ -300,7 +360,7 @@ async fn read_cached_body(path: &str) -> Option<Vec<u8>> {
     }
     within(
         "cache hit did not finish",
-        hit.finish(&*CACHE, &key, &span.handle()),
+        hit.finish(cache, &key, &span.handle()),
     )
     .await
     .unwrap();
@@ -332,6 +392,7 @@ async fn custom_cache_fill(path: &str, downstream: Downstream, handles_abandonme
     };
     let server = RunningProxy::start(
         CacheFillProxy {
+            cache: &*CACHE,
             observed: observed.clone(),
             handles_abandonment,
         },
@@ -415,7 +476,7 @@ async fn custom_cache_fill(path: &str, downstream: Downstream, handles_abandonme
         FIRST_BODY.len() + LAST_BODY.len()
     );
 
-    let cached_body = read_cached_body(path)
+    let cached_body = read_cached_body(&CACHE, path)
         .await
         .expect("completed custom response was not cached");
     assert_eq!(cached_body, [FIRST_BODY, LAST_BODY].concat());

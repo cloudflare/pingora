@@ -519,6 +519,7 @@ where
         let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
 
         let mut next_upstream_task: Option<HttpTask> = None;
+        let mut fill_cancellation = CacheFillCancellationState::new();
 
         /* duplex mode without caching
          * Read body from downstream while reading response from upstream
@@ -542,9 +543,11 @@ where
             || downstream_custom_read && !downstream_state.is_errored()
             || downstream_custom_write && !session.downstream_abandoned_during_cache_fill()
         {
-            if session.downstream_abandoned_during_cache_fill() {
+            let downstream_abandoned = session.downstream_abandoned_during_cache_fill();
+            if downstream_abandoned {
                 downstream_custom_message_inject_rx = None;
             }
+            fill_cancellation.start_watching(downstream_abandoned, &session.cache);
             // reserve tx capacity ahead to avoid deadlock, see below
 
             let send_permit = tx
@@ -669,7 +672,8 @@ where
                     }
                 },
 
-                task = rx.recv(), if session.should_poll_upstream_tasks(&response_state) && next_upstream_task.is_none() => {
+                task = fill_cancellation.recv_upstream(&mut rx), if session.should_poll_upstream_tasks(&response_state) && next_upstream_task.is_none() => {
+                    let task = task?;
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
                         let upgraded = session.was_upgraded();
@@ -930,7 +934,8 @@ where
                     .cache_http_task(session, &task, ctx, serve_from_cache)
                     .await
                 {
-                    session.cache.disable(NoCacheReason::StorageError);
+                    let reason = session.cache_failure_reason(&e, NoCacheReason::StorageError);
+                    session.cache.disable(reason);
                     if serve_from_cache.cache_write_failure_is_fatal(
                         session.downstream_abandoned_during_cache_fill(),
                     ) {
@@ -1218,7 +1223,12 @@ mod tests {
         CustomSenderOutcome, CustomWriteCalls, HeldCustomSenderProxy, RecordingCustomWriter,
         WRITER_DEMAND_CACHE,
     };
+    use crate::test_support::{
+        cache_miss_session_on, AbandonmentSignalProxy, CANCELLATION_WATCHED_STORAGE,
+    };
+    use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
     struct ResponseFilter101;
@@ -1426,5 +1436,329 @@ mod tests {
             abandonments: observed.abandonments(),
             released_writers: WRITER_DEMAND_CACHE.released_writers(path),
         }
+    }
+
+    // A cancellation requested once the abandoned fill is parked on its upstream read wakes the loop.
+    #[tokio::test]
+    async fn abandoned_fill_is_cancelled_without_another_upstream_task() {
+        assert_cancellation_ends_admitted_fill(
+            "/h1-cancel-after-abandonment",
+            AbandonmentTiming::AfterAdmission,
+        )
+        .await;
+    }
+
+    // A cancellation requested before the attempt starts ends the fill as soon as the writer exists.
+    #[tokio::test]
+    async fn fill_cancelled_before_the_attempt_ends_at_admission() {
+        assert_cancellation_ends_admitted_fill(
+            "/h1-cancel-before-attempt",
+            AbandonmentTiming::BeforeAttempt,
+        )
+        .await;
+    }
+
+    async fn assert_cancellation_ends_admitted_fill(path: &str, abandonment: AbandonmentTiming) {
+        let (mut session, mut client) =
+            cache_miss_session_on(path, &abandonment, true, &*CANCELLATION_WATCHED_STORAGE).await;
+        let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(!cancellation.is_cancelled(), "{path} was not fresh");
+        let cancel_before_attempt = matches!(abandonment, AbandonmentTiming::BeforeAttempt);
+        if cancel_before_attempt {
+            assert!(cancellation.cancel());
+        }
+        let inner = AbandonmentSignalProxy::default();
+        let abandoned = Arc::clone(&inner.abandoned);
+        let proxy = HttpProxy::new(inner, Arc::new(ServerConf::default()));
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let (request_tx, _request_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut ctx = ();
+
+        let proxy_loop = proxy.proxy_handle_downstream(
+            &mut session,
+            request_tx,
+            response_rx,
+            &mut ctx,
+            &mut custom_writer,
+            &mut custom_reader,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        let drive = async {
+            let header = ResponseHeader::build(200, None).unwrap();
+            response_tx
+                .send(HttpTask::Header(Box::new(header), false))
+                .await
+                .unwrap();
+            if !cancel_before_attempt {
+                let mut response = Vec::new();
+                while !response.ends_with(b"\r\n\r\n") {
+                    response.push(client.read_u8().await.unwrap());
+                }
+                drop(client);
+                abandoned.notified().await;
+                assert!(cancellation.cancel());
+            }
+            // Keep the upstream pipe open: only the cancellation may end the loop.
+            response_tx
+        };
+
+        let (result, _response_tx) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(proxy_loop, drive)
+        })
+        .await
+        .expect("H1 transport loop kept waiting for upstream after the cancellation");
+
+        let error = result.unwrap_err();
+        assert_eq!(error.etype(), &ERR_CACHE_FILL_CANCELLED);
+        assert_eq!(error.retry, pingora_error::RetryType::Decided(false));
+        assert!(session.downstream_abandoned_during_cache_fill());
+        assert!(
+            session.cache.is_cache_admission_active(),
+            "the loop must leave the writer for the request to drop"
+        );
+    }
+
+    // Cancellation only interrupts waiting for the upstream: a response that is admitted and
+    // completed within one upstream batch is committed even though a cancellation was pending.
+    #[tokio::test]
+    async fn batched_complete_response_commits_despite_a_pending_cancellation() {
+        let header = ResponseHeader::build(200, None).unwrap();
+        let body = HttpTask::Body(Some(Bytes::from_static(b"complete")), true);
+        assert_batched_response_commits(
+            "/h1-cancel-before-batched-header-and-body",
+            vec![HttpTask::Header(Box::new(header), false), body],
+        )
+        .await;
+
+        let header = ResponseHeader::build(204, None).unwrap();
+        assert_batched_response_commits(
+            "/h1-cancel-before-batched-bodyless-header",
+            vec![HttpTask::Header(Box::new(header), true)],
+        )
+        .await;
+    }
+
+    /// Run the transport loop for an abandoned request with a pending cancellation whose whole
+    /// upstream response is already queued, so the writer is created and finished in one
+    /// `process_upstream_tasks` call.
+    async fn assert_batched_response_commits(path: &str, response: Vec<HttpTask>) {
+        let (mut session, _client) = cache_miss_session_on(
+            path,
+            &AbandonmentTiming::BeforeAttempt,
+            true,
+            &*CANCELLATION_WATCHED_STORAGE,
+        )
+        .await;
+        assert!(
+            !CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "{path} was not fresh"
+        );
+        let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(cancellation.cancel(), "{path} was not fresh");
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let (request_tx, _request_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        for task in response {
+            response_tx.try_send(task).unwrap();
+        }
+        drop(response_tx);
+        let mut ctx = ();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.proxy_handle_downstream(
+                &mut session,
+                request_tx,
+                response_rx,
+                &mut ctx,
+                &mut custom_writer,
+                &mut custom_reader,
+                Arc::new(AtomicU8::new(PipeState::Active as u8)),
+            ),
+        )
+        .await
+        .expect("H1 transport loop did not finish the queued response");
+
+        assert!(
+            !result.unwrap(),
+            "a complete batched response must end the loop normally"
+        );
+        assert!(
+            CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "a response that was already complete was discarded for an older cancellation"
+        );
+    }
+
+    // The final task can arrive while the loop is mid-batch: after an earlier poll has already
+    // taken the header out of the channel, a later poll finds a new final task and a pending
+    // cancellation ready at the same time. `should_write_response` gates every downstream write
+    // on the downstream not being abandoned, so a cancellation is only honored at all once the
+    // downstream is abandoned - this drives no output to `client`; a capacity-1 response channel
+    // supplies the synchronisation instead of a socket read.
+    #[tokio::test]
+    async fn queued_final_task_wins_a_cancellation_ready_in_the_same_poll() {
+        let path = "/h1-cancel-races-a-mid-batch-final-task";
+        let (mut session, _client) = cache_miss_session_on(
+            path,
+            &AbandonmentTiming::BeforeAttempt,
+            true,
+            &*CANCELLATION_WATCHED_STORAGE,
+        )
+        .await;
+        assert!(
+            !CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "{path} was not fresh"
+        );
+        let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(!cancellation.is_cancelled(), "{path} was not fresh");
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let (request_tx, _request_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        // Capacity 1: the second `send` below can only complete once the loop has taken the
+        // header out of the channel, proving the loop is past the first batch and back at
+        // `recv_upstream` for the next poll.
+        let (response_tx, response_rx) = mpsc::channel(1);
+        let mut ctx = ();
+
+        let proxy_loop = proxy.proxy_handle_downstream(
+            &mut session,
+            request_tx,
+            response_rx,
+            &mut ctx,
+            &mut custom_writer,
+            &mut custom_reader,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        let drive = async {
+            let header = ResponseHeader::build(200, None).unwrap();
+            response_tx
+                .send(HttpTask::Header(Box::new(header), false))
+                .await
+                .unwrap();
+
+            // Blocks until the loop consumes the header, freeing the one buffer slot.
+            response_tx
+                .send(HttpTask::Body(Some(Bytes::from_static(b"complete")), true))
+                .await
+                .unwrap();
+
+            // No `.await` between the send above resolving and this call: the final task is
+            // already in the channel before the cancellation becomes ready. `recv_upstream`
+            // counts the queue when it first observes the cancellation, so the task sits
+            // inside that snapshot and the loop delivers it instead of failing the fill.
+            assert!(cancellation.cancel());
+
+            response_tx
+        };
+
+        let (result, _response_tx) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(proxy_loop, drive)
+        })
+        .await
+        .expect("H1 transport loop did not finish the mid-batch response");
+
+        assert!(
+            !result.unwrap(),
+            "a task queued before the loop's next poll must win over a cancellation ready at the same time"
+        );
+        assert!(
+            CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "a response whose final task beat the cancellation to the same poll was discarded"
+        );
+    }
+
+    // Without the opt-in the proxy never watches for a cancellation: an application that
+    // cancels anyway sees its fill run to completion, as before cancellation existed.
+    #[tokio::test]
+    async fn cancellation_is_never_watched_without_the_opt_in() {
+        let path = "/h1-cancel-without-opt-in";
+        let (mut session, mut client) = cache_miss_session_on(
+            path,
+            &AbandonmentTiming::AfterAdmission,
+            true,
+            &*CANCELLATION_WATCHED_STORAGE,
+        )
+        .await;
+        session.set_handles_downstream_abandonment(false);
+        assert!(
+            !CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "{path} was not fresh"
+        );
+        let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(!cancellation.is_cancelled(), "{path} was not fresh");
+        let inner = AbandonmentSignalProxy::default();
+        let abandoned = Arc::clone(&inner.abandoned);
+        let proxy = HttpProxy::new(inner, Arc::new(ServerConf::default()));
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let (request_tx, _request_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut ctx = ();
+
+        let proxy_loop = proxy.proxy_handle_downstream(
+            &mut session,
+            request_tx,
+            response_rx,
+            &mut ctx,
+            &mut custom_writer,
+            &mut custom_reader,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        let drive = async {
+            let header = ResponseHeader::build(200, None).unwrap();
+            response_tx
+                .send(HttpTask::Header(Box::new(header), false))
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                response.push(client.read_u8().await.unwrap());
+            }
+            drop(client);
+            assert!(cancellation.cancel());
+            response_tx
+                .send(HttpTask::Body(Some(Bytes::from_static(b"complete")), true))
+                .await
+                .unwrap();
+            // The upstream side closes its channel after the final task, like a finished
+            // upstream: without the opt-in the loop waits for that once the downstream failed.
+            drop(response_tx);
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(proxy_loop, drive)
+        })
+        .await
+        .expect("H1 transport loop did not finish a fill that did not opt in");
+
+        if let Err(error) = &result {
+            assert_ne!(
+                error.etype(),
+                &ERR_CACHE_FILL_CANCELLED,
+                "a request that did not opt in was cancelled"
+            );
+        }
+        assert!(!session.downstream_abandoned_during_cache_fill());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), abandoned.notified())
+                .await
+                .is_err(),
+            "the abandonment hook ran for a request that did not opt in"
+        );
+        assert!(
+            CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
+            "a fill that did not opt in was discarded for a cancellation"
+        );
     }
 }
