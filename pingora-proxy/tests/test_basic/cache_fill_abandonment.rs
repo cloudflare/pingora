@@ -104,6 +104,8 @@ mod post_admission_errors;
 mod pre_admission;
 #[path = "cache_fill_abandonment/pre_admission_no_fill.rs"]
 mod pre_admission_no_fill;
+#[path = "cache_fill_abandonment/stalled_hit.rs"]
+mod stalled_hit;
 #[path = "cache_fill_abandonment/upstream_errors.rs"]
 mod upstream_errors;
 #[path = "cache_fill_abandonment/write_timeout.rs"]

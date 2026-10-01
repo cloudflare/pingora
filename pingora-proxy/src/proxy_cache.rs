@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::proxy_common::downstream_read_error_means_client_left;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
@@ -26,6 +27,46 @@ use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
 const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
+
+#[cfg(test)]
+mod disconnect_tests;
+
+/// How [`HttpProxy::proxy_cache_hit`] ended.
+pub(crate) struct CacheHitOutcome {
+    /// Whether the downstream session can be reused.
+    pub(crate) reuse: bool,
+    /// The error that ended the hit, if it failed.
+    pub(crate) error: Option<Box<Error>>,
+    /// Whether that error is the client leaving, as seen by the client watch of an opted-in hit.
+    pub(crate) client_left: bool,
+}
+
+impl CacheHitOutcome {
+    fn served() -> Self {
+        Self {
+            reuse: true,
+            error: None,
+            client_left: false,
+        }
+    }
+
+    /// A failure before anything was written downstream, which leaves the session reusable.
+    fn failed_before_writing(error: Box<Error>) -> Self {
+        Self {
+            reuse: true,
+            error: Some(error),
+            client_left: false,
+        }
+    }
+
+    fn failed(error: Box<Error>) -> Self {
+        Self {
+            reuse: false,
+            error: Some(error),
+            client_left: false,
+        }
+    }
+}
 
 impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
@@ -263,15 +304,24 @@ where
                         }
                     }
 
-                    let (reuse, err) = self.proxy_cache_hit(session, ctx).await;
-                    if let Some(e) = err.as_ref() {
-                        error!(
-                            "Fail to serve cache: {e}, {}",
-                            self.inner.request_summary(session, ctx)
-                        );
+                    let CacheHitOutcome {
+                        reuse,
+                        error,
+                        client_left,
+                    } = self.proxy_cache_hit(session, ctx).await;
+                    if let Some(e) = error.as_ref() {
+                        // Only a hit that the opted-in client watch ended because its client
+                        // left is offered to the hook; a hit without the opt-in never has one.
+                        // Every other failure logs as it does without the opt-in.
+                        if !(client_left && self.inner.suppress_error_log(session, ctx, e)) {
+                            error!(
+                                "Fail to serve cache: {e}, {}",
+                                self.inner.request_summary(session, ctx)
+                            );
+                        }
                     }
                     // responses is served from cache, exit
-                    break Some((reuse, err));
+                    break Some((reuse, error));
                 }
                 Err(e) => {
                     // Allow cache miss to fill cache even if cache lookup errors
@@ -289,12 +339,11 @@ where
         }
     }
 
-    // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache_hit(
         &self,
         session: &mut Session<DS>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
-    ) -> (bool, Option<Box<Error>>)
+    ) -> CacheHitOutcome
     where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
@@ -354,7 +403,7 @@ where
                             error!("failed to send error response to downstream: {e}");
                         });
                     // we have not write anything dirty to downstream, it is still reusable
-                    return (true, Some(e));
+                    return CacheHitOutcome::failed_before_writing(e);
                 }
 
                 if let Err(e) = session
@@ -364,7 +413,7 @@ where
                     .map_err(|e| e.into_down())
                 {
                     // downstream connection is bad already
-                    return (false, Some(e));
+                    return CacheHitOutcome::failed(e);
                 }
             }
             Err(e) => {
@@ -380,7 +429,7 @@ where
                         error!("failed to send error response to downstream: {e}");
                     });
                 // we have not write anything dirty to downstream, it is still reusable
-                return (true, Some(e));
+                return CacheHitOutcome::failed_before_writing(e);
             }
         }
         debug!("finished sending cached header to downstream");
@@ -409,7 +458,7 @@ where
                 RangeType::Single(r) => {
                     if session.cache.hit_handler().can_seek() {
                         if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
                         None
                     } else {
@@ -419,15 +468,75 @@ where
                 RangeType::Multi(_) => {
                     let mut range_filter = RangeBodyFilter::new_range(range_type.clone());
                     if let Err(e) = seek_multipart(session.cache.hit_handler(), &mut range_filter) {
-                        return (false, Some(e));
+                        return CacheHitOutcome::failed(e);
                     }
                     Some(range_filter)
                 }
                 RangeType::Invalid => unreachable!(),
                 RangeType::None => None,
             };
+            // A hit never reads the request body. Waiting on an HTTP/2 stream reads nothing, so
+            // that client is watched from the start. Any other idle read takes a byte, which
+            // belongs to the request body until it is complete, so that client is watched only
+            // if its request body is already complete.
+            let mut watch_downstream = session.handles_downstream_abandonment()
+                && (session.downstream_session.is_http2()
+                    || session.downstream_session.is_body_done());
             loop {
-                match session.cache.hit_handler().read_body().await {
+                // Once the response is complete, an HTTP/1 client may send its next request,
+                // which belongs to the next session on the connection, even while the cache
+                // reader has yet to return the end of the body. Stop watching so it stays unread.
+                if watch_downstream && session.downstream_session.is_response_complete() {
+                    watch_downstream = false;
+                }
+                let watched = if watch_downstream {
+                    // Keep polling this read across downstream events instead of recreating it:
+                    // only leaving the hit may drop a pending read, which a hit handler that is
+                    // not cancel-safe would lose.
+                    let read = session.cache.hit_handler().read_body();
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            body = &mut read => break Ok(body),
+                            // A streaming hit can wait on its writer indefinitely, so watch the
+                            // client too and let its departure release this reader. This is the
+                            // idle read of the regular proxy loops: an HTTP/1 next request sent
+                            // early ends it with `ConnectError`, unless pipelining is enabled,
+                            // which keeps that request's first byte for the next session.
+                            downstream = session
+                                .downstream_session
+                                .read_body_or_idle(true),
+                                if watch_downstream =>
+                            {
+                                match downstream {
+                                    Err(error) => break Err(error),
+                                    // Only a custom session can end its idle wait without an
+                                    // error. Stop watching instead of waiting on it again.
+                                    Ok(_) => watch_downstream = false,
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Ok(session.cache.hit_handler().read_body().await)
+                };
+                let body = match watched {
+                    Ok(body) => body,
+                    // The client closed or reset its connection or stream, or sent its next
+                    // HTTP/1 request early and is still connected. The pending read is gone by
+                    // now, so the whole session can tell the two apart.
+                    Err(error) => {
+                        let client_left = downstream_read_error_means_client_left(&error)
+                            && session.downstream_left_before_response_complete();
+                        return CacheHitOutcome {
+                            reuse: false,
+                            error: Some(error.into_down()),
+                            client_left,
+                        };
+                    }
+                };
+                match body {
                     Ok(raw_body) => {
                         let end = raw_body.is_none();
 
@@ -457,7 +566,7 @@ where
                                         }
                                         Err(e) => e,
                                     };
-                                    return (false, Some(e));
+                                    return CacheHitOutcome::failed(e);
                                 }
                             }
                         }
@@ -480,7 +589,7 @@ where
                             Ok(None) => { /* continue */ }
                             Err(e) => {
                                 // body is being sent, don't treat downstream as reusable
-                                return (false, Some(e));
+                                return CacheHitOutcome::failed(e);
                             }
                         }
 
@@ -489,7 +598,7 @@ where
                             .response_body_filter(&mut body, end)
                         {
                             // body is being sent, don't treat downstream as reusable
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
 
                         if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
@@ -506,13 +615,13 @@ where
                             .await
                             .map_err(|e| e.into_down())
                         {
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
                         if end {
                             break;
                         }
                     }
-                    Err(e) => return (false, Some(e)),
+                    Err(e) => return CacheHitOutcome::failed(e),
                 }
             }
         }
@@ -525,9 +634,9 @@ where
         match session.as_mut().finish_body().await {
             Ok(_) => {
                 debug!("finished sending cached body to downstream");
-                (true, None)
+                CacheHitOutcome::served()
             }
-            Err(e) => (false, Some(e)),
+            Err(e) => CacheHitOutcome::failed(e),
         }
     }
 
@@ -976,7 +1085,9 @@ where
             .cache
             .release_write_lock(NoCacheReason::UpstreamError);
 
-        Some(self.proxy_cache_hit(session, ctx).await)
+        // The caller logs a failure as it logs any other final proxy error.
+        let outcome = self.proxy_cache_hit(session, ctx).await;
+        Some((outcome.reuse, outcome.error))
     }
 
     // helper function to check when to continue to retry lock (true) or give up (false)
