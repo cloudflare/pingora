@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::utils::server_utils::recorded_fail_to_proxy_code;
 
 #[derive(Clone, Copy)]
 enum PostAbandonmentUpstreamFailure {
@@ -139,6 +140,11 @@ async fn assert_h2_post_admission_failure_after_reset(
     let attempts = recorded_upstream_attempts(path) - attempts_before;
     let forced_retry_calls = forced_retry_error_hook_calls(path) - forced_retry_calls_before;
     if handles_abandonment {
+        assert_eq!(
+            recorded_fail_to_proxy_code(path),
+            Some(0),
+            "an abandoned request reports 0, as with the default fail_to_proxy: its downstream is gone"
+        );
         assert_eq!(
             forced_retry_calls, 1,
             "the upstream failure did not pass through the retry override"

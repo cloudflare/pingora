@@ -16,6 +16,7 @@
 
 use super::{CacheKey, CacheMeta};
 use crate::eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
+use crate::fill_cancellation::CacheFillCancellationWatcher;
 use crate::key::CompactCacheKey;
 use crate::trace::SpanHandle;
 
@@ -256,6 +257,10 @@ pub trait HandleHit {
     /// Read cached body
     ///
     /// Return `None` when no more body to read.
+    ///
+    /// A storage whose fills can be cancelled, see [`HandleMiss::cancellation_watcher`], should
+    /// return `None` only once the whole body has been read, and an error to a reader of a write
+    /// that was dropped before [`HandleMiss::finish`].
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>>;
 
     /// Finish the current cache hit
@@ -360,6 +365,14 @@ pub trait HandleMiss {
     ///
     /// When `self` is dropped without calling this function, the storage should consider this write
     /// failed.
+    ///
+    /// The proxy drops the miss handler of a cancelled fill without calling this function, and
+    /// takes `Ok(None)` from [`HandleHit::read_body`] as the end of a complete body. A storage
+    /// whose fills can be cancelled should therefore give the hit handlers reading this write,
+    /// whether from [`Storage::lookup_streaming_write`] or from a lookup that found it in
+    /// progress, an error rather than `Ok(None)` once it is dropped unfinished, so they do not
+    /// serve the truncated body as a success. [`MemCache`](crate::MemCache) does so when built
+    /// with [`MemCache::fail_readers_of_dropped_writes`](crate::MemCache::fail_readers_of_dropped_writes).
     async fn finish(
         self: Box<Self>, // because self is always used as a trait object
     ) -> Result<MissFinishType>;
@@ -391,6 +404,132 @@ pub trait HandleMiss {
     /// returns `false`. Other backends return `false`.
     fn release_writer_demand(&self) -> bool {
         false
+    }
+
+    /// Return a watcher that resolves once this fill should be cancelled.
+    ///
+    /// The proxy polls the watcher only after the filling request's downstream has been
+    /// abandoned; see [`CacheFillCancellation`](crate::fill_cancellation::CacheFillCancellation)
+    /// for what a resolved watcher makes it do and for how long one value stays in force.
+    /// Backends that let every fill run until the upstream completes leave this at the default
+    /// `None`.
+    ///
+    /// The [`CacheFillCancellation`](crate::fill_cancellation::CacheFillCancellation) belongs to
+    /// the state shared by everyone using one logical fill, and exists before any miss handler
+    /// does. The paths that release demand call `cancel()` on it, and every miss handler of
+    /// that fill, across upstream attempts, returns a watcher of the same value. It is neither
+    /// installed from the downstream-abandonment callback, nor keyed globally by cache key, nor
+    /// recreated per upstream attempt.
+    ///
+    /// In the example below, an application hook that sees the downstream abandoned reaches
+    /// `FillState::release_writer` by calling
+    /// [`HttpCache::release_miss_writer_demand`](crate::HttpCache::release_miss_writer_demand),
+    /// which calls [`Self::release_writer_demand`] on the active miss handler.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use async_trait::async_trait;
+    /// use parking_lot::Mutex;
+    /// use pingora_cache::storage::{HandleMiss, MissFinishType};
+    /// use pingora_cache::{CacheFillCancellation, CacheFillCancellationWatcher};
+    /// use pingora_error::Result;
+    ///
+    /// /// Demand for one logical fill: how many readers are attached, whether the filling
+    /// /// request still wants it, and whether admission of new readers has closed.
+    /// struct Demand {
+    ///     readers: usize,
+    ///     writer: bool,
+    ///     closed: bool,
+    /// }
+    ///
+    /// /// Shared by every reader and writer of one logical fill.
+    /// struct FillState {
+    ///     demand: Mutex<Demand>,
+    ///     cancellation: CacheFillCancellation,
+    /// }
+    ///
+    /// impl FillState {
+    ///     /// A fill starts with the filling request's own writer demand held.
+    ///     fn new() -> Self {
+    ///         Self {
+    ///             demand: Mutex::new(Demand {
+    ///                 readers: 0,
+    ///                 writer: true,
+    ///                 closed: false,
+    ///             }),
+    ///             cancellation: CacheFillCancellation::new(),
+    ///         }
+    ///     }
+    ///
+    ///     /// Admit a new reader. Returns `false` once admission has closed, in which
+    ///     /// case the caller must not attach to this fill.
+    ///     fn admit_reader(&self) -> bool {
+    ///         let mut demand = self.demand.lock();
+    ///         if demand.closed {
+    ///             return false;
+    ///         }
+    ///         demand.readers += 1;
+    ///         true
+    ///     }
+    ///
+    ///     /// Release a reader's demand.
+    ///     fn release_reader(&self) {
+    ///         let mut demand = self.demand.lock();
+    ///         demand.readers -= 1;
+    ///         self.close_if_idle(&mut demand);
+    ///     }
+    ///
+    ///     /// Release the filling request's own demand, leaving any readers attached.
+    ///     /// Repeat calls are harmless and report that there was nothing left to release.
+    ///     fn release_writer(&self) -> bool {
+    ///         let mut demand = self.demand.lock();
+    ///         if !demand.writer {
+    ///             return false;
+    ///         }
+    ///         demand.writer = false;
+    ///         self.close_if_idle(&mut demand);
+    ///         true
+    ///     }
+    ///
+    ///     /// The last demand to leave closes admission and cancels the fill under the same
+    ///     /// lock that counted it: `cancel()` is final, so a reader admitted after admission
+    ///     /// closes would attach to a fill that never resumes.
+    ///     fn close_if_idle(&self, demand: &mut Demand) {
+    ///         if demand.readers == 0 && !demand.writer {
+    ///             demand.closed = true;
+    ///             self.cancellation.cancel();
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// struct FillWriter {
+    ///     fill: Arc<FillState>,
+    /// }
+    ///
+    /// #[async_trait]
+    /// impl HandleMiss for FillWriter {
+    ///     async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+    ///         Ok(MissFinishType::Created(0))
+    ///     }
+    ///
+    ///     fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+    ///         // Every writer of this fill watches the same value.
+    ///         Some(self.fill.cancellation.watcher())
+    ///     }
+    ///
+    ///     fn release_writer_demand(&self) -> bool {
+    ///         // The fill outlives this writer whenever readers remain attached.
+    ///         self.fill.release_writer()
+    ///     }
+    /// }
+    /// ```
+    fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+        None
     }
 
     /// Return the identity of the entry produced by this write to the eviction manager.

@@ -17,8 +17,9 @@ use bytes::Bytes;
 use pingora_cache::storage::{HandleMiss, MissFinishType};
 use pingora_cache::trace::SpanHandle;
 use pingora_cache::{
-    CacheEntryId, CacheKey, CacheMeta, HitHandler, MemCache, MissHandler, PurgeOutcome,
-    PurgeTarget, PurgeType, RespCacheable, Storage,
+    CacheEntryId, CacheFillCancellation, CacheFillCancellationWatcher, CacheKey, CacheMeta,
+    HitHandler, MemCache, MissHandler, PurgeOutcome, PurgeTarget, PurgeType, RespCacheable,
+    Storage,
 };
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -174,6 +175,185 @@ impl Storage for WriterDemandCache {
     }
 }
 
+/// [`MemCache`] whose miss handlers offer the cancellation watcher registered for their cache key.
+///
+/// [`Self::cancellation_for`] returns one [`CacheFillCancellation`] per key, created on first use.
+/// The same value is shared by every miss handler of one logical fill, matching the contract
+/// [`HandleMiss::cancellation_watcher`] documents: it is removed only when a handler's `finish()`
+/// returns `Ok`, so a handler dropped without finishing (a retried upstream attempt) leaves the
+/// value in place for the next attempt to observe. There is no implicit clearing beyond that
+/// rule; [`Self::reset_cancellation`] drops a value unconditionally, for a test that needs to
+/// start a genuinely new logical fill after a cancelled or committed one.
+pub(crate) struct CancellationWatchedStorage {
+    inner: MemCache,
+    cancellations: Mutex<HashMap<String, Arc<CacheFillCancellation>>>,
+}
+
+pub(crate) static CANCELLATION_WATCHED_STORAGE: LazyLock<CancellationWatchedStorage> =
+    LazyLock::new(|| CancellationWatchedStorage {
+        inner: MemCache::new(),
+        cancellations: Mutex::new(HashMap::new()),
+    });
+
+impl CancellationWatchedStorage {
+    /// The cancellation for a primary cache key, created on first use.
+    pub(crate) fn cancellation_for(&self, key: &str) -> Arc<CacheFillCancellation> {
+        Arc::clone(
+            self.cancellations
+                .lock()
+                .unwrap()
+                .entry(key.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Drops the cancellation for `key` unconditionally.
+    ///
+    /// Use this to start a genuinely new logical fill after a cancelled or committed one; there
+    /// is no other way to clear a stored value.
+    pub(crate) fn reset_cancellation(&self, key: &str) {
+        self.cancellations.lock().unwrap().remove(key);
+    }
+
+    /// Removes the cancellation for `key` if it is still the value passed in.
+    ///
+    /// A miss handler calls this from `finish()` to drop the cancellation once its fill reaches a
+    /// terminal state. The identity check protects a value a newer fill has since installed, via
+    /// [`Self::reset_cancellation`] or a fresh `get_miss_handler` call, from being removed by a
+    /// handler that belonged to an earlier fill.
+    fn remove_if_current(&self, key: &str, cancellation: &Arc<CacheFillCancellation>) {
+        let mut cancellations = self.cancellations.lock().unwrap();
+        if cancellations
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, cancellation))
+        {
+            cancellations.remove(key);
+        }
+    }
+
+    /// Whether a completed response is cached under this primary key.
+    pub(crate) async fn is_committed(&'static self, key: &str) -> bool {
+        let span = pingora_cache::trace::Span::inactive();
+        self.inner
+            .lookup(&CacheKey::new(key, ""), &span.handle())
+            .await
+            .unwrap()
+            .is_some()
+    }
+}
+
+#[async_trait]
+impl Storage for CancellationWatchedStorage {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        self.inner.lookup(key, trace).await
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        self.inner
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<MissHandler> {
+        let inner = self.inner.get_miss_handler(key, meta, trace).await?;
+        let primary_key = key
+            .primary_key_str()
+            .expect("test keys are UTF-8")
+            .to_owned();
+        let cancellation = self.cancellation_for(&primary_key);
+        Ok(Box::new(CancellationWatchedMissHandler {
+            inner,
+            cancellation,
+            storage: self,
+            key: primary_key,
+        }))
+    }
+
+    async fn purge(
+        &'static self,
+        target: PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.inner.purge(target, purge_type, trace).await
+    }
+
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.inner.expire(target, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<bool> {
+        self.inner.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct CancellationWatchedMissHandler {
+    inner: MissHandler,
+    cancellation: Arc<CacheFillCancellation>,
+    storage: &'static CancellationWatchedStorage,
+    key: String,
+}
+
+#[async_trait]
+impl HandleMiss for CancellationWatchedMissHandler {
+    async fn write_body(&mut self, data: Bytes, eof: bool) -> Result<()> {
+        self.inner.write_body(data, eof).await
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        let CancellationWatchedMissHandler {
+            inner,
+            cancellation,
+            storage,
+            key,
+        } = *self;
+        let result = inner.finish().await;
+        if result.is_ok() {
+            storage.remove_if_current(&key, &cancellation);
+        }
+        result
+    }
+
+    fn streaming_write_tag(&self) -> Option<&[u8]> {
+        self.inner.streaming_write_tag()
+    }
+
+    fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+        Some(self.cancellation.watcher())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CustomWriteCalls {
     writes: AtomicUsize,
@@ -319,6 +499,47 @@ impl ProxyHttp for HeldCustomSenderProxy {
     }
 }
 
+/// Caches every response and signals when the proxy reports downstream abandonment.
+#[derive(Default)]
+pub(crate) struct AbandonmentSignalProxy {
+    pub(crate) abandoned: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ProxyHttp for AbandonmentSignalProxy {
+    type CTX = ();
+
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        unreachable!("test calls the transport loop directly")
+    }
+
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        response: &ResponseHeader,
+        _ctx: &mut (),
+    ) -> Result<RespCacheable> {
+        let now = std::time::SystemTime::now();
+        Ok(RespCacheable::Cacheable(CacheMeta::new(
+            now + Duration::from_secs(60),
+            now,
+            0,
+            0,
+            response.clone(),
+        )))
+    }
+
+    fn downstream_abandoned_during_cache_fill(&self, _session: &Session, _ctx: &mut ()) {
+        self.abandoned.notify_one();
+    }
+}
+
 pub(crate) enum AbandonmentTiming {
     BeforeAttempt,
     AfterAdmission,
@@ -329,9 +550,26 @@ pub(crate) async fn cache_miss_session(
     abandonment: &AbandonmentTiming,
     handles_abandonment: bool,
 ) -> (Session, DuplexStream) {
-    let (mut session, client) = cache_miss_session_for_request(
+    cache_miss_session_on(
+        path,
+        abandonment,
+        handles_abandonment,
+        &*WRITER_DEMAND_CACHE,
+    )
+    .await
+}
+
+/// An H1 session in the miss phase for `path` on `storage`, with the client half returned.
+pub(crate) async fn cache_miss_session_on(
+    path: &str,
+    abandonment: &AbandonmentTiming,
+    handles_abandonment: bool,
+    storage: &'static (dyn Storage + Sync),
+) -> (Session, DuplexStream) {
+    let (mut session, client) = miss_session(
         &format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n"),
         handles_abandonment,
+        storage,
     )
     .await;
     if matches!(abandonment, AbandonmentTiming::BeforeAttempt) {
@@ -347,15 +585,22 @@ pub(crate) async fn cache_miss_session_for_request(
     request: &str,
     handles_abandonment: bool,
 ) -> (Session, DuplexStream) {
+    miss_session(request, handles_abandonment, &*WRITER_DEMAND_CACHE).await
+}
+
+/// An HTTP/1 session that read `request` and is a cache miss for the request path on `storage`.
+async fn miss_session(
+    request: &str,
+    handles_abandonment: bool,
+    storage: &'static (dyn Storage + Sync),
+) -> (Session, DuplexStream) {
     let (mut client, server) = tokio::io::duplex(1024);
     client.write_all(request.as_bytes()).await.unwrap();
 
     let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
     session.set_handles_downstream_abandonment(handles_abandonment);
     session.read_request().await.unwrap();
-    session
-        .cache
-        .enable(&*WRITER_DEMAND_CACHE, None, None, None, None);
+    session.cache.enable(storage, None, None, None, None);
     let key = CacheKey::new(session.req_header().uri.path(), "");
     session.cache.set_cache_key(key);
     session.cache.cache_miss();
@@ -429,4 +674,82 @@ pub(crate) async fn drive_custom_sender_while_client_leaves(
         response_tx.send(HttpTask::Done).await.unwrap();
     }
     (late_message_accepted, handles_abandonment.then_some(sender))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal cacheable response for exercising [`Storage::get_miss_handler`] directly.
+    fn test_meta() -> CacheMeta {
+        let now = std::time::SystemTime::now();
+        let header = ResponseHeader::build(200, None).unwrap();
+        CacheMeta::new(now + Duration::from_secs(60), now, 0, 0, header)
+    }
+
+    // The cancellation for a path is shared across upstream attempts of one logical fill, and is
+    // removed only once a miss handler commits - never merely by being dropped mid-attempt.
+    #[tokio::test]
+    async fn cancellation_survives_a_retry_and_clears_on_commit() {
+        let path = "/test-support-lifecycle-commit";
+        CANCELLATION_WATCHED_STORAGE.reset_cancellation(path);
+        let key = CacheKey::new(path, "");
+        let span = pingora_cache::trace::Span::inactive();
+
+        let first = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(
+            !first.is_cancelled(),
+            "a fresh cancellation must not start cancelled"
+        );
+
+        // A miss handler dropped without finish() models a retried upstream attempt: the
+        // fixture must leave the cancellation in place for that retry to observe.
+        drop(
+            CANCELLATION_WATCHED_STORAGE
+                .get_miss_handler(&key, &test_meta(), &span.handle())
+                .await
+                .unwrap(),
+        );
+        let after_drop = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(
+            Arc::ptr_eq(&first, &after_drop),
+            "a handler dropped without finish() must not clear the cancellation"
+        );
+
+        // The retry's own handler commits successfully: the fill has reached a terminal state
+        // and the value must be gone, so the next logical fill of this path starts fresh.
+        CANCELLATION_WATCHED_STORAGE
+            .get_miss_handler(&key, &test_meta(), &span.handle())
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let after_commit = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(
+            !Arc::ptr_eq(&first, &after_commit),
+            "a committed fill's cancellation must be replaced by a fresh value"
+        );
+        assert!(!after_commit.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn reset_cancellation_replaces_a_cancelled_value() {
+        let path = "/test-support-lifecycle-reset";
+        CANCELLATION_WATCHED_STORAGE.reset_cancellation(path);
+
+        let cancelled = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(cancelled.cancel());
+
+        CANCELLATION_WATCHED_STORAGE.reset_cancellation(path);
+        let fresh = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
+        assert!(
+            !Arc::ptr_eq(&cancelled, &fresh),
+            "reset_cancellation must install a new value"
+        );
+        assert!(
+            !fresh.is_cancelled(),
+            "the value after reset must be uncancelled"
+        );
+    }
 }

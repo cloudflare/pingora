@@ -96,6 +96,7 @@ fn start_custom_proxy(
     let mut service = ProxyServiceBuilder::new(
         &Arc::new(ServerConf::default()),
         CacheFillProxy {
+            cache: &*CACHE,
             observed,
             handles_abandonment,
         },
@@ -127,7 +128,7 @@ enum FailureTiming {
 /// `OnAbandonment` once the proxy has handled the client leaving, `WhileConnected` when the test
 /// releases it.
 async fn custom_write_failure(path: &str, timing: FailureTiming, handles_abandonment: bool) {
-    assert!(read_cached_body(path).await.is_none());
+    assert!(read_cached_body(&CACHE, path).await.is_none());
     // Only abandonment handling cancels the write toward the client that left.
     let abandoned = matches!(timing, FailureTiming::OnAbandonment) && handles_abandonment;
     let failure = Arc::new(WriteFailure::default());
@@ -194,7 +195,7 @@ async fn custom_write_failure(path: &str, timing: FailureTiming, handles_abandon
         assert_eq!(observed.callback_calls.load(Ordering::Relaxed), 1);
         assert_eq!(observed.custom_messages.load(Ordering::Relaxed), 1);
         assert_eq!(
-            read_cached_body(path)
+            read_cached_body(&CACHE, path)
                 .await
                 .expect("custom write cancellation discarded the cache fill"),
             [FIRST_BODY, LAST_BODY].concat()

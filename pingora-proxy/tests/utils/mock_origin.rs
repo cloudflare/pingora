@@ -17,6 +17,14 @@ use std::process::{self, Stdio};
 use std::sync::LazyLock;
 use std::{thread, time};
 
+pub(crate) fn install_certificate(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Other integration test processes can load this certificate concurrently.
+    let staged = tempfile::NamedTempFile::new_in(destination.parent().unwrap_or(Path::new(".")))?;
+    std::fs::copy(source, staged.path())?;
+    staged.persist(destination).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Written by the mock origin's nginx.conf (`pid`).
 const PID_FILE: &str = "/tmp/pingora_mock_origin.pid";
 
@@ -42,12 +50,12 @@ fn init() -> bool {
     #[cfg(feature = "any_tls")]
     {
         let mut dst_cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
-        std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
+        install_certificate(Path::new(&src_cert_path), Path::new(&dst_cert_path)).unwrap();
         dst_cert_path = format!(
             "{}/tests/utils/conf/keys/server.crt",
             env!("CARGO_MANIFEST_DIR")
         );
-        std::fs::copy(Path::new(&src_cert_path), Path::new(&dst_cert_path));
+        install_certificate(Path::new(&src_cert_path), Path::new(&dst_cert_path)).unwrap();
     }
 
     // Every test process restarts openresty. The previous instance keeps its listen ports

@@ -31,6 +31,25 @@ use utils::server_utils::{
     suppress_proxy_warn_log_calls,
 };
 
+#[test]
+fn certificate_install_keeps_open_readers_on_complete_file() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.pem");
+    let destination = dir.path().join("installed.pem");
+    std::fs::write(&source, b"new certificate").unwrap();
+    std::fs::write(&destination, b"old certificate").unwrap();
+
+    let mut reader = std::fs::File::open(&destination).unwrap();
+    utils::mock_origin::install_certificate(&source, &destination).unwrap();
+
+    let mut observed = Vec::new();
+    reader.read_to_end(&mut observed).unwrap();
+    assert_eq!(observed, b"old certificate");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new certificate");
+}
+
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
 }

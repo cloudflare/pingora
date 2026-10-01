@@ -22,13 +22,14 @@ use pingora_core::protocols::http::custom::{
 };
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest, UniqueIDType};
 use pingora_core::upstreams::peer::Peer;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 pub const FIRST_BODY: &[u8] = b"before abandonment\n";
 pub const LAST_BODY: &[u8] = b"after abandonment\n";
@@ -37,22 +38,40 @@ pub const LATE_MESSAGE_COUNT: usize = CUSTOM_MESSAGE_QUEUE_SIZE + 1;
 pub struct CustomUpstream {
     pub connector: StreamingConnector,
     pub producer: StreamingProducer,
+    /// Abandon/shutdown calls the custom session recorded, shared with tests.
+    pub abandon_calls: Arc<Mutex<Vec<String>>>,
+    /// Request headers the proxy asked the custom session to write, shared with tests.
+    pub request_headers_written: Arc<AtomicUsize>,
+    /// Sessions the proxy released back to the connector, shared with tests.
+    pub releases: Arc<AtomicUsize>,
+    /// Fired once the session reads the terminal `None` of the response body.
+    pub body_drained: Arc<Notify>,
 }
 
 impl CustomUpstream {
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(None, false)
     }
 
     /// The upstream holds its response header until the producer is released.
     pub fn with_held_response_header() -> Self {
         let (release, held) = oneshot::channel();
-        let mut upstream = Self::build(Some(held));
+        let mut upstream = Self::build(Some(held), false);
         upstream.producer.header = Some(release);
         upstream
     }
 
-    fn build(held_header: Option<oneshot::Receiver<()>>) -> Self {
+    /// Like [`Self::new`], but once the producer is dropped the response body fails with an
+    /// upstream read error instead of ending.
+    pub fn failing_when_producer_drops() -> Self {
+        Self::build(None, true)
+    }
+
+    fn build(held_header: Option<oneshot::Receiver<()>>, fail_when_producer_drops: bool) -> Self {
+        let abandon_calls = Arc::new(Mutex::new(Vec::new()));
+        let request_headers_written = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let body_drained = Arc::new(Notify::new());
         let (custom_tx, custom_rx) = mpsc::channel(CUSTOM_MESSAGE_QUEUE_SIZE);
         let (body_tx, body_rx) = mpsc::channel(1);
         let mut response = ResponseHeader::build(200, None).unwrap();
@@ -70,13 +89,22 @@ impl CustomUpstream {
                     body: body_rx,
                     custom: Some(BoundedCustomReader(custom_rx)),
                     response_finished: false,
+                    fail_when_producer_drops,
+                    abandon_calls: Arc::clone(&abandon_calls),
+                    request_headers_written: Arc::clone(&request_headers_written),
+                    body_drained: Arc::clone(&body_drained),
                 })),
+                releases: Arc::clone(&releases),
             },
             producer: StreamingProducer {
                 header: None,
                 custom: custom_tx,
                 body: body_tx,
             },
+            abandon_calls,
+            request_headers_written,
+            releases,
+            body_drained,
         }
     }
 }
@@ -87,8 +115,55 @@ pub struct StreamingProducer {
     body: mpsc::Sender<Bytes>,
 }
 
+/// How [`StreamingProducer::run_watching_reader`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProducerOutcome {
+    /// The proxy dropped its response body reader before the test released the producer.
+    BodyReaderDropped,
+    /// The test released the producer, which then sent the rest of the response.
+    Released {
+        /// Whether the proxy had dropped its custom-message reader by then.
+        reader_closed: bool,
+    },
+}
+
 impl StreamingProducer {
+    /// Send the first body chunk and custom message, wait for the release, then send the rest.
+    ///
+    /// Blocks on the release however the proxy behaves; tests that expect the proxy to give
+    /// up early abort this future instead.
     pub async fn run(self, release: oneshot::Receiver<()>) -> bool {
+        self.send_first().await;
+        release
+            .await
+            .expect("test did not release the upstream response");
+        self.send_rest().await
+    }
+
+    /// Like [`Self::run`], but also watch for the proxy dropping its response body reader
+    /// while waiting for the release.
+    pub async fn run_watching_reader(self, release: oneshot::Receiver<()>) -> ProducerOutcome {
+        self.send_first().await;
+        tokio::select! {
+            _ = self.body.closed() => return ProducerOutcome::BodyReaderDropped,
+            released = release => {
+                released.expect("test did not release the upstream response");
+            }
+        }
+        ProducerOutcome::Released {
+            reader_closed: self.send_rest().await,
+        }
+    }
+
+    /// Send the first body chunk and custom message, then stop once `fail` fires or is dropped.
+    ///
+    /// A [`CustomUpstream::failing_when_producer_drops`] session then fails its response body.
+    pub async fn run_until_failure(self, fail: oneshot::Receiver<()>) {
+        self.send_first().await;
+        let _ = fail.await;
+    }
+
+    async fn send_first(&self) {
         self.body
             .send(Bytes::from_static(FIRST_BODY))
             .await
@@ -97,13 +172,14 @@ impl StreamingProducer {
             .send(Ok(Bytes::from_static(b"first")))
             .await
             .unwrap();
-        release
-            .await
-            .expect("test did not release the upstream response");
+    }
+
+    /// Release a held response header, then send the rest. Returns whether the proxy had dropped
+    /// its custom-message reader.
+    async fn send_rest(self) -> bool {
         if let Some(header) = self.header {
             header.send(()).unwrap();
         }
-
         let mut reader_closed = false;
         // A dropped receiver discards custom messages. An idle, live receiver blocks HTTP EOF.
         for _ in 0..LATE_MESSAGE_COUNT {
@@ -121,6 +197,7 @@ impl StreamingProducer {
 
 pub struct StreamingConnector {
     session: Mutex<Option<StreamingSession>>,
+    releases: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -153,6 +230,7 @@ impl Connector for StreamingConnector {
         _peer: &P,
         _idle_timeout: Option<Duration>,
     ) {
+        self.releases.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -162,11 +240,16 @@ pub struct StreamingSession {
     body: mpsc::Receiver<Bytes>,
     custom: Option<BoundedCustomReader>,
     response_finished: bool,
+    fail_when_producer_drops: bool,
+    abandon_calls: Arc<Mutex<Vec<String>>>,
+    request_headers_written: Arc<AtomicUsize>,
+    body_drained: Arc<Notify>,
 }
 
 #[async_trait]
 impl Session for StreamingSession {
     async fn write_request_header(&mut self, request: Box<RequestHeader>, end: bool) -> Result<()> {
+        self.request_headers_written.fetch_add(1, Ordering::Relaxed);
         assert_eq!(request.method, http::Method::GET);
         assert!(end);
         Ok(())
@@ -194,7 +277,14 @@ impl Session for StreamingSession {
 
     async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
         let body = self.body.recv().await;
+        if body.is_none() && self.fail_when_producer_drops {
+            return Error::e_explain(ErrorType::ReadError, "injected upstream failure")
+                .map_err(|e| e.into_up());
+        }
         self.response_finished = body.is_none();
+        if self.response_finished {
+            self.body_drained.notify_one();
+        }
         Ok(body)
     }
 
@@ -202,7 +292,19 @@ impl Session for StreamingSession {
         self.response_finished
     }
 
-    async fn shutdown(&mut self, _code: u32, _context: &str) {}
+    async fn shutdown(&mut self, code: u32, ctx: &str) {
+        self.abandon_calls
+            .lock()
+            .unwrap()
+            .push(format!("shutdown({code}, {ctx})"));
+    }
+
+    async fn abandon(&mut self, ctx: &str) {
+        self.abandon_calls
+            .lock()
+            .unwrap()
+            .push(format!("abandon({ctx})"));
+    }
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         Some(&self.response)

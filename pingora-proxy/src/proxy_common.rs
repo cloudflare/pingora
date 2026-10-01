@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use http::header::{self, HeaderName};
+use log::debug;
+use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
+use pingora_cache::{CacheFillCancellationWatcher, HttpCache};
 use pingora_core::protocols::http::authority::{raw_target_authority, RawTargetAuthority};
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpUpstreamRequestPolicy};
@@ -22,6 +25,7 @@ use pingora_error::{
     OrErr, Result,
 };
 use pingora_http::RequestHeader;
+use tokio::sync::mpsc;
 
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
 pub(crate) const KEEP_ALIVE: &str = "keep-alive";
@@ -428,6 +432,135 @@ pub(crate) fn downstream_read_error_means_client_left(error: &Error) -> bool {
         error.etype(),
         ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::H2Error
     )
+}
+
+/// The application cancelled a cache fill whose downstream was already abandoned.
+///
+/// Not retryable: a retry would restart the fill nobody is waiting for.
+pub(crate) fn cache_fill_cancelled() -> Box<Error> {
+    let mut error = Error::explain(
+        ERR_CACHE_FILL_CANCELLED,
+        "cache fill cancelled after downstream abandonment",
+    )
+    .into_down();
+    error.set_retry(false);
+    error
+}
+
+/// Watches for the application's cancellation of an abandoned cache fill.
+///
+/// The watcher belongs to the miss writer, so watching starts once the downstream is
+/// abandoned and a writer exists. A writer that offers no watcher ends the watch for the
+/// rest of the upstream attempt.
+///
+/// The cancellation is honored while the transport loop waits for the next upstream task, see
+/// [`recv_upstream`](Self::recv_upstream). Tasks the upstream side had already handed over are
+/// processed first, so a complete response is committed even when the cancellation arrived just
+/// before its final task, and the number of those tasks is bounded, so an upstream that always
+/// has data ready cannot keep an abandoned fill alive.
+#[derive(Debug)]
+pub(crate) enum CacheFillCancellationState {
+    /// No writer has been asked for a watcher yet.
+    Unwatched,
+    /// The writer offered no watcher; the fill runs until the upstream completes.
+    Unsupported,
+    Watching(CacheFillCancellationWatcher),
+    /// The cancellation was observed. `remaining` bounds how many more tasks
+    /// [`recv_upstream`](Self::recv_upstream) itself hands back: fixed at the number the
+    /// upstream side had queued when the cancellation was observed, and delivery also stops as
+    /// soon as the queue is empty. The transport loop batches each handoff with whatever else
+    /// is already queued, so the data that follows a cancellation is bounded but not limited to
+    /// that snapshot.
+    Draining {
+        remaining: usize,
+    },
+    /// The watched writer's admission ended, committed or not, so a cancellation no longer
+    /// applies: an upstream that still sends tasks after a committed response (such as its
+    /// final `Done`) must not fail it.
+    Settled,
+}
+
+impl CacheFillCancellationState {
+    pub fn new() -> Self {
+        Self::Unwatched
+    }
+
+    /// Start watching the miss writer once the downstream is abandoned and a writer exists, and
+    /// stop once that writer's admission is no longer active.
+    ///
+    /// Called at the top of every transport loop iteration.
+    pub fn start_watching(&mut self, downstream_abandoned: bool, cache: &HttpCache) {
+        match self {
+            Self::Unwatched if downstream_abandoned && cache.is_cache_admission_active() => {
+                *self = match cache.miss_cancellation_watcher() {
+                    Some(watcher) => Self::Watching(watcher),
+                    None => Self::Unsupported,
+                };
+            }
+            Self::Watching(_) | Self::Draining { .. } if !cache.is_cache_admission_active() => {
+                *self = Self::Settled;
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_watching(&self) -> bool {
+        matches!(self, Self::Watching(_))
+    }
+
+    /// Receive the next upstream task, or fail with [`cache_fill_cancelled`] once the
+    /// application cancelled the fill and every task it had already handed over is processed.
+    ///
+    /// Tasks queued when the cancellation is first observed are delivered first, so the final
+    /// task of a complete response is never discarded, and the count handed back this way is
+    /// bounded at that moment's queue length. The upstream producer and the transport loop are
+    /// sibling futures of one `tokio::try_join!`, so nothing can refill the queue while a batch
+    /// is being drained, and every handoff here decrements the budget, so an upstream that
+    /// always has data ready cannot defer the cancellation indefinitely.
+    /// `None` means the upstream side closed the channel, exactly like
+    /// [`mpsc::Receiver::recv`].
+    ///
+    /// Cancel-safe: neither a task nor a cancellation is lost when the returned future is
+    /// dropped before it resolves.
+    pub async fn recv_upstream(
+        &mut self,
+        rx: &mut mpsc::Receiver<HttpTask>,
+    ) -> Result<Option<HttpTask>> {
+        if let Self::Watching(watcher) = self {
+            if watcher.is_cancelled() {
+                // Requested while the loop was busy: hand over what the upstream side already
+                // queued, then fail. Counting the queue once is what bounds the wait.
+                *self = Self::Draining {
+                    remaining: rx.len(),
+                };
+            }
+        }
+        match self {
+            Self::Unwatched | Self::Unsupported | Self::Settled => Ok(rx.recv().await),
+            Self::Watching(watcher) => {
+                tokio::select! {
+                    biased;
+                    task = rx.recv() => return Ok(task),
+                    _ = watcher.cancelled() => {}
+                }
+                // The cancellation won the wait, so the upstream side had queued nothing.
+                *self = Self::Draining { remaining: 0 };
+                debug!("cache fill cancelled after downstream abandonment");
+                Err(cache_fill_cancelled())
+            }
+            Self::Draining { remaining } => {
+                if *remaining > 0 {
+                    if let Ok(task) = rx.try_recv() {
+                        *remaining -= 1;
+                        return Ok(Some(task));
+                    }
+                }
+                debug!("cache fill cancelled after downstream abandonment");
+                Err(cache_fill_cancelled())
+            }
+        }
+    }
 }
 
 /// Possible downstream states during request multiplexing
@@ -964,5 +1097,203 @@ mod tests {
         ds.reset(); // must not overwrite Errored
         assert!(ds.is_errored());
         assert!(!ds.can_poll());
+    }
+
+    mod fill_cancellation {
+        use super::*;
+        use crate::test_support::CANCELLATION_WATCHED_STORAGE;
+        use pingora_cache::{CacheKey, CacheMeta, HttpCache, MemCache, Storage};
+        use pingora_error::{ErrorSource, RetryType};
+        use pingora_http::ResponseHeader;
+        use std::sync::LazyLock;
+        use std::time::{Duration, SystemTime};
+
+        static PLAIN_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+
+        async fn miss_with_writer(key: &str, storage: &'static (dyn Storage + Sync)) -> HttpCache {
+            let mut cache = HttpCache::new();
+            cache.enable(storage, None, None, None, None);
+            cache.set_cache_key(CacheKey::new(key, ""));
+            cache.cache_miss();
+            let now = SystemTime::now();
+            cache.set_cache_meta(CacheMeta::new(
+                now + Duration::from_secs(60),
+                now,
+                0,
+                0,
+                ResponseHeader::build(200, None).unwrap(),
+            ));
+            cache.set_miss_handler().await.unwrap();
+            assert!(cache.is_cache_admission_active());
+            cache
+        }
+
+        /// `recv_upstream` on `rx`, or `None` when it is still pending after a short wait.
+        async fn recv_quickly(
+            watch: &mut CacheFillCancellationState,
+            rx: &mut mpsc::Receiver<HttpTask>,
+        ) -> Option<Result<Option<HttpTask>>> {
+            tokio::time::timeout(Duration::from_millis(20), watch.recv_upstream(rx))
+                .await
+                .ok()
+        }
+
+        fn assert_cancelled(result: Option<Result<Option<HttpTask>>>) {
+            let error = result
+                .expect("recv_upstream still pending")
+                .expect_err("recv_upstream did not fail");
+            assert_eq!(error.etype(), &ERR_CACHE_FILL_CANCELLED);
+            assert_eq!(error.esource(), &ErrorSource::Downstream);
+            assert_eq!(error.retry, RetryType::Decided(false));
+        }
+
+        #[tokio::test]
+        async fn cancellation_is_ignored_until_the_downstream_is_abandoned() {
+            let key = "/cancellation-before-abandonment";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+            let (_tx, mut rx) = mpsc::channel(1);
+
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(false, &cache);
+            assert!(!watch.is_watching());
+            assert!(recv_quickly(&mut watch, &mut rx).await.is_none());
+
+            watch.start_watching(true, &cache);
+            assert!(watch.is_watching());
+            assert_cancelled(recv_quickly(&mut watch, &mut rx).await);
+        }
+
+        #[tokio::test]
+        async fn watching_starts_with_the_writer_and_wakes_on_cancel() {
+            let key = "/cancellation-after-writer";
+            let mut cache = HttpCache::new();
+            cache.enable(&*CANCELLATION_WATCHED_STORAGE, None, None, None, None);
+            cache.set_cache_key(CacheKey::new(key, ""));
+            cache.cache_miss();
+            let (_tx, mut rx) = mpsc::channel(1);
+
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(true, &cache);
+            assert!(
+                !watch.is_watching(),
+                "nothing to watch before a writer exists"
+            );
+
+            cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            watch.start_watching(true, &cache);
+            assert!(watch.is_watching());
+            assert!(recv_quickly(&mut watch, &mut rx).await.is_none());
+
+            let pending = tokio::spawn(async move {
+                let result = watch.recv_upstream(&mut rx).await;
+                (watch, rx, result)
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+            let (mut watch, mut rx, result) = tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .expect("cancel did not wake the pending receive")
+                .unwrap();
+            assert_cancelled(Some(result));
+            assert_cancelled(recv_quickly(&mut watch, &mut rx).await);
+        }
+
+        #[tokio::test]
+        async fn queued_tasks_win_over_a_pending_cancellation() {
+            let key = "/cancellation-with-queued-tasks";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(true, &cache);
+            assert!(watch.is_watching());
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+
+            let (tx, mut rx) = mpsc::channel(2);
+            tx.try_send(HttpTask::Body(None, false)).unwrap();
+            tx.try_send(HttpTask::Done).unwrap();
+            assert!(matches!(
+                recv_quickly(&mut watch, &mut rx).await,
+                Some(Ok(Some(HttpTask::Body(None, false))))
+            ));
+            assert!(matches!(
+                recv_quickly(&mut watch, &mut rx).await,
+                Some(Ok(Some(HttpTask::Done)))
+            ));
+            assert_cancelled(recv_quickly(&mut watch, &mut rx).await);
+
+            // Once the queued tasks are gone the fill stays cancelled: reporting the closed
+            // channel as a clean end would let the loop commit a response the upstream never
+            // finished sending.
+            drop(tx);
+            assert_cancelled(recv_quickly(&mut watch, &mut rx).await);
+        }
+
+        #[tokio::test]
+        async fn a_closed_upstream_channel_is_not_a_cancellation() {
+            let key = "/cancellation-with-a-closed-upstream";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(true, &cache);
+            assert!(watch.is_watching());
+
+            let (tx, mut rx) = mpsc::channel(2);
+            drop(tx);
+            assert!(
+                matches!(recv_quickly(&mut watch, &mut rx).await, Some(Ok(None))),
+                "a closed upstream channel ends the upstream, it is not a cancellation"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_steadily_streaming_upstream_cannot_outrun_a_cancellation() {
+            let key = "/cancellation-with-a-sustained-backlog";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(true, &cache);
+            assert!(watch.is_watching());
+
+            // An upstream that always has data ready, exactly like an origin streaming a large
+            // asset faster than the cache write path retires it. The queue is refilled
+            // synchronously so the backlog is a precondition of the test rather than something
+            // the scheduler has to provide: a spawned producer may not run before the first
+            // receive, which would let the cancellation win against an empty queue.
+            let (tx, mut rx) = mpsc::channel(4);
+            for _ in 0..64 {
+                while tx.try_send(HttpTask::Body(None, false)).is_ok() {}
+                assert!(!rx.is_empty(), "the backlog must be ready at every receive");
+                if let Some(Ok(Some(_))) = recv_quickly(&mut watch, &mut rx).await {
+                    continue;
+                }
+                panic!("a queued task lost to a cancellation that was not yet requested");
+            }
+
+            // The cancellation must be honored while the backlog is still being handed over,
+            // otherwise an abandoned fill of a large asset runs to completion despite `cancel`.
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+            for _ in 0..64 {
+                while tx.try_send(HttpTask::Body(None, false)).is_ok() {}
+                assert!(!rx.is_empty(), "the backlog must be ready at every receive");
+                match recv_quickly(&mut watch, &mut rx).await {
+                    Some(Ok(Some(_))) => continue,
+                    result => {
+                        assert_cancelled(result);
+                        return;
+                    }
+                }
+            }
+            panic!("a steadily streaming upstream starved the cancellation");
+        }
+
+        #[tokio::test]
+        async fn writers_without_a_watcher_are_never_cancelled() {
+            let cache = miss_with_writer("/no-watcher", &*PLAIN_STORAGE).await;
+            let (_tx, mut rx) = mpsc::channel(1);
+            let mut watch = CacheFillCancellationState::new();
+            watch.start_watching(true, &cache);
+            assert!(!watch.is_watching());
+            assert!(recv_quickly(&mut watch, &mut rx).await.is_none());
+            watch.start_watching(true, &cache);
+            assert!(matches!(watch, CacheFillCancellationState::Unsupported));
+        }
     }
 }
