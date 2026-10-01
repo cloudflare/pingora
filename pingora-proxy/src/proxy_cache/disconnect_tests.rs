@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::test_support::run_ready_tasks;
+use crate::test_support::{next_session, run_ready_tasks};
 use bytes::BytesMut;
 use pingora_cache::{storage::HandleHit, CacheKey, CacheMeta, HitStatus, MemCache};
 use pingora_error::ErrorSource;
@@ -49,25 +49,6 @@ async fn read_cached_response(client: &mut (impl AsyncRead + Unpin)) -> Vec<u8> 
         response.extend_from_slice(&buf[..read]);
     }
     response
-}
-
-/// Finish `session` as the proxy does, then read the next request from the reused connection.
-///
-/// Also returns the bytes `session` read that the next request starts with.
-async fn next_session(session: Session) -> (HttpSession, Option<BytesMut>) {
-    let reusable = session
-        .downstream_session
-        .finish()
-        .await
-        .unwrap()
-        .expect("the connection must be reusable");
-    let (stream, prefix) = reusable.into_parts();
-    let mut next = HttpSession::new_http1(stream);
-    if let Some(prefix) = &prefix {
-        next.set_pipelined_prefix(prefix.clone());
-    }
-    next.read_request().await.unwrap();
-    (next, prefix)
 }
 
 struct StalledHit {

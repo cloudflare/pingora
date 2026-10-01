@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use pingora_cache::storage::{HandleMiss, MissFinishType};
 use pingora_cache::trace::SpanHandle;
 use pingora_cache::{
@@ -22,6 +22,7 @@ use pingora_cache::{
     Storage,
 };
 use pingora_core::protocols::http::custom::CustomMessageWrite;
+use pingora_core::protocols::http::ServerSession;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, Result};
 use pingora_http::ResponseHeader;
@@ -426,6 +427,25 @@ pub(crate) async fn run_ready_tasks() {
     }
 }
 
+/// Finish `session` as the proxy does, then read the next request from the reused connection.
+///
+/// Also returns the bytes `session` read that the next request starts with.
+pub(crate) async fn next_session(session: Session) -> (ServerSession, Option<BytesMut>) {
+    let reusable = session
+        .downstream_session
+        .finish()
+        .await
+        .unwrap()
+        .expect("the connection must be reusable");
+    let (stream, prefix) = reusable.into_parts();
+    let mut next = ServerSession::new_http1(stream);
+    if let Some(prefix) = &prefix {
+        next.set_pipelined_prefix(prefix.clone());
+    }
+    next.read_request().await.unwrap();
+    (next, prefix)
+}
+
 pub(crate) struct HeldCustomSenderProxy {
     sender: Mutex<Option<oneshot::Sender<mpsc::Sender<Bytes>>>>,
     observed: Arc<HeldCustomSenderObservations>,
@@ -519,6 +539,8 @@ impl ProxyHttp for HeldCustomSenderProxy {
 #[derive(Default)]
 pub(crate) struct AbandonmentSignalProxy {
     pub(crate) abandoned: Arc<tokio::sync::Notify>,
+    pub(crate) body_delay: Option<Duration>,
+    pub(crate) body_delayed: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -549,6 +571,22 @@ impl ProxyHttp for AbandonmentSignalProxy {
             0,
             response.clone(),
         )))
+    }
+
+    async fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut (),
+    ) -> Result<Option<Duration>> {
+        if body.as_ref().is_some_and(|body| !body.is_empty()) {
+            if let Some(delay) = self.body_delay {
+                self.body_delayed.notify_one();
+                return Ok(Some(delay));
+            }
+        }
+        Ok(None)
     }
 
     fn downstream_abandoned_during_cache_fill(&self, _session: &Session, _ctx: &mut ()) {
