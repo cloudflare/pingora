@@ -160,7 +160,7 @@ where
     /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete)),
     /// an HTTP/1 client that sends its next request before this response is complete, or a
     /// client whose request body read times out or is malformed, is handled exactly as without
-    /// this opt-in. A watched cache hit, below, is the exception.
+    /// this opt-in. A watched cache hit or subrequest pipe, below, is the exception.
     ///
     /// A cache hit also watches its client while it waits for its cached body, until its
     /// response is complete: an HTTP/2 client from the start, since waiting on its stream reads
@@ -177,6 +177,17 @@ where
     /// until the hit ends or a response write fails, as in the proxy loops. A stale-if-error hit
     /// keeps that path's logging: its caller offers every final error to
     /// [`Self::suppress_error_log`], as without this opt-in.
+    ///
+    /// A subrequest pipe ([`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest)) also
+    /// watches its client while it waits for the subrequest's response, and fails as soon as the
+    /// client leaves: an HTTP/2 client from the start, any other client once its request body is
+    /// complete, so unlike a hit, a pipe can start watching partway through. `abort_on_close`
+    /// and the pipelining policy apply as for a hit, including that a client that closes after
+    /// the pipe kept its next request's first byte goes unnoticed. Without this opt-in, the pipe
+    /// reads the client only to forward a body the subrequest asked for, so an early next
+    /// request can be left unread. That function documents the details. Returning `true` for a
+    /// subrequest makes it treat the request that created it as gone only once that request
+    /// stops receiving the subrequest's response, not as soon as it stops sending request input.
     ///
     /// The rest applies only once a client leaves before its response is completely delivered,
     /// while a cache fill can still produce an entry (a miss with an active cache writer, or
@@ -206,7 +217,9 @@ where
     /// rather than [`NoCacheReason::StorageError`](pingora_cache::NoCacheReason::StorageError).
     ///
     /// Any other downstream failure is handled as it would be without this opt-in. When it
-    /// returns `false`, the default, the proxy behaves as it did before this handling existed.
+    /// returns `false`, the default, the proxy behaves as it did before this handling existed,
+    /// except that a [`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest) that fails on
+    /// a client read turns keep-alive off with or without this opt-in.
     fn should_handle_downstream_abandonment(
         &self,
         _session: &Session<DS>,

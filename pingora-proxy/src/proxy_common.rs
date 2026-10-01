@@ -25,9 +25,34 @@ use pingora_error::{
     OrErr, Result,
 };
 use pingora_http::RequestHeader;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
+
+/// Pace an upstream task, waking when an abandoned fill's writer cancels it.
+///
+/// Cancellation only interrupts the delay. The caller still processes the accepted task;
+/// [`CacheFillCancellationState::recv_upstream`] then drains bounded queued work, allowing a complete
+/// response already handed over to finish normally.
+pub(crate) async fn wait_for_upstream_delay(
+    cache: &HttpCache,
+    downstream_abandoned: bool,
+    duration: Duration,
+) {
+    if downstream_abandoned {
+        if let Some(mut watcher) = cache.miss_cancellation_watcher() {
+            tokio::select! {
+                biased;
+                _ = watcher.cancelled() => {}
+                _ = tokio::time::sleep(duration) => {}
+            }
+            return;
+        }
+    }
+    tokio::time::sleep(duration).await;
+}
+
 pub(crate) const KEEP_ALIVE: &str = "keep-alive";
 pub(crate) const PROXY_CONNECTION: &str = "proxy-connection";
 pub(crate) const HTTP2_SETTINGS: &str = "http2-settings";
@@ -1126,6 +1151,53 @@ mod tests {
             cache.set_miss_handler().await.unwrap();
             assert!(cache.is_cache_admission_active());
             cache
+        }
+
+        #[tokio::test]
+        async fn detached_pacing_observes_an_already_requested_cancellation() {
+            let key = "/pacing-cancelled-before-wait";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                wait_for_upstream_delay(&cache, true, Duration::from_secs(65)),
+            )
+            .await
+            .expect("an already cancelled fill waited for its pacing budget");
+        }
+
+        #[tokio::test]
+        async fn attached_pacing_keeps_its_delay_despite_writer_cancellation() {
+            let key = "/pacing-attached-cancelled-writer";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            assert!(CANCELLATION_WATCHED_STORAGE.cancellation_for(key).cancel());
+            let duration = Duration::from_millis(30);
+            let start = tokio::time::Instant::now();
+            wait_for_upstream_delay(&cache, false, duration).await;
+            assert!(start.elapsed() >= duration);
+        }
+
+        #[tokio::test]
+        async fn detached_pacing_keeps_its_delay_without_a_cancellation() {
+            let key = "/pacing-detached-live-writer";
+            let cache = miss_with_writer(key, &*CANCELLATION_WATCHED_STORAGE).await;
+            assert!(!CANCELLATION_WATCHED_STORAGE
+                .cancellation_for(key)
+                .is_cancelled());
+            let duration = Duration::from_millis(30);
+            let start = tokio::time::Instant::now();
+            wait_for_upstream_delay(&cache, true, duration).await;
+            assert!(start.elapsed() >= duration);
+        }
+
+        #[tokio::test]
+        async fn detached_pacing_keeps_its_delay_without_a_storage_watcher() {
+            let cache = miss_with_writer("/pacing-detached-plain-storage", &*PLAIN_STORAGE).await;
+            assert!(cache.miss_cancellation_watcher().is_none());
+            let duration = Duration::from_millis(30);
+            let start = tokio::time::Instant::now();
+            wait_for_upstream_delay(&cache, true, duration).await;
+            assert!(start.elapsed() >= duration);
         }
 
         /// `recv_upstream` on `rx`, or `None` when it is still pending after a short wait.

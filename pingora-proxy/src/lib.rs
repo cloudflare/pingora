@@ -772,8 +772,21 @@ where
     /// The proxy applies [`ProxyHttp::should_handle_downstream_abandonment`]'s answer through this
     /// method once per request. It is not public, since changing the answer later in the request
     /// would change how an abandonment already recorded is handled.
+    ///
+    /// For a subrequest session it also sets the subrequest's idle wait: with `handles` set, the
+    /// wait ends once the response is no longer received instead of once request input closes.
+    /// A parent that closes request input may still want the response:
+    /// [`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest) drops its request sender
+    /// whenever it returns, including on an error, while the state it returns keeps the response
+    /// receiver ([`pipe_rx`](crate::subrequest::pipe::PipeSubrequestState::pipe_rx)) for the
+    /// caller to drain. Only dropping that receiver abandons the subrequest. This changes only
+    /// the idle wait, which a subrequest enters once its request body is complete.
     pub(crate) fn set_handles_downstream_abandonment(&mut self, handles: bool) {
         self.handles_downstream_abandonment = handles;
+        // pingora-core implements a subrequest's idle wait and cannot read this flag.
+        if let Some(subrequest) = self.downstream_session.as_subrequest_mut() {
+            subrequest.set_idle_watches_response_receiver(handles);
+        }
     }
 
     /// Whether Pingora kept processing a potential cache fill of this request after its

@@ -972,7 +972,12 @@ where
         if !from_cache {
             if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
-                time::sleep(duration).await;
+                wait_for_upstream_delay(
+                    &session.cache,
+                    session.downstream_abandoned_during_cache_fill(),
+                    duration,
+                )
+                .await;
             }
 
             // cache the original response before any downstream transformation
@@ -1843,6 +1848,7 @@ mod tests {
         assert_cancellation_ends_admitted_fill(
             "/h2-cancel-after-abandonment",
             AbandonmentTiming::AfterAdmission,
+            false,
         )
         .await;
     }
@@ -1854,11 +1860,26 @@ mod tests {
         assert_cancellation_ends_admitted_fill(
             "/h2-cancel-before-attempt",
             AbandonmentTiming::BeforeAttempt,
+            false,
         )
         .await;
     }
 
-    async fn assert_cancellation_ends_admitted_fill(path: &str, abandonment: AbandonmentTiming) {
+    #[tokio::test]
+    async fn detached_fill_cancellation_interrupts_body_pacing() {
+        assert_cancellation_ends_admitted_fill(
+            "/h2-cancel-during-detached-pacing",
+            AbandonmentTiming::AfterAdmission,
+            true,
+        )
+        .await;
+    }
+
+    async fn assert_cancellation_ends_admitted_fill(
+        path: &str,
+        abandonment: AbandonmentTiming,
+        pace_body: bool,
+    ) {
         let (mut session, mut client) =
             cache_miss_session_on(path, &abandonment, true, &*CANCELLATION_WATCHED_STORAGE).await;
         let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
@@ -1867,8 +1888,12 @@ mod tests {
         if cancel_before_attempt {
             assert!(cancellation.cancel());
         }
-        let inner = AbandonmentSignalProxy::default();
+        let inner = AbandonmentSignalProxy {
+            body_delay: pace_body.then_some(Duration::from_secs(65)),
+            ..Default::default()
+        };
         let abandoned = Arc::clone(&inner.abandoned);
+        let body_delayed = Arc::clone(&inner.body_delayed);
         let proxy = HttpProxy::new(inner, Arc::new(ServerConf::default()));
         let mut custom_writer = None;
         let mut custom_reader = None;
@@ -1907,6 +1932,13 @@ mod tests {
                 }
                 drop(client);
                 abandoned.notified().await;
+                if pace_body {
+                    response_tx
+                        .send(HttpTask::Body(Some(Bytes::from_static(b"paced")), false))
+                        .await
+                        .unwrap();
+                    body_delayed.notified().await;
+                }
                 assert!(cancellation.cancel());
             }
             // Keep the upstream pipe open: only the cancellation may end the loop.
@@ -1934,7 +1966,7 @@ mod tests {
     // This exercises the same `start_watching`/`recv_upstream` wiring as the parked-cancellation
     // tests above, but with the whole response already queued before the loop's first poll.
     #[tokio::test]
-    async fn batched_complete_response_commits_despite_a_pending_cancellation() {
+    async fn batched_complete_response_with_pacing_commits_despite_a_pending_cancellation() {
         let path = "/h2-cancel-before-batched-response";
         let (mut session, _client) = cache_miss_session_on(
             path,
@@ -1950,7 +1982,10 @@ mod tests {
         let cancellation = CANCELLATION_WATCHED_STORAGE.cancellation_for(path);
         assert!(cancellation.cancel(), "{path} was not fresh");
         let proxy = HttpProxy::new(
-            AbandonmentSignalProxy::default(),
+            AbandonmentSignalProxy {
+                body_delay: Some(Duration::from_secs(65)),
+                ..Default::default()
+            },
             Arc::new(ServerConf::default()),
         );
         let mut custom_writer = None;
