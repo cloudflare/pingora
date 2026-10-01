@@ -242,7 +242,7 @@ where
             .or_err(InternalError, "try_reserve() body pipe for subrequest");
 
         tokio::select! {
-            task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_done() => {
+            task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_delivery_done() => {
                 debug!("upstream event: {:?}", task);
                 if let Some(t) = task {
                     // Did the subrequest get headers?
@@ -276,13 +276,13 @@ where
 
                     // NOTE: technically it is the downstream whose response state has finished here
                     // we consider the subrequest's work done however
-                    response_state.maybe_set_upstream_done(response_done);
+                    response_state.maybe_set_upstream_delivery_done(response_done);
                     // unsuccessful upgrade response may force the request done
                     // (can only happen with a real session, TODO to allow with preset body)
                     downstream_state.maybe_finished(!use_preset_body && session.is_body_done());
                 } else {
                     debug!("upstream channel closed early");
-                    response_state.maybe_set_upstream_done(true);
+                    response_state.maybe_set_upstream_delivery_done(true);
                 }
             },
 
@@ -327,7 +327,7 @@ where
                 // If the request is websocket, `None` body means the request is closed.
                 // Set the response to be done as well so that the request completes normally.
                 if body.is_none() && session.is_upgrade_req() {
-                    response_state.maybe_set_upstream_done(true);
+                    response_state.maybe_set_upstream_delivery_done(true);
                 }
 
                 let is_body_done = session.is_body_done();

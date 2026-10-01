@@ -823,6 +823,12 @@ impl HttpSession {
         self.response_written.as_deref()
     }
 
+    /// Whether the whole response is written: END_STREAM was sent with the final header, the
+    /// last body chunk, the trailers or [`Self::finish`].
+    pub fn is_response_complete(&self) -> bool {
+        self.ended
+    }
+
     /// Give up the stream abruptly.
     ///
     /// This will send an `INTERNAL_ERROR` stream error to the client.

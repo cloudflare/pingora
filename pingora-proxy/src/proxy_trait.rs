@@ -144,6 +144,50 @@ where
         false
     }
 
+    /// Opt this request in to Pingora's handling of a client that leaves while this request's
+    /// response is still being produced.
+    ///
+    /// The proxy calls this once per request, subrequests included, right after
+    /// [`Self::early_request_filter`] succeeds and before downstream modules and
+    /// [`Self::request_filter`] run, and keeps the answer for the rest of the request; see
+    /// [`Session::handles_downstream_abandonment`]. The decision can use what
+    /// `early_request_filter` put in the context. A subrequest does not inherit its parent's
+    /// answer.
+    ///
+    /// Returning `true` changes nothing while the client stays connected. A client that fails
+    /// after its response was completely written (see
+    /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete)),
+    /// an HTTP/1 client that sends its next request before this response is complete, or a
+    /// client whose request body read times out or is malformed, is handled exactly as without
+    /// this opt-in.
+    ///
+    /// The rest applies only once a client leaves before its response is completely delivered,
+    /// while a cache fill can still produce an entry (a miss with an active cache writer, or
+    /// streaming storage before the response's cache decision is made). The proxy then records
+    /// the abandonment and reports it once through
+    /// [`Self::downstream_abandoned_during_cache_fill`]. After that:
+    /// - the proxy stops writing to and waiting on that downstream and finishes the upstream
+    ///   response for the cache. The default [`Self::fail_to_proxy`] writes no error response to
+    ///   it and reports 0. Stale-if-error is the exception: if the upstream fails before any
+    ///   response was written and the stale entry can be served on error, that stale response is
+    ///   still written to the downstream, as without this opt-in;
+    /// - a response that will not be admitted to the cache fails the request, as does a failed
+    ///   write of its header or body to the cache, since the cache is its only output. A failed
+    ///   finish of the cache entry stays best-effort, as without this opt-in: the entry is not
+    ///   admitted, and that failure does not itself fail the request;
+    /// - a retry happens only if the request body was read to its end, caching is still
+    ///   enabled, and no cache writer is still active.
+    ///
+    /// Any other downstream failure is handled as it would be without this opt-in. When it
+    /// returns `false`, the default, the proxy behaves as it did before this handling existed.
+    fn should_handle_downstream_abandonment(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> bool {
+        false
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is
@@ -572,6 +616,29 @@ where
         false
     }
 
+    /// Called at most once when Pingora keeps processing a potential streaming cache fill after
+    /// the downstream becomes unusable, for a request that
+    /// [`Self::should_handle_downstream_abandonment`] opted in.
+    ///
+    /// It runs only while the fill can still produce an entry: during a miss with an active cache
+    /// writer, or with streaming storage before the response's cache decision is made, which can
+    /// be before response cacheability or miss-handler creation is known. Storage backends
+    /// without streaming partial writes propagate the downstream error and do not call this hook.
+    /// The hook runs inline on proxy I/O paths, so implementations should be cheap.
+    ///
+    /// It runs at most once per request, retries included, and [`Session::downstream_abandoned_during_cache_fill`]
+    /// stays `true` for the rest of the request. Applications can release their downstream demand
+    /// here, then call [`HttpCache::release_miss_writer_demand`] if a miss writer already exists.
+    /// Calling it before a writer exists does not affect writers created later, by the fill's
+    /// cache admission or by a retry, and this hook is not called again for them. An application
+    /// whose storage tracks writer demand therefore carries the abandonment to that storage
+    /// itself: for example, it keeps the abandonment in the request context, copies it into the
+    /// [`CacheMeta`](pingora_cache::CacheMeta) returned by [`Self::response_cache_filter`], and
+    /// has [`Storage::get_miss_handler`](pingora_cache::storage::Storage::get_miss_handler)
+    /// release the new writer's demand before returning it.
+    fn downstream_abandoned_during_cache_fill(&self, _session: &Session<DS>, _ctx: &mut Self::CTX) {
+    }
+
     /// A value of true means that the proxy warning log message will be suppressed.
     /// The default value is false.
     ///
@@ -647,6 +714,9 @@ where
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
     /// The response status code of the error response may be returned for logging purposes.
+    /// By default no error response is written and 0 is returned once
+    /// [`Session::downstream_abandoned_during_cache_fill`] is true, since the proxy no longer
+    /// writes to that downstream. Overrides that write responses should check it too.
     /// Additionally, the user can return whether this session may be reused in spite of the error.
     /// Today this reuse status is only respected for errors that occur prior to upstream peer
     /// selection, and the keepalive configured on the `Session` itself still takes precedent.
@@ -660,6 +730,8 @@ where
         Self::CTX: Send + Sync,
     {
         let code = match e.etype() {
+            // Nothing written to a downstream that a cache fill abandoned can reach it.
+            _ if session.downstream_abandoned_during_cache_fill() => 0,
             HTTPStatus(code) => *code,
             _ => {
                 match e.esource() {
@@ -774,6 +846,9 @@ where
 
 /// Context struct returned by `fail_to_proxy`.
 pub struct FailToProxy {
+    /// The response status that describes the failure, or 0 when none applies, such as for a
+    /// downstream connection that is already dead or one abandoned during a cache fill. The final
+    /// "Fail to proxy" error log reports it.
     pub error_code: u16,
     pub can_reuse_downstream: bool,
 }

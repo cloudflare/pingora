@@ -376,6 +376,8 @@ where
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
+            // The HTTP/1 producer stops reading at its first `is_end` task.
+            response_state.maybe_set_upstream_producer_done(initial_task.is_end());
             // Serving the cached response and discarding the upstream one; nothing
             // is written downstream this round, so return None and let the caller
             // continue.
@@ -394,6 +396,7 @@ where
                 break; // upstream closed
             }
         }
+        response_state.maybe_set_upstream_producer_done(tasks.iter().any(HttpTask::is_end));
 
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
@@ -421,15 +424,24 @@ where
             }
             // check error and abort
             // otherwise the error is surfaced via write_response_tasks()
-            if !serve_from_cache.should_send_to_downstream() {
+            if !serve_from_cache
+                .should_write_response(session.downstream_abandoned_during_cache_fill())
+            {
                 if let HttpTask::Failed(e) = task {
                     return Err(e);
+                }
+                if session.downstream_abandoned_during_cache_fill() {
+                    if serve_from_cache.abandoned_before_admission(&session.cache) {
+                        return Err(downstream_closed_before_cache_admission());
+                    }
+                    continue;
                 }
             }
             filtered_tasks.push(task);
         }
 
-        if !serve_from_cache.should_send_to_downstream() {
+        if !serve_from_cache.should_write_response(session.downstream_abandoned_during_cache_fill())
+        {
             // TODO: need to derive response_done from filtered_tasks in case downstream failed already
             return Ok(None);
         }
@@ -466,7 +478,9 @@ where
             mut downstream_custom_message_inject_rx,
         ) = if downstream_custom_message_writer.is_some() {
             let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx))
+            let inject_rx =
+                (!session.downstream_abandoned_during_cache_fill()).then_some(inject_rx);
+            (true, true, Some(inject_tx), inject_rx)
         } else {
             (false, false, None, None)
         };
@@ -479,7 +493,11 @@ where
                 .await?;
         }
 
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        let request_body_finished = session.as_mut().is_body_done();
+        let mut downstream_state = DownstreamStateMachine::for_proxy_attempt(
+            request_body_finished,
+            session.downstream_abandoned_during_cache_fill(),
+        );
 
         let buffer = session.as_ref().get_retry_buffer();
 
@@ -489,14 +507,8 @@ where
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            self.send_body_to_pipe(
-                session,
-                buffer,
-                downstream_state.is_done(),
-                send_permit,
-                ctx,
-            )
-            .await?;
+            self.send_body_to_pipe(session, buffer, request_body_finished, send_permit, ctx)
+                .await?;
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -526,10 +538,13 @@ where
          * Usually there is no request body to read for cacheable request
          */
         while !downstream_state.is_done()
-            || !response_state.is_done()
+            || !session.response_work_done(&response_state)
             || downstream_custom_read && !downstream_state.is_errored()
-            || downstream_custom_write
+            || downstream_custom_write && !session.downstream_abandoned_during_cache_fill()
         {
+            if session.downstream_abandoned_during_cache_fill() {
+                downstream_custom_message_inject_rx = None;
+            }
             // reserve tx capacity ahead to avoid deadlock, see below
 
             let send_permit = tx
@@ -566,7 +581,19 @@ where
                                 || serve_from_cache.is_miss();
                             if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
-                                downstream_state.to_errored();
+                                if downstream_read_error_means_client_left(&e) {
+                                    self.abandon_downstream_for_cache_fill(
+                                        &serve_from_cache,
+                                        &mut downstream_state,
+                                        &mut response_state,
+                                        session,
+                                        ctx,
+                                    );
+                                } else {
+                                    // Any other read error, such as a timeout or a malformed
+                                    // body, leaves the client connected.
+                                    downstream_state.to_errored();
+                                }
                                 if !self.inner.suppress_proxy_warn_log(
                                     session,
                                     ctx,
@@ -591,7 +618,7 @@ where
                     // If the request is websocket, `None` body means the request is closed.
                     // Set the response to be done as well so that the request completes normally.
                     if body.is_none() && session.was_upgraded() {
-                        response_state.maybe_set_upstream_done(true);
+                        response_state.maybe_set_upstream_delivery_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
@@ -633,16 +660,16 @@ where
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
-                        response_state.maybe_set_upstream_done(response_done);
+                        response_state.maybe_set_upstream_delivery_done(response_done);
                         // unsuccessful upgrade response may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
                     } else {
                         debug!("empty upstream event");
-                        response_state.maybe_set_upstream_done(true);
+                        response_state.maybe_set_upstream_delivery_done(true);
                     }
                 },
 
-                task = rx.recv(), if !response_state.upstream_done() && next_upstream_task.is_none() => {
+                task = rx.recv(), if session.should_poll_upstream_tasks(&response_state) && next_upstream_task.is_none() => {
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
                         let upgraded = session.was_upgraded();
@@ -665,13 +692,19 @@ where
                             trace!("reset downstream state on upgrade");
                             downstream_state.reset();
                         }
-                        response_state.maybe_set_upstream_done(response_done);
+                        response_state.maybe_set_upstream_delivery_done(response_done);
                         // unsuccessful upgrade response (or end of upstream upgraded conn,
                         // which forces the body reader to complete) may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
                     } else {
                         debug!("empty upstream event");
-                        response_state.maybe_set_upstream_done(true);
+                        if session.downstream_abandoned_during_cache_fill() {
+                            return Error::e_explain(
+                                InternalError,
+                                "upstream response task pipe closed before completion",
+                            );
+                        }
+                        response_state.maybe_set_upstream_delivery_done(true);
                     }
                 },
 
@@ -693,8 +726,14 @@ where
                             Ok(b) => response_state.maybe_set_cache_done(b),
                             Err(e) => if serve_from_cache.is_miss() {
                                 // give up writing to downstream but wait for upstream cache write to finish
-                                downstream_state.to_errored();
                                 response_state.maybe_set_cache_done(true);
+                                self.abandon_downstream_for_cache_fill(
+                                    &serve_from_cache,
+                                    &mut downstream_state,
+                                    &mut response_state,
+                                    session,
+                                    ctx,
+                                );
                                 if !self.inner.suppress_proxy_warn_log(
                                     session,
                                     ctx,
@@ -755,8 +794,14 @@ where
                                 }
                                 Err(e) => if serve_from_cache.is_miss() {
                                     // give up writing to downstream but wait for upstream cache write to finish
-                                    downstream_state.to_errored();
                                     response_state.maybe_set_cache_done(true);
+                                    self.abandon_downstream_for_cache_fill(
+                                        &serve_from_cache,
+                                        &mut downstream_state,
+                                        &mut response_state,
+                                        session,
+                                        ctx,
+                                    );
                                     if !self.inner.suppress_proxy_warn_log(
                                         session,
                                         ctx,
@@ -780,13 +825,13 @@ where
 
                         // Also poll for upstream tasks - if we get one, cancel the write and handle it.
                         // Only poll if there is no buffered task already waiting to be processed.
-                        upstream_task = rx.recv(), if !response_state.upstream_done() && serve_from_cache.is_on() && next_upstream_task.is_none() => {
+                        upstream_task = rx.recv(), if !response_state.upstream_delivery_done() && serve_from_cache.is_on() && next_upstream_task.is_none() => {
                             if let Some(t) = upstream_task {
                                 // Store this upstream task to be processed next iteration
                                 next_upstream_task = Some(t);
                                 continue;
                             } else {
-                                response_state.maybe_set_upstream_done(true);
+                                response_state.maybe_set_upstream_delivery_done(true);
                             }
                         }
                     }
@@ -812,7 +857,8 @@ where
                         .await?;
                 },
 
-                data = custom_inject_rx_recv, if downstream_custom_write => {
+                data = custom_inject_rx_recv,
+                    if downstream_custom_write && !session.downstream_abandoned_during_cache_fill() => {
                     match data.flatten() {
                         Some(data) => {
                             if let Some(ref mut custom_writer) = downstream_custom_message_writer {
@@ -885,7 +931,9 @@ where
                     .await
                 {
                     session.cache.disable(NoCacheReason::StorageError);
-                    if serve_from_cache.is_miss_body() {
+                    if serve_from_cache.cache_write_failure_is_fatal(
+                        session.downstream_abandoned_during_cache_fill(),
+                    ) {
                         // if the response stream cache body during miss but write fails, it has to
                         // give up the entire request
                         return Err(e);
@@ -900,7 +948,9 @@ where
                 }
             }
 
-            if !serve_from_cache.should_send_to_downstream() {
+            if !serve_from_cache
+                .should_write_response(session.downstream_abandoned_during_cache_fill())
+            {
                 return Ok(task);
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
@@ -1163,6 +1213,11 @@ pub(crate) async fn send_body_to1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        cache_miss_session, drive_custom_sender_while_client_leaves, AbandonmentTiming,
+        CustomSenderOutcome, CustomWriteCalls, HeldCustomSenderProxy, RecordingCustomWriter,
+        WRITER_DEMAND_CACHE,
+    };
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
@@ -1270,5 +1325,106 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    #[tokio::test]
+    async fn abandoned_downstream_does_not_wait_for_or_write_custom_messages() {
+        let outcome = run_custom_sender_while_client_leaves(
+            "/h1-held-custom-message",
+            AbandonmentTiming::BeforeAttempt,
+            true,
+        )
+        .await;
+        assert!(!outcome.result.unwrap());
+        assert!(!outcome.late_message_accepted);
+        assert_eq!(outcome.custom_writes, 0);
+        assert_eq!(outcome.custom_finishes, 0);
+    }
+
+    #[tokio::test]
+    async fn abandonment_closes_custom_sender_during_cache_fill() {
+        let outcome = run_custom_sender_while_client_leaves(
+            "/h1-custom-message-after-admission",
+            AbandonmentTiming::AfterAdmission,
+            true,
+        )
+        .await;
+        assert!(!outcome.result.unwrap());
+        assert!(!outcome.late_message_accepted);
+        assert_eq!(outcome.custom_writes, 0);
+        assert_eq!(outcome.custom_finishes, 0);
+        assert_eq!(outcome.abandonments, 1);
+        assert_eq!(outcome.released_writers, 1);
+    }
+
+    // The control: without the handling custom messages keep flowing and no demand is released.
+    #[tokio::test]
+    async fn abandonment_closes_custom_sender_during_cache_fill_without_abandonment_handling() {
+        let outcome = run_custom_sender_while_client_leaves(
+            "/h1-custom-message-after-admission-ungated",
+            AbandonmentTiming::AfterAdmission,
+            false,
+        )
+        .await;
+        assert!(!outcome.result.unwrap());
+        assert!(outcome.late_message_accepted);
+        assert_eq!(outcome.custom_writes, 1);
+        assert_eq!(outcome.custom_finishes, 1);
+        assert_eq!(outcome.abandonments, 0);
+        assert_eq!(outcome.released_writers, 0);
+    }
+
+    async fn run_custom_sender_while_client_leaves(
+        path: &str,
+        abandonment: AbandonmentTiming,
+        handles_abandonment: bool,
+    ) -> CustomSenderOutcome {
+        let (mut session, client) =
+            cache_miss_session(path, &abandonment, handles_abandonment).await;
+        let (inner, custom_sender, observed) = HeldCustomSenderProxy::new();
+        let proxy = HttpProxy::new(inner, Arc::new(ServerConf::default()));
+        let calls = Arc::new(CustomWriteCalls::default());
+        let mut custom_writer =
+            Some(Box::new(RecordingCustomWriter::new(Arc::clone(&calls)))
+                as Box<dyn CustomMessageWrite>);
+        let mut custom_reader = None;
+        let (request_tx, _request_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut ctx = ();
+
+        let proxy_loop = proxy.proxy_handle_downstream(
+            &mut session,
+            request_tx,
+            response_rx,
+            &mut ctx,
+            &mut custom_writer,
+            &mut custom_reader,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        let drive = drive_custom_sender_while_client_leaves(
+            custom_sender,
+            client,
+            response_tx,
+            abandonment,
+            false,
+            handles_abandonment,
+            &observed,
+        );
+
+        let (result, (late_message_accepted, _held_sender)) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(proxy_loop, drive)
+            })
+            .await
+            .expect("H1 transport loop stayed open for the application's custom-message sender");
+
+        CustomSenderOutcome {
+            result,
+            late_message_accepted,
+            custom_writes: calls.writes(),
+            custom_finishes: calls.finishes(),
+            abandonments: observed.abandonments(),
+            released_writers: WRITER_DEMAND_CACHE.released_writers(path),
+        }
     }
 }

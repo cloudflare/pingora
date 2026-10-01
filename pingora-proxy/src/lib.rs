@@ -95,6 +95,8 @@ mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
 pub mod subrequest;
+#[cfg(test)]
+mod test_support;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
@@ -324,6 +326,41 @@ where
             }
         })
         .await;
+    }
+
+    /// Ignore a downstream failure so that a cache fill can continue without its downstream.
+    ///
+    /// This always marks the downstream errored. When
+    /// [`Session::handles_downstream_abandonment`] is set, the fill can still produce a cache
+    /// entry (see `ServeFromCache::can_still_fill_cache`) and the client left before its response
+    /// was completely delivered (see `Session::downstream_left_before_response_complete`), it
+    /// also stops waiting for the cached response to reach the downstream and, the first time,
+    /// records the abandonment and calls [`ProxyHttp::downstream_abandoned_during_cache_fill`].
+    /// Otherwise the failure is ignored exactly as without that handling. A failed downstream
+    /// read comes here only if `proxy_common::downstream_read_error_means_client_left` holds;
+    /// any other read error only marks the downstream errored.
+    fn abandon_downstream_for_cache_fill(
+        &self,
+        serve_from_cache: &proxy_cache::ServeFromCache,
+        downstream_state: &mut proxy_common::DownstreamStateMachine,
+        response_state: &mut proxy_common::ResponseStateMachine,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) where
+        SV: ProxyHttp<DS>,
+    {
+        downstream_state.to_errored();
+        if !session.handles_downstream_abandonment()
+            || !serve_from_cache.can_still_fill_cache(&session.cache)
+            || !session.downstream_left_before_response_complete()
+        {
+            return;
+        }
+        response_state.maybe_set_cache_done(true);
+        if session.mark_downstream_abandoned_during_cache_fill() {
+            self.inner
+                .downstream_abandoned_during_cache_fill(session, ctx);
+        }
     }
 
     async fn handle_new_request(
@@ -618,6 +655,8 @@ where
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Set from [`ProxyHttp::should_handle_downstream_abandonment`] after `early_request_filter`.
+    handles_downstream_abandonment: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -649,6 +688,7 @@ where
             upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
+            handles_downstream_abandonment: false,
             shutdown_flag,
         }
     }
@@ -694,6 +734,97 @@ where
 
     pub fn as_downstream(&self) -> &HttpSession<DS> {
         &self.downstream_session
+    }
+
+    /// Whether [`ProxyHttp::should_handle_downstream_abandonment`] opted this request in.
+    ///
+    /// The proxy asks once, right after [`ProxyHttp::early_request_filter`] succeeds, so this is
+    /// `false` until then and already set when [`ProxyHttp::request_filter`] runs.
+    pub fn handles_downstream_abandonment(&self) -> bool {
+        self.handles_downstream_abandonment
+    }
+
+    /// Set whether this request opted in to downstream abandonment handling.
+    ///
+    /// The proxy applies [`ProxyHttp::should_handle_downstream_abandonment`]'s answer through this
+    /// method once per request. It is not public, since changing the answer later in the request
+    /// would change how an abandonment already recorded is handled.
+    pub(crate) fn set_handles_downstream_abandonment(&mut self, handles: bool) {
+        self.handles_downstream_abandonment = handles;
+    }
+
+    /// Whether Pingora kept processing a potential cache fill of this request after its
+    /// downstream became unusable, that is, whether
+    /// [`ProxyHttp::downstream_abandoned_during_cache_fill`] was called for it.
+    ///
+    /// This records a past event, not an active cache writer: it can be set before cache
+    /// admission, and it stays `true` after the fill is declined or the request is retried.
+    /// Always `false` unless [`Self::handles_downstream_abandonment`] is set.
+    pub fn downstream_abandoned_during_cache_fill(&self) -> bool {
+        self.handles_downstream_abandonment && self.cache.downstream_abandoned_during_cache_fill()
+    }
+
+    /// Whether this attempt's response work is done.
+    ///
+    /// A connected request follows downstream delivery. An abandoned request waits for the
+    /// upstream task producer and any active cache admission.
+    fn response_work_done(&self, response_state: &proxy_common::ResponseStateMachine) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            response_state.upstream_producer_done() && !self.cache.is_cache_admission_active()
+        } else {
+            response_state.is_done()
+        }
+    }
+
+    /// Whether the transport loop should still receive upstream tasks.
+    ///
+    /// Direct delivery may end before the upstream producer does; once the downstream is
+    /// abandoned only the producer's terminal task matters.
+    fn should_poll_upstream_tasks(
+        &self,
+        response_state: &proxy_common::ResponseStateMachine,
+    ) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            !response_state.upstream_producer_done()
+        } else {
+            !response_state.upstream_delivery_done()
+        }
+    }
+
+    /// Whether a downstream failure means the client left before its response was completely
+    /// delivered.
+    ///
+    /// A client whose response is complete (see
+    /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete))
+    /// has everything this request owes it. A failed read reaches this check only if it closed or
+    /// broke the client's connection or stream (see `HttpProxy::abandon_downstream_for_cache_fill`).
+    fn downstream_left_before_response_complete(&self) -> bool {
+        !self.downstream_session.is_response_complete()
+    }
+
+    /// Whether a retry is still possible after abandonment.
+    ///
+    /// A retried attempt of an abandoned request can only fill the cache, so caching must still
+    /// be enabled. A bypassed response is admitted only if `cache_miss` enables caching again,
+    /// which it just declined or has not been asked yet, and nobody waits on that. The attempt
+    /// also never reads the abandoned downstream again, so it can only resend a request body
+    /// whose framing completed successfully. It also must not start while this attempt's cache
+    /// writer is still active, since a new admission cannot start on top of it.
+    fn cache_fill_retry_allowed(&mut self) -> bool {
+        !self.downstream_abandoned_during_cache_fill()
+            || (self.downstream_session.is_body_complete()
+                && self.cache.enabled()
+                && !self.cache.is_cache_admission_active())
+    }
+
+    /// Record that the downstream became unusable during a potential cache fill, returning
+    /// `true` only the first time (see [`Self::downstream_abandoned_during_cache_fill`]).
+    ///
+    /// Records nothing if [`Self::handles_downstream_abandonment`] is unset or caching was
+    /// never enabled for this request.
+    pub(crate) fn mark_downstream_abandoned_during_cache_fill(&mut self) -> bool {
+        self.handles_downstream_abandonment
+            && self.cache.mark_downstream_abandoned_during_cache_fill()
     }
 
     /// Write HTTP response with the given error code to the downstream.
@@ -1207,6 +1338,10 @@ where
         if self.inner.allow_spawning_subrequest(&session, &ctx) {
             session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
+        let handles_downstream_abandonment = self
+            .inner
+            .should_handle_downstream_abandonment(&session, &ctx);
+        session.set_handles_downstream_abandonment(handles_downstream_abandonment);
 
         let req = session.downstream_session.req_header_mut();
 
@@ -1324,7 +1459,10 @@ where
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
+                Some(mut error) => {
+                    if !session.cache_fill_retry_allowed() {
+                        error.set_retry(false);
+                    }
                     let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
@@ -2706,5 +2844,141 @@ mod tests {
         .await
         .expect("read_request parked after shutdown");
         assert!(session.is_none());
+    }
+
+    /// Opts a request in from `early_request_filter` and records what `request_filter` sees.
+    struct AbandonmentOptInProxy {
+        seen_in_request_filter: Arc<std::sync::OnceLock<bool>>,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for AbandonmentOptInProxy {
+        type CTX = bool;
+
+        fn new_ctx(&self) -> Self::CTX {
+            false
+        }
+
+        async fn early_request_filter(
+            &self,
+            session: &mut Session,
+            opt_in: &mut bool,
+        ) -> Result<()> {
+            *opt_in = session.get_header_bytes("x-opt-in") == b"true";
+            Ok(())
+        }
+
+        fn should_handle_downstream_abandonment(&self, _session: &Session, opt_in: &bool) -> bool {
+            *opt_in
+        }
+
+        async fn request_filter(&self, session: &mut Session, _opt_in: &mut bool) -> Result<bool> {
+            self.seen_in_request_filter
+                .set(session.handles_downstream_abandonment())
+                .unwrap();
+            session.respond_error(204).await?;
+            Ok(true)
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _opt_in: &mut bool,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("request_filter responds to every request")
+        }
+    }
+
+    async fn opt_in_seen_by_request_filter(request: &[u8]) -> Option<bool> {
+        let seen_in_request_filter = Arc::new(std::sync::OnceLock::new());
+        let proxy = Arc::new(HttpProxy::new(
+            AbandonmentOptInProxy {
+                seen_in_request_filter: seen_in_request_filter.clone(),
+            },
+            Arc::new(ServerConf::default()),
+        ));
+        let session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        proxy.process_request(session, false).await;
+        seen_in_request_filter.get().copied()
+    }
+
+    #[tokio::test]
+    async fn request_filter_sees_the_downstream_abandonment_opt_in() {
+        let opted_in = b"GET / HTTP/1.1\r\nHost: example.com\r\nx-opt-in: true\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(opted_in).await, Some(true));
+        let default = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(default).await, Some(false));
+    }
+
+    mod fail_to_proxy_default {
+        use super::*;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+        use tokio::io::{AsyncReadExt, DuplexStream};
+
+        /// Run the default `fail_to_proxy` and return its code with whatever reached the client.
+        async fn fail_to_proxy_outcome(
+            path: &str,
+            abandonment: AbandonmentTiming,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(path, &abandonment, true).await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy.fail_to_proxy(&mut session, &error, &mut true).await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        async fn read_to_end(mut client: DuplexStream) -> Vec<u8> {
+            let mut written = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut written))
+                .await
+                .expect("dropping the session did not close the client half")
+                .unwrap();
+            written
+        }
+
+        fn upstream_read_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        // Nothing reaches a downstream that a cache fill abandoned, so by default no status
+        // describes the failure. `error_response_still_reaches_a_live_downstream` is the
+        // connected twin.
+        #[tokio::test]
+        async fn abandoned_downstream_reports_no_status_by_default() {
+            for (path, error) in [
+                ("/fail-to-proxy-abandoned-upstream", upstream_read_error()),
+                (
+                    "/fail-to-proxy-abandoned-http-status",
+                    Error::new(ErrorType::HTTPStatus(503)),
+                ),
+            ] {
+                let (code, written) =
+                    fail_to_proxy_outcome(path, AbandonmentTiming::BeforeAttempt, error).await;
+                assert_eq!(code, 0, "{path}: reported a status nobody received");
+                assert!(
+                    written.is_empty(),
+                    "{path}: an error response was written to an abandoned downstream: {written:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn error_response_still_reaches_a_live_downstream() {
+            let (code, written) = fail_to_proxy_outcome(
+                "/fail-to-proxy-live-upstream",
+                AbandonmentTiming::AfterAdmission,
+                upstream_read_error(),
+            )
+            .await;
+            assert_eq!(code, 502);
+            assert!(
+                written.starts_with(b"HTTP/1.1 502 "),
+                "the live downstream did not get the error response: {written:?}"
+            );
+        }
     }
 }

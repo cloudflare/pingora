@@ -647,6 +647,13 @@ impl HttpSession {
         self.body_reader.body_done()
     }
 
+    /// Whether the request body reached its framing-defined end without an error.
+    /// A premature EOF makes `is_body_done()` true but leaves this false.
+    pub fn is_body_complete(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.body_complete()
+    }
+
     /// Whether the request has an empty body
     /// Because HTTP 1.1 clients have to send either `Content-Length` or `Transfer-Encoding` in order
     /// to signal the server that it will send the body, this function returns accurate results even
@@ -684,6 +691,17 @@ impl HttpSession {
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
+    }
+
+    /// Whether the whole response is written: a final (non-1xx) header went out, no queued
+    /// proxy task remains, and the body is complete by its framing (its `Content-Length` is
+    /// satisfied or the body has been finished).
+    pub fn is_response_complete(&self) -> bool {
+        self.response_written
+            .as_ref()
+            .is_some_and(|header| !header.status.is_informational())
+            && !self.has_pending_proxy_tasks()
+            && self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade

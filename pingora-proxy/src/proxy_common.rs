@@ -14,8 +14,13 @@
 
 use http::header::{self, HeaderName};
 use pingora_core::protocols::http::authority::{raw_target_authority, RawTargetAuthority};
+use pingora_core::protocols::http::HttpTask;
 use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpUpstreamRequestPolicy};
-use pingora_error::{Error, ErrorType::InvalidHTTPHeader, OrErr, Result};
+use pingora_error::{
+    Error,
+    ErrorType::{self, InvalidHTTPHeader, WriteError},
+    OrErr, Result,
+};
 use pingora_http::RequestHeader;
 
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
@@ -408,8 +413,25 @@ pub(crate) fn sanitize_h2_upstream_request(
     Ok(())
 }
 
+pub(crate) fn downstream_closed_before_cache_admission() -> Box<Error> {
+    Error::explain(WriteError, "downstream closed before cache admission").into_down()
+}
+
+/// Whether a failed downstream read means the client left: its connection or HTTP/2 stream
+/// closed or failed.
+///
+/// A read timeout, a malformed request body, or data sent after the request is complete is the
+/// proxy's verdict on a client that is still connected and can still get a response, so it is
+/// not the client leaving.
+pub(crate) fn downstream_read_error_means_client_left(error: &Error) -> bool {
+    matches!(
+        error.etype(),
+        ErrorType::ConnectionClosed | ErrorType::ReadError | ErrorType::H2Error
+    )
+}
+
 /// Possible downstream states during request multiplexing
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DownstreamStateMachine {
     /// more request (body) to read
     Reading,
@@ -426,6 +448,15 @@ impl DownstreamStateMachine {
             Self::ReadingFinished
         } else {
             Self::Reading
+        }
+    }
+
+    /// Reconstruct downstream state at the start of an upstream attempt.
+    pub fn for_proxy_attempt(finished: bool, downstream_abandoned: bool) -> Self {
+        if downstream_abandoned {
+            Self::Errored
+        } else {
+            Self::new(finished)
         }
     }
 
@@ -473,27 +504,39 @@ impl DownstreamStateMachine {
     }
 }
 
-/// Possible upstream states during request multiplexing
+/// Per-attempt response progress. The upstream producer emitting its terminal task is tracked
+/// separately from completing either downstream delivery path.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponseStateMachine {
-    upstream_response_done: bool,
+    upstream_producer_done: bool,
+    upstream_delivery_done: bool,
     cached_response_done: bool,
 }
 
 impl ResponseStateMachine {
     pub fn new() -> Self {
         ResponseStateMachine {
-            upstream_response_done: false,
+            upstream_producer_done: false,
+            upstream_delivery_done: false,
             cached_response_done: true, // no cached response by default
         }
     }
 
+    /// Whether direct upstream delivery and any cached delivery have both ended.
+    /// This does not describe the lifetime of the upstream task producer.
     pub fn is_done(&self) -> bool {
-        self.upstream_response_done && self.cached_response_done
+        self.upstream_delivery_done && self.cached_response_done
     }
 
-    pub fn upstream_done(&self) -> bool {
-        self.upstream_response_done
+    /// Whether this attempt's upstream task producer emitted its terminal task.
+    /// It can be true even when the task was diverted to cache instead of delivered.
+    pub fn upstream_producer_done(&self) -> bool {
+        self.upstream_producer_done
+    }
+
+    /// Whether no more direct upstream output needs downstream delivery.
+    pub fn upstream_delivery_done(&self) -> bool {
+        self.upstream_delivery_done
     }
 
     pub fn cached_done(&self) -> bool {
@@ -504,9 +547,15 @@ impl ResponseStateMachine {
         self.cached_response_done = false;
     }
 
-    pub fn maybe_set_upstream_done(&mut self, done: bool) {
+    pub fn maybe_set_upstream_producer_done(&mut self, done: bool) {
         if done {
-            self.upstream_response_done = true;
+            self.upstream_producer_done = true;
+        }
+    }
+
+    pub fn maybe_set_upstream_delivery_done(&mut self, done: bool) {
+        if done {
+            self.upstream_delivery_done = true;
         }
     }
 
@@ -515,6 +564,15 @@ impl ResponseStateMachine {
             self.cached_response_done = true;
         }
     }
+}
+
+/// Whether `task` is the last task an HTTP/2 or custom upstream producer sends.
+///
+/// Those producers always finish a response with [`HttpTask::Done`] or [`HttpTask::Failed`],
+/// after any trailer or end-of-stream body. The HTTP/1 producer stops reading at the first
+/// [`HttpTask::is_end`] task and never sends `Done` or a trailer, so HTTP/1 uses `is_end`.
+pub(crate) fn ends_upstream_task_stream(task: &HttpTask) -> bool {
+    matches!(task, HttpTask::Done | HttpTask::Failed(_))
 }
 
 /// Shared signal from the downstream proxy half to the upstream half: set to
@@ -852,6 +910,21 @@ mod tests {
         assert!(ds.is_done());
         assert!(ds.can_poll()); // ReadingFinished still allows polling (for idle)
         assert!(!ds.is_errored());
+    }
+
+    #[test]
+    fn proxy_attempt_reconstructs_downstream_state() {
+        for (finished, abandoned, expected) in [
+            (false, false, DownstreamStateMachine::Reading),
+            (true, false, DownstreamStateMachine::ReadingFinished),
+            (false, true, DownstreamStateMachine::Errored),
+            (true, true, DownstreamStateMachine::Errored),
+        ] {
+            assert_eq!(
+                DownstreamStateMachine::for_proxy_attempt(finished, abandoned),
+                expected
+            );
+        }
     }
 
     #[test]

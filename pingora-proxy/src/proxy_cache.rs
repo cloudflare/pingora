@@ -646,6 +646,9 @@ where
                                 self.inner.cache_miss(session, ctx);
                                 if !session.cache.enabled() {
                                     fill_cache = false;
+                                    if session.handles_downstream_abandonment() {
+                                        serve_from_cache.decline_fill();
+                                    }
                                 }
                             } else {
                                 // we've allowed caching on the next request,
@@ -2362,6 +2365,8 @@ pub mod range_filter {
 pub(crate) enum ServeFromCache {
     // not using cache
     Off,
+    // not using cache, and the response's cache fill was declined (see `decline_fill`)
+    OffFillDeclined,
     // should serve cache header
     CacheHeader,
     // should serve cache header only
@@ -2388,7 +2393,7 @@ impl ServeFromCache {
     }
 
     pub fn is_on(&self) -> bool {
-        !matches!(self, Self::Off)
+        !matches!(self, Self::Off | Self::OffFillDeclined)
     }
 
     pub fn is_miss(&self) -> bool {
@@ -2417,6 +2422,48 @@ impl ServeFromCache {
 
     pub fn should_send_to_downstream(&self) -> bool {
         !self.is_on()
+    }
+
+    /// Whether upstream response output can still be sent downstream.
+    pub fn should_write_response(&self, downstream_abandoned: bool) -> bool {
+        !downstream_abandoned && self.should_send_to_downstream()
+    }
+
+    /// Whether this response's cache fill can still produce a cache entry, so that losing the
+    /// downstream now abandons it: a miss whose cache writer is active, or, on storage with
+    /// streaming partial writes, a response whose cache decision is still open.
+    pub fn can_still_fill_cache(&self, cache: &HttpCache) -> bool {
+        (matches!(self, Self::Off) && cache.support_streaming_partial_write() == Some(true))
+            || (self.is_miss() && cache.is_cache_admission_active())
+    }
+
+    /// Whether the downstream was abandoned for a cache fill that will never be admitted.
+    ///
+    /// The fill was declined, or no fill is served back and caching is neither enabled nor
+    /// bypassed. Either way the rest of the response has nowhere to go: the transport loops
+    /// then fail the request with
+    /// [`downstream_closed_before_cache_admission`](crate::proxy_common::downstream_closed_before_cache_admission).
+    pub fn abandoned_before_admission(&self, cache: &HttpCache) -> bool {
+        cache.downstream_abandoned_during_cache_fill()
+            && (matches!(self, Self::OffFillDeclined)
+                || (!self.is_miss() && !cache.enabled() && !cache.bypassing()))
+    }
+
+    /// Whether a failed cache write must fail the request.
+    ///
+    /// A miss body is served from the cache write. Once the downstream is abandoned the cache
+    /// is the response's only output, and a storage may stop a fill nobody reads by failing
+    /// its writes, so the rest of the upstream response is not read for nothing.
+    pub fn cache_write_failure_is_fatal(&self, downstream_abandoned: bool) -> bool {
+        self.is_miss_body() || downstream_abandoned
+    }
+
+    /// Record that the `cache_miss` callback left this response's cache fill declined. Only
+    /// requests that handle downstream abandonment record it; any other request stays `Off`.
+    pub fn decline_fill(&mut self) {
+        if matches!(self, Self::Off) {
+            *self = Self::OffFillDeclined;
+        }
     }
 
     pub fn enable(&mut self) {
@@ -2465,7 +2512,7 @@ impl ServeFromCache {
             return Error::e_explain(InternalError, "Cache disabled");
         }
         match self {
-            Self::Off => panic!("ProxyUseCache not enabled"),
+            Self::Off | Self::OffFillDeclined => panic!("ProxyUseCache not enabled"),
             Self::CacheHeader => {
                 *self = Self::CacheBody(true);
                 Ok(HttpTask::Header(cache_hit_header(cache), false)) // false for now

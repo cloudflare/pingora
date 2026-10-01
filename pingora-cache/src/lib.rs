@@ -365,6 +365,8 @@ struct HttpCacheInner {
     // phases report the reason they acted on rather than inferring one. Outlives cache
     // disablement because it is read after the response header arrives.
     pub predicted_uncacheable_reason: Option<NoCacheReason>,
+    // Survives cache disablement so a retry cannot revive the downstream.
+    downstream_abandoned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -391,6 +393,29 @@ impl HttpCache {
     /// Whether the cache is enabled
     pub fn enabled(&self) -> bool {
         !matches!(self.phase, CachePhase::Disabled(_) | CachePhase::Bypass)
+    }
+
+    /// Whether the downstream became unusable during a potential cache fill of this request.
+    ///
+    /// This records a past event, not an active cache writer: it is retained after caching
+    /// is disabled or enabled again for this request.
+    #[doc(hidden)]
+    pub fn downstream_abandoned_during_cache_fill(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.downstream_abandoned)
+    }
+
+    /// Record that the downstream became unusable during a potential cache fill, returning
+    /// `true` only on the first transition.
+    ///
+    /// Returns `false` without allocating if caching has never been enabled.
+    #[doc(hidden)]
+    pub fn mark_downstream_abandoned_during_cache_fill(&mut self) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        !std::mem::replace(&mut inner.downstream_abandoned, true)
     }
 
     /// Whether the cache is being bypassed
@@ -613,6 +638,7 @@ impl HttpCache {
                     max_file_size_tracker: None,
                     predictor,
                     predicted_uncacheable_reason: None,
+                    downstream_abandoned: self.downstream_abandoned_during_cache_fill(),
                 }));
             }
             _ => panic!("Cannot enable already enabled HttpCache {:?}", self.phase),
@@ -1065,6 +1091,34 @@ impl HttpCache {
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
+    }
+
+    /// The active miss writer, if any. Unlike [`Self::miss_handler`], never panics: phases other
+    /// than miss or expired have no writer.
+    fn maybe_miss_handler(&self) -> Option<&MissHandler> {
+        if !matches!(self.phase, CachePhase::Miss | CachePhase::Expired) {
+            return None;
+        }
+        self.inner
+            .as_ref()?
+            .enabled_ctx
+            .as_ref()?
+            .miss_handler
+            .as_ref()
+    }
+
+    /// Return whether this request currently has a cache writer.
+    pub fn is_cache_admission_active(&self) -> bool {
+        self.maybe_miss_handler().is_some()
+    }
+
+    /// Release the current miss writer's demand for a streaming cache fill.
+    ///
+    /// Returns `false` when no miss writer is active, the storage does not track
+    /// demand, or the writer's demand was already released.
+    pub fn release_miss_writer_demand(&self) -> bool {
+        self.maybe_miss_handler()
+            .is_some_and(|handler| handler.release_writer_demand())
     }
 
     /// Finish cache admission
@@ -2000,6 +2054,9 @@ mod tests {
     struct IdentifiedMissHandler {
         finish: MissFinishType,
     }
+    struct DemandTrackingMissHandler {
+        writer_demand: std::sync::atomic::AtomicBool,
+    }
     struct CountingDeferPolicy(AtomicUsize);
     struct CountingReadyPolicy(AtomicUsize);
     #[derive(Default)]
@@ -2086,6 +2143,21 @@ mod tests {
 
         fn entry_id(&self) -> Option<eviction::CacheEntryId> {
             Some(eviction::CacheEntryId::new(7))
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for DemandTrackingMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            unreachable!("test only exercises writer demand")
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            unreachable!("test only exercises writer demand")
+        }
+
+        fn release_writer_demand(&self) -> bool {
+            self.writer_demand.swap(false, Ordering::AcqRel)
         }
     }
 
@@ -2714,6 +2786,63 @@ mod tests {
         assert!(!status.is_fresh());
         assert!(!status.is_treated_as_miss());
         assert_eq!(status.as_str(), "force_expired_serve_stale");
+    }
+
+    #[test]
+    fn downstream_abandonment_survives_cache_disable_and_reenable() {
+        let mut cache = HttpCache::new();
+        assert!(!cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        assert!(!cache.downstream_abandoned_during_cache_fill());
+        assert!(cache.mark_downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+        assert!(cache.downstream_abandoned_during_cache_fill());
+
+        cache.disable(NoCacheReason::StorageError);
+        assert!(cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        assert!(cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+    }
+
+    #[test]
+    fn miss_writer_demand_release_delegates_to_active_handler_once() {
+        let mut cache = HttpCache::new();
+        assert!(!cache.release_miss_writer_demand());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("writer-demand", ""));
+        cache.cache_miss();
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+
+        assert!(cache.release_miss_writer_demand());
+        assert!(!cache.release_miss_writer_demand());
+    }
+
+    #[test]
+    fn expired_entry_writer_demand_can_be_released() {
+        let now = SystemTime::now();
+        let mut cache = cache_with_stale_meta(
+            test_meta(now - Duration::from_secs(120)),
+            CacheKey::new("expired-writer-demand", ""),
+        );
+        cache.set_cache_meta(test_meta(now));
+        assert_eq!(cache.phase(), CachePhase::Expired);
+        assert!(!cache.is_cache_admission_active());
+
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+
+        assert!(cache.is_cache_admission_active());
+        assert!(cache.release_miss_writer_demand());
+        assert!(!cache.release_miss_writer_demand());
     }
 
     #[tokio::test]

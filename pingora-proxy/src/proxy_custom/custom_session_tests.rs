@@ -132,6 +132,7 @@ async fn upgraded_custom_reset() -> Box<Error> {
         down_custom_rx,
         true,
         cancel_tx,
+        None,
         Arc::new(AtomicU8::new(PipeState::Active as u8)),
     );
     tokio::pin!(relay);
