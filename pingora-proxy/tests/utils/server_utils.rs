@@ -25,7 +25,7 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
-use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
+use pingora_cache::storage::{HandleHit, HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
@@ -43,10 +43,14 @@ use pingora_core::server::configuration::Opt;
 use pingora_core::services::{Service, ServiceWithDependents};
 use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamRequestPolicy};
 use pingora_core::utils::tls::CertKey;
+use pingora_error::ErrorType;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_proxy::subrequest::pipe::{pipe_subrequest, InputBody, InputBodyType};
+use pingora_proxy::subrequest::Ctx as SubrequestCtx;
 use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -247,6 +251,16 @@ impl ProxyHttp for ExampleProxyHttps {
 pub struct ExampleProxyHttp {}
 
 static SUPPRESS_PROXY_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn enable_proxy_tasks_from_header(session: &mut Session) {
+    if session
+        .req_header()
+        .headers
+        .contains_key("x-proxy-tasks-enabled")
+    {
+        session.downstream_session.set_proxy_tasks_enabled(true);
+    }
+}
 
 pub fn reset_suppress_proxy_warn_log_calls() {
     SUPPRESS_PROXY_WARN_LOG_CALLS.store(0, Ordering::Relaxed);
@@ -497,6 +511,10 @@ impl ProxyHttp for ExampleProxyHttp {
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
 static CACHE_FINISH_FAIL_BACKEND: FinishFailCache = FinishFailCache;
+static CACHE_STREAMING_FINISH_FAIL_BACKEND: FailingStreamingCache =
+    FailingStreamingCache(MissFailure::Finish);
+static CACHE_WRITE_FAIL_BACKEND: FailingStreamingCache = FailingStreamingCache(MissFailure::Write);
+static CACHE_DEMAND_COUNTING_BACKEND: DemandCountingCache = DemandCountingCache;
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
 static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
@@ -573,6 +591,426 @@ impl HandleMiss for FinishFailMissHandler {
     }
 }
 
+/// Which [`HandleMiss`] call of a [`FailingStreamingCache`] fill fails.
+#[derive(Clone, Copy)]
+enum MissFailure {
+    /// Every body write.
+    Write,
+    /// The finish of the entry.
+    Finish,
+}
+
+/// Streaming storage over [`CACHE_BACKEND`] whose fills fail at one [`HandleMiss`] call.
+struct FailingStreamingCache(MissFailure);
+
+#[async_trait]
+impl Storage for FailingStreamingCache {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND.lookup(key, trace).await
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        let inner = CACHE_BACKEND.get_miss_handler(key, meta, trace).await?;
+        Ok(Box::new(FailingMissHandler {
+            inner,
+            failure: self.0,
+        }))
+    }
+
+    async fn purge(
+        &'static self,
+        target: pingora_cache::PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        CACHE_BACKEND.purge(target, purge_type, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        CACHE_BACKEND.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct FailingMissHandler {
+    inner: pingora_cache::MissHandler,
+    failure: MissFailure,
+}
+
+#[async_trait]
+impl HandleMiss for FailingMissHandler {
+    async fn write_body(&mut self, data: bytes::Bytes, eof: bool) -> Result<()> {
+        match self.failure {
+            MissFailure::Write => Error::e_explain(FileWriteError, "cache body write failed"),
+            MissFailure::Finish => self.inner.write_body(data, eof).await,
+        }
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        match self.failure {
+            MissFailure::Write => self.inner.finish().await,
+            MissFailure::Finish => {
+                Error::e_explain(FileWriteError, "cache miss finalization failed")
+            }
+        }
+    }
+
+    fn streaming_write_tag(&self) -> Option<&[u8]> {
+        self.inner.streaming_write_tag()
+    }
+
+    fn entry_id(&self) -> Option<pingora_cache::eviction::CacheEntryId> {
+        self.inner.entry_id()
+    }
+}
+
+/// The key request-lifecycle instrumentation records under: the request target as sent, including
+/// any query string. Two requests differing only by query are distinct requests, and the cache key
+/// already distinguishes them, so the counters must agree.
+fn request_lifecycle_key(req: &RequestHeader) -> String {
+    req.uri
+        .path_and_query()
+        .map_or_else(|| req.uri.path().to_owned(), |pq| pq.as_str().to_owned())
+}
+
+/// What [`DemandCountingCache`] observed for the latest fill of one cache key.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DemandFillObservations {
+    /// Whether the writer still holds its claim on the fill.
+    pub writer_claim: bool,
+    /// `release_writer_demand` calls that released the writer's claim.
+    pub writer_demand_releases: usize,
+    /// Readers of the in-progress fill that still hold their claim.
+    pub reader_claims: usize,
+    /// Readers that attached to the in-progress fill.
+    pub readers_attached: usize,
+    /// Whether every claim was gone at some point, which stops the fill for good.
+    pub stopped: bool,
+    /// Body writes the storage accepted, and their bytes.
+    pub body_writes: usize,
+    pub body_bytes: usize,
+    /// Body writes the storage failed because the fill had stopped, and their bytes.
+    pub failed_writes: usize,
+    pub failed_bytes: usize,
+    /// Whether the fill finished and was admitted.
+    pub finished: bool,
+}
+
+impl DemandFillObservations {
+    fn update_stopped(&mut self) {
+        if !self.writer_claim && self.reader_claims == 0 {
+            self.stopped = true;
+        }
+    }
+}
+
+/// One fill's claims, shared by its writer and the readers streaming from it.
+#[derive(Default)]
+struct FillDemand(Mutex<DemandFillObservations>);
+
+/// Fills in progress, by the cache key hash the underlying storage uses.
+static ACTIVE_DEMAND_FILLS: Lazy<Mutex<HashMap<String, Arc<FillDemand>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+/// The latest fill of each primary cache key, kept for observation after it ends.
+static DEMAND_FILLS_BY_PRIMARY_KEY: Lazy<Mutex<HashMap<String, Arc<FillDemand>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// What the demand-counting storage observed for the latest fill of `primary_key` (the test
+/// proxy's cache key is the request's host followed by its path).
+pub fn demand_fill_observations(primary_key: &str) -> DemandFillObservations {
+    DEMAND_FILLS_BY_PRIMARY_KEY
+        .lock()
+        .unwrap()
+        .get(primary_key)
+        .map(|fill| *fill.0.lock().unwrap())
+        .unwrap_or_default()
+}
+
+/// Streaming storage that stops a fill nobody wants any more, like a storage that serves byte
+/// ranges to coalesced readers.
+///
+/// A fill starts with its writer's claim. Every reader streaming from the fill while it is in
+/// progress holds a claim until it drops its hit handler. The writer's claim goes away through
+/// [`HandleMiss::release_writer_demand`]. Once no claim is left the fill has stopped: its next
+/// body write fails, and its readers then see an error instead of the end of the body. The
+/// writer's own read-back of its fill holds no claim.
+struct DemandCountingCache;
+
+impl DemandCountingCache {
+    fn active_fill(key: &CacheKey) -> Option<Arc<FillDemand>> {
+        use pingora_cache::key::CacheHashKey;
+        ACTIVE_DEMAND_FILLS
+            .lock()
+            .unwrap()
+            .get(&key.combined())
+            .cloned()
+    }
+}
+
+#[async_trait]
+impl Storage for DemandCountingCache {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        let hit = CACHE_BACKEND.lookup(key, trace).await?;
+        let Some((meta, inner)) = hit else {
+            return Ok(None);
+        };
+        let Some(fill) = Self::active_fill(key) else {
+            return Ok(Some((meta, inner)));
+        };
+        Ok(Some((
+            meta,
+            Box::new(DemandClaimingHitHandler {
+                inner,
+                claim: ReaderClaim::new(fill),
+            }),
+        )))
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        CACHE_BACKEND
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::MissHandler> {
+        use pingora_cache::key::CacheHashKey;
+        let inner = CACHE_BACKEND.get_miss_handler(key, meta, trace).await?;
+        let fill = Arc::new(FillDemand(Mutex::new(DemandFillObservations {
+            writer_claim: true,
+            ..Default::default()
+        })));
+        let hash = key.combined();
+        ACTIVE_DEMAND_FILLS
+            .lock()
+            .unwrap()
+            .insert(hash.clone(), fill.clone());
+        DEMAND_FILLS_BY_PRIMARY_KEY.lock().unwrap().insert(
+            key.primary_key_str().unwrap_or_default().to_owned(),
+            fill.clone(),
+        );
+        Ok(Box::new(DemandCountingMissHandler {
+            inner,
+            registration: ActiveFill { fill, hash },
+        }))
+    }
+
+    async fn purge(
+        &'static self,
+        target: pingora_cache::PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        CACHE_BACKEND.purge(target, purge_type, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<bool> {
+        CACHE_BACKEND.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+        self
+    }
+}
+
+struct DemandCountingMissHandler {
+    inner: pingora_cache::MissHandler,
+    registration: ActiveFill,
+}
+
+impl DemandCountingMissHandler {
+    fn fill(&self) -> &FillDemand {
+        &self.registration.fill
+    }
+}
+
+/// A fill's entry in [`ACTIVE_DEMAND_FILLS`], removed when its writer goes.
+struct ActiveFill {
+    fill: Arc<FillDemand>,
+    hash: String,
+}
+
+impl Drop for ActiveFill {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_DEMAND_FILLS.lock().unwrap();
+        if active
+            .get(&self.hash)
+            .is_some_and(|fill| Arc::ptr_eq(fill, &self.fill))
+        {
+            active.remove(&self.hash);
+        }
+    }
+}
+
+#[async_trait]
+impl HandleMiss for DemandCountingMissHandler {
+    async fn write_body(&mut self, data: bytes::Bytes, eof: bool) -> Result<()> {
+        // An upstream read that ends inside an HTTP/1 chunk head reaches storage as an empty
+        // write. Tests count the chunks a fill takes, so such a write counts nowhere, even after
+        // the fill stopped.
+        if data.is_empty() && !eof {
+            return self.inner.write_body(data, eof).await;
+        }
+        {
+            let mut state = self.fill().0.lock().unwrap();
+            if state.stopped {
+                state.failed_writes += 1;
+                state.failed_bytes += data.len();
+                return Error::e_explain(FileWriteError, "no claim left on the cache fill");
+            }
+        }
+        let len = data.len();
+        self.inner.write_body(data, eof).await?;
+        let mut state = self.fill().0.lock().unwrap();
+        state.body_writes += 1;
+        state.body_bytes += len;
+        Ok(())
+    }
+
+    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+        let Self {
+            inner,
+            registration,
+        } = *self;
+        let finished = inner.finish().await?;
+        registration.fill.0.lock().unwrap().finished = true;
+        Ok(finished)
+    }
+
+    fn streaming_write_tag(&self) -> Option<&[u8]> {
+        self.inner.streaming_write_tag()
+    }
+
+    fn release_writer_demand(&self) -> bool {
+        let mut state = self.fill().0.lock().unwrap();
+        if !state.writer_claim {
+            return false;
+        }
+        state.writer_claim = false;
+        state.writer_demand_releases += 1;
+        state.update_stopped();
+        true
+    }
+}
+
+/// A reader's claim on an in-progress fill, released when dropped.
+struct ReaderClaim(Arc<FillDemand>);
+
+impl ReaderClaim {
+    fn new(fill: Arc<FillDemand>) -> Self {
+        {
+            let mut state = fill.0.lock().unwrap();
+            state.reader_claims += 1;
+            state.readers_attached += 1;
+        }
+        Self(fill)
+    }
+}
+
+impl Drop for ReaderClaim {
+    fn drop(&mut self) {
+        let mut state = self.0 .0.lock().unwrap();
+        state.reader_claims -= 1;
+        state.update_stopped();
+    }
+}
+
+/// A reader of an in-progress [`DemandCountingCache`] fill, holding a claim on it.
+struct DemandClaimingHitHandler {
+    inner: HitHandler,
+    claim: ReaderClaim,
+}
+
+#[async_trait]
+impl HandleHit for DemandClaimingHitHandler {
+    async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+        match self.inner.read_body().await? {
+            Some(body) => Ok(Some(body)),
+            // The in-memory storage ends a partial read the same way whether its writer
+            // finished or failed; a fill that stopped must not look complete.
+            None if self.claim.0 .0.lock().unwrap().failed_writes > 0 => {
+                Error::e_explain(ReadError, "the cache fill stopped before completion")
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn finish(
+        self: Box<Self>,
+        storage: &'static (dyn Storage + Sync),
+        key: &CacheKey,
+        trace: &pingora_cache::trace::SpanHandle,
+    ) -> Result<()> {
+        self.inner.finish(storage, key, trace).await
+    }
+
+    fn should_count_access(&self) -> bool {
+        self.inner.should_count_access()
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
     upstream_status: Option<u16>,
@@ -581,6 +1019,189 @@ pub struct CacheCTX {
 pub struct ExampleProxyCache {}
 
 static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS_BY_PATH: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct CacheFillAbandonmentObservations {
+    calls: usize,
+    calls_with_pending_tasks: usize,
+}
+
+static DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS: Lazy<
+    Mutex<HashMap<String, CacheFillAbandonmentObservations>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_UPSTREAM_ATTEMPTS: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_UPSTREAM_REQUEST_FILTERS: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_REQUEST_COMPLETIONS: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_REQUEST_ERRORS: Lazy<Mutex<HashMap<String, Option<ErrorType>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_CACHE_REASONS: Lazy<Mutex<HashMap<String, Option<NoCacheReason>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+/// `FailToProxy::error_code` reported by the cache proxy for instrumented requests.
+static RECORDED_FAIL_TO_PROXY_CODES: Lazy<Mutex<HashMap<String, u16>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Upstream response hook calls recorded by the test proxy.
+pub struct UpstreamResponseHookCalls {
+    /// Response header calls.
+    pub headers: usize,
+    /// Response body calls with a body chunk.
+    pub body_chunks: usize,
+    /// Response trailer calls.
+    pub trailers: usize,
+}
+
+static UPSTREAM_RESPONSE_HOOK_CALLS: Lazy<Mutex<HashMap<String, UpstreamResponseHookCalls>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct ForcedRetryHookObservations {
+    calls: usize,
+    calls_with_retry_disabled: usize,
+}
+
+static FORCED_RETRY_ERROR_HOOK_CALLS: Lazy<Mutex<HashMap<String, ForcedRetryHookObservations>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_CACHE_LOOKUPS: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// What the cache proxy's subrequest pipe observed for a request that asked for one with
+/// `x-pipe-subrequest`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PipedSubrequest {
+    /// How `pipe_subrequest` ended: `None` while it runs, then `Ok` or the error's type.
+    pub outcome: Option<std::result::Result<(), ErrorType>>,
+}
+
+static PIPED_SUBREQUESTS: Lazy<Mutex<HashMap<String, PipedSubrequest>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// How many ignored downstream cache errors the proxy reported for this path.
+pub fn downstream_cache_warn_log_calls_for(path: &str) -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS_BY_PATH
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// How many forced-retry hook calls received an error with retry disabled.
+pub fn forced_retry_error_hook_calls_with_retry_disabled(path: &str) -> usize {
+    FORCED_RETRY_ERROR_HOOK_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|observations| observations.calls_with_retry_disabled)
+        .unwrap_or_default()
+}
+
+/// How many times the cache proxy was notified that the downstream was abandoned while a cache
+/// fill continued.
+pub fn downstream_abandoned_during_cache_fill_calls(path: &str) -> usize {
+    DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|observations| observations.calls)
+        .unwrap_or_default()
+}
+
+/// How many cache-fill callbacks for this path ran with a queued downstream task.
+pub fn downstream_abandoned_with_pending_tasks_calls(path: &str) -> usize {
+    DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|observations| observations.calls_with_pending_tasks)
+        .unwrap_or_default()
+}
+
+/// How many upstream attempts the cache proxy started for this path.
+pub fn recorded_upstream_attempts(path: &str) -> usize {
+    RECORDED_UPSTREAM_ATTEMPTS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// How many upstream request filters completed for this path.
+pub fn recorded_upstream_request_filters(path: &str) -> usize {
+    RECORDED_UPSTREAM_REQUEST_FILTERS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// How many instrumented requests completed for this path.
+pub fn recorded_request_completions(path: &str) -> usize {
+    RECORDED_REQUEST_COMPLETIONS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// The final proxy error recorded for an instrumented request.
+pub fn recorded_request_error(path: &str) -> Option<ErrorType> {
+    RECORDED_REQUEST_ERRORS
+        .lock()
+        .unwrap()
+        .get(path)
+        .cloned()
+        .flatten()
+}
+
+/// The disabled-cache reason at the end of an instrumented request.
+pub fn recorded_cache_reason(path: &str) -> Option<NoCacheReason> {
+    RECORDED_CACHE_REASONS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .flatten()
+}
+
+/// The `FailToProxy::error_code` the cache proxy reported for an instrumented request.
+pub fn recorded_fail_to_proxy_code(path: &str) -> Option<u16> {
+    RECORDED_FAIL_TO_PROXY_CODES
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+}
+
+/// Upstream response hook calls recorded for this path.
+pub fn upstream_response_hook_calls(path: &str) -> UpstreamResponseHookCalls {
+    UPSTREAM_RESPONSE_HOOK_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// What the subrequest pipe observed for this path, once a request asked for one.
+pub fn piped_subrequest(path: &str) -> Option<PipedSubrequest> {
+    PIPED_SUBREQUESTS.lock().unwrap().get(path).cloned()
+}
+
+/// How many instrumented requests for this path reached their cache lookup.
+pub fn recorded_cache_lookups(path: &str) -> usize {
+    RECORDED_CACHE_LOOKUPS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
+}
 
 /// How many times the cache proxy has reported a downstream error that it ignored in order
 /// to let a cache fill finish.
@@ -589,6 +1210,16 @@ static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// sleeping for an arbitrary duration.
 pub fn downstream_cache_warn_log_calls() -> usize {
     DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
+
+/// How many times the test proxy forced an upstream error to be retryable for this path.
+pub fn forced_retry_error_hook_calls(path: &str) -> usize {
+    FORCED_RETRY_ERROR_HOOK_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .map(|observations| observations.calls)
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -605,6 +1236,27 @@ impl ProxyHttp for ExampleProxyCache {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        enable_proxy_tasks_from_header(session);
+        if let Some(timeout_ms) = session
+            .req_header()
+            .headers
+            .get("x-write-timeout-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+        {
+            session.set_write_timeout(Some(Duration::from_millis(timeout_ms)));
+        }
+        if let Some(timeout_ms) = session
+            .req_header()
+            .headers
+            .get("x-downstream-read-timeout-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+        {
+            session
+                .downstream_session
+                .set_read_timeout(Some(Duration::from_millis(timeout_ms)));
+        }
         if session
             .req_header()
             .headers
@@ -629,7 +1281,58 @@ impl ProxyHttp for ExampleProxyCache {
                 .unwrap()
                 .adjust_decompression(true);
         }
+        if session.get_header_bytes("x-abort-on-close") == b"false" {
+            session.downstream_session.set_abort_on_close(false);
+        }
         Ok(())
+    }
+
+    fn allow_spawning_subrequest(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        session
+            .req_header()
+            .headers
+            .contains_key("x-pipe-subrequest")
+    }
+
+    /// `x-pipe-subrequest: no-body` serves an HTTP/1 request by piping a subrequest for the same
+    /// target (which proxies it as usual) to the client, with an empty preset request body. The
+    /// outcome is recorded for [`piped_subrequest`].
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        if session.get_header_bytes("x-pipe-subrequest") != b"no-body"
+            || session.subrequest_ctx.is_some()
+        {
+            // Not a piped request, or the piped subrequest itself.
+            return Ok(false);
+        }
+        let path = request_lifecycle_key(session.req_header());
+        PIPED_SUBREQUESTS
+            .lock()
+            .unwrap()
+            .insert(path.clone(), PipedSubrequest::default());
+        let (subrequest, handle) = session
+            .subrequest_spawner
+            .as_ref()
+            .expect("allow_spawning_subrequest is set for piped requests")
+            .create_subrequest(session.as_downstream(), SubrequestCtx::builder().build());
+        let result = pipe_subrequest(
+            session,
+            subrequest,
+            handle,
+            |task| Ok(Some(task)),
+            InputBodyType::Preset(InputBody::NoBody),
+        )
+        .await;
+        let outcome = Some(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|e| e.error.etype().clone()),
+        );
+        PIPED_SUBREQUESTS
+            .lock()
+            .unwrap()
+            .insert(path, PipedSubrequest { outcome });
+        result.map(|_| true).map_err(|e| e.error)
     }
 
     async fn upstream_peer(
@@ -638,6 +1341,13 @@ impl ProxyHttp for ExampleProxyCache {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let req = session.req_header();
+        if req.headers.contains_key("x-record-request-lifecycle") {
+            *RECORDED_UPSTREAM_ATTEMPTS
+                .lock()
+                .unwrap()
+                .entry(request_lifecycle_key(req))
+                .or_default() += 1;
+        }
         let port = req
             .headers
             .get("x-port")
@@ -652,12 +1362,34 @@ impl ProxyHttp for ExampleProxyCache {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+            if let Some(max_streams) = req
+                .headers
+                .get("x-h2-max-streams")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+            {
+                peer.options.max_h2_streams = max_streams;
+            }
         }
 
         Ok(peer)
     }
 
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-request-lifecycle")
+        {
+            // Nothing between this filter and the cache lookup (or the wait on the cache lock
+            // that follows it) waits on I/O, so a test can take this count as "the request has
+            // reached its cache lookup".
+            *RECORDED_CACHE_LOOKUPS
+                .lock()
+                .unwrap()
+                .entry(request_lifecycle_key(session.req_header()))
+                .or_default() += 1;
+        }
         // TODO: only allow GET & HEAD
 
         if session.get_header_bytes("x-bypass-cache") != b"" {
@@ -675,12 +1407,40 @@ impl ProxyHttp for ExampleProxyCache {
             .map(|_| CACHE_LOCK.as_ref());
         let mut overrides = CacheOptionOverrides::default();
         overrides.wait_timeout = Some(Duration::from_secs(2));
+        if let Some(wait_timeout) = session
+            .req_header()
+            .headers
+            .get("x-cache-lock-wait-timeout-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+        {
+            overrides.wait_timeout = Some(wait_timeout);
+        }
         let storage = if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-write")
+        {
+            &CACHE_WRITE_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-fail-finish-streaming")
+        {
+            &CACHE_STREAMING_FINISH_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
             .req_header()
             .headers
             .contains_key("x-cache-fail-finish")
         {
             &CACHE_FINISH_FAIL_BACKEND as &'static (dyn Storage + Sync)
+        } else if session
+            .req_header()
+            .headers
+            .contains_key("x-cache-demand-counting")
+        {
+            &CACHE_DEMAND_COUNTING_BACKEND as &'static (dyn Storage + Sync)
         } else {
             &*CACHE_BACKEND as &'static (dyn Storage + Sync)
         };
@@ -715,6 +1475,17 @@ impl ProxyHttp for ExampleProxyCache {
         }
 
         Ok(())
+    }
+
+    fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-test-leave-predictor-bypass")
+        {
+            return;
+        }
+        session.cache.cache_miss();
     }
 
     /// Reference `cache_key_callback` implementation for integration tests.
@@ -830,6 +1601,17 @@ impl ProxyHttp for ExampleProxyCache {
         upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-request-lifecycle")
+        {
+            *RECORDED_UPSTREAM_REQUEST_FILTERS
+                .lock()
+                .unwrap()
+                .entry(request_lifecycle_key(session.req_header()))
+                .or_default() += 1;
+        }
         if let Some(up_accept_encoding) = session
             .req_header()
             .headers
@@ -881,6 +1663,20 @@ impl ProxyHttp for ExampleProxyCache {
         if session
             .req_header()
             .headers
+            .contains_key("x-test-upstream-response-hooks")
+        {
+            let path = request_lifecycle_key(session.req_header());
+            UPSTREAM_RESPONSE_HOOK_CALLS
+                .lock()
+                .unwrap()
+                .entry(path)
+                .or_default()
+                .headers += 1;
+            upstream_response.insert_header("x-upstream-hook-applied", "true")?;
+        }
+        if session
+            .req_header()
+            .headers
             .contains_key("x-upstream-fake-http10")
         {
             // TODO to simulate an actual http1.0 origin
@@ -897,6 +1693,115 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-test-upstream-response-hooks")
+        {
+            if body.is_some() {
+                let path = request_lifecycle_key(session.req_header());
+                UPSTREAM_RESPONSE_HOOK_CALLS
+                    .lock()
+                    .unwrap()
+                    .entry(path)
+                    .or_default()
+                    .body_chunks += 1;
+            }
+
+            if body.as_deref() == Some(b"after abandonment") {
+                *body = Some(bytes::Bytes::from_static(b"after filter data"));
+                let delay = session
+                    .req_header()
+                    .headers
+                    .get("x-upstream-hook-delay-ms")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok())
+                    .map(Duration::from_millis);
+                return Ok(delay);
+            }
+        }
+
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-retryable-upstream-body-filter-error")
+            && body.as_deref() == Some(b"trigger retryable body filter error")
+        {
+            let mut error = Error::explain(ReadError, "injected upstream body filter error");
+            if !session
+                .req_header()
+                .headers
+                .contains_key("x-force-retry-in-error-hook")
+            {
+                error.set_retry(true);
+            }
+            return Err(error.into_up());
+        }
+        Ok(None)
+    }
+
+    async fn upstream_response_trailer_filter(
+        &self,
+        session: &mut Session,
+        _upstream_trailers: &mut http::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-test-upstream-response-hooks")
+        {
+            let path = request_lifecycle_key(session.req_header());
+            UPSTREAM_RESPONSE_HOOK_CALLS
+                .lock()
+                .unwrap()
+                .entry(path)
+                .or_default()
+                .trailers += 1;
+        }
+        Ok(())
+    }
+
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        error: Box<Error>,
+        _ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<Error> {
+        let mut error = error.more_context(format!("Peer: {peer}"));
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-force-retry-in-error-hook")
+        {
+            let path = request_lifecycle_key(session.req_header());
+            let mut observations_by_path = FORCED_RETRY_ERROR_HOOK_CALLS.lock().unwrap();
+            let observations = observations_by_path.entry(path).or_default();
+            observations.calls += 1;
+            observations.calls_with_retry_disabled += usize::from(matches!(
+                error.retry,
+                pingora_error::RetryType::Decided(false)
+            ));
+            error.set_retry(true);
+        } else if !session.req_header().method.is_idempotent()
+            || session.as_ref().retry_buffer_truncated()
+        {
+            error.set_retry(false);
+        } else {
+            error.retry.decide_reuse(client_reused);
+        }
+        error
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -906,6 +1811,17 @@ impl ProxyHttp for ExampleProxyCache {
     where
         Self::CTX: Send + Sync,
     {
+        if upstream_response.status.is_informational()
+            && session
+                .req_header()
+                .headers
+                .contains_key("x-fail-downstream-informational-filter-after-abandonment")
+        {
+            return Error::e_explain(
+                InternalError,
+                "downstream informational response filter ran after abandonment",
+            );
+        }
         if session.cache.enabled() {
             match session.cache.phase() {
                 CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
@@ -939,6 +1855,27 @@ impl ProxyHttp for ExampleProxyCache {
         Ok(())
     }
 
+    async fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-fail-downstream-filter-after-abandonment")
+            && body.as_deref() == Some(b"after filter data")
+        {
+            return Error::e_explain(
+                InternalError,
+                "downstream body filter ran after abandonment",
+            );
+        }
+        Ok(None)
+    }
+
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -950,6 +1887,7 @@ impl ProxyHttp for ExampleProxyCache {
     {
         // default OSS fail_to_proxy with added headers
         let code = match e.etype() {
+            _ if session.downstream_abandoned_during_cache_fill() => 0,
             HTTPStatus(code) => *code,
             _ => {
                 match e.esource() {
@@ -967,6 +1905,16 @@ impl ProxyHttp for ExampleProxyCache {
                 }
             }
         };
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-request-lifecycle")
+        {
+            RECORDED_FAIL_TO_PROXY_CODES
+                .lock()
+                .unwrap()
+                .insert(request_lifecycle_key(session.req_header()), code);
+        }
         if code > 0 {
             let mut resp = gen_error_response(code);
             // any relevant metadata headers to add
@@ -1011,6 +1959,51 @@ impl ProxyHttp for ExampleProxyCache {
         }
     }
 
+    fn should_handle_downstream_abandonment(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        session.get_header_bytes("x-handle-downstream-abandonment") == b"true"
+    }
+
+    /// Records the call and, as an application whose storage tracks writer demand does, releases
+    /// the active miss writer's demand. Storages that don't track demand ignore the release.
+    fn downstream_abandoned_during_cache_fill(&self, session: &Session, _ctx: &mut Self::CTX) {
+        let path = request_lifecycle_key(session.req_header());
+        {
+            let mut observations_by_path = DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS.lock().unwrap();
+            let observations = observations_by_path.entry(path).or_default();
+            observations.calls += 1;
+            if session.has_pending_downstream_tasks() {
+                observations.calls_with_pending_tasks += 1;
+            }
+        }
+        session.cache.release_miss_writer_demand();
+    }
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, _ctx: &mut Self::CTX) {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-request-lifecycle")
+        {
+            let path = request_lifecycle_key(session.req_header());
+            RECORDED_REQUEST_ERRORS
+                .lock()
+                .unwrap()
+                .insert(path.clone(), error.map(|error| error.etype().clone()));
+            RECORDED_CACHE_REASONS.lock().unwrap().insert(
+                path.clone(),
+                match session.cache.phase() {
+                    CachePhase::Disabled(reason) => Some(reason),
+                    _ => None,
+                },
+            );
+            *RECORDED_REQUEST_COMPLETIONS
+                .lock()
+                .unwrap()
+                .entry(path)
+                .or_default() += 1;
+        }
+    }
+
     fn suppress_proxy_warn_log(
         &self,
         _session: &Session,
@@ -1020,6 +2013,12 @@ impl ProxyHttp for ExampleProxyCache {
     ) -> bool {
         if context == ProxyWarnLogContext::DownstreamCache {
             DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+            let path = request_lifecycle_key(_session.req_header());
+            *DOWNSTREAM_CACHE_WARN_LOG_CALLS_BY_PATH
+                .lock()
+                .unwrap()
+                .entry(path)
+                .or_default() += 1;
         }
         // only observing, keep the logging behavior unchanged
         false

@@ -380,6 +380,19 @@ pub trait HandleMiss {
         None
     }
 
+    /// Release this writer's demand for an in-progress streaming fill, returning `true` only if
+    /// this call released it.
+    ///
+    /// A storage that shares one fill among concurrent readers can count each party that still
+    /// wants the object: the request that writes it, plus every reader attached to the write.
+    /// The writer's demand is that request's share, which an application drops through
+    /// [`crate::HttpCache::release_miss_writer_demand`] once the request's client has left.
+    /// Storage that tracks demand should make the release idempotent, so that a later call
+    /// returns `false`. Other backends return `false`.
+    fn release_writer_demand(&self) -> bool {
+        false
+    }
+
     /// Return the identity of the entry produced by this write to the eviction manager.
     ///
     /// Storage that identifies a stored generation beyond its

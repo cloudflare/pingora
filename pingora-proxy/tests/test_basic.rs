@@ -1662,3 +1662,9 @@ async fn test_h2_reset_before_headers_flush_keeps_headers_first() {
     drop(send_stream);
     let _ = conn_task.await;
 }
+
+#[path = "test_basic/cache_fill_abandonment.rs"]
+mod cache_fill_abandonment;
+
+#[path = "test_basic/gate_off_contract.rs"]
+mod gate_off_contract;

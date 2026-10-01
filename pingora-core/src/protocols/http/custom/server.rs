@@ -106,6 +106,15 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_written(&self) -> Option<&ResponseHeader>;
 
+    /// Whether the whole response is written, so nothing is left to deliver to the client.
+    ///
+    /// The proxy uses this to tell a client that failed after receiving its whole response from
+    /// one that left before it was complete. With the default `false`, every failure the proxy
+    /// counts as the client leaving is taken as leaving before the response was complete.
+    fn is_response_complete(&self) -> bool {
+        false
+    }
+
     fn shutdown(&mut self, code: u32, ctx: &str) -> impl Future<Output = ()> + Send;
 
     /// Abandon the response mid-message, in a way the peer can tell apart from a
