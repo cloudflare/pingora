@@ -835,7 +835,7 @@ impl HttpSession {
             debug!("Response header: {resp_header:?}");
             trace!(
                 "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
+                String::from_utf8_lossy(self.get_headers_raw())
             );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
@@ -2885,6 +2885,32 @@ hello";
         }
 
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_response_header_non_utf8() {
+        init_log();
+        let wire = b"GET / HTTP/1.1\r\n\r\n";
+        // Header value contains 0xff which is invalid UTF-8
+        let input = b"HTTP/1.1 200 OK\r\nX-Custom: \xff\r\nContent-Length: 0\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob);
+            }
+            _ => panic!("task should be header"),
+        }
     }
 }
 
