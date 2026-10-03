@@ -50,7 +50,7 @@ impl Estimator {
                 let counter = &slot[hash % slot.len()];
                 // Overflow is allowed for simplicity
                 let current = counter.fetch_add(value, Ordering::Relaxed);
-                std::cmp::min(min, current + value)
+                std::cmp::min(min, current.wrapping_add(value))
             })
     }
 
@@ -99,6 +99,22 @@ mod tests {
         assert_eq!(v, 3);
         let v = est.incr("b", 2);
         assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn incr_overflow() {
+        let est = Estimator::new(1, 1);
+        assert_eq!(est.incr("a", isize::MAX), isize::MAX);
+        assert_eq!(est.incr("a", 1), isize::MIN);
+        assert_eq!(est.get("a"), isize::MIN);
+    }
+
+    #[test]
+    fn incr_underflow() {
+        let est = Estimator::new(1, 1);
+        assert_eq!(est.incr("a", isize::MIN), isize::MIN);
+        assert_eq!(est.incr("a", -1), isize::MAX);
+        assert_eq!(est.get("a"), isize::MAX);
     }
 
     #[test]
