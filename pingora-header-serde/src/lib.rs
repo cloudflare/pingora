@@ -322,6 +322,20 @@ mod tests {
     }
 
     #[test]
+    fn test_ser_de_keeps_repeated_headers() {
+        // repeated fields such as Set-Cookie survive a round trip instead of collapsing to one
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.append_header("Set-Cookie", "a=1").unwrap();
+        header.append_header("Set-Cookie", "b=2").unwrap();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        let cookies: Vec<_> = header2.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
+    #[test]
     fn test_no_headers() {
         let serde = HeaderSerde::new(None);
         let header = ResponseHeader::build(200, None).unwrap(); // No headers added

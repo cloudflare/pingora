@@ -2863,6 +2863,27 @@ mod tests {
         assert_eq!(waiting.await.unwrap(), LockWaitOutcome::TransientError);
     }
 
+    /// An uncacheable response gives the lock up, so waiting readers all proceed uncached.
+    #[tokio::test]
+    async fn an_uncacheable_response_makes_waiting_readers_give_up() {
+        let key = "origin-not-cache";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+        assert!(writer.is_cache_lock_writer());
+
+        let mut reader = locked_reader(key, None);
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move { reader.cache_lock_wait().await });
+        tokio::task::yield_now().await;
+
+        writer.release_write_lock(NoCacheReason::OriginNotCache);
+
+        assert_eq!(waiting.await.unwrap(), LockWaitOutcome::GiveUp);
+    }
+
     fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
         let mut cache = HttpCache::new();
         cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
