@@ -1222,6 +1222,28 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_remove_header_drops_case_name() {
+        // removing a header also drops its case-preserved name, keeping names paired with values
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.append_header("X-Removed", "gone").unwrap();
+        req.append_header("FoO", "Bar").unwrap();
+        req.remove_header("x-removed");
+        req.append_header("BAZ", "baR").unwrap();
+        let mut buf: Vec<u8> = vec![];
+        req.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"FoO: Bar\r\nBAZ: baR\r\n");
+
+        let mut resp = ResponseHeader::new(None);
+        resp.append_header("X-Removed", "gone").unwrap();
+        resp.append_header("FoO", "Bar").unwrap();
+        resp.remove_header("x-removed");
+        resp.append_header("BAZ", "baR").unwrap();
+        let mut buf: Vec<u8> = vec![];
+        resp.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"FoO: Bar\r\nBAZ: baR\r\n");
+    }
+
     // These two no longer need patched_http1: the target carries no representable
     // path-and-query, so the Uri is rooted without consulting the linked http crate.
     #[test]
