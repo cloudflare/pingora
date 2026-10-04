@@ -1136,6 +1136,20 @@ mod tests {
         assert_eq!(meta.provenance_raw(), Some(provenance));
     }
 
+    /// Each serve-stale window includes its last second, as `is_fresh` includes `fresh_until`.
+    #[test]
+    fn test_cache_meta_serve_stale_window_end_is_inclusive() {
+        let admission = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let fresh_until = admission + Duration::from_secs(60);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let meta = CacheMeta::new(fresh_until, admission, 30, 120, header);
+
+        assert!(meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(30)));
+        assert!(meta.serve_stale_if_error(fresh_until + Duration::from_secs(120)));
+        assert!(!meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(31)));
+        assert!(!meta.serve_stale_if_error(fresh_until + Duration::from_secs(121)));
+    }
+
     #[test]
     fn expiring_at_the_current_instant_leaves_the_serve_stale_windows_open() {
         let admission = SystemTime::now();
