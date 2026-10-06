@@ -130,7 +130,7 @@ impl ProxyHttp for MyProxy {
             // Mutate: wrap the original body in an envelope before forwarding.
             let wrapped = format!(r#"{{"envelope":true,"original":{text}}}"#);
             info!("mutate: {wrapped}");
-            session.set_buffered_body(Some(Bytes::from(wrapped.clone())));
+            session.set_buffered_body(Some(Bytes::from(wrapped.clone())))?;
 
             // Update Content-Length to match the new body size.
             session

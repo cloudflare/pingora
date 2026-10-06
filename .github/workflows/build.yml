@@ -89,9 +89,10 @@ jobs:
       - name: Test early request body buffering
         if: matrix.toolchain == '1.97.1'
         run: |
-          cargo check --package pingora-proxy --all-targets --features openssl,early_body_buffer
+          cargo clippy --package pingora-proxy --all-targets --features openssl,early_body_buffer \
+            -- --allow=unknown-lints --deny=warnings
           cargo test --package pingora-proxy --features openssl,early_body_buffer \
-            --lib --test test_early_body_buffer_retry --no-fail-fast -- --test-threads=1
+            --lib --test test_early_body_buffer_retry --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)

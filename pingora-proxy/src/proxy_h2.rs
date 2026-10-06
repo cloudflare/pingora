@@ -542,29 +542,7 @@ where
                 .await?;
         }
 
-        #[cfg(not(feature = "early_body_buffer"))]
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
-
-        #[cfg(not(feature = "early_body_buffer"))]
-        let buffer = session.as_mut().get_retry_buffer();
-
-        #[cfg(feature = "early_body_buffer")]
-        let (mut downstream_state, buffer) = {
-            let is_body_buffered = session.is_body_buffered();
-            // Clone, never take: early buffering drains the body before
-            // enable_retry_buffering(), so this is the only copy a retry can replay.
-            let buffered_body = session.get_buffered_body().cloned();
-            crate::proxy_common::select_upstream_body_source(
-                is_body_buffered,
-                buffered_body,
-                || {
-                    (
-                        session.as_mut().is_body_done(),
-                        session.as_mut().get_retry_buffer(),
-                    )
-                },
-            )
-        };
+        let (mut downstream_state, buffer) = session.upstream_body_source();
 
         #[cfg(not(feature = "early_body_buffer"))]
         if let Some(buffer) = buffer {

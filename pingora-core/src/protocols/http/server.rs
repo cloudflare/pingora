@@ -793,10 +793,7 @@ where
     pub async fn write_continue_response(&mut self) -> Result<()> {
         match self {
             Self::H1(s) => s.write_continue_response().await,
-            Self::H2(s) => s.write_response_header(
-                Box::new(ResponseHeader::build(100, Some(0)).unwrap()),
-                false,
-            ),
+            Self::H2(s) => s.write_continue_response(),
             Self::Subrequest(s) => s.write_continue_response().await,
             // TODO(slava): is there any write_continue_response calls?
             Self::Custom(s) => {

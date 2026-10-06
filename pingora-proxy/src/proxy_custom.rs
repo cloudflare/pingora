@@ -25,7 +25,7 @@ use pingora_core::{
     ImmutStr,
 };
 use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
-use proxy_common::{DownstreamStateMachine, PipeState, ResponseStateMachine};
+use proxy_common::{PipeState, ResponseStateMachine};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -85,6 +85,18 @@ where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
+        // Custom upstreams do not forward early-buffered bodies yet, so fail before writing.
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            return (
+                false,
+                Some(Error::explain(
+                    InternalError,
+                    "early-buffered request bodies are not supported for custom upstreams",
+                )),
+            );
+        }
+
         client_session.set_read_timeout(peer.options.read_timeout);
         client_session.set_write_timeout(peer.options.write_timeout);
 
@@ -393,10 +405,10 @@ where
     {
         let mut cancel_downstream_reader_tx = Some(cancel_downstream_reader_tx);
 
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        let (mut downstream_state, buffer) = session.upstream_body_source();
 
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = buffer {
             self.send_body_to_custom(
                 session,
                 Some(buffer),
@@ -1297,5 +1309,35 @@ mod tests {
         .await;
 
         assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
+    }
+
+    /// The unit custom client session panics on every call, so reaching it fails this test.
+    #[cfg(feature = "early_body_buffer")]
+    #[tokio::test]
+    async fn early_buffered_body_is_rejected_before_custom_upstream_write() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("test request should be written");
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .set_buffered_body(Some(Bytes::from_static(b"buffered")))
+            .unwrap();
+
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        let peer = HttpPeer::new("127.0.0.1:80", false, String::new());
+        let (reuse, error) = proxy
+            .custom_proxy_down_to_up(&mut session, &mut (), &peer, &mut ())
+            .await;
+
+        assert!(!reuse);
+        let error = error.expect("buffered body must be rejected");
+        assert_eq!(error.etype(), &InternalError);
+        assert!(!error.retry());
     }
 }

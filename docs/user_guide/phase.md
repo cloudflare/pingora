@@ -62,15 +62,15 @@ This is the first phase of every request.
 This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
 ### `early_request_body_filter()`
-This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. `early_request_body_buffer_timeout()` can optionally bound the complete buffering phase, including body-filter callbacks. Requires the `early_body_buffer` cargo feature.
+This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. `early_request_body_buffer_timeout()` can optionally bound the complete buffering phase, including body-filter callbacks. No upstream timeout backstops this phase: HTTP/2 body reads have no per-read timeout and the HTTP/1 read timeout resets on every read, so applications enabling buffering should set a finite deadline. Requires the `early_body_buffer` cargo feature.
 
 Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
 
 Modify or discard each chunk through the callback's `body` argument. Set `*body = None` on every invocation to discard the entire body. After the buffering loop finishes, Pingora assembles the filtered chunks and stores the result, so do not call `session.set_buffered_body()` from `early_request_body_filter()`. To replace the fully assembled body, call it later from `request_filter()`.
 
-Whenever filtering or replacement changes the body length, update `Content-Length` and `Transfer-Encoding` before forwarding. In particular, leaving the original `Content-Length` after discarding bytes can leave an HTTP/1.1 upstream waiting for data that will never arrive. Pingora emits HTTP/2 stream termination itself based on the downstream request rather than the chunks retained by this filter.
+Whenever filtering or replacement changes the body length, update `Content-Length` and `Transfer-Encoding` before forwarding. In particular, leaving the original `Content-Length` after discarding bytes can leave an HTTP/1.1 upstream waiting for data that will never arrive. HTTP/2 stream termination is derived from the buffered body.
 
-Pingora answers an HTTP/1.1 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
+Pingora answers an HTTP/1.1 or HTTP/2 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
 
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.

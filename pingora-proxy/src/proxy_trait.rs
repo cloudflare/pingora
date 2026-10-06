@@ -293,9 +293,12 @@ where
     /// Set a deadline for buffering the entire request body.
     ///
     /// The deadline includes local `100 Continue` handling, downstream reads, and
-    /// [`Self::early_request_body_filter()`] calls. When it expires, buffering fails with a
-    /// downstream read timeout. Returning `None` leaves total buffering time unbounded, although
-    /// protocol-specific per-read timeouts may still apply.
+    /// [`Self::early_request_body_filter()`] calls. When it expires, buffering fails with HTTP 408.
+    ///
+    /// Returning `None` leaves total buffering time unbounded. No upstream exists yet, so no
+    /// upstream timeout backstops this phase: H2 body reads have no per-read timeout, and the H1
+    /// downstream read timeout resets on every read. Applications enabling buffering should
+    /// return a finite deadline.
     ///
     /// This is only consulted when [`Self::early_request_body_buffer_limit()`] returns `Some`.
     ///
@@ -327,8 +330,7 @@ where
     /// later from [`Self::request_filter()`].
     ///
     /// When filtering changes the body length, update `Content-Length` and `Transfer-Encoding`
-    /// before forwarding. Pingora emits HTTP/2 stream termination itself based on the downstream
-    /// request rather than the chunks retained by this filter.
+    /// before forwarding. HTTP/2 stream termination is derived from the buffered body.
     ///
     /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
     ///
@@ -700,9 +702,9 @@ where
     /// to the upstream.
     ///
     /// By default, this hook forces retry to false, regardless of the incoming retry state, when
-    /// the request method is non-idempotent, or when the body retry buffer was truncated. For
-    /// eligible requests,
-    /// [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused connection.
+    /// the request method is non-idempotent or the body retry buffer was truncated. For eligible
+    /// requests, [`pingora_error::RetryType::ReusedOnly`] errors are retried only on a reused
+    /// connection.
     ///
     /// Implementations that override this hook replace the default policy and are responsible for
     /// deciding when a retry is safe.
@@ -715,8 +717,8 @@ where
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        let body_replayable = session.req_header().method.is_idempotent();
-        if !body_replayable || session.as_ref().retry_buffer_truncated() {
+        if !session.req_header().method.is_idempotent() || session.as_ref().retry_buffer_truncated()
+        {
             e.set_retry(false);
         } else {
             e.retry.decide_reuse(client_reused);

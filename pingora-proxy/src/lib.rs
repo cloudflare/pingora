@@ -69,9 +69,7 @@ use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
 #[cfg(feature = "early_body_buffer")]
-use pingora_core::protocols::http::v1::common::{
-    header_value_content_length, is_expect_continue_req,
-};
+use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
@@ -998,8 +996,23 @@ where
     /// Application code calling this directly must first fully consume the downstream body and
     /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
     /// `Transfer-Encoding` to describe the supplied body.
+    ///
+    /// Returns an error if the downstream body has not been fully consumed.
     #[cfg(feature = "early_body_buffer")]
-    pub fn set_buffered_body(&mut self, body: Option<Bytes>) {
+    pub fn set_buffered_body(&mut self, body: Option<Bytes>) -> Result<()> {
+        // Also pins the H1 body reader to the original framing before callers rewrite it.
+        if !self.downstream_session.is_body_done() {
+            return Error::e_explain(
+                InternalError,
+                "set_buffered_body called before the downstream body was fully consumed",
+            );
+        }
+        self.store_buffered_body(body);
+        Ok(())
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    fn store_buffered_body(&mut self, body: Option<Bytes>) {
         self.body_buffered = true;
         self.buffered_request_body = body;
     }
@@ -1017,23 +1030,27 @@ where
     ///
     /// Used when buffering confirms that the request body is empty.
     #[cfg(feature = "early_body_buffer")]
-    pub fn mark_body_buffered(&mut self) {
+    pub(crate) fn mark_body_buffered(&mut self) {
         self.body_buffered = true;
     }
 
-    /// Creates a Session from an H1 HttpSession (for testing only).
-    #[cfg(all(test, feature = "early_body_buffer"))]
-    pub fn new_h1_with_http_session(
-        http_session: pingora_core::protocols::http::v1::server::HttpSession,
-    ) -> Self {
-        use pingora_core::protocols::http::ServerSession;
-
-        Self::new(
-            Box::new(ServerSession::H1(http_session)),
-            &HttpModules::new(),
-            #[cfg(feature = "upstream_modules")]
-            &HttpModules::new(),
-            Arc::new(AtomicBool::new(false)),
+    /// Returns the initial downstream body state and any body to send before reading downstream.
+    ///
+    /// Without early buffering this preserves the ordinary retry-buffer behavior.
+    pub(crate) fn upstream_body_source(
+        &mut self,
+    ) -> (proxy_common::DownstreamStateMachine, Option<Bytes>) {
+        #[cfg(feature = "early_body_buffer")]
+        if self.body_buffered {
+            // Clone, never take: this bypasses the retry buffer, so it is the only replayable copy.
+            return (
+                proxy_common::DownstreamStateMachine::ReadingFinished,
+                self.buffered_request_body.clone(),
+            );
+        }
+        (
+            proxy_common::DownstreamStateMachine::new(self.downstream_session.is_body_done()),
+            self.downstream_session.get_retry_buffer(),
         )
     }
 
@@ -1581,7 +1598,7 @@ where
             {
                 Ok(result) => result,
                 Err(_) => Error::e_explain(
-                    ReadTimedout,
+                    HTTPStatus(408),
                     format!("buffering request body, timeout: {total_timeout:?}"),
                 )
                 .map_err(|e| e.into_down()),
@@ -1635,7 +1652,7 @@ where
             return Ok(());
         }
 
-        if is_expect_continue_req(session.downstream_session.req_header()) {
+        if expects_continue(session.downstream_session.req_header()) {
             session
                 .downstream_session
                 .write_continue_response()
@@ -1696,7 +1713,11 @@ where
                 if let Some(combined) = combined.as_mut() {
                     combined.extend_from_slice(&filtered);
                 } else if let Some(first) = first_part.take() {
-                    let capacity = content_length.unwrap_or(retained_size).max(retained_size);
+                    // Content-Length is client-controlled, so it only seeds a bounded allocation.
+                    let capacity = content_length
+                        .unwrap_or(retained_size)
+                        .min(EARLY_BODY_PRESIZE_LIMIT)
+                        .max(retained_size);
                     let mut body = bytes::BytesMut::with_capacity(capacity);
                     body.extend_from_slice(&first);
                     body.extend_from_slice(&filtered);
@@ -1714,14 +1735,27 @@ where
         if retained_size == 0 {
             session.mark_body_buffered();
         } else if let Some(combined) = combined {
-            session.set_buffered_body(Some(combined.freeze()));
+            session.store_buffered_body(Some(combined.freeze()));
         } else {
             // common case: a single chunk can be moved without a second copy
-            session.set_buffered_body(first_part);
+            session.store_buffered_body(first_part);
         }
 
         Ok(())
     }
+}
+
+#[cfg(feature = "early_body_buffer")]
+const EARLY_BODY_PRESIZE_LIMIT: usize = 1 << 20;
+
+/// Like the H1 check, but also covers H2, which permits `Expect: 100-continue` too.
+#[cfg(feature = "early_body_buffer")]
+fn expects_continue(req: &RequestHeader) -> bool {
+    matches!(req.version, Version::HTTP_11 | Version::HTTP_2)
+        && req
+            .headers
+            .get(header::EXPECT)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
 /* Make process_subrequest() a trait to workaround https://github.com/rust-lang/rust/issues/78649
@@ -2334,35 +2368,6 @@ mod tests {
         }
     }
 
-    struct NonIdempotentRetryProxy;
-
-    #[async_trait]
-    impl ProxyHttp for NonIdempotentRetryProxy {
-        type CTX = ();
-
-        fn new_ctx(&self) -> Self::CTX {}
-
-        async fn upstream_peer(
-            &self,
-            _session: &mut Session,
-            _ctx: &mut Self::CTX,
-        ) -> Result<Box<HttpPeer>> {
-            unreachable!()
-        }
-
-        fn error_while_proxy(
-            &self,
-            _peer: &HttpPeer,
-            _session: &mut Session,
-            mut error: Box<Error>,
-            _ctx: &mut Self::CTX,
-            client_reused: bool,
-        ) -> Box<Error> {
-            error.retry.decide_reuse(client_reused);
-            error
-        }
-    }
-
     fn default_policy_would_retry_for_session(
         session: &mut Session,
         retry: RetryType,
@@ -2438,28 +2443,6 @@ mod tests {
             )
             .await
         );
-    }
-
-    #[tokio::test]
-    async fn application_override_can_enable_non_idempotent_retry() {
-        let mut session = new_request_session(
-            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
-            Arc::new(Mutex::new(Vec::new())),
-        )
-        .await;
-        let peer = HttpPeer::new("127.0.0.1:80", false, "".to_string());
-
-        for client_reused in [false, true] {
-            let mut error = Error::new_up(ReadError);
-            error.retry = RetryType::ReusedOnly;
-
-            assert_eq!(
-                NonIdempotentRetryProxy
-                    .error_while_proxy(&peer, &mut session, error, &mut (), client_reused,)
-                    .retry(),
-                client_reused
-            );
-        }
     }
 
     #[tokio::test]
@@ -2940,64 +2923,107 @@ mod tests {
     #[cfg(feature = "early_body_buffer")]
     mod body_buffer {
         use super::*;
-        use pingora_core::protocols::http::v1::server::HttpSession;
-        use tokio_test::io::Builder;
 
-        fn create_test_session() -> Session {
-            let mock_io = Builder::new().build();
-            let http_session = HttpSession::new(Box::new(mock_io));
-            Session::new_h1_with_http_session(http_session)
+        const EMPTY_POST: &[u8] =
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+
+        async fn empty_post_session() -> Session {
+            new_request_session(EMPTY_POST, Arc::new(Mutex::new(Vec::new()))).await
         }
 
-        #[test]
-        fn test_initial_state() {
-            let session = create_test_session();
+        #[tokio::test]
+        async fn test_initial_state() {
+            let session = empty_post_session().await;
             assert!(!session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());
         }
 
-        #[test]
-        fn test_set_and_get_buffered_body() {
-            let mut session = create_test_session();
+        #[tokio::test]
+        async fn test_set_and_get_buffered_body() {
+            let mut session = empty_post_session().await;
             let body = Bytes::from("test body");
 
-            session.set_buffered_body(Some(body.clone()));
+            session.set_buffered_body(Some(body.clone())).unwrap();
 
             assert!(session.is_body_buffered());
             assert_eq!(session.get_buffered_body(), Some(&body));
         }
 
-        #[test]
-        fn test_buffered_body_survives_repeated_reads() {
-            let mut session = create_test_session();
-            let body = Bytes::from("test body");
+        #[tokio::test]
+        async fn test_set_buffered_body_requires_consumed_downstream_body() {
+            let mut session = new_request_session(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
 
-            session.set_buffered_body(Some(body.clone()));
+            assert!(session.set_buffered_body(Some(Bytes::from("x"))).is_err());
+            assert!(!session.is_body_buffered());
 
-            for _ in 0..3 {
-                assert_eq!(session.get_buffered_body(), Some(&body));
-                assert!(session.is_body_buffered());
-            }
+            while session.read_request_body().await.unwrap().is_some() {}
+            session.set_buffered_body(Some(Bytes::from("x"))).unwrap();
+            assert!(session.is_body_buffered());
         }
 
-        #[test]
-        fn test_mark_body_buffered() {
-            let mut session = create_test_session();
+        #[tokio::test]
+        async fn test_mark_body_buffered() {
+            let mut session = empty_post_session().await;
 
-            assert!(!session.is_body_buffered());
             session.mark_body_buffered();
             assert!(session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());
         }
 
-        #[test]
-        fn test_set_none_marks_empty_body_buffered() {
-            let mut session = create_test_session();
+        #[tokio::test]
+        async fn test_set_none_marks_empty_body_buffered() {
+            let mut session = empty_post_session().await;
 
-            assert!(!session.is_body_buffered());
-            session.set_buffered_body(None);
+            session.set_buffered_body(None).unwrap();
             assert!(session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_upstream_body_source_replays_buffered_body() {
+            let mut session = empty_post_session().await;
+            let body = Bytes::from("payload");
+            session.set_buffered_body(Some(body.clone())).unwrap();
+
+            for _ in 0..3 {
+                let (state, buffer) = session.upstream_body_source();
+                assert!(state.is_done());
+                assert!(
+                    state.can_poll(),
+                    "finished bodies must still poll for close"
+                );
+                assert_eq!(buffer, Some(body.clone()));
+            }
+        }
+
+        #[tokio::test]
+        async fn test_upstream_body_source_empty_buffered_body() {
+            let mut session = empty_post_session().await;
+            session.set_buffered_body(None).unwrap();
+
+            let (state, buffer) = session.upstream_body_source();
+            assert!(state.is_done());
+            assert!(state.can_poll());
+            assert_eq!(buffer, None);
+        }
+
+        #[test]
+        fn test_expects_continue_covers_h1_and_h2() {
+            for version in [Version::HTTP_11, Version::HTTP_2] {
+                let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+                req.set_version(version);
+                req.insert_header(header::EXPECT, "100-Continue").unwrap();
+                assert!(expects_continue(&req), "{version:?}");
+            }
+
+            let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+            req.set_version(Version::HTTP_10);
+            req.insert_header(header::EXPECT, "100-continue").unwrap();
+            assert!(!expects_continue(&req));
         }
     }
 

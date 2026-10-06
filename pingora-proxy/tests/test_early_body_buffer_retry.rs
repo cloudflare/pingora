@@ -29,7 +29,7 @@ use pingora_core::prelude::HttpPeer;
 use pingora_core::protocols::ALPN;
 use pingora_core::server::configuration::ServerConf;
 
-use pingora_error::{Error, ErrorSource, ErrorType, Result};
+use pingora_error::{Error, Result};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -264,6 +264,7 @@ struct EarlyBufferProxy {
     early_filter_suffix: Option<&'static str>,
     replacement_body: Option<&'static str>,
     body_filter_calls: Arc<AtomicUsize>,
+    early_filter_chunks: Arc<AtomicUsize>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
     use_h2_upstream: bool,
     max_attempts: Arc<AtomicUsize>,
@@ -307,6 +308,9 @@ impl ProxyHttp for EarlyBufferProxy {
         _end_of_stream: bool,
         _ctx: &mut Ctx,
     ) -> Result<()> {
+        if body.is_some() {
+            self.early_filter_chunks.fetch_add(1, Ordering::SeqCst);
+        }
         if self.drop_body_in_early_filter {
             *body = None;
             let req = session.downstream_session.req_header_mut();
@@ -325,7 +329,7 @@ impl ProxyHttp for EarlyBufferProxy {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Ctx) -> Result<bool> {
         if let Some(replacement) = self.replacement_body {
-            session.set_buffered_body(Some(Bytes::from_static(replacement.as_bytes())));
+            session.set_buffered_body(Some(Bytes::from_static(replacement.as_bytes())))?;
             session
                 .req_header_mut()
                 .insert_header(http::header::CONTENT_LENGTH, replacement.len().to_string())?;
@@ -343,7 +347,7 @@ impl ProxyHttp for EarlyBufferProxy {
                 break;
             }
         }
-        session.set_buffered_body(Some(body.freeze()));
+        session.set_buffered_body(Some(body.freeze()))?;
         Ok(false)
     }
 
@@ -403,24 +407,6 @@ impl ProxyHttp for EarlyBufferProxy {
         error.retry.decide_reuse(client_reused);
         error
     }
-
-    async fn fail_to_proxy(
-        &self,
-        session: &mut Session,
-        error: &Error,
-        _ctx: &mut Ctx,
-    ) -> FailToProxy {
-        let error_code = match error.etype() {
-            ErrorType::HTTPStatus(code) => *code,
-            ErrorType::ReadTimedout if error.esource() == &ErrorSource::Downstream => 408,
-            _ => 500,
-        };
-        session.respond_error(error_code).await.unwrap();
-        FailToProxy {
-            error_code,
-            can_reuse_downstream: false,
-        }
-    }
 }
 
 #[async_trait]
@@ -465,6 +451,7 @@ impl ProxyHttp for DefaultRetryEarlyBufferProxy {
 struct Harness {
     proxy_port: u16,
     body_filter_calls: Arc<AtomicUsize>,
+    early_filter_chunks: Arc<AtomicUsize>,
     max_attempts: Arc<AtomicUsize>,
     recorder: Arc<Recorder>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
@@ -564,6 +551,7 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
         spawn_origin(recorder.clone(), config.fail_first).await
     };
     let body_filter_calls = Arc::new(AtomicUsize::new(0));
+    let early_filter_chunks = Arc::new(AtomicUsize::new(0));
     let max_attempts = Arc::new(AtomicUsize::new(0));
     let upstream_filter_expect_seen = Arc::new(AtomicBool::new(false));
 
@@ -580,6 +568,7 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
             early_filter_suffix: config.early_filter_suffix,
             replacement_body: config.replacement_body,
             body_filter_calls: app_body_filter_calls,
+            early_filter_chunks: early_filter_chunks.clone(),
             upstream_filter_expect_seen: app_expect_seen,
             use_h2_upstream: config.use_h2_upstream,
             max_attempts: app_attempts,
@@ -591,6 +580,7 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
     Harness {
         proxy_port,
         body_filter_calls,
+        early_filter_chunks,
         max_attempts,
         recorder,
         upstream_filter_expect_seen,
@@ -811,6 +801,39 @@ async fn post_with_expect_continue(port: u16, body: &str) -> (String, String) {
     .expect("proxy did not complete the Expect: 100-continue exchange")
 }
 
+async fn post_h2_with_expect_continue(port: u16, body: &'static str) -> String {
+    tokio::time::timeout(CLIENT_TIMEOUT, async {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (client, connection) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://127.0.0.1:{port}/echo"))
+            .header(http::header::CONTENT_LENGTH, body.len().to_string())
+            .header(http::header::EXPECT, "100-continue")
+            .body(())
+            .unwrap();
+        let mut client = client.ready().await.unwrap();
+        let (mut response, mut request_body) = client.send_request(request, false).unwrap();
+
+        let interim = std::future::poll_fn(|cx| response.poll_informational(cx))
+            .await
+            .expect("stream ended before an informational response")
+            .unwrap();
+        assert_eq!(interim.status(), http::StatusCode::CONTINUE);
+
+        request_body
+            .send_data(Bytes::from_static(body.as_bytes()), true)
+            .unwrap();
+        response.await.unwrap().status().as_u16().to_string()
+    })
+    .await
+    .expect("proxy did not complete the H2 Expect: 100-continue exchange")
+}
+
 async fn post_slow_body(port: u16) -> String {
     tokio::time::timeout(CLIENT_TIMEOUT, async {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -986,6 +1009,41 @@ async fn chunked_input_limit_is_enforced_before_filter_discards_bytes() {
     );
 }
 
+/// A client-advertised Content-Length must not size the allocation: with an effectively
+/// unlimited cap, two small chunks under `Content-Length: isize::MAX` used to abort the process.
+#[tokio::test]
+async fn huge_advertised_length_does_not_size_buffer_allocation() {
+    let harness = start_harness(usize::MAX, false).await;
+
+    tokio::time::timeout(CLIENT_TIMEOUT, async {
+        let mut stream = TcpStream::connect(("127.0.0.1", harness.proxy_port))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+            isize::MAX
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        // Wait for each chunk to be filtered so TCP cannot coalesce them into the single-chunk path.
+        for (seen, chunk) in [(1, b"a"), (2, b"b")] {
+            stream.write_all(chunk).await.unwrap();
+            stream.flush().await.unwrap();
+            while harness.early_filter_chunks.load(Ordering::SeqCst) < seen {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    })
+    .await
+    .expect("client could not send the partial body");
+
+    assert_eq!(
+        post(harness.proxy_port, "still-alive").await,
+        "200",
+        "proxy should survive and keep serving after the partial huge-length request"
+    );
+    assert_eq!(harness.recorder.bodies(), vec!["still-alive".to_string()]);
+}
+
 #[tokio::test]
 async fn retained_body_limit_is_enforced_after_filter_expands_bytes() {
     let harness = start_harness_with_config(
@@ -1060,6 +1118,33 @@ async fn expect_continue_is_answered_locally_and_not_forwarded_to_h1_or_h2() {
             "Expect must not be forwarded to the {protocol} origin after buffering"
         );
     }
+}
+
+#[tokio::test]
+async fn h2_expect_continue_is_answered_locally_and_not_forwarded() {
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            use_h2_downstream: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+    let body = "h2-continue-after-interim";
+
+    assert_eq!(
+        post_h2_with_expect_continue(harness.proxy_port, body).await,
+        "200"
+    );
+    assert_eq!(harness.recorder.bodies(), vec![body.to_string()]);
+    assert!(
+        harness
+            .recorder
+            .heads()
+            .iter()
+            .all(|head| !head.to_ascii_lowercase().contains("expect")),
+        "Expect must not be forwarded to the origin after buffering"
+    );
 }
 
 #[tokio::test]
