@@ -814,8 +814,8 @@ impl HttpSession {
             let end_of_body = self.is_body_done();
             debug!("Response header: {resp_header:?}");
             trace!(
-                "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
+                "Raw Response header: {}",
+                String::from_utf8_lossy(self.get_headers_raw())
             );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
