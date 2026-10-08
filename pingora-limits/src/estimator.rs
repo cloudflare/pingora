@@ -48,9 +48,8 @@ impl Estimator {
             .fold(isize::MAX, |min, (slot, hasher)| {
                 let hash = hash(&key, hasher) as usize;
                 let counter = &slot[hash % slot.len()];
-                // Overflow is allowed for simplicity
                 let current = counter.fetch_add(value, Ordering::Relaxed);
-                std::cmp::min(min, current + value)
+                std::cmp::min(min, current.wrapping_add(value))
             })
     }
 
