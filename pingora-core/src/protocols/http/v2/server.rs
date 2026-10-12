@@ -1836,9 +1836,8 @@ mod test {
                 .unwrap();
 
             let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            // Send a body matching the first Content-Length value so the h2
-            // codec accepts the stream and Pingora's duplicate-CL validation is
-            // what rejects the request.
+            // Match the first value so older h2 versions reach Pingora's
+            // duplicate-CL validation. Newer codecs reject the headers first.
             req_body.reserve_capacity(5);
             req_body.send_data("abcde".into(), true).unwrap();
 
@@ -1852,13 +1851,14 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        // The malformed stream is reset during acceptance, so it is reported as
-        // rejected rather than surfaced to the application as a session.
+        // Pingora reports its own rejection, while h2 versions that reject the
+        // headers internally return None after the client closes. Neither path
+        // may surface the malformed request as an application session.
         let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap();
         assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
+            !matches!(accepted, Some(H2Accept::Session(_))),
             "malformed request must not surface as a session"
         );
 
@@ -1875,7 +1875,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_req_malformed_stream_budget_exhausted() {
+    async fn test_req_duplicate_host_exhausts_malformed_stream_budget() {
         let (client, server) = duplex(65536);
 
         let client_task = tokio::spawn(async move {
@@ -1885,21 +1885,18 @@ mod test {
             });
             let mut h2 = h2.ready().await.unwrap();
 
+            // Duplicate Host fields reach Pingora's authority validation even
+            // when the h2 codec rejects conflicting Content-Length itself.
             let request = Request::builder()
                 .method(Method::GET)
                 .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
+                .header(header::HOST, "www.example.com")
+                .header(header::HOST, "www.example.com")
                 .body(())
                 .unwrap();
 
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-            let err = response.await.unwrap_err();
-            if let Some(reason) = err.reason() {
-                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
-            }
+            let (response, _) = h2.send_request(request, true).unwrap();
+            let _ = response.await;
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
