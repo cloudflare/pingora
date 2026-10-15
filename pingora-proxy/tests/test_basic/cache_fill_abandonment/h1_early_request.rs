@@ -112,7 +112,7 @@ async fn run_early_next_request(
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let request = read_h1_head(&mut socket).await;
+        let request = read_http1_head(&mut socket).await;
         // Whatever the client asked for, the fill is a GET.
         assert!(
             request.starts_with(&format!("GET {path} HTTP/1.1")),

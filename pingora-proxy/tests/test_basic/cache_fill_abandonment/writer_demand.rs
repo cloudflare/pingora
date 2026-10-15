@@ -89,7 +89,7 @@ impl ChunkedOrigin {
         let (closed_tx, closed) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_h1_head(&mut socket).await;
+            read_http1_head(&mut socket).await;
             socket.write_all(RESPONSE_HEAD).await.unwrap();
             write_chunk(&mut socket, CHUNKS[0]).await.unwrap();
             let mut byte = [0u8; 1];
@@ -433,7 +433,7 @@ async fn start_streaming_origin(
     let port = listener.local_addr().unwrap().port();
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         socket.write_all(RESPONSE_HEAD).await.unwrap();
         let chunk = vec![b's'; STREAM_CHUNK];
         write_chunk(&mut socket, &chunk).await.unwrap();

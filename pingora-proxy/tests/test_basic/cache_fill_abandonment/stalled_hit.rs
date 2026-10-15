@@ -157,7 +157,7 @@ impl ScriptedOrigin {
             mpsc::unbounded_channel::<(&'static [u8], oneshot::Sender<bool>)>();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_h1_head(&mut socket).await;
+            read_http1_head(&mut socket).await;
             requested_tx.send(()).unwrap();
             let mut probe = [0u8; 1];
             loop {
