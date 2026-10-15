@@ -27,7 +27,7 @@ async fn serve_h1_origin(
         .await
         .expect("proxy did not connect to the HTTP/1 origin")
         .unwrap();
-    read_h1_head(&mut socket).await;
+    read_http1_head(&mut socket).await;
     socket
         .write_all(
             b"HTTP/1.1 200 OK\r\nCache-Control: max-age=30\r\nTransfer-Encoding: chunked\r\nTrailer: x-origin-trailer\r\n\r\nc\r\nbefore reset\r\n",

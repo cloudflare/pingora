@@ -22,7 +22,10 @@ use futures::{SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue};
 use http_body_util::BodyExt;
 use pingora_http::ResponseHeader;
-use pingora_test_utils::http_origin::HttpOrigin;
+use pingora_test_utils::{
+    http_origin::HttpOrigin,
+    raw_http_origin::{read_http1_head, RawHttpOrigin},
+};
 use reqwest::{StatusCode, Version};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -37,23 +40,52 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 #[tokio::test]
 async fn test_ip_binding() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:6147/client_ip")
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, peer| async move {
+        read_http1_head(&mut stream).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nx-client-ip: {}\r\n\r\n",
+            peer.ip()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/client_ip")
+        .header("x-port", origin.addr().port().to_string())
+        .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let headers = res.headers();
     assert_eq!(headers["x-client-ip"], "127.0.0.2");
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_duplex() {
-    init();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        read_http1_head(&mut stream).await;
+        let body = [b'A'; 64 * 5];
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 320\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+        stream.write_all(&body).await.unwrap();
+        std::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
     // NOTE: this doesn't really verify that we are in full duplex mode as reqwest
     // won't allow us control when req body is sent
     let client = reqwest::Client::new();
     let res = client
         .post("http://127.0.0.1:6147/duplex/")
+        .header("x-port", origin.addr().port().to_string())
         .body("b".repeat(1024 * 1024)) // 1 MB upload
         .timeout(Duration::from_secs(5))
         .send()
@@ -64,18 +96,34 @@ async fn test_duplex() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_connection_die() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:6147/connection_die")
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        read_http1_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nAAAAA")
+            .await
+            .unwrap();
+        stream.set_zero_linger().unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/connection_die")
+        .header("x-port", origin.addr().port().to_string())
+        .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await;
     // reqwest doesn't allow us to inspect the partial body
     assert!(body.is_err());
+    origin.shutdown().await;
 }
 
 // This test is ignored because it has a fundamental timing dependency.
@@ -129,10 +177,18 @@ async fn test_upload_connection_die() {
 
 #[tokio::test]
 async fn test_upload() {
-    init();
+    init_proxy().await;
+    let origin = HttpOrigin::bind(|request| async move {
+        assert_eq!(request.body().len(), 15 * 1024 * 1024);
+        http::Response::new(Bytes::from(vec![b'A'; 64 * 5]))
+    })
+    .await
+    .unwrap();
+
     let client = reqwest::Client::new();
     let res = client
         .post("http://127.0.0.1:6147/upload/")
+        .header("x-port", origin.addr().port().to_string())
         .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
         .timeout(Duration::from_secs(5))
         .send()
@@ -141,14 +197,27 @@ async fn test_upload() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 64 * 5);
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_close_on_response_before_downstream_finish() {
-    init();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        read_http1_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
     let client = reqwest::Client::new();
     let res = client
         .post("http://127.0.0.1:6147/test2")
+        .header("x-port", origin.addr().port().to_string())
         .header("x-close-on-response-before-downstream-finish", "1")
         .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
         .timeout(Duration::from_secs(5))
@@ -160,11 +229,12 @@ async fn test_close_on_response_before_downstream_finish() {
     assert_eq!(headers["Connection"], "close");
     let body = res.text().await.unwrap();
     assert_eq!(body.len(), 11);
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_h1_upstream_not_reused_after_request_body_finish_error() {
-    init();
+    init_proxy().await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_port = listener.local_addr().unwrap().port();
@@ -483,7 +553,7 @@ fn capture_h1_upstream() -> impl std::future::Future<Output = (u16, oneshot::Rec
 // Ambiguous H2 authority must not reach upstream.
 #[tokio::test]
 async fn test_h2_ambiguous_authority_never_reaches_h1_upstream() {
-    init();
+    init_proxy().await;
 
     // With only `:authority` to go on, the downgrade synthesizes a matching `Host`.
     let (port, received) = capture_h1_upstream().await;
@@ -545,7 +615,7 @@ async fn test_h2_ambiguous_authority_never_reaches_h1_upstream() {
 
 #[tokio::test]
 async fn test_h2_downstream_host_override_selects_upstream_authority() {
-    init();
+    init_proxy().await;
 
     let (port, received) = capture_h1_upstream().await;
     assert_eq!(
@@ -585,7 +655,7 @@ async fn test_h2_downstream_host_override_selects_upstream_authority() {
 
 #[tokio::test]
 async fn test_post_filter_userinfo_authority_never_reaches_upstream() {
-    init();
+    init_proxy().await;
 
     let (port, mut received) = capture_h1_upstream().await;
     let status = send_h2c_host_override_request(port, false, "user@evil.example").await;
@@ -642,7 +712,7 @@ async fn send_h1_raw_bytes(request: &[u8]) -> String {
 #[cfg(feature = "patched_http1")]
 #[tokio::test]
 async fn test_hostless_non_utf8_h1_target_is_rejected_before_h2_serialization() {
-    init();
+    init_proxy().await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -665,7 +735,7 @@ async fn test_hostless_non_utf8_h1_target_is_rejected_before_h2_serialization() 
 
 #[tokio::test]
 async fn test_h1_absolute_form_to_h2_upstream_sends_path_and_query() {
-    init();
+    init_proxy().await;
 
     // An H1 upstream receives the absolute-form target verbatim from raw_path(), but
     // `:path` carries only the path and query (RFC 9113 section 8.3.1), so the two
@@ -701,7 +771,7 @@ async fn test_h1_absolute_form_to_h2_upstream_sends_path_and_query() {
 
 #[tokio::test]
 async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
-    init();
+    init_proxy().await;
 
     let request = concat!(
         "GET http://client.example/test HTTP/1.1\r\n",
@@ -768,7 +838,7 @@ async fn test_h1_absolute_form_host_is_restored_after_filter_deletion() {
 
 #[tokio::test]
 async fn test_origin_form_host_deletion_is_handled_before_upstream() {
-    init();
+    init_proxy().await;
 
     let request = concat!(
         "GET /test HTTP/1.1\r\n",
@@ -810,7 +880,7 @@ async fn test_origin_form_host_deletion_is_handled_before_upstream() {
 
 #[tokio::test]
 async fn test_hostless_h1_absolute_form_uses_target_authority() {
-    init();
+    init_proxy().await;
 
     let request = concat!(
         "GET http://client.example/test HTTP/1.0\r\n",
@@ -870,7 +940,7 @@ async fn test_hostless_http10_request_remains_hostless_upstream() {
 // Ambiguous H1 authority must not reach upstream.
 #[tokio::test]
 async fn test_h1_ambiguous_authority_never_reaches_upstream() {
-    init();
+    init_proxy().await;
 
     // A single valid Host is proxied, and "@" outside an authority is ordinary data.
     for (case, request) in [
@@ -1093,7 +1163,7 @@ async fn test_h1_upstream_rejects_excessive_connection_nominations() {
 
 #[tokio::test]
 async fn test_h1_upstream_preserves_chunked_framing_after_sanitizing_headers() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
@@ -1125,7 +1195,7 @@ async fn test_h1_upstream_preserves_chunked_framing_after_sanitizing_headers() {
 
 #[tokio::test]
 async fn test_h1_upstream_synthesizes_chunked_when_content_length_is_nominated() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
@@ -1156,7 +1226,7 @@ async fn test_h1_upstream_synthesizes_chunked_when_content_length_is_nominated()
 
 #[tokio::test]
 async fn test_h1_upstream_forwards_only_normalized_websocket_upgrade_metadata() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1188,7 +1258,7 @@ async fn test_h1_upstream_forwards_only_normalized_websocket_upgrade_metadata() 
 
 #[tokio::test]
 async fn test_h1_upstream_normalizes_websocket_upgrade_without_connection_token() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1216,7 +1286,7 @@ async fn test_h1_upstream_normalizes_websocket_upgrade_without_connection_token(
 
 #[tokio::test]
 async fn test_h1_upstream_normalizes_mixed_case_websocket_upgrade() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1244,7 +1314,7 @@ async fn test_h1_upstream_normalizes_mixed_case_websocket_upgrade() {
 
 #[tokio::test]
 async fn test_h1_upstream_does_not_upgrade_http10_websocket_request() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1270,7 +1340,7 @@ async fn test_h1_upstream_does_not_upgrade_http10_websocket_request() {
 
 #[tokio::test]
 async fn test_h1_upstream_denies_h2c_upgrade_metadata_by_default() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1299,7 +1369,7 @@ async fn test_h1_upstream_denies_h2c_upgrade_metadata_by_default() {
 
 #[tokio::test]
 async fn test_h1_upstream_denied_upgrade_does_not_tunnel_unsolicited_101_body() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: h2c\r\n\r\ntunneled",
@@ -1347,7 +1417,7 @@ async fn test_h1_upstream_denied_upgrade_does_not_tunnel_unsolicited_101_body() 
 
 #[tokio::test]
 async fn test_h1_upstream_accepts_101_when_neither_side_requested_upgrade() {
-    init();
+    init_proxy().await;
     let (port, _received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 101 Switching Protocols\r\n\r\n").await;
 
@@ -1366,7 +1436,7 @@ async fn test_h1_upstream_accepts_101_when_neither_side_requested_upgrade() {
 
 #[tokio::test]
 async fn test_h1_upstream_rejects_101_when_filter_adds_upgrade_without_downstream_upgrade() {
-    init();
+    init_proxy().await;
     let (port, _received) = capture_upstream_request(
         b"\r\n\r\n",
         b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1389,7 +1459,7 @@ async fn test_h1_upstream_rejects_101_when_filter_adds_upgrade_without_downstrea
 
 #[tokio::test]
 async fn test_h1_upstream_normalizes_transfer_coding_to_chunked_when_sanitizing() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
@@ -1420,7 +1490,7 @@ async fn test_h1_upstream_normalizes_transfer_coding_to_chunked_when_sanitizing(
 
 #[tokio::test]
 async fn test_h1_upstream_synthesizes_chunked_after_filter_removes_framing() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
@@ -1450,7 +1520,7 @@ async fn test_h1_upstream_synthesizes_chunked_after_filter_removes_framing() {
 
 #[tokio::test]
 async fn test_h1_upstream_does_not_synthesize_framing_for_empty_body() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1477,7 +1547,7 @@ async fn test_h1_upstream_does_not_synthesize_framing_for_empty_body() {
 
 #[tokio::test]
 async fn test_h1_upstream_does_not_synthesize_framing_without_downstream_body_headers() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1502,7 +1572,7 @@ async fn test_h1_upstream_does_not_synthesize_framing_without_downstream_body_he
 
 #[tokio::test]
 async fn test_h1_upstream_finishes_chunked_body_when_filter_discards_body() {
-    init();
+    init_proxy().await;
     let (port, received) = capture_upstream_request(
         b"0\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
@@ -1611,7 +1681,7 @@ async fn test_h1_upstream_always_sends_http11_request_version() {
 
 #[tokio::test]
 async fn test_h1_upstream_legacy_preset_preserves_upgrade_and_nominated_fields() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1643,7 +1713,7 @@ async fn test_h1_upstream_legacy_preset_preserves_upgrade_and_nominated_fields()
 
 #[tokio::test]
 async fn test_h1_upstream_preserve_upgrade_retains_complete_handshake_metadata() {
-    init();
+    init_proxy().await;
     let (port, received) =
         capture_upstream_request(b"\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -1675,7 +1745,7 @@ async fn test_h1_upstream_preserve_upgrade_retains_complete_handshake_metadata()
 
 #[tokio::test]
 async fn test_h2_upstream_strips_connection_nominated_fields() {
-    init();
+    init_proxy().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = oneshot::channel();
@@ -1711,7 +1781,7 @@ async fn test_h2_upstream_strips_connection_nominated_fields() {
 
 #[tokio::test]
 async fn test_h2_upstream_rejects_sensitive_fields_nominated_by_connection() {
-    init();
+    init_proxy().await;
     for nominated in ["Host", "X-Forwarded-For", ":authority"] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1918,7 +1988,7 @@ async fn test_download_timeout_min_rate() {
 // before sending END_STREAM, a subsequent downstream h1 request may be blocked
 #[tokio::test]
 async fn test_h2_upstream_no_end_stream_read_timeout() {
-    init();
+    init_proxy().await;
 
     // Spawn a custom H2 origin:
     //   Request 1: sends Content-Length body WITHOUT END_STREAM, then goes quiet
@@ -2069,7 +2139,7 @@ async fn mock_100_continue_server() -> u16 {
 
 #[tokio::test]
 async fn test_head_with_100_continue() {
-    init();
+    init_proxy().await;
 
     let port = mock_100_continue_server().await;
 
@@ -3202,7 +3272,7 @@ mod test_cache {
             rx
         }
 
-        init();
+        init_proxy().await;
 
         let url = "http://127.0.0.1:6148/unique/test_1xx_caching";
 
