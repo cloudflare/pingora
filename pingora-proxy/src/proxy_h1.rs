@@ -325,12 +325,24 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // The end of the request's own (pre-upgrade) body arrives as a plain `Body`
+                    // task. For an empty request (a websocket GET) the downstream queues it
+                    // before this loop starts, so the 101 can be read first; that end must
+                    // not be taken for the end of the upgraded stream (`UpgradedBody` or a
+                    // dropped sender), or the connection closes right after the 101.
+                    let pre_upgrade_end = matches!(body, Some(HttpTask::Body(_, true)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
-                                response_done = true;
+                                if pre_upgrade_end {
+                                    // continue receiving the upgraded body, as when this end
+                                    // is handled before the 101
+                                    request_done = false;
+                                } else {
+                                    response_done = true;
+                                }
                             }
                         },
                         Err(e) => {
@@ -1270,5 +1282,74 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    async fn read_until_head_end(stream: &mut tokio::io::DuplexStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+    }
+
+    // For a request without a body, the downstream half queues `Body(None, true)` before the
+    // duplex loop starts, so the upstream half may read the 101 first. That pre-upgrade end of
+    // body must not end the upgraded stream.
+    #[tokio::test]
+    async fn upgraded_stream_survives_request_end_handled_after_101() {
+        use tokio::io::AsyncReadExt;
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let (stream, mut upstream) = tokio::io::duplex(1024);
+        let mut client = HttpSessionV1::new(Box::new(stream));
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("Upgrade", "websocket").unwrap();
+        req.insert_header("Connection", "Upgrade").unwrap();
+        client.write_request_header(Box::new(req)).await.unwrap();
+        read_until_head_end(&mut upstream).await;
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+
+        let (to_downstream, mut from_upstream) = mpsc::channel(4);
+        let (to_upstream, from_downstream) = mpsc::channel(4);
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let upstream_half =
+            proxy.proxy_handle_upstream(&mut client, to_downstream, from_downstream, pipe_state);
+
+        let driver = async move {
+            // The 101 is read before the request's end of body is handled.
+            let header = from_upstream.recv().await.unwrap();
+            assert!(matches!(header, HttpTask::Header(..)), "{header:?}");
+            to_upstream.send(HttpTask::Body(None, true)).await.unwrap();
+            let sent = to_upstream
+                .send(HttpTask::UpgradedBody(
+                    Some(Bytes::from_static(b"ping")),
+                    false,
+                ))
+                .await;
+            assert!(
+                sent.is_ok(),
+                "the upgraded stream ended on the pre-upgrade end of body"
+            );
+            let mut buf = [0u8; 4];
+            time::timeout(Duration::from_secs(5), upstream.read_exact(&mut buf))
+                .await
+                .expect("the upgraded body was not forwarded upstream")
+                .unwrap();
+            assert_eq!(&buf, b"ping");
+            // The downstream closing the upgraded stream still ends it.
+            to_upstream
+                .send(HttpTask::UpgradedBody(None, true))
+                .await
+                .unwrap();
+            (from_upstream, upstream)
+        };
+
+        let (result, _keep) = tokio::join!(upstream_half, driver);
+        result.unwrap();
     }
 }
