@@ -613,10 +613,8 @@ async fn custom_upstream_early_next_request_then_close_fails_request() {
 /// body upload while it holds the response header. The proxy cancels only the forwarding of
 /// custom messages to the upstream: the application's sender to the upstream is closed with
 /// nothing written to or finished on the upstream, while messages from the upstream still go
-/// through the proxy's filter. The response that follows fills the cache but is not written to
-/// the client; once the custom messages from the upstream end, the request fails with the same
-/// write error as when the client closes, and the proxy answers the still-connected client with
-/// a `500`.
+/// through the proxy's filter. The complete response that follows fills the cache and reaches
+/// the client; once the custom messages from the upstream end, the request succeeds.
 #[tokio::test]
 async fn custom_upstream_upload_failure_stops_custom_messages_to_upstream_only() {
     let path = "/gate_off/custom_upstream_upload_failure";
@@ -674,11 +672,15 @@ async fn custom_upstream_upload_failure_stops_custom_messages_to_upstream_only()
     drop(upstream.custom);
     drop(to_downstream);
     let completions = proxy.observed.wait_for_completions(2).await;
-    assert_eq!(completions[1], failed_with_errored_downstream("POST"));
-    // The proxy had written nothing to the client, so it answers the failure with a `500`.
+    assert_eq!(completions[1], completed("POST"));
     let head = read_head(&mut client).await;
-    assert!(head.starts_with("HTTP/1.1 500"), "{head}");
-    assert_eq!(read_rest(&mut client).await, b"");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        header_value(&head, "x-cache-status"),
+        Some("miss"),
+        "{head}"
+    );
+    assert_eq!(read_n(&mut client, 12).await, b"hello world!");
     assert_eq!(proxy.observed.upstream_attempts(), 1);
     // The proxy hands the session back to its connector before the request completes.
     assert!(
