@@ -36,6 +36,7 @@ pub(crate) struct Acceptor {
     ssl_acceptor: SslAcceptor,
     callbacks: Option<SharedTlsAcceptCallbacks>,
     offload: Option<OffloadRuntime>,
+    write_coalescing: bool,
 }
 
 /// The TLS settings of a listening endpoint
@@ -43,6 +44,7 @@ pub struct TlsSettings {
     accept_builder: SslAcceptorBuilder,
     callbacks: Option<TlsAcceptCallbacks>,
     offload_threadpool: Option<(usize, usize)>,
+    write_coalescing: bool,
 }
 
 impl From<SslAcceptorBuilder> for TlsSettings {
@@ -51,6 +53,7 @@ impl From<SslAcceptorBuilder> for TlsSettings {
             accept_builder: settings,
             callbacks: None,
             offload_threadpool: None,
+            write_coalescing: false,
         }
     }
 }
@@ -90,6 +93,7 @@ impl TlsSettings {
             accept_builder,
             callbacks: None,
             offload_threadpool: None,
+            write_coalescing: false,
         })
     }
 
@@ -104,6 +108,7 @@ impl TlsSettings {
             accept_builder,
             callbacks: Some(callbacks),
             offload_threadpool: None,
+            write_coalescing: false,
         })
     }
 
@@ -145,6 +150,14 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
+    /// Coalesce the vectored writes of connections accepted on this endpoint, which is
+    /// default off. See [`SslStream::enable_write_coalescing`].
+    ///
+    /// **Note:** this is _unstable_ and may be renamed or removed in the future.
+    pub fn enable_write_coalescing(&mut self) {
+        self.write_coalescing = true;
+    }
+
     /// Set the ALPN preference of this endpoint. See [`ALPN`] for more details
     pub fn set_alpn(&mut self, alpn: ALPN) {
         match alpn {
@@ -175,6 +188,7 @@ impl TlsSettings {
             offload: self.offload_threadpool.map(|(shards, threads_per_shard)| {
                 OffloadRuntime::new("downstream TLS offload", shards, threads_per_shard)
             }),
+            write_coalescing: self.write_coalescing,
         }
     }
 }
@@ -182,7 +196,7 @@ impl TlsSettings {
 impl Acceptor {
     pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<SslStream<S>> {
         debug!("new ssl session");
-        if let Some(offload) = self.offload.as_ref() {
+        let mut stream = if let Some(offload) = self.offload.as_ref() {
             let ssl_acceptor = self.ssl_acceptor.clone();
             let callbacks = self.callbacks.clone();
             offload
@@ -194,12 +208,16 @@ impl Acceptor {
                     }
                 })
                 .await
-                .or_err(InternalError, "TLS offload runtime failure")?
+                .or_err(InternalError, "TLS offload runtime failure")??
         } else if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(&self.ssl_acceptor, stream, cb.as_ref()).await
+            handshake_with_callback(&self.ssl_acceptor, stream, cb.as_ref()).await?
         } else {
-            handshake(&self.ssl_acceptor, stream).await
+            handshake(&self.ssl_acceptor, stream).await?
+        };
+        if self.write_coalescing {
+            stream.enable_write_coalescing();
         }
+        Ok(stream)
     }
 }
 
@@ -294,5 +312,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bytes_read, 0);
+    }
+
+    /// Accepts a TLS connection with `settings` and returns the server's stream.
+    async fn accept_with(settings: TlsSettings) -> SslStream<tokio::io::DuplexStream> {
+        use crate::tls::ssl::{Ssl, SslConnector, SslVerifyMode};
+
+        let acceptor = settings.build();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client = tokio::spawn(async move {
+            let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+            connector.set_verify(SslVerifyMode::NONE);
+            let ssl = Ssl::new(&connector.build().into_context()).unwrap();
+            let mut stream = SslStream::new(ssl, client_io).unwrap();
+            stream.connect().await.unwrap();
+            stream
+        });
+        let server = acceptor.tls_handshake(server_io).await.unwrap();
+        client.await.unwrap();
+        server
+    }
+
+    #[tokio::test]
+    async fn accepted_streams_coalesce_writes_only_when_enabled() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        assert!(!accept_with(settings).await.write_coalescing());
+
+        let mut settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        settings.enable_write_coalescing();
+        assert!(accept_with(settings).await.write_coalescing());
     }
 }

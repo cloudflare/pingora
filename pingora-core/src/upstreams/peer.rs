@@ -377,6 +377,8 @@ impl Peer for BasicPeer {
     fn reuse_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self._address.hash(&mut hasher);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -561,6 +563,12 @@ pub struct PeerOptions {
     pub second_keyshare: bool,
     /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
+    /// Whether to coalesce the vectored writes of TLS connections to this peer, which is
+    /// default off. See `SslStream::enable_write_coalescing`. Only BoringSSL and OpenSSL
+    /// connections support it; other TLS backends ignore it.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    pub tls_write_coalescing: bool,
     /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
@@ -643,6 +651,7 @@ impl PeerOptions {
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
             tcp_fast_open: false,
+            tls_write_coalescing: false,
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
@@ -837,6 +846,8 @@ impl Hash for HttpPeer {
         // adjusted over the lifetime of a connection.
         self.options.curves.hash(state);
         self.options.second_keyshare.hash(state);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(state);
     }
 }
 
@@ -956,5 +967,24 @@ mod tests {
         assert!(!policy.strip_connection_nominated);
         assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    /// A connection keeps the write coalescing it was made with, so a peer that changes the
+    /// setting must not reuse it.
+    #[test]
+    fn peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into());
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
+    }
+
+    #[test]
+    fn basic_peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let mut peer = BasicPeer::new("127.0.0.1:443");
+        peer.sni = "pingora.org".into();
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
     }
 }

@@ -253,7 +253,7 @@ where
         .and_then(|o| o.upstream_tls_handshake_complete_hook.clone());
     let connect_future = handshake(ssl_conf, peer.sni(), stream, complete_hook);
 
-    match peer.connection_timeout() {
+    let mut stream = match peer.connection_timeout() {
         Some(t) => match pingora_timeout::timeout(t, connect_future).await {
             Ok(res) => res,
             Err(_) => Error::e_explain(
@@ -262,7 +262,14 @@ where
             ),
         },
         None => connect_future.await,
+    }?;
+    if peer
+        .get_peer_options()
+        .is_some_and(|o| o.tls_write_coalescing)
+    {
+        stream.enable_write_coalescing();
     }
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -273,8 +280,9 @@ mod tests {
     use crate::tls::pkey::PKey;
     use crate::tls::ssl::SslAcceptor;
     use crate::tls::x509::X509;
-    use crate::upstreams::peer::BasicPeer;
+    use crate::upstreams::peer::{BasicPeer, HttpPeer};
     use std::sync::Mutex;
+    use tokio::io::DuplexStream;
 
     // `verify-leaf.crt` is issued to `verify.test` by `verify-ca.crt`; both expire in 2126.
     const SNI: &str = "verify.test";
@@ -389,5 +397,38 @@ mod tests {
         handshake_with_fixture_server(&peer).await.unwrap();
 
         assert_eq!(*calls.lock().unwrap(), [(true, 1, 2), (true, 0, 2)]);
+    }
+
+    /// Connects to `peer` with the default connector, with a local TLS server on the other end
+    /// of a duplex, and returns the client's stream.
+    async fn connect_locally(peer: &HttpPeer) -> SslStream<DuplexStream> {
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        let dir = env!("CARGO_MANIFEST_DIR");
+        acceptor
+            .set_certificate_chain_file(format!("{dir}/tests/keys/server.crt"))
+            .unwrap();
+        acceptor
+            .set_private_key_file(format!("{dir}/tests/keys/key.pem"), SslFiletype::PEM)
+            .unwrap();
+        let acceptor = acceptor.build();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { accept(&acceptor, server_io).await.unwrap() });
+
+        let connector = Connector::new(None);
+        let stream = connect(client_io, peer, None, &connector.ctx)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn upstream_streams_coalesce_writes_only_when_the_peer_enables_it() {
+        let mut peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into());
+        peer.options.verify_cert = false;
+        assert!(!connect_locally(&peer).await.write_coalescing());
+
+        peer.options.tls_write_coalescing = true;
+        assert!(connect_locally(&peer).await.write_coalescing());
     }
 }
