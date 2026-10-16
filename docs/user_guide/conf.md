@@ -20,7 +20,7 @@ group: webusers
 | daemon | whether to run the server in the background | bool |
 | error_log | the path to error log output file. STDERR is used if not set | string |
 | upgrade_sock | the path to the upgrade socket. | string |
-| threads | number of threads per service | number |
+| threads | number of threads per service. Services in a [runtime group](runtime_groups.md) share one runtime sized for the group | number |
 | user | the user the pingora server should be run under after daemonization | string |
 | group | the group the pingora server should be run under after daemonization | string |
 | working_directory | the working directory for the daemonized process | string |

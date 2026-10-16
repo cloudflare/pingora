@@ -18,6 +18,7 @@ mod bootstrap_services;
 pub mod configuration;
 #[cfg(unix)]
 mod daemon;
+mod runtime_group;
 #[cfg(unix)]
 pub(crate) mod transfer_fd;
 
@@ -38,6 +39,8 @@ pub use pingora_runtime::{
 };
 pub use pingora_runtime::{RuntimeMetricsOpts, RuntimeOpts};
 use pingora_timeout::fast_timeout;
+pub use runtime_group::RuntimeGroupConf;
+use runtime_group::{RuntimeDefaults, RuntimePlan};
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 use std::sync::Arc;
@@ -51,7 +54,8 @@ use tokio::time::{sleep, Duration};
 use crate::prelude::background_service;
 use crate::server::bootstrap_services::{Bootstrap, BootstrapService};
 use crate::services::{
-    DependencyGraph, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch, ServiceWithDependents,
+    DependencyGraph, ServiceDependency, ServiceHandle, ServiceReadyNotifier, ServiceReadyWatch,
+    ServiceWithDependents,
 };
 use configuration::{Opt, ServerConf};
 use std::collections::HashMap;
@@ -218,6 +222,9 @@ pub struct Server {
 
     /// Specification of service level dependencies
     dependencies: Arc<Mutex<DependencyGraph>>,
+
+    /// Runtime groups registered with [`Self::add_runtime_group()`].
+    runtime_groups: HashMap<String, RuntimeGroupConf>,
 
     /// Service initialization
     bootstrap: Arc<Mutex<Bootstrap>>,
@@ -388,31 +395,18 @@ impl Server {
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_service(
+    /// Spawn the task that waits for the service's dependencies and then starts it on `runtime`.
+    fn spawn_service(
+        runtime: &Runtime,
         mut service: Box<dyn ServiceWithDependents>,
         #[cfg(unix)] fds: ListenFds,
         shutdown: ShutdownWatch,
-        threads: usize,
-        work_stealing: bool,
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
-        blocking_opts: BlockingPoolOpts,
-        runtime_opts: RuntimeOpts,
-    ) -> Runtime
-// NOTE: we need to keep the runtime outside async since
-        // otherwise the runtime will be dropped.
-    {
-        let service_runtime = Server::create_runtime(
-            service.name(),
-            threads,
-            work_stealing,
-            blocking_opts,
-            runtime_opts,
-        );
+    ) {
         let service_name = service.name().to_string();
-        service_runtime.get_handle().spawn(async move {
+        runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
             let mut time_waited_opt: Option<Duration> = None;
             for mut watch in dependency_watches {
@@ -444,7 +438,6 @@ impl Server {
                 .await;
             info!("service '{}' exited.", service_name);
         });
-        service_runtime
     }
 
     /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
@@ -480,6 +473,7 @@ impl Server {
             configuration: Arc::new(conf),
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
+            runtime_groups: HashMap::new(),
             bootstrap,
         }
     }
@@ -528,6 +522,7 @@ impl Server {
             configuration: Arc::new(conf),
             options: opt,
             dependencies: Arc::new(Mutex::new(DependencyGraph::new())),
+            runtime_groups: HashMap::new(),
             bootstrap,
         })
     }
@@ -605,6 +600,55 @@ impl Server {
     /// running, this function will try to get all its listening sockets in order to take them over.
     pub fn bootstrap(&mut self) {
         self.bootstrap.lock().bootstrap();
+    }
+
+    /// Register a runtime group, so that every service whose
+    /// [`runtime_group()`](ServiceWithDependents::runtime_group) returns `name` shares one runtime
+    /// built from `conf`.
+    ///
+    /// Services with similar workloads can share one worker pool this way, instead of each
+    /// service getting a runtime of its own. Each member keeps its own name, dependencies,
+    /// startup delay and readiness. The group's runtime is built when its first member starts,
+    /// and its worker threads (only the first 15 bytes are visible on Linux) and dial9 runtime
+    /// name are taken from the group name.
+    ///
+    /// Registration is optional: services may name a group that was never registered. Each
+    /// setting of the group's runtime is resolved as follows:
+    /// - threads: [`RuntimeGroupConf::threads`] if set, otherwise the largest
+    ///   [`threads()`](ServiceWithDependents::threads) among the members, with
+    ///   [`ServerConf::threads`] standing in for members that return [`None`]. [`Self::run()`]
+    ///   exits with an error if the result is zero, or if a member asks for zero threads in a
+    ///   group that does not set its own;
+    /// - runtime options: [`RuntimeGroupConf::runtime_opts`] if set, otherwise the one member's
+    ///   [`runtime_opts_override()`](ServiceWithDependents::runtime_opts_override), otherwise the
+    ///   server's runtime options. [`Self::run()`] exits with an error if two or more members
+    ///   override the runtime options of a group that does not set its own;
+    /// - work stealing and the blocking pool: the group's settings if set, otherwise the
+    ///   server configuration's. The blocking-thread limit applies to the group's runtime as a
+    ///   whole.
+    ///
+    /// A member setting that the group's configuration overrides is logged as a warning.
+    ///
+    /// [`Self::run()`] also exits with an error if two members of one group declare the same
+    /// address in [`listen_addresses()`](ServiceWithDependents::listen_addresses). Listeners
+    /// share descriptors by address through the server's listening-fd table, whether the
+    /// descriptor was inherited or freshly bound, so two members of one group cannot listen on
+    /// the same address; run them in separate runtimes or give them distinct addresses. Only
+    /// exactly equal address strings are caught, and members that return [`None`] there are not
+    /// checked.
+    ///
+    /// A group named like an ungrouped service is logged as a warning, because both runtimes'
+    /// worker threads and dial9 runtimes would share that name.
+    ///
+    /// The service created by [`Self::bootstrap_as_a_service()`] blocks while it receives
+    /// inherited sockets, so it always runs on a runtime of its own.
+    ///
+    /// Registering the same name again replaces the earlier configuration.
+    pub fn add_runtime_group(&mut self, name: impl Into<String>, conf: RuntimeGroupConf) {
+        let name = name.into();
+        if self.runtime_groups.insert(name.clone(), conf).is_some() {
+            warn!("Runtime group '{name}' registered again; the last configuration is used");
+        }
     }
 
     /// Create a service that will run to prepare the service to start
@@ -688,9 +732,6 @@ impl Server {
         #[cfg(feature = "sentry")]
         self.bootstrap.lock().start_sentry();
 
-        // Holds tuples of runtimes and their service name.
-        let mut runtimes: Vec<(Runtime, String)> = Vec::new();
-
         // Set this before the bootstrap service loads inherited fds.
         #[cfg(unix)]
         if let Some(expected) = self.collect_listen_addresses() {
@@ -713,6 +754,27 @@ impl Server {
             .collect();
         info!("Starting services in dependency order: {:?}", service_names);
 
+        let RuntimePlan {
+            runtimes: planned_runtimes,
+            runtime_of,
+        } = match self.plan_runtimes(
+            &startup_order,
+            &RuntimeDefaults {
+                threads: conf.threads,
+                work_stealing: conf.work_stealing,
+                blocking_opts: &blocking_opts,
+                runtime_opts: &runtime_opts,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                error!("Failed to set up service runtimes: {e}");
+                std::process::exit(1);
+            }
+        };
+        // Built lazily, when the runtime's first service starts.
+        let mut runtimes: Vec<Option<Runtime>> = planned_runtimes.iter().map(|_| None).collect();
+
         // Start services in dependency order
         for (service_id, service) in startup_order {
             let mut wrapper = match self.services.remove(&service_id) {
@@ -726,12 +788,7 @@ impl Server {
                 }
             };
 
-            let threads = wrapper.service.threads().unwrap_or(conf.threads);
             let name = wrapper.service.name().to_string();
-            let service_runtime_opts = wrapper
-                .service
-                .runtime_opts_override(&runtime_opts)
-                .unwrap_or_else(|| runtime_opts.clone());
 
             // Extract dependency watches from the ServiceHandle
             let dependencies = self
@@ -761,21 +818,47 @@ impl Server {
                 .map(|s| s.ready_watch.clone())
                 .collect::<Vec<_>>();
 
-            let runtime = Server::run_service(
+            let Some((slot, planned)) = runtime_of
+                .get(&service_id)
+                .and_then(|&index| Some((runtimes.get_mut(index)?, planned_runtimes.get(index)?)))
+            else {
+                error!(
+                    "Failed to set up service runtimes: no runtime planned for service '{name}'"
+                );
+                std::process::exit(1);
+            };
+            let runtime = slot.get_or_insert_with(|| {
+                if planned.grouped {
+                    info!(
+                        "Starting runtime group '{}' with {} threads for services: {:?}",
+                        planned.name, planned.threads, planned.members
+                    );
+                }
+                Server::create_runtime(
+                    &planned.name,
+                    planned.threads,
+                    planned.work_stealing,
+                    planned.blocking_opts.clone(),
+                    planned.runtime_opts.clone(),
+                )
+            });
+            Server::spawn_service(
+                runtime,
                 wrapper.service,
                 #[cfg(unix)]
                 self.listen_fds(),
                 self.shutdown_recv.clone(),
-                threads,
-                conf.work_stealing,
                 self.configuration.listener_tasks_per_fd,
                 ready_notifier,
                 dependency_watches,
-                blocking_opts.clone(),
-                service_runtime_opts,
             );
-            runtimes.push((runtime, name));
         }
+        // Holds tuples of runtimes and the names used for them in logs.
+        let runtimes: Vec<(Runtime, String)> = runtimes
+            .into_iter()
+            .zip(&planned_runtimes)
+            .filter_map(|(runtime, planned)| Some((runtime?, planned.label())))
+            .collect();
 
         // blocked on main loop so that it runs forever
         // Only work steal runtime can use block_on()
@@ -856,6 +939,22 @@ impl Server {
         self.execution_phase_watch
             .send(ExecutionPhase::Terminated)
             .ok();
+    }
+
+    /// Resolve which runtime each service in `startup_order` runs on.
+    fn plan_runtimes(
+        &self,
+        startup_order: &[(NodeIndex, ServiceDependency)],
+        defaults: &RuntimeDefaults,
+    ) -> Result<RuntimePlan, String> {
+        runtime_group::plan_runtimes(
+            startup_order.iter().filter_map(|(id, _)| {
+                let wrapper = self.services.get(id)?;
+                Some((*id, wrapper.service.as_ref()))
+            }),
+            &self.runtime_groups,
+            defaults,
+        )
     }
 
     fn create_runtime(

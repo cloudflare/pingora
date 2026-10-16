@@ -2020,6 +2020,7 @@ where
     server_options: Option<HttpServerOptions>,
     client_options: Option<ConnectorOptions>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
+    runtime_group: Option<String>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, (), ()> {
@@ -2042,6 +2043,7 @@ impl<SV> ProxyServiceBuilder<SV, (), ()> {
             server_options: None,
             client_options: None,
             runtime_opts_override: None,
+            runtime_group: None,
         }
     }
 }
@@ -2081,6 +2083,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -2092,6 +2095,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         }
     }
 
@@ -2122,6 +2126,14 @@ where
         self
     }
 
+    /// Run the [Service] built by this builder in the named runtime group.
+    ///
+    /// See [`Service::set_runtime_group`].
+    pub fn runtime_group(mut self, group: impl Into<String>) -> Self {
+        self.runtime_group = Some(group.into());
+        self
+    }
+
     /// Builds a new [Service] from the [ProxyServiceBuilder].
     ///
     /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
@@ -2142,6 +2154,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         } = self;
 
         let mut proxy = HttpProxy::new_custom(
@@ -2157,6 +2170,9 @@ where
         let mut service = Service::<_, DS>::new_with_custom_session(name, proxy);
         if let Some(runtime_opts_override) = runtime_opts_override {
             service.set_runtime_opts_override(runtime_opts_override);
+        }
+        if let Some(runtime_group) = runtime_group {
+            service.set_runtime_group(runtime_group);
         }
         service
     }

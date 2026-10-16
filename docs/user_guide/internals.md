@@ -27,7 +27,7 @@ After spawning the *services*, the server continues to listen to a termination e
 
 > NOTE: there are also "background" services, which just do *stuff*, and aren't necessarily listening to a socket. For now we're just talking about listener services.
 
-Each service has its own threadpool/tokio runtime, with a number of threads based on the configured value. Worker threads are not shared cross-service. Service runtime threadpools may be work-stealing (tokio-default), or non-work-stealing (N isolated single threaded runtimes).
+By default, each service has its own threadpool/tokio runtime, with a number of threads based on the configured value, and worker threads are not shared cross-service. Services in a [runtime group](runtime_groups.md) share one runtime instead. Service runtime threadpools may be work-stealing (tokio-default), or non-work-stealing (N isolated single threaded runtimes).
 
 ```
 ┌─────────────────────────┐
