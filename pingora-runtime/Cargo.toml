@@ -29,7 +29,7 @@ log = { workspace = true }
 dial9-tokio-telemetry = { version = "0.3", optional = true }
 dial9-perf-self-profile = { version = "0.4", optional = true }
 # Dial9's metrique dependencies require Rust 1.89. This optional feature is
-# therefore outside Pingora's Rust 1.85 default-feature MSRV check.
+# therefore outside Pingora's Rust 1.88 default-feature MSRV check.
 # Dial9 permits incompatible metrique companion releases with broad 0.1 ranges.
 # These direct dependencies are intentionally unreferenced; pin the complete
 # API-coupled family until Dial9's dependency ranges are tightened.
