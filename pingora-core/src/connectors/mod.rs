@@ -37,42 +37,11 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tls::TlsConnector;
-use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::Mutex;
-
-/// Holds a pooled [Stream] so it can be reclaimed by taking it out from
-/// behind the pool's lock rather than via `Arc::try_unwrap`.
-///
-/// `reused_stream` used to wait for the idle poller to drop its lock guard
-/// and then call `Arc::try_unwrap` on the strong count. That races with
-/// `OwnedMutexGuard::drop`, which releases the lock *before* dropping its own
-/// `Arc` clone of the mutex: the waiter can be woken and reach `try_unwrap`
-/// while the poller's clone is still alive, losing a perfectly healthy
-/// connection back to a fresh dial (see GH #998). Wrapping the stream in an
-/// `Option` and `take()`-ing it while holding the lock sidesteps the strong
-/// count entirely, so the race window no longer matters.
-struct ReusableStream(Option<Stream>);
-
-impl AsyncRead for ReusableStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.0.as_mut() {
-            Some(s) => Pin::new(s).poll_read(cx, buf),
-            // Only reachable if something polls after take(), which never
-            // happens: idle_poll exits for good once the stream is reused.
-            None => Poll::Ready(Ok(())),
-        }
-    }
-}
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 #[derive(Clone, Debug)]
 pub(crate) struct IdleConnection {
@@ -223,7 +192,8 @@ mod response_parser_config_tests {
 /// [TransportConnector] provides APIs to connect to servers via TCP or TLS with connection reuse
 pub struct TransportConnector {
     tls_ctx: tls::Connector,
-    connection_pool: Arc<ConnectionPool<Arc<Mutex<ReusableStream>>>>,
+    /// The stream is taken out of the `Option` when the connection is reused.
+    connection_pool: Arc<ConnectionPool<Arc<Mutex<Option<Stream>>>>>,
     offload: Option<OffloadRuntime>,
     bind_to_v4: Vec<SocketAddr>,
     bind_to_v6: Vec<SocketAddr>,
@@ -305,12 +275,11 @@ impl TransportConnector {
         match self.connection_pool.get(&peer.reuse_hash()) {
             Some(s) => {
                 debug!("find reusable stream, trying to acquire it");
-                // Wait for the idle poll to release it, and keep holding the
-                // guard: taking the stream out while we exclusively hold the
-                // lock is race-free regardless of when the poller's own Arc
-                // clone finishes dropping (see ReusableStream's doc comment).
-                let mut guard = s.lock().await;
-                match guard.0.take() {
+                // Wait for the idle poll to release the stream, then move it out under the lock.
+                // The idle poll's guard keeps its own `Arc` for a moment after unlocking, so
+                // `Arc::try_unwrap` here could still see a second owner.
+                let stream = s.lock().await.take();
+                match stream {
                     Some(mut stream) => {
                         // test_reusable_stream: we assume server would never actively send data
                         // first on an idle stream.
@@ -343,10 +312,10 @@ impl TransportConnector {
                             }
                         }
                     }
-                    // Should never happen: nothing else ever takes from this
-                    // Option, so it's still Some whenever the pool handed us `s`.
                     None => {
-                        error!("failed to acquire reusable stream");
+                        // Unreachable: `pool.get()` hands each pooled entry to exactly one caller,
+                        // and only this function takes the stream out of the slot.
+                        error!("reusable stream was already taken");
                         None
                     }
                 }
@@ -377,9 +346,15 @@ impl TransportConnector {
         let id = stream.id();
         let meta = ConnectionMeta::new(key, id);
         debug!("Try to keepalive client session");
-        let stream = Arc::new(Mutex::new(ReusableStream(Some(stream))));
-        let locked_stream = stream.clone().try_lock_owned().unwrap(); // safe as we just created it
-        let (notify_close, watch_use) = self.connection_pool.put(&meta, stream);
+        let pooled = Arc::new(Mutex::new(None));
+        let locked_stream = OwnedMutexGuard::map(
+            pooled
+                .clone()
+                .try_lock_owned()
+                .expect("newly created mutex must be unlocked"),
+            |slot| slot.insert(stream),
+        );
+        let (notify_close, watch_use) = self.connection_pool.put(&meta, pooled);
         let idle_meta = IdleConnection::new(meta);
         let pool = self.connection_pool.clone(); //clone the arc
         let keepalive_pool_callback = self.keepalive_pool_callback.clone();
@@ -724,6 +699,78 @@ mod tests {
         drop(stream);
         let _ = shutdown_tx.send(());
         server_handle.await.unwrap();
+    }
+
+    /// Wakes the test when the idle watcher's unlock wakes the pickup, then blocks the
+    /// watcher's thread until the test has polled the pickup again.
+    struct StallingWaker {
+        woken: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl std::task::Wake for StallingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.woken.send(());
+            let _ = self.resume.lock().unwrap().recv();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reuse_stream_while_idle_watcher_is_unlocking() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        // An upstream that accepts connections and never writes to them, so a pooled
+        // connection always stays reusable.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = BasicPeer::new(&listener.local_addr().unwrap().to_string());
+        tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.push(stream);
+            }
+        });
+
+        let connector = TransportConnector::new(None);
+        let mut stream = connector.new_stream(&peer).await.unwrap();
+        for _ in 0..100 {
+            connector.release_stream(stream, peer.reuse_hash(), None);
+
+            let (woken_tx, woken_rx) = std::sync::mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let waker = Waker::from(Arc::new(StallingWaker {
+                woken: woken_tx,
+                resume: std::sync::Mutex::new(resume_rx),
+            }));
+            let mut cx = Context::from_waker(&waker);
+            // Unconstrained, so tokio's coop budget never calls the stalling waker on this thread.
+            let mut pickup =
+                std::pin::pin!(tokio::task::unconstrained(connector.reused_stream(&peer)));
+
+            // The idle watcher almost always still holds the lock when the pickup first asks
+            // for it. When it let go first there is no unlock to poll inside, so try again.
+            if let Poll::Ready(reused) = pickup.as_mut().poll(&mut cx) {
+                stream = reused.expect("healthy pooled connection was dropped");
+                continue;
+            }
+            woken_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("idle watcher should unlock the stream");
+            // The watcher's thread is now stalled inside its unlock: the lock is free, but the
+            // watcher has not yet dropped its own handle to the stream.
+            let reused = pickup.as_mut().poll(&mut cx);
+            resume_tx.send(()).unwrap();
+            assert!(
+                matches!(reused, Poll::Ready(Some(_))),
+                "healthy pooled connection was dropped"
+            );
+            return;
+        }
+        panic!("the idle watcher never held the lock when the pickup asked for it");
     }
 
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — SYN packets are silently
