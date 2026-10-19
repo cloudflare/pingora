@@ -31,7 +31,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -369,11 +369,10 @@ pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 64 * 1024;
 /// similar to Nagle's algorithm, but user space can control when to flush.
 pub const DEFAULT_L4_WRITE_BUFFER_SIZE: usize = 1460;
 
-/// L4 [`BufStream`] buffer sizing.
+/// L4 read and write buffer sizing.
 ///
 /// Leaving either side as `None` preserves Pingora's default for that side.
-/// Setting either side to `Some(0)` disables `BufStream` buffering for that
-/// direction.
+/// Setting either side to `Some(0)` disables buffering for that direction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct L4BufferSettings {
     /// Read buffer size in bytes. `None` uses [`DEFAULT_L4_READ_BUFFER_SIZE`].
@@ -391,7 +390,7 @@ impl L4BufferSettings {
         }
     }
 
-    /// Create settings that disable both read and write `BufStream` buffering.
+    /// Create settings that disable both read and write buffering.
     pub fn unbuffered() -> Self {
         Self::new(0, 0)
     }
@@ -419,6 +418,105 @@ impl L4BufferSettings {
     }
 }
 
+/// The L4 buffers in front of a [`RawStreamWrapper`]: a read buffer over a write
+/// buffer, the same layering as tokio's [`BufStream`](tokio::io::BufStream).
+///
+/// A zero read capacity leaves the read buffer out, because [`BufReader`] panics on
+/// a zero capacity. Reads then go straight to the raw stream, as they did through
+/// an empty `BufReader`. [`BufWriter`] accepts a zero capacity and writes straight
+/// through.
+#[derive(Debug)]
+enum BufferedStream {
+    UnbufferedRead(BufWriter<RawStreamWrapper>),
+    BufferedRead(BufReader<BufWriter<RawStreamWrapper>>),
+}
+
+impl BufferedStream {
+    fn with_capacity(read: usize, write: usize, stream: RawStreamWrapper) -> Self {
+        let writer = BufWriter::with_capacity(write, stream);
+        if read == 0 {
+            BufferedStream::UnbufferedRead(writer)
+        } else {
+            BufferedStream::BufferedRead(BufReader::with_capacity(read, writer))
+        }
+    }
+
+    fn writer(&self) -> &BufWriter<RawStreamWrapper> {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer,
+            BufferedStream::BufferedRead(reader) => reader.get_ref(),
+        }
+    }
+
+    fn writer_mut(&mut self) -> &mut BufWriter<RawStreamWrapper> {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer,
+            BufferedStream::BufferedRead(reader) => reader.get_mut(),
+        }
+    }
+
+    fn get_ref(&self) -> &RawStreamWrapper {
+        self.writer().get_ref()
+    }
+
+    fn get_mut(&mut self) -> &mut RawStreamWrapper {
+        self.writer_mut().get_mut()
+    }
+
+    /// Return the raw stream. Anything left in either buffer is lost.
+    fn into_inner(self) -> RawStreamWrapper {
+        match self {
+            BufferedStream::UnbufferedRead(writer) => writer.into_inner(),
+            BufferedStream::BufferedRead(reader) => reader.into_inner().into_inner(),
+        }
+    }
+}
+
+impl AsyncRead for BufferedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            BufferedStream::UnbufferedRead(writer) => Pin::new(writer).poll_read(cx, buf),
+            BufferedStream::BufferedRead(reader) => Pin::new(reader).poll_read(cx, buf),
+        }
+    }
+}
+
+// `BufReader` only forwards writes to the `BufWriter` under it, so write to the `BufWriter`
+// directly.
+impl AsyncWrite for BufferedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.writer_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(self.writer_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Pin::new(self.writer_mut()).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(self.writer_mut()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.writer().is_write_vectored()
+    }
+}
+
 // NOTE: with writer buffering, users need to call flush() to make sure the data is actually
 // sent. Otherwise data could be stuck in the buffer forever or get lost when stream is closed.
 
@@ -426,7 +524,7 @@ impl L4BufferSettings {
 #[derive(Debug)]
 pub struct Stream {
     // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
-    stream: Option<BufStream<RawStreamWrapper>>,
+    stream: Option<BufferedStream>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
@@ -445,11 +543,11 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn stream(&self) -> &BufStream<RawStreamWrapper> {
+    fn stream(&self) -> &BufferedStream {
         self.stream.as_ref().expect("stream should always be set")
     }
 
-    fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
+    fn stream_mut(&mut self) -> &mut BufferedStream {
         self.stream.as_mut().expect("stream should always be set")
     }
 
@@ -525,15 +623,15 @@ impl Stream {
         }
     }
 
-    /// Set the buffer of BufStream
+    /// Set the read and write buffer sizes
     /// It is only set later because of the malloc overhead in critical accept() path
     pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
-        // Since BufStream doesn't provide an API to adjust the buf directly,
-        // we take the raw stream out of it and put it in a new BufStream with the size we want
+        // Since the buffers can't be resized in place,
+        // we take the raw stream out of them and put it in new buffers with the size we want
         let stream = mem::take(&mut self.stream);
         let stream = stream.map(|s| {
-            BufStream::with_capacity(
+            BufferedStream::with_capacity(
                 buffer.read_capacity(),
                 buffer.write_capacity(),
                 s.into_inner(),
@@ -546,7 +644,7 @@ impl Stream {
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
@@ -569,7 +667,7 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Virtual(s)),
@@ -593,7 +691,7 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
+            stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
                 RawStreamWrapper::new(RawStream::Unix(s)),
