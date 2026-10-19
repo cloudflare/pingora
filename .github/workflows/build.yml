@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         # nightly, msrv, and latest stable
-        toolchain: [nightly, 1.85.0, 1.97.1]
+        toolchain: [nightly, 1.88.0, 1.97.1]
     runs-on: ubuntu-24.04
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -29,7 +29,7 @@ jobs:
           sudo apt install -y cmake libclang-dev ca-certificates curl --no-install-recommends
 
       - name: Cache OpenResty
-        if: matrix.toolchain != '1.85.0'
+        if: matrix.toolchain != '1.88.0'
         id: cache-openresty
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -37,7 +37,7 @@ jobs:
           key: openresty-${{ runner.os }}-${{ runner.arch }}-${{ env.OPENRESTY_VERSION }}-${{ env.OPENRESTY_SHA256 }}-v1
 
       - name: Build OpenResty
-        if: matrix.toolchain != '1.85.0' && steps.cache-openresty.outputs.cache-hit != 'true'
+        if: matrix.toolchain != '1.88.0' && steps.cache-openresty.outputs.cache-hit != 'true'
         run: |
           sudo apt install -y build-essential libpcre2-dev libssl-dev zlib1g-dev --no-install-recommends
 
@@ -58,7 +58,7 @@ jobs:
           make install
 
       - name: Add OpenResty to PATH
-        if: matrix.toolchain != '1.85.0'
+        if: matrix.toolchain != '1.88.0'
         run: |
           test -x "$HOME/.local/openresty/bin/openresty"
           echo "$HOME/.local/openresty/bin" >> "$GITHUB_PATH"
@@ -75,7 +75,7 @@ jobs:
 
       - name: Run cargo check
         run: |
-          if [[ ${{ matrix.toolchain }} == 1.85.0 ]]; then
+          if [[ ${{ matrix.toolchain }} == 1.88.0 ]]; then
             # pingora-foundations follows Foundations' higher MSRV and is covered by the other toolchains in this matrix.
             cargo check --workspace --exclude pingora-foundations
           else
@@ -83,13 +83,13 @@ jobs:
           fi
 
       - name: Run cargo test
-        if: matrix.toolchain != '1.85.0'
+        if: matrix.toolchain != '1.88.0'
         run: cargo test --verbose --lib --bins --tests --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
-        if: matrix.toolchain != '1.85.0'
+        if: matrix.toolchain != '1.88.0'
         run: cargo test --verbose --doc
 
       - name: Run cargo clippy
