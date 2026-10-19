@@ -44,7 +44,13 @@ impl BackendSelection for KetamaHashing {
             .filter_map(|b| {
                 // FIXME: ketama only supports Inet addr, UDS addrs are ignored here
                 if let SocketAddr::Inet(addr) = b.addr {
-                    Some(Bucket::new(addr, b.weight as u32))
+                    // `Backend::weight` is an unvalidated usize set by whatever
+                    // `ServiceDiscovery` is in use (some treat 0 as "draining").
+                    // `Bucket::new` panics on a weight of 0, which would kill the
+                    // load balancer's background update task the next time
+                    // discovery returns such a backend. Clamp instead of passing
+                    // it through.
+                    Some(Bucket::new(addr, (b.weight as u32).max(1)))
                 } else {
                     None
                 }
@@ -156,5 +162,29 @@ mod test {
         assert_eq!(iter.next(), Some(&b1));
         let mut iter = hash.iter(b"test9");
         assert_eq!(iter.next(), Some(&b2));
+    }
+
+    #[test]
+    fn test_ketama_zero_weight_backend_does_not_panic() {
+        // A zero-weight backend used to panic inside Bucket::new and, on the
+        // real update path, take down the load balancer's background update
+        // task for good. It should be treated as weight 1 instead.
+        let b1 = Backend::new_with_weight("1.1.1.1:80", 0).unwrap();
+        let b2 = Backend::new("1.0.0.1:80").unwrap();
+        let backends = BTreeSet::from_iter([b1.clone(), b2.clone()]);
+
+        let hash = Arc::new(KetamaHashing::build(&backends));
+
+        // The zero-weight backend must still be reachable on the ring.
+        let mut seen_b1 = false;
+        for i in 0..100 {
+            let key = format!("test{i}");
+            let mut iter = hash.iter(key.as_bytes());
+            if iter.next() == Some(&b1) {
+                seen_b1 = true;
+                break;
+            }
+        }
+        assert!(seen_b1, "zero-weight backend should still get traffic");
     }
 }
