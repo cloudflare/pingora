@@ -202,8 +202,8 @@ impl TransportStackBuilder {
 /// Configuration for one listening endpoint.
 ///
 /// This configures the endpoint address and endpoint-specific transport
-/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4
-/// [`BufStream`](tokio::io::BufStream) buffer sizes.
+/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4 buffer sizes
+/// ([`L4BufferSettings`]).
 pub struct ListenerConfig {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
@@ -270,7 +270,7 @@ impl ListenerConfig {
         self
     }
 
-    /// Set L4 `BufStream` buffer sizes for this endpoint.
+    /// Set L4 read and write buffer sizes for this endpoint.
     pub fn l4_buffer(mut self, settings: L4BufferSettings) -> Self {
         self.l4_buffer = settings;
         self
@@ -568,6 +568,42 @@ mod test {
         // OS has completed the TCP handshake.
         TcpStream::connect(addrs[0]).await.unwrap();
         TcpStream::connect(addrs[1]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_unbuffered_listener_serves_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut listeners = Listeners::new();
+        listeners.add_listener(
+            ListenerConfig::tcp("127.0.0.1:0").l4_buffer(L4BufferSettings::unbuffered()),
+        );
+        let listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap().handshake().await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        server.await.unwrap();
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"pong");
     }
 
     #[test]
