@@ -582,6 +582,7 @@ where
                 client_body,
                 ctx,
                 write_timeout,
+                true,
             )
             .await
             .map_err(|e| e.error)?;
@@ -597,6 +598,7 @@ where
                 client_body,
                 ctx,
                 write_timeout,
+                true,
             )
             .await
             .map_err(|e| e.error)?;
@@ -688,7 +690,7 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout, false).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
@@ -1160,6 +1162,7 @@ where
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_body_to2(
         &self,
         session: &mut Session<DS>,
@@ -1168,6 +1171,7 @@ where
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
+        initial_replay: bool,
     ) -> std::result::Result<bool, H2BodySendError>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -1206,7 +1210,16 @@ where
          * downstream stream handles referenced while a downstream RST_STREAM goes
          * unobserved, pinning the downstream connection window credit until the
          * write completes. */
-        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+        // A complete replay cut short cannot resume, so while a partial-write fill could outlive
+        // the client, leave its closure to the loop's cache-fill policy. Decided after the body
+        // filters, which may disable caching.
+        let watch_downstream_close = !(initial_replay
+            && end_of_body
+            && session.cache.support_streaming_partial_write() == Some(true));
+        let stream_close = watch_downstream_close
+            .then(|| session.downstream_session.watch_h2_stream_close())
+            .flatten();
+        if let Some(stream_close) = stream_close {
             tokio::select! {
                 biased;
                 res = write_body(client_body, data, end, write_timeout) => {
@@ -1512,6 +1525,9 @@ fn test_h2_path_is_rooted_for_targets_with_no_authority() {
         );
     }
 }
+
+#[cfg(test)]
+mod replay_tests;
 
 #[cfg(test)]
 mod tests {
