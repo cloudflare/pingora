@@ -325,12 +325,23 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // The downstream half only marks tasks `UpgradedBody` once it has observed
+                    // the upgrade, so the end of the upgrade request's own body is a plain
+                    // `Body` task. When the upstream's 101 is read before that task is consumed,
+                    // it arrives with `was_upgraded()` already true and must not be mistaken for
+                    // the end of the tunnel.
+                    let ends_tunnel = !matches!(body, Some(HttpTask::Body(..)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
-                                response_done = true;
+                                if ends_tunnel {
+                                    response_done = true;
+                                } else {
+                                    // Keep streaming the downstream half of the tunnel.
+                                    request_done = false;
+                                }
                             }
                         },
                         Err(e) => {
@@ -1235,6 +1246,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
 
     struct ResponseFilter101;
 
@@ -1279,6 +1291,90 @@ mod tests {
             .await
             .expect("test request should parse");
         session
+    }
+
+    /// The upgrade request itself carries no body, so the downstream half sends a single
+    /// `Body(None, true)`. If the upstream's 101 is read before that task is consumed, the task
+    /// arrives after the session is already upgraded; treating it as the end of the tunnel tore
+    /// the connection down right after a successful upgrade.
+    #[tokio::test]
+    async fn upgraded_request_survives_body_end_queued_before_the_101() {
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+
+        let (mut upstream_peer, upstream_stream) = tokio::io::duplex(4096);
+        let mut client_session =
+            HttpSessionV1::new(Box::new(upstream_stream) as pingora_core::protocols::Stream);
+
+        let mut req = RequestHeader::build("GET", b"/socket", None).unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("Connection", "Upgrade").unwrap();
+        req.insert_header("Upgrade", "websocket").unwrap();
+        client_session
+            .write_request_header(Box::new(req))
+            .await
+            .expect("test request should be written");
+
+        // The upstream accepts the upgrade right away, so its 101 wins the race against the
+        // proxy's own processing of the (empty) request body.
+        upstream_peer
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .expect("test response should be written");
+
+        let (tx_upstream, _rx_upstream) = mpsc::channel(10);
+        let (tx_downstream, rx_downstream) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            // The end of the upgrade request's own body, queued while the 101 was being read.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx_downstream.send(HttpTask::Body(None, true)).await;
+            // The client's first frame on the established tunnel.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx_downstream
+                .send(HttpTask::UpgradedBody(
+                    Some(Bytes::from_static(b"ping")),
+                    false,
+                ))
+                .await;
+            // The client closes its half of the tunnel, which does end it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(tx_downstream);
+        });
+
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        timeout(
+            Duration::from_secs(5),
+            proxy.proxy_handle_upstream(
+                &mut client_session,
+                tx_upstream,
+                rx_downstream,
+                pipe_state,
+            ),
+        )
+        .await
+        .expect("proxy_handle_upstream should not hang")
+        .expect("proxy_handle_upstream should not fail");
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(Ok(n)) =
+            timeout(Duration::from_millis(200), upstream_peer.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+            if received.ends_with(b"ping") {
+                break;
+            }
+        }
+        let received = String::from_utf8_lossy(&received).into_owned();
+        assert!(
+            received.ends_with("ping"),
+            "the tunnel should still forward the client's frames, upstream saw: {received:?}"
+        );
     }
 
     #[tokio::test]
