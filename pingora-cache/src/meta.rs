@@ -18,7 +18,7 @@ pub use http::Extensions;
 use log::warn;
 use once_cell::sync::{Lazy, OnceCell};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_header_serde::HeaderSerde;
+use pingora_header_serde::{HeaderSerde, ResponseParserConfig};
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -962,6 +962,11 @@ impl CacheMetaDefaults {
 /// Used during initialization of [`HEADER_SERDE`].
 static COMPRESSION_DICT_CONTENT: OnceCell<Cow<'static, [u8]>> = OnceCell::new();
 
+/// The parser configuration for cached response headers.
+///
+/// Used during initialization of [`HEADER_SERDE`].
+static HEADER_SERDE_PARSER_CONFIG: OnceCell<ResponseParserConfig> = OnceCell::new();
+
 static HEADER_SERDE: Lazy<HeaderSerde> = Lazy::new(|| {
     let dict_opt = if let Some(dict_content) = COMPRESSION_DICT_CONTENT.get() {
         Some(dict_content.to_vec())
@@ -970,7 +975,10 @@ static HEADER_SERDE: Lazy<HeaderSerde> = Lazy::new(|| {
         None
     };
 
-    HeaderSerde::new(dict_opt)
+    HeaderSerde::new_with_parser_config(
+        dict_opt,
+        *HEADER_SERDE_PARSER_CONFIG.get_or_init(ResponseParserConfig::default),
+    )
 });
 
 pub(crate) fn header_serialize(header: &ResponseHeader) -> Result<Vec<u8>> {
@@ -1009,10 +1017,40 @@ pub fn set_compression_dict_content(content: Cow<'static, [u8]>) -> bool {
     COMPRESSION_DICT_CONTENT.set(content).is_ok()
 }
 
+/// Set the HTTP/1 response parser configuration for cached response headers.
+///
+/// Call this before serializing or deserializing cache metadata. Returns
+/// `false` if the configuration has already been set or the process-wide
+/// header serializer has already been initialized. This configuration is
+/// independent from the parser used by
+/// [`CachePutCtx`](crate::put::CachePutCtx) and upstream
+/// [`ConnectorOptions`](pingora_core::connectors::ConnectorOptions).
+pub fn set_header_serde_parser_config(config: ResponseParserConfig) -> bool {
+    HEADER_SERDE_PARSER_CONFIG.set(config).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn cache_meta_round_trips_with_default_header_limit() {
+        let now = SystemTime::now();
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(256)).unwrap();
+        for i in 0..256 {
+            header
+                .append_header(format!("x-{i}"), format!("value-{i}"))
+                .unwrap();
+        }
+        let meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        let (internal, header) = meta.serialize().unwrap();
+        let decoded = CacheMeta::deserialize(&internal, &header).unwrap();
+
+        assert_eq!(decoded.headers().len(), 256);
+        assert_eq!(decoded.headers()["x-255"], "value-255");
+    }
 
     #[test]
     fn test_cache_meta_age_without_override() {
@@ -1134,6 +1172,20 @@ mod tests {
         assert_eq!(meta.created(), admission);
         assert_eq!(meta.provenance(), provenance);
         assert_eq!(meta.provenance_raw(), Some(provenance));
+    }
+
+    /// Each serve-stale window includes its last second, as `is_fresh` includes `fresh_until`.
+    #[test]
+    fn test_cache_meta_serve_stale_window_end_is_inclusive() {
+        let admission = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let fresh_until = admission + Duration::from_secs(60);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let meta = CacheMeta::new(fresh_until, admission, 30, 120, header);
+
+        assert!(meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(30)));
+        assert!(meta.serve_stale_if_error(fresh_until + Duration::from_secs(120)));
+        assert!(!meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(31)));
+        assert!(!meta.serve_stale_if_error(fresh_until + Duration::from_secs(121)));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pingora-pool = { version = "0.9.0", path = "../pingora-pool" }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
 pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
+pingora-http-parser = { workspace = true }
 pingora-rustls = { version = "0.9.0", path = "../pingora-rustls", optional = true }
 pingora-s2n = { version = "0.9.0", path = "../pingora-s2n", optional = true }
 bstr = { workspace = true }
@@ -34,7 +35,6 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true, optional = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
-httparse = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
@@ -83,6 +83,7 @@ nix = { version = "~0.31.1", features = ["socket", "net", "fs", "uio"] }
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+httparse = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio"] }
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
@@ -122,7 +123,7 @@ openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
 s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]
-patched_http1 = ["pingora-http/patched_http1"]
+patched_http1 = ["pingora-http/patched_http1", "pingora-http-parser/patched_http1"]
 openssl_derived = ["any_tls"]
 any_tls = ["dep:tokio-util"]
 sentry = ["dep:sentry"]

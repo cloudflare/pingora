@@ -122,6 +122,15 @@ where
         matches!(self, Self::Custom(_))
     }
 
+    /// Whether an upgraded session should keep polling after request-body completion.
+    ///
+    /// Custom transports can use the idle poll to observe an out-of-band reset after
+    /// request EOF. HTTP/1 and subrequest sessions must leave the completed request
+    /// unpolled because their idle read can treat a valid half-close as a disconnect.
+    pub fn poll_after_upgrade(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
     /// Return a stable, human-readable label for this downstream session type.
     pub fn session_type(&self) -> &'static str {
         match self {
@@ -378,6 +387,15 @@ where
         }
     }
 
+    /// Set the maximum number of fields accepted in an HTTP/1 request head.
+    ///
+    /// This is a no-op for non-HTTP/1 sessions.
+    pub fn set_h1_header_count_limit(&mut self, limit: super::v1::HeaderLimit) {
+        if let Self::H1(session) = self {
+            session.set_header_count_limit(limit);
+        }
+    }
+
     /// Set user-defined context to carry across requests on the same keepalive connection.
     ///
     /// Only applicable for HTTP/1.x connections; noop for h2, subrequest, and custom sessions.
@@ -555,6 +573,20 @@ where
         }
     }
 
+    /// Whether the whole response is written: a final (non-1xx) header went out, nothing
+    /// remains queued, and the body is complete by its framing.
+    ///
+    /// For H2 this is when END_STREAM was sent. A custom session reports it through
+    /// [`super::custom::server::Session::is_response_complete`].
+    pub fn is_response_complete(&self) -> bool {
+        match self {
+            Self::H1(s) => s.is_response_complete(),
+            Self::H2(s) => s.is_response_complete(),
+            Self::Subrequest(s) => s.is_response_complete(),
+            Self::Custom(s) => s.is_response_complete(),
+        }
+    }
+
     /// Give up the http session abruptly.
     ///
     /// This is a failure path: the response is abandoned mid-message, so each
@@ -600,6 +632,18 @@ where
             Self::H1(s) => s.is_body_done(),
             Self::H2(s) => s.is_body_done(),
             Self::Subrequest(s) => s.is_body_done(),
+            Self::Custom(s) => s.is_body_done(),
+        }
+    }
+
+    /// Whether the request body has ended successfully for transports with explicit framing.
+    /// For H1 and subrequests, a read error can make `is_body_done()` true without completing
+    /// the declared body. H2 and custom sessions retain their existing completion contract.
+    pub fn is_body_complete(&mut self) -> bool {
+        match self {
+            Self::H1(s) => s.is_body_complete(),
+            Self::H2(s) => s.is_body_done(),
+            Self::Subrequest(s) => s.is_body_complete(),
             Self::Custom(s) => s.is_body_done(),
         }
     }
@@ -1081,6 +1125,120 @@ mod tests {
         session.shutdown().await;
 
         assert_eq!(*shutdown_calls.lock().unwrap(), ["abandon(shutdown)"]);
+    }
+
+    /// Reads `request` into an HTTP/1 session with proxy tasks enabled. The returned client end
+    /// holds only 64 bytes and is not read, so a larger response header write stays pending.
+    async fn h1_session_with_backpressured_client(
+        request: &str,
+    ) -> (Session, tokio::io::DuplexStream) {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut session = Session::new_http1(Box::new(server));
+        assert!(session.read_request().await.unwrap());
+        session.set_proxy_tasks_enabled(true);
+        (session, client)
+    }
+
+    fn response_with_large_header(status: u16, content_length: usize) -> Box<ResponseHeader> {
+        let mut response = ResponseHeader::build(status, None).unwrap();
+        response
+            .insert_header("content-length", content_length)
+            .unwrap();
+        response
+            .insert_header("x-padding", "p".repeat(1024))
+            .unwrap();
+        Box::new(response)
+    }
+
+    /// Queues `tasks`, cancels their write while the header is still pending, then lets the
+    /// client read and finishes the write, returning `is_response_complete` at both points.
+    async fn response_complete_around_pending_header_write(
+        request: &str,
+        tasks: Vec<HttpTask>,
+    ) -> (bool, bool) {
+        use futures::FutureExt;
+        use tokio::io::AsyncReadExt;
+
+        let (mut session, mut client) = h1_session_with_backpressured_client(request).await;
+        for task in tasks {
+            session.send_downstream_proxy_task(task);
+        }
+        assert!(session
+            .write_downstream_proxy_tasks()
+            .now_or_never()
+            .is_none());
+        assert!(session.has_pending_downstream_proxy_tasks());
+        let while_pending = session.as_http1().unwrap().is_response_complete();
+
+        let client_reads = tokio::spawn(async move {
+            let mut sink = [0u8; 256];
+            while client.read(&mut sink).await.unwrap() > 0 {}
+        });
+        assert!(session.write_downstream_proxy_tasks().await.unwrap());
+        let after_write = session.as_http1().unwrap().is_response_complete();
+        drop(session);
+        client_reads.await.unwrap();
+        (while_pending, after_write)
+    }
+
+    async fn assert_header_only_response_completes_when_written(
+        request: &str,
+        response: Box<ResponseHeader>,
+    ) {
+        let (while_pending, after_write) = response_complete_around_pending_header_write(
+            request,
+            vec![HttpTask::Header(response, true)],
+        )
+        .await;
+        assert!(
+            !while_pending,
+            "response complete before the header was written"
+        );
+        assert!(after_write, "response not complete after it was written");
+    }
+
+    #[tokio::test]
+    async fn response_is_complete_only_after_a_pending_head_response() {
+        assert_header_only_response_completes_when_written(
+            "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n",
+            response_with_large_header(200, 5),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_is_complete_only_after_a_pending_304_response() {
+        assert_header_only_response_completes_when_written(
+            "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            response_with_large_header(304, 5),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_is_complete_only_after_a_pending_empty_response() {
+        assert_header_only_response_completes_when_written(
+            "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            response_with_large_header(200, 0),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn response_is_complete_only_after_a_pending_response_with_a_body() {
+        let (while_pending, after_write) = response_complete_around_pending_header_write(
+            "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            vec![
+                HttpTask::Header(response_with_large_header(200, 5), false),
+                HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            ],
+        )
+        .await;
+        assert!(!while_pending);
+        assert!(after_write);
     }
 
     struct ProxyTaskCustom {

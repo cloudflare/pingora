@@ -13,4 +13,9 @@ ignore = [
     # h2 0.3.27 is pulled in only by the optional worker-s3 dependency chain.
     # The feature is disabled by default, but users who enable it remain affected.
     "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
+    # Same legacy chain: only rustls 0.21.12 (via hyper-rustls 0.24) is
+    # flagged. There is no 0.21.x backport (patched >= 0.23.46), and rustls
+    # 0.23 is already on 0.23.46.
+    "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
+    "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade key exchange
 ]

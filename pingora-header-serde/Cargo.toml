@@ -26,7 +26,7 @@ zstd = "0.13.1"
 zstd-safe = { version = "7.1.0", features = ["std"] }
 http = { workspace = true }
 bytes = { workspace = true }
-httparse = { workspace = true }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
+pingora-http-parser = { workspace = true }
 thread_local = "1.0"

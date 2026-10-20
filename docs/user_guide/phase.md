@@ -60,6 +60,8 @@ This is the first phase of every request.
 
 This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
+Right after this phase, before downstream modules and `request_filter()` run, the proxy calls `should_handle_downstream_abandonment()` once to decide whether this request opts in to Pingora's handling of a client that leaves while its response is still being produced. The decision can use the context set up in this phase. It returns `false` by default, which keeps the proxy behaving as it did before that handling existed.
+
 ### `request_filter()`
 This phase is usually for validating request inputs, rate limiting, and initializing context.
 
@@ -126,7 +128,7 @@ This phase is usually for logging and post request cleanup.
 ### `request_summary()`
 This is not a phase, but a commonly used callback.
 
-Every error that reaches `fail_to_proxy()` will be automatically logged in the error log. `request_summary()` will be called to dump the info regarding the request when logging the error.
+Errors that reach `fail_to_proxy()` are logged in the error log unless `suppress_error_log()` suppresses them. `request_summary()` will be called to dump the info regarding the request when logging the error.
 
 This callback returns a string which allows users to customize what info to dump in the error log to help track and debug the failures.
 
@@ -134,6 +136,25 @@ This callback returns a string which allows users to customize what info to dump
 This is also not a phase, but another callback.
 
 `fail_to_proxy()` errors are automatically logged in the error log, but users may not be interested in every error. For example, downstream errors are logged if the client disconnects early, but these errors can become noisy if users are mainly interested in observing upstream issues. This callback can inspect the error and returns true or false. If true, the error will not be written to the log.
+
+By default, once a request that `should_handle_downstream_abandonment()` opted in has had its downstream abandoned during a cache fill, this suppresses exactly the errors `pingora_cache::fill_cancellation::is_cache_fill_cancelled()` recognizes: `ERR_CACHE_FILL_CANCELLED`, including when another error wraps it. A cache fill the application itself asked to end early is expected control flow rather than a failure. The error still reaches `logging()`, so access logs are unaffected. For any other request or error the default suppresses nothing. Overriding this callback replaces the default entirely, including that suppression.
+
+Besides errors that reach `fail_to_proxy()`, it is offered the failure of a cache hit of an opted-in request whose client watch ended the hit because the client closed or reset its connection or stream. Every other failed cache hit is logged as it is without the opt-in.
+
+### `downstream_abandoned_during_cache_fill()`
+This is also not a phase, but another callback.
+
+It applies only to a request that `should_handle_downstream_abandonment()` opted in. Pingora calls it when that request's downstream becomes unusable and Pingora keeps filling the cache without it. Pingora calls it at most once per request, retries included.
+
+Pingora calls it only if the fill can still produce a cache entry:
+* during a miss with an active cache writer, or
+* with streaming storage, before the response's cache decision is made. The response's cacheability and its cache writer may not be known yet at that point.
+
+With storage that does not support streaming partial writes, Pingora does not keep filling. It returns the downstream error and does not call this callback.
+
+The callback runs inline on proxy I/O paths, so keep it cheap.
+
+By default the fill then runs until the upstream response completes. A storage backend can let the application cancel it earlier: its miss handler returns a `CacheFillCancellationWatcher` from `HandleMiss::cancellation_watcher()`, and the application calls `cancel()` on the matching `CacheFillCancellation` once nobody is waiting for the fill, either inside this callback or later, for example when the last other reader of the same asset leaves. The proxy only honors the cancellation after the downstream was abandoned, because until then the fill is also the downstream's response, and it observes it the next time it asks for upstream data: data the upstream already handed over is processed first, so a response whose final upstream bytes have already arrived is committed normally, and only a bounded amount of further data follows, so an upstream that always has more ready cannot keep a cancelled fill running. An honored cancellation cancels the upstream read without waiting for more upstream data, drops the miss handler without `finish()`, and fails the request with `ERR_CACHE_FILL_CANCELLED`, which is never retried. One `CacheFillCancellation` covers one logical fill, including miss handlers created for later upstream attempts after abandonment; it must not be reused for an unrelated later request that happens to share the cache key.
 
 ### `suppress_proxy_warn_log()`
 This is also not a phase, but another callback.

@@ -124,6 +124,9 @@ pub struct HttpSession {
     proxy_tasks_enabled: bool,
     /// Cancel-safe proxy task state.
     proxy_task_state: ProxyTaskState,
+    /// Whether [`Self::idle`] waits for the response receiver to close instead of the request
+    /// sender. Defaults to `false`; see [`Self::set_idle_watches_response_receiver`].
+    idle_watches_response_receiver: bool,
 }
 
 /// A handle to the subrequest session itself to interact or read from it.
@@ -186,6 +189,7 @@ impl HttpSession {
                 digest: digest.map(Box::new),
                 proxy_tasks_enabled: false,
                 proxy_task_state: ProxyTaskState::default(),
+                idle_watches_response_receiver: false,
             },
             SubrequestHandle {
                 tx: downstream_tx,
@@ -342,6 +346,12 @@ impl HttpSession {
         self.body_reader.body_done()
     }
 
+    /// Whether the request body reached its framing-defined end without an error.
+    pub fn is_body_complete(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.body_complete()
+    }
+
     /// Whether the request has an empty body
     /// Because HTTP 1.1 clients have to send either `Content-Length` or `Transfer-Encoding` in order
     /// to signal the server that it will send the body, this function returns accurate results even
@@ -420,6 +430,16 @@ impl HttpSession {
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_ref()
+    }
+
+    /// Whether the whole response is written: a final (non-1xx) header went out, no queued
+    /// proxy task remains, and the body is complete by its framing.
+    pub fn is_response_complete(&self) -> bool {
+        self.response_written
+            .as_ref()
+            .is_some_and(|header| !header.status.is_informational())
+            && !self.has_pending_proxy_tasks()
+            && self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade
@@ -601,8 +621,16 @@ impl HttpSession {
         })
     }
 
-    /// This function will (async) block forever until the client closes the connection.
+    /// Wait for an unexpected request task, or until the client of this subrequest goes away.
+    ///
+    /// Done and empty body tasks are skipped. The client goes away when it drops the request
+    /// sender ([`SubrequestHandle::tx`]), or, with [`Self::set_idle_watches_response_receiver`],
+    /// when it drops the response receiver ([`SubrequestHandle::rx`]). The wait then returns a
+    /// `ReadError`.
     pub async fn idle(&mut self) -> Result<HttpTask> {
+        if self.idle_watches_response_receiver {
+            return self.idle_until_response_receiver_closes().await;
+        }
         let rx = self.rx.as_mut().expect("rx valid before shutdown");
         let mut task = rx
             .recv()
@@ -621,9 +649,48 @@ impl HttpSession {
         Ok(task)
     }
 
+    /// [`Self::idle`] for a session with [`Self::set_idle_watches_response_receiver`] enabled.
+    async fn idle_until_response_receiver_closes(&mut self) -> Result<HttpTask> {
+        let rx = self.rx.as_mut().expect("rx valid before shutdown");
+        let tx = self.tx.as_ref().expect("tx valid before shutdown");
+        loop {
+            let task = tokio::select! {
+                task = rx.recv() => task,
+                _ = tx.closed() => None,
+            };
+            // Without a task, the request sender or the response receiver closed. The caller can
+            // close the sender while it still drains the response, so only losing the receiver
+            // abandons this work.
+            let Some(task) = task else {
+                tx.closed().await;
+                return Error::e_explain(
+                    ReadError,
+                    "response receiver closed during HTTP idle state",
+                );
+            };
+            if matches!(&task, HttpTask::Done)
+                || matches!(&task, HttpTask::Body(b, _) if b.as_ref().is_none_or(|b| b.is_empty()))
+            {
+                continue;
+            }
+            return Ok(task);
+        }
+    }
+
+    /// Make [`Self::idle`] treat the client as gone only once it drops the response receiver
+    /// ([`SubrequestHandle::rx`]).
+    ///
+    /// By default the idle wait ends when the client drops the request sender
+    /// ([`SubrequestHandle::tx`]), and dropping only the response receiver goes unnoticed. When
+    /// enabled, the client may drop the request sender while it still drains the response, and
+    /// the wait ends once nothing receives the response.
+    pub fn set_idle_watches_response_receiver(&mut self, enabled: bool) {
+        self.idle_watches_response_receiver = enabled;
+    }
+
     /// This function will return body bytes (same as [`Self::read_body_bytes()`]), but after
-    /// the client body finishes (`Ok(None)` is returned), calling this function again will block
-    /// forever, same as [`Self::idle()`].
+    /// the client body finishes (`Ok(None)` is returned), calling this function again waits the
+    /// way [`Self::idle()`] does.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if no_body_expected || self.is_body_done() {
             let read_task = self.idle().await?;
@@ -1269,6 +1336,52 @@ mod tests_stream {
     fn recv_task(rx: &mut mpsc::Receiver<HttpTask>) -> HttpTask {
         rx.try_recv()
             .expect("expected subrequest output task to be queued")
+    }
+
+    #[rstest]
+    #[case::request_open(false)]
+    #[case::request_closed(true)]
+    #[tokio::test(start_paused = true)]
+    async fn idle_waits_for_response_receiver(#[case] close_request: bool) {
+        let (mut session, handle) = build_req().await;
+        session.set_idle_watches_response_receiver(true);
+        handle.tx.send(HttpTask::Done).await.unwrap();
+        if close_request {
+            drop(handle.tx);
+        }
+        let idle = session.read_body_or_idle(true);
+        tokio::pin!(idle);
+        tokio::select! {
+            biased;
+            result = &mut idle => panic!("the response is still being consumed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        drop(handle.rx);
+        let error = tokio::time::timeout(Duration::from_secs(1), idle)
+            .await
+            .expect("idle did not observe the abandoned response")
+            .unwrap_err();
+        assert_eq!(error.etype, ReadError);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_ends_when_the_request_sender_closes_by_default() {
+        let (mut session, handle) = build_req().await;
+        handle.tx.send(HttpTask::Done).await.unwrap();
+        drop(handle.rx);
+        let idle = session.read_body_or_idle(true);
+        tokio::pin!(idle);
+        tokio::select! {
+            biased;
+            result = &mut idle => panic!("a dropped response receiver ended the idle wait: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        drop(handle.tx);
+        let error = tokio::time::timeout(Duration::from_secs(1), idle)
+            .await
+            .expect("idle did not observe the closed request sender")
+            .unwrap_err();
+        assert_eq!(error.etype, ReadError);
     }
 
     async fn session_from_input(input: &[u8]) -> (HttpSession, SubrequestHandle) {

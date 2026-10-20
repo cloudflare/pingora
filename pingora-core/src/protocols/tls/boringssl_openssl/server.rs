@@ -57,8 +57,10 @@ pub async fn handshake_with_callback<S: IO>(
         .await
         .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     if !done {
+        let downstream_fd = tls_stream.get_ref().id();
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
+        ext::set_downstream_fd(ssl_mut, downstream_fd);
         callbacks.certificate_callback(ssl_mut).await;
         Pin::new(&mut tls_stream)
             .resume_accept()
@@ -176,6 +178,7 @@ mod tests {
         #[async_trait]
         impl TlsAccept for Callback {
             async fn certificate_callback(&self, ssl: &mut TlsRef) -> () {
+                assert_eq!(ext::get_downstream_fd(ssl), Some(0));
                 assert_eq!(
                     ssl.servername(ssl::NameType::HOST_NAME).unwrap(),
                     "pingora.org"
