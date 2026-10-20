@@ -23,6 +23,7 @@ use log::{debug, error};
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::protocols::http::custom::server::Session as CustomServerSession;
 use crate::protocols::http::v1::HeaderLimit;
@@ -34,6 +35,8 @@ use crate::protocols::ALPN;
 
 // https://datatracker.ietf.org/doc/html/rfc9113#section-3.4
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+// Upper bound on the h2c preface sniff and the h2 handshake, same as the listener handshake
+const H2_SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
@@ -302,9 +305,13 @@ where
         // try to read h2 preface
         else if h2c && !custom {
             let mut buf = [0u8; H2_PREFACE.len()];
-            let peeked = stream
-                .try_peek(&mut buf)
+            // a client may send fewer bytes than the preface and then wait, bound the peek
+            let peeked = timeout(H2_SETUP_TIMEOUT, stream.try_peek(&mut buf))
                 .await
+                .map_err(|_| {
+                    debug!("Timed out while peeking h2c preface");
+                })
+                .ok()?
                 .map_err(|e| {
                     // this error is normal when h1 reuse and close the connection
                     debug!("Read error while peeking h2c preface {e}");
@@ -328,13 +335,18 @@ where
             });
 
             let h2_options = self.h2_options();
-            let h2_conn = match server::handshake(stream, h2_options).await {
-                Err(e) => {
-                    error!("H2 handshake error {e}");
-                    return None;
-                }
-                Ok(c) => c,
-            };
+            let h2_conn =
+                match timeout(H2_SETUP_TIMEOUT, server::handshake(stream, h2_options)).await {
+                    Err(_) => {
+                        debug!("H2 handshake timed out");
+                        return None;
+                    }
+                    Ok(Err(e)) => {
+                        error!("H2 handshake error {e}");
+                        return None;
+                    }
+                    Ok(Ok(c)) => c,
+                };
 
             // The accept-loop body — including the graceful-shutdown state
             // machine — lives in `server::accept_downstream_sessions` so that
@@ -463,5 +475,106 @@ mod tests {
         assert!(session2.take_connection_user_context().is_none());
         // Keepalive should still work
         assert_eq!(session2.get_keepalive(), Some(30));
+    }
+
+    use crate::protocols::l4::stream::Stream as L4Stream;
+    use crate::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+    // In-memory socket: lets an l4 `Stream` (which supports `try_peek`) run without a real socket
+    #[derive(Debug)]
+    struct DuplexSocket(DuplexStream);
+
+    impl AsyncRead for DuplexSocket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DuplexSocket {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl VirtualSocket for DuplexSocket {
+        fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct H2cApp {
+        options: HttpServerOptions,
+    }
+
+    #[async_trait]
+    impl HttpServerApp for H2cApp {
+        async fn process_new_http(
+            self: &Arc<Self>,
+            _session: ServerSession,
+            _shutdown: &ShutdownWatch,
+        ) -> Option<ReusedHttpStream> {
+            None
+        }
+
+        fn server_options(&self) -> Option<&HttpServerOptions> {
+            Some(&self.options)
+        }
+    }
+
+    // Runs process_new on an h2c listener against a peer that sends `sent` then goes quiet.
+    // Returns whether process_new finished within much longer than any sane readiness deadline.
+    async fn h2c_process_new_finishes(sent: &[u8]) -> bool {
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let stream: Stream = Box::new(L4Stream::from(VirtualSocketStream::new(Box::new(
+            DuplexSocket(server),
+        ))));
+        client.write_all(sent).await.unwrap();
+        client.flush().await.unwrap();
+
+        let options = HttpServerOptions {
+            h2c: true,
+            ..Default::default()
+        };
+        let app = Arc::new(H2cApp { options });
+        let (_tx, shutdown) = tokio::sync::watch::channel(false);
+        let res = tokio::time::timeout(
+            Duration::from_secs(600),
+            <H2cApp as ServerApp<()>>::process_new(&app, stream, &shutdown),
+        )
+        .await;
+        // keep the client open until here so the server never sees EOF
+        drop(client);
+        res.is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_h2c_sniff_short_h1_request_does_not_hang() {
+        // complete 18-byte HTTP/1.0 request, 6 bytes short of the 24-byte h2 preface
+        assert!(h2c_process_new_finishes(b"GET / HTTP/1.0\r\n\r\n").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_h2c_sniff_silent_peer_does_not_hang() {
+        assert!(h2c_process_new_finishes(b"").await);
     }
 }
