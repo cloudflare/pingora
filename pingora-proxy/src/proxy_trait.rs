@@ -333,9 +333,13 @@ where
 
     /// Determine whether to buffer the entire request body before connecting to upstream.
     ///
-    /// This is called after [`Self::early_request_filter()`] but before [`Self::request_filter()`]
-    /// and [`Self::upstream_peer()`]. The body can be accessed via
-    /// [`Session::get_buffered_body()`].
+    /// This is called after [`Self::early_request_filter()`],
+    /// [`Self::allow_spawning_subrequest()`], and [`Self::should_handle_downstream_abandonment()`],
+    /// but before [`Self::request_filter()`] and [`Self::upstream_peer()`]. The body can be
+    /// accessed via [`Session::get_buffered_body()`].
+    ///
+    /// When this returns `Some`, Pingora reads the downstream body itself, so neither this nor
+    /// [`Self::early_request_body_filter()`] may read it, including through a spawned subrequest.
     ///
     /// # Returns
     /// - `None`: Don't buffer, stream body to upstream (default)

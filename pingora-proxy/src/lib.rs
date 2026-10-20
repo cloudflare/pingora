@@ -1498,6 +1498,14 @@ where
                 .await;
         }
 
+        if self.inner.allow_spawning_subrequest(&session, &ctx) {
+            session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
+        }
+        let handles_downstream_abandonment = self
+            .inner
+            .should_handle_downstream_abandonment(&session, &ctx);
+        session.set_handles_downstream_abandonment(handles_downstream_abandonment);
+
         // early body buffering: read full request body before request_filter
         // see https://github.com/cloudflare/pingora/issues/780
         #[cfg(feature = "early_body_buffer")]
@@ -1508,14 +1516,6 @@ where
                     .await;
             }
         }
-
-        if self.inner.allow_spawning_subrequest(&session, &ctx) {
-            session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
-        }
-        let handles_downstream_abandonment = self
-            .inner
-            .should_handle_downstream_abandonment(&session, &ctx);
-        session.set_handles_downstream_abandonment(handles_downstream_abandonment);
 
         let req = session.downstream_session.req_header_mut();
 

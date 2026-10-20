@@ -1366,3 +1366,53 @@ async fn explicit_empty_buffer_does_not_write_after_h2_end_stream() {
         "H2 origin should observe the explicit empty buffer"
     );
 }
+
+/// Records whether the downstream abandonment opt-in was already applied when buffering began.
+struct AbandonmentOrderProxy {
+    origin_port: u16,
+    opted_in_before_buffering: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ProxyHttp for AbandonmentOrderProxy {
+    type CTX = ();
+
+    fn new_ctx(&self) {}
+
+    fn should_handle_downstream_abandonment(&self, _session: &Session, _ctx: &()) -> bool {
+        true
+    }
+
+    fn early_request_body_buffer_limit(&self, session: &Session, _ctx: &()) -> Option<usize> {
+        self.opted_in_before_buffering
+            .store(session.handles_downstream_abandonment(), Ordering::SeqCst);
+        Some(64 * 1024)
+    }
+
+    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
+        Ok(Box::new(HttpPeer::new(
+            format!("127.0.0.1:{}", self.origin_port),
+            false,
+            String::new(),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn abandonment_opt_in_is_applied_before_early_buffering() {
+    let recorder = Arc::new(Recorder::default());
+    let origin_port = spawn_origin(recorder.clone(), false).await;
+    let opted_in_before_buffering = Arc::new(AtomicBool::new(false));
+    let proxy_port = spawn_proxy_service(
+        AbandonmentOrderProxy {
+            origin_port,
+            opted_in_before_buffering: opted_in_before_buffering.clone(),
+        },
+        false,
+    )
+    .await;
+
+    assert_eq!(post(proxy_port, "payload").await, "200");
+    assert!(opted_in_before_buffering.load(Ordering::SeqCst));
+    assert_eq!(recorder.bodies(), vec!["payload".to_string()]);
+}
