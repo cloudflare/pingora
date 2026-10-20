@@ -110,4 +110,9 @@ jobs:
 
       - name: Run cargo machete
         run: |
-          [[ ${{ matrix.toolchain }} != 1.97.1 ]] || (cargo install cargo-machete --version 0.7.0 && cargo machete)
+          [[ ${{ matrix.toolchain }} != 1.97.1 ]] || (
+            # pingora-runtime's dial9 feature lists the metrique crates only to pin their versions,
+            # so no code references them. cargo-machete reads ignore lists only from Cargo.toml.
+            printf '\n[package.metadata.cargo-machete]\nignored = ["metrique", "metrique-core", "metrique-macro", "metrique-service-metrics", "metrique-timesource", "metrique-writer", "metrique-writer-core", "metrique-writer-macro"]\n' >> pingora-runtime/Cargo.toml
+            cargo install cargo-machete --version 0.7.0 && cargo machete
+          )

@@ -178,6 +178,27 @@ impl std::convert::From<SavedBody> for InputBody {
     }
 }
 
+/// Pipe the main session's request into `subrequest` and the subrequest's response back to the
+/// main session.
+///
+/// When [`Session::handles_downstream_abandonment`] is set, the pipe also watches the client
+/// while it waits for the subrequest's response, including while the subrequest has not asked
+/// for a body, is fed a preset one or cannot take more input: an HTTP/2 client from the start,
+/// any other client once its request body is complete. It fails with the downstream error as
+/// soon as the client leaves instead of waiting for that response. The watch is the regular idle
+/// read, as in the regular proxy: an HTTP/1 next request that the client sends early fails the
+/// pipe with a downstream `ConnectError` while pipelining is disabled, and is kept for the next
+/// session when it is enabled (see
+/// [`set_pipelining_enabled`](pingora_core::protocols::http::ServerSession::set_pipelining_enabled)).
+/// Once the watch has kept that request's first byte, later idle reads do not read the client,
+/// so a client that then closes goes unnoticed until the pipe ends, as in the proxy loops. The
+/// watch stops once the response is complete, so a next request sent after it stays unread.
+/// Without the opt-in, the pipe reads the client only to forward a body the subrequest asked
+/// for, so an early next request can be left unread.
+///
+/// With or without the opt-in, a client read that fails the pipe turns keep-alive off: an
+/// HTTP/1 read after the request body may have consumed the start of the next request, so the
+/// connection must not be reused.
 pub async fn pipe_subrequest<DS, F>(
     session: &mut Session<DS>,
     mut subrequest: PreparedSubrequest<DS>,
@@ -234,15 +255,35 @@ where
     let mut proxy_error_rx_err = false;
     let mut proxy_error_rx = subrequest_handle.subreq_proxy_error;
 
+    // Whether the pipe may watch the client; see `watch_downstream` below. Cleared once an idle
+    // wait ends without an error.
+    let mut may_watch_downstream = session.handles_downstream_abandonment();
+
     // Note: "upstream" here refers to subrequest session tasks,
     // downstream refers to main session
     while !downstream_state.is_done() || !response_state.is_done() {
         let send_permit = tx
             .try_reserve()
             .or_err(InternalError, "try_reserve() body pipe for subrequest");
+        let forward_body = wants_body && !use_preset_body && send_permit.is_ok();
+        // With the opt-in, the pipe watches the main session's client whenever it waits for the
+        // subrequest's response without reading that client to forward a body;
+        // `pipe_subrequest` documents the policy. The protocol that matters is the main
+        // session's, not the subrequest's, which is always HTTP/1. An HTTP/2 main session's idle
+        // wait reads nothing, so it is watched at once. Any other idle read takes a byte, which
+        // belongs to the request body until the body is complete, so that client is watched
+        // only then. Without a preset body, only the forwarding read below and a response write
+        // complete the body, and each marks the downstream done in the same branch, so by then
+        // the pipe has already sent the body's end. `!forward_body` keeps the watch off while
+        // the forwarding read, which once the body is complete is this same idle read, reads
+        // the client.
+        let watch_downstream = may_watch_downstream
+            && !forward_body
+            && !response_state.upstream_delivery_done()
+            && (session.is_http2() || session.is_body_done());
 
         tokio::select! {
-            task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_done() => {
+            task = state.pipe_rx.as_mut().expect("pipe_rx always set after spawn").recv(), if !response_state.upstream_delivery_done() => {
                 debug!("upstream event: {:?}", task);
                 if let Some(t) = task {
                     // Did the subrequest get headers?
@@ -276,13 +317,13 @@ where
 
                     // NOTE: technically it is the downstream whose response state has finished here
                     // we consider the subrequest's work done however
-                    response_state.maybe_set_upstream_done(response_done);
+                    response_state.maybe_set_upstream_delivery_done(response_done);
                     // unsuccessful upgrade response may force the request done
                     // (can only happen with a real session, TODO to allow with preset body)
                     downstream_state.maybe_finished(!use_preset_body && session.is_body_done());
                 } else {
                     debug!("upstream channel closed early");
-                    response_state.maybe_set_upstream_done(true);
+                    response_state.maybe_set_upstream_delivery_done(true);
                 }
             },
 
@@ -317,17 +358,34 @@ where
                  */
             },
 
-            body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
-                if wants_body && !use_preset_body && downstream_state.can_poll() && send_permit.is_ok() => {
+            body = session.downstream_session.read_body_or_idle(watch_downstream || downstream_state.is_done()),
+                if downstream_state.can_poll() && (forward_body || watch_downstream) => {
+                debug!(
+                    "downstream event: {} for subrequest",
+                    if watch_downstream { "client watch" } else { "main body" }
+                );
+                if let Err(e) = body.as_ref() {
+                    // A client whose read failed is not reused: an HTTP/1 client read after the
+                    // request body may have consumed the start of the next request.
+                    debug!("downstream read failed, keep-alive off: {e}");
+                    session.downstream_session.set_keepalive(None);
+                }
+                let body = map_pipe_err(body.map_err(|e| e.into_down()), false, &mut state)?;
+                // The watch reserves no send permit and yields no client body, so it must not
+                // fall through to the forwarding path below. Only a custom session can end its
+                // idle wait without an error; stop watching instead of waiting on it again.
+                if watch_downstream {
+                    may_watch_downstream = false;
+                    continue;
+                }
+
                 // this is the first subrequest
                 // send the body
-                debug!("downstream event: main body for subrequest");
-                let body = map_pipe_err(body.map_err(|e| e.into_down()), false, &mut state)?;
 
                 // If the request is websocket, `None` body means the request is closed.
                 // Set the response to be done as well so that the request completes normally.
                 if body.is_none() && session.is_upgrade_req() {
-                    response_state.maybe_set_upstream_done(true);
+                    response_state.maybe_set_upstream_delivery_done(true);
                 }
 
                 let is_body_done = session.is_body_done();
@@ -588,3 +646,6 @@ mod tests {
         assert!(error.state.header_received);
     }
 }
+
+#[cfg(test)]
+mod disconnect_tests;

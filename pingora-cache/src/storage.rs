@@ -15,14 +15,18 @@
 //! Cache backend storage abstraction
 
 use super::{CacheKey, CacheMeta};
-use crate::eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
+use crate::eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef, EvictionManager};
+use crate::fill_cancellation::CacheFillCancellationWatcher;
 use crate::key::CompactCacheKey;
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
+use log::warn;
 use pingora_error::Result;
 use std::any::Any;
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::time::SystemTime;
+use tokio::runtime::Handle;
 
 /// The reason a purge() is called
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +260,10 @@ pub trait HandleHit {
     /// Read cached body
     ///
     /// Return `None` when no more body to read.
+    ///
+    /// A storage whose fills can be cancelled, see [`HandleMiss::cancellation_watcher`], should
+    /// return `None` only once the whole body has been read, and an error to a reader of a write
+    /// that was dropped before [`HandleMiss::finish`].
     async fn read_body(&mut self) -> Result<Option<bytes::Bytes>>;
 
     /// Finish the current cache hit
@@ -350,6 +358,112 @@ pub enum MissFinishType {
     Appended(usize, Option<usize>),
 }
 
+/// A write's eviction accounting, which the caller prepares before it finishes the write and
+/// [`MissCompletion::complete`] applies once the write succeeds.
+///
+/// [`HandleMiss::finish_with_eviction`] receives it. Storage that overrides that method can move
+/// it into the worker that finishes the write, so the write's accounting has one owner whether or
+/// not the caller is still awaiting the write. It is not `Clone`, and `complete` consumes it, so a
+/// write is accounted at most once. A successful `finish_with_eviction` returns the
+/// [`MissCompleted`] that only `complete` creates, so an override cannot report success without
+/// having applied it.
+#[must_use = "a successful write is accounted only by calling `complete`"]
+pub struct MissCompletion {
+    item: CacheEntryKey,
+    fresh_until: SystemTime,
+    eviction: Option<&'static (dyn EvictionManager + Sync)>,
+    storage: &'static (dyn Storage + Sync),
+    trace: SpanHandle,
+    trace_name: &'static str,
+    /// The runtime that purges evicted entries, when [`Self::new`] ran on one with an eviction
+    /// manager to purge for.
+    executor: Option<Handle>,
+}
+
+impl MissCompletion {
+    /// Prepare the accounting for a write of `item`, an entry fresh until `fresh_until`.
+    ///
+    /// Without an `eviction` manager, [`Self::complete`] does nothing. With one, it purges the
+    /// entries the write evicts from `storage`, under a span named `trace_name` that starts as a
+    /// child of `trace` when the write completes. The purges run on the Tokio runtime current
+    /// here, so `complete` can run on a thread outside it, such as a blocking worker. When this
+    /// runs outside a runtime, they run on the one current where `complete` runs.
+    pub fn new(
+        item: CacheEntryKey,
+        fresh_until: SystemTime,
+        eviction: Option<&'static (dyn EvictionManager + Sync)>,
+        storage: &'static (dyn Storage + Sync),
+        trace: SpanHandle,
+        trace_name: &'static str,
+    ) -> Self {
+        MissCompletion {
+            item,
+            fresh_until,
+            eviction,
+            storage,
+            trace,
+            trace_name,
+            executor: eviction.and_then(|_| Handle::try_current().ok()),
+        }
+    }
+
+    /// Apply a successful write to the eviction manager: admit a created entry at its size, or
+    /// grow an appended one by its delta, capped by its max size. The entries this evicts are
+    /// purged from storage in the background, each as a [`PurgeType::Eviction`] of that exact
+    /// entry.
+    ///
+    /// This neither blocks nor awaits, so storage can call it from whatever worker finishes the
+    /// write, a blocking thread included.
+    ///
+    /// Returns the receipt that a successful [`HandleMiss::finish_with_eviction`] returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when there is an eviction manager and neither [`Self::new`] nor this call ran
+    /// inside a Tokio runtime.
+    pub fn complete(self, finish: MissFinishType) -> MissCompleted {
+        let completed = MissCompleted { _private: () };
+        let Some(eviction) = self.eviction else {
+            return completed;
+        };
+        let executor = self.executor.unwrap_or_else(Handle::current);
+        let evicted = match finish {
+            MissFinishType::Created(size) => eviction.admit(self.item, size, self.fresh_until),
+            MissFinishType::Appended(delta, max_weight) => {
+                eviction.increment_weight(&self.item, delta, max_weight)
+            }
+        };
+        // actual eviction can be done async
+        let span = self.trace.child(self.trace_name, |o| o.start());
+        let handle = span.handle();
+        let storage = self.storage;
+        let trace_name = self.trace_name;
+        executor.spawn(async move {
+            for item in evicted {
+                let target = PurgeTarget::Exact(&item);
+                if let Err(e) = storage.purge(target, PurgeType::Eviction, &handle).await {
+                    warn!("Failed to purge {target} during {trace_name}: {e}");
+                }
+            }
+        });
+        completed
+    }
+}
+
+/// Proof that a write's [`MissCompletion`] was applied.
+///
+/// Only [`MissCompletion::complete`] creates one, and a successful
+/// [`HandleMiss::finish_with_eviction`] must return it, so an override that drops its completion
+/// cannot also report success. Storage cannot make one any other way:
+///
+/// ```compile_fail
+/// let forged = pingora_cache::storage::MissCompleted { _private: () };
+/// ```
+#[derive(Debug)]
+pub struct MissCompleted {
+    _private: (),
+}
+
 /// Cache miss handling trait
 #[async_trait]
 pub trait HandleMiss {
@@ -358,11 +472,51 @@ pub trait HandleMiss {
 
     /// Finish the cache admission
     ///
-    /// When `self` is dropped without calling this function, the storage should consider this write
-    /// failed.
+    /// When `self` is dropped before this function or [`Self::finish_with_eviction`] finishes the
+    /// write, the storage should consider this write failed.
+    ///
+    /// The proxy drops the miss handler of a cancelled fill without finishing it, and
+    /// takes `Ok(None)` from [`HandleHit::read_body`] as the end of a complete body. A storage
+    /// whose fills can be cancelled should therefore give the hit handlers reading this write,
+    /// whether from [`Storage::lookup_streaming_write`] or from a lookup that found it in
+    /// progress, an error rather than `Ok(None)` once it is dropped unfinished, so they do not
+    /// serve the truncated body as a success. [`MemCache`](crate::MemCache) does so when built
+    /// with [`MemCache::fail_readers_of_dropped_writes`](crate::MemCache::fail_readers_of_dropped_writes).
     async fn finish(
         self: Box<Self>, // because self is always used as a trait object
     ) -> Result<MissFinishType>;
+
+    /// Finish the cache admission, as [`Self::finish`] does, and apply the finished write to
+    /// eviction through `completion`.
+    ///
+    /// The cache finishes writes through this method. The default calls `finish`, then
+    /// [`MissCompletion::complete`] with its result, with no await in between, so dropping the
+    /// caller's future cannot separate a finished write from its accounting. A failed `finish`
+    /// drops `completion` without applying it.
+    ///
+    /// The [`MissCompleted`] a success returns can only come from `complete`, so the compiler
+    /// rejects an implementation that reports success without applying `completion`.
+    ///
+    /// Storage that corrects eviction weights out of band, for example from a background size
+    /// scan, can override this to keep those corrections out of the interval between a write's
+    /// completion and its accounting: move `completion` into the worker that finishes the write,
+    /// and call `complete` there before releasing the write's own active-write state. An override
+    /// returns the receipt from `complete` when the write succeeds, and drops `completion` without
+    /// calling it when the write fails. Such a worker can outlive the caller's future and still
+    /// complete the write's accounting after the caller is gone.
+    ///
+    /// Callers that drop a miss handler without finishing it, as the proxy does for a cancelled
+    /// fill, never call this, so storage must not expect a completion for that write.
+    ///
+    /// A handler that wraps another handler must forward this method as well as `finish`:
+    /// inheriting the default would apply the accounting outside the wrapped storage's write.
+    async fn finish_with_eviction(
+        self: Box<Self>,
+        completion: MissCompletion,
+    ) -> Result<MissCompleted> {
+        let finish = self.finish().await?;
+        Ok(completion.complete(finish))
+    }
 
     /// Return a streaming write tag recognized by the underlying [`Storage`].
     ///
@@ -377,6 +531,145 @@ pub trait HandleMiss {
     // But most use cases likely only require a simple integer and may not like the overhead of a
     // Vec/String allocation or even a Cow, though such data types can also be used here.
     fn streaming_write_tag(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Release this writer's demand for an in-progress streaming fill, returning `true` only if
+    /// this call released it.
+    ///
+    /// A storage that shares one fill among concurrent readers can count each party that still
+    /// wants the object: the request that writes it, plus every reader attached to the write.
+    /// The writer's demand is that request's share, which an application drops through
+    /// [`crate::HttpCache::release_miss_writer_demand`] once the request's client has left.
+    /// Storage that tracks demand should make the release idempotent, so that a later call
+    /// returns `false`. Other backends return `false`.
+    fn release_writer_demand(&self) -> bool {
+        false
+    }
+
+    /// Return a watcher that resolves once this fill should be cancelled.
+    ///
+    /// The proxy polls the watcher only after the filling request's downstream has been
+    /// abandoned; see [`CacheFillCancellation`](crate::fill_cancellation::CacheFillCancellation)
+    /// for what a resolved watcher makes it do and for how long one value stays in force.
+    /// Backends that let every fill run until the upstream completes leave this at the default
+    /// `None`.
+    ///
+    /// The [`CacheFillCancellation`](crate::fill_cancellation::CacheFillCancellation) belongs to
+    /// the state shared by everyone using one logical fill, and exists before any miss handler
+    /// does. The paths that release demand call `cancel()` on it, and every miss handler of
+    /// that fill, across upstream attempts, returns a watcher of the same value. It is neither
+    /// installed from the downstream-abandonment callback, nor keyed globally by cache key, nor
+    /// recreated per upstream attempt.
+    ///
+    /// In the example below, an application hook that sees the downstream abandoned reaches
+    /// `FillState::release_writer` by calling
+    /// [`HttpCache::release_miss_writer_demand`](crate::HttpCache::release_miss_writer_demand),
+    /// which calls [`Self::release_writer_demand`] on the active miss handler.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use async_trait::async_trait;
+    /// use parking_lot::Mutex;
+    /// use pingora_cache::storage::{HandleMiss, MissFinishType};
+    /// use pingora_cache::{CacheFillCancellation, CacheFillCancellationWatcher};
+    /// use pingora_error::Result;
+    ///
+    /// /// Demand for one logical fill: how many readers are attached, whether the filling
+    /// /// request still wants it, and whether admission of new readers has closed.
+    /// struct Demand {
+    ///     readers: usize,
+    ///     writer: bool,
+    ///     closed: bool,
+    /// }
+    ///
+    /// /// Shared by every reader and writer of one logical fill.
+    /// struct FillState {
+    ///     demand: Mutex<Demand>,
+    ///     cancellation: CacheFillCancellation,
+    /// }
+    ///
+    /// impl FillState {
+    ///     /// A fill starts with the filling request's own writer demand held.
+    ///     fn new() -> Self {
+    ///         Self {
+    ///             demand: Mutex::new(Demand {
+    ///                 readers: 0,
+    ///                 writer: true,
+    ///                 closed: false,
+    ///             }),
+    ///             cancellation: CacheFillCancellation::new(),
+    ///         }
+    ///     }
+    ///
+    ///     /// Admit a new reader. Returns `false` once admission has closed, in which
+    ///     /// case the caller must not attach to this fill.
+    ///     fn admit_reader(&self) -> bool {
+    ///         let mut demand = self.demand.lock();
+    ///         if demand.closed {
+    ///             return false;
+    ///         }
+    ///         demand.readers += 1;
+    ///         true
+    ///     }
+    ///
+    ///     /// Release a reader's demand.
+    ///     fn release_reader(&self) {
+    ///         let mut demand = self.demand.lock();
+    ///         demand.readers -= 1;
+    ///         self.close_if_idle(&mut demand);
+    ///     }
+    ///
+    ///     /// Release the filling request's own demand, leaving any readers attached.
+    ///     /// Repeat calls are harmless and report that there was nothing left to release.
+    ///     fn release_writer(&self) -> bool {
+    ///         let mut demand = self.demand.lock();
+    ///         if !demand.writer {
+    ///             return false;
+    ///         }
+    ///         demand.writer = false;
+    ///         self.close_if_idle(&mut demand);
+    ///         true
+    ///     }
+    ///
+    ///     /// The last demand to leave closes admission and cancels the fill under the same
+    ///     /// lock that counted it: `cancel()` is final, so a reader admitted after admission
+    ///     /// closes would attach to a fill that never resumes.
+    ///     fn close_if_idle(&self, demand: &mut Demand) {
+    ///         if demand.readers == 0 && !demand.writer {
+    ///             demand.closed = true;
+    ///             self.cancellation.cancel();
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// struct FillWriter {
+    ///     fill: Arc<FillState>,
+    /// }
+    ///
+    /// #[async_trait]
+    /// impl HandleMiss for FillWriter {
+    ///     async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+    ///         Ok(MissFinishType::Created(0))
+    ///     }
+    ///
+    ///     fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+    ///         // Every writer of this fill watches the same value.
+    ///         Some(self.fill.cancellation.watcher())
+    ///     }
+    ///
+    ///     fn release_writer_demand(&self) -> bool {
+    ///         // The fill outlives this writer whenever readers remain attached.
+    ///         self.fill.release_writer()
+    ///     }
+    /// }
+    /// ```
+    fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
         None
     }
 

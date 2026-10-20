@@ -140,6 +140,8 @@ dial9 = ["pingora-core/dial9"]
 dial9-worker-s3 = ["dial9", "pingora-core/dial9-worker-s3"]
 
 ## Enable dial9 CPU profiling support.
+##
+## Usable stack traces require building with `-C force-frame-pointers=yes`.
 dial9-cpu-profiling = ["dial9", "pingora-core/dial9-cpu-profiling"]
 
 ## Enable upstream modules: the `adjust_upstream_modules` callback, the
