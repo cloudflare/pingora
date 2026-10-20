@@ -132,7 +132,7 @@ impl TimerManager {
             std::thread::sleep(RESOLUTION_DURATION);
             let now = Instant::now() - self.zero;
             self.clock_watchdog
-                .store(now.as_secs() as i64, Ordering::Relaxed);
+                .store(now.as_secs() as i64, Ordering::SeqCst);
             if self.is_paused_for_fork() {
                 // just stop acquiring the locks, waiting for fork to happen
                 continue;
