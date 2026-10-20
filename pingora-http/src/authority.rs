@@ -232,4 +232,21 @@ mod tests {
             RawTargetAuthority::None
         );
     }
+
+    #[test]
+    fn classify_raw_target_authority_scheme_case_insensitive() {
+        // RFC 3986 schemes are case-insensitive: `HTTP` gets the same ambiguity rules as `http`
+        for target in [
+            b"HTTP://good.example\\evil.example/".as_slice(),
+            b"Https:authority.example/test",
+            b"WS://good.example\\evil.example/",
+        ] {
+            assert_eq!(
+                raw_target_authority(target),
+                RawTargetAuthority::AmbiguousAuthority,
+                "{}",
+                String::from_utf8_lossy(target)
+            );
+        }
+    }
 }

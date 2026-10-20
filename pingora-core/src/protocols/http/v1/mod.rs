@@ -14,6 +14,10 @@
 
 //! HTTP/1.x implementation
 
+pub use pingora_http::h1::{
+    parser_capabilities, HeaderLimit, ParserCapabilities, ResponseParserConfig,
+};
+
 pub(crate) mod body;
 pub mod client;
 pub mod common;

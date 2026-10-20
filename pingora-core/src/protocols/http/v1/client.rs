@@ -18,7 +18,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use http::{header, header::AsHeaderName, HeaderValue, StatusCode, Version};
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
-use pingora_http::{HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http::{
+    h1::{HeaderLimit, ResponseParserConfig},
+    HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader,
+};
+use pingora_http_parser::{parse_response, HeaderStorage, Status as ParseStatus};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::str;
@@ -67,6 +71,8 @@ pub struct HttpSession {
     // If allowed, does not fail with error on invalid content-length
     // (treats as close-delimited response).
     allow_h1_response_invalid_content_length: bool,
+    /// Configuration for parsing HTTP/1 response heads.
+    response_parser_config: ResponseParserConfig,
 }
 
 /// HTTP 1.x client session
@@ -100,6 +106,7 @@ impl HttpSession {
             received_upgrade_req_body: false,
             close_delimited_resp: false,
             allow_h1_response_invalid_content_length: false,
+            response_parser_config: ResponseParserConfig::default(),
         }
     }
 
@@ -271,22 +278,25 @@ impl HttpSession {
 
         loop {
             if parse_existing_buffer {
-                let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-                let mut resp = httparse::Response::new(&mut headers);
-                let parsed = parse_resp_buffer(&mut resp, &self.response_header_read_buf);
+                let mut storage = HeaderStorage::new();
+                let parsed = parse_response(
+                    &mut storage,
+                    &self.response_header_read_buf,
+                    self.response_parser_config,
+                );
                 match parsed {
-                    HeaderParseState::Complete(s) => {
+                    Ok(ParseStatus::Complete(s, resp)) => {
                         let total_read = self.response_header_read_buf.len();
                         let base = self.response_header_read_buf.as_ptr() as usize;
-                        let mut header_refs = Vec::<KVRef>::with_capacity(resp.headers.len());
+                        let mut header_refs = Vec::<KVRef>::with_capacity(resp.header_count());
 
                         // Note: resp.headers has the correct number of headers
                         // while header_refs doesn't as it is still empty
-                        let _num_headers = populate_headers(base, &mut header_refs, resp.headers);
+                        let _num_headers = populate_headers(base, &mut header_refs, resp.headers());
 
                         let mut response_header = match ResponseHeader::build(
-                            resp.code.unwrap(),
-                            Some(resp.headers.len()),
+                            resp.code().unwrap(),
+                            Some(resp.header_count()),
                         ) {
                             Ok(header) => Box::new(header),
                             Err(e) => return self.fail_response_header_read(e),
@@ -295,13 +305,13 @@ impl HttpSession {
                         // TODO: enforce https://datatracker.ietf.org/doc/html/rfc9110#section-15.2
                         // "Since HTTP/1.0 did not define any 1xx status codes,
                         // a server MUST NOT send a 1xx response to an HTTP/1.0 client."
-                        response_header.set_version(match resp.version {
+                        response_header.set_version(match resp.version() {
                             Some(1) => Version::HTTP_11,
                             Some(0) => Version::HTTP_10,
                             _ => Version::HTTP_09,
                         });
 
-                        if let Err(e) = response_header.set_reason_phrase(resp.reason) {
+                        if let Err(e) = response_header.set_reason_phrase(resp.reason()) {
                             return self.fail_response_header_read(e);
                         }
 
@@ -354,8 +364,8 @@ impl HttpSession {
                         // when the upgraded body tasks are received
                         return Ok(s);
                     }
-                    HeaderParseState::Partial => { /* read more below */ }
-                    HeaderParseState::Invalid(e) => {
+                    Ok(ParseStatus::Partial) => { /* read more below */ }
+                    Err(e) => {
                         return self.fail_response_header_read(Error::because(
                             InvalidHTTPHeader,
                             format!("buf: {}", self.response_header_read_buf.escape_ascii()),
@@ -521,6 +531,16 @@ impl HttpSession {
 
     pub fn set_allow_h1_response_invalid_content_length(&mut self, allow: bool) {
         self.allow_h1_response_invalid_content_length = allow;
+    }
+
+    /// Set the maximum number of fields accepted in a response head.
+    pub fn set_header_count_limit(&mut self, limit: HeaderLimit) {
+        self.response_parser_config.header_limit = limit;
+    }
+
+    /// Set the HTTP/1 response parser configuration.
+    pub fn set_response_parser_config(&mut self, config: ResponseParserConfig) {
+        self.response_parser_config = config;
     }
 
     pub(super) fn get_headers_raw(&self) -> &[u8] {
@@ -815,7 +835,7 @@ impl HttpSession {
             debug!("Response header: {resp_header:?}");
             trace!(
                 "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
+                String::from_utf8_lossy(self.get_headers_raw())
             );
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
@@ -882,26 +902,6 @@ impl HttpSession {
     }
 }
 
-#[inline]
-fn parse_resp_buffer<'buf>(
-    resp: &mut httparse::Response<'_, 'buf>,
-    buf: &'buf [u8],
-) -> HeaderParseState {
-    let mut parser = httparse::ParserConfig::default();
-    parser.allow_spaces_after_header_name_in_responses(true);
-    parser.allow_obsolete_multiline_headers_in_responses(true);
-    let res = match parser.parse_response(resp, buf) {
-        Ok(s) => s,
-        Err(e) => {
-            return HeaderParseState::Invalid(e);
-        }
-    };
-    match res {
-        httparse::Status::Complete(s) => HeaderParseState::Complete(s),
-        _ => HeaderParseState::Partial,
-    }
-}
-
 /// Returns `true` if `path` contains a byte that must never appear in an HTTP/1.1
 /// request target: NUL (`0x00`), LF (`0x0a`), CR (`0x0d`), or SP (`0x20`).
 ///
@@ -959,6 +959,7 @@ mod tests_stream {
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
     use crate::upstreams::peer::PeerOptions;
     use crate::ErrorType;
+    use pingora_http::h1::parser_capabilities;
     use rstest::rstest;
     use tokio_test::io::Builder;
 
@@ -975,6 +976,54 @@ mod tests_stream {
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
         assert_eq!(0, http_stream.resp_header().unwrap().headers.len());
+    }
+
+    #[tokio::test]
+    async fn read_response_with_raised_header_count_limit() {
+        let mut input = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..4096 {
+            input.extend_from_slice(format!("x-{i}: value-{i}\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"\r\n");
+
+        let mock_io = Builder::new().read(&input).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_header_count_limit(HeaderLimit::Limited(4096));
+        session.read_response().await.unwrap();
+
+        assert_eq!(session.resp_header().unwrap().headers.len(), 4096);
+        assert_eq!(
+            session.resp_header().unwrap().headers["x-4095"],
+            "value-4095"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_header_count_limit_is_preserved() {
+        let mut input = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..257 {
+            input.extend_from_slice(format!("x-{i}: value\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"\r\n");
+
+        let mock_io = Builder::new().read(&input).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        let error = session.read_response().await.unwrap_err();
+
+        assert_eq!(error.etype(), &InvalidHTTPHeader);
+        assert!(error.to_string().contains("too many headers"));
+    }
+
+    #[rstest]
+    #[case(b"HTTP/1.1 200 OK\r\nServer : pingora\r\n\r\n")]
+    #[case(b"HTTP/1.1 200 OK\r\nServer: pingora\r\n folded\r\n\r\n")]
+    #[tokio::test]
+    async fn response_compatibility_syntax_is_rejected_by_default(#[case] input: &[u8]) {
+        let mock_io = Builder::new().read(input).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        let error = session.read_response().await.unwrap_err();
+
+        assert_eq!(error.etype(), &InvalidHTTPHeader);
     }
 
     #[tokio::test]
@@ -1192,23 +1241,30 @@ mod tests_stream {
         let input = b"HTTP/1.1 200 OK\r\nServer : pingora\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let parser_config =
+            ResponseParserConfig::default().with_spaces_after_header_name_in_responses(true);
+        http_stream.set_response_parser_config(parser_config);
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
         assert_eq!(http_stream.get_header("Server").unwrap(), "pingora");
     }
 
-    #[cfg(feature = "patched_http1")]
     #[tokio::test]
-    async fn read_resp_header_with_utf8() {
+    async fn read_resp_header_with_non_ascii_name_matches_backend_capability() {
         init_log();
         let input = "HTTP/1.1 200 OK\r\nServer👍: pingora\r\n\r\n".as_bytes();
         let mock_io = Builder::new().read(input).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let resp = http_stream.read_resp_header_parts().await.unwrap();
-        assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
-        assert_eq!(http_stream.get_header("Server👍").unwrap(), "pingora");
-        assert_eq!(resp.headers.get("Server👍").unwrap(), "pingora");
+        let result = http_stream.read_resp_header_parts().await;
+        if parser_capabilities().non_ascii_response_header_names {
+            let resp = result.unwrap();
+            assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
+            assert_eq!(http_stream.get_header("Server👍").unwrap(), "pingora");
+            assert_eq!(resp.headers.get("Server👍").unwrap(), "pingora");
+        } else {
+            assert_eq!(result.unwrap_err().etype(), &InvalidHTTPHeader);
+        }
     }
 
     #[tokio::test]
@@ -2143,6 +2199,10 @@ mod tests_stream {
         let input = b"HTTP/1.1 200 OK\r\nServer : pingora\r\n Foo: Bar\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let parser_config = ResponseParserConfig::default()
+            .with_spaces_after_header_name_in_responses(true)
+            .with_obsolete_multiline_headers_in_responses(true);
+        http_stream.set_response_parser_config(parser_config);
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
 
@@ -2155,6 +2215,7 @@ mod tests_stream {
         let input = b"HTTP/1.1 200 OK\r\nServer : pingora\r\n\t  Fizz: Buzz\r\n\r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.set_response_parser_config(parser_config);
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
         assert_eq!(1, http_stream.resp_header().unwrap().headers.len());
@@ -2824,6 +2885,32 @@ hello";
         }
 
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn read_response_header_non_utf8() {
+        init_log();
+        let wire = b"GET / HTTP/1.1\r\n\r\n";
+        // Header value contains 0xff which is invalid UTF-8
+        let input = b"HTTP/1.1 200 OK\r\nX-Custom: \xff\r\nContent-Length: 0\r\n\r\n";
+
+        let mock_io = Builder::new().write(&wire[..]).read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        let new_request = RequestHeader::build("GET", b"/", None).unwrap();
+        http_stream
+            .write_request_header(Box::new(new_request))
+            .await
+            .unwrap();
+
+        let task = http_stream.read_response_task().await.unwrap();
+        match task {
+            HttpTask::Header(h, eob) => {
+                assert_eq!(h.status, 200);
+                assert!(eob);
+            }
+            _ => panic!("task should be header"),
+        }
     }
 }
 

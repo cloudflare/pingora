@@ -14,6 +14,7 @@
 
 //! Cache lock
 
+use crate::fill_cancellation::REASON_CACHE_FILL_CANCELLED;
 use crate::trace::{Span, Tag};
 use crate::{hashtable::ConcurrentHashTable, key::CacheHashKey, CacheKey, NoCacheReason};
 
@@ -47,10 +48,19 @@ pub trait CacheKeyLock {
     }
 
     /// Set a lock status for a custom `NoCacheReason`.
-    fn custom_lock_status(&self, _custom_no_cache: &'static str) -> LockStatus {
-        // treat custom no cache reasons as GiveUp by default
-        // (like OriginNotCache)
-        LockStatus::GiveUp
+    ///
+    /// By default, [`REASON_CACHE_FILL_CANCELLED`] gives [`LockStatus::TransientError`], so a
+    /// waiting reader becomes the next writer, and any other custom reason gives
+    /// [`LockStatus::GiveUp`], like `OriginNotCache`.
+    fn custom_lock_status(&self, custom_no_cache: &'static str) -> LockStatus {
+        if custom_no_cache == REASON_CACHE_FILL_CANCELLED {
+            // a cancellation ends this writer's fill, not the response's cacheability
+            LockStatus::TransientError
+        } else {
+            // treat other custom no cache reasons as GiveUp by default
+            // (like OriginNotCache)
+            LockStatus::GiveUp
+        }
     }
 }
 

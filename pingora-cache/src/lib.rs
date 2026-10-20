@@ -24,13 +24,14 @@ use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use pingora_timeout::timeout;
 use std::time::{Duration, Instant, SystemTime};
-use storage::MissFinishType;
+use storage::{MissCompletion, MissFinishType};
 use strum::IntoStaticStr;
 use trace::{CacheTraceCTX, Span, Tag};
 
 pub mod admission;
 pub mod cache_control;
 pub mod eviction;
+pub mod fill_cancellation;
 pub mod filters;
 pub mod hashtable;
 pub mod key;
@@ -47,11 +48,15 @@ mod variance;
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
 pub use eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
+pub use fill_cancellation::{CacheFillCancellation, CacheFillCancellationWatcher};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
-pub use meta::{set_compression_dict_content, set_compression_dict_path};
+pub use meta::{
+    set_compression_dict_content, set_compression_dict_path, set_header_serde_parser_config,
+};
 pub use meta::{CacheMeta, CacheMetaDefaults};
+pub use pingora_http::h1::{HeaderLimit, ResponseParserConfig};
 pub use storage::{
     HitHandler, MissHandler, PurgeAction, PurgeOutcome, PurgeTarget, PurgeType, Storage,
 };
@@ -362,6 +367,8 @@ struct HttpCacheInner {
     // phases report the reason they acted on rather than inferring one. Outlives cache
     // disablement because it is read after the response header arrives.
     pub predicted_uncacheable_reason: Option<NoCacheReason>,
+    // Survives cache disablement so a retry cannot revive the downstream.
+    downstream_abandoned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -388,6 +395,29 @@ impl HttpCache {
     /// Whether the cache is enabled
     pub fn enabled(&self) -> bool {
         !matches!(self.phase, CachePhase::Disabled(_) | CachePhase::Bypass)
+    }
+
+    /// Whether the downstream became unusable during a potential cache fill of this request.
+    ///
+    /// This records a past event, not an active cache writer: it is retained after caching
+    /// is disabled or enabled again for this request.
+    #[doc(hidden)]
+    pub fn downstream_abandoned_during_cache_fill(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.downstream_abandoned)
+    }
+
+    /// Record that the downstream became unusable during a potential cache fill, returning
+    /// `true` only on the first transition.
+    ///
+    /// Returns `false` without allocating if caching has never been enabled.
+    #[doc(hidden)]
+    pub fn mark_downstream_abandoned_during_cache_fill(&mut self) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        !std::mem::replace(&mut inner.downstream_abandoned, true)
     }
 
     /// Whether the cache is being bypassed
@@ -610,6 +640,7 @@ impl HttpCache {
                     max_file_size_tracker: None,
                     predictor,
                     predicted_uncacheable_reason: None,
+                    downstream_abandoned: self.downstream_abandoned_during_cache_fill(),
                 }));
             }
             _ => panic!("Cannot enable already enabled HttpCache {:?}", self.phase),
@@ -1064,6 +1095,42 @@ impl HttpCache {
         }
     }
 
+    /// The active miss writer, if any. Unlike [`Self::miss_handler`], never panics: phases other
+    /// than miss or expired have no writer.
+    fn maybe_miss_handler(&self) -> Option<&MissHandler> {
+        if !matches!(self.phase, CachePhase::Miss | CachePhase::Expired) {
+            return None;
+        }
+        self.inner
+            .as_ref()?
+            .enabled_ctx
+            .as_ref()?
+            .miss_handler
+            .as_ref()
+    }
+
+    /// Return whether this request currently has a cache writer.
+    pub fn is_cache_admission_active(&self) -> bool {
+        self.maybe_miss_handler().is_some()
+    }
+
+    /// Release the current miss writer's demand for a streaming cache fill.
+    ///
+    /// Returns `false` when no miss writer is active, the storage does not track
+    /// demand, or the writer's demand was already released.
+    pub fn release_miss_writer_demand(&self) -> bool {
+        self.maybe_miss_handler()
+            .is_some_and(|handler| handler.release_writer_demand())
+    }
+
+    /// Return the current miss writer's cancellation watcher.
+    ///
+    /// Returns `None` when no miss writer is active or the storage does not cancel fills early;
+    /// see [`storage::HandleMiss::cancellation_watcher`].
+    pub fn miss_cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+        self.maybe_miss_handler()?.cancellation_watcher()
+    }
+
     /// Finish cache admission
     ///
     /// If [self] is dropped without calling this, the cache admission is considered incomplete and
@@ -1082,13 +1149,33 @@ impl HttpCache {
                     // already finished, we allow calling this function more than once
                     return Ok(());
                 };
-                // Save the entry ID before `finish` consumes the miss handler.
-                let entry_id = miss_handler.entry_id();
-                let finish_result = miss_handler.finish().await;
                 let key = inner
                     .key
                     .as_ref()
                     .expect("key set by miss or expired phase");
+                // Prepared before `finish` consumes the miss handler, which applies it to eviction
+                // once the write succeeds.
+                let completion = MissCompletion::new(
+                    eviction::CacheEntryKey::from_entry_id(
+                        key.to_compact(),
+                        miss_handler.entry_id(),
+                    ),
+                    inner_enabled
+                        .meta
+                        .as_ref()
+                        .expect("meta set by miss or expired phase")
+                        .0
+                        .internal
+                        .fresh_until,
+                    inner_enabled.eviction,
+                    inner_enabled.storage,
+                    inner_enabled.traces.get_cache_span(),
+                    "eviction",
+                );
+                let finish_result = miss_handler
+                    .finish_with_eviction(completion)
+                    .await
+                    .map(|_completed| ());
                 if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
                     let lock = lock_ctx.lock.take();
                     if let Some(Locked::Write(permit)) = lock {
@@ -1102,44 +1189,8 @@ impl HttpCache {
                         lock_ctx.cache_lock.release(key, permit, lock_status);
                     }
                 }
-                let size = match finish_result {
-                    Ok(size) => size,
-                    Err(e) => {
-                        inner_enabled.traces.finish_miss_span();
-                        return Err(e);
-                    }
-                };
-                if let Some(eviction) = inner_enabled.eviction {
-                    let cache_key = key.to_compact();
-                    let meta = inner_enabled.meta.as_ref().unwrap();
-                    let entry_key = eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
-                    let evicted = match size {
-                        MissFinishType::Created(size) => {
-                            eviction.admit(entry_key, size, meta.0.internal.fresh_until)
-                        }
-                        MissFinishType::Appended(size, max_size) => {
-                            eviction.increment_weight(&entry_key, size, max_size)
-                        }
-                    };
-                    // actual eviction can be done async
-                    let span = inner_enabled.traces.child("eviction");
-                    let handle = span.handle();
-                    let storage = inner_enabled.storage;
-                    tokio::task::spawn(async move {
-                        for item in evicted {
-                            let target = storage::PurgeTarget::Exact(&item);
-                            if let Err(e) =
-                                storage.purge(target, PurgeType::Eviction, &handle).await
-                            {
-                                warn!(
-                                    "Failed to purge {target} during eviction for finish miss handler: {e}"
-                                );
-                            }
-                        }
-                    });
-                }
                 inner_enabled.traces.finish_miss_span();
-                Ok(())
+                finish_result
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
@@ -1969,12 +2020,15 @@ impl HttpCache {
 mod tests {
     use super::*;
     use crate::lock::{CacheLock, UnusableFill};
+    use crate::storage::MissCompleted;
     use async_trait::async_trait;
     use http::StatusCode;
+    use pingora_error::{Error, ErrorType, OrErr};
     use std::any::Any;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
+    use tokio::sync::oneshot;
 
     /// Storage fixture with successful metadata updates and configurable purge results.
     struct UpdateOkStorage {
@@ -1997,14 +2051,76 @@ mod tests {
     struct IdentifiedMissHandler {
         finish: MissFinishType,
     }
+    struct DemandTrackingMissHandler {
+        writer_demand: std::sync::atomic::AtomicBool,
+    }
+    /// Finishes with a fixed result and inherits the default
+    /// [`storage::HandleMiss::finish_with_eviction`].
+    pub(crate) struct ScriptedMissHandler(pub(crate) Result<MissFinishType>);
+    /// Finishes its write on a spawned worker that outlives the caller's future once `release`
+    /// fires, and completes the write's accounting there, as storage that reconciles eviction
+    /// weights in the background does.
+    pub(crate) struct DetachedMissHandler {
+        pub(crate) release: oneshot::Receiver<()>,
+        pub(crate) finish: MissFinishType,
+    }
+    /// Storage whose purges record their exact targets and purge types.
+    #[derive(Default)]
+    pub(crate) struct PurgeRecordingStorage {
+        purged: Mutex<Vec<(eviction::CacheEntryKey, PurgeType)>>,
+    }
     struct CountingDeferPolicy(AtomicUsize);
     struct CountingReadyPolicy(AtomicUsize);
     #[derive(Default)]
-    struct RecordingEviction {
+    pub(crate) struct RecordingEviction {
         removed: Mutex<Option<eviction::CacheEntryKey>>,
         accessed: Mutex<Option<eviction::CacheEntryKey>>,
         admitted: Mutex<Option<eviction::CacheEntryKey>>,
         incremented: Mutex<Option<(eviction::CacheEntryKey, usize, Option<usize>)>>,
+        /// Admissions and weight increments applied so far.
+        updates: AtomicUsize,
+        /// What the next admission or weight increment evicts.
+        victims: Mutex<Vec<eviction::CacheEntryKey>>,
+    }
+
+    impl RecordingEviction {
+        pub(crate) fn evicting(victim: eviction::CacheEntryKey) -> Self {
+            Self {
+                victims: Mutex::new(vec![victim]),
+                ..Default::default()
+            }
+        }
+
+        pub(crate) fn updates(&self) -> usize {
+            self.updates.load(Ordering::SeqCst)
+        }
+
+        fn record_update(&self) -> Vec<eviction::CacheEntryKey> {
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            std::mem::take(&mut *self.victims.lock().unwrap())
+        }
+    }
+
+    impl PurgeRecordingStorage {
+        /// Wait for the background purges of `count` entries.
+        pub(crate) async fn purged(
+            &self,
+            count: usize,
+        ) -> Vec<(eviction::CacheEntryKey, PurgeType)> {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    {
+                        let purged = self.purged.lock().unwrap();
+                        if purged.len() >= count {
+                            return purged.clone();
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("eviction purges must run")
+        }
     }
 
     static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage { purge_ok: false };
@@ -2083,6 +2199,120 @@ mod tests {
 
         fn entry_id(&self) -> Option<eviction::CacheEntryId> {
             Some(eviction::CacheEntryId::new(7))
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for DemandTrackingMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            unreachable!("test only exercises writer demand")
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            unreachable!("test only exercises writer demand")
+        }
+
+        fn release_writer_demand(&self) -> bool {
+            self.writer_demand.swap(false, Ordering::AcqRel)
+        }
+    }
+
+    /// Miss handler that offers a watcher of its fill's cancellation.
+    struct CancellationOfferingMissHandler(std::sync::Arc<CacheFillCancellation>);
+
+    #[async_trait]
+    impl storage::HandleMiss for CancellationOfferingMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            unreachable!("test only exercises the cancellation watcher")
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            unreachable!("test only exercises the cancellation watcher")
+        }
+
+        fn cancellation_watcher(&self) -> Option<CacheFillCancellationWatcher> {
+            Some(self.0.watcher())
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for ScriptedMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            self.0
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for DetachedMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            unreachable!("the cache finishes writes through finish_with_eviction")
+        }
+
+        async fn finish_with_eviction(
+            self: Box<Self>,
+            completion: MissCompletion,
+        ) -> Result<MissCompleted> {
+            let Self { release, finish } = *self;
+            tokio::spawn(async move {
+                release.await.expect("the test releases the write");
+                completion.complete(finish)
+            })
+            .await
+            .or_err(ErrorType::InternalError, "write worker failed")
+        }
+    }
+
+    #[async_trait]
+    impl Storage for PurgeRecordingStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            target: storage::PurgeTarget<'_>,
+            purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            let storage::PurgeTarget::Exact(item) = target else {
+                panic!("eviction purges target an exact entry, not {target}");
+            };
+            self.purged.lock().unwrap().push((item.clone(), purge_type));
+            Ok(storage::PurgeOutcome::Purged(None))
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
         }
     }
 
@@ -2259,7 +2489,7 @@ mod tests {
             _fresh_until: SystemTime,
         ) -> Vec<eviction::CacheEntryKey> {
             *self.admitted.lock().unwrap() = Some(item);
-            Vec::new()
+            self.record_update()
         }
 
         fn increment_weight(
@@ -2269,7 +2499,7 @@ mod tests {
             max_weight: Option<usize>,
         ) -> Vec<eviction::CacheEntryKey> {
             *self.incremented.lock().unwrap() = Some((item.clone(), delta, max_weight));
-            Vec::new()
+            self.record_update()
         }
 
         fn remove(&self, item: eviction::CacheEntryKeyRef<'_>) {
@@ -2353,7 +2583,7 @@ mod tests {
         }
     }
 
-    fn test_meta(created: SystemTime) -> CacheMeta {
+    pub(crate) fn test_meta(created: SystemTime) -> CacheMeta {
         let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
         CacheMeta::new(created + Duration::from_secs(60), created, 30, 30, header)
     }
@@ -2365,6 +2595,111 @@ mod tests {
         cache.phase = CachePhase::Stale;
         cache.inner_enabled_mut().meta = Some(meta);
         cache
+    }
+
+    fn leak<T>(value: T) -> &'static T {
+        Box::leak(Box::new(value))
+    }
+
+    fn cache_with_miss_handler(
+        handler: MissHandler,
+        eviction: Option<&'static RecordingEviction>,
+        storage: &'static PurgeRecordingStorage,
+    ) -> HttpCache {
+        let mut cache = HttpCache::new();
+        let eviction =
+            eviction.map(|eviction| eviction as &'static (dyn eviction::EvictionManager + Sync));
+        cache.enable(storage, eviction, None, None, None);
+        cache.set_cache_key(CacheKey::new("completed-miss", ""));
+        cache.cache_miss();
+        cache.set_cache_meta(test_meta(SystemTime::now()));
+        cache.inner_enabled_mut().miss_handler = Some(handler);
+        cache
+    }
+
+    #[tokio::test]
+    async fn miss_completion_applies_only_successful_finishes() {
+        for finish in [
+            Ok(MissFinishType::Created(3)),
+            Ok(MissFinishType::Appended(2, Some(5))),
+            Err(Error::new(ErrorType::WriteError)),
+        ] {
+            let success = finish.is_ok();
+            let eviction = leak(RecordingEviction::default());
+            let handler = Box::new(ScriptedMissHandler(finish));
+            let storage = leak(PurgeRecordingStorage::default());
+            let mut cache = cache_with_miss_handler(handler, Some(eviction), storage);
+
+            assert_eq!(cache.finish_miss_handler().await.is_ok(), success);
+            assert_eq!(eviction.updates(), usize::from(success));
+        }
+    }
+
+    /// Finishing a miss needs a Tokio runtime only to purge what a successful write evicts.
+    #[test]
+    fn miss_finishes_without_a_runtime_when_nothing_is_purged() {
+        for (eviction, finish) in [
+            (None, Ok(MissFinishType::Created(3))),
+            (
+                Some(leak(RecordingEviction::default())),
+                Err(Error::new(ErrorType::WriteError)),
+            ),
+        ] {
+            let success = finish.is_ok();
+            let handler = Box::new(ScriptedMissHandler(finish));
+            let storage = leak(PurgeRecordingStorage::default());
+            let mut cache = cache_with_miss_handler(handler, eviction, storage);
+
+            let finished = futures::executor::block_on(cache.finish_miss_handler());
+            assert_eq!(finished.is_ok(), success);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_completed_miss_is_accounted_once() {
+        let eviction = leak(RecordingEviction::default());
+        let (release, released) = oneshot::channel();
+        release.send(()).unwrap();
+        let handler = Box::new(DetachedMissHandler {
+            release: released,
+            finish: MissFinishType::Created(3),
+        });
+        let storage = leak(PurgeRecordingStorage::default());
+        let mut cache = cache_with_miss_handler(handler, Some(eviction), storage);
+
+        cache.finish_miss_handler().await.unwrap();
+        assert_eq!(
+            eviction.updates(),
+            1,
+            "the cache must not apply a write its storage completed"
+        );
+    }
+
+    /// A write that its storage finishes on a worker keeps its accounting, and the purges of the
+    /// entries that accounting evicts, after the caller's future is dropped.
+    #[tokio::test]
+    async fn storage_completes_a_miss_whose_caller_is_dropped() {
+        let victim = eviction::CacheEntryKey::key_only(CacheKey::new("victim", "").to_compact());
+        let eviction = leak(RecordingEviction::evicting(victim.clone()));
+        let storage = leak(PurgeRecordingStorage::default());
+        let (release, released) = oneshot::channel();
+        let handler = Box::new(DetachedMissHandler {
+            release: released,
+            finish: MissFinishType::Created(3),
+        });
+        let mut cache = cache_with_miss_handler(handler, Some(eviction), storage);
+        let mut finish = tokio_test::task::spawn(cache.finish_miss_handler());
+
+        tokio_test::assert_pending!(finish.poll());
+        drop(finish);
+        assert_eq!(eviction.updates(), 0);
+        release.send(()).unwrap();
+        let purged = storage.purged(1).await;
+        assert_eq!(eviction.updates(), 1);
+        assert!(
+            matches!(purged.as_slice(), [(item, PurgeType::Eviction)] if *item == victim),
+            "{purged:?}"
+        );
     }
 
     static FILL_INTEREST_LOCK: LazyLock<CacheLock> =
@@ -2526,6 +2861,27 @@ mod tests {
         writer.release_write_lock(NoCacheReason::StorageError);
 
         assert_eq!(waiting.await.unwrap(), LockWaitOutcome::TransientError);
+    }
+
+    /// An uncacheable response gives the lock up, so waiting readers all proceed uncached.
+    #[tokio::test]
+    async fn an_uncacheable_response_makes_waiting_readers_give_up() {
+        let key = "origin-not-cache";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+        assert!(writer.is_cache_lock_writer());
+
+        let mut reader = locked_reader(key, None);
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move { reader.cache_lock_wait().await });
+        tokio::task::yield_now().await;
+
+        writer.release_write_lock(NoCacheReason::OriginNotCache);
+
+        assert_eq!(waiting.await.unwrap(), LockWaitOutcome::GiveUp);
     }
 
     fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
@@ -2711,6 +3067,102 @@ mod tests {
         assert!(!status.is_fresh());
         assert!(!status.is_treated_as_miss());
         assert_eq!(status.as_str(), "force_expired_serve_stale");
+    }
+
+    #[test]
+    fn downstream_abandonment_survives_cache_disable_and_reenable() {
+        let mut cache = HttpCache::new();
+        assert!(!cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        assert!(!cache.downstream_abandoned_during_cache_fill());
+        assert!(cache.mark_downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+        assert!(cache.downstream_abandoned_during_cache_fill());
+
+        cache.disable(NoCacheReason::StorageError);
+        assert!(cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        assert!(cache.downstream_abandoned_during_cache_fill());
+        assert!(!cache.mark_downstream_abandoned_during_cache_fill());
+    }
+
+    #[test]
+    fn miss_writer_demand_release_delegates_to_active_handler_once() {
+        let mut cache = HttpCache::new();
+        assert!(!cache.release_miss_writer_demand());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("writer-demand", ""));
+        cache.cache_miss();
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+
+        assert!(cache.release_miss_writer_demand());
+        assert!(!cache.release_miss_writer_demand());
+    }
+
+    #[test]
+    fn expired_entry_writer_demand_can_be_released() {
+        let now = SystemTime::now();
+        let mut cache = cache_with_stale_meta(
+            test_meta(now - Duration::from_secs(120)),
+            CacheKey::new("expired-writer-demand", ""),
+        );
+        cache.set_cache_meta(test_meta(now));
+        assert_eq!(cache.phase(), CachePhase::Expired);
+        assert!(!cache.is_cache_admission_active());
+
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+
+        assert!(cache.is_cache_admission_active());
+        assert!(cache.release_miss_writer_demand());
+        assert!(!cache.release_miss_writer_demand());
+    }
+
+    #[test]
+    fn miss_cancellation_watcher_follows_the_active_handler() {
+        let mut cache = HttpCache::new();
+        assert!(cache.miss_cancellation_watcher().is_none());
+
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("cancellation-watcher", ""));
+        cache.cache_miss();
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "a miss without a writer has nothing to cancel"
+        );
+
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(DemandTrackingMissHandler {
+            writer_demand: std::sync::atomic::AtomicBool::new(true),
+        }));
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "a writer that does not cancel early offers no watcher"
+        );
+
+        let cancellation = std::sync::Arc::new(CacheFillCancellation::new());
+        cache.inner_enabled_mut().miss_handler = Some(Box::new(CancellationOfferingMissHandler(
+            std::sync::Arc::clone(&cancellation),
+        )));
+        let watcher = cache
+            .miss_cancellation_watcher()
+            .expect("writer offers a watcher");
+        assert!(!watcher.is_cancelled());
+        assert!(cancellation.cancel());
+        assert!(watcher.is_cancelled());
+
+        cache.disable(NoCacheReason::InternalError);
+        assert!(
+            cache.miss_cancellation_watcher().is_none(),
+            "disabling the cache drops the writer and its watcher"
+        );
     }
 
     #[tokio::test]
