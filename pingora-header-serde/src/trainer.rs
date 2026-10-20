@@ -16,8 +16,9 @@ use pingora_header_serde::dict::train;
 use std::env;
 use std::io::{self, Write};
 
-pub fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let dict = train(&args[1]);
-    io::stdout().write_all(&dict).unwrap();
+    let dict = train(&args[1])?;
+    io::stdout().write_all(&dict)?;
+    Ok(())
 }
