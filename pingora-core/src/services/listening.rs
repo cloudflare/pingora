@@ -369,6 +369,6 @@ where
     }
 
     fn listen_addresses(&self) -> Option<Vec<String>> {
-        Some(self.listeners.addresses())
+        Some(self.listeners.fd_transfer_keys())
     }
 }
