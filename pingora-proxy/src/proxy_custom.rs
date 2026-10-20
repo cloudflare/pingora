@@ -176,18 +176,6 @@ where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
-        // Custom upstreams do not forward early-buffered bodies yet, so fail before writing.
-        #[cfg(feature = "early_body_buffer")]
-        if session.is_body_buffered() {
-            return (
-                false,
-                Some(Error::explain(
-                    InternalError,
-                    "early-buffered request bodies are not supported for custom upstreams",
-                )),
-            );
-        }
-
         client_session.set_read_timeout(peer.options.read_timeout);
         client_session.set_write_timeout(peer.options.write_timeout);
 
@@ -212,9 +200,21 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&http::header::EXPECT);
+        }
+
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
@@ -521,6 +521,10 @@ where
             request_body_finished,
             session.downstream_abandoned_during_cache_fill(),
         );
+
+        // An empty buffered body already ended the request on its header.
+        #[cfg(feature = "early_body_buffer")]
+        let buffer = buffer.filter(|b| !b.is_empty() || !session.is_body_buffered());
 
         // retry, send buffer if it exists
         if let Some(buffer) = buffer {
@@ -1846,44 +1850,6 @@ mod tests {
         .await;
 
         assert!(!CACHE_PREDICTOR.cacheable_prediction(&key));
-    }
-
-    /// The unit custom client session panics on every call, so reaching it fails this test.
-    #[cfg(feature = "early_body_buffer")]
-    #[tokio::test]
-    async fn early_buffered_body_is_rejected_before_custom_upstream_write() {
-        let (mut client, server) = tokio::io::duplex(1024);
-        client
-            .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .expect("test request should be written");
-        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
-        session
-            .read_request()
-            .await
-            .expect("test request should parse");
-        session
-            .set_buffered_body(Some(Bytes::from_static(b"buffered")))
-            .unwrap();
-
-        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
-        let peer = HttpPeer::new("127.0.0.1:80", false, String::new());
-        let mut request_write_attempted = false;
-        let (reuse, error) = proxy
-            .custom_proxy_down_to_up(
-                &mut session,
-                &mut (),
-                &peer,
-                &mut (),
-                &mut request_write_attempted,
-            )
-            .await;
-
-        assert!(!reuse);
-        assert!(!request_write_attempted);
-        let error = error.expect("buffered body must be rejected");
-        assert_eq!(error.etype(), &InternalError);
-        assert!(!error.retry());
     }
 
     // A cancellation requested once the abandoned fill is parked on its upstream read wakes the

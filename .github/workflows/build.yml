@@ -92,7 +92,8 @@ jobs:
           cargo clippy --package pingora-proxy --all-targets --features openssl,early_body_buffer \
             -- --allow=unknown-lints --deny=warnings
           cargo test --package pingora-proxy --features openssl,early_body_buffer \
-            --lib --test test_early_body_buffer_retry --no-fail-fast
+            --lib --test test_early_body_buffer_retry --test test_early_body_buffer_custom \
+            --no-fail-fast
 
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
