@@ -1862,6 +1862,59 @@ async fn test_upgrade_body_after_101() {
 }
 
 #[tokio::test]
+async fn test_upgrade_survives_request_body_end_handled_after_101() {
+    // An upgrade request carries no body, so the downstream half queues a single
+    // end-of-body task before the upstream has answered anything. Whether that task or
+    // the 101 is handled first is decided by the scheduler: the end of the request body
+    // must not be mistaken for the end of the tunnel in either order.
+    //
+    // x-delay-request-body pins the ordering that used to tear the tunnel down the
+    // instant it was established, which otherwise only reproduces under load.
+    init();
+    let _ = *WS_ECHO_RAW;
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+
+    let req = concat!(
+        "GET /upgrade_after_delayed_body_end HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "X-Port: 9284\r\n",
+        "X-Delay-Request-Body: 200\r\n",
+        "\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let fut = read_response_header(&mut stream);
+    let (resp_header, preread) = timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("timed out waiting for 101");
+    assert_eq!(resp_header.status, 101);
+
+    // The tunnel is established. It has to still be there once the delayed end of the
+    // request body lands, so send a payload and expect the origin's echo back.
+    let ws_payload = b"hello";
+    stream.write_all(ws_payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut echoed = preread;
+    let fut = async {
+        let mut buf = [0; 1024];
+        while echoed.len() < ws_payload.len() {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "tunnel closed instead of echoing the payload back");
+            echoed.extend_from_slice(&buf[..n]);
+        }
+    };
+    timeout(Duration::from_secs(5), fut)
+        .await
+        .expect("timed out waiting for the echoed payload");
+    assert_eq!(echoed, ws_payload);
+}
+
+#[tokio::test]
 async fn test_download_timeout() {
     init();
     use tokio::time::sleep;
