@@ -36,6 +36,9 @@
 //!
 //! If looking to build a (reverse) proxy, see [`pingora-proxy`](https://docs.rs/pingora-proxy) crate.
 //!
+//! The [user guide](https://github.com/cloudflare/pingora/blob/main/docs/user_guide/index.md) introduces
+//! both crates and walks through building a proxy with them.
+//!
 //! # Feature flags
 #![cfg_attr(
     feature = "document-features",
