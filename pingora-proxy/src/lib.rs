@@ -1198,11 +1198,12 @@ where
     /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
     /// `Transfer-Encoding` to describe the supplied body.
     ///
-    /// Returns an error if the downstream body has not been fully consumed.
+    /// Returns an error if the downstream body has not been fully consumed, including when its
+    /// read failed before the declared framing ended.
     #[cfg(feature = "early_body_buffer")]
     pub fn set_buffered_body(&mut self, body: Option<Bytes>) -> Result<()> {
         // Also pins the H1 body reader to the original framing before callers rewrite it.
-        if !self.downstream_session.is_body_done() {
+        if !self.downstream_session.is_body_complete() {
             return Error::e_explain(
                 InternalError,
                 "set_buffered_body called before the downstream body was fully consumed",
@@ -3167,6 +3168,20 @@ mod tests {
             while session.read_request_body().await.unwrap().is_some() {}
             session.set_buffered_body(Some(Bytes::from("x"))).unwrap();
             assert!(session.is_body_buffered());
+        }
+
+        #[tokio::test]
+        async fn test_set_buffered_body_rejects_truncated_downstream_body() {
+            let mut session = new_request_session(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhe",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            while let Ok(Some(_)) = session.read_request_body().await {}
+            assert!(session.downstream_session.is_body_done());
+            assert!(session.set_buffered_body(Some(Bytes::from("he"))).is_err());
+            assert!(!session.is_body_buffered());
         }
 
         #[tokio::test]
