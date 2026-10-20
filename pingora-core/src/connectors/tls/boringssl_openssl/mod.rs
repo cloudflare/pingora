@@ -199,11 +199,11 @@ where
 
     // disable verification if sni does not exist
     // XXX: verify on empty string cause null string seg fault
-    if peer.sni().is_empty() {
+    let verify_mode = if peer.sni().is_empty() {
         ssl_conf.set_use_server_name_indication(false);
         /* NOTE: technically we can still verify who signs the cert but turn it off to be
         consistent with nginx's behavior */
-        ssl_conf.set_verify(SslVerifyMode::NONE);
+        SslVerifyMode::NONE
     } else if peer.verify_cert() {
         if peer.verify_hostname() {
             let verify_param = ssl_conf.param_mut();
@@ -222,9 +222,15 @@ where
                 }
             }
         }
-        ssl_conf.set_verify(SslVerifyMode::PEER);
+        SslVerifyMode::PEER
     } else {
-        ssl_conf.set_verify(SslVerifyMode::NONE);
+        SslVerifyMode::NONE
+    };
+    match peer.upstream_tls_verify_callback().cloned() {
+        Some(callback) => {
+            ssl_conf.set_verify_callback(verify_mode, move |ok, ctx| callback(ok, ctx))
+        }
+        None => ssl_conf.set_verify(verify_mode),
     }
 
     /*
@@ -256,5 +262,132 @@ where
             ),
         },
         None => connect_future.await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::tls::server::handshake as accept;
+    use crate::protocols::tls::VerifyCallback;
+    use crate::tls::pkey::PKey;
+    use crate::tls::ssl::SslAcceptor;
+    use crate::tls::x509::X509;
+    use crate::upstreams::peer::BasicPeer;
+    use std::sync::Mutex;
+
+    // `verify-leaf.crt` is issued to `verify.test` by `verify-ca.crt`; both expire in 2126.
+    const SNI: &str = "verify.test";
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/tests/certs/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    fn peer(trust_ca: bool, callback: VerifyCallback) -> BasicPeer {
+        let mut peer = BasicPeer::new("127.0.0.1:443");
+        peer.sni = SNI.to_string();
+        if trust_ca {
+            let ca = X509::from_pem(&fixture("verify-ca.crt")).unwrap();
+            peer.options.ca = Some(Arc::new(vec![ca].into_boxed_slice()));
+        }
+        peer.options.upstream_tls_verify_callback = Some(callback);
+        peer
+    }
+
+    /// Returns a callback that records `(preverify_ok, depth, chain length)` for each call and
+    /// returns `verdict(preverify_ok)`.
+    fn recording(
+        verdict: fn(bool) -> bool,
+    ) -> (VerifyCallback, Arc<Mutex<Vec<(bool, u32, usize)>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let callback: VerifyCallback = Arc::new(move |ok, ctx| {
+            let chain_len = ctx.chain().map_or(0, |c| c.len());
+            recorded
+                .lock()
+                .unwrap()
+                .push((ok, ctx.error_depth(), chain_len));
+            verdict(ok)
+        });
+        (callback, calls)
+    }
+
+    /// Runs a TLS handshake from `connect` against a server presenting the fixture leaf.
+    async fn handshake_with_fixture_server(peer: &BasicPeer) -> Result<()> {
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        builder
+            .set_certificate(&X509::from_pem(&fixture("verify-leaf.crt")).unwrap())
+            .unwrap();
+        builder
+            .set_private_key(&PKey::private_key_from_pem(&fixture("verify-leaf.key")).unwrap())
+            .unwrap();
+        let acceptor = builder.build();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = accept(&acceptor, server).await;
+        });
+        let connector = super::Connector::new(None);
+        let result = connect(client, peer, None, &connector.ctx)
+            .await
+            .map(|_| ());
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn verify_callback_observes_verified_chain() {
+        let (callback, calls) = recording(|ok| ok);
+        handshake_with_fixture_server(&peer(true, callback))
+            .await
+            .unwrap();
+
+        // the CA, then the leaf, each with the whole chain built
+        assert_eq!(*calls.lock().unwrap(), [(true, 1, 2), (true, 0, 2)]);
+    }
+
+    #[tokio::test]
+    async fn verify_callback_can_reject_verified_chain() {
+        let (callback, calls) = recording(|_| false);
+        let err = handshake_with_fixture_server(&peer(true, callback))
+            .await
+            .unwrap_err();
+
+        // verification stops at the rejected CA
+        assert_eq!(*calls.lock().unwrap(), [(true, 1, 2)]);
+        assert!(err.to_string().contains("TLS connect() failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn verify_callback_runs_when_verification_is_off() {
+        let (callback, calls) = recording(|_| false);
+        let mut peer = peer(false, callback);
+        peer.options.verify_cert = false;
+        // the CA is not trusted, and even rejecting cannot fail the handshake
+        handshake_with_fixture_server(&peer).await.unwrap();
+
+        // the leaf's issuer is missing
+        assert_eq!(*calls.lock().unwrap(), [(false, 0, 1)]);
+    }
+
+    #[tokio::test]
+    async fn verify_callback_sees_hostname_mismatch_once() {
+        let (callback, calls) = recording(|ok| ok);
+        let mut peer = peer(true, callback);
+        peer.sni = "other.test".to_string();
+        handshake_with_fixture_server(&peer).await.unwrap_err();
+
+        // the hostname is checked before the chain's signatures, so the leaf fails without an
+        // earlier successful call
+        assert_eq!(*calls.lock().unwrap(), [(false, 0, 2)]);
+    }
+
+    #[tokio::test]
+    async fn verify_callback_runs_without_sni() {
+        let (callback, calls) = recording(|ok| ok);
+        let mut peer = peer(true, callback);
+        peer.sni.clear();
+        handshake_with_fixture_server(&peer).await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), [(true, 1, 2), (true, 0, 2)]);
     }
 }
