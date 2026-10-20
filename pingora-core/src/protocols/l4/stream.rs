@@ -372,8 +372,8 @@ pub const DEFAULT_L4_WRITE_BUFFER_SIZE: usize = 1460;
 /// L4 [`BufStream`] buffer sizing.
 ///
 /// Leaving either side as `None` preserves Pingora's default for that side.
-/// Setting either side to `Some(0)` disables `BufStream` buffering for that
-/// direction.
+/// A read buffer size of `Some(0)` is clamped to one byte. Use
+/// [`L4BufferSettings::unbuffered`] to disable buffering entirely.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct L4BufferSettings {
     /// Read buffer size in bytes. `None` uses [`DEFAULT_L4_READ_BUFFER_SIZE`].
@@ -391,7 +391,7 @@ impl L4BufferSettings {
         }
     }
 
-    /// Create settings that disable both read and write `BufStream` buffering.
+    /// Create settings that disable both read and write buffering.
     pub fn unbuffered() -> Self {
         Self::new(0, 0)
     }
@@ -410,12 +410,109 @@ impl L4BufferSettings {
 
     /// Resolved read buffer size after applying defaults.
     pub fn read_capacity(&self) -> usize {
-        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE)
+        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE).max(1)
     }
 
     /// Resolved write buffer size after applying defaults.
     pub fn write_capacity(&self) -> usize {
         self.write.unwrap_or(DEFAULT_L4_WRITE_BUFFER_SIZE)
+    }
+}
+
+#[derive(Debug)]
+enum StreamType {
+    Buffered(BufStream<RawStreamWrapper>),
+    Unbuffered(RawStreamWrapper),
+}
+
+impl StreamType {
+    fn get_ref(&self) -> &RawStreamWrapper {
+        match self {
+            Self::Buffered(stream) => stream.get_ref(),
+            Self::Unbuffered(stream) => stream,
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut RawStreamWrapper {
+        match self {
+            Self::Buffered(stream) => stream.get_mut(),
+            Self::Unbuffered(stream) => stream,
+        }
+    }
+}
+
+impl AsyncRead for StreamType {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Safety: Basic enum pin projection
+        unsafe {
+            match Pin::get_unchecked_mut(self) {
+                Self::Buffered(stream) => Pin::new_unchecked(stream).poll_read(cx, buf),
+                Self::Unbuffered(stream) => Pin::new_unchecked(stream).poll_read(cx, buf),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for StreamType {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Safety: Basic enum pin projection
+        unsafe {
+            match Pin::get_unchecked_mut(self) {
+                Self::Buffered(stream) => Pin::new_unchecked(stream).poll_write(cx, buf),
+                Self::Unbuffered(stream) => Pin::new_unchecked(stream).poll_write(cx, buf),
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Safety: Basic enum pin projection
+        unsafe {
+            match Pin::get_unchecked_mut(self) {
+                Self::Buffered(stream) => Pin::new_unchecked(stream).poll_flush(cx),
+                Self::Unbuffered(stream) => Pin::new_unchecked(stream).poll_flush(cx),
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Safety: Basic enum pin projection
+        unsafe {
+            match Pin::get_unchecked_mut(self) {
+                Self::Buffered(stream) => Pin::new_unchecked(stream).poll_shutdown(cx),
+                Self::Unbuffered(stream) => Pin::new_unchecked(stream).poll_shutdown(cx),
+            }
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        // Safety: Basic enum pin projection
+        unsafe {
+            match Pin::get_unchecked_mut(self) {
+                Self::Buffered(stream) => Pin::new_unchecked(stream).poll_write_vectored(cx, bufs),
+                Self::Unbuffered(stream) => {
+                    Pin::new_unchecked(stream).poll_write_vectored(cx, bufs)
+                }
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Buffered(stream) => stream.is_write_vectored(),
+            Self::Unbuffered(stream) => stream.is_write_vectored(),
+        }
     }
 }
 
@@ -426,7 +523,7 @@ impl L4BufferSettings {
 #[derive(Debug)]
 pub struct Stream {
     // Use `Option` to be able to swap to adjust the buffer size. Always safe to unwrap
-    stream: Option<BufStream<RawStreamWrapper>>,
+    stream: Option<StreamType>,
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
@@ -445,11 +542,11 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn stream(&self) -> &BufStream<RawStreamWrapper> {
+    fn stream(&self) -> &StreamType {
         self.stream.as_ref().expect("stream should always be set")
     }
 
-    fn stream_mut(&mut self) -> &mut BufStream<RawStreamWrapper> {
+    fn stream_mut(&mut self) -> &mut StreamType {
         self.stream.as_mut().expect("stream should always be set")
     }
 
@@ -530,14 +627,22 @@ impl Stream {
     pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
         // Since BufStream doesn't provide an API to adjust the buf directly,
-        // we take the raw stream out of it and put it in a new BufStream with the size we want
+        // take the raw stream out and put it in a new variant with the requested size.
         let stream = mem::take(&mut self.stream);
         let stream = stream.map(|s| {
-            BufStream::with_capacity(
-                buffer.read_capacity(),
-                buffer.write_capacity(),
-                s.into_inner(),
-            )
+            let raw_stream = match s {
+                StreamType::Buffered(stream) => stream.into_inner(),
+                StreamType::Unbuffered(stream) => stream,
+            };
+            if buffer.read == Some(0) && buffer.write == Some(0) {
+                StreamType::Unbuffered(raw_stream)
+            } else {
+                StreamType::Buffered(BufStream::with_capacity(
+                    buffer.read_capacity(),
+                    buffer.write_capacity(),
+                    raw_stream,
+                ))
+            }
         });
         let _ = mem::replace(&mut self.stream, stream);
     }
@@ -546,11 +651,9 @@ impl Stream {
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Tcp(s)),
-            )),
+            stream: Some(StreamType::Unbuffered(RawStreamWrapper::new(
+                RawStream::Tcp(s),
+            ))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -569,11 +672,9 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Virtual(s)),
-            )),
+            stream: Some(StreamType::Unbuffered(RawStreamWrapper::new(
+                RawStream::Virtual(s),
+            ))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
@@ -593,11 +694,9 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
-            stream: Some(BufStream::with_capacity(
-                0,
-                0,
-                RawStreamWrapper::new(RawStream::Unix(s)),
-            )),
+            stream: Some(StreamType::Unbuffered(RawStreamWrapper::new(
+                RawStream::Unix(s),
+            ))),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
             established_ts: SystemTime::now(),
