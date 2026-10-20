@@ -66,6 +66,9 @@ pub struct Bootstrap {
     upgrade: bool,
 
     upgrade_sock: String,
+    /// Maximum number of accept() retries when receiving fds from the old process.
+    /// See [`ServerConf::upgrade_sock_connect_accept_max_retries`].
+    upgrade_sock_connect_accept_max_retries: Option<usize>,
 
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
@@ -119,6 +122,7 @@ impl Bootstrap {
             test,
             upgrade,
             upgrade_sock,
+            upgrade_sock_connect_accept_max_retries: conf.upgrade_sock_connect_accept_max_retries,
             #[cfg(unix)]
             listen_fds: Arc::new(Mutex::new(Fds::new())),
             #[cfg(unix)]
@@ -247,7 +251,10 @@ impl Bootstrap {
         if upgrade {
             debug!("Trying to receive socks");
             let mut fds = Fds::new();
-            fds.get_from_sock(self.upgrade_sock.as_str())?;
+            fds.get_from_sock_with_retry(
+                self.upgrade_sock.as_str(),
+                self.upgrade_sock_connect_accept_max_retries,
+            )?;
             if let Some(expected) = &self.expected_listen_addrs {
                 Self::close_unclaimed_fds(&mut fds, expected);
             }
@@ -339,5 +346,39 @@ mod tests {
         // `Fds` does not close on drop.
         // SAFETY: asserted open just above, and no other owner remains.
         drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_fds_uses_configured_upgrade_sock_max_retries() {
+        use std::time::Instant;
+
+        let (execution_phase_watch, _) = broadcast::channel(1);
+        let conf = ServerConf {
+            upgrade_sock: "/tmp/pingora_test_bootstrap_retry.sock".to_string(),
+            upgrade_sock_connect_accept_max_retries: Some(0),
+            ..Default::default()
+        };
+        let mut bootstrap = Bootstrap::new(&None, &conf, &execution_phase_watch);
+
+        // Nothing sends to the upgrade sock, so accept() retries until max_retries is hit.
+        // The accept loop waits one RETRY_INTERVAL (1 second) beyond the configured count, so
+        // 0 retries takes about 1 second and the default of 5 retries takes about 6 seconds.
+        let start = Instant::now();
+        let result = bootstrap.load_fds(true);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(bootstrap.listen_fds.lock().is_empty());
+        assert!(
+            elapsed.as_secs() >= 1,
+            "Expected at least 1 second, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
     }
 }

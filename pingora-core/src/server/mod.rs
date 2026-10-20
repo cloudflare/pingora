@@ -289,7 +289,11 @@ impl Server {
                         false
                     } else {
                         info!("Trying to send socks");
-                        match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                        let conf = self.configuration.as_ref();
+                        match fds.send_to_sock_with_retry(
+                            conf.upgrade_sock.as_str(),
+                            conf.upgrade_sock_connect_accept_max_retries,
+                        ) {
                             Ok(_) => {
                                 info!("listener sockets sent");
                             }

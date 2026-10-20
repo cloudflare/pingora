@@ -20,6 +20,7 @@ group: webusers
 | daemon | whether to run the server in the background | bool |
 | error_log | the path to error log output file. STDERR is used if not set | string |
 | upgrade_sock | the path to the upgrade socket. | string |
+| upgrade_sock_connect_accept_max_retries | Maximum number of retries when the old process connects to the upgrade socket and when the new process accepts on it. The retry interval is 1 second. The accept side waits one additional interval. Default: `5` | number |
 | threads | number of threads per service | number |
 | user | the user the pingora server should be run under after daemonization | string |
 | group | the group the pingora server should be run under after daemonization | string |
