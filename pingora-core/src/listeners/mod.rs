@@ -123,11 +123,11 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 #[cfg(any(feature = "openssl_derived", feature = "rustls"))]
 pub(crate) type SharedTlsAcceptCallbacks = Arc<dyn TlsAccept + Send + Sync>;
 
-/// Callback for processing raw bytes before TLS handshake.
+/// Callback for processing raw bytes before TLS or a cleartext application protocol.
 ///
 /// This trait allows applications to read and process data from the raw TCP stream
-/// before the TLS handshake occurs. This is useful for protocols like HAProxy's
-/// PROXY protocol, which sends client address information before TLS.
+/// before protocol handling occurs. This is useful for protocols like HAProxy's
+/// PROXY protocol, which sends client address information before TLS or HTTP.
 ///
 /// # Example
 ///
@@ -148,7 +148,7 @@ pub(crate) type SharedTlsAcceptCallbacks = Arc<dyn TlsAccept + Send + Sync>;
 /// ```
 #[async_trait]
 pub trait PreTlsProcess: Send + Sync {
-    /// Process the raw stream before TLS handshake.
+    /// Process the raw stream before TLS or cleartext protocol handling.
     ///
     /// The implementation can read bytes from the stream (e.g., PROXY protocol header)
     /// and update the stream's socket digest with parsed information such as the
@@ -315,12 +315,11 @@ pub(crate) struct UninitializedStream {
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer(self.l4_buffer);
-        if let Some(tls) = self.tls {
-            // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
-            if let Some(ref callback) = self.pre_tls_callback {
-                callback.process(&mut self.l4).await?;
-            }
+        if let Some(ref callback) = self.pre_tls_callback {
+            callback.process(&mut self.l4).await?;
+        }
 
+        if let Some(tls) = self.tls {
             let tls_stream = tls.tls_handshake(self.l4).await?;
             Ok(Box::new(tls_stream))
         } else {
@@ -463,9 +462,9 @@ impl Listeners {
 
     /// Set a pre-TLS callback for all endpoints in this listener collection.
     ///
-    /// The callback will be invoked after TCP accept but before the TLS handshake,
-    /// allowing the application to read and process data such as PROXY protocol
-    /// headers that arrive before TLS.
+    /// The callback will be invoked after TCP accept but before TLS or cleartext
+    /// protocol handling, allowing the application to process data such as PROXY
+    /// protocol headers.
     ///
     /// # Example
     ///
@@ -530,11 +529,20 @@ impl Listeners {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[cfg(feature = "connection_filter")]
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
+
+    struct CountingPreTlsProcess(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl PreTlsProcess for CountingPreTlsProcess {
+        async fn process(&self, _stream: &mut L4Stream) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_listen_tcp() {
@@ -568,6 +576,32 @@ mod test {
         // OS has completed the TCP handshake.
         TcpStream::connect(addrs[0]).await.unwrap();
         TcpStream::connect(addrs[1]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pre_tls_callback_runs_for_tcp() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.set_pre_tls_callback(Arc::new(CountingPreTlsProcess(Arc::clone(&calls))));
+        let listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
+
+        let task = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            stream.handshake().await.unwrap();
+        });
+
+        TcpStream::connect(addr).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
