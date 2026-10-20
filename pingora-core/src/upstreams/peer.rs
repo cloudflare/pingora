@@ -17,10 +17,10 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
-#[cfg(feature = "openssl_derived")]
-use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::{HandshakeCompleteHook, VerifyCallback};
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -304,6 +304,16 @@ pub trait Peer: Display + Clone {
             .upstream_tls_handshake_complete_hook
             .as_ref()
     }
+
+    /// Returns a callback that should be run while the upstream's certificate chain is verified.
+    ///
+    /// See [`PeerOptions::upstream_tls_verify_callback`].
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_verify_callback(&self) -> Option<&VerifyCallback> {
+        self.get_peer_options()?
+            .upstream_tls_verify_callback
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -567,6 +577,34 @@ pub struct PeerOptions {
     #[cfg(feature = "openssl_derived")]
     #[derivative(Debug = "ignore")]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
+    /// Callback run while the upstream's certificate chain is verified, with the semantics of an
+    /// `SSL_set_verify` callback.
+    ///
+    /// It is called with the result so far (`preverify_ok`) for each certificate in the built
+    /// chain and for each error found, and its return value replaces that result: returning
+    /// `false` fails verification and stops it, returning `true` for an error accepts the chain
+    /// despite that error, and returning `preverify_ok` only observes.
+    /// [`X509StoreContextRef::chain`] holds the chain built so far.
+    ///
+    /// It runs inside the TLS library's verify callback, so a panic aborts the process.
+    ///
+    /// It also runs when certificate verification is off (`verify_cert` is false or the SNI is
+    /// empty), where its return value cannot fail the handshake, though returning `false` still
+    /// stops verification.
+    ///
+    /// It runs during each full handshake when the server's certificate arrives, before the
+    /// server has proven it holds the certificate's key, so being called does not mean the
+    /// handshake will succeed. It does not run for resumed sessions, on renegotiation, or for
+    /// connections reused from the pool. It is not part of the connection reuse key either, so a
+    /// pooled connection established without it, or with another callback, can be reused for
+    /// this peer. For [`HttpPeer`], use a distinct `group_key` to keep them apart.
+    ///
+    /// Currently only enabled for openssl variants.
+    ///
+    /// [`X509StoreContextRef::chain`]: crate::tls::x509::X509StoreContextRef::chain
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_verify_callback: Option<VerifyCallback>,
 }
 
 impl PeerOptions {
@@ -611,6 +649,8 @@ impl PeerOptions {
             proxy_digest_user_data_hook: None,
             #[cfg(feature = "openssl_derived")]
             upstream_tls_handshake_complete_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_verify_callback: None,
         }
     }
 

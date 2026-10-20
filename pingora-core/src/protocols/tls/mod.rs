@@ -47,6 +47,13 @@ pub type HandshakeCompleteHook = std::sync::Arc<
     dyn Fn(&TlsRef) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> + Send + Sync,
 >;
 
+/// Containing type for a user callback run while an upstream certificate chain is verified.
+///
+/// See [`PeerOptions::upstream_tls_verify_callback`](crate::upstreams::peer::PeerOptions::upstream_tls_verify_callback).
+#[cfg(feature = "openssl_derived")]
+pub type VerifyCallback =
+    std::sync::Arc<dyn Fn(bool, &mut crate::tls::x509::X509StoreContextRef) -> bool + Send + Sync>;
+
 /// The protocol for Application-Layer Protocol Negotiation
 #[derive(Hash, Clone, Debug, PartialEq, PartialOrd)]
 pub enum ALPN {
