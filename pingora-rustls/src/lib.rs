@@ -45,7 +45,7 @@ pub fn install_default_crypto_provider() {
     let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 }
 pub use rustls_native_certs::load_native_certs;
-use rustls_pemfile::Item;
+use rustls_pki_types::pem::{PemObject, SectionKind};
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -66,11 +66,11 @@ where
 }
 
 /// Read the pem file at the given path from disk
-fn load_pem_file<P>(path: P) -> Result<Vec<Item>>
+fn load_pem_file<P>(path: P) -> Result<Vec<(SectionKind, Vec<u8>)>>
 where
     P: AsRef<Path>,
 {
-    rustls_pemfile::read_all(&mut load_file(path)?)
+    <(SectionKind, Vec<u8>)>::pem_reader_iter(load_file(path)?)
         .map(|item_res| {
             item_res.or_err(
                 ErrorType::InvalidCert,
@@ -86,9 +86,9 @@ pub fn load_ca_file_into_store<P>(path: P, cert_store: &mut RootCertStore) -> Re
 where
     P: AsRef<Path>,
 {
-    for pem_item in load_pem_file(path)? {
+    for (kind, der) in load_pem_file(path)? {
         // only loading certificates, handling a CA file
-        let Item::X509Certificate(content) = pem_item else {
+        let Some(content) = CertificateDer::from_pem(kind, der) else {
             return Error::e_explain(
                 ErrorType::InvalidCert,
                 "Pem file contains un-loadable certificate type",
@@ -106,10 +106,16 @@ where
 /// Attempt to load the native cas into the given root-certificate store
 pub fn load_platform_certs_incl_env_into_store(ca_certs: &mut RootCertStore) -> Result<()> {
     // this includes handling of ENV vars SSL_CERT_FILE & SSL_CERT_DIR
-    for cert in load_native_certs()
-        .or_err(ErrorType::InvalidCert, "Failed to load native certificates")?
-        .into_iter()
-    {
+    let native_certs = load_native_certs();
+    if let Some(error) = native_certs.errors.into_iter().next() {
+        return Error::e_because(
+            ErrorType::InvalidCert,
+            "Failed to load native certificates",
+            error,
+        );
+    }
+
+    for cert in native_certs.certs {
         ca_certs.add(cert).or_err(
             ErrorType::InvalidCert,
             "Failed to load native certificate into root store",
@@ -129,25 +135,14 @@ pub fn load_certs_and_key_files<'a>(
 
     let certs = certs_file
         .into_iter()
-        .filter_map(|item| {
-            if let Item::X509Certificate(cert) = item {
-                Some(cert)
-            } else {
-                None
-            }
-        })
+        .filter_map(|(kind, der)| CertificateDer::from_pem(kind, der))
         .collect::<Vec<_>>();
 
     // These are the currently supported pk types -
     // [https://doc.servo.org/rustls/key/struct.PrivateKey.html]
     let private_key_opt = key_file
         .into_iter()
-        .filter_map(|key_item| match key_item {
-            Item::Pkcs1Key(key) => Some(PrivateKeyDer::from(key)),
-            Item::Pkcs8Key(key) => Some(PrivateKeyDer::from(key)),
-            Item::Sec1Key(key) => Some(PrivateKeyDer::from(key)),
-            _ => None,
-        })
+        .filter_map(|(kind, der)| PrivateKeyDer::from_pem(kind, der))
         .next();
 
     if let (Some(private_key), false) = (private_key_opt, certs.is_empty()) {
@@ -159,8 +154,7 @@ pub fn load_certs_and_key_files<'a>(
 
 /// Load the certificate
 pub fn load_pem_file_ca(path: &String) -> Result<Vec<u8>> {
-    let mut reader = load_file(path)?;
-    let cas_file_items = rustls_pemfile::certs(&mut reader)
+    let cas_file_items = CertificateDer::pem_reader_iter(load_file(path)?)
         .map(|item_res| {
             item_res.or_err(
                 ErrorType::InvalidCert,
@@ -176,7 +170,9 @@ pub fn load_pem_file_ca(path: &String) -> Result<Vec<u8>> {
 }
 
 pub fn load_pem_file_private_key(path: &String) -> Result<Vec<u8>> {
-    Ok(rustls_pemfile::private_key(&mut load_file(path)?)
+    Ok(PrivateKeyDer::pem_reader_iter(load_file(path)?)
+        .next()
+        .transpose()
         .or_err(
             ErrorType::InvalidCert,
             "Failed to load private key from file",
