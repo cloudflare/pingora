@@ -75,6 +75,7 @@ pub mod tls;
 pub use crate::tls::listeners as tls;
 
 use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
+use crate::upstreams::peer::Tracer;
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -168,6 +169,7 @@ struct TransportStackBuilder {
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
 }
 
 impl TransportStackBuilder {
@@ -195,6 +197,7 @@ impl TransportStackBuilder {
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
         })
     }
 }
@@ -283,6 +286,7 @@ pub(crate) struct TransportStack {
     tls: Option<Arc<Acceptor>>,
     l4_buffer: L4BufferSettings,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
 }
 
 impl TransportStack {
@@ -291,7 +295,17 @@ impl TransportStack {
     }
 
     pub async fn accept(&self) -> Result<UninitializedStream> {
-        let stream = self.l4.accept().await?;
+        let mut stream = self.l4.accept().await?;
+        // Attach the listener's tracer, if any, the same way the upstream connector does:
+        // report the connection now and let `Stream`'s `Drop` report the disconnect. The
+        // tracer rides on the L4 stream, which `handshake()` keeps alive in both the plain
+        // and the TLS case, so the whole life of the connection is covered -- including
+        // connections that never finish the handshake.
+        if let Some(tracer) = self.tracer.as_ref() {
+            let tracer = tracer.clone();
+            tracer.0.on_connected();
+            stream.tracer = Some(tracer);
+        }
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
@@ -342,6 +356,7 @@ pub struct Listeners {
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
 }
 
 impl Listeners {
@@ -352,6 +367,7 @@ impl Listeners {
             #[cfg(feature = "connection_filter")]
             connection_filter: None,
             pre_tls_callback: None,
+            tracer: None,
         }
     }
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
@@ -458,6 +474,7 @@ impl Listeners {
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
         });
     }
 
@@ -490,6 +507,41 @@ impl Listeners {
         }
     }
 
+    /// Set a [`Tracer`] to report the lifetime of accepted (downstream) connections.
+    ///
+    /// The tracer is cloned per connection. [`Tracing::on_connected`] is called right after
+    /// `accept()` returns, before the TLS handshake, and [`Tracing::on_disconnected`] is called
+    /// by [`Stream`]'s `Drop`. The two therefore pair by construction, and connections that
+    /// never finish the handshake are covered as well.
+    ///
+    /// This is the same mechanism [`crate::upstreams::peer::Peer::get_tracer`] provides for
+    /// connections Pingora opens *to* an upstream; this method is the downstream counterpart.
+    ///
+    /// [`Tracing::on_connected`]: crate::upstreams::peer::Tracing::on_connected
+    /// [`Tracing::on_disconnected`]: crate::upstreams::peer::Tracing::on_disconnected
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pingora_core::listeners::Listeners;
+    /// use pingora_core::upstreams::peer::Tracer;
+    ///
+    /// let mut listeners = Listeners::new();
+    /// listeners.set_tracer(Tracer(Box::new(MyConnectionCount::default())));
+    /// listeners.add_tcp("0.0.0.0:8080");
+    /// ```
+    pub fn set_tracer(&mut self, tracer: Tracer) {
+        log::debug!("Setting tracer on Listeners");
+
+        // Store the tracer for future endpoints
+        self.tracer = Some(tracer.clone());
+
+        // Apply to existing stacks
+        for stack in &mut self.stacks {
+            stack.tracer = Some(tracer.clone());
+        }
+    }
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided.
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
@@ -499,6 +551,7 @@ impl Listeners {
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
         })
     }
 
@@ -568,6 +621,87 @@ mod test {
         // OS has completed the TCP handshake.
         TcpStream::connect(addrs[0]).await.unwrap();
         TcpStream::connect(addrs[1]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_listener_tracer_reports_connect_and_disconnect() {
+        use crate::upstreams::peer::Tracing;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Counters {
+            connected: AtomicUsize,
+            disconnected: AtomicUsize,
+        }
+
+        // A tracer clone must share the counters with the original: the listener clones the
+        // tracer once per connection.
+        #[derive(Debug, Clone)]
+        struct Count(Arc<Counters>);
+
+        impl Tracing for Count {
+            fn on_connected(&self) {
+                self.0.connected.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_disconnected(&self) {
+                self.0.disconnected.fetch_add(1, Ordering::Relaxed);
+            }
+            fn boxed_clone(&self) -> Box<dyn Tracing> {
+                Box::new(self.clone())
+            }
+        }
+
+        let counters = Arc::new(Counters::default());
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.set_tracer(Tracer(Box::new(Count(counters.clone()))));
+
+        let mut built = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(built.len(), 1);
+        let stack = built.pop().unwrap();
+        let addr = stack.l4.local_addr().unwrap();
+
+        let accepted = tokio::spawn(async move { stack.accept().await.unwrap() });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let stream = accepted.await.unwrap();
+
+        // Reported at accept time, before any handshake.
+        assert_eq!(counters.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.disconnected.load(Ordering::Relaxed), 0);
+
+        // Dropping the connection without ever handshaking still reports the disconnect,
+        // which is the window an application-side counter cannot see.
+        drop(stream);
+        assert_eq!(counters.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.disconnected.load(Ordering::Relaxed), 1);
+
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_listener_without_tracer_is_unchanged() {
+        // The default is no tracer; this is the "nothing changes for anyone who does not opt
+        // in" half, and it fails if `accept()` ever starts assuming a tracer is present.
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        let mut built = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+        let stack = built.pop().unwrap();
+        let addr = stack.l4.local_addr().unwrap();
+
+        let accepted = tokio::spawn(async move { stack.accept().await.unwrap() });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = accepted.await.unwrap();
+        drop(stream);
     }
 
     #[test]
