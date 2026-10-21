@@ -70,15 +70,40 @@ pub trait Ssl {
     }
 }
 
-/// The ability peek data before consuming it
+/// The ability to peek data before consuming it
 #[async_trait]
 pub trait Peek {
-    /// Peek data but not consuming it. This call should block until some data
+    /// Peek data but don't consume it. This call should block until some data
     /// is sent.
     /// Return `false` if peeking is not supported/allowed.
     async fn try_peek(&mut self, _buf: &mut [u8]) -> std::io::Result<bool> {
         Ok(false)
     }
+}
+
+/// The ability to tell the state of the peer side of the transport without reading.
+pub trait GetTransportState {
+    /// Returns the state of the peer side of the transport. This function does not read and it
+    /// does not wait. `None` means that the stream cannot tell.
+    ///
+    /// A stream that an I/O driver serves shows only the events that the driver processed. A
+    /// close or a reset that the driver did not process shows as [`TransportState::Open`]. A TLS
+    /// stream returns the state of the transport below it. A TLS `close_notify` without a
+    /// transport close shows as open.
+    fn get_transport_state(&self) -> Option<TransportState>;
+}
+
+/// The state of the peer side of a transport. [`GetTransportState::get_transport_state`]
+/// returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportState {
+    /// The peer did not close or reset the transport. Data can wait to be read.
+    Open,
+    /// The peer closed its send side. Data that it sent before the FIN can be unread.
+    Closed,
+    /// The transport has an error, for example a reset.
+    Reset,
 }
 
 use std::any::Any;
@@ -94,6 +119,7 @@ pub trait IO:
     + GetTimingDigest
     + GetProxyDigest
     + GetSocketDigest
+    + GetTransportState
     + Peek
     + Unpin
     + Debug
@@ -115,6 +141,7 @@ impl<
             + GetTimingDigest
             + GetProxyDigest
             + GetSocketDigest
+            + GetTransportState
             + Peek
             + Unpin
             + Debug
@@ -165,6 +192,11 @@ mod ext_io_impl {
             None
         }
     }
+    impl GetTransportState for Mock {
+        fn get_transport_state(&self) -> Option<TransportState> {
+            None
+        }
+    }
 
     impl Peek for Mock {}
 
@@ -192,6 +224,11 @@ mod ext_io_impl {
     }
     impl<T> GetSocketDigest for Cursor<T> {
         fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+    impl<T> GetTransportState for Cursor<T> {
+        fn get_transport_state(&self) -> Option<TransportState> {
             None
         }
     }
@@ -224,6 +261,11 @@ mod ext_io_impl {
             None
         }
     }
+    impl GetTransportState for DuplexStream {
+        fn get_transport_state(&self) -> Option<TransportState> {
+            None
+        }
+    }
 
     impl Peek for DuplexStream {}
 }
@@ -235,8 +277,8 @@ pub mod ext_test {
     use async_trait::async_trait;
 
     use super::{
-        raw_connect, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
-        SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
+        raw_connect, GetProxyDigest, GetSocketDigest, GetTimingDigest, GetTransportState, Peek,
+        Shutdown, SocketDigest, Ssl, TimingDigest, TransportState, UniqueID, UniqueIDType,
     };
 
     #[async_trait]
@@ -261,6 +303,11 @@ pub mod ext_test {
     }
     impl GetSocketDigest for tokio::net::UnixStream {
         fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+    impl GetTransportState for tokio::net::UnixStream {
+        fn get_transport_state(&self) -> Option<TransportState> {
             None
         }
     }

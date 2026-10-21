@@ -99,8 +99,9 @@ pub(crate) mod test_util {
     // Implement IO-required traits so FlushTrackingMock can be used as Box<dyn IO>
     // in HttpSession tests (server.rs).
     use crate::protocols::{
-        raw_connect::ProxyDigest, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown,
-        SocketDigest, Ssl, TimingDigest, UniqueID, UniqueIDType,
+        raw_connect::ProxyDigest, GetProxyDigest, GetSocketDigest, GetTimingDigest,
+        GetTransportState, Peek, Shutdown, SocketDigest, Ssl, TimingDigest, TransportState,
+        UniqueID, UniqueIDType,
     };
 
     #[async_trait::async_trait]
@@ -125,6 +126,11 @@ pub(crate) mod test_util {
     }
     impl GetSocketDigest for FlushTrackingMock {
         fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+            None
+        }
+    }
+    impl GetTransportState for FlushTrackingMock {
+        fn get_transport_state(&self) -> Option<TransportState> {
             None
         }
     }

@@ -8,6 +8,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::ext::TcpKeepalive;
+use crate::protocols::TransportState;
 
 /// A limited set of socket options that can be set on a [`VirtualSocket`].
 #[non_exhaustive]
@@ -21,6 +22,12 @@ pub enum VirtualSockOpt {
 pub trait VirtualSocket: AsyncRead + AsyncWrite + Unpin + Send + Sync + std::fmt::Debug {
     /// Set a socket option.
     fn set_socket_option(&self, opt: VirtualSockOpt) -> std::io::Result<()>;
+
+    /// Returns the state of the peer side without reading. `None` means that the socket cannot
+    /// tell.
+    fn get_transport_state(&self) -> Option<TransportState> {
+        None
+    }
 }
 
 /// Wrapper around any type implementing  [`VirtualSocket`].
@@ -37,6 +44,11 @@ impl VirtualSocketStream {
     #[inline]
     pub fn set_socket_option(&self, opt: VirtualSockOpt) -> std::io::Result<()> {
         self.socket.set_socket_option(opt)
+    }
+
+    #[inline]
+    pub fn get_transport_state(&self) -> Option<TransportState> {
+        self.socket.get_transport_state()
     }
 }
 

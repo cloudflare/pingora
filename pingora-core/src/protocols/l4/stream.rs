@@ -31,7 +31,6 @@ use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
-#[cfg(target_os = "linux")]
 use tokio::io::Interest;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
@@ -43,8 +42,8 @@ use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl,
-    TimingDigest, UniqueID, UniqueIDType,
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, GetTransportState, Peek, Shutdown,
+    SocketDigest, Ssl, TimingDigest, TransportState, UniqueID, UniqueIDType,
 };
 use crate::upstreams::peer::Tracer;
 
@@ -832,6 +831,28 @@ impl Peek for Stream {
         // rewind regardless of what is read
         self.rewind(buf);
         Ok(true)
+    }
+}
+
+impl GetTransportState for Stream {
+    /// Polls the readiness of the socket one time. `ready()` does not use coop budget. It does
+    /// not take the wakeup of a reader that waits.
+    fn get_transport_state(&self) -> Option<TransportState> {
+        let interest = Interest::READABLE | Interest::ERROR;
+        let ready = match &self.stream().get_ref().stream {
+            RawStream::Tcp(s) => s.ready(interest).now_or_never(),
+            #[cfg(unix)]
+            RawStream::Unix(s) => s.ready(interest).now_or_never(),
+            RawStream::Virtual(s) => return s.get_transport_state(),
+        };
+        match ready {
+            None => Some(TransportState::Open),
+            Some(Ok(r)) if r.is_error() => Some(TransportState::Reset),
+            Some(Ok(r)) if r.is_read_closed() => Some(TransportState::Closed),
+            Some(Ok(_)) => Some(TransportState::Open),
+            // The I/O driver is gone.
+            Some(Err(_)) => None,
+        }
     }
 }
 

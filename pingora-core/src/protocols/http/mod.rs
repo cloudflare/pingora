@@ -28,7 +28,7 @@ pub mod subrequest;
 pub mod v1;
 pub mod v2;
 
-pub use server::{ReusableHttpStream, Session as ServerSession};
+pub use server::{DownstreamGone, ReusableHttpStream, Session as ServerSession};
 
 /// The Pingora server name string
 pub const SERVER_NAME: &[u8; 7] = b"Pingora";

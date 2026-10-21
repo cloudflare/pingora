@@ -15,7 +15,7 @@
 use super::coalesce::WriteCoalescer;
 use crate::protocols::digest::TimingDigest;
 use crate::protocols::tls::{SslDigest, ALPN};
-use crate::protocols::{Peek, Ssl, UniqueID, UniqueIDType};
+use crate::protocols::{GetTransportState, Peek, Ssl, TransportState, UniqueID, UniqueIDType};
 use crate::tls::{self, ssl, tokio_ssl::SslStream as InnerSsl};
 use crate::utils::tls::{get_organization, get_serial};
 use log::warn;
@@ -255,6 +255,12 @@ impl SslDigest {
 
 // TODO: implement Peek if needed
 impl<T> Peek for SslStream<T> {}
+
+impl<T: GetTransportState> GetTransportState for SslStream<T> {
+    fn get_transport_state(&self) -> Option<TransportState> {
+        self.ssl.get_ref().get_transport_state()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -546,5 +552,51 @@ mod tests {
                 .expect("h2 exchange over retried TLS writes timed out");
             }
         }
+    }
+
+    /// The TLS stream returns the state of the TCP connection below it.
+    #[tokio::test]
+    async fn transport_state_comes_from_the_tcp_connection() {
+        use crate::protocols::l4::stream::Stream as L4Stream;
+        use crate::protocols::{GetTransportState, TransportState};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let acceptor = {
+            let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+            let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+            let mut builder =
+                ssl::SslAcceptor::mozilla_intermediate_v5(ssl::SslMethod::tls()).unwrap();
+            builder.set_certificate_chain_file(cert).unwrap();
+            builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
+            builder.build()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            super::super::server::handshake(&acceptor, L4Stream::from(tcp))
+                .await
+                .unwrap()
+        });
+
+        let tcp = TcpStream::connect(addr).await.unwrap().into_std().unwrap();
+        // A second handle to shut down the write side, so that the server sees a FIN and not a
+        // reset, whatever TLS data the client has not read.
+        let half = tcp.try_clone().unwrap();
+        let ssl = ssl::Ssl::new(&strict_context(false)).unwrap();
+        let mut client = SslStream::new(ssl, TcpStream::from_std(tcp).unwrap()).unwrap();
+        client.connect().await.unwrap();
+        let server = server.await.unwrap();
+        assert_eq!(server.get_transport_state(), Some(TransportState::Open));
+
+        half.shutdown(std::net::Shutdown::Write).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.get_transport_state() != Some(TransportState::Closed) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the TLS stream did not report the close");
+        drop(client);
     }
 }
