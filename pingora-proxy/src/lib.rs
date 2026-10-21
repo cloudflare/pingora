@@ -3719,4 +3719,187 @@ mod tests {
             "only a cancelled fill changes the reason"
         );
     }
+
+    /// The pattern in `docs/user_guide/failover.md`: `upstream_peer` stops the retries when the
+    /// client is gone.
+    mod downstream_gone_hooks {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, UnixStream};
+
+        #[derive(Clone, Copy)]
+        enum Leave {
+            Never,
+            BeforeRequest,
+            /// In the first `upstream_peer` call, after its check. The first attempt then fails.
+            InUpstreamPeer,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Upstream {
+            /// The connect fails.
+            Refusing,
+            /// The connect succeeds, then the upstream closes the connection.
+            Closing,
+        }
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        struct Calls {
+            upstream_peer: usize,
+            fail_to_connect: usize,
+            error_while_proxy: usize,
+        }
+
+        struct HookProxy {
+            peer: HttpPeer,
+            client: Mutex<Option<UnixStream>>,
+            leave: Leave,
+            calls: Mutex<Calls>,
+        }
+
+        #[async_trait]
+        impl ProxyHttp for HookProxy {
+            type CTX = ();
+            fn new_ctx(&self) {}
+
+            async fn upstream_peer(
+                &self,
+                session: &mut Session,
+                _ctx: &mut (),
+            ) -> Result<Box<HttpPeer>> {
+                self.calls.lock().unwrap().upstream_peer += 1;
+                if session.downstream_gone().is_some() {
+                    return Err(Error::explain(ConnectionClosed, "client gone").into_down());
+                }
+                if matches!(self.leave, Leave::InUpstreamPeer) {
+                    self.client.lock().unwrap().take();
+                    tokio::task::yield_now().await;
+                }
+                Ok(Box::new(self.peer.clone()))
+            }
+
+            fn fail_to_connect(
+                &self,
+                _session: &mut Session,
+                _peer: &HttpPeer,
+                _ctx: &mut (),
+                mut e: Box<Error>,
+            ) -> Box<Error> {
+                self.calls.lock().unwrap().fail_to_connect += 1;
+                // This app retries connect failures, which are not retryable by default.
+                e.set_retry(true);
+                e
+            }
+
+            fn error_while_proxy(
+                &self,
+                _peer: &HttpPeer,
+                _session: &mut Session,
+                mut e: Box<Error>,
+                _ctx: &mut (),
+                _client_reused: bool,
+            ) -> Box<Error> {
+                self.calls.lock().unwrap().error_while_proxy += 1;
+                // This app retries every error on an established connection. By default, only
+                // some errors on a reused connection are retried.
+                e.set_retry(true);
+                e
+            }
+        }
+
+        async fn run(leave: Leave, upstream: Upstream) -> Calls {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await
+                .unwrap();
+            let mut session = Session::new_h1(Box::new(L4Stream::from(server)));
+            session.read_request().await.unwrap();
+            let mut client = Some(client);
+            if matches!(leave, Leave::BeforeRequest) {
+                client.take();
+                tokio::task::yield_now().await;
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            match upstream {
+                // The listener closes here, so the address refuses connections.
+                Upstream::Refusing => drop(listener),
+                Upstream::Closing => {
+                    tokio::spawn(async move {
+                        while let Ok((stream, _)) = listener.accept().await {
+                            drop(stream);
+                        }
+                    });
+                }
+            }
+            let proxy = Arc::new(HttpProxy::new(
+                HookProxy {
+                    peer: HttpPeer::new(addr, false, String::new()).unwrap(),
+                    client: Mutex::new(client),
+                    leave,
+                    calls: Mutex::default(),
+                },
+                Arc::new(ServerConf {
+                    max_retries: 3,
+                    ..ServerConf::default()
+                }),
+            ));
+            proxy.process_request(session, ()).await;
+            let calls = *proxy.inner.calls.lock().unwrap();
+            calls
+        }
+
+        #[tokio::test]
+        async fn client_that_stays_gets_all_retries() {
+            let calls = run(Leave::Never, Upstream::Refusing).await;
+            assert_eq!(
+                calls,
+                Calls {
+                    upstream_peer: 3,
+                    fail_to_connect: 3,
+                    error_while_proxy: 0,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn upstream_peer_stops_before_the_first_attempt() {
+            let calls = run(Leave::BeforeRequest, Upstream::Refusing).await;
+            assert_eq!(
+                calls,
+                Calls {
+                    upstream_peer: 1,
+                    fail_to_connect: 0,
+                    error_while_proxy: 0,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn upstream_peer_stops_the_retries_after_a_failed_connect() {
+            let calls = run(Leave::InUpstreamPeer, Upstream::Refusing).await;
+            assert_eq!(
+                calls,
+                Calls {
+                    upstream_peer: 2,
+                    fail_to_connect: 1,
+                    error_while_proxy: 0,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn upstream_peer_stops_the_retries_after_an_error_on_a_connection() {
+            let calls = run(Leave::InUpstreamPeer, Upstream::Closing).await;
+            assert_eq!(
+                calls,
+                Calls {
+                    upstream_peer: 2,
+                    fail_to_connect: 0,
+                    error_while_proxy: 1,
+                }
+            );
+        }
+    }
 }
