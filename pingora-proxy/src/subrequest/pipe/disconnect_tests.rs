@@ -199,6 +199,24 @@ async fn bodyless_request_observes_disconnect_without_child_body_demand() {
     detects_disconnect_without_child_body_demand(InputBodyType::SaveBody(0)).await;
 }
 
+/// A client that closes before the child sends a response header to its empty-body Upgrade `GET`
+/// ends the pipe and releases the child.
+#[tokio::test]
+async fn upgrade_request_disconnect_before_the_response_header_fails_the_pipe() {
+    let (mut client, server) = tokio::io::duplex(1024);
+    client.write_all(UPGRADE_REQUEST).await.unwrap();
+    let mut session = Session::new_h1(Box::new(server));
+    session.downstream_session.read_request().await.unwrap();
+    let disconnect = async { drop(client) };
+    assert_stalled_pipe_disconnects(
+        session,
+        InputBodyType::SaveBody(0),
+        ConnectionClosed,
+        disconnect,
+    )
+    .await;
+}
+
 async fn detects_half_close_without_child_body_demand(input: InputBodyType) {
     let (session, mut client) = h1_get_session().await;
     // A half-close (write side shut down, read side still open) must be
