@@ -51,7 +51,7 @@ use crate::protocols::http::{
     subrequest::dummy::DummyIO,
     v1::common::{header_value_content_length, is_chunked_encoding_from_headers, BODY_BUF_LIMIT},
     v1::server::HttpSession as SessionV1,
-    HttpTask,
+    DownstreamGone, HttpTask,
 };
 use crate::protocols::{Digest, SocketAddr};
 
@@ -675,6 +675,18 @@ impl HttpSession {
             }
             return Ok(task);
         }
+    }
+
+    /// Checks one time if the client is gone. This function does not read.
+    ///
+    /// It returns [`DownstreamGone::StreamReset`] once the client drops the response receiver
+    /// ([`SubrequestHandle::rx`]), and after [`Self::shutdown`], because no response can reach the
+    /// client any more.
+    pub fn downstream_gone(&self) -> Option<DownstreamGone> {
+        self.tx
+            .as_ref()
+            .is_none_or(|tx| tx.is_closed())
+            .then_some(DownstreamGone::StreamReset)
     }
 
     /// Make [`Self::idle`] treat the client as gone only once it drops the response receiver
@@ -1362,6 +1374,18 @@ mod tests_stream {
             .expect("idle did not observe the abandoned response")
             .unwrap_err();
         assert_eq!(error.etype, ReadError);
+    }
+
+    #[tokio::test]
+    async fn downstream_gone_reads_nothing() {
+        let (mut session, handle) = build_req().await;
+        handle.tx.send(HttpTask::Done).await.unwrap();
+        drop(handle.tx);
+        assert_eq!(session.downstream_gone(), None);
+        drop(handle.rx);
+        assert_eq!(session.downstream_gone(), Some(DownstreamGone::StreamReset));
+        let queued = session.rx.as_mut().unwrap().try_recv();
+        assert!(matches!(queued, Ok(HttpTask::Done)));
     }
 
     #[tokio::test(start_paused = true)]

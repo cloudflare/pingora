@@ -15,12 +15,16 @@
 use std::{future::Future, time::Duration};
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{FutureExt, Stream};
 use http::HeaderMap;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 
-use crate::protocols::{http::HttpTask, l4::socket::SocketAddr, Digest};
+use crate::protocols::{
+    http::{DownstreamGone, HttpTask},
+    l4::socket::SocketAddr,
+    Digest,
+};
 
 use super::CustomMessageWrite;
 
@@ -156,6 +160,21 @@ pub trait Session: Send + Sync + Unpin + 'static {
         &mut self,
         no_body_expected: bool,
     ) -> impl Future<Output = Result<Option<Bytes>>> + Send;
+
+    /// Checks one time if the client is gone. This function must not wait or read request data.
+    ///
+    /// The default polls [`Session::read_body_or_idle`] one time, but only after
+    /// [`Session::is_body_done`]. Before that time, it returns `None`. An error from the idle read
+    /// counts as [`DownstreamGone::Reset`], except that `ConnectionClosed` counts as
+    /// [`DownstreamGone::Closed`] and `ConnectError` as [`DownstreamGone::UnexpectedData`].
+    /// Override this function if the session can find a close or a reset without the idle read.
+    fn downstream_gone(&mut self) -> Option<DownstreamGone> {
+        if !self.is_body_done() {
+            return None;
+        }
+        let error = self.read_body_or_idle(true).now_or_never()?.err()?;
+        Some(DownstreamGone::from_idle_error(&error))
+    }
 
     fn body_bytes_sent(&self) -> usize;
 

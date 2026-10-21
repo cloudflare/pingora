@@ -25,7 +25,7 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::{Error, Result};
+use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::time::Duration;
@@ -49,6 +49,35 @@ impl ReusableHttpStream {
     /// bytes already read for the next pipelined request.
     pub fn into_parts(self) -> (Stream, Option<BytesMut>) {
         (self.stream, self.pipelined_prefix)
+    }
+}
+
+/// Why [`Session::downstream_gone`] found that the client is gone.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownstreamGone {
+    /// The client closed its side of the connection.
+    Closed,
+    /// The connection or session was reset or failed.
+    Reset,
+    /// The client sent `RST_STREAM` for the HTTP/2 stream, with any reason including
+    /// `NO_ERROR`, or a subrequest's client dropped its response receiver. Not necessarily
+    /// abnormal: it only means the client stopped waiting.
+    StreamReset,
+    /// The client sent data that this session cannot use, such as an HTTP/1 next request
+    /// before this response with pipelining disabled. HTTP/1 keeps the data and does not reuse
+    /// the connection. The client can still be connected.
+    UnexpectedData,
+}
+
+impl DownstreamGone {
+    /// Maps an error from the idle read of `read_body_or_idle`.
+    pub(crate) fn from_idle_error(error: &Error) -> Self {
+        match error.etype() {
+            ErrorType::ConnectionClosed => Self::Closed,
+            ErrorType::ConnectError => Self::UnexpectedData,
+            _ => Self::Reset,
+        }
     }
 }
 
@@ -776,6 +805,23 @@ where
         match self {
             Self::H2(s) => Some(s.idle()),
             _ => None,
+        }
+    }
+
+    /// Checks one time if the client is gone. This function does not wait and does not read
+    /// request data.
+    ///
+    /// If the check does not find that the client is gone, it returns `None`. For the rules of
+    /// each session type, see [`super::v1::server::HttpSession::downstream_gone`],
+    /// [`super::v2::server::HttpSession::downstream_gone`],
+    /// [`super::subrequest::server::HttpSession::downstream_gone`] and
+    /// [`super::custom::server::Session::downstream_gone`].
+    pub fn downstream_gone(&mut self) -> Option<DownstreamGone> {
+        match self {
+            Self::H1(s) => s.downstream_gone(),
+            Self::H2(s) => s.downstream_gone(),
+            Self::Subrequest(s) => s.downstream_gone(),
+            Self::Custom(s) => s.downstream_gone(),
         }
     }
 

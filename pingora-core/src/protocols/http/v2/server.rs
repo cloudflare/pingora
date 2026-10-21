@@ -15,7 +15,7 @@
 //! HTTP/2 server session
 
 use bytes::Bytes;
-use futures::Future;
+use futures::{Future, FutureExt};
 use h2::server;
 use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
@@ -41,7 +41,7 @@ use crate::protocols::http::v1::client::{
     http_req_header_to_wire, request_target_has_forbidden_byte,
 };
 use crate::protocols::http::v1::common::validate_content_length_without_transfer_encoding;
-use crate::protocols::http::HttpTask;
+use crate::protocols::http::{DownstreamGone, HttpTask};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType, OrErr, Result};
@@ -933,6 +933,18 @@ impl HttpSession {
     /// its internal tasks as the client waiting for the tasks goes away
     pub fn idle(&mut self) -> Idle<'_> {
         Idle(self)
+    }
+
+    /// Checks one time if the client is gone. This function polls [`Self::idle`] one time. It does
+    /// not read body data.
+    ///
+    /// It returns [`DownstreamGone::StreamReset`] when the client resets the stream. It returns
+    /// [`DownstreamGone::Reset`] when the stream or the connection fails.
+    pub fn downstream_gone(&mut self) -> Option<DownstreamGone> {
+        match self.idle().now_or_never()? {
+            Ok(_) => Some(DownstreamGone::StreamReset),
+            Err(_) => Some(DownstreamGone::Reset),
+        }
     }
 
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
@@ -2109,6 +2121,75 @@ mod test {
         for handle in handles {
             // ensure no panics
             assert!(handle.await.is_ok());
+        }
+    }
+
+    /// `downstream_gone` finds nothing on a live stream, and finds a client reset or a dropped
+    /// connection.
+    #[tokio::test]
+    async fn test_downstream_gone() {
+        for drop_connection in [false, true] {
+            let (client, server) = duplex(65536);
+            let (gone_tx, gone_rx) = oneshot::channel::<()>();
+            let client_task = tokio::spawn(async move {
+                let (h2, connection) = h2::client::handshake(client).await.unwrap();
+                let connection = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let mut h2 = h2.ready().await.unwrap();
+                let request = Request::builder()
+                    .uri("https://www.example.com/")
+                    .body(())
+                    .unwrap();
+                let (_response, mut req_body) = h2.send_request(request, true).unwrap();
+                gone_rx.await.unwrap();
+                if drop_connection {
+                    connection.abort();
+                } else {
+                    req_body.send_reset(h2::Reason::CANCEL);
+                }
+                std::future::pending::<()>().await;
+            });
+
+            let mut connection = handshake(Box::new(server), None).await.unwrap();
+            let digest = Arc::new(Digest::default());
+            let Some(H2Accept::Session(http)) =
+                HttpSession::from_h2_conn(&mut connection, digest.clone())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected a session");
+            };
+            let session_task = tokio::spawn(async move {
+                let mut session = crate::protocols::http::ServerSession::new_http2(http);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(session.downstream_gone(), None, "live stream reported gone");
+                gone_tx.send(()).unwrap();
+                loop {
+                    if let Some(gone) = session.downstream_gone() {
+                        break gone;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            let drive = async {
+                while let Ok(Some(_)) =
+                    HttpSession::from_h2_conn(&mut connection, digest.clone()).await
+                {
+                }
+                std::future::pending::<()>().await;
+            };
+            let gone = tokio::select! {
+                r = session_task => r.unwrap(),
+                _ = drive => unreachable!(),
+            };
+            let expected = if drop_connection {
+                DownstreamGone::Reset
+            } else {
+                DownstreamGone::StreamReset
+            };
+            assert_eq!(gone, expected);
+            client_task.abort();
         }
     }
 }
