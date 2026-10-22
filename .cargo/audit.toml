@@ -18,4 +18,9 @@ ignore = [
     # 0.23 is already on 0.23.46.
     "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
     "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade key exchange
+    # webpki-roots 0.26.11 and rustls-webpki 0.101.7 are pulled in transitively
+    # by optional/legacy dependency chains with no 0.26.x or 0.101.x backports
+    # (patched in webpki-roots >= 1.0.10 and rustls-webpki >= 0.103.16).
+    "RUSTSEC-2026-0381", # webpki-roots: bundled root certificates allow trust in distrusted emSign intermediates
+    "RUSTSEC-2026-0382", # rustls-webpki: certificate verification may accept distrusted intermediates
 ]
