@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [package.metadata.docs.rs]
 features = ["document-features"]
+rustc-args = ["--cfg", "tokio_unstable"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
