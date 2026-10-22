@@ -71,18 +71,44 @@ impl Fds {
     where
         P: ?Sized + NixPath + std::fmt::Display,
     {
+        self.send_to_sock_with_retry(path, None)
+    }
+
+    /// Send the fds to the given socket.
+    /// `max_retry` overrides the default number of connect() retries.
+    pub(crate) fn send_to_sock_with_retry<P>(
+        &self,
+        path: &P,
+        max_retry: Option<usize>,
+    ) -> Result<usize, Error>
+    where
+        P: ?Sized + NixPath + std::fmt::Display,
+    {
         let (vec_key, vec_fds) = self.serialize();
         let mut ser_buf: [u8; 2048] = [0; 2048];
         let ser_key_size = serialize_vec_string(&vec_key, &mut ser_buf);
-        send_fds_to(vec_fds, &ser_buf[..ser_key_size], path, None)
+        send_fds_to(vec_fds, &ser_buf[..ser_key_size], path, max_retry)
     }
 
     pub fn get_from_sock<P>(&mut self, path: &P) -> Result<(), Error>
     where
         P: ?Sized + NixPath + std::fmt::Display,
     {
+        self.get_from_sock_with_retry(path, None)
+    }
+
+    /// Receive fds from the given socket.
+    /// `max_retry` overrides the default number of accept() retries.
+    pub(crate) fn get_from_sock_with_retry<P>(
+        &mut self,
+        path: &P,
+        max_retry: Option<usize>,
+    ) -> Result<(), Error>
+    where
+        P: ?Sized + NixPath + std::fmt::Display,
+    {
         let mut de_buf: [u8; 2048] = [0; 2048];
-        let (fds, bytes) = get_fds_from(path, &mut de_buf, None)?;
+        let (fds, bytes) = get_fds_from(path, &mut de_buf, max_retry)?;
         let keys = deserialize_vec_string(&de_buf[..bytes])?;
         self.deserialize(keys, fds);
         Ok(())
@@ -653,6 +679,64 @@ mod tests {
         assert!(
             elapsed.as_secs() >= 2,
             "Expected at least 2 seconds, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed.as_secs() < 4,
+            "Expected less than 4 seconds, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fds_send_to_sock_with_retry_respects_max_retry() {
+        init_log();
+        use std::time::Instant;
+
+        let dumb_fd = socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:80".to_string(), dumb_fd.as_raw_fd());
+
+        // Try to send with a custom max_retries of 0
+        let start = Instant::now();
+        let result = fds.send_to_sock_with_retry("/tmp/pingora_test_fds_send_retry.sock", Some(0));
+        let elapsed = start.elapsed();
+
+        // Should fail on the first connect attempt without sleeping for RETRY_INTERVAL
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_secs() < 2,
+            "Expected less than 2 seconds, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fds_get_from_sock_with_retry_respects_max_retry() {
+        init_log();
+        use std::time::Instant;
+
+        let mut fds = Fds::new();
+
+        // Try to receive with a custom max_retries of 0
+        let start = Instant::now();
+        let result =
+            fds.get_from_sock_with_retry("/tmp/pingora_test_fds_receive_retry.sock", Some(0));
+        let elapsed = start.elapsed();
+
+        // Should fail after a single RETRY_INTERVAL (1 second) instead of the default 5 retries
+        assert!(result.is_err());
+        assert!(fds.is_empty());
+        assert!(
+            elapsed.as_secs() >= 1,
+            "Expected at least 1 second, got {:?}",
             elapsed
         );
         assert!(
