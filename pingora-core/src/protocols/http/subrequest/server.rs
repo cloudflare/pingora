@@ -1218,7 +1218,7 @@ fn body_mode_for_header(
     }
     if matches!(
         header.status,
-        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
     ) || method == Some(&Method::HEAD)
     {
         return Some(BodyMode::ContentLength(0, 0));
@@ -2533,6 +2533,30 @@ mod test_proxy_tasks {
             .write_proxy_tasks()
             .await
             .expect("HEAD proxy task response should complete");
+        assert!(end);
+        assert!(matches!(recv_task(&mut handle.rx), HttpTask::Header(..)));
+        assert!(matches!(recv_task(&mut handle.rx), HttpTask::Done));
+        assert_rx_empty(&mut handle.rx);
+        assert_eq!(session.body_bytes_sent(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_task_205_response_drops_body() {
+        init_log();
+        let (mut session, mut handle) = build_req().await;
+        session.set_proxy_tasks_enabled(true);
+
+        let mut header = test_header(StatusCode::RESET_CONTENT);
+        header
+            .insert_header("content-length", "10")
+            .expect("test content-length header is valid");
+        session.send_proxy_task(HttpTask::Header(Box::new(header), false));
+        session.send_proxy_task(HttpTask::Body(Some(Bytes::from("not-sent")), true));
+
+        let end = session
+            .write_proxy_tasks()
+            .await
+            .expect("205 proxy task response should complete");
         assert!(end);
         assert!(matches!(recv_task(&mut handle.rx), HttpTask::Header(..)));
         assert!(matches!(recv_task(&mut handle.rx), HttpTask::Done));
