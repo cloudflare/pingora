@@ -949,10 +949,10 @@ impl HttpSession {
 
     fn init_body_writer(&mut self, header: &ResponseHeader) {
         use http::StatusCode;
-        /* the following responses don't have body 204, 304, and HEAD */
+        /* the following responses don't have body 204, 205, 304, and HEAD */
         if matches!(
             header.status,
-            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+            StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT | StatusCode::NOT_MODIFIED
         ) || self.get_method() == Some(&Method::HEAD)
         {
             self.body_writer.init_content_length(0);
@@ -3701,6 +3701,32 @@ mod test_proxy_tasks {
              (body_writer.finished() is true). Got flush_before={flush_before}, \
              flush_after={flush_after}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_205_response_drops_body() {
+        init_log();
+
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        // Only the header goes out; the body must not be written for a 205.
+        let expected_header = b"HTTP/1.1 205 Reset Content\r\nContent-Length: 5\r\n\r\n";
+
+        let mock_io = Builder::new().read(request).write(expected_header).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        let mut header = ResponseHeader::build(StatusCode::RESET_CONTENT, Some(1)).unwrap();
+        header.insert_header("Content-Length", "5").unwrap();
+        http_stream
+            .write_response_header(Box::new(header))
+            .await
+            .unwrap();
+
+        // The body writer is already finished, so the body is dropped.
+        assert!(http_stream.body_writer.finished());
+        assert_eq!(http_stream.write_body(b"hello").await.unwrap(), None);
+        http_stream.finish_body().await.unwrap();
     }
 
     #[tokio::test]
