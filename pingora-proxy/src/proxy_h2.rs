@@ -200,6 +200,11 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&header::EXPECT);
+        }
+
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
                 return (false, Some(e.into_in()));
@@ -245,6 +250,13 @@ where
         let host = req.remove_header(&http::header::HOST);
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
@@ -327,6 +339,7 @@ where
                 rx,
                 ctx,
                 write_timeout,
+                body_empty,
                 &mut downstream_custom_message_writer,
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
@@ -517,6 +530,7 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
+        upstream_body_finished: bool,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
@@ -527,6 +541,9 @@ where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
+        #[cfg(not(feature = "early_body_buffer"))]
+        let _ = upstream_body_finished;
+
         // setup custom message forwarding, if downstream supports it
         let (
             mut downstream_custom_read,
@@ -550,17 +567,32 @@ where
                 .await?;
         }
 
-        let request_body_finished = session.as_mut().is_body_done();
+        let (request_body_finished, buffer) = session.upstream_body_source();
         let mut downstream_state = DownstreamStateMachine::for_proxy_attempt(
             request_body_finished,
             session.downstream_abandoned_during_cache_fill(),
         );
 
-        // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        #[cfg(not(feature = "early_body_buffer"))]
+        if let Some(buffer) = buffer {
             self.send_body_to2(
                 session,
                 Some(buffer),
+                request_body_finished,
+                client_body,
+                ctx,
+                write_timeout,
+            )
+            .await
+            .map_err(|e| e.error)?;
+        }
+
+        // The caller already ended an empty buffered body on HEADERS or empty DATA.
+        #[cfg(feature = "early_body_buffer")]
+        if !upstream_body_finished && (buffer.is_some() || session.is_body_buffered()) {
+            self.send_body_to2(
+                session,
+                buffer,
                 request_body_finished,
                 client_body,
                 ctx,
@@ -1174,7 +1206,16 @@ where
          * downstream stream handles referenced while a downstream RST_STREAM goes
          * unobserved, pinning the downstream connection window credit until the
          * write completes. */
-        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+        // An early-buffered body is sent whole before the loop and cannot resume if cut short, so
+        // while a partial-write fill could outlive the client, leave its closure to the loop's
+        // cache-fill policy. Decided after the body filters, which may disable caching.
+        #[cfg(feature = "early_body_buffer")]
+        let skip_close_watch = session.is_body_buffered()
+            && session.cache.support_streaming_partial_write() == Some(true);
+        let stream_close = session.downstream_session.watch_h2_stream_close();
+        #[cfg(feature = "early_body_buffer")]
+        let stream_close = stream_close.filter(|_| !skip_close_watch);
+        if let Some(stream_close) = stream_close {
             tokio::select! {
                 biased;
                 res = write_body(client_body, data, end, write_timeout) => {
@@ -1481,6 +1522,9 @@ fn test_h2_path_is_rooted_for_targets_with_no_authority() {
     }
 }
 
+#[cfg(all(test, feature = "early_body_buffer"))]
+mod replay_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1625,6 +1669,7 @@ mod tests {
             response_rx,
             &mut ctx,
             None,
+            false,
             &mut custom_writer,
             &mut custom_reader,
             Arc::new(AtomicU8::new(PipeState::Active as u8)),
@@ -1810,6 +1855,7 @@ mod tests {
             response_rx,
             &mut ctx,
             None,
+            false,
             &mut custom_writer,
             &mut custom_reader,
             Arc::new(AtomicU8::new(PipeState::Active as u8)),
@@ -1914,6 +1960,7 @@ mod tests {
             response_rx,
             &mut ctx,
             None,
+            false,
             &mut custom_writer,
             &mut custom_reader,
             Arc::new(AtomicU8::new(PipeState::Active as u8)),
@@ -2019,6 +2066,7 @@ mod tests {
                 response_rx,
                 &mut ctx,
                 None,
+                false,
                 &mut custom_writer,
                 &mut custom_reader,
                 Arc::new(AtomicU8::new(PipeState::Active as u8)),
@@ -2086,6 +2134,7 @@ mod tests {
             response_rx,
             &mut ctx,
             None,
+            false,
             &mut custom_writer,
             &mut custom_reader,
             Arc::new(AtomicU8::new(PipeState::Active as u8)),

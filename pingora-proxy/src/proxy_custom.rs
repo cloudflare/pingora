@@ -242,9 +242,21 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&http::header::EXPECT);
+        }
+
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
@@ -549,7 +561,7 @@ where
             cancel_upstream_reader_tx,
         );
 
-        let request_body_finished = session.as_mut().is_body_done();
+        let (request_body_finished, buffer) = session.upstream_body_source();
         let mut downstream_state = DownstreamStateMachine::for_proxy_attempt(
             request_body_finished,
             session.downstream_abandoned_during_cache_fill(),
@@ -564,8 +576,12 @@ where
         let mut reads_since_upload_failure = 0;
         let mut upgraded_downstream_half_closed = false;
 
+        // An empty buffered body already ended the request on its header.
+        #[cfg(feature = "early_body_buffer")]
+        let buffer = buffer.filter(|b| !b.is_empty() || !session.is_body_buffered());
+
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = buffer {
             if let CustomBodyWriteResult::UpstreamFailed(error) = self
                 .send_body_to_custom(
                     session,
