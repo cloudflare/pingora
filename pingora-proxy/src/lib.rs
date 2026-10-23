@@ -1216,7 +1216,7 @@ where
     #[cfg(feature = "early_body_buffer")]
     fn store_buffered_body(&mut self, body: Option<Bytes>) {
         self.body_buffered = true;
-        self.buffered_request_body = body;
+        self.buffered_request_body = body.filter(|b| !b.is_empty());
     }
 
     /// Returns whether a body has been buffered (or confirmed empty).
@@ -3198,6 +3198,15 @@ mod tests {
             let mut session = empty_post_session().await;
 
             session.set_buffered_body(None).unwrap();
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_set_empty_body_reads_back_as_none() {
+            let mut session = empty_post_session().await;
+
+            session.set_buffered_body(Some(Bytes::new())).unwrap();
             assert!(session.is_body_buffered());
             assert!(session.get_buffered_body().is_none());
         }

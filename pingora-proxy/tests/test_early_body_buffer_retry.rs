@@ -263,6 +263,7 @@ struct EarlyBufferProxy {
     drop_body_in_early_filter: bool,
     early_filter_suffix: Option<&'static str>,
     replacement_body: Option<&'static str>,
+    replacement_chunked: bool,
     body_filter_calls: Arc<AtomicUsize>,
     early_filter_chunks: Arc<AtomicUsize>,
     upstream_filter_expect_seen: Arc<AtomicBool>,
@@ -330,9 +331,13 @@ impl ProxyHttp for EarlyBufferProxy {
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Ctx) -> Result<bool> {
         if let Some(replacement) = self.replacement_body {
             session.set_buffered_body(Some(Bytes::from_static(replacement.as_bytes())))?;
-            session
-                .req_header_mut()
-                .insert_header(http::header::CONTENT_LENGTH, replacement.len().to_string())?;
+            let req = session.req_header_mut();
+            if self.replacement_chunked {
+                req.remove_header(&http::header::CONTENT_LENGTH);
+                req.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+            } else {
+                req.insert_header(http::header::CONTENT_LENGTH, replacement.len().to_string())?;
+            }
             return Ok(false);
         }
 
@@ -497,6 +502,7 @@ struct HarnessConfig {
     drop_body_in_early_filter: bool,
     early_filter_suffix: Option<&'static str>,
     replacement_body: Option<&'static str>,
+    replacement_chunked: bool,
     fail_first: bool,
     use_h2_downstream: bool,
     use_h2_upstream: bool,
@@ -567,6 +573,7 @@ async fn start_harness_with_config(limit: usize, config: HarnessConfig) -> Harne
             drop_body_in_early_filter: config.drop_body_in_early_filter,
             early_filter_suffix: config.early_filter_suffix,
             replacement_body: config.replacement_body,
+            replacement_chunked: config.replacement_chunked,
             body_filter_calls: app_body_filter_calls,
             early_filter_chunks: early_filter_chunks.clone(),
             upstream_filter_expect_seen: app_expect_seen,
@@ -1245,6 +1252,27 @@ async fn empty_h1_request_body_can_be_replaced_for_h1_upstream() {
         harness.recorder.bodies(),
         vec![REPLACEMENT.to_string()],
         "H1 origin should receive the application-supplied body"
+    );
+}
+
+#[tokio::test]
+async fn empty_h1_request_body_can_be_replaced_with_chunked_framing_for_h1_upstream() {
+    const REPLACEMENT: &str = "replacement-body";
+    let harness = start_harness_with_config(
+        64 * 1024,
+        HarnessConfig {
+            replacement_body: Some(REPLACEMENT),
+            replacement_chunked: true,
+            ..HarnessConfig::default()
+        },
+    )
+    .await;
+
+    assert_eq!(post_empty(harness.proxy_port).await, "200");
+    assert_eq!(
+        harness.recorder.bodies(),
+        vec![REPLACEMENT.to_string()],
+        "H1 origin should receive the application-supplied body with chunked framing"
     );
 }
 

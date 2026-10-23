@@ -30,26 +30,21 @@ use tokio::task::JoinHandle;
 
 /// One byte over the default H2 window, and within the retry buffer.
 const RETRY_BODY_LEN: usize = 64 * 1024;
-#[cfg(feature = "early_body_buffer")]
 const BUFFERED_BODY_LEN: usize = 1 << 20;
 
 #[derive(Clone, Copy)]
 enum Body {
     /// Read from the client into the ordinary retry buffer.
     RetryBuffer,
-    /// Read into the retry buffer while the client still owes one more byte.
-    PartialRetryBuffer,
     /// Left for the transport loop to read, ending with a chunk the upstream window cannot take.
     Streamed,
-    #[cfg(feature = "early_body_buffer")]
     EarlyBuffered,
 }
 
 impl Body {
     fn len(self) -> usize {
         match self {
-            Body::RetryBuffer | Body::PartialRetryBuffer | Body::Streamed => RETRY_BODY_LEN,
-            #[cfg(feature = "early_body_buffer")]
+            Body::RetryBuffer | Body::Streamed => RETRY_BODY_LEN,
             Body::EarlyBuffered => BUFFERED_BODY_LEN,
         }
     }
@@ -57,9 +52,7 @@ impl Body {
     /// The `content-length` the client declares.
     fn declared_len(self) -> usize {
         match self {
-            Body::PartialRetryBuffer => RETRY_BODY_LEN + 1,
             Body::RetryBuffer | Body::Streamed => RETRY_BODY_LEN,
-            #[cfg(feature = "early_body_buffer")]
             Body::EarlyBuffered => 0,
         }
     }
@@ -101,14 +94,12 @@ async fn downstream(
     let bytes = |len| Bytes::from(vec![b'x'; len]);
     match body {
         Body::RetryBuffer => downstream_body.send_data(bytes(body.len()), true).unwrap(),
-        Body::PartialRetryBuffer => downstream_body.send_data(bytes(body.len()), false).unwrap(),
         Body::Streamed => {
             downstream_body
                 .send_data(bytes(body.len() - 1), false)
                 .unwrap();
             downstream_body.send_data(bytes(1), true).unwrap();
         }
-        #[cfg(feature = "early_body_buffer")]
         Body::EarlyBuffered => {}
     }
     let Some(H2Accept::Session(http)) =
@@ -136,23 +127,19 @@ async fn downstream(
     );
     session.set_handles_downstream_abandonment(true);
     match body {
-        Body::RetryBuffer | Body::PartialRetryBuffer => {
+        Body::RetryBuffer => {
             session.as_mut().enable_retry_buffering();
             let mut read = 0;
             while read < body.len() {
                 read += session.read_request_body().await.unwrap().unwrap().len();
             }
-            assert_eq!(
-                session.as_mut().is_body_done(),
-                matches!(body, Body::RetryBuffer)
-            );
+            assert!(session.as_mut().is_body_done());
             assert_eq!(
                 session.as_ref().get_retry_buffer().map(|b| b.len()),
                 Some(body.len())
             );
         }
         Body::Streamed => {}
-        #[cfg(feature = "early_body_buffer")]
         Body::EarlyBuffered => session
             .set_buffered_body(Some(Bytes::from(vec![b'x'; body.len()])))
             .unwrap(),
@@ -337,9 +324,15 @@ where
     );
 }
 
+/// Ordinary retry buffers keep upstream's closure watch with early buffering enabled.
 #[tokio::test]
-async fn retry_buffer_replay_completes_for_partial_write_fill() {
-    assert_replayed(Body::RetryBuffer, CacheState::PartialWriteMiss).await;
+async fn retry_buffer_replay_fails_when_client_resets_during_partial_write_fill() {
+    assert_fails_fast(
+        AbandonmentSignalProxy::default(),
+        Body::RetryBuffer,
+        CacheState::PartialWriteMiss,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -352,33 +345,22 @@ async fn uncached_retry_buffer_replay_fails_when_client_resets() {
     .await;
 }
 
-#[cfg(feature = "early_body_buffer")]
 #[tokio::test]
 async fn buffered_replay_completes_for_partial_write_fill() {
     assert_replayed(Body::EarlyBuffered, CacheState::PartialWriteMiss).await;
 }
 
 #[tokio::test]
-async fn abandoned_retry_replay_completes_for_partial_write_fill() {
-    assert_replayed(Body::RetryBuffer, CacheState::AbandonedPartialWriteMiss).await;
+async fn abandoned_buffered_replay_completes_for_partial_write_fill() {
+    assert_replayed(Body::EarlyBuffered, CacheState::AbandonedPartialWriteMiss).await;
 }
 
 #[tokio::test]
-async fn abandoned_retry_replay_without_fill_fails_when_client_resets() {
+async fn abandoned_buffered_replay_without_fill_fails_when_client_resets() {
     assert_fails_fast(
         AbandonmentSignalProxy::default(),
-        Body::RetryBuffer,
+        Body::EarlyBuffered,
         CacheState::AbandonedWithoutFill,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn incomplete_retry_buffer_replay_fails_when_client_resets() {
-    assert_fails_fast(
-        AbandonmentSignalProxy::default(),
-        Body::PartialRetryBuffer,
-        CacheState::PartialWriteMiss,
     )
     .await;
 }
@@ -467,16 +449,15 @@ async fn streamed_final_chunk_still_watches_client_closure() {
 }
 
 #[tokio::test]
-async fn replay_fails_when_body_filter_disables_caching() {
+async fn buffered_replay_fails_when_body_filter_disables_caching() {
     assert_fails_fast(
         DisableCacheInBodyFilter,
-        Body::RetryBuffer,
+        Body::EarlyBuffered,
         CacheState::PartialWriteMiss,
     )
     .await;
 }
 
-#[cfg(feature = "early_body_buffer")]
 #[tokio::test]
 async fn uncached_buffered_replay_fails_when_client_resets() {
     assert_fails_fast(

@@ -357,6 +357,12 @@ where
     /// - Retained bytes are checked after filtering
     /// - If exceeded, returns HTTP 413 (Payload Too Large)
     ///
+    /// # Memory
+    /// The limit applies to each request, not to a total. Each HTTP/2 stream buffers separately, so
+    /// one connection can retain up to its concurrent stream count times `max_size`: 100 streams
+    /// with `Some(10 << 20)` is about 1 GiB. The body is held until the request finishes,
+    /// including while a long response streams.
+    ///
     /// # Retries
     /// The complete retained body is separate from Pingora's ordinary 64 KiB retry buffer and can
     /// be replayed on every retry allowed by [`Self::error_while_proxy()`].

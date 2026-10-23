@@ -24,7 +24,8 @@
 //!    to discard the chunk.
 //!
 //! 2. **Peek**: read the assembled buffered body with `get_buffered_body()`
-//!    in `request_filter()` to make routing decisions.
+//!    in `request_filter()` to make routing decisions. Bodies containing
+//!    `beta` are routed to httpbin's `/anything/beta` path.
 //!
 //! 3. **Mutate**: replace the buffered body with `set_buffered_body()` so
 //!    the upstream receives the modified version. Do this from `request_filter()`,
@@ -43,6 +44,7 @@ use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
+use pingora_http::RequestHeader;
 use pingora_proxy::{ProxyHttp, Session};
 
 pub struct MyProxy;
@@ -140,6 +142,19 @@ impl ProxyHttp for MyProxy {
         Ok(false)
     }
 
+    /// Route: apply the decision made from the buffered body.
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if ctx.route_beta {
+            upstream_request.set_uri(http::Uri::from_static("/anything/beta"));
+        }
+        Ok(())
+    }
+
     async fn upstream_peer(
         &self,
         _session: &mut Session,
@@ -158,7 +173,8 @@ impl ProxyHttp for MyProxy {
 
 // RUST_LOG=INFO cargo run --features openssl,early_body_buffer --example body_routing
 //
-// Peek + mutate — body is inspected for routing then wrapped in an envelope:
+// Peek + mutate — body is inspected for routing then wrapped in an envelope; the first request
+// is routed to /anything/beta:
 //   curl -X POST 127.0.0.1:6193/post -H "Host: httpbin.org" -H "Content-Type: application/json" -d '{"route": "beta"}'
 //   curl -X POST 127.0.0.1:6193/post -H "Host: httpbin.org" -H "Content-Type: application/json" -d '{"route": "default"}'
 //

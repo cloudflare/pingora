@@ -115,7 +115,16 @@ where
             }
         }
 
-        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
+        // A filter may supply a body for a request that arrived without one.
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
+        let body_empty = session.is_body_empty();
+        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !body_empty) {
             return (false, true, Some(e));
         }
 
