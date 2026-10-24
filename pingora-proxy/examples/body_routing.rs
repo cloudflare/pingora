@@ -134,10 +134,11 @@ impl ProxyHttp for MyProxy {
             info!("mutate: {wrapped}");
             session.set_buffered_body(Some(Bytes::from(wrapped.clone())))?;
 
-            // Update Content-Length to match the new body size.
-            session
-                .req_header_mut()
-                .insert_header(http::header::CONTENT_LENGTH, wrapped.len().to_string())?;
+            // Update the framing to match the new body: set Content-Length and drop
+            // Transfer-Encoding, which a chunked request would otherwise still carry.
+            let req = session.req_header_mut();
+            req.insert_header(http::header::CONTENT_LENGTH, wrapped.len().to_string())?;
+            req.remove_header(&http::header::TRANSFER_ENCODING);
         }
         Ok(false)
     }
