@@ -5,19 +5,21 @@ The pingora-proxy HTTP proxy framework supports highly programmable proxy behavi
 
 ## Life of a proxied HTTP request
 1. The life of a proxied HTTP request starts when the proxy reads the request header from the **downstream** (i.e., the client).
-2. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
-3. The proxy then sends the request header to the upstream.
-4. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
+2. If the request opts in to early body buffering (the `early_body_buffer` cargo feature, with `early_request_body_buffer_limit()` returning a limit), the proxy reads the whole request body from the downstream before choosing an upstream. Otherwise the body is read later, while it is proxied.
+3. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
+4. The proxy then sends the request header to the upstream.
+5. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
     a. upstream response (both header and body) to the downstream, and
-    b. downstream request body to upstream (if any).
-5. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
+    b. downstream request body to upstream (if any; an early-buffered body is sent from memory).
+6. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
 
 ## Pingora-proxy phases and filters
 Pingora-proxy allows users to insert arbitrary logic into the life of a request.
 ```mermaid
  graph TD;
     start("new request")-->early_request_filter;
-    early_request_filter-->early_request_body_filter;
+    early_request_filter-->request_filter;
+    early_request_filter-.feature: early_body_buffer.->early_request_body_filter;
     early_request_body_filter-->request_filter;
     request_filter-->upstream_peer;
 
