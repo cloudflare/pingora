@@ -335,8 +335,10 @@ where
     ///
     /// This is called after [`Self::early_request_filter()`],
     /// [`Self::allow_spawning_subrequest()`], and [`Self::should_handle_downstream_abandonment()`],
-    /// but before [`Self::request_filter()`] and [`Self::upstream_peer()`]. The body can be
-    /// accessed via [`Session::get_buffered_body()`].
+    /// but before [`Self::request_filter()`] and [`Self::upstream_peer()`]. Nothing has been
+    /// buffered yet when it runs: the assembled body is available through
+    /// [`Session::get_buffered_body()`] from the downstream modules' header filters and
+    /// [`Self::request_filter()`] onward.
     ///
     /// When this returns `Some`, Pingora reads the downstream body itself, so neither this nor
     /// [`Self::early_request_body_filter()`] may read it, including through a spawned subrequest.
