@@ -437,7 +437,7 @@ async fn assert_abandoned_storage_failure(
         match upstream {
             Upstream::H1 => {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                read_h1_head(&mut socket).await;
+                read_http1_head(&mut socket).await;
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: max-age=30\r\n\r\n",
                     first.len() + 4

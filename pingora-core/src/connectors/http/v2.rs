@@ -1152,4 +1152,188 @@ mod tests {
         assert!(result.unwrap().is_none());
         assert!(conn.is_shutting_down());
     }
+
+    /// A server that writes HTTP/2 frames by hand. `h2`'s own server stops writing to a stream
+    /// as soon as it reads the client's RST_STREAM, so it cannot model frames that a real server
+    /// had already sent when the client cancelled.
+    mod raw_h2_server {
+        use std::io;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+        use tokio::sync::mpsc;
+
+        const DATA: u8 = 0x0;
+        pub const HEADERS: u8 = 0x1;
+        pub const RST_STREAM: u8 = 0x3;
+        const SETTINGS: u8 = 0x4;
+        pub const GOAWAY: u8 = 0x7;
+        const END_STREAM: u8 = 0x1;
+        const END_HEADERS: u8 = 0x4;
+        const ACK: u8 = 0x1;
+        pub const CANCEL: u32 = 0x8;
+        /// HPACK static table index 8, `:status: 200`.
+        const STATUS_200: &[u8] = &[0x88];
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+        pub struct Frame {
+            pub kind: u8,
+            pub stream_id: u32,
+            pub payload: Vec<u8>,
+        }
+
+        pub struct Server {
+            writer: WriteHalf<DuplexStream>,
+        }
+
+        impl Server {
+            /// Completes the server side of the connection preface and returns the server with
+            /// a channel that yields every frame the client sends afterwards.
+            pub async fn accept(io: DuplexStream) -> (Self, mpsc::UnboundedReceiver<Frame>) {
+                let (mut reader, writer) = tokio::io::split(io);
+                let mut preface = [0u8; PREFACE.len()];
+                reader.read_exact(&mut preface).await.unwrap();
+                assert_eq!(preface, PREFACE);
+
+                let mut server = Server { writer };
+                server.write_frame(SETTINGS, 0, 0, &[]).await.unwrap();
+                // The client sends its SETTINGS with the preface.
+                server.write_frame(SETTINGS, ACK, 0, &[]).await.unwrap();
+
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(read_frames(reader, tx));
+                (server, rx)
+            }
+
+            /// Fails once the client has closed the connection.
+            pub async fn write_frame(
+                &mut self,
+                kind: u8,
+                flags: u8,
+                stream_id: u32,
+                payload: &[u8],
+            ) -> io::Result<()> {
+                let len = payload.len() as u32;
+                let mut frame = Vec::with_capacity(9 + payload.len());
+                frame.extend_from_slice(&len.to_be_bytes()[1..]);
+                frame.push(kind);
+                frame.push(flags);
+                frame.extend_from_slice(&stream_id.to_be_bytes());
+                frame.extend_from_slice(payload);
+                self.writer.write_all(&frame).await
+            }
+
+            /// Writes a 200 response with `body` on the stream.
+            pub async fn write_response(&mut self, stream_id: u32, body: &[u8]) -> io::Result<()> {
+                self.write_frame(HEADERS, END_HEADERS, stream_id, STATUS_200)
+                    .await?;
+                self.write_frame(DATA, END_STREAM, stream_id, body).await
+            }
+        }
+
+        async fn read_frames(mut reader: ReadHalf<DuplexStream>, tx: mpsc::UnboundedSender<Frame>) {
+            loop {
+                let mut header = [0u8; 9];
+                if reader.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let stream_id =
+                    u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+                let mut payload = vec![0u8; len];
+                if reader.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let frame = Frame {
+                    kind: header[3],
+                    stream_id,
+                    payload,
+                };
+                if tx.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// When the client cancels a stream, the server may already have sent its response, and
+    /// RFC 9113 section 5.1 requires the client to discard those frames. However many streams
+    /// the client cancels over the life of the connection, the late frames must not close it and
+    /// fail the requests in flight on it.
+    #[tokio::test]
+    async fn test_h2_late_frames_on_cancelled_streams_keep_connection() {
+        use raw_h2_server::*;
+
+        const ROUNDS: usize = 21;
+        const CONCURRENT: usize = 100;
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = CONCURRENT + 1;
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+        let (mut server, mut client_frames) = Server::accept(server).await;
+
+        let request = || {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            req.insert_header(http::header::HOST, "example.com")
+                .unwrap();
+            Box::new(req)
+        };
+
+        // A slow request stays in flight for the whole test.
+        let mut in_flight = conn.spawn_stream().await.unwrap().unwrap();
+        in_flight.write_request_header(request(), true).unwrap();
+        let in_flight_id = loop {
+            let frame = client_frames.recv().await.unwrap();
+            if frame.kind == HEADERS {
+                break frame.stream_id;
+            }
+        };
+
+        let mut late_responses = 0;
+        'rounds: for _ in 0..ROUNDS {
+            // The client abandons requests, like a proxy whose downstream left.
+            let mut cancelled = Vec::with_capacity(CONCURRENT);
+            for _ in 0..CONCURRENT {
+                let Ok(Some(mut session)) = conn.spawn_stream().await else {
+                    break 'rounds;
+                };
+                session.write_request_header(request(), true).unwrap();
+                cancelled.push(session);
+            }
+            drop(cancelled);
+
+            // The server had already answered each request when its RST_STREAM arrived.
+            let mut answered = 0;
+            while answered < CONCURRENT {
+                let Some(frame) = client_frames.recv().await else {
+                    break 'rounds;
+                };
+                if frame.kind != RST_STREAM || frame.payload != CANCEL.to_be_bytes() {
+                    continue;
+                }
+                if server
+                    .write_response(frame.stream_id, &[0; 1024])
+                    .await
+                    .is_err()
+                {
+                    break 'rounds;
+                }
+                answered += 1;
+                late_responses += 1;
+            }
+        }
+
+        let _ = server.write_response(in_flight_id, b"ok").await;
+        let result = in_flight.read_response_header().await;
+        assert!(
+            result.is_ok(),
+            "the in-flight request failed: {}",
+            result.unwrap_err()
+        );
+        assert_eq!(in_flight.response_header().unwrap().status, 200);
+        while let Ok(frame) = client_frames.try_recv() {
+            assert_ne!(frame.kind, GOAWAY, "the client closed the connection");
+        }
+        // More late responses than h2's default limit of 1024 local resets.
+        assert_eq!(late_responses, ROUNDS * CONCURRENT);
+    }
 }

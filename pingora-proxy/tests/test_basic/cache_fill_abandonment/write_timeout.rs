@@ -43,7 +43,7 @@ async fn serve_h1_origin(
     finish: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (mut socket, _) = listener.accept().await.unwrap();
-    read_h1_head(&mut socket).await;
+    read_http1_head(&mut socket).await;
     socket
         .write_all(
             format!(
@@ -179,7 +179,7 @@ async fn assert_downstream_write_timeout_completes_cache_fill(
         .await
         .expect("the origin did not send the first response chunk")
         .unwrap();
-    let response_head = read_h1_head(&mut downstream).await;
+    let response_head = read_http1_head(&mut downstream).await;
     assert!(
         response_head.lines().next().unwrap().contains(" 200 "),
         "{response_head}"

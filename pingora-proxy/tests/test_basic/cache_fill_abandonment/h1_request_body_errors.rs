@@ -60,7 +60,7 @@ async fn uncacheable_origin(
                     .await
                     .expect("the proxy did not connect to the origin")
                     .unwrap();
-                read_h1_head(&mut socket).await;
+                read_http1_head(&mut socket).await;
                 request_seen.send(()).unwrap();
                 respond.await.unwrap();
                 socket

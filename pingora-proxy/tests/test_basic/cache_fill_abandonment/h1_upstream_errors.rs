@@ -36,7 +36,7 @@ async fn assert_h1_pre_admission_abandonment_retries_complete_request_and_fills_
             .await
             .expect("proxy did not connect to the first HTTP/1 upstream")
             .unwrap();
-        read_h1_head(&mut first_socket).await;
+        read_http1_head(&mut first_socket).await;
         first_request_seen_tx.send(()).unwrap();
 
         fail_first_attempt_rx.await.unwrap();
@@ -46,7 +46,7 @@ async fn assert_h1_pre_admission_abandonment_retries_complete_request_and_fills_
             .await
             .expect("proxy did not retry the HTTP/1 upstream request")
             .unwrap();
-        read_h1_head(&mut retry_socket).await;
+        read_http1_head(&mut retry_socket).await;
         retry_seen_tx.send(()).unwrap();
         retry_socket
             .write_all(
@@ -152,7 +152,7 @@ async fn assert_h1_abandoned_cache_fill_propagates_truncated_upstream_response(
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         drop(listener);
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nCache-Control: max-age=30\r\n\r\nhello",

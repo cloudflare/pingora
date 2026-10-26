@@ -221,7 +221,7 @@ impl GatedOrigin {
             match upstream {
                 Upstream::H1 => {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let request = read_h1_head(&mut socket).await;
+                    let request = read_http1_head(&mut socket).await;
                     assert_eq!(
                         request.lines().next().unwrap(),
                         format!("GET {path} HTTP/1.1")
@@ -354,7 +354,7 @@ async fn half_close_after_response_header(
         )
         .await
         .unwrap();
-    let head = read_h1_head(&mut downstream).await;
+    let head = read_http1_head(&mut downstream).await;
     assert!(head.starts_with(request.status_line()), "{head:?}");
     assert!(
         head.to_ascii_lowercase().contains("x-cache-status: miss"),
@@ -436,7 +436,7 @@ async fn pipe_head_miss(path: &'static str, handles_abandonment: bool) -> Closed
         )
         .await
         .unwrap();
-    let head = read_h1_head(&mut downstream).await;
+    let head = read_http1_head(&mut downstream).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head:?}");
     assert!(
         head.to_ascii_lowercase().contains("x-cache-status: miss"),
