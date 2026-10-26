@@ -668,6 +668,109 @@ async fn test_dropped_conn_put_body_over() {
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
 }
 
+async fn test_dropped_conn_put_body_over_custom_buffer() {
+    init();
+    let client = reqwest::Client::new();
+    let port = "8001"; // special port to avoid unexpected connection reuse from other tests
+                       // larger than the default 64 KiB retry buffer, within this proxy's 128 KiB
+    let large_body = String::from_utf8(vec![b'e'; 1024 * 64 + 1]).unwrap();
+
+    for _ in 1..3 {
+        // load conn into pool
+        let res = client
+            .get("http://127.0.0.1:6155")
+            .header("x-port", port)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    let res = client
+        .put("http://127.0.0.1:6155/bad_lb")
+        .header("x-port", port)
+        .body(large_body)
+        .send()
+        .await
+        .unwrap();
+
+    // The 128 KiB retry buffer replays the whole body on retry — byte for byte.
+    // (The origin echoes via ngx.say, which appends a newline; strip it before comparing.)
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
+    let body = body
+        .strip_suffix('\n')
+        .expect("the echo ends with ngx.say's newline");
+    assert_eq!(body.len(), 64 * 1024 + 1);
+    assert!(body.bytes().all(|b| b == b'e'));
+}
+
+async fn test_dropped_conn_put_body_exactly_custom_buffer_size() {
+    init();
+    let client = reqwest::Client::new();
+    let port = "8001"; // special port to avoid unexpected connection reuse from other tests
+                       // exactly this proxy's 128 KiB retry buffer: the `<=` edge, which must still replay
+    let body = "e".repeat(128 * 1024);
+
+    for _ in 1..3 {
+        // load conn into pool
+        let res = client
+            .get("http://127.0.0.1:6155")
+            .header("x-port", port)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    let res = client
+        .put("http://127.0.0.1:6155/bad_lb")
+        .header("x-port", port)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let echoed = res.text().await.unwrap();
+    assert_eq!(
+        echoed
+            .strip_suffix('\n')
+            .expect("the echo ends with ngx.say's newline"),
+        body
+    );
+}
+
+async fn test_dropped_conn_put_body_over_custom_buffer_limit() {
+    init();
+    let client = reqwest::Client::new();
+    let port = "8001"; // special port to avoid unexpected connection reuse from other tests
+                       // one byte past this proxy's 128 KiB retry buffer
+    let large_body = String::from_utf8(vec![b'e'; 128 * 1024 + 1]).unwrap();
+
+    for _ in 1..3 {
+        // load conn into pool
+        let res = client
+            .get("http://127.0.0.1:6155")
+            .header("x-port", port)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    let res = client
+        .put("http://127.0.0.1:6155/bad_lb")
+        .header("x-port", port)
+        .body(large_body)
+        .send()
+        .await
+        .unwrap();
+
+    // One byte past the custom limit, the body cannot be replayed, so no retry happens.
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+}
+
 #[tokio::test]
 async fn test_dropped_conn() {
     // These tests can race with each other
@@ -676,6 +779,9 @@ async fn test_dropped_conn() {
     test_dropped_conn_post_empty_body().await;
     test_dropped_conn_post_body().await;
     test_dropped_conn_put_body_over().await;
+    test_dropped_conn_put_body_over_custom_buffer().await;
+    test_dropped_conn_put_body_exactly_custom_buffer_size().await;
+    test_dropped_conn_put_body_over_custom_buffer_limit().await;
 }
 
 // currently not supported with Rustls implementation

@@ -143,7 +143,10 @@ where
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        session.as_mut().enable_retry_buffering();
+        let retry_buffer_size = self.inner.retry_buffer_size();
+        session
+            .as_mut()
+            .enable_retry_buffering_with_size(retry_buffer_size);
 
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.

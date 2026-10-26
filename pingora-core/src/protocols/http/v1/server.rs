@@ -1186,8 +1186,14 @@ impl HttpSession {
     }
 
     pub fn enable_retry_buffering(&mut self) {
+        self.enable_retry_buffering_with_size(BODY_BUF_LIMIT)
+    }
+
+    /// Enable retry buffering with a custom buffer size. Request bodies larger than `size`
+    /// cannot be replayed and so cannot be retried.
+    pub fn enable_retry_buffering_with_size(&mut self, size: usize) {
         if self.retry_buffer.is_none() {
-            self.retry_buffer = Some(FixedBuffer::new(BODY_BUF_LIMIT))
+            self.retry_buffer = Some(FixedBuffer::new(size))
         }
     }
 

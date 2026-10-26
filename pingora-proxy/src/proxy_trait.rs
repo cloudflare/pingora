@@ -401,6 +401,17 @@ where
         )
     }
 
+    /// The retry buffer size, in bytes, for downstream sessions. Request bodies larger than
+    /// this cannot be replayed and so cannot be retried. Defaults to 64 KiB, the historical
+    /// fixed limit; apps serving larger bodies override it. The value is read each time a
+    /// request is proxied (per H2 stream) and is fixed for that request's retry attempts, so
+    /// changing it at runtime affects subsequent requests, including requests on already-open
+    /// connections. Custom downstream sessions use their own fixed size unless they override
+    /// `enable_retry_buffering_with_size`. A size of 0 disables body replay entirely.
+    fn retry_buffer_size(&self) -> usize {
+        pingora_core::protocols::http::body_buffer::DEFAULT_RETRY_BUFFER_LIMIT
+    }
+
     /// Modify the request before it is sent to the upstream.
     ///
     /// Unlike [Self::request_filter()], this filter allows changing the request headers sent to

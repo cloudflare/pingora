@@ -262,7 +262,10 @@ where
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        session.as_mut().enable_retry_buffering();
+        let retry_buffer_size = self.inner.retry_buffer_size();
+        session
+            .as_mut()
+            .enable_retry_buffering_with_size(retry_buffer_size);
 
         // Custom message logic
 

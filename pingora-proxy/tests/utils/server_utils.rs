@@ -253,7 +253,10 @@ impl ProxyHttp for ExampleProxyHttps {
     }
 }
 
-pub struct ExampleProxyHttp {}
+#[derive(Default)]
+pub struct ExampleProxyHttp {
+    retry_buffer_size: Option<usize>,
+}
 
 static SUPPRESS_PROXY_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -280,6 +283,11 @@ impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
     fn new_ctx(&self) -> Self::CTX {
         CTX::default()
+    }
+
+    fn retry_buffer_size(&self) -> usize {
+        self.retry_buffer_size
+            .unwrap_or(pingora_core::protocols::http::body_buffer::DEFAULT_RETRY_BUFFER_LIMIT)
     }
 
     async fn early_request_filter(
@@ -2552,13 +2560,21 @@ fn test_main() {
     my_server.bootstrap();
 
     let mut proxy_service_http =
-        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp::default());
     proxy_service_http.add_tcp("0.0.0.0:6147");
     #[cfg(unix)]
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
 
+    let mut proxy_service_http_large_retry_buffer = pingora_proxy::http_proxy_service(
+        &my_server.configuration,
+        ExampleProxyHttp {
+            retry_buffer_size: Some(128 * 1024),
+        },
+    );
+    proxy_service_http_large_retry_buffer.add_tcp("0.0.0.0:6155");
+
     let mut proxy_service_http_connect =
-        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp::default());
     let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
     let mut http_server_options = HttpServerOptions::default();
     http_server_options.allow_connect_method_proxying = true;
@@ -2566,7 +2582,7 @@ fn test_main() {
     proxy_service_http_connect.add_tcp("0.0.0.0:6160");
 
     let mut proxy_service_h2c =
-        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp::default());
 
     let http_logic = proxy_service_h2c.app_logic_mut().unwrap();
     let mut http_server_options = HttpServerOptions::default();
@@ -2617,6 +2633,7 @@ fn test_main() {
     let mut services: Vec<Box<dyn ServiceWithDependents>> = vec![
         Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
+        Box::new(proxy_service_http_large_retry_buffer),
         Box::new(proxy_service_http_connect),
         Box::new(proxy_service_cache),
         Box::new(proxy_service_cache_h2c),

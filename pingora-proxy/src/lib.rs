@@ -2311,13 +2311,20 @@ mod tests {
     }
 
     async fn buffered_put_session(body_len: usize) -> Session {
+        buffered_put_session_with_size(body_len, None).await
+    }
+
+    async fn buffered_put_session_with_size(body_len: usize, size: Option<usize>) -> Session {
         let mut request =
             format!("PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body_len}\r\n\r\n")
                 .into_bytes();
         request.resize(request.len() + body_len, b'a');
 
         let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
-        session.enable_retry_buffering();
+        match size {
+            Some(size) => session.enable_retry_buffering_with_size(size),
+            None => session.enable_retry_buffering(),
+        }
         while session.read_request_body().await.unwrap().is_some() {}
         session
     }
@@ -2357,6 +2364,27 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_honors_a_custom_retry_buffer_size() {
+        // over the default 64 KiB but inside the custom 128 KiB: replayable
+        let mut fits = buffered_put_session_with_size(64 * 1024 + 1, Some(128 * 1024)).await;
+        assert!(!fits.retry_buffer_truncated());
+        assert!(default_policy_would_retry_for_session(
+            &mut fits,
+            RetryType::Decided(true),
+            false,
+        ));
+
+        // one byte past the custom 128 KiB: truncated, not retried
+        let mut over = buffered_put_session_with_size(128 * 1024 + 1, Some(128 * 1024)).await;
+        assert!(over.retry_buffer_truncated());
+        assert!(!default_policy_would_retry_for_session(
+            &mut over,
+            RetryType::Decided(true),
+            false,
+        ));
     }
 
     #[tokio::test]
