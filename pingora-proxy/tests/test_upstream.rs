@@ -14,7 +14,7 @@
 
 mod utils;
 
-use utils::server_utils::{init, init_proxy};
+use utils::server_utils::{init, init_proxy, recorded_upstream_body_bytes_sent};
 use utils::websocket::{WS_ECHO, WS_ECHO_RAW};
 
 use bytes::Bytes;
@@ -1777,6 +1777,69 @@ async fn test_h2_upstream_strips_connection_nominated_fields() {
     let headers = rx.await.unwrap();
     assert!(headers.get("connection").is_none());
     assert!(headers.get("x-private-hop").is_none());
+}
+
+// H2 upstreams must report the request body bytes sent, like the H1 upstream path does.
+#[tokio::test]
+async fn test_h2_upstream_records_request_body_bytes_sent() {
+    init_proxy().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        // The connection has to keep being polled for DATA frames to be read, so the request
+        // body is drained in its own task.
+        while let Some(result) = connection.accept().await {
+            let (request, mut respond) = result.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut body = request.into_body();
+                let mut received = 0;
+                while let Some(chunk) = body.data().await {
+                    received += chunk.unwrap().len();
+                }
+                tx.send(received).await.unwrap();
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                respond.send_response(response, true).unwrap();
+            });
+        }
+    });
+
+    let request = format!(
+        concat!(
+            "POST /upstream-body-bytes-h2 HTTP/1.1\r\n",
+            "Host: example.test\r\n",
+            "X-Port: {port}\r\n",
+            "X-H2: true\r\n",
+            "x-record-upstream-body-bytes: true\r\n",
+            "Content-Length: 5\r\n",
+            "\r\n",
+            "hello",
+        ),
+        port = port,
+    );
+    assert_eq!(send_raw_request_to_test_proxy(request).await.status, 200);
+    assert_eq!(
+        rx.recv().await.unwrap(),
+        5,
+        "the upstream must receive the whole request body"
+    );
+
+    // `logging()` runs after the response is written downstream.
+    let recorded = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(recorded) = recorded_upstream_body_bytes_sent("/upstream-body-bytes-h2") {
+                return recorded;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("logging() should record the request body bytes sent");
+    assert_eq!(recorded, Some(5));
 }
 
 #[tokio::test]
