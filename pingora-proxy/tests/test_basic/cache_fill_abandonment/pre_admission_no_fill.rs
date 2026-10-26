@@ -671,7 +671,7 @@ async fn assert_h1_upstream_stops_when_non_streaming_cache_admission_loses_downs
             .await
             .expect("proxy did not connect to the HTTP/1 upstream")
             .unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nCache-Control: max-age=30\r\n\r\npartial",

@@ -14,6 +14,68 @@
 
 use super::*;
 
+#[tokio::test]
+async fn failed_upload_keeps_active_fill_until_terminal_response_after_framed_delivery() {
+    const PATH: &str = "/failed-upload-framed-delivery-active-fill";
+    let (mut session, mut client) = cache_miss_session_for_request(
+        &format!("POST {PATH} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\n"),
+        true,
+    )
+    .await;
+    let proxy = HttpProxy::new(
+        CacheFillCallbackProxy::default(),
+        Arc::new(ServerConf::default()),
+    );
+    let (channels, CustomLoopDriver { tasks, .. }) = CustomLoop::new();
+    let failed = Arc::new(tokio::sync::Notify::new());
+    let writer = Box::new(FailingRequestBodyWriter {
+        failure: RequestBodyFailure::Write,
+        write_attempted: failed.clone(),
+    });
+    let drive = async {
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.insert_header("content-length", "4").unwrap();
+        tasks
+            .send(HttpTask::Header(Box::new(header), false))
+            .await
+            .unwrap();
+        read_response_head(&mut client).await;
+        client.write_all(b"body").await.unwrap();
+        failed.notified().await;
+        tasks
+            .send(HttpTask::Body(Some(Bytes::from_static(b"body")), false))
+            .await
+            .unwrap();
+        let mut body = [0; 4];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"body");
+        // The client has its entire framed body, but the cache producer has not ended.
+        tasks
+            .send(HttpTask::Failed(
+                Error::explain(ReadError, "late fill failure").into_up(),
+            ))
+            .await
+            .unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(channels.run(&proxy, &mut session, writer), drive)
+    })
+    .await
+    .expect("the active fill must consume the terminal error");
+    assert_eq!(
+        result
+            .expect_err("failed fill must fail the attempt")
+            .etype(),
+        &WriteError
+    );
+    assert!(session.downstream_session.is_response_complete());
+    drop(session);
+    assert!(
+        cached_response(PATH).await.is_none(),
+        "failed fill must not be published"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum RequestBodyFailure {
     Write,
@@ -64,7 +126,7 @@ impl BodyWrite for FailingRequestBodyWriter {
 
 // The second run is the same upload failure without abandonment handling, and ends the same way.
 #[tokio::test]
-async fn custom_loop_propagates_request_body_write_failure_during_cache_miss() {
+async fn custom_loop_preserves_response_after_request_body_write_failure_during_cache_miss() {
     for (path, handles_abandonment) in [
         ("/custom-fill-request-body-write-error", true),
         ("/custom-fill-request-body-write-error-ungated", false),
@@ -80,7 +142,7 @@ async fn custom_loop_propagates_request_body_write_failure_during_cache_miss() {
 
 // The second run is the same upload failure without abandonment handling, and ends the same way.
 #[tokio::test]
-async fn custom_loop_propagates_request_body_finish_failure_during_cache_miss() {
+async fn custom_loop_preserves_response_after_request_body_finish_failure_during_cache_miss() {
     for (path, handles_abandonment) in [
         ("/custom-fill-request-body-finish-error", true),
         ("/custom-fill-request-body-finish-error-ungated", false),
@@ -160,9 +222,12 @@ async fn assert_request_body_failure_keeps_custom_output(
         Some(b"late upstream message".as_slice()),
         "custom output must keep flowing after the upstream request body failed"
     );
-    // An upload failure is not an abandonment: the request fails as it does without the opt-in.
-    let error = result.expect_err("request body failure was swallowed during a cache miss");
-    assert_eq!(error.etype(), &WriteError);
+    // An upload failure is not downstream abandonment. A complete response
+    // survives it, independently of the cache-abandonment opt-in.
+    assert!(
+        matches!(result, Ok(true)),
+        "complete response was lost: {result:?}"
+    );
     assert_eq!(count(&observed.calls), 0);
     assert_eq!(WRITER_DEMAND_CACHE.released_writers(path), 0);
     assert_eq!(count(&observed.upstream_custom_message_calls), 1);
@@ -398,4 +463,130 @@ async fn custom_loop_request_body_read_timeout_is_not_abandonment() {
             .expect_err("the request succeeded without delivering its response");
         assert_eq!(error.etype(), &WriteError);
     }
+}
+
+/// A session for a request whose client left during an earlier attempt's cache fill, with the
+/// request body that attempt buffered for retries. The departure is recorded the way the proxy
+/// loop records a failed downstream read.
+async fn departed_client_with_retry_buffer<SV>(proxy: &HttpProxy<SV>, path: &str) -> Session
+where
+    SV: ProxyHttp<CTX = ()>,
+{
+    let (mut session, mut client) = cache_miss_session_for_request(
+        &format!("POST {path} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\n"),
+        true,
+    )
+    .await;
+    session.as_mut().enable_retry_buffering();
+    client.write_all(b"body").await.unwrap();
+    let buffered = session
+        .downstream_session
+        .read_request_body()
+        .await
+        .unwrap();
+    assert_eq!(buffered.as_deref(), Some(b"body".as_slice()));
+    drop(client);
+    proxy.abandon_downstream_for_cache_fill(
+        &ServeFromCache::new(),
+        &mut DownstreamStateMachine::new(true),
+        &mut ResponseStateMachine::new(),
+        &mut session,
+        &mut (),
+    );
+    assert!(session.downstream_abandoned_during_cache_fill());
+    session
+}
+
+async fn h1_retry_upload_failure_after_client_left(path: &str) -> Option<Box<Error>> {
+    let proxy = HttpProxy::new(
+        CacheFillCallbackProxy::default(),
+        Arc::new(ServerConf::default()),
+    );
+    let mut session = departed_client_with_retry_buffer(&proxy, path).await;
+    let mut request = session.req_header().clone();
+    pingora_cache::filters::upstream::request_filter(
+        &mut request,
+        session.cache.maybe_cache_meta(),
+    );
+    crate::proxy_common::finalize_h1_upstream_request_framing(&mut request, true).unwrap();
+    let request_wire =
+        pingora_core::protocols::http::v1::client::http_req_header_to_wire(&request).unwrap();
+    let upstream_io = tokio_test::io::Builder::new()
+        .write(&request_wire)
+        .write_error(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        .read(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\n\r\nbody")
+        .build();
+    let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
+    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+    let (_, _, error) = proxy
+        .proxy_1to1(&mut session, &mut upstream, &peer, &mut ())
+        .await;
+    error
+}
+
+async fn custom_retry_upload_failure_after_client_left(path: &str) -> Result<bool> {
+    let proxy = HttpProxy::new(
+        CacheFillCallbackProxy::default(),
+        Arc::new(ServerConf::default()),
+    );
+    let mut session = departed_client_with_retry_buffer(&proxy, path).await;
+    let (channels, CustomLoopDriver { tasks: task_tx, .. }) = CustomLoop::new();
+    let write_attempted = Arc::new(tokio::sync::Notify::new());
+    let request_body = Box::new(FailingRequestBodyWriter {
+        failure: RequestBodyFailure::Write,
+        write_attempted: Arc::clone(&write_attempted),
+    });
+    let proxy_loop = channels.run(&proxy, &mut session, request_body);
+    let drive = async {
+        write_attempted.notified().await;
+        task_tx.send(cacheable_response_header()).await.unwrap();
+        task_tx
+            .send(HttpTask::Body(Some(Bytes::from_static(b"body")), true))
+            .await
+            .unwrap();
+        task_tx.send(HttpTask::Done).await.unwrap();
+        drop(task_tx);
+    };
+    let (result, ()) = tokio::join!(proxy_loop, drive);
+    result
+}
+
+/// A retry attempt resends the buffered request body. When that upload fails after the client
+/// left, the complete response still fills the cache and the attempt succeeds, on both paths.
+#[tokio::test]
+async fn retry_upload_failure_after_client_left_matches_h1() {
+    const H1_PATH: &str = "/h1-fill-retry-upload-failure";
+    const CUSTOM_PATH: &str = "/custom-fill-retry-upload-failure";
+    let h1_error = tokio::time::timeout(
+        Duration::from_secs(3),
+        h1_retry_upload_failure_after_client_left(H1_PATH),
+    )
+    .await
+    .expect("the HTTP/1 retry attempt did not finish");
+    assert!(h1_error.is_none(), "HTTP/1: {h1_error:?}");
+    assert_eq!(
+        cached_response(H1_PATH)
+            .await
+            .map(|(_, body)| body)
+            .as_deref(),
+        Some(b"body".as_slice())
+    );
+
+    let custom_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        custom_retry_upload_failure_after_client_left(CUSTOM_PATH),
+    )
+    .await
+    .expect("the custom retry attempt did not finish");
+    assert!(
+        matches!(custom_result, Ok(false)),
+        "custom: {custom_result:?}"
+    );
+    assert_eq!(
+        cached_response(CUSTOM_PATH)
+            .await
+            .map(|(_, body)| body)
+            .as_deref(),
+        Some(b"body".as_slice())
+    );
 }

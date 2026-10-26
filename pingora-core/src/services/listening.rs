@@ -57,6 +57,7 @@ where
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
+    runtime_group: Option<String>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -74,6 +75,7 @@ where
             _custom_session: PhantomData,
             threads: None,
             runtime_opts_override: None,
+            runtime_group: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -92,6 +94,7 @@ where
             _custom_session: PhantomData,
             threads: None,
             runtime_opts_override: None,
+            runtime_group: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -102,6 +105,14 @@ where
     /// Returning [`None`] from the override uses the global runtime options.
     pub fn set_runtime_opts_override(&mut self, override_fn: RuntimeOptsOverride) {
         self.runtime_opts_override = Some(override_fn);
+    }
+
+    /// Run this service in the named runtime group.
+    ///
+    /// Services in the same group share one runtime. See
+    /// [`ServiceWithDependents::runtime_group`](crate::services::ServiceWithDependents::runtime_group).
+    pub fn set_runtime_group(&mut self, group: impl Into<String>) {
+        self.runtime_group = Some(group.into());
     }
 
     /// Set a custom connection filter for this service.
@@ -366,6 +377,10 @@ where
         self.runtime_opts_override
             .as_ref()
             .and_then(|override_fn| override_fn(global))
+    }
+
+    fn runtime_group(&self) -> Option<&str> {
+        self.runtime_group.as_deref()
     }
 
     fn listen_addresses(&self) -> Option<Vec<String>> {

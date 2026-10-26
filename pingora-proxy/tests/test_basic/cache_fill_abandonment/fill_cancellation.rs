@@ -90,7 +90,7 @@ impl StalledH1Origin {
         let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_h1_head(&mut socket).await;
+            read_http1_head(&mut socket).await;
             request_seen_tx.send(()).unwrap();
             send_response_rx.await.unwrap();
             socket
@@ -1614,7 +1614,7 @@ async fn start_streaming_origin(
     let reported_before = downstream_cache_warn_log_calls_for(path);
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\

@@ -667,6 +667,7 @@ impl DownstreamStateMachine {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResponseStateMachine {
     upstream_producer_done: bool,
+    upstream_response_complete: bool,
     upstream_delivery_done: bool,
     cached_response_done: bool,
 }
@@ -675,6 +676,7 @@ impl ResponseStateMachine {
     pub fn new() -> Self {
         ResponseStateMachine {
             upstream_producer_done: false,
+            upstream_response_complete: false,
             upstream_delivery_done: false,
             cached_response_done: true, // no cached response by default
         }
@@ -690,6 +692,16 @@ impl ResponseStateMachine {
     /// It can be true even when the task was diverted to cache instead of delivered.
     pub fn upstream_producer_done(&self) -> bool {
         self.upstream_producer_done
+    }
+
+    /// Whether this attempt's upstream task producer emitted [`HttpTask::Done`].
+    ///
+    /// HTTP/2 and custom producers emit `Done` only after reading the whole body and any
+    /// trailers, so unlike [`Self::upstream_producer_done`] this is false when the response ended
+    /// with [`HttpTask::Failed`] or the task pipe closed early. Only the custom upstream path
+    /// records it.
+    pub fn upstream_response_complete(&self) -> bool {
+        self.upstream_response_complete
     }
 
     /// Whether no more direct upstream output needs downstream delivery.
@@ -708,6 +720,12 @@ impl ResponseStateMachine {
     pub fn maybe_set_upstream_producer_done(&mut self, done: bool) {
         if done {
             self.upstream_producer_done = true;
+        }
+    }
+
+    pub fn maybe_set_upstream_response_complete(&mut self, complete: bool) {
+        if complete {
+            self.upstream_response_complete = true;
         }
     }
 
@@ -739,6 +757,10 @@ pub(crate) fn ends_upstream_task_stream(task: &HttpTask) -> bool {
 /// closure (downstream finished the response by its own framing) from an
 /// unexpected one.
 ///
+/// Custom upstreams first store [`UploadFailed`](Self::UploadFailed) if their request writer
+/// fails. The response reader can then defer its header error to the downstream half, which
+/// reports the saved upload error. This state does not signal successful completion.
+///
 /// Stored in an `AtomicU8` shared via `Arc`: the downstream half stores with
 /// [`Release`](std::sync::atomic::Ordering::Release) and the upstream half loads
 /// with [`Acquire`](std::sync::atomic::Ordering::Acquire), comparing against
@@ -748,14 +770,20 @@ pub(crate) fn ends_upstream_task_stream(task: &HttpTask) -> bool {
 pub(crate) enum PipeState {
     Active = 0,
     DownstreamComplete = 1,
+    /// The custom upload failed, so its writer is no longer polled. A response header read
+    /// failure can now be queued for arbitration with the saved upload error.
+    UploadFailed = 2,
+    /// A failed upload's downstream finished successfully. Its response reader can be cancelled
+    /// even if the upstream has not sent EOS; no cache fill still needs that reader.
+    DownstreamCompleteAfterUploadFailure = 3,
 }
 
 impl PipeState {
-    /// Whether `raw` — a value previously read from the shared `AtomicU8` — is
-    /// [`DownstreamComplete`](Self::DownstreamComplete). Centralizes the `as u8`
-    /// comparison the upstream halves perform on a task-pipe closure.
+    /// Whether `raw`, read from the shared `AtomicU8`, represents clean downstream completion,
+    /// either with or without an upload failure.
     pub(crate) fn is_downstream_complete(raw: u8) -> bool {
         raw == PipeState::DownstreamComplete as u8
+            || raw == PipeState::DownstreamCompleteAfterUploadFailure as u8
     }
 }
 

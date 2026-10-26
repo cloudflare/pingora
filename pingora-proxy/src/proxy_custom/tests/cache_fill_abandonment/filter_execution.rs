@@ -252,11 +252,13 @@ async fn process_response_after_client_left(
                     &mut serve_from_cache,
                     &mut range_body_filter,
                     &mut response_state,
+                    &mut None,
                 )
                 .await?;
             assert_eq!(response_done, None);
         }
         assert!(response_state.upstream_producer_done());
+        assert!(response_state.upstream_response_complete());
         assert!(!session.cache.is_cache_admission_active());
         assert!(!response_state.is_done());
         assert!(session.response_work_done(&response_state));

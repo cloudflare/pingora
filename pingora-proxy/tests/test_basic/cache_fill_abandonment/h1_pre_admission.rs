@@ -28,7 +28,7 @@ async fn test_h1_incomplete_abandoned_request_is_not_retried() {
         let upstream = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             drop(listener);
-            read_h1_head(&mut socket).await;
+            read_http1_head(&mut socket).await;
             request_seen_tx.send(()).unwrap();
             fail_upstream_rx.await.unwrap();
             drop(socket);
@@ -103,7 +103,7 @@ async fn assert_h1_pre_admission_abandonment_propagates_truncated_fill(
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         drop(listener);
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         request_seen_tx.send(()).unwrap();
 
         send_early_hints_rx.await.unwrap();
@@ -258,7 +258,7 @@ async fn assert_h1_complete_get_abandonment_notifies_before_upstream_response(
 
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         request_seen_tx.send(()).unwrap();
 
         send_response_rx.await.unwrap();
@@ -364,7 +364,7 @@ async fn assert_h1_pre_admission_abandonment_stops_uncacheable_response(
 
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         request_seen_tx.send(()).unwrap();
 
         send_response_rx.await.unwrap();
@@ -466,7 +466,7 @@ async fn assert_h1_downstream_abandonment_before_cache_admission_completes_fill(
 
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        read_h1_head(&mut socket).await;
+        read_http1_head(&mut socket).await;
         request_seen_tx.send(()).unwrap();
         send_early_hints_rx.await.unwrap();
 
