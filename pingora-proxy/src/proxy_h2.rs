@@ -24,7 +24,7 @@ use pingora_core::protocols::http::authority::{
     raw_target_authority, validate_request_authority, RawTargetAuthority,
 };
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
-use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
+use pingora_core::protocols::http::v2::client::{Http2Session, RequestBodyWriter};
 
 /// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
 ///
@@ -306,7 +306,7 @@ where
             .take_request_body_writer()
             .expect("already send request header");
 
-        // need to get the write_timeout here since we pass the h2 SendStream
+        // need to get the write_timeout here since we pass the request body writer
         // directly to bidirection_down_to_up
         let write_timeout = peer.options.write_timeout;
 
@@ -412,6 +412,9 @@ where
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
+        // Record request body bytes written to the upstream (HTTP/2 DATA payload).
+        session.set_upstream_body_bytes_sent(client_session.body_bytes_sent());
+
         // Note: upstream_write_pending_time is not tracked for HTTP/2 (multiplexed streams).
 
         (server_session_reuse, error)
@@ -513,7 +516,7 @@ where
     async fn bidirection_down_to_up(
         &self,
         session: &mut Session<DS>,
-        client_body: &mut h2::SendStream<bytes::Bytes>,
+        client_body: &mut RequestBodyWriter,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
@@ -1133,7 +1136,7 @@ where
         session: &mut Session<DS>,
         mut data: Option<Bytes>,
         end_of_body: bool,
-        client_body: &mut h2::SendStream<bytes::Bytes>,
+        client_body: &mut RequestBodyWriter,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
     ) -> std::result::Result<bool, H2BodySendError>
@@ -1177,7 +1180,7 @@ where
         if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
             tokio::select! {
                 biased;
-                res = write_body(client_body, data, end, write_timeout) => {
+                res = client_body.write_body(data, end, write_timeout) => {
                     res.map_err(|e| e.into_up())?;
                 }
                 close_result = stream_close => {
@@ -1192,7 +1195,8 @@ where
                 }
             }
         } else {
-            write_body(client_body, data, end, write_timeout)
+            client_body
+                .write_body(data, end, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
@@ -1614,7 +1618,8 @@ mod tests {
             .uri(format!("https://example.com{path}"))
             .body(())
             .unwrap();
-        let (_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+        let (_response, request_body) = h2_client.send_request(request, false).unwrap();
+        let mut request_body = RequestBodyWriter::new(request_body);
         let mut custom_writer = None;
         let mut custom_reader = None;
         let mut ctx = ();
@@ -1802,7 +1807,8 @@ mod tests {
             .uri("https://example.com/")
             .body(())
             .unwrap();
-        let (_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+        let (_response, request_body) = h2_client.send_request(request, false).unwrap();
+        let mut request_body = RequestBodyWriter::new(request_body);
 
         let proxy_loop = proxy.bidirection_down_to_up(
             &mut session,
@@ -1906,7 +1912,8 @@ mod tests {
             .uri("https://example.com/")
             .body(())
             .unwrap();
-        let (_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+        let (_response, request_body) = h2_client.send_request(request, false).unwrap();
+        let mut request_body = RequestBodyWriter::new(request_body);
 
         let proxy_loop = proxy.bidirection_down_to_up(
             &mut session,
@@ -1999,7 +2006,8 @@ mod tests {
             .uri("https://example.com/")
             .body(())
             .unwrap();
-        let (_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+        let (_response, request_body) = h2_client.send_request(request, false).unwrap();
+        let mut request_body = RequestBodyWriter::new(request_body);
 
         let header = ResponseHeader::build(200, None).unwrap();
         response_tx
@@ -2078,7 +2086,8 @@ mod tests {
             .uri("https://example.com/")
             .body(())
             .unwrap();
-        let (_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+        let (_response, request_body) = h2_client.send_request(request, false).unwrap();
+        let mut request_body = RequestBodyWriter::new(request_body);
 
         let proxy_loop = proxy.bidirection_down_to_up(
             &mut session,

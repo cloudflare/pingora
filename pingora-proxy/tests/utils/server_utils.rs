@@ -512,6 +512,19 @@ impl ProxyHttp for ExampleProxyHttp {
             false
         }
     }
+
+    async fn logging(&self, session: &mut Session, _error: Option<&Error>, _ctx: &mut Self::CTX) {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-record-upstream-body-bytes")
+        {
+            RECORDED_UPSTREAM_BODY_BYTES_SENT.lock().unwrap().insert(
+                request_lifecycle_key(session.req_header()),
+                session.upstream_body_bytes_sent(),
+            );
+        }
+    }
 }
 
 static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
@@ -1466,6 +1479,9 @@ static RECORDED_UPSTREAM_REQUEST_FILTERS: Lazy<Mutex<HashMap<String, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static RECORDED_REQUEST_COMPLETIONS: Lazy<Mutex<HashMap<String, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// `Session::upstream_body_bytes_sent` recorded in `logging()` for instrumented requests.
+static RECORDED_UPSTREAM_BODY_BYTES_SENT: Lazy<Mutex<HashMap<String, Option<usize>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static RECORDED_REQUEST_ERRORS: Lazy<Mutex<HashMap<String, Option<ErrorType>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static RECORDED_CACHE_REASONS: Lazy<Mutex<HashMap<String, Option<NoCacheReason>>>> =
@@ -1580,6 +1596,16 @@ pub fn recorded_request_completions(path: &str) -> usize {
         .get(path)
         .copied()
         .unwrap_or_default()
+}
+
+/// The `Session::upstream_body_bytes_sent` recorded for an instrumented request, once
+/// `logging()` ran. `None` inside the outer option is "not measured".
+pub fn recorded_upstream_body_bytes_sent(path: &str) -> Option<Option<usize>> {
+    RECORDED_UPSTREAM_BODY_BYTES_SENT
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
 }
 
 /// The final proxy error recorded for an instrumented request.

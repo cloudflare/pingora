@@ -670,9 +670,9 @@ where
     upstream_body_bytes_received: usize,
     /// Request body bytes written to the upstream (payload only). Set by proxy layer.
     ///
-    /// `None` when the proxy layer does not track it (HTTP/2 and custom upstreams), which is
-    /// deliberately distinct from `Some(0)` so that "not measured" cannot be mistaken for
-    /// "a request body was dropped".
+    /// `None` when the proxy layer does not track it (custom upstreams), which is deliberately
+    /// distinct from `Some(0)` so that "not measured" cannot be mistaken for "a request body
+    /// was dropped".
     upstream_body_bytes_sent: Option<usize>,
     /// Whether proxy task filtering has seen a downstream 101 upgrade header.
     downstream_task_seen_upgraded: bool,
@@ -1131,7 +1131,7 @@ where
     /// Get the request body bytes written to the upstream (payload only) recorded by the proxy
     /// layer.
     ///
-    /// Returns `None` when the proxy layer does not track it (HTTP/2 and custom upstreams).
+    /// Returns `None` when the proxy layer does not track it (custom upstreams).
     pub fn upstream_body_bytes_sent(&self) -> Option<usize> {
         self.upstream_body_bytes_sent
     }

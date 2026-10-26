@@ -235,7 +235,6 @@ where
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
         // Record request body bytes written to the upstream (payload only) for logging consumers.
-        // Only HTTP/1.x tracks this; see `Session::upstream_body_bytes_sent`.
         session.set_upstream_body_bytes_sent(client_session.body_bytes_sent());
 
         // Record upstream write pending time for this session only (delta from baseline).
