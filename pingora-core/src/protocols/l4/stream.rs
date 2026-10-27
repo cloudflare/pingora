@@ -15,23 +15,25 @@
 //! Transport layer connection
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use futures::FutureExt;
 use log::{debug, error};
 
 use pingora_error::{ErrorType::*, OrErr, Result};
+use std::future::Future;
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
@@ -180,6 +182,17 @@ impl RawStreamWrapper {
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
             reusable_cmsg_space: nix::cmsg_space!(nix::sys::socket::Timestamps),
+        }
+    }
+
+    /// Wait before allocating read-ahead storage for real sockets. Virtual
+    /// streams expose only AsyncRead, so their poll_read registers the waker.
+    fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &self.stream {
+            RawStream::Tcp(stream) => stream.poll_read_ready(cx),
+            #[cfg(unix)]
+            RawStream::Unix(stream) => stream.poll_read_ready(cx),
+            RawStream::Virtual(_) => Poll::Ready(Ok(())),
         }
     }
 
@@ -359,8 +372,9 @@ impl AsRawSocket for RawStreamWrapper {
 ///
 /// Large read buffering helps reducing syscalls with little trade-off. The SSL
 /// layer always does "small" reads in 16k chunks (TLS record size), so L4 read
-/// buffering helps a lot.
-pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 64 * 1024;
+/// buffering helps a lot. The 32 KiB default fits jemalloc's default tcache limit
+/// and matches the HTTP/1 body read buffer.
+pub const DEFAULT_L4_READ_BUFFER_SIZE: usize = 32 * 1024;
 
 /// The default L4 write buffer size.
 ///
@@ -418,41 +432,58 @@ impl L4BufferSettings {
     }
 }
 
-/// The L4 buffers in front of a [`RawStreamWrapper`]: a read buffer over a write
-/// buffer, the same layering as tokio's [`BufStream`](tokio::io::BufStream).
-///
-/// A zero read capacity leaves the read buffer out, because [`BufReader`] panics on
-/// a zero capacity. Reads then go straight to the raw stream, as they did through
-/// an empty `BufReader`. [`BufWriter`] accepts a zero capacity and writes straight
-/// through.
+/// Read-ahead storage whose debug output omits buffered contents.
+#[derive(Default)]
+struct ReadBuffer {
+    storage: BytesMut,
+}
+
+impl std::fmt::Debug for ReadBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadBuffer")
+            .field("len", &self.storage.len())
+            .field("capacity", &self.storage.capacity())
+            .finish()
+    }
+}
+
+impl ReadBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            storage: BytesMut::with_capacity(capacity),
+        }
+    }
+}
+
+/// Read-ahead storage over a write buffer. Read storage is acquired only when
+/// attempting a ready read. A full refill can reuse its allocation after being
+/// consumed; a drained short refill, Pending, EOF, or an error releases it.
+/// If the caller stops reading after a full refill, its empty allocation stays
+/// until another read. A zero capacity disables buffering in that direction.
 #[derive(Debug)]
-enum BufferedStream {
-    UnbufferedRead(BufWriter<RawStreamWrapper>),
-    BufferedRead(BufReader<BufWriter<RawStreamWrapper>>),
+struct BufferedStream {
+    writer: BufWriter<RawStreamWrapper>,
+    read_capacity: usize,
+    read_buf: ReadBuffer,
+    read_pos: usize,
 }
 
 impl BufferedStream {
     fn with_capacity(read: usize, write: usize, stream: RawStreamWrapper) -> Self {
-        let writer = BufWriter::with_capacity(write, stream);
-        if read == 0 {
-            BufferedStream::UnbufferedRead(writer)
-        } else {
-            BufferedStream::BufferedRead(BufReader::with_capacity(read, writer))
+        Self {
+            writer: BufWriter::with_capacity(write, stream),
+            read_capacity: read,
+            read_buf: ReadBuffer::default(),
+            read_pos: 0,
         }
     }
 
     fn writer(&self) -> &BufWriter<RawStreamWrapper> {
-        match self {
-            BufferedStream::UnbufferedRead(writer) => writer,
-            BufferedStream::BufferedRead(reader) => reader.get_ref(),
-        }
+        &self.writer
     }
 
     fn writer_mut(&mut self) -> &mut BufWriter<RawStreamWrapper> {
-        match self {
-            BufferedStream::UnbufferedRead(writer) => writer,
-            BufferedStream::BufferedRead(reader) => reader.get_mut(),
-        }
+        &mut self.writer
     }
 
     fn get_ref(&self) -> &RawStreamWrapper {
@@ -465,10 +496,7 @@ impl BufferedStream {
 
     /// Return the raw stream. Anything left in either buffer is lost.
     fn into_inner(self) -> RawStreamWrapper {
-        match self {
-            BufferedStream::UnbufferedRead(writer) => writer.into_inner(),
-            BufferedStream::BufferedRead(reader) => reader.into_inner().into_inner(),
-        }
+        self.writer.into_inner()
     }
 }
 
@@ -478,15 +506,58 @@ impl AsyncRead for BufferedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match &mut *self {
-            BufferedStream::UnbufferedRead(writer) => Pin::new(writer).poll_read(cx, buf),
-            BufferedStream::BufferedRead(reader) => Pin::new(reader).poll_read(cx, buf),
+        let this = &mut *self;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
         }
+
+        if this.read_pos < this.read_buf.storage.len() {
+            let count = buf
+                .remaining()
+                .min(this.read_buf.storage.len() - this.read_pos);
+            buf.put_slice(&this.read_buf.storage[this.read_pos..this.read_pos + count]);
+            this.read_pos += count;
+            if this.read_pos == this.read_buf.storage.len() {
+                if this.read_buf.storage.len() == this.read_buf.storage.capacity() {
+                    this.read_buf.storage.clear();
+                } else {
+                    this.read_buf = ReadBuffer::default();
+                }
+                this.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Preserve BufReader's bypass for destinations at least as large as
+        // the configured read-ahead capacity, including unbuffered reads.
+        if buf.remaining() >= this.read_capacity {
+            this.read_buf = ReadBuffer::default();
+            return Pin::new(&mut this.writer).poll_read(cx, buf);
+        }
+
+        // Keep reusable storage local so any Pending or error, including from
+        // the readiness check, drops it before returning to the caller.
+        let mut storage = std::mem::take(&mut this.read_buf);
+        ready!(this.writer.get_ref().poll_read_ready(cx))?;
+        if storage.storage.capacity() == 0 {
+            storage = ReadBuffer::new(this.read_capacity);
+        }
+        // Read through the wrapper so RX timestamps and virtual streams keep
+        // their normal behavior. Stale readiness may still return Pending;
+        // the local allocation is then dropped before yielding.
+        // read_buf fills spare capacity without zeroing the whole destination.
+        let read = ready!(pin!(this.writer.read_buf(&mut storage.storage)).poll(cx))?;
+        let count = read.min(buf.remaining());
+        buf.put_slice(&storage.storage[..count]);
+        if count < read {
+            this.read_buf = storage;
+            this.read_pos = count;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
-// `BufReader` only forwards writes to the `BufWriter` under it, so write to the `BufWriter`
-// directly.
+// Keep write buffering independent of the lifetime of read-ahead storage.
 impl AsyncWrite for BufferedStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -966,6 +1037,279 @@ impl AccumulatedDuration {
             }
             _ => self.start(),
         }
+    }
+}
+
+#[cfg(test)]
+mod read_buffer_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    async fn tcp_pair(capacity: usize) -> (BufferedStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let stream = RawStreamWrapper::new(RawStream::Tcp(accepted.unwrap().0));
+        (
+            BufferedStream::with_capacity(capacity, DEFAULT_L4_WRITE_BUFFER_SIZE, stream),
+            peer.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn idle_tcp_has_no_read_allocation_and_cancelled_read_can_resume() {
+        let (mut stream, mut peer) = tcp_pair(DEFAULT_L4_READ_BUFFER_SIZE).await;
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+        let mut byte = [0; 1];
+        for _ in 0..3 {
+            assert!(stream.read(&mut byte).now_or_never().is_none());
+            assert_eq!(stream.read_buf.storage.capacity(), 0);
+        }
+        peer.write_all(b"a").await.unwrap();
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"a");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+        peer.shutdown().await.unwrap();
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn draining_read_ahead_releases_storage_and_preserves_write_buffer() {
+        let (mut stream, mut peer) = tcp_pair(DEFAULT_L4_READ_BUFFER_SIZE).await;
+        stream.write_all(b"out").await.unwrap();
+        assert_eq!(stream.writer.buffer(), b"out");
+        peer.write_all(b"abcd").await.unwrap();
+
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"a");
+        assert_eq!(&stream.read_buf.storage[stream.read_pos..], b"bcd");
+        let mut rest = [0; 3];
+        stream.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"bcd");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+        assert_eq!(stream.writer.buffer(), b"out");
+
+        stream.flush().await.unwrap();
+        peer.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"out");
+        assert!(stream.read(&mut byte).now_or_never().is_none());
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_read_ahead_reuses_storage_until_a_short_read() {
+        let socket = std::io::Cursor::new(b"abcdefghijklmnopqrst".to_vec());
+        let raw = RawStreamWrapper::new(RawStream::Virtual(virt::VirtualSocketStream::new(
+            Box::new(socket),
+        )));
+        let mut stream = BufferedStream::with_capacity(8, 0, raw);
+        let mut part = [0; 4];
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"abcd");
+        let allocation = stream.read_buf.storage.as_ptr();
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"efgh");
+        assert_eq!(stream.read_buf.storage.capacity(), 8);
+        assert!(stream.read_buf.storage.is_empty());
+
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"ijkl");
+        assert_eq!(stream.read_buf.storage.as_ptr(), allocation);
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"mnop");
+        assert_eq!(stream.read_buf.storage.capacity(), 8);
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"qrst");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_read_ahead_is_released_when_tcp_read_blocks() {
+        let (mut stream, mut peer) = tcp_pair(4).await;
+        peer.write_all(b"abcd").await.unwrap();
+        let mut part = [0; 2];
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"ab");
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"cd");
+        assert_eq!(stream.read_buf.storage.capacity(), 4);
+        assert!(stream.read(&mut part).now_or_never().is_none());
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+
+        peer.write_all(b"ef").await.unwrap();
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(&part, b"ef");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn full_read_ahead_is_released_on_eof_or_error() {
+        for error in [false, true] {
+            let mut builder = tokio_test::io::Builder::new();
+            builder.read(b"abcd");
+            if error {
+                builder.read_error(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            let socket = builder.build();
+            drop(builder);
+            let raw = RawStreamWrapper::new(RawStream::Virtual(virt::VirtualSocketStream::new(
+                Box::new(socket),
+            )));
+            let mut stream = BufferedStream::with_capacity(4, 0, raw);
+            let mut part = [0; 2];
+            stream.read_exact(&mut part).await.unwrap();
+            assert_eq!(&part, b"ab");
+            stream.read_exact(&mut part).await.unwrap();
+            assert_eq!(&part, b"cd");
+            assert_eq!(stream.read_buf.storage.capacity(), 4);
+            let result = stream.read(&mut part).await;
+            if error {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            assert_eq!(stream.read_buf.storage.capacity(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_read_ahead_is_released_when_bypassed() {
+        let socket = std::io::Cursor::new(b"abcdefghijkl".to_vec());
+        let raw = RawStreamWrapper::new(RawStream::Virtual(virt::VirtualSocketStream::new(
+            Box::new(socket),
+        )));
+        let mut stream = BufferedStream::with_capacity(4, 0, raw);
+        let mut part = [0; 2];
+        stream.read_exact(&mut part).await.unwrap();
+        stream.read_exact(&mut part).await.unwrap();
+        assert_eq!(stream.read_buf.storage.capacity(), 4);
+        let mut rest = [0; 8];
+        stream.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"efghijkl");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_and_small_read_capacities_and_empty_destinations() {
+        for capacity in [0, 1, 2, DEFAULT_L4_READ_BUFFER_SIZE] {
+            let (mut stream, mut peer) = tcp_pair(capacity).await;
+            assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+            assert_eq!(stream.read_buf.storage.capacity(), 0);
+            peer.write_all(b"abcd").await.unwrap();
+            let mut body = [0; 4];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"abcd");
+            assert_eq!(stream.read_buf.storage.capacity(), 0);
+        }
+    }
+
+    impl virt::VirtualSocket for tokio::io::DuplexStream {
+        fn set_socket_option(&self, _opt: virt::VirtualSockOpt) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl virt::VirtualSocket for std::io::Cursor<Vec<u8>> {
+        fn set_socket_option(&self, _opt: virt::VirtualSockOpt) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl virt::VirtualSocket for tokio_test::io::Mock {
+        fn set_socket_option(&self, _opt: virt::VirtualSockOpt) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Compare the previous reader with the new policy using TLS-sized reads.
+    /// Run alone: cargo test -p pingora-core --release benchmark_transport_read_buffers -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "interactive read-buffer benchmark"]
+    async fn benchmark_transport_read_buffers() {
+        async fn transfer(mut reader: impl AsyncRead + Unpin) -> Duration {
+            let start = Instant::now();
+            let mut buf = [0; 16 * 1024];
+            let mut total = 0;
+            loop {
+                let read = reader.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                total += read;
+                std::hint::black_box(&buf[..read]);
+            }
+            assert_eq!(total, 128 * 1024 * 1024);
+            start.elapsed()
+        }
+
+        fn source() -> RawStreamWrapper {
+            RawStreamWrapper::new(RawStream::Virtual(virt::VirtualSocketStream::new(
+                Box::new(std::io::Cursor::new(vec![b'x'; 128 * 1024 * 1024])),
+            )))
+        }
+
+        for repetition in 1..=3 {
+            let old = tokio::io::BufReader::with_capacity(
+                DEFAULT_L4_READ_BUFFER_SIZE,
+                BufWriter::with_capacity(DEFAULT_L4_WRITE_BUFFER_SIZE, source()),
+            );
+            let old = transfer(old).await;
+            let new = BufferedStream::with_capacity(
+                DEFAULT_L4_READ_BUFFER_SIZE,
+                DEFAULT_L4_WRITE_BUFFER_SIZE,
+                source(),
+            );
+            let new = transfer(new).await;
+            println!(
+                "transport/128MiB repetition={repetition} previous_ms={:.1} candidate_ms={:.1}",
+                old.as_secs_f64() * 1000.0,
+                new.as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn virtual_stream_releases_storage_on_pending_and_wakes_on_data() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let stream = RawStreamWrapper::new(RawStream::Virtual(virt::VirtualSocketStream::new(
+            Box::new(socket),
+        )));
+        let mut stream = BufferedStream::with_capacity(DEFAULT_L4_READ_BUFFER_SIZE, 0, stream);
+        let mut byte = [0; 1];
+        assert!(stream.read(&mut byte).now_or_never().is_none());
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+        let (read, write) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(stream.read_exact(&mut byte), async {
+                tokio::task::yield_now().await;
+                peer.write_all(b"a").await
+            })
+        })
+        .await
+        .unwrap();
+        read.unwrap();
+        write.unwrap();
+        assert_eq!(&byte, b"a");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_stream_waits_without_storage_and_resumes() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let stream = RawStreamWrapper::new(RawStream::Unix(socket));
+        let mut stream = BufferedStream::with_capacity(DEFAULT_L4_READ_BUFFER_SIZE, 0, stream);
+        let mut byte = [0; 1];
+        assert!(stream.read(&mut byte).now_or_never().is_none());
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
+        peer.write_all(b"a").await.unwrap();
+        stream.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"a");
+        assert_eq!(stream.read_buf.storage.capacity(), 0);
     }
 }
 

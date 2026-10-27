@@ -507,7 +507,9 @@ impl HttpSession {
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         let read = self.read_body_ref().await?;
-        Ok(read.map(Bytes::copy_from_slice))
+        let bytes = read.map(Bytes::copy_from_slice);
+        self.body_reader.release_completed_buf();
+        Ok(bytes)
     }
 
     /// Upstream response body bytes received (payload only; excludes headers/framing).
@@ -976,6 +978,30 @@ mod tests_stream {
         let res = http_stream.read_response().await;
         assert_eq!(input.len(), res.unwrap());
         assert_eq!(0, http_stream.resp_header().unwrap().headers.len());
+    }
+
+    #[tokio::test]
+    async fn completed_body_storage_respects_payload_ownership() {
+        for copied in [false, true] {
+            let mock_io = Builder::new()
+                .read(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
+                .read(b"abc")
+                .build();
+            let mut session = HttpSession::new(Box::new(mock_io));
+            session.read_response().await.unwrap();
+            if copied {
+                let body = session.read_body_bytes().await.unwrap().unwrap();
+                assert!(session.body_reader.body_buf.is_none());
+                drop(session);
+                assert_eq!(body, b"abc"[..]);
+            } else {
+                let body = session.read_body_ref().await.unwrap().unwrap();
+                assert_eq!(body, b"abc");
+                assert!(session.body_reader.body_buf.is_some());
+                assert!(session.read_body_ref().await.unwrap().is_none());
+                assert!(session.body_reader.body_buf.is_none());
+            }
+        }
     }
 
     #[tokio::test]
