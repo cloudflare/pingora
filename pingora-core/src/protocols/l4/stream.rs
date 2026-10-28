@@ -38,6 +38,7 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+use crate::listeners::ConnectionPermit;
 use crate::protocols::l4::ext::{set_tcp_keepalive, TcpKeepalive};
 use crate::protocols::l4::virt;
 use crate::protocols::raw_connect::ProxyDigest;
@@ -611,6 +612,9 @@ pub struct Stream {
     write_pending_time: AccumulatedDuration,
     /// Last rx timestamp associated with the last recvmsg call.
     pub rx_ts: Option<SystemTime>,
+    /// Counts an accepted connection against its endpoint's limits. Declared after `stream`, so
+    /// the socket closes before the connection stops counting.
+    connection_permit: ConnectionPermit,
 }
 
 impl Stream {
@@ -620,6 +624,11 @@ impl Stream {
 
     fn stream_mut(&mut self) -> &mut BufferedStream {
         self.stream.as_mut().expect("stream should always be set")
+    }
+
+    /// Count this stream against its endpoint's connection limit until it is dropped.
+    pub(crate) fn set_connection_permit(&mut self, permit: ConnectionPermit) {
+        self.connection_permit = permit;
     }
 
     /// Record transport connection timing for this stream.
@@ -731,6 +740,7 @@ impl From<TcpStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            connection_permit: ConnectionPermit::uncounted(),
         }
     }
 }
@@ -754,6 +764,7 @@ impl From<virt::VirtualSocketStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            connection_permit: ConnectionPermit::uncounted(),
         }
     }
 }
@@ -778,6 +789,7 @@ impl From<UnixStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            connection_permit: ConnectionPermit::uncounted(),
         }
     }
 }
