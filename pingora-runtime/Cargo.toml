@@ -1,6 +1,6 @@
 [package]
 name = "pingora-runtime"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -26,6 +26,20 @@ serde = { version = "1.0", features = ["derive"] }
 thread_local = "1"
 log = { workspace = true }
 dial9-tokio-telemetry = { version = "0.3", optional = true }
+dial9-perf-self-profile = { version = "0.4", optional = true }
+# Dial9's metrique dependencies require Rust 1.89. This optional feature is
+# therefore outside Pingora's Rust 1.85 default-feature MSRV check.
+# Dial9 permits incompatible metrique companion releases with broad 0.1 ranges.
+# These direct dependencies are intentionally unreferenced; pin the complete
+# API-coupled family until Dial9's dependency ranges are tightened.
+metrique = { version = "=0.1.25", optional = true }
+metrique-core = { version = "=0.1.20", optional = true }
+metrique-macro = { version = "=0.1.16", optional = true }
+metrique-service-metrics = { version = "=0.1.21", optional = true }
+metrique-timesource = { version = "=0.1.9", optional = true }
+metrique-writer = { version = "=0.1.22", optional = true }
+metrique-writer-core = { version = "=0.1.16", optional = true }
+metrique-writer-macro = { version = "=0.1.9", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 
 [dev-dependencies]
@@ -37,10 +51,24 @@ harness = false
 
 [features]
 default = []
-dial9 = ["dep:dial9-tokio-telemetry"]
+dial9 = [
+    "dep:dial9-tokio-telemetry",
+    "dep:metrique",
+    "dep:metrique-core",
+    "dep:metrique-macro",
+    "dep:metrique-service-metrics",
+    "dep:metrique-timesource",
+    "dep:metrique-writer",
+    "dep:metrique-writer-core",
+    "dep:metrique-writer-macro",
+]
 dial9-worker-s3 = [
     "dial9",
     "dep:aws-sdk-s3",
     "dial9-tokio-telemetry/worker-s3",
 ]
-dial9-cpu-profiling = ["dial9", "dial9-tokio-telemetry/cpu-profiling"]
+dial9-cpu-profiling = [
+    "dial9",
+    "dep:dial9-perf-self-profile",
+    "dial9-tokio-telemetry/cpu-profiling",
+]

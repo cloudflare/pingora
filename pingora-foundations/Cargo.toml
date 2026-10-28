@@ -1,6 +1,6 @@
 [package]
 name = "pingora-foundations"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Pingora Team at Cloudflare <pingora@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -17,7 +17,7 @@ name = "pingora_foundations"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false, optional = true }
+pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false, optional = true }
 # Adopt Foundations minor releases deliberately because they may raise the effective MSRV.
 foundations = { version = "~5.6.5", default-features = false }
 async-trait = { workspace = true, optional = true }

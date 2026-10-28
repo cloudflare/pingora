@@ -1,6 +1,6 @@
 [package]
 name = "pingora-pool"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -24,7 +24,7 @@ parking_lot = "0.12"
 dashmap = "5"
 crossbeam-queue = "0.3"
 futures = { workspace = true }
-pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
+pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
 
 [dev-dependencies]
 tokio-test = "0.4"

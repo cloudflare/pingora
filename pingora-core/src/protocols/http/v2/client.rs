@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use crate::connectors::http::v2::ConnectionRef;
+use crate::protocols::http::authority::validate_request_authority_fields;
 use crate::protocols::http::v1::common::validate_content_length_without_transfer_encoding;
 use crate::protocols::{Digest, SocketAddr, UniqueIDType};
 
@@ -94,8 +95,12 @@ impl Http2Session {
         }
     }
 
+    /// Prepare H2 authority fields and reject userinfo ([RFC 9113 section 8.3.1]).
+    ///
+    /// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
     fn sanitize_request_header(req: &mut RequestHeader) -> Result<()> {
         req.set_version(http::Version::HTTP_2);
+        validate_request_authority_fields(req)?;
         if req.uri.authority().is_some() {
             return Ok(());
         }
@@ -103,10 +108,13 @@ impl Http2Session {
         let Some(authority) = req.headers.get(http::header::HOST).map(|v| v.as_bytes()) else {
             return Error::e_explain(InvalidHTTPHeader, "no authority header for h2");
         };
+        let Some(path_and_query) = req.uri.path_and_query() else {
+            return Error::e_explain(InvalidHTTPHeader, "no path and query for h2");
+        };
         let uri = http::uri::Builder::new()
             .scheme("https") // fixed for now
             .authority(authority)
-            .path_and_query(req.uri.path_and_query().as_ref().unwrap().as_str())
+            .path_and_query(path_and_query.as_str())
             .build();
         match uri {
             Ok(uri) => {
@@ -191,16 +199,13 @@ impl Http2Session {
             panic!("H2 response header is already read")
         }
 
-        let Some(resp_fut) = self.resp_fut.take() else {
-            panic!("Try to take response header, but it is already taken")
-        };
-
-        let res = match self.read_timeout {
-            Some(t) => timeout(t, resp_fut)
+        let read_timeout = self.read_timeout;
+        let res = match read_timeout {
+            Some(t) => timeout(t, std::future::poll_fn(|cx| self.poll_response_header(cx)))
                 .await
                 .map_err(|_| Error::explain(ReadTimedout, "while reading h2 response header"))
                 .map_err(|e| self.handle_err(e))?,
-            None => resp_fut.await,
+            None => std::future::poll_fn(|cx| self.poll_response_header(cx)).await,
         };
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
         let response_header = ResponseHeader::from(resp);
@@ -216,6 +221,28 @@ impl Http2Session {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), h2::Error>> {
+        let res = match ready!(self.poll_response_header(cx)) {
+            Ok(res) => res,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+
+        let (resp, body_reader) = res.into_parts();
+        let response_header = ResponseHeader::from(resp);
+        if let Err(e) = validate_response_header(&response_header) {
+            warn!("invalid h2 response header: {e}");
+            return Poll::Ready(Err(Reason::PROTOCOL_ERROR.into()));
+        }
+
+        self.response_header = Some(response_header);
+        self.response_body_reader = Some(body_reader);
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_response_header(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<http::Response<RecvStream>, h2::Error>> {
         if self.response_header.is_some() {
             panic!("H2 response header is already read")
         }
@@ -233,17 +260,7 @@ impl Http2Session {
             }
         };
 
-        let (resp, body_reader) = res.into_parts();
-        let response_header = ResponseHeader::from(resp);
-        if let Err(e) = validate_response_header(&response_header) {
-            warn!("invalid h2 response header: {e}");
-            return Poll::Ready(Err(Reason::PROTOCOL_ERROR.into()));
-        }
-
-        self.response_header = Some(response_header);
-        self.response_body_reader = Some(body_reader);
-
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(res))
     }
 
     /// Read the response body
@@ -652,6 +669,153 @@ mod tests_h2 {
     use bytes::Bytes;
     use http::{Response, StatusCode};
     use tokio::io::duplex;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn sanitize_request_header_rejects_invalid_authority_fields() {
+        let mut host = RequestHeader::build_no_case("GET", b"/test", None).unwrap();
+        host.insert_header(http::header::HOST, "user@evil.example")
+            .unwrap();
+        assert!(Http2Session::sanitize_request_header(&mut host).is_err());
+
+        let mut uri = RequestHeader::from(
+            http::Request::builder()
+                .uri("https://user@evil.example/test")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        assert!(Http2Session::sanitize_request_header(&mut uri).is_err());
+
+        let mut mismatch = RequestHeader::from(
+            http::Request::builder()
+                .uri("https://authority.example/test")
+                .header(http::header::HOST, "other.example")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        assert!(Http2Session::sanitize_request_header(&mut mismatch).is_err());
+
+        let mut duplicate = RequestHeader::build_no_case("GET", b"/test", None).unwrap();
+        duplicate
+            .append_header(http::header::HOST, "authority.example")
+            .unwrap();
+        duplicate
+            .append_header(http::header::HOST, "authority.example")
+            .unwrap();
+        assert!(Http2Session::sanitize_request_header(&mut duplicate).is_err());
+    }
+
+    async fn session_with_delayed_response() -> (
+        Http2Session,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_io, server_io) = duplex(65536);
+        let (request_accepted_tx, request_accepted_rx) = oneshot::channel();
+        let (release_response_tx, release_response_rx) = oneshot::channel();
+
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            if let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                assert_eq!(req.method(), http::Method::GET);
+                let _ = request_accepted_tx.send(());
+                let _ = release_response_rx.await;
+
+                let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                send_resp.send_response(resp, true).unwrap();
+                conn.graceful_shutdown();
+            }
+            while let Some(_result) = conn.accept().await {}
+        });
+
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            1,
+            Digest::default(),
+        );
+        let mut h2s = Http2Session::new(send_req, conn_ref);
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), true).unwrap();
+
+        request_accepted_rx
+            .await
+            .expect("server should accept the request before the response-header read");
+
+        (h2s, release_response_tx, server_task, connection_task)
+    }
+
+    #[tokio::test]
+    async fn response_header_read_can_resume_after_read_timeout() {
+        let (mut h2s, release_response, server_task, connection_task) =
+            session_with_delayed_response().await;
+        h2s.read_timeout = Some(Duration::from_millis(1));
+
+        let err = h2s
+            .read_response_header()
+            .await
+            .expect_err("delayed response header should hit the read timeout");
+        assert!(
+            matches!(err.etype, ReadTimedout),
+            "unexpected first read error: {err:?}"
+        );
+        assert!(h2s.response_header().is_none());
+        assert!(
+            h2s.resp_fut.is_some(),
+            "timing out must not drop the pending response future"
+        );
+
+        h2s.read_timeout = None;
+        release_response.send(()).unwrap();
+        h2s.read_response_header().await.unwrap();
+        assert_eq!(h2s.response_header().unwrap().status, StatusCode::OK);
+
+        server_task.abort();
+        connection_task.abort();
+    }
+
+    #[tokio::test]
+    async fn response_header_read_can_resume_after_external_cancellation() {
+        let (mut h2s, release_response, server_task, connection_task) =
+            session_with_delayed_response().await;
+
+        let first_read =
+            tokio::time::timeout(Duration::from_millis(1), h2s.read_response_header()).await;
+        assert!(
+            first_read.is_err(),
+            "external timeout should cancel the pending header read"
+        );
+        assert!(h2s.response_header().is_none());
+        assert!(
+            h2s.resp_fut.is_some(),
+            "cancelling the read must not drop the pending response future"
+        );
+
+        release_response.send(()).unwrap();
+        h2s.read_response_header().await.unwrap();
+        assert_eq!(h2s.response_header().unwrap().status, StatusCode::OK);
+
+        server_task.abort();
+        connection_task.abort();
+    }
 
     #[tokio::test]
     async fn h2_body_bytes_received_multi_frames() {

@@ -21,7 +21,8 @@
 //! eviction results from these methods. Evicted items are instead handled
 //! by the [`AsyncEvictionCallback`] provided at construction time.
 
-use super::EvictionManager;
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
+#[cfg(test)]
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
@@ -47,12 +48,12 @@ use std::time::SystemTime;
 /// [`ShutdownWatch`]), then chain optional setters before calling
 /// [`ManagerBuilder::build`].
 pub struct Manager<const N: usize> {
-    lru: Arc<AsyncLru<CompactCacheKey, N>>,
+    lru: Arc<AsyncLru<CacheEntryKey, N>>,
 }
 
 impl<const N: usize> Manager<N> {
     /// Construct from a pre-built [`AsyncLru`].
-    pub fn from_lru(lru: Arc<AsyncLru<CompactCacheKey, N>>) -> Self {
+    pub fn from_lru(lru: Arc<AsyncLru<CacheEntryKey, N>>) -> Self {
         Manager { lru }
     }
 }
@@ -82,7 +83,7 @@ pub struct ManagerBuilder<C, const N: usize> {
 
 impl<C, const N: usize> ManagerBuilder<C, N>
 where
-    C: AsyncEvictionCallback<CompactCacheKey>,
+    C: AsyncEvictionCallback<CacheEntryKey>,
 {
     /// Set the estimated per-shard capacity for preallocation.
     pub fn capacity(mut self, capacity: usize) -> Self {
@@ -142,7 +143,7 @@ impl<const N: usize> Manager<N> {
         runtime: tokio::runtime::Handle,
     ) -> ManagerBuilder<C, N>
     where
-        C: AsyncEvictionCallback<CompactCacheKey>,
+        C: AsyncEvictionCallback<CacheEntryKey>,
     {
         ManagerBuilder {
             weight_limit,
@@ -172,22 +173,22 @@ impl<const N: usize> Manager<N> {
         self.lru.shard_len(shard)
     }
 
-    /// Compute the shard index for a given cache key using the same hash
+    /// Compute the shard index for a given cache entry using the same hash
     /// function used internally by the LRU.
-    pub fn get_shard_for_key(&self, key: &CompactCacheKey) -> usize {
+    pub fn get_shard_for_key(&self, key: &CacheEntryKey) -> usize {
         (hash_key(key) % N as u64) as usize
     }
 
     /// Peek at the least-recently-used key in the given shard. Async —
     /// sends a request/response message to the shard actor. Returns `None`
     /// if `shard >= N` or the shard is empty.
-    pub async fn peek_lru(&self, shard: usize) -> Option<CompactCacheKey> {
+    pub async fn peek_lru(&self, shard: usize) -> Option<CacheEntryKey> {
         self.lru.peek_lru(shard).await.map(|(key, _weight)| key)
     }
 
-    /// Peek the weight of a cache key without promoting it. Lock-free.
-    /// Returns `None` if the key is absent.
-    pub fn peek_weight(&self, item: &CompactCacheKey) -> Option<usize> {
+    /// Peek the weight of a cache entry without promoting it. Lock-free.
+    /// Returns `None` if the entry is absent.
+    pub fn peek_weight(&self, item: &CacheEntryKey) -> Option<usize> {
         self.lru.peek_weight(item)
     }
 
@@ -214,7 +215,7 @@ impl<const N: usize> Manager<N> {
     }
 
     /// Deserialize a shard buffer into a list of `(key, weight)` pairs.
-    fn deserialize_shard(buf: &[u8]) -> Result<Vec<(CompactCacheKey, usize)>> {
+    fn deserialize_shard(buf: &[u8]) -> Result<Vec<(CacheEntryKey, usize)>> {
         use rmp_serde::decode::Deserializer;
         use serde::de::Deserializer as _;
 
@@ -225,7 +226,7 @@ impl<const N: usize> Manager<N> {
     }
 
     /// Insert deserialized items into the LRU at the tail.
-    fn load_shard(&self, items: Vec<(CompactCacheKey, usize)>) {
+    fn load_shard(&self, items: Vec<(CacheEntryKey, usize)>) {
         for (key, weight) in items {
             self.lru.insert_tail(key, weight);
         }
@@ -235,7 +236,7 @@ impl<const N: usize> Manager<N> {
 struct CollectItems;
 
 impl<'de> serde::de::Visitor<'de> for CollectItems {
-    type Value = Vec<(CompactCacheKey, usize)>;
+    type Value = Vec<(CacheEntryKey, usize)>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("array of (key, weight) tuples")
@@ -246,7 +247,7 @@ impl<'de> serde::de::Visitor<'de> for CollectItems {
         A: SeqAccess<'de>,
     {
         let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-        while let Some(item) = seq.next_element::<(CompactCacheKey, usize)>()? {
+        while let Some(item) = seq.next_element::<(CacheEntryKey, usize)>()? {
             items.push(item);
         }
         Ok(items)
@@ -280,10 +281,10 @@ impl<const N: usize> EvictionManager for Manager<N> {
     /// the eviction workers and delivered via the [`AsyncEvictionCallback`].
     fn admit(
         &self,
-        item: CompactCacheKey,
+        item: CacheEntryKey,
         size: usize,
         _fresh_until: SystemTime,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         self.lru.admit(item, size);
         vec![]
     }
@@ -294,10 +295,10 @@ impl<const N: usize> EvictionManager for Manager<N> {
     /// the eviction workers and delivered via the [`AsyncEvictionCallback`].
     fn increment_weight(
         &self,
-        item: &CompactCacheKey,
+        item: &CacheEntryKey,
         delta: usize,
         max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         self.lru.increment_weight(item, delta, max_weight);
         vec![]
     }
@@ -305,15 +306,15 @@ impl<const N: usize> EvictionManager for Manager<N> {
     /// Remove a cache key from the LRU. Fire-and-forget — enqueued on the
     /// shard's unbounded channel, so the message is never dropped (it fails
     /// only if the actor is gone, i.e. during shutdown).
-    fn remove(&self, item: &CompactCacheKey) {
-        self.lru.remove(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        self.lru.remove_by_hash(hash_key(&item));
     }
 
     /// Record an access to a cache key. If the key already exists it is
     /// promoted to the head of the LRU; otherwise it is admitted with the
     /// given `size`. Returns `true` if the key was already present (promoted),
     /// `false` if it was newly admitted.
-    fn access(&self, item: &CompactCacheKey, size: usize, _fresh_until: SystemTime) -> bool {
+    fn access(&self, item: &CacheEntryKey, size: usize, _fresh_until: SystemTime) -> bool {
         if self.lru.promote(item) {
             true
         } else {
@@ -324,7 +325,7 @@ impl<const N: usize> EvictionManager for Manager<N> {
 
     /// Check whether a cache key exists in the LRU without promoting it.
     /// Lock-free.
-    fn peek(&self, item: &CompactCacheKey) -> bool {
+    fn peek(&self, item: &CacheEntryKey) -> bool {
         self.lru.peek(item)
     }
 
@@ -353,6 +354,26 @@ impl<const N: usize> EvictionManager for Manager<N> {
 }
 
 #[cfg(test)]
+impl<const N: usize> Manager<N> {
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::increment_weight(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            delta,
+            max_weight,
+        )
+        .into_iter()
+        .map(CacheEntryKey::into_key)
+        .collect()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::key::CacheKey;
@@ -362,7 +383,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let manager = Manager::<1>::builder(
             100,
-            Arc::new(|_key: CompactCacheKey, _weight| async {}),
+            Arc::new(|_key: CacheEntryKey, _weight| async {}),
             shutdown_rx,
             tokio::runtime::Handle::current(),
         )
@@ -372,8 +393,39 @@ mod tests {
         manager.increment_weight(&key, 7, Some(10));
         manager.shard_weight(0).await;
 
-        assert_eq!(manager.peek_weight(&key), Some(7));
+        assert_eq!(manager.peek_weight(&CacheEntryKey::key_only(key)), Some(7));
         assert_eq!(manager.total_items(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_requires_complete_identity() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let manager = Manager::<1>::builder(
+            100,
+            Arc::new(|_key: CacheEntryKey, _weight| async {}),
+            shutdown_rx,
+            tokio::runtime::Handle::current(),
+        )
+        .build();
+        let key = CacheKey::new("identified", "1").to_compact();
+        let id = crate::eviction::CacheEntryId::new(42);
+
+        let _ = EvictionManager::admit(
+            &manager,
+            CacheEntryKey::identified(key.clone(), id),
+            1,
+            SystemTime::now(),
+        );
+        // A shard query waits for the actor to process preceding messages on its FIFO channel.
+        manager.shard_weight(0).await;
+
+        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, None));
+        manager.shard_weight(0).await;
+        assert_eq!(manager.total_size(), 1);
+
+        EvictionManager::remove(&manager, CacheEntryKeyRef::from_entry_id(&key, Some(id)));
+        manager.shard_weight(0).await;
+        assert_eq!(manager.total_size(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -392,7 +444,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let manager = Manager::<2>::builder(
             100,
-            Arc::new(|_key: CompactCacheKey, _weight| async {}),
+            Arc::new(|_key: CacheEntryKey, _weight| async {}),
             shutdown_rx,
             tokio::runtime::Handle::current(),
         )

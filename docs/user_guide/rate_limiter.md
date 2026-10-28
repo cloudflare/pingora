@@ -5,8 +5,8 @@ Pingora provides a crate `pingora-limits` which provides a simple and easy to us
 1. Add the following dependencies to your `Cargo.toml`:
    ```toml
    async-trait="0.1"
-   pingora = { version = "0.8", features = [ "lb", "openssl" ] }
-   pingora-limits = "0.8.0"
+   pingora = { version = "0.9", features = [ "lb", "openssl" ] }
+   pingora-limits = "0.9.0"
    ```
 2. Declare a global rate limiter map to store the rate limiter for each client. In this example, we use `appid`.
 3. Override the `request_filter` method in the `ProxyHttp` trait to implement rate limiting.
@@ -18,10 +18,11 @@ Pingora provides a crate `pingora-limits` which provides a simple and easy to us
 ## Example
 ```rust
 use async_trait::async_trait;
+use std::sync::LazyLock;
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora_limits::rate::Rate;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn main() {

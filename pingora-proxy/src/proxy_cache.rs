@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::*;
+use crate::proxy_common::downstream_read_error_means_client_left;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
-use pingora_cache::lock::LockStatus;
+use pingora_cache::lock::LockWaitOutcome;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
 use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
 use pingora_core::protocols::http::conditional_filter::to_304;
@@ -27,20 +28,61 @@ use std::time::SystemTime;
 
 const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
-impl<SV, C> HttpProxy<SV, C>
+#[cfg(test)]
+mod disconnect_tests;
+
+/// How [`HttpProxy::proxy_cache_hit`] ended.
+pub(crate) struct CacheHitOutcome {
+    /// Whether the downstream session can be reused.
+    pub(crate) reuse: bool,
+    /// The error that ended the hit, if it failed.
+    pub(crate) error: Option<Box<Error>>,
+    /// Whether that error is the client leaving, as seen by the client watch of an opted-in hit.
+    pub(crate) client_left: bool,
+}
+
+impl CacheHitOutcome {
+    fn served() -> Self {
+        Self {
+            reuse: true,
+            error: None,
+            client_left: false,
+        }
+    }
+
+    /// A failure before anything was written downstream, which leaves the session reusable.
+    fn failed_before_writing(error: Box<Error>) -> Self {
+        Self {
+            reuse: true,
+            error: Some(error),
+            client_left: false,
+        }
+    }
+
+    fn failed(error: Box<Error>) -> Self {
+        Self {
+            reuse: false,
+            error: Some(error),
+            client_left: false,
+        }
+    }
+}
+
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Option<(bool, Option<Box<Error>>)>
     // None: continue to proxy, Some: return
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // Cache logic request phase
         if let Err(e) = self.inner.request_cache_filter(session, ctx) {
@@ -144,10 +186,18 @@ where
                                 }
                             }
                             Ok(Some(ForcedFreshness::ForceExpired)) => {
-                                // force expired asset should not be serve as stale
-                                // because force expire is usually to remove data
+                                // this variant exists to take data out of service, so the
+                                // stale body must not be served while it revalidates
                                 meta.disable_serve_stale();
                                 HitStatus::ForceExpired
+                            }
+                            Ok(Some(ForcedFreshness::ForceExpiredServeStale { expired_at })) => {
+                                // this variant keeps the serve stale windows, so they run
+                                // from when the asset went out of service, not its deadline
+                                if let Some(expired_at) = expired_at {
+                                    meta.expire_at(expired_at);
+                                }
+                                HitStatus::ForceExpiredServeStale
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
                             Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
@@ -166,8 +216,8 @@ where
                             break None;
                         } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
-                            let lock_status = session.cache.cache_lock_wait().await;
-                            if self.handle_lock_status(session, ctx, lock_status) {
+                            let outcome = session.cache.cache_lock_wait().await;
+                            if self.handle_lock_wait_outcome(session, ctx, outcome) {
                                 if self.cache_lock_retry_limit_exceeded(
                                     session,
                                     ctx,
@@ -207,8 +257,8 @@ where
                             let will_serve_stale = session.cache.can_serve_stale_updating()
                                 && self.inner.should_serve_stale(session, ctx, None);
                             if !will_serve_stale {
-                                let lock_status = session.cache.cache_lock_wait().await;
-                                if self.handle_lock_status(session, ctx, lock_status) {
+                                let outcome = session.cache.cache_lock_wait().await;
+                                if self.handle_lock_wait_outcome(session, ctx, outcome) {
                                     if self.cache_lock_retry_limit_exceeded(
                                         session,
                                         ctx,
@@ -254,15 +304,24 @@ where
                         }
                     }
 
-                    let (reuse, err) = self.proxy_cache_hit(session, ctx).await;
-                    if let Some(e) = err.as_ref() {
-                        error!(
-                            "Fail to serve cache: {e}, {}",
-                            self.inner.request_summary(session, ctx)
-                        );
+                    let CacheHitOutcome {
+                        reuse,
+                        error,
+                        client_left,
+                    } = self.proxy_cache_hit(session, ctx).await;
+                    if let Some(e) = error.as_ref() {
+                        // Only a hit that the opted-in client watch ended because its client
+                        // left is offered to the hook; a hit without the opt-in never has one.
+                        // Every other failure logs as it does without the opt-in.
+                        if !(client_left && self.inner.suppress_error_log(session, ctx, e)) {
+                            error!(
+                                "Fail to serve cache: {e}, {}",
+                                self.inner.request_summary(session, ctx)
+                            );
+                        }
                     }
                     // responses is served from cache, exit
-                    break Some((reuse, err));
+                    break Some((reuse, error));
                 }
                 Err(e) => {
                     // Allow cache miss to fill cache even if cache lookup errors
@@ -280,15 +339,14 @@ where
         }
     }
 
-    // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache_hit(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
-    ) -> (bool, Option<Box<Error>>)
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) -> CacheHitOutcome
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         use range_filter::*;
 
@@ -345,7 +403,7 @@ where
                             error!("failed to send error response to downstream: {e}");
                         });
                     // we have not write anything dirty to downstream, it is still reusable
-                    return (true, Some(e));
+                    return CacheHitOutcome::failed_before_writing(e);
                 }
 
                 if let Err(e) = session
@@ -355,7 +413,7 @@ where
                     .map_err(|e| e.into_down())
                 {
                     // downstream connection is bad already
-                    return (false, Some(e));
+                    return CacheHitOutcome::failed(e);
                 }
             }
             Err(e) => {
@@ -371,7 +429,7 @@ where
                         error!("failed to send error response to downstream: {e}");
                     });
                 // we have not write anything dirty to downstream, it is still reusable
-                return (true, Some(e));
+                return CacheHitOutcome::failed_before_writing(e);
             }
         }
         debug!("finished sending cached header to downstream");
@@ -400,7 +458,7 @@ where
                 RangeType::Single(r) => {
                     if session.cache.hit_handler().can_seek() {
                         if let Err(e) = session.cache.hit_handler().seek(r.start, Some(r.end)) {
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
                         None
                     } else {
@@ -410,15 +468,75 @@ where
                 RangeType::Multi(_) => {
                     let mut range_filter = RangeBodyFilter::new_range(range_type.clone());
                     if let Err(e) = seek_multipart(session.cache.hit_handler(), &mut range_filter) {
-                        return (false, Some(e));
+                        return CacheHitOutcome::failed(e);
                     }
                     Some(range_filter)
                 }
                 RangeType::Invalid => unreachable!(),
                 RangeType::None => None,
             };
+            // A hit never reads the request body. Waiting on an HTTP/2 stream reads nothing, so
+            // that client is watched from the start. Any other idle read takes a byte, which
+            // belongs to the request body until it is complete, so that client is watched only
+            // if its request body is already complete.
+            let mut watch_downstream = session.handles_downstream_abandonment()
+                && (session.downstream_session.is_http2()
+                    || session.downstream_session.is_body_done());
             loop {
-                match session.cache.hit_handler().read_body().await {
+                // Once the response is complete, an HTTP/1 client may send its next request,
+                // which belongs to the next session on the connection, even while the cache
+                // reader has yet to return the end of the body. Stop watching so it stays unread.
+                if watch_downstream && session.downstream_session.is_response_complete() {
+                    watch_downstream = false;
+                }
+                let watched = if watch_downstream {
+                    // Keep polling this read across downstream events instead of recreating it:
+                    // only leaving the hit may drop a pending read, which a hit handler that is
+                    // not cancel-safe would lose.
+                    let read = session.cache.hit_handler().read_body();
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            body = &mut read => break Ok(body),
+                            // A streaming hit can wait on its writer indefinitely, so watch the
+                            // client too and let its departure release this reader. This is the
+                            // idle read of the regular proxy loops: an HTTP/1 next request sent
+                            // early ends it with `ConnectError`, unless pipelining is enabled,
+                            // which keeps that request's first byte for the next session.
+                            downstream = session
+                                .downstream_session
+                                .read_body_or_idle(true),
+                                if watch_downstream =>
+                            {
+                                match downstream {
+                                    Err(error) => break Err(error),
+                                    // Only a custom session can end its idle wait without an
+                                    // error. Stop watching instead of waiting on it again.
+                                    Ok(_) => watch_downstream = false,
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Ok(session.cache.hit_handler().read_body().await)
+                };
+                let body = match watched {
+                    Ok(body) => body,
+                    // The client closed or reset its connection or stream, or sent its next
+                    // HTTP/1 request early and is still connected. The pending read is gone by
+                    // now, so the whole session can tell the two apart.
+                    Err(error) => {
+                        let client_left = downstream_read_error_means_client_left(&error)
+                            && session.downstream_left_before_response_complete();
+                        return CacheHitOutcome {
+                            reuse: false,
+                            error: Some(error.into_down()),
+                            client_left,
+                        };
+                    }
+                };
+                match body {
                     Ok(raw_body) => {
                         let end = raw_body.is_none();
 
@@ -448,7 +566,7 @@ where
                                         }
                                         Err(e) => e,
                                     };
-                                    return (false, Some(e));
+                                    return CacheHitOutcome::failed(e);
                                 }
                             }
                         }
@@ -462,6 +580,7 @@ where
                         match self
                             .inner
                             .response_body_filter(session, &mut body, end, ctx)
+                            .await
                         {
                             Ok(Some(duration)) => {
                                 trace!("delaying response for {duration:?}");
@@ -470,7 +589,7 @@ where
                             Ok(None) => { /* continue */ }
                             Err(e) => {
                                 // body is being sent, don't treat downstream as reusable
-                                return (false, Some(e));
+                                return CacheHitOutcome::failed(e);
                             }
                         }
 
@@ -479,7 +598,7 @@ where
                             .response_body_filter(&mut body, end)
                         {
                             // body is being sent, don't treat downstream as reusable
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
 
                         if !end && body.as_ref().is_none_or(|b| b.is_empty()) {
@@ -496,13 +615,13 @@ where
                             .await
                             .map_err(|e| e.into_down())
                         {
-                            return (false, Some(e));
+                            return CacheHitOutcome::failed(e);
                         }
                         if end {
                             break;
                         }
                     }
-                    Err(e) => return (false, Some(e)),
+                    Err(e) => return CacheHitOutcome::failed(e),
                 }
             }
         }
@@ -515,9 +634,9 @@ where
         match session.as_mut().finish_body().await {
             Ok(_) => {
                 debug!("finished sending cached body to downstream");
-                (true, None)
+                CacheHitOutcome::served()
             }
-            Err(e) => (false, Some(e)),
+            Err(e) => CacheHitOutcome::failed(e),
         }
     }
 
@@ -526,11 +645,11 @@ where
     pub(crate) fn downstream_response_conditional_filter(
         &self,
         use_cache: &mut ServeFromCache,
-        session: &Session,
+        session: &Session<DS>,
         resp: &mut ResponseHeader,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
         // TODO: range
         let req = session.req_header();
@@ -561,29 +680,56 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
-    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    /// Finish the cache admission. A failure disables the cache and the response goes on, unless
+    /// the storage failed it because an abandoned fill was cancelled.
+    async fn finish_miss_handler_best_effort(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+    ) -> Result<()>
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
-        if let Err(e) = session.cache.finish_miss_handler().await {
-            warn!(
-                "Failed to finish cache miss admission: {e}, {}",
-                self.inner.request_summary(session, ctx)
-            );
-            session.cache.disable(NoCacheReason::StorageError);
+        // The proxy itself does not look for a cancellation here: it is only observed when the
+        // loop next asks for upstream data, so once the final upstream task reaches this point
+        // the response is committed even if a cancellation was requested while that task was in
+        // flight. A storage that honors the cancellation can still fail the finish.
+        match session.cache.finish_miss_handler().await {
+            Ok(()) => Ok(()),
+            // An explicit cancellation of an abandoned fill ends the request, as it does when
+            // the loop observes it while waiting for upstream data.
+            Err(mut error)
+                if session.downstream_abandoned_during_cache_fill()
+                    && session.is_cache_fill_cancellation(&error) =>
+            {
+                session.cache.disable(NoCacheReason::Custom(
+                    pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED,
+                ));
+                error.set_retry(false);
+                Err(error)
+            }
+            Err(error) => {
+                warn!(
+                    "Failed to finish cache miss admission: {error}, {}",
+                    self.inner.request_summary(session, ctx)
+                );
+                let reason = session.cache_failure_reason(&error, NoCacheReason::StorageError);
+                session.cache.disable(reason);
+                Ok(())
+            }
         }
     }
 
     pub(crate) async fn cache_http_task(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         serve_from_cache: &mut ServeFromCache,
     ) -> Result<()>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !session.cache.enabled() && !session.cache.bypassing() {
             return Ok(());
@@ -603,13 +749,20 @@ where
                     Cacheable(meta) => {
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
-                            // The cache might have been bypassed because the response exceeded the
-                            // maximum cacheable asset size. If that looks like the case (there
-                            // is a maximum file size configured and we don't know the content
-                            // length up front), attempting to re-enable the cache now would cause
-                            // the request to fail when the chunked response exceeds the maximum
-                            // file size again.
-                            if session.cache.max_file_size_bytes().is_some()
+                            // Only hold this request back if the predictor bypassed it over size.
+                            // Re-enabling the cache without a known content length would fail the
+                            // request mid-body if the response exceeds the maximum file size
+                            // again, so wait for the body to finish and let the response filters
+                            // re-admit the key. Every other bypass reason says nothing about size
+                            // and must not be reported as PredictedResponseTooLarge.
+                            let bypassed_over_size =
+                                match session.cache.predicted_uncacheable_reason() {
+                                    Some(reason) => reason == NoCacheReason::ResponseTooLarge,
+                                    // unknown reason, stay conservative
+                                    None => true,
+                                };
+                            if bypassed_over_size
+                                && session.cache.max_file_size_bytes().is_some()
                                 && !meta.headers().contains_key(header::CONTENT_LENGTH)
                             {
                                 session
@@ -626,6 +779,9 @@ where
                                 self.inner.cache_miss(session, ctx);
                                 if !session.cache.enabled() {
                                     fill_cache = false;
+                                    if session.handles_downstream_abandonment() {
+                                        serve_from_cache.decline_fill();
+                                    }
                                 }
                             } else {
                                 // we've allowed caching on the next request,
@@ -682,7 +838,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                self.finish_miss_handler_best_effort(session, ctx).await;
+                                self.finish_miss_handler_best_effort(session, ctx).await?;
                             }
                         }
                     }
@@ -728,13 +884,13 @@ where
 
                             miss_handler.write_body(d.clone(), *end_stream).await?;
                             if *end_stream {
-                                self.finish_miss_handler_best_effort(session, ctx).await;
+                                self.finish_miss_handler_best_effort(session, ctx).await?;
                             }
                         }
                     }
                     None => {
                         if session.cache.enabled() && *end_stream {
-                            self.finish_miss_handler_best_effort(session, ctx).await;
+                            self.finish_miss_handler_best_effort(session, ctx).await?;
                         }
                     }
                 }
@@ -742,7 +898,7 @@ where
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    self.finish_miss_handler_best_effort(session, ctx).await;
+                    self.finish_miss_handler_best_effort(session, ctx).await?;
                 }
             }
             HttpTask::Failed(_) => {
@@ -758,13 +914,13 @@ where
     // Return true if local cache should be used, false otherwise
     pub(crate) async fn revalidate_or_stale(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &mut HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> bool
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !session.cache.enabled() {
             return false;
@@ -893,13 +1049,13 @@ where
     // bool: can the downstream connection be reused
     pub(crate) async fn handle_stale_if_error(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         error: &Error,
     ) -> Option<(bool, Option<Box<Error>>)>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // the caller might already checked this as an optimization
         if !session.cache.can_serve_stale_error() {
@@ -929,34 +1085,40 @@ where
             .cache
             .release_write_lock(NoCacheReason::UpstreamError);
 
-        Some(self.proxy_cache_hit(session, ctx).await)
+        // The caller logs a failure as it logs any other final proxy error.
+        let outcome = self.proxy_cache_hit(session, ctx).await;
+        Some((outcome.reuse, outcome.error))
     }
 
     // helper function to check when to continue to retry lock (true) or give up (false)
-    fn handle_lock_status(
+    fn handle_lock_wait_outcome(
         &self,
-        session: &mut Session,
-        ctx: &SV::CTX,
-        lock_status: LockStatus,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        outcome: LockWaitOutcome,
     ) -> bool
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
-        debug!("cache unlocked {lock_status:?}");
-        match lock_status {
+        debug!("cache unlocked {outcome:?}");
+        match outcome {
             // should lookup the cached asset again
-            LockStatus::Done => true,
+            LockWaitOutcome::Done => true,
             // should compete to be a new writer
-            LockStatus::TransientError => true,
-            // the request is uncacheable, go ahead to fetch from the origin
-            LockStatus::GiveUp => {
-                // TODO: It will be nice for the writer to propagate the real reason
+            LockWaitOutcome::TransientError => true,
+            // the writer found no lock was needed; every reader goes upstream
+            LockWaitOutcome::GiveUp => {
                 session.cache.disable(NoCacheReason::CacheLockGiveUp);
-                // not cacheable, just go to the origin.
+                false
+            }
+            // this reader alone stopped waiting, over a fill it cannot use; the
+            // cause travels with the outcome, so there is nothing to look up
+            LockWaitOutcome::Abandoned { reason, .. } => {
+                session.cache.disable(reason);
                 false
             }
             // treat this the same as TransientError
-            LockStatus::Dangling => {
+            LockWaitOutcome::Dangling => {
                 // software bug, but request can recover from this
                 warn!(
                     "Dangling cache lock, {}",
@@ -966,7 +1128,7 @@ where
             }
             // If this reader has spent too long waiting on locks, let the request
             // through while disabling cache (to avoid amplifying disk writes).
-            LockStatus::WaitTimeout => {
+            LockWaitOutcome::WaitTimeout => {
                 warn!(
                     "Cache lock timeout, {}",
                     self.inner.request_summary(session, ctx)
@@ -978,20 +1140,18 @@ where
             // When a singular cache lock has been held for too long,
             // we should allow requests to recompete for the lock
             // to protect upstreams from load.
-            LockStatus::AgeTimeout => true,
-            // software bug, this status should be impossible to reach
-            LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+            LockWaitOutcome::AgeTimeout => true,
         }
     }
 
     fn cache_lock_retry_limit_exceeded(
         &self,
-        session: &mut Session,
-        ctx: &SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
         cache_lock_retries: &mut usize,
     ) -> bool
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
         *cache_lock_retries += 1;
         let max_retries = session
@@ -2340,6 +2500,8 @@ pub mod range_filter {
 pub(crate) enum ServeFromCache {
     // not using cache
     Off,
+    // not using cache, and the response's cache fill was declined (see `decline_fill`)
+    OffFillDeclined,
     // should serve cache header
     CacheHeader,
     // should serve cache header only
@@ -2366,7 +2528,7 @@ impl ServeFromCache {
     }
 
     pub fn is_on(&self) -> bool {
-        !matches!(self, Self::Off)
+        !matches!(self, Self::Off | Self::OffFillDeclined)
     }
 
     pub fn is_miss(&self) -> bool {
@@ -2395,6 +2557,48 @@ impl ServeFromCache {
 
     pub fn should_send_to_downstream(&self) -> bool {
         !self.is_on()
+    }
+
+    /// Whether upstream response output can still be sent downstream.
+    pub fn should_write_response(&self, downstream_abandoned: bool) -> bool {
+        !downstream_abandoned && self.should_send_to_downstream()
+    }
+
+    /// Whether this response's cache fill can still produce a cache entry, so that losing the
+    /// downstream now abandons it: a miss whose cache writer is active, or, on storage with
+    /// streaming partial writes, a response whose cache decision is still open.
+    pub fn can_still_fill_cache(&self, cache: &HttpCache) -> bool {
+        (matches!(self, Self::Off) && cache.support_streaming_partial_write() == Some(true))
+            || (self.is_miss() && cache.is_cache_admission_active())
+    }
+
+    /// Whether the downstream was abandoned for a cache fill that will never be admitted.
+    ///
+    /// The fill was declined, or no fill is served back and caching is neither enabled nor
+    /// bypassed. Either way the rest of the response has nowhere to go: the transport loops
+    /// then fail the request with
+    /// [`downstream_closed_before_cache_admission`](crate::proxy_common::downstream_closed_before_cache_admission).
+    pub fn abandoned_before_admission(&self, cache: &HttpCache) -> bool {
+        cache.downstream_abandoned_during_cache_fill()
+            && (matches!(self, Self::OffFillDeclined)
+                || (!self.is_miss() && !cache.enabled() && !cache.bypassing()))
+    }
+
+    /// Whether a failed cache write must fail the request.
+    ///
+    /// A miss body is served from the cache write. Once the downstream is abandoned the cache
+    /// is the response's only output, and a storage may stop a fill nobody reads by failing
+    /// its writes, so the rest of the upstream response is not read for nothing.
+    pub fn cache_write_failure_is_fatal(&self, downstream_abandoned: bool) -> bool {
+        self.is_miss_body() || downstream_abandoned
+    }
+
+    /// Record that the `cache_miss` callback left this response's cache fill declined. Only
+    /// requests that handle downstream abandonment record it; any other request stays `Off`.
+    pub fn decline_fill(&mut self) {
+        if matches!(self, Self::Off) {
+            *self = Self::OffFillDeclined;
+        }
     }
 
     pub fn enable(&mut self) {
@@ -2443,7 +2647,7 @@ impl ServeFromCache {
             return Error::e_explain(InternalError, "Cache disabled");
         }
         match self {
-            Self::Off => panic!("ProxyUseCache not enabled"),
+            Self::Off | Self::OffFillDeclined => panic!("ProxyUseCache not enabled"),
             Self::CacheHeader => {
                 *self = Self::CacheBody(true);
                 Ok(HttpTask::Header(cache_hit_header(cache), false)) // false for now
@@ -2574,5 +2778,366 @@ impl ServeFromCache {
         }
         *self = Self::CacheBody(false);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pingora_cache::{
+        fill_cancellation::{ERR_CACHE_FILL_CANCELLED, REASON_CACHE_FILL_CANCELLED},
+        predictor::{CacheablePredictor, Predictor},
+        storage::{HandleMiss, MissFinishType, PurgeOutcome, PurgeTarget, PurgeType, Storage},
+        CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
+    };
+    use pingora_http::ResponseHeader;
+    use std::sync::{Arc, LazyLock};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    /// Stands in for a caller-defined `NoCacheReason::Custom` that has nothing to do with size.
+    const AUTHORIZATION_HEADER: &str = "AuthorizationHeader";
+
+    static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+    static CACHE_PREDICTOR: LazyLock<Predictor<1>> = LazyLock::new(|| Predictor::new(10, None));
+
+    /// Fails `finish` the way a storage that honors a fill cancellation might, wrapping
+    /// [`ERR_CACHE_FILL_CANCELLED`] in its own error.
+    static FINISH_CANCELLED_STORAGE: FinishFailStorage =
+        FinishFailStorage(Some(ERR_CACHE_FILL_CANCELLED));
+
+    /// Fails every miss handler's `finish` with a `FileWriteError`, caused by an error of the
+    /// given type if there is one.
+    struct FinishFailStorage(Option<ErrorType>);
+
+    #[async_trait]
+    impl Storage for FinishFailStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, pingora_cache::HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<pingora_cache::MissHandler> {
+            Ok(Box::new(FinishFailMissHandler(self.0.clone())))
+        }
+
+        async fn purge(
+            &'static self,
+            _target: PurgeTarget<'_>,
+            _purge_type: PurgeType,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<PurgeOutcome> {
+            Ok(PurgeOutcome::NotFound)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &pingora_cache::trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    struct FinishFailMissHandler(Option<ErrorType>);
+
+    #[async_trait]
+    impl HandleMiss for FinishFailMissHandler {
+        async fn write_body(&mut self, _data: Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            let context = "cache miss finalization failed";
+            match self.0 {
+                None => Error::e_explain(FileWriteError, context),
+                Some(cause) => Error::e_because(FileWriteError, context, Error::new(cause)),
+            }
+        }
+    }
+
+    struct TestProxy;
+
+    #[async_trait]
+    impl ProxyHttp for TestProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test drives cache_http_task directly")
+        }
+
+        fn response_cache_filter(
+            &self,
+            _session: &Session,
+            resp: &ResponseHeader,
+            _ctx: &mut Self::CTX,
+        ) -> Result<RespCacheable> {
+            let now = SystemTime::now();
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                now + Duration::from_secs(60),
+                now,
+                0,
+                0,
+                resp.clone(),
+            )))
+        }
+    }
+
+    /// Build a session that the predictor has bypassed, exactly as `proxy_cache` would:
+    /// the key is remembered as uncacheable for `reason`, so lookup is skipped.
+    async fn bypassed_session(
+        key: CacheKey,
+        reason: NoCacheReason,
+        max_file_size: usize,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key.clone());
+        session.cache.set_max_file_size_bytes(max_file_size);
+
+        CACHE_PREDICTOR.mark_uncacheable(&key, reason);
+        assert!(
+            !session.cache.cacheable_prediction(),
+            "predictor should bypass a key it just marked uncacheable"
+        );
+        session.cache.bypass();
+        session
+    }
+
+    /// A cacheable 200 with no `Content-Length`, i.e. an origin that chunks the body.
+    fn chunked_cacheable_response() -> ResponseHeader {
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.insert_header(http::header::CACHE_CONTROL, "max-age=60")
+            .unwrap();
+        resp
+    }
+
+    async fn finish_fail_session_on(
+        path: &'static str,
+        storage: &'static FinishFailStorage,
+    ) -> Session {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.set_handles_downstream_abandonment(true);
+        session.read_request().await.unwrap();
+        session.cache.enable(storage, None, None, None, None);
+        session.cache.set_cache_key(CacheKey::new(path, ""));
+        session.cache.cache_miss();
+        session
+    }
+
+    async fn start_finish_fail_admission(
+        proxy: &HttpProxy<TestProxy>,
+        session: &mut Session,
+        serve_from_cache: &mut ServeFromCache,
+    ) {
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(chunked_cacheable_response()), false),
+                &mut (),
+                serve_from_cache,
+            )
+            .await
+            .unwrap();
+        assert!(session.cache.is_cache_admission_active());
+        assert!(session.mark_downstream_abandoned_during_cache_fill());
+    }
+
+    #[tokio::test]
+    async fn abandoned_finalization_cancellation_is_still_classified_as_cancelled() {
+        let mut session =
+            finish_fail_session_on("/finish-cancelled-abandoned", &FINISH_CANCELLED_STORAGE).await;
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        let mut serve_from_cache = ServeFromCache::new();
+        start_finish_fail_admission(&proxy, &mut session, &mut serve_from_cache).await;
+
+        let error = proxy
+            .cache_http_task(
+                &mut session,
+                &HttpTask::Done,
+                &mut (),
+                &mut serve_from_cache,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            session.cache_failure_reason(&error, NoCacheReason::StorageError),
+            NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED)
+        );
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_cancellation_is_classified_only_with_the_opt_in() {
+        for (handles_abandonment, expected) in [
+            (false, NoCacheReason::StorageError),
+            (true, NoCacheReason::Custom(REASON_CACHE_FILL_CANCELLED)),
+        ] {
+            let mut session =
+                finish_fail_session_on("/finish-cancelled-attached", &FINISH_CANCELLED_STORAGE)
+                    .await;
+            session.set_handles_downstream_abandonment(handles_abandonment);
+            let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+
+            proxy
+                .cache_http_task(
+                    &mut session,
+                    &HttpTask::Header(Box::new(chunked_cacheable_response()), true),
+                    &mut (),
+                    &mut ServeFromCache::new(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Disabled(expected),
+                "opt-in {handles_abandonment}"
+            );
+        }
+    }
+
+    async fn run_header_task(session: &mut Session, resp: ResponseHeader) {
+        let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
+        proxy
+            .cache_http_task(
+                session,
+                &HttpTask::Header(Box::new(resp), true),
+                &mut (),
+                &mut ServeFromCache::new(),
+            )
+            .await
+            .expect("cache_http_task should succeed");
+    }
+
+    /// A predictor bypass that had nothing to do with size must not be reported as
+    /// PredictedResponseTooLarge, and must not cost the request a wasted bypass.
+    #[tokio::test]
+    async fn non_size_bypass_admits_and_clears_predictor() {
+        for reason in [
+            NoCacheReason::Custom(AUTHORIZATION_HEADER),
+            NoCacheReason::OriginNotCache,
+        ] {
+            let key = CacheKey::new(format!("/non-size-bypass/{}", reason.as_str()), "");
+            let mut session = bypassed_session(key.clone(), reason, 1024).await;
+
+            run_header_task(&mut session, chunked_cacheable_response()).await;
+
+            assert_eq!(
+                session.cache.phase(),
+                CachePhase::Miss,
+                "bypass remembered for {reason:?} should admit this response, got {:?}",
+                session.cache.phase()
+            );
+            assert!(
+                CACHE_PREDICTOR.cacheable_prediction(&key),
+                "bypass remembered for {reason:?} should be cleared once the response came back cacheable"
+            );
+        }
+    }
+
+    /// The deferral only exists to protect against a response that already blew the size
+    /// limit once. That case still defers, and still reports the reason it acted on.
+    #[tokio::test]
+    async fn size_bypass_defers_when_length_is_unknown() {
+        let key = CacheKey::new("/size-bypass-chunked", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
+        assert!(
+            !CACHE_PREDICTOR.cacheable_prediction(&key),
+            "the response body has not been measured yet, so the key stays marked"
+        );
+    }
+
+    /// With a Content-Length the size is known up front, so even a size bypass can admit.
+    #[tokio::test]
+    async fn size_bypass_admits_when_length_is_known() {
+        let key = CacheKey::new("/size-bypass-with-length", "");
+        let mut session =
+            bypassed_session(key.clone(), NoCacheReason::ResponseTooLarge, 1024).await;
+
+        let mut resp = chunked_cacheable_response();
+        resp.insert_header(CONTENT_LENGTH, "5").unwrap();
+        run_header_task(&mut session, resp).await;
+
+        assert_eq!(session.cache.phase(), CachePhase::Miss);
+    }
+
+    /// Without a predictor reason there is nothing to act on, so the conservative
+    /// deferral stays in place.
+    #[tokio::test]
+    async fn unknown_bypass_reason_stays_conservative() {
+        let key = CacheKey::new("/unknown-bypass-reason", "");
+        // Bypass without the predictor remembering anything, e.g. a caller that bypassed
+        // for its own reasons.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        session
+            .cache
+            .enable(&*CACHE_STORAGE, None, Some(&*CACHE_PREDICTOR), None, None);
+        session.cache.set_cache_key(key);
+        session.cache.set_max_file_size_bytes(1024);
+        session.cache.bypass();
+        assert_eq!(session.cache.predicted_uncacheable_reason(), None);
+
+        run_header_task(&mut session, chunked_cacheable_response()).await;
+
+        assert_eq!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        );
     }
 }

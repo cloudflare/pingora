@@ -22,7 +22,10 @@ use bytes::BytesMut;
 use log::{debug, error};
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::protocols::http::custom::server::Session as CustomServerSession;
+use crate::protocols::http::v1::HeaderLimit;
 use crate::protocols::http::v2::server;
 use crate::protocols::http::{ReusableHttpStream, ServerSession};
 use crate::protocols::Digest;
@@ -34,7 +37,10 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
-pub trait ServerApp {
+pub trait ServerApp<DS = ()>
+where
+    DS: CustomServerSession,
+{
     /// Whenever a new connection is established, this function will be called with the established
     /// [`Stream`] object provided.
     ///
@@ -82,6 +88,18 @@ pub struct HttpServerOptions {
     ///
     /// Unlike nginx, the default behavior here is _no limit_.
     pub keepalive_request_limit: Option<u32>,
+
+    /// Maximum number of fields accepted in an HTTP/1 request head.
+    ///
+    /// The default is [`HeaderLimit::Limited`] with a value of 256. This does not replace
+    /// Pingora's byte-size limit for the complete request head.
+    pub h1_header_count_limit: HeaderLimit,
+
+    /// If set, close a downstream HTTP/2 connection that has been idle
+    /// for this duration.
+    ///
+    /// Default: `None`
+    pub h2_idle_timeout: Option<Duration>,
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -113,7 +131,10 @@ pub struct HttpPersistentSettings {
 }
 
 impl HttpPersistentSettings {
-    pub fn for_session(session: &ServerSession) -> Self {
+    pub fn for_session<CS>(session: &ServerSession<CS>) -> Self
+    where
+        CS: CustomServerSession,
+    {
         HttpPersistentSettings {
             keepalive_timeout: session.get_keepalive(),
             keepalive_reuses_remaining: session.get_keepalive_reuses_remaining(),
@@ -141,7 +162,10 @@ impl HttpPersistentSettings {
         self.pipelined_prefix = Some(prefix);
     }
 
-    pub fn apply_to_session(self, session: &mut ServerSession) {
+    pub fn apply_to_session<CS>(self, session: &mut ServerSession<CS>)
+    where
+        CS: CustomServerSession,
+    {
         let Self {
             keepalive_timeout,
             mut keepalive_reuses_remaining,
@@ -207,7 +231,10 @@ impl ReusedHttpStream {
 
 /// This trait defines the interface of an HTTP application.
 #[async_trait]
-pub trait HttpServerApp {
+pub trait HttpServerApp<DS = ()>
+where
+    DS: CustomServerSession,
+{
     /// Similar to the [`ServerApp`], this function is called whenever a new HTTP session is established.
     ///
     /// After successful processing, [`ServerSession::finish()`] can be
@@ -217,7 +244,7 @@ pub trait HttpServerApp {
     /// a `None` should be returned.
     async fn process_new_http(
         self: &Arc<Self>,
-        mut session: ServerSession,
+        mut session: ServerSession<DS>,
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream>;
@@ -251,9 +278,10 @@ pub trait HttpServerApp {
 }
 
 #[async_trait]
-impl<T> ServerApp for T
+impl<T, DS> ServerApp<DS> for T
 where
-    T: HttpServerApp + Send + Sync + 'static,
+    T: HttpServerApp<DS> + Send + Sync + 'static,
+    DS: CustomServerSession,
 {
     async fn process_new(
         self: &Arc<Self>,
@@ -313,21 +341,37 @@ where
             // the same code path is exercised by tests in `protocols::http::v2`.
             let app = self.clone();
             let shutdown_for_session = shutdown.clone();
-            server::accept_downstream_sessions(h2_conn, digest, shutdown.clone(), |h2_stream| {
-                let app = app.clone();
-                let shutdown = shutdown_for_session.clone();
-                pingora_runtime::current_handle().spawn(async move {
-                    // Note, `PersistentSettings` not currently relevant for h2
-                    app.process_new_http(ServerSession::new_http2(h2_stream), &shutdown)
+            let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
+            server::accept_downstream_sessions(
+                h2_conn,
+                digest,
+                shutdown.clone(),
+                h2_idle_timeout,
+                |h2_stream, guard| {
+                    let app = app.clone();
+                    let shutdown = shutdown_for_session.clone();
+                    pingora_runtime::current_handle().spawn(async move {
+                        // hold `guard` for the session's lifetime so the accept
+                        // loop's idle timeout sees this connection as busy.
+                        let _guard = guard;
+                        // Note, `PersistentSettings` not currently relevant for h2
+                        app.process_new_http(
+                            ServerSession::<DS>::new_http2_with_custom_session(h2_stream),
+                            &shutdown,
+                        )
                         .await;
-                });
-            })
+                    });
+                },
+            )
             .await;
         } else if custom || matches!(stream.selected_alpn_proto(), Some(ALPN::Custom(_))) {
             return self.clone().process_custom_session(stream, shutdown).await;
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
-            let mut session = ServerSession::new_http1(stream);
+            let h1_header_count_limit = self
+                .server_options()
+                .map_or_else(HeaderLimit::default, |opts| opts.h1_header_count_limit);
+            let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
             if *shutdown.borrow() {
                 // stop downstream from reusing if this service is shutting down soon
                 session.set_keepalive(None);
@@ -339,10 +383,13 @@ where
                 self.server_options()
                     .and_then(|opts| opts.keepalive_request_limit),
             );
+            session.set_h1_header_count_limit(h1_header_count_limit);
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
-                let mut session = ServerSession::new_http1(stream);
+                let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
+                // Keepalive reuse creates a fresh session, so reapply listener parser settings.
+                session.set_h1_header_count_limit(h1_header_count_limit);
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
                 }
@@ -362,6 +409,14 @@ where
 mod tests {
     use super::*;
     use tokio_test::io::Builder;
+
+    #[test]
+    fn http_server_options_preserve_default_header_limit() {
+        assert_eq!(
+            HttpServerOptions::default().h1_header_count_limit,
+            HeaderLimit::default()
+        );
+    }
 
     #[test]
     fn test_persistent_settings_user_context_roundtrip() {

@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 use http::HeaderMap;
@@ -26,25 +25,40 @@ use crate::protocols::{http::HttpTask, l4::socket::SocketAddr, Digest};
 use super::CustomMessageWrite;
 
 #[doc(hidden)]
-#[async_trait]
+/// A concrete custom downstream session.
+///
+/// Async operations return concrete `Send` futures so dispatch does not require
+/// an allocation per call. Implementations may use `async fn` to satisfy these
+/// methods. This trait is intentionally not dyn-compatible.
 pub trait Session: Send + Sync + Unpin + 'static {
     fn req_header(&self) -> &RequestHeader;
 
     fn req_header_mut(&mut self) -> &mut RequestHeader;
 
-    async fn read_body_bytes(&mut self) -> Result<Option<Bytes>>;
+    fn read_body_bytes(&mut self) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
-    async fn drain_request_body(&mut self) -> Result<()>;
+    fn drain_request_body(&mut self) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_response_header(&mut self, resp: Box<ResponseHeader>, end: bool) -> Result<()>;
+    fn write_response_header(
+        &mut self,
+        resp: Box<ResponseHeader>,
+        end: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_response_header_ref(&mut self, resp: &ResponseHeader, end: bool) -> Result<()>;
+    fn write_response_header_ref(
+        &mut self,
+        resp: &ResponseHeader,
+        end: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_body(&mut self, data: Bytes, end: bool) -> Result<()>;
+    fn write_body(&mut self, data: Bytes, end: bool) -> impl Future<Output = Result<()>> + Send;
 
-    async fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()>;
+    fn write_trailers(&mut self, trailers: HeaderMap) -> impl Future<Output = Result<()>> + Send;
 
-    async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
+    fn response_duplex_vec(
+        &mut self,
+        tasks: Vec<HttpTask>,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     /// Whether the cancel-safe proxy task API is enabled for this session.
     fn proxy_tasks_enabled(&self) -> bool {
@@ -72,8 +86,8 @@ pub trait Session: Send + Sync + Unpin + 'static {
     ///
     /// # Panics
     /// Panics if the Custom session does not implement the proxy task API.
-    async fn write_proxy_tasks(&mut self) -> Result<bool> {
-        panic!("Custom proxy task API not implemented")
+    fn write_proxy_tasks(&mut self) -> impl Future<Output = Result<bool>> + Send {
+        async { panic!("Custom proxy task API not implemented") }
     }
 
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
@@ -92,15 +106,56 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_written(&self) -> Option<&ResponseHeader>;
 
-    async fn shutdown(&mut self, code: u32, ctx: &str);
+    /// Whether the whole response is written, so nothing is left to deliver to the client.
+    ///
+    /// The proxy uses this to tell a client that failed after receiving its whole response from
+    /// one that left before it was complete. With the default `false`, every failure the proxy
+    /// counts as the client leaving is taken as leaving before the response was complete.
+    fn is_response_complete(&self) -> bool {
+        false
+    }
+
+    fn shutdown(&mut self, code: u32, ctx: &str) -> impl Future<Output = ()> + Send;
+
+    /// Abandon the response mid-message, in a way the peer can tell apart from a
+    /// response that was completed.
+    ///
+    /// Callers use this to signal that the message they were sending cannot be
+    /// finished, so the peer must not treat what it has already received as a
+    /// whole message. It is the counterpart of [`Session::finish`], which ends a
+    /// message that *is* complete.
+    ///
+    /// Defaults to [`Session::shutdown`], preserving the behavior of
+    /// implementations that predate this method. Implementations whose protocol
+    /// can distinguish an abandoned message from a completed one should override
+    /// this; otherwise a peer may read the abandoned message as successful.
+    fn abandon(&mut self, ctx: &str) -> impl Future<Output = ()> + Send {
+        async move {
+            self.shutdown(0, ctx).await;
+        }
+    }
 
     fn is_body_done(&mut self) -> bool;
 
-    async fn finish(&mut self) -> Result<()>;
+    fn finish(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     fn is_body_empty(&mut self) -> bool;
 
-    async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>>;
+    /// Read a request-body chunk, or watch for transport termination while idle.
+    ///
+    /// When `no_body_expected` is `false`, return body bytes or `Ok(None)` for EOF.
+    /// When it is `true`, no further request-body events are expected: remain pending
+    /// until a reset, disconnect, or other transport error can be returned as `Err`.
+    /// Do not return `Ok(None)` again or return additional body bytes in idle mode.
+    /// Implementations should reject either result as an internal error.
+    ///
+    /// This operation must be cancellation-safe: proxy loops may drop and recreate
+    /// its future when another request or response event becomes ready. Dropping
+    /// the future must not lose body bytes or a termination notification.
+    fn read_body_or_idle(
+        &mut self,
+        no_body_expected: bool,
+    ) -> impl Future<Output = Result<Option<Bytes>>> + Send;
 
     fn body_bytes_sent(&self) -> usize;
 
@@ -122,7 +177,7 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn get_retry_buffer(&self) -> Option<Bytes>;
 
-    async fn finish_custom(&mut self) -> Result<()>;
+    fn finish_custom(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     fn take_custom_message_reader(
         &mut self,
@@ -153,7 +208,6 @@ pub trait Session: Send + Sync + Unpin + 'static {
 }
 
 #[doc(hidden)]
-#[async_trait]
 impl Session for () {
     fn req_header(&self) -> &RequestHeader {
         unreachable!("server session: req_header")

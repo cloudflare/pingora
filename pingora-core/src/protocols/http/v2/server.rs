@@ -21,14 +21,20 @@ use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 use http::header::HeaderName;
 use http::uri::PathAndQuery;
-use http::{header, HeaderMap, Response};
+use http::{header, HeaderMap, Response, StatusCode};
 use log::{debug, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
+use tokio::sync::Notify;
 
+use crate::protocols::http::authority::{
+    has_ambiguous_port_suffix, raw_target_authority, validate_request_authority_fields,
+    RawTargetAuthority,
+};
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
@@ -50,15 +56,10 @@ pub use h2::server::Builder as H2Options;
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
 
-// Per-connection lifetime budget for malformed downstream requests (e.g.
-// ambiguous Content-Length framing) that we will reset before treating the
-// connection as abusive and tearing it down. The count is NOT reset by valid
-// streams, so a client cannot evade the bound by interleaving valid requests.
-// A well-behaved client never sends malformed framing, so this is never tripped
-// in practice; it bounds the total reset work a misbehaving or malicious client
-// can drive over the life of a single connection.
+// Per-connection budget for requests rejected during acceptance. Valid streams do not reset it,
+// preventing unbounded rejection work, but interoperability errors can also consume the budget.
 // TODO: expose this through HTTP/2 server configuration if deployments need a
-// different tolerance for malformed stream resets.
+// different tolerance for malformed stream rejections.
 const MAX_MALFORMED_STREAMS_PER_CONN: usize = 32;
 
 /// Build [`H2Options`] with bounded defaults for received requests.
@@ -97,10 +98,11 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 /// Drive a server-side HTTP/2 connection's accept loop, dispatching each new
 /// stream to `on_session` until the connection closes.
 ///
-/// This loop ends in one of three ways:
+/// This loop ends when:
 ///   * the client closes the H2 connection cleanly ([`HttpSession::from_h2_conn`]
 ///     returns `Ok(None)` after the final GOAWAY is flushed),
 ///   * the codec hits a connection error, or
+///   * the configured idle timeout expires while no streams are active, or
 ///   * the runtime-level `graceful_shutdown_timeout_seconds` ceiling fires and
 ///     force-kills the task driving this future.
 ///
@@ -117,25 +119,31 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 ///      - the codec is driven to completion so the final GOAWAY can be
 ///        flushed and the connection closed cleanly.
 ///
-/// `on_session` is invoked once per accepted stream. Typical callers spawn a
-/// task to process the session so the accept loop is not blocked.
+/// `on_session` is invoked once per accepted stream, together with a
+/// [`StreamGuard`]. Typical callers spawn a task to process the session so the
+/// accept loop is not blocked, and move the guard into that task so its lifetime
+/// matches the session.
 ///
-/// Note: this function does not impose its own per-connection drain timeout.
-/// The runtime-level `graceful_shutdown_timeout_seconds` is the only ceiling,
-/// so a slow client can keep this future alive up to that bound.
+/// Note: this function does not impose its own per-connection drain timeout
+/// (after a shutdown signal). The runtime-level `graceful_shutdown_timeout_seconds`
+/// is the only ceiling there, so a slow client can keep this future alive up to
+/// that bound during drain.
 // TODO: add a per-connection drain timeout to bound how long a single
 // misbehaving client can keep this task alive after GOAWAY.
 pub(crate) async fn accept_downstream_sessions<F>(
     mut conn: H2Connection<Stream>,
     digest: Arc<Digest>,
     mut shutdown: ShutdownWatch,
+    idle_timeout: Option<Duration>,
     mut on_session: F,
 ) where
-    F: FnMut(HttpSession),
+    F: FnMut(HttpSession, StreamGuard),
 {
     let mut shutdown_initiated = false;
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
+    // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
+    let active = Arc::new(ActiveSessions::new());
     loop {
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
@@ -160,6 +168,15 @@ pub(crate) async fn accept_downstream_sessions<F>(
                     digest.clone(),
                     &mut malformed_streams,
                 ) => h2_stream,
+                // Any accepted stream cancels this future. The next iteration
+                // waits for all active streams to finish before starting a fresh
+                // idle period.
+                _ = wait_for_idle_timeout(&active, idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                    // Idle with nothing in flight: drop `conn` to close the
+                    // socket now (no graceful GOAWAY wait that could hang on
+                    // a dead peer).
+                    return;
+                }
             }
         };
         match h2_stream {
@@ -171,11 +188,60 @@ pub(crate) async fn accept_downstream_sessions<F>(
             }
             // None means the connection is ready to be closed
             Ok(None) => return,
-            // The offending stream was already reset; keep the connection alive
-            // and continue accepting sibling streams.
+            // The offending stream was already answered or reset; keep the
+            // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
-            Ok(Some(H2Accept::Session(session))) => on_session(session),
+            Ok(Some(H2Accept::Session(session))) => {
+                on_session(session, active.start_session());
+            }
         }
+    }
+}
+
+/// Tracks one in-flight downstream H2 session for [`accept_downstream_sessions`].
+/// `on_session` receives it alongside each session; keep it alive for as long as
+/// the session is being processed (e.g. move it into the spawned task) so the
+/// accept loop's idle timeout can tell a busy connection from an idle one. It
+/// decrements the in-flight counter when dropped.
+pub(crate) struct StreamGuard(Arc<ActiveSessions>);
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0.idle.notify_one();
+        }
+    }
+}
+
+struct ActiveSessions {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl ActiveSessions {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
+    fn start_session(self: &Arc<Self>) -> StreamGuard {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        StreamGuard(self.clone())
+    }
+
+    async fn wait_until_idle(&self) {
+        while self.count.load(Ordering::Relaxed) != 0 {
+            self.idle.notified().await;
+        }
+    }
+}
+
+async fn wait_for_idle_timeout(active: &ActiveSessions, idle_timeout: Duration) {
+    active.wait_until_idle().await;
+    if !idle_timeout.is_zero() {
+        pingora_timeout::sleep(idle_timeout).await;
     }
 }
 
@@ -239,10 +305,81 @@ pub enum H2Accept {
     /// A new request stream was established and is ready to be served.
     Session(HttpSession),
     /// The next stream was rejected during acceptance (for example, its request
-    /// target contained a forbidden byte) and has already been reset with
-    /// `RST_STREAM`. Sibling streams and the connection are unaffected; the
-    /// caller should continue accepting.
+    /// target contained a forbidden byte) and has already been answered or
+    /// reset. Sibling streams and the connection are unaffected; the caller
+    /// should continue accepting. Repeated rejections can exhaust the
+    /// per-connection budget, causing acceptance to return a connection error
+    /// instead to bound rejection work.
     Rejected,
+}
+
+/// Reject ambiguous H2 authority representations:
+///
+/// - duplicate `Host` ([RFC 9112 section 3.2]);
+/// - userinfo or conflicting authority fields ([RFC 9113 section 8.3.1]);
+/// - missing `Host` and `:authority`;
+/// - absolute-form or ambiguous HTTP `:path`;
+///
+/// HTTP/1 uses
+/// [`validate_request_authority`](crate::protocols::http::authority::validate_request_authority).
+///
+/// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+fn invalid_request_authority(request: &RequestHeader) -> bool {
+    if let Err(error) = validate_request_authority_fields(request) {
+        debug!("rejecting downstream h2 request: {error}");
+        return true;
+    }
+    if request.uri.authority().is_none() && !request.headers.contains_key(header::HOST) {
+        debug!("rejecting downstream h2 request: missing authority");
+        return true;
+    }
+
+    // Normal CONNECT has no `:protocol` and carries its target only in `:authority`. Extended
+    // CONNECT sets `:protocol` and also has a `:path`, which must pass the raw-target checks below.
+    let is_normal_connect = request.method == http::Method::CONNECT
+        && request.extensions.get::<h2::ext::Protocol>().is_none();
+    if is_normal_connect {
+        if request
+            .uri
+            .authority()
+            .is_some_and(|authority| has_ambiguous_port_suffix(authority.as_str().as_bytes()))
+        {
+            debug!("rejecting downstream h2 request: ambiguous CONNECT authority");
+            return true;
+        } else {
+            return false;
+        }
+    }
+    match raw_target_authority(request.raw_path()) {
+        RawTargetAuthority::None => false,
+        RawTargetAuthority::Absolute { .. } => {
+            debug!("rejecting downstream h2 request: absolute-form in :path");
+            true
+        }
+        RawTargetAuthority::AmbiguousAuthority => {
+            debug!("rejecting downstream h2 request: ambiguous HTTP absolute-form in :path");
+            true
+        }
+    }
+}
+
+fn account_malformed_stream(malformed_streams: &mut usize) -> Result<()> {
+    *malformed_streams += 1;
+    if *malformed_streams >= MAX_MALFORMED_STREAMS_PER_CONN {
+        // Rare, connection-level abuse signal (at most once per torn-down
+        // connection), so warn! is flood-safe here and useful for detecting
+        // abuse in production.
+        warn!(
+            "tearing down downstream h2 connection after \
+             {malformed_streams} malformed requests"
+        );
+        return Error::e_explain(
+            ErrorType::H2Error,
+            "too many malformed downstream requests on connection",
+        );
+    }
+    Ok(())
 }
 
 impl HttpSession {
@@ -259,8 +396,8 @@ impl HttpSession {
     ///
     /// The return value distinguishes three outcomes:
     /// * `Ok(Some(`[`H2Accept::Session`]`))` — a new stream is ready to serve.
-    /// * `Ok(Some(`[`H2Accept::Rejected`]`))` — the stream was reset during
-    ///   acceptance; the caller should keep looping to accept sibling streams.
+    /// * `Ok(Some(`[`H2Accept::Rejected`]`))` — the stream was answered or reset
+    ///   during acceptance; the caller should keep accepting sibling streams.
     /// * `Ok(None)` — the connection is closing, so the loop can exit.
     ///
     /// This convenience wrapper uses a fresh malformed-stream counter on every
@@ -281,9 +418,10 @@ impl HttpSession {
     ///
     /// `malformed_streams` is a per-connection counter, owned by the caller and
     /// shared across every call for the same connection. It tracks the total
-    /// number of malformed streams reset over the connection's lifetime (it is
-    /// never reset by valid streams), so a client cannot evade the
-    /// [`MAX_MALFORMED_STREAMS_PER_CONN`] bound by interleaving valid requests.
+    /// number of malformed streams counted by these acceptance checks over the
+    /// connection's lifetime. Valid streams do not reset it, so a client cannot
+    /// evade the [`MAX_MALFORMED_STREAMS_PER_CONN`] bound by interleaving valid
+    /// requests.
     /// Callers should initialize it to `0` once per connection.
     async fn from_h2_conn_with_malformed_budget(
         conn: &mut H2Connection<Stream>,
@@ -312,6 +450,7 @@ impl HttpSession {
         if request_target_has_forbidden_byte(request_header.raw_path()) {
             debug!("Rejecting H2 request: forbidden delimiter byte in request target");
             send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
+            account_malformed_stream(malformed_streams)?;
             return Ok(Some(H2Accept::Rejected));
         }
 
@@ -328,20 +467,22 @@ impl HttpSession {
             debug!("rejecting downstream h2 request: {e}");
             send_response.send_reset(h2::Reason::PROTOCOL_ERROR);
 
-            *malformed_streams += 1;
-            if *malformed_streams >= MAX_MALFORMED_STREAMS_PER_CONN {
-                // Rare, connection-level abuse signal (at most once per
-                // torn-down connection), so warn! is flood-safe here and
-                // useful for detecting abuse in production.
-                warn!(
-                    "tearing down downstream h2 connection after \
-                     {malformed_streams} malformed requests"
-                );
-                return Error::e_explain(
-                    ErrorType::H2Error,
-                    "too many malformed downstream requests on connection",
-                );
+            account_malformed_stream(malformed_streams)?;
+            return Ok(Some(H2Accept::Rejected));
+        }
+
+        // RFC 9113 section 8.1.1 forbids forwarding a malformed request:
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.1.1
+        if invalid_request_authority(&request_header) {
+            let mut response = Response::new(());
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            // An immediate PROTOCOL_ERROR reset would replace this observable 400 in h2. Dropping
+            // an unfinished request body can still reset the stream.
+            if let Err(e) = send_response.send_response(response, true) {
+                // A client reset before the write is stream-local; siblings survive.
+                debug!("failed to send downstream h2 authority rejection: {e}");
             }
+            account_malformed_stream(malformed_streams)?;
             return Ok(Some(H2Accept::Rejected));
         }
 
@@ -682,6 +823,12 @@ impl HttpSession {
         self.response_written.as_deref()
     }
 
+    /// Whether the whole response is written: END_STREAM was sent with the final header, the
+    /// last body chunk, the trailers or [`Self::finish`].
+    pub fn is_response_complete(&self) -> bool {
+        self.ended
+    }
+
     /// Give up the stream abruptly.
     ///
     /// This will send an `INTERNAL_ERROR` stream error to the client.
@@ -819,9 +966,11 @@ impl HttpSession {
 mod test {
     use super::*;
     use bytes::Bytes;
-    use h2::frame::{Frame, Settings};
-    use http::{HeaderValue, Method, Request};
+    use futures::SinkExt;
+    use h2::frame::{Frame, Headers, Pseudo, Reset, Settings};
+    use http::{HeaderValue, Method, Request, Uri};
     use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
+    use tokio::sync::oneshot;
     use tokio_stream::StreamExt;
 
     async fn advertised_settings(options: Option<H2Options>) -> Settings {
@@ -840,6 +989,541 @@ mod test {
 
         let _ = handshake.await.unwrap().unwrap();
         settings
+    }
+
+    #[test]
+    fn test_invalid_request_authority() {
+        let request = |uri: &str, hosts: &[&str]| {
+            let mut request = Request::builder().uri(uri).body(()).unwrap();
+            for host in hosts {
+                request
+                    .headers_mut()
+                    .append(header::HOST, HeaderValue::from_str(host).unwrap());
+            }
+            RequestHeader::from(request.into_parts().0)
+        };
+        let authority_request = |hosts: &[&str]| request("https://authority.example/test", hosts);
+
+        assert!(!invalid_request_authority(&authority_request(&[])));
+        assert!(!invalid_request_authority(&authority_request(&[
+            "authority.example"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "other.example"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "AUTHORITY.EXAMPLE"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example:443"
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example",
+            "authority.example",
+        ])));
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example",
+            "other.example",
+        ])));
+
+        // Names the same host, but is not the same field value, and we do not normalize.
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example."
+        ])));
+
+        // An :authority with a port is compared the same way, in both directions.
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["other.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["authority.example"]
+        )));
+        assert!(!invalid_request_authority(&request(
+            "https://authority.example:443/test",
+            &["authority.example:443"]
+        )));
+
+        // Userinfo is rejected regardless of Host, including a byte-identical one.
+        for uri in [
+            "https://user@authority.example/test",
+            "https://other.example@authority.example/test",
+            "https://user:pass@authority.example:8443/test",
+            "https://@authority.example/test",
+        ] {
+            let authority = uri
+                .parse::<http::Uri>()
+                .unwrap()
+                .authority()
+                .unwrap()
+                .to_string();
+            assert!(
+                invalid_request_authority(&request(uri, &[])),
+                "{uri} should be rejected without a Host field"
+            );
+            assert!(
+                invalid_request_authority(&request(uri, &[&authority])),
+                "{uri} should be rejected with a matching Host field"
+            );
+        }
+
+        // Without :authority, Host is the only authority.
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["user@evil.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["other.example@authority.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["@evil.example"]
+        )));
+        assert!(!invalid_request_authority(&request(
+            "/test",
+            &["authority.example"]
+        )));
+        assert!(invalid_request_authority(&request("/test", &[])));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["a.example", "b.example"]
+        )));
+
+        let raw_path_request = |target: &str, host: &str| {
+            let mut request = RequestHeader::build_no_case("GET", target.as_bytes(), None).unwrap();
+            request.set_version(http::Version::HTTP_2);
+            request.append_header(header::HOST, host).unwrap();
+            request
+        };
+        assert!(invalid_request_authority(&raw_path_request(
+            "http://other.example/admin",
+            "authority.example"
+        )));
+        assert!(invalid_request_authority(&raw_path_request(
+            "http://authority.example/admin",
+            "authority.example"
+        )));
+        assert!(invalid_request_authority(&raw_path_request(
+            "http:/\\/\\other.example/admin",
+            "authority.example"
+        )));
+        assert!(!invalid_request_authority(&raw_path_request(
+            "/redirect?next=http://other.example/admin",
+            "authority.example"
+        )));
+
+        let connect = RequestHeader::from(
+            Request::builder()
+                .method(http::Method::CONNECT)
+                .uri("http:443")
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        assert!(!invalid_request_authority(&connect));
+
+        let mut extended_connect =
+            raw_path_request("http://other.example/tunnel", "authority.example");
+        extended_connect.set_method(http::Method::CONNECT);
+        extended_connect
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from("websocket"));
+        assert!(invalid_request_authority(&extended_connect));
+
+        // Pin the divergence the rejection above exists to prevent.
+        let sneaky = "https://other.example@authority.example/test"
+            .parse::<http::Uri>()
+            .unwrap();
+        assert_eq!(sneaky.host(), Some("authority.example"));
+        assert_eq!(
+            sneaky.authority().map(|a| a.as_str()),
+            Some("other.example@authority.example")
+        );
+
+        // The authority parser refuses `%40`, so a literal `@` is the only reachable form.
+        assert!("https://other.example%40authority.example/test"
+            .parse::<http::Uri>()
+            .is_err());
+
+        // Bracketed hosts, zone ID included, must not trip the `@` check.
+        for uri in [
+            "https://[::1]:8443/test",
+            "https://[fe80::1%25eth0]:8443/test",
+        ] {
+            assert!(
+                !invalid_request_authority(&request(uri, &[])),
+                "{uri} should be accepted"
+            );
+        }
+
+        // Nothing to reconcile, but duplicate Host is still rejected.
+        assert!(!invalid_request_authority(&request(
+            "/test",
+            &["host.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["host.example", "other.example"]
+        )));
+        assert!(invalid_request_authority(&request(
+            "/test",
+            &["host.example", "host.example"]
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_authority_host_mismatch_with_400() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut h2 = h2.ready().await.unwrap();
+            let mismatched = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .header(header::HOST, "other.example")
+                .body(())
+                .unwrap();
+            let (response, request_body) = h2.send_request(mismatched, false).unwrap();
+
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            drop(response);
+            drop(request_body);
+
+            let mut h2 = h2.ready().await.unwrap();
+            let duplicate = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .header(header::HOST, "authority.example")
+                .header(header::HOST, "authority.example")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(duplicate, true).unwrap();
+
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let mut body = response.into_body();
+            assert!(body.data().await.is_none());
+
+            let mut h2 = h2.ready().await.unwrap();
+            let missing = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(missing, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+            let mut h2 = h2.ready().await.unwrap();
+            let matching = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .header(header::HOST, "authority.example")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(matching, true).unwrap();
+
+            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "mismatched authority reached the application"
+        );
+
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "duplicate Host fields reached the application"
+        );
+
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "missing authority reached the application"
+        );
+
+        let Some(H2Accept::Session(mut session)) =
+            HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("matching authority did not reach the application");
+        };
+        assert_eq!(
+            session.req_header().headers[header::HOST],
+            "authority.example"
+        );
+        session
+            .write_response_header(
+                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
+                true,
+            )
+            .unwrap();
+        drop(session);
+
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn(&mut connection, digest),
+        )
+        .await
+        .expect("connection did not finish after authority mismatch test")
+        .expect("connection failed after authority mismatch test");
+        assert!(done.is_none());
+
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_authority_userinfo_with_400() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            // The H1 downgrade would synthesize Host from the full authority.
+            let mut h2 = h2.ready().await.unwrap();
+            let synthesized = Request::builder()
+                .method(Method::GET)
+                .uri("https://other.example@authority.example/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(synthesized, true).unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "userinfo authority was accepted without a Host field"
+            );
+
+            // A byte-identical Host does not make the userinfo acceptable.
+            let mut h2 = h2.ready().await.unwrap();
+            let matching_host = Request::builder()
+                .method(Method::GET)
+                .uri("https://other.example@authority.example/test")
+                .header(header::HOST, "other.example@authority.example")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(matching_host, true).unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "userinfo authority was accepted with a matching Host field"
+            );
+
+            // Rejections are stream-local: a clean sibling still reaches the application.
+            let mut h2 = h2.ready().await.unwrap();
+            let clean = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(clean, true).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        for case in ["without a Host field", "with a matching Host field"] {
+            let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(accepted, Some(H2Accept::Rejected)),
+                "userinfo authority {case} reached the application"
+            );
+        }
+
+        let Some(H2Accept::Session(mut session)) =
+            HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("clean request did not reach the application after rejections");
+        };
+        session
+            .write_response_header(
+                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
+                true,
+            )
+            .unwrap();
+        drop(session);
+
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn(&mut connection, digest),
+        )
+        .await
+        .expect("connection did not finish after authority userinfo test")
+        .expect("connection failed after authority userinfo test");
+        assert!(done.is_none());
+
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_authority_rejection_write_is_stream_local() {
+        let (mut client, server) = duplex(65536);
+        let (frames_sent, wait_for_frames) = oneshot::channel();
+
+        let client = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            let mut fields = HeaderMap::new();
+            fields.insert(header::HOST, HeaderValue::from_static("other.example"));
+            let mut mismatched = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://authority.example/test"),
+                    None,
+                ),
+                fields,
+            );
+            mismatched.set_end_headers();
+            codec.send(mismatched.into()).await.unwrap();
+            codec
+                .send(Reset::new(1.into(), h2::Reason::CANCEL).into())
+                .await
+                .unwrap();
+
+            let mut fields = HeaderMap::new();
+            fields.insert(header::HOST, HeaderValue::from_static("authority.example"));
+            let mut matching = Headers::new(
+                3.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://authority.example/test"),
+                    None,
+                ),
+                fields,
+            );
+            matching.set_end_headers();
+            matching.set_end_stream();
+            codec.send(matching.into()).await.unwrap();
+            frames_sent.send(()).unwrap();
+
+            timeout(Duration::from_secs(1), async {
+                while let Some(frame) = codec.next().await {
+                    if let Frame::Headers(headers) = frame.unwrap() {
+                        if headers.stream_id() == 3u32 {
+                            return;
+                        }
+                    }
+                }
+                panic!("connection closed before the sibling response");
+            })
+            .await
+            .expect("timed out waiting for the sibling response");
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        wait_for_frames.await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Some(H2Accept::Rejected)),
+            "reset authority mismatch reached the application"
+        );
+
+        let Some(H2Accept::Session(mut session)) =
+            HttpSession::from_h2_conn(&mut connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("sibling stream was dropped after the failed 400 write");
+        };
+        session
+            .write_response_header(
+                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
+                true,
+            )
+            .unwrap();
+        drop(session);
+
+        let done = timeout(
+            Duration::from_secs(1),
+            HttpSession::from_h2_conn(&mut connection, digest),
+        )
+        .await
+        .expect("connection did not finish after the sibling response")
+        .expect("connection failed after the sibling response");
+        assert!(done.is_none());
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_authority_mismatch_exhausts_malformed_stream_budget() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut h2 = h2.ready().await.unwrap();
+            let mismatched = Request::builder()
+                .method(Method::GET)
+                .uri("https://authority.example/test")
+                .header(header::HOST, "other.example")
+                .body(())
+                .unwrap();
+            let (response, _) = h2.send_request(mismatched, true).unwrap();
+
+            let _ = response.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+
+        let err = match HttpSession::from_h2_conn_with_malformed_budget(
+            &mut connection,
+            digest,
+            &mut malformed_streams,
+        )
+        .await
+        {
+            Ok(Some(_)) => panic!("authority mismatch must not surface as a session"),
+            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.etype(), &ErrorType::H2Error);
+        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
+
+        drop(connection);
+        client.await.unwrap();
     }
 
     #[tokio::test]
@@ -866,6 +1550,28 @@ mod test {
 
         assert_eq!(settings.max_header_list_size(), Some(1234));
         assert_eq!(settings.max_concurrent_streams(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_zero_idle_timeout_waits_for_active_session() {
+        let active = Arc::new(ActiveSessions::new());
+        let guard = active.start_session();
+        let timeout_active = active.clone();
+        let timeout = tokio::spawn(async move {
+            wait_for_idle_timeout(&timeout_active, Duration::ZERO).await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !timeout.is_finished(),
+            "zero timeout must not spin or expire while a session is active"
+        );
+
+        drop(guard);
+        pingora_timeout::timeout(Duration::from_secs(1), timeout)
+            .await
+            .expect("zero timeout did not expire after the session finished")
+            .expect("timeout task panicked");
     }
 
     #[tokio::test]
@@ -969,6 +1675,51 @@ mod test {
 
         client.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[cfg(feature = "patched_http1")]
+    #[tokio::test]
+    async fn test_forbidden_target_exhausts_malformed_stream_budget() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("https://www.example.com/a\r\nX-Injected: 1")
+                .body(())
+                .unwrap();
+            assert!(request.uri().path().contains('\n'));
+            let (response, _) = h2.send_request(request, true).unwrap();
+            let _ = response.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
+
+        let err = match HttpSession::from_h2_conn_with_malformed_budget(
+            &mut connection,
+            digest,
+            &mut malformed_streams,
+        )
+        .await
+        {
+            Ok(Some(_)) => panic!("forbidden target must not surface as a session"),
+            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.etype(), &ErrorType::H2Error);
+        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
+
+        drop(connection);
+        client.await.unwrap();
     }
 
     #[tokio::test]
@@ -1091,9 +1842,8 @@ mod test {
                 .unwrap();
 
             let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            // Send a body matching the first Content-Length value so the h2
-            // codec accepts the stream and Pingora's duplicate-CL validation is
-            // what rejects the request.
+            // Match the first value so older h2 versions reach Pingora's
+            // duplicate-CL validation. Newer codecs reject the headers first.
             req_body.reserve_capacity(5);
             req_body.send_data("abcde".into(), true).unwrap();
 
@@ -1107,13 +1857,14 @@ mod test {
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
-        // The malformed stream is reset during acceptance, so it is reported as
-        // rejected rather than surfaced to the application as a session.
+        // Pingora reports its own rejection, while h2 versions that reject the
+        // headers internally return None after the client closes. Neither path
+        // may surface the malformed request as an application session.
         let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap();
         assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
+            !matches!(accepted, Some(H2Accept::Session(_))),
             "malformed request must not surface as a session"
         );
 
@@ -1130,7 +1881,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_req_malformed_stream_budget_exhausted() {
+    async fn test_req_duplicate_host_exhausts_malformed_stream_budget() {
         let (client, server) = duplex(65536);
 
         let client_task = tokio::spawn(async move {
@@ -1140,21 +1891,18 @@ mod test {
             });
             let mut h2 = h2.ready().await.unwrap();
 
+            // Duplicate Host fields reach Pingora's authority validation even
+            // when the h2 codec rejects conflicting Content-Length itself.
             let request = Request::builder()
                 .method(Method::GET)
                 .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
+                .header(header::HOST, "www.example.com")
+                .header(header::HOST, "www.example.com")
                 .body(())
                 .unwrap();
 
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-            let err = response.await.unwrap_err();
-            if let Some(reason) = err.reason() {
-                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
-            }
+            let (response, _) = h2.send_request(request, true).unwrap();
+            let _ = response.await;
         });
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();

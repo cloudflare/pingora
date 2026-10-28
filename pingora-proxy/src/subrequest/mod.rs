@@ -146,11 +146,19 @@ impl Ctx {
     }
 }
 
-use crate::HttpSession;
+use crate::{DownstreamSession, HttpSession};
 
-pub(crate) fn create_session(parsed_session: &HttpSession) -> (HttpSession, SubrequestHandle) {
+pub(crate) fn create_session<DS>(
+    parsed_session: &HttpSession<DS>,
+) -> (HttpSession<DS>, SubrequestHandle)
+where
+    DS: DownstreamSession,
+{
     let (session, handle) = SessionSubrequest::new_from_session(parsed_session);
-    (HttpSession::new_subrequest(session), handle)
+    (
+        HttpSession::<DS>::new_subrequest_with_custom_session(session),
+        handle,
+    )
 }
 
 #[tokio::test]

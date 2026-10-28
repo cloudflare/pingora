@@ -8,7 +8,7 @@ Prometheus HTTP metrics server for scraping.
 Add `pingora-prometheus` to your `Cargo.toml`:
 
 ```toml
-pingora-prometheus = "0.8.0"
+pingora-prometheus = "0.9.0"
 ```
 
 ## Setting up a Prometheus Metrics Endpoint

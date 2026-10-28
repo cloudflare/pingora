@@ -14,7 +14,8 @@
 
 //! A simple LRU cache manager built on top of the `lru` crate
 
-use super::EvictionManager;
+use super::{CacheEntryKey, CacheEntryKeyRef, EvictionManager};
+#[cfg(test)]
 use crate::key::CompactCacheKey;
 
 use async_trait::async_trait;
@@ -34,7 +35,7 @@ use std::time::SystemTime;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Node {
-    key: CompactCacheKey,
+    key: CacheEntryKey,
     size: usize,
 }
 
@@ -78,7 +79,7 @@ impl Manager {
         }
     }
 
-    fn insert(&self, hash_key: u64, node: CompactCacheKey, size: usize, reverse: bool) {
+    fn insert(&self, hash_key: u64, node: CacheEntryKey, size: usize, reverse: bool) {
         use std::cmp::Ordering::*;
         let node = Node { key: node, size };
         let old = {
@@ -125,7 +126,7 @@ impl Manager {
     }
 
     // evict items until the used capacity is below the size limit and watermark count
-    fn evict(&self) -> Vec<CompactCacheKey> {
+    fn evict(&self) -> Vec<CacheEntryKey> {
         if self.used.load(Ordering::Relaxed) <= self.limit
             && self
                 .items_watermark
@@ -206,7 +207,7 @@ impl<'de> serde::de::Visitor<'de> for InsertToManager<'_> {
 }
 
 #[inline]
-fn u64key(key: &CompactCacheKey) -> u64 {
+fn u64key(key: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
@@ -231,10 +232,10 @@ impl EvictionManager for Manager {
 
     fn admit(
         &self,
-        item: CompactCacheKey,
+        item: CacheEntryKey,
         size: usize,
         _fresh_until: SystemTime,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(&item);
         self.insert(key, item, size, false);
         self.evict()
@@ -242,10 +243,10 @@ impl EvictionManager for Manager {
 
     fn increment_weight(
         &self,
-        item: &CompactCacheKey,
+        item: &CacheEntryKey,
         delta: usize,
         max_weight: Option<usize>,
-    ) -> Vec<CompactCacheKey> {
+    ) -> Vec<CacheEntryKey> {
         let key = u64key(item);
         if !self.increase_weight(key, delta, max_weight) {
             self.insert(
@@ -258,8 +259,8 @@ impl EvictionManager for Manager {
         self.evict()
     }
 
-    fn remove(&self, item: &CompactCacheKey) {
-        let key = u64key(item);
+    fn remove(&self, item: CacheEntryKeyRef<'_>) {
+        let key = u64key(&item);
         let node = self.lru.write().pop(&key);
         if let Some(n) = node {
             self.used.fetch_sub(n.size, Ordering::Relaxed);
@@ -267,7 +268,7 @@ impl EvictionManager for Manager {
         }
     }
 
-    fn access(&self, item: &CompactCacheKey, size: usize, _fresh_until: SystemTime) -> bool {
+    fn access(&self, item: &CacheEntryKey, size: usize, _fresh_until: SystemTime) -> bool {
         let key = u64key(item);
         if self.lru.write().get(&key).is_none() {
             self.insert(key, item.clone(), size, false);
@@ -277,7 +278,7 @@ impl EvictionManager for Manager {
         }
     }
 
-    fn peek(&self, item: &CompactCacheKey) -> bool {
+    fn peek(&self, item: &CacheEntryKey) -> bool {
         let key = u64key(item);
         self.lru.read().peek(&key).is_some()
     }
@@ -334,6 +335,55 @@ impl EvictionManager for Manager {
 }
 
 #[cfg(test)]
+impl Manager {
+    fn admit(
+        &self,
+        item: CompactCacheKey,
+        size: usize,
+        fresh_until: SystemTime,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::admit(self, CacheEntryKey::key_only(item), size, fresh_until)
+            .into_iter()
+            .map(CacheEntryKey::into_key)
+            .collect()
+    }
+
+    fn increment_weight(
+        &self,
+        item: &CompactCacheKey,
+        delta: usize,
+        max_weight: Option<usize>,
+    ) -> Vec<CompactCacheKey> {
+        EvictionManager::increment_weight(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            delta,
+            max_weight,
+        )
+        .into_iter()
+        .map(CacheEntryKey::into_key)
+        .collect()
+    }
+
+    fn remove(&self, item: &CompactCacheKey) {
+        EvictionManager::remove(self, CacheEntryKeyRef::from_entry_id(item, None));
+    }
+
+    fn access(&self, item: &CompactCacheKey, size: usize, fresh_until: SystemTime) -> bool {
+        EvictionManager::access(
+            self,
+            &CacheEntryKey::key_only(item.clone()),
+            size,
+            fresh_until,
+        )
+    }
+
+    fn peek(&self, item: &CompactCacheKey) -> bool {
+        EvictionManager::peek(self, &CacheEntryKey::key_only(item.clone()))
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::CacheKey;
@@ -360,6 +410,18 @@ mod test {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0], key1);
         assert_eq!(v[1], key2);
+    }
+
+    #[test]
+    fn test_identified_entries_are_distinct() {
+        let lru = Manager::new(1);
+        let key = CacheKey::new("a", "1").to_compact();
+        let first = CacheEntryKey::identified(key.clone(), crate::CacheEntryId::new(1));
+        let second = CacheEntryKey::identified(key, crate::CacheEntryId::new(2));
+        let until = SystemTime::now();
+
+        assert!(EvictionManager::admit(&lru, first.clone(), 1, until).is_empty());
+        assert_eq!(EvictionManager::admit(&lru, second, 1, until), vec![first]);
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub trait ServiceDiscovery {
     /// Enablement map keys are hashes of the corresponding [`Backend`] values,
     /// produced with [`std::collections::hash_map::DefaultHasher`]. A backend
     /// omitted from the map is considered enabled.
+    ///
+    /// Background services drop this future to cancel discovery on shutdown, so
+    /// an implementation must not rely on running to completion once polled.
     async fn discover(&self) -> Result<(BTreeSet<Backend>, HashMap<u64, bool>)>;
 }
 

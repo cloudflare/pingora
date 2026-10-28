@@ -16,6 +16,7 @@ use super::HttpSession;
 use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, TransportConnector};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
+use crate::protocols::http::v1::ResponseParserConfig;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
@@ -87,12 +88,37 @@ impl ConnectionRef {
             release_lock: Arc::new(Mutex::new(())),
         }))
     }
-
+    // TODO: Migrate callers of `more_streams_allowed()` to
+    // `can_accept_streams(1)`, then deprecate/remove the duplicate legacy method.
+    // The unified predicate should reject closed and shutting-down connections;
+    // it remains advisory and does not reserve stream capacity.
     pub fn more_streams_allowed(&self) -> bool {
         let current = self.0.current_streams.load(Ordering::Relaxed);
         !self.is_shutting_down()
             && self.0.max_streams > current
             && self.0.connection_stub.0.current_max_send_streams() > current
+    }
+
+    /// Return the number of additional streams this connection can currently accept.
+    ///
+    /// This is an advisory snapshot and does not reserve capacity. Concurrent stream creation,
+    /// connection closure, or a peer settings update can invalidate it immediately.
+    pub fn free_stream_slots(&self) -> usize {
+        if self.is_closed() || self.is_shutting_down() {
+            return 0;
+        }
+
+        let current = self.0.current_streams.load(Ordering::Relaxed);
+        let limit = self
+            .0
+            .max_streams
+            .min(self.0.connection_stub.0.current_max_send_streams());
+        limit.saturating_sub(current)
+    }
+
+    /// Return whether this connection can currently accept `streams` additional streams.
+    pub fn can_accept_streams(&self, streams: usize) -> bool {
+        streams > 0 && self.free_stream_slots() >= streams
     }
 
     pub fn is_idle(&self) -> bool {
@@ -282,6 +308,7 @@ pub struct Connector {
     // the pool of h2 connections that have ongoing streams
     in_use_pool: InUsePool,
     pool_callback: Option<PoolCallback>,
+    h1_response_parser_config: ResponseParserConfig,
 }
 
 impl Connector {
@@ -293,12 +320,18 @@ impl Connector {
         let pool_callback = options
             .as_ref()
             .and_then(|o| o.keepalive_pool_callback.clone());
+        let h1_response_parser_config = options
+            .as_ref()
+            .map_or_else(ResponseParserConfig::default, |options| {
+                options.h1_response_parser_config
+            });
         // connection offload is handled by the [TransportConnector]
         Connector {
             transport: TransportConnector::new(options),
             idle_pool: Arc::new(ConnectionPool::new(pool_size)),
             in_use_pool: InUsePool::new(),
             pool_callback,
+            h1_response_parser_config,
         }
     }
 
@@ -328,9 +361,9 @@ impl Connector {
             Some(ALPN::H2) => { /* continue */ }
             Some(_) => {
                 // H2 not supported
-                return Ok(HttpSession::H1(Http1Session::new_with_options(
-                    stream, peer,
-                )));
+                let mut session = Http1Session::new_with_options(stream, peer);
+                session.set_response_parser_config(self.h1_response_parser_config);
+                return Ok(HttpSession::H1(session));
             }
             None => {
                 // if tls but no ALPN, default to h1
@@ -340,9 +373,9 @@ impl Connector {
                         .get_peer_options()
                         .is_none_or(|o| o.alpn.get_min_http_version() == 1)
                 {
-                    return Ok(HttpSession::H1(Http1Session::new_with_options(
-                        stream, peer,
-                    )));
+                    let mut session = Http1Session::new_with_options(stream, peer);
+                    session.set_response_parser_config(self.h1_response_parser_config);
+                    return Ok(HttpSession::H1(session));
                 }
                 // else: min http version=H2 over plaintext, there is no ALPN anyways, we trust
                 // the caller that the server speaks h2c
@@ -650,6 +683,7 @@ mod tests {
     use bytes::Bytes;
     use http::{Response, StatusCode};
     use pingora_http::RequestHeader;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
@@ -700,6 +734,48 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_parser_config_is_applied_to_h1_fallback() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nServer : pingora\r\n folded\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut options = ConnectorOptions::new(1);
+        options.h1_response_parser_config = ResponseParserConfig::default()
+            .with_spaces_after_header_name_in_responses(true)
+            .with_obsolete_multiline_headers_in_responses(true);
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(address, false, "".into());
+        peer.options.set_http_version(2, 1);
+
+        let session = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
+        let HttpSession::H1(mut session) = session else {
+            panic!("expect h1");
+        };
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+        session.read_response().await.unwrap();
+        assert_eq!(session.get_header("server").unwrap(), "pingora folded");
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -838,6 +914,34 @@ mod tests {
 
         assert!(conn.is_shutting_down());
         assert!(!conn.more_streams_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_free_stream_slots() {
+        let (client_io, _server_io) = tokio::io::duplex(65536);
+        let (send_req, _connection) = h2::client::Builder::new()
+            .initial_max_send_streams(3)
+            .handshake(client_io)
+            .await
+            .unwrap();
+        let (closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 4, Digest::default());
+
+        assert_eq!(conn.free_stream_slots(), 3);
+        assert!(conn.can_accept_streams(3));
+        assert!(!conn.can_accept_streams(4));
+        assert!(!conn.can_accept_streams(0));
+
+        conn.0.current_streams.store(1, Ordering::Relaxed);
+        assert_eq!(conn.free_stream_slots(), 2);
+
+        closed_tx.send(true).unwrap();
+        assert_eq!(conn.free_stream_slots(), 0);
+
+        closed_tx.send(false).unwrap();
+        conn.mark_shutdown();
+        assert_eq!(conn.free_stream_slots(), 0);
     }
 
     #[cfg(all(feature = "any_tls", unix))]
@@ -1047,5 +1151,189 @@ mod tests {
         );
         assert!(result.unwrap().is_none());
         assert!(conn.is_shutting_down());
+    }
+
+    /// A server that writes HTTP/2 frames by hand. `h2`'s own server stops writing to a stream
+    /// as soon as it reads the client's RST_STREAM, so it cannot model frames that a real server
+    /// had already sent when the client cancelled.
+    mod raw_h2_server {
+        use std::io;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+        use tokio::sync::mpsc;
+
+        const DATA: u8 = 0x0;
+        pub const HEADERS: u8 = 0x1;
+        pub const RST_STREAM: u8 = 0x3;
+        const SETTINGS: u8 = 0x4;
+        pub const GOAWAY: u8 = 0x7;
+        const END_STREAM: u8 = 0x1;
+        const END_HEADERS: u8 = 0x4;
+        const ACK: u8 = 0x1;
+        pub const CANCEL: u32 = 0x8;
+        /// HPACK static table index 8, `:status: 200`.
+        const STATUS_200: &[u8] = &[0x88];
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+        pub struct Frame {
+            pub kind: u8,
+            pub stream_id: u32,
+            pub payload: Vec<u8>,
+        }
+
+        pub struct Server {
+            writer: WriteHalf<DuplexStream>,
+        }
+
+        impl Server {
+            /// Completes the server side of the connection preface and returns the server with
+            /// a channel that yields every frame the client sends afterwards.
+            pub async fn accept(io: DuplexStream) -> (Self, mpsc::UnboundedReceiver<Frame>) {
+                let (mut reader, writer) = tokio::io::split(io);
+                let mut preface = [0u8; PREFACE.len()];
+                reader.read_exact(&mut preface).await.unwrap();
+                assert_eq!(preface, PREFACE);
+
+                let mut server = Server { writer };
+                server.write_frame(SETTINGS, 0, 0, &[]).await.unwrap();
+                // The client sends its SETTINGS with the preface.
+                server.write_frame(SETTINGS, ACK, 0, &[]).await.unwrap();
+
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(read_frames(reader, tx));
+                (server, rx)
+            }
+
+            /// Fails once the client has closed the connection.
+            pub async fn write_frame(
+                &mut self,
+                kind: u8,
+                flags: u8,
+                stream_id: u32,
+                payload: &[u8],
+            ) -> io::Result<()> {
+                let len = payload.len() as u32;
+                let mut frame = Vec::with_capacity(9 + payload.len());
+                frame.extend_from_slice(&len.to_be_bytes()[1..]);
+                frame.push(kind);
+                frame.push(flags);
+                frame.extend_from_slice(&stream_id.to_be_bytes());
+                frame.extend_from_slice(payload);
+                self.writer.write_all(&frame).await
+            }
+
+            /// Writes a 200 response with `body` on the stream.
+            pub async fn write_response(&mut self, stream_id: u32, body: &[u8]) -> io::Result<()> {
+                self.write_frame(HEADERS, END_HEADERS, stream_id, STATUS_200)
+                    .await?;
+                self.write_frame(DATA, END_STREAM, stream_id, body).await
+            }
+        }
+
+        async fn read_frames(mut reader: ReadHalf<DuplexStream>, tx: mpsc::UnboundedSender<Frame>) {
+            loop {
+                let mut header = [0u8; 9];
+                if reader.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let stream_id =
+                    u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+                let mut payload = vec![0u8; len];
+                if reader.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                let frame = Frame {
+                    kind: header[3],
+                    stream_id,
+                    payload,
+                };
+                if tx.send(frame).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// When the client cancels a stream, the server may already have sent its response, and
+    /// RFC 9113 section 5.1 requires the client to discard those frames. However many streams
+    /// the client cancels over the life of the connection, the late frames must not close it and
+    /// fail the requests in flight on it.
+    #[tokio::test]
+    async fn test_h2_late_frames_on_cancelled_streams_keep_connection() {
+        use raw_h2_server::*;
+
+        const ROUNDS: usize = 21;
+        const CONCURRENT: usize = 100;
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = CONCURRENT + 1;
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+        let (mut server, mut client_frames) = Server::accept(server).await;
+
+        let request = || {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            req.insert_header(http::header::HOST, "example.com")
+                .unwrap();
+            Box::new(req)
+        };
+
+        // A slow request stays in flight for the whole test.
+        let mut in_flight = conn.spawn_stream().await.unwrap().unwrap();
+        in_flight.write_request_header(request(), true).unwrap();
+        let in_flight_id = loop {
+            let frame = client_frames.recv().await.unwrap();
+            if frame.kind == HEADERS {
+                break frame.stream_id;
+            }
+        };
+
+        let mut late_responses = 0;
+        'rounds: for _ in 0..ROUNDS {
+            // The client abandons requests, like a proxy whose downstream left.
+            let mut cancelled = Vec::with_capacity(CONCURRENT);
+            for _ in 0..CONCURRENT {
+                let Ok(Some(mut session)) = conn.spawn_stream().await else {
+                    break 'rounds;
+                };
+                session.write_request_header(request(), true).unwrap();
+                cancelled.push(session);
+            }
+            drop(cancelled);
+
+            // The server had already answered each request when its RST_STREAM arrived.
+            let mut answered = 0;
+            while answered < CONCURRENT {
+                let Some(frame) = client_frames.recv().await else {
+                    break 'rounds;
+                };
+                if frame.kind != RST_STREAM || frame.payload != CANCEL.to_be_bytes() {
+                    continue;
+                }
+                if server
+                    .write_response(frame.stream_id, &[0; 1024])
+                    .await
+                    .is_err()
+                {
+                    break 'rounds;
+                }
+                answered += 1;
+                late_responses += 1;
+            }
+        }
+
+        let _ = server.write_response(in_flight_id, b"ok").await;
+        let result = in_flight.read_response_header().await;
+        assert!(
+            result.is_ok(),
+            "the in-flight request failed: {}",
+            result.unwrap_err()
+        );
+        assert_eq!(in_flight.response_header().unwrap().status, 200);
+        while let Ok(frame) = client_frames.try_recv() {
+            assert_ne!(frame.kind, GOAWAY, "the client closed the connection");
+        }
+        // More late responses than h2's default limit of 1024 local resets.
+        assert_eq!(late_responses, ROUNDS * CONCURRENT);
     }
 }

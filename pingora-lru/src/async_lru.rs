@@ -63,7 +63,11 @@ fn send_msg<K: Send>(tx: &mpsc::UnboundedSender<LruMsg<K>>, msg: LruMsg<K>) {
 }
 
 fn get_shard<K: Hash>(key: &K, n_shards: usize) -> usize {
-    (hash_key(key) % n_shards as u64) as usize
+    get_shard_from_hash(hash_key(key), n_shards)
+}
+
+fn get_shard_from_hash(key_hash: u64, n_shards: usize) -> usize {
+    (key_hash % n_shards as u64) as usize
 }
 
 /// A message sent to a shard actor.
@@ -586,7 +590,7 @@ where
         drop(guard);
 
         if exists {
-            let shard = get_shard(key, N);
+            let shard = get_shard_from_hash(key_hash, N);
             send_msg(&self.shards[shard].tx, LruMsg::Promote { key_hash });
         }
         exists
@@ -610,9 +614,19 @@ where
     /// The message is enqueued on the shard's unbounded channel, so it is
     /// never dropped (it fails only if the actor is gone, i.e. during
     /// shutdown).
+    ///
+    /// The key is matched by hash. Use [`Self::remove_by_hash`] when the caller already has the
+    /// hash, including from an alternate key representation.
     pub fn remove(&self, key: &K) {
-        let key_hash = hash_key(key);
-        let shard = get_shard(key, N);
+        self.remove_by_hash(hash_key(key));
+    }
+
+    /// Remove an entry using a precomputed [`hash_key`] result. Fire-and-forget.
+    ///
+    /// This supports alternate key representations that cannot implement `Borrow<K>`. The hash
+    /// must match the `K` originally inserted; it selects both the shard and the entry within it.
+    pub fn remove_by_hash(&self, key_hash: u64) {
+        let shard = get_shard_from_hash(key_hash, N);
         send_msg(&self.shards[shard].tx, LruMsg::Remove { key_hash });
     }
 
@@ -1152,9 +1166,10 @@ mod tests {
         wait();
 
         lru.remove(&key(1));
+        lru.remove_by_hash(hash_key(&key(2)));
         wait();
         assert!(!lru.peek(&key(1)));
-        assert!(lru.peek(&key(2)));
+        assert!(!lru.peek(&key(2)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

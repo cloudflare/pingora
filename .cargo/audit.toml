@@ -2,11 +2,25 @@
 # aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
 # dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
 # our usage because this is TLS client use only and does not parse CRLs.
-# Remove once the upstream aws-s3-transfer-manager-rs fix ships.
+# Remove once Pingora migrates to the Dial9 release line that removed
+# aws-sdk-s3-transfer-manager.
 
 [advisories]
 ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+    # h2 0.3.27 is pulled in only by the optional worker-s3 dependency chain.
+    # The feature is disabled by default, but users who enable it remain affected.
+    "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
+    # Same legacy chain: only rustls 0.21.12 (via hyper-rustls 0.24) is
+    # flagged. There is no 0.21.x backport (patched >= 0.23.46), and rustls
+    # 0.23 is already on 0.23.46.
+    "RUSTSEC-2026-0346", # rustls: Debug impls for client session values expose TLS secrets
+    "RUSTSEC-2026-0349", # rustls: unauthenticated ServerHello can downgrade key exchange
+    # webpki-roots 0.26.11 and rustls-webpki 0.101.7 are pulled in transitively
+    # by optional/legacy dependency chains with no 0.26.x or 0.101.x backports
+    # (patched in webpki-roots >= 1.0.10 and rustls-webpki >= 0.103.16).
+    "RUSTSEC-2026-0381", # webpki-roots: bundled root certificates allow trust in distrusted emSign intermediates
+    "RUSTSEC-2026-0382", # rustls-webpki: certificate verification may accept distrusted intermediates
 ]

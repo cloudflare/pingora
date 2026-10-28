@@ -23,7 +23,10 @@ use http::{header, header::AsHeaderName, Method, Version};
 use log::{debug, trace, warn};
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http::{h1::HeaderLimit, IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http_parser::{
+    parse_request, Error as ParseError, HeaderStorage, Status as ParseStatus,
+};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
@@ -35,7 +38,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusableHttpStream};
+use crate::protocols::http::{
+    authority::validate_request_authority, body_buffer::FixedBuffer, date, HttpTask,
+    ReusableHttpStream,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -141,6 +147,8 @@ pub struct HttpSession {
     /// Defaults to false. Can be enabled via [`set_pipelining_enabled`](Self::set_pipelining_enabled).
     /// See [`Self::set_pipelining_enabled`] for RFC 9112 §9.3.2 semantics.
     pipelining_enabled: bool,
+    /// Maximum number of fields accepted in the HTTP/1 request head.
+    header_limit: HeaderLimit,
     /// Pipelined bytes from the previous request on the same keep-alive connection,
     /// to be parsed as the start of this session's request. Consumed on the first
     /// call to [`Self::read_request`]. Set via [`Self::set_pipelined_prefix`] after
@@ -201,6 +209,7 @@ impl HttpSession {
             abort_on_close: true,
             proxy_tasks_enabled: false,
             pipelining_enabled: false,
+            header_limit: HeaderLimit::default(),
             pipelined_prefix: None,
             pipelined_idle_bytes_stashed: false,
         }
@@ -328,11 +337,10 @@ impl HttpSession {
 
             // Use loop as GOTO to retry escaped request buffer, not a real loop
             loop {
-                let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-                let mut req = httparse::Request::new(&mut headers);
-                let parsed = parse_req_buffer(&mut req, &buf);
+                let mut storage = HeaderStorage::new();
+                let parsed = parse_request(&mut storage, &buf, self.header_limit);
                 match parsed {
-                    HeaderParseState::Complete(s) => {
+                    Ok(ParseStatus::Complete(s, req)) => {
                         self.raw_header = Some(BufRef(0, s));
 
                         // We have the header name and values we parsed to be just 0 copy Bytes
@@ -341,19 +349,18 @@ impl HttpSession {
                         // `KVRef`s to record the offset of each piece of data, drop `req`, convert
                         // buf, the do the 0 copy update
                         let base = buf.as_ptr() as usize;
-                        let mut header_refs = Vec::<KVRef>::with_capacity(req.headers.len());
+                        let mut header_refs = Vec::<KVRef>::with_capacity(req.header_count());
                         // Note: req.headers has the correct number of headers
                         // while header_refs doesn't as it is still empty
-                        let _num_headers = populate_headers(base, &mut header_refs, req.headers);
+                        let _num_headers = populate_headers(base, &mut header_refs, req.headers());
 
                         let mut request_header = Box::new(RequestHeader::build(
-                            req.method.unwrap_or(""),
-                            // we path httparse to allow unsafe bytes in the str
-                            req.path.unwrap_or("").as_bytes(),
-                            Some(req.headers.len()),
+                            req.method().unwrap_or(""),
+                            req.path_bytes().unwrap_or_default(),
+                            Some(req.header_count()),
                         )?);
 
-                        request_header.set_version(match req.version {
+                        request_header.set_version(match req.version() {
                             Some(1) => Version::HTTP_11,
                             Some(0) => Version::HTTP_10,
                             _ => Version::HTTP_09,
@@ -427,11 +434,11 @@ impl HttpSession {
 
                         return Ok(Some(s));
                     }
-                    HeaderParseState::Partial => {
+                    Ok(ParseStatus::Partial) => {
                         break; /* continue the read loop */
                     }
-                    HeaderParseState::Invalid(e) => match e {
-                        httparse::Error::Token | httparse::Error::Version => {
+                    Err(e) => match e {
+                        ParseError::Token | ParseError::Version => {
                             // URI escaping rebuilds the current header. Detach any request body or
                             // pipelined suffix first so normalization never copies queued requests.
                             // `separator_start` is the index of the blank line itself, so the
@@ -480,6 +487,9 @@ impl HttpSession {
     /// this function and most other functions will panic if called before [`Self::read_request()`]
     pub fn validate_request(&self) -> Result<()> {
         let req_header = self.req_header();
+
+        // Reject an ambiguous authority before anything routes on it.
+        validate_request_authority(req_header)?;
 
         // Validate/reconcile Content-Length per RFC 9110 section 8.6 (hyper
         // parity): identical duplicates and comma-combined identical values are
@@ -637,6 +647,13 @@ impl HttpSession {
         self.body_reader.body_done()
     }
 
+    /// Whether the request body reached its framing-defined end without an error.
+    /// A premature EOF makes `is_body_done()` true but leaves this false.
+    pub fn is_body_complete(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.body_complete()
+    }
+
     /// Whether the request has an empty body
     /// Because HTTP 1.1 clients have to send either `Content-Length` or `Transfer-Encoding` in order
     /// to signal the server that it will send the body, this function returns accurate results even
@@ -674,6 +691,17 @@ impl HttpSession {
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
+    }
+
+    /// Whether the whole response is written: a final (non-1xx) header went out, no queued
+    /// proxy task remains, and the body is complete by its framing (its `Content-Length` is
+    /// satisfied or the body has been finished).
+    pub fn is_response_complete(&self) -> bool {
+        self.response_written
+            .as_ref()
+            .is_some_and(|header| !header.status.is_informational())
+            && !self.has_pending_proxy_tasks()
+            && self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade
@@ -1007,6 +1035,11 @@ impl HttpSession {
     /// request N+1 begins processing. No parallel pipelining.
     pub fn set_pipelining_enabled(&mut self, enabled: bool) {
         self.pipelining_enabled = enabled;
+    }
+
+    /// Set the maximum number of fields accepted in the request head.
+    pub fn set_header_count_limit(&mut self, limit: HeaderLimit) {
+        self.header_limit = limit;
     }
 
     /// Set pipelined bytes to be parsed as the start of this session's request.
@@ -1784,35 +1817,6 @@ fn escape_illegal_request_line(buf: &BytesMut) -> Option<BytesMut> {
         Some(new_buf)
     } else {
         None
-    }
-}
-
-#[inline]
-fn parse_req_buffer<'buf>(
-    req: &mut httparse::Request<'_, 'buf>,
-    buf: &'buf [u8],
-) -> HeaderParseState {
-    use httparse::Result;
-
-    #[cfg(feature = "patched_http1")]
-    fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
-        req.parse_unchecked(buf)
-    }
-
-    #[cfg(not(feature = "patched_http1"))]
-    fn parse<'buf>(req: &mut httparse::Request<'_, 'buf>, buf: &'buf [u8]) -> Result<usize> {
-        req.parse(buf)
-    }
-
-    let res = match parse(req, buf) {
-        Ok(s) => s,
-        Err(e) => {
-            return HeaderParseState::Invalid(e);
-        }
-    };
-    match res {
-        httparse::Status::Complete(s) => HeaderParseState::Complete(s),
-        _ => HeaderParseState::Partial,
     }
 }
 
@@ -2896,6 +2900,95 @@ mod tests_stream {
         assert_eq!(res, BufRef::new(0, 3));
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
         assert_eq!(input3, http_stream.get_body(&res));
+    }
+
+    #[tokio::test]
+    async fn read_request_with_raised_header_count_limit() {
+        let mut input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n".to_vec();
+        for i in 0..4095 {
+            input.extend_from_slice(format!("x-{i}: value-{i}\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"\r\n");
+
+        let mock_io = Builder::new().read(&input).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.set_header_count_limit(HeaderLimit::Limited(4096));
+        session.read_request().await.unwrap();
+
+        assert_eq!(session.req_header().headers.len(), 4096);
+        assert_eq!(session.req_header().headers["x-4094"], "value-4094");
+    }
+
+    #[tokio::test]
+    async fn default_header_count_limit_is_preserved() {
+        let mut input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n".to_vec();
+        for i in 0..256 {
+            input.extend_from_slice(format!("x-{i}: value\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"\r\n");
+
+        let mock_io = Builder::new().read(&input).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        let error = session.read_request().await.unwrap_err();
+
+        assert_eq!(error.etype(), &InvalidHTTPHeader);
+        assert!(error.to_string().contains("too many headers"));
+    }
+
+    #[tokio::test]
+    async fn read_absolute_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.2: a server MUST accept absolute-form. The target is kept
+        // verbatim, while the Uri exposes only the path component.
+        // §3.2.2 requires Host to match the request-target authority; a mismatch is
+        // rejected by the ingress authority validation, which this fixture is not
+        // exercising.
+        let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org:8080\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(
+            &b"http://pingora.org:8080/a?q=b"[..],
+            http_stream.get_path()
+        );
+        let uri = &http_stream.req_header().uri;
+        assert_eq!("/a", uri.path());
+        assert_eq!(Some("q=b"), uri.query());
+        // Scheme and authority stay off the Uri so the proxy layer reconciles the
+        // target authority against `Host` from the raw bytes.
+        assert_eq!(None, uri.authority());
+        assert_eq!(None, uri.scheme_str());
+    }
+
+    #[tokio::test]
+    async fn read_absolute_form_request_target_rejects_host_mismatch() {
+        init_log();
+        // The fixture above has to keep `Host` and the request-target authority
+        // consistent to get past ingress validation. Pin the rejection it relies on, so
+        // that agreement stays a deliberate property of the fixture rather than an
+        // assumption that could silently stop holding.
+        let input = b"GET http://pingora.org:8080/a?q=b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let err = http_stream.read_request().await.unwrap_err();
+        assert_eq!(&InvalidHTTPHeader, err.etype());
+        // InvalidHTTPHeader covers every authority rejection, so pin the reason as well.
+        assert!(
+            format!("{err}").contains("Host header differs from request-target authority"),
+            "rejected for the wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_authority_form_request_target() {
+        init_log();
+        // RFC 9112 §3.2.3: authority-form reaches the tunnel destination verbatim.
+        let input = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(&b"pingora.org:443"[..], http_stream.get_path());
+        assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
     }
 
     #[test]

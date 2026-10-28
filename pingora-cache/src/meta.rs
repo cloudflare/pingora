@@ -17,7 +17,7 @@
 pub use http::Extensions;
 use log::warn;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
-use pingora_header_serde::HeaderSerde;
+use pingora_header_serde::{HeaderSerde, ResponseParserConfig};
 use pingora_http::{HMap, ResponseHeader};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -781,6 +781,27 @@ impl CacheMeta {
         self.0.internal.stale_while_revalidate_sec = 0;
     }
 
+    /// Mark this asset stale as of `instant`, so the next read revalidates it.
+    ///
+    /// The serve stale windows are measured off `fresh_until`, so anchoring it on the point the
+    /// asset went out of service is what keeps them the length the response asked for. A purge
+    /// at `P` on an asset with a 10 minute stale-while-revalidate leaves the stale body servable
+    /// until `P + 10m`, not until the asset's own deadline plus 10 minutes. A caller that wants
+    /// the next read to block on revalidation instead should call
+    /// [`CacheMeta::disable_serve_stale`] as well.
+    ///
+    /// `instant` only ever moves `fresh_until` earlier, so applying the same expiry on every read
+    /// is safe. Passing `SystemTime::now()` on each read rather than the point the asset went out
+    /// of service would restart the windows every time and hold them open forever. It also means
+    /// an asset that has already outlived its windows keeps them closed.
+    ///
+    /// Unlike [`CacheMeta::update_freshness`] this leaves `updated` alone, so age and
+    /// provenance still describe when the asset was actually stored.
+    pub fn expire_at(&mut self, instant: SystemTime) {
+        let fresh_until = &mut self.0.internal.fresh_until;
+        *fresh_until = (*fresh_until).min(instant);
+    }
+
     /// Update the freshness metadata of this asset.
     ///
     /// Refreshes `fresh_until`, `stale_while_revalidate_sec`, and
@@ -941,6 +962,11 @@ impl CacheMetaDefaults {
 /// Used during initialization of [`HEADER_SERDE`].
 static COMPRESSION_DICT_CONTENT: OnceLock<Cow<'static, [u8]>> = OnceLock::new();
 
+/// The parser configuration for cached response headers.
+///
+/// Used during initialization of [`HEADER_SERDE`].
+static HEADER_SERDE_PARSER_CONFIG: OnceLock<ResponseParserConfig> = OnceLock::new();
+
 static HEADER_SERDE: LazyLock<HeaderSerde> = LazyLock::new(|| {
     let dict_opt = if let Some(dict_content) = COMPRESSION_DICT_CONTENT.get() {
         Some(dict_content.to_vec())
@@ -949,7 +975,10 @@ static HEADER_SERDE: LazyLock<HeaderSerde> = LazyLock::new(|| {
         None
     };
 
-    HeaderSerde::new(dict_opt)
+    HeaderSerde::new_with_parser_config(
+        dict_opt,
+        *HEADER_SERDE_PARSER_CONFIG.get_or_init(ResponseParserConfig::default),
+    )
 });
 
 pub(crate) fn header_serialize(header: &ResponseHeader) -> Result<Vec<u8>> {
@@ -988,10 +1017,40 @@ pub fn set_compression_dict_content(content: Cow<'static, [u8]>) -> bool {
     COMPRESSION_DICT_CONTENT.set(content).is_ok()
 }
 
+/// Set the HTTP/1 response parser configuration for cached response headers.
+///
+/// Call this before serializing or deserializing cache metadata. Returns
+/// `false` if the configuration has already been set or the process-wide
+/// header serializer has already been initialized. This configuration is
+/// independent from the parser used by
+/// [`CachePutCtx`](crate::put::CachePutCtx) and upstream
+/// [`ConnectorOptions`](pingora_core::connectors::ConnectorOptions).
+pub fn set_header_serde_parser_config(config: ResponseParserConfig) -> bool {
+    HEADER_SERDE_PARSER_CONFIG.set(config).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn cache_meta_round_trips_with_default_header_limit() {
+        let now = SystemTime::now();
+        let mut header = ResponseHeader::build(StatusCode::OK, Some(256)).unwrap();
+        for i in 0..256 {
+            header
+                .append_header(format!("x-{i}"), format!("value-{i}"))
+                .unwrap();
+        }
+        let meta = CacheMeta::new(now + Duration::from_secs(300), now, 0, 0, header);
+
+        let (internal, header) = meta.serialize().unwrap();
+        let decoded = CacheMeta::deserialize(&internal, &header).unwrap();
+
+        assert_eq!(decoded.headers().len(), 256);
+        assert_eq!(decoded.headers()["x-255"], "value-255");
+    }
 
     #[test]
     fn test_cache_meta_age_without_override() {
@@ -1113,5 +1172,160 @@ mod tests {
         assert_eq!(meta.created(), admission);
         assert_eq!(meta.provenance(), provenance);
         assert_eq!(meta.provenance_raw(), Some(provenance));
+    }
+
+    /// Each serve-stale window includes its last second, as `is_fresh` includes `fresh_until`.
+    #[test]
+    fn test_cache_meta_serve_stale_window_end_is_inclusive() {
+        let admission = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let fresh_until = admission + Duration::from_secs(60);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let meta = CacheMeta::new(fresh_until, admission, 30, 120, header);
+
+        assert!(meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(30)));
+        assert!(meta.serve_stale_if_error(fresh_until + Duration::from_secs(120)));
+        assert!(!meta.serve_stale_while_revalidate(fresh_until + Duration::from_secs(31)));
+        assert!(!meta.serve_stale_if_error(fresh_until + Duration::from_secs(121)));
+    }
+
+    #[test]
+    fn expiring_at_the_current_instant_leaves_the_serve_stale_windows_open() {
+        let admission = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            admission + Duration::from_secs(300),
+            admission,
+            30,
+            30,
+            header,
+        );
+        assert!(meta.is_fresh(admission));
+
+        let expired_at = SystemTime::now();
+        meta.expire_at(expired_at);
+
+        assert_eq!(meta.fresh_until(), expired_at);
+        assert!(!meta.is_fresh(expired_at + Duration::from_secs(1)));
+
+        // Both windows hang off fresh_until, so landing it at the expiry rather than earlier
+        // is what leaves them open.
+        assert!(meta.serve_stale_while_revalidate(expired_at));
+        assert!(meta.serve_stale_if_error(expired_at));
+    }
+
+    /// The point of taking the instant: a purge 5 minutes into an hour of freshness has to
+    /// leave the window its own length, not the hour it interrupted plus its own length.
+    #[test]
+    fn expiring_at_an_instant_measures_the_serve_stale_windows_from_that_instant() {
+        let admission = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            admission + Duration::from_secs(3600),
+            admission,
+            600,
+            600,
+            header,
+        );
+
+        let expired_at = admission + Duration::from_secs(300);
+        meta.expire_at(expired_at);
+
+        assert_eq!(meta.fresh_until(), expired_at);
+        assert!(!meta.is_fresh(expired_at + Duration::from_secs(1)));
+
+        // Open for its 600s from the expiry, and shut after them, rather than running to
+        // the original deadline of admission + 3600s.
+        assert!(meta.serve_stale_while_revalidate(expired_at + Duration::from_secs(599)));
+        assert!(meta.serve_stale_if_error(expired_at + Duration::from_secs(599)));
+        assert!(!meta.serve_stale_while_revalidate(expired_at + Duration::from_secs(601)));
+        assert!(!meta.serve_stale_if_error(expired_at + Duration::from_secs(601)));
+    }
+
+    /// Expiring is applied on every read, so it has to be idempotent. Re-anchoring on each
+    /// read's own clock is what would hold the windows open forever.
+    #[test]
+    fn expiring_at_an_instant_is_idempotent() {
+        let admission = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            admission + Duration::from_secs(3600),
+            admission,
+            600,
+            600,
+            header,
+        );
+
+        let expired_at = admission + Duration::from_secs(300);
+        meta.expire_at(expired_at);
+        meta.expire_at(expired_at);
+        meta.expire_at(expired_at);
+
+        assert_eq!(meta.fresh_until(), expired_at);
+        assert!(!meta.serve_stale_while_revalidate(expired_at + Duration::from_secs(601)));
+    }
+
+    /// Expiring must not put a staler body back into service than the asset already had.
+    #[test]
+    fn expiring_at_a_later_instant_leaves_a_closed_window_closed() {
+        let admission = SystemTime::now() - Duration::from_secs(3600);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let fresh_until = admission + Duration::from_secs(60);
+        let mut meta = CacheMeta::new(fresh_until, admission, 60, 60, header);
+
+        let now = SystemTime::now();
+        assert!(!meta.serve_stale_while_revalidate(now));
+
+        meta.expire_at(now);
+
+        assert_eq!(
+            meta.fresh_until(),
+            fresh_until,
+            "expiring later than the asset's own deadline must not move it"
+        );
+        assert!(!meta.serve_stale_while_revalidate(now));
+        assert!(!meta.serve_stale_if_error(now));
+    }
+
+    /// The blocking behaviour is still reachable, it just has to be asked for.
+    #[test]
+    fn expiring_and_disabling_serve_stale_leaves_nothing_to_serve() {
+        let admission = SystemTime::now();
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            admission + Duration::from_secs(300),
+            admission,
+            30,
+            30,
+            header,
+        );
+
+        let expired_at = SystemTime::now();
+        meta.expire_at(expired_at);
+        meta.disable_serve_stale();
+
+        assert!(!meta.is_fresh(expired_at + Duration::from_secs(1)));
+        assert!(!meta.serve_stale_while_revalidate(expired_at));
+        assert!(!meta.serve_stale_if_error(expired_at));
+    }
+
+    #[test]
+    fn expiring_a_meta_leaves_its_admission_history_alone() {
+        let admission = SystemTime::now() - Duration::from_secs(120);
+        let provenance = admission - Duration::from_secs(30);
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        let mut meta = CacheMeta::new(
+            admission + Duration::from_secs(300),
+            admission,
+            0,
+            0,
+            header,
+        );
+        meta.set_provenance(provenance);
+
+        meta.expire_at(SystemTime::now());
+
+        assert_eq!(meta.created(), admission);
+        assert_eq!(meta.updated(), admission);
+        assert_eq!(meta.provenance(), provenance);
     }
 }

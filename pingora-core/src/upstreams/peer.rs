@@ -419,6 +419,13 @@ pub struct HttpUpstreamRequestPolicy {
     /// rejected rather than forwarded with protected metadata removed when this behavior is
     /// enabled.
     pub strip_connection_nominated: bool,
+    /// Reject `Connection` nominations that are not a valid HTTP `token` (RFC 9110 §5.6.2), such
+    /// as `Connection: "X-Forwarded-For"`, instead of tolerating them as distinct literal fields.
+    ///
+    /// Defaults to `true`. Exact nominations of protected fields and pseudo-headers are rejected
+    /// either way. Only has an effect when
+    /// [`strip_connection_nominated`](Self::strip_connection_nominated) is enabled.
+    pub reject_malformed_connection_nominations: bool,
     /// Controls forwarding of HTTP/1 protocol upgrade request fields.
     pub h1_upgrade: H1UpgradePolicy,
 }
@@ -438,6 +445,7 @@ impl HttpUpstreamRequestPolicy {
         Self {
             strip_hop_by_hop: false,
             strip_connection_nominated: false,
+            reject_malformed_connection_nominations: false,
             h1_upgrade: H1UpgradePolicy::Preserve,
         }
     }
@@ -456,6 +464,7 @@ impl Default for HttpUpstreamRequestPolicy {
         Self {
             strip_hop_by_hop: true,
             strip_connection_nominated: true,
+            reject_malformed_connection_nominations: true,
             h1_upgrade: H1UpgradePolicy::WebSocketOnly,
         }
     }
@@ -896,6 +905,7 @@ mod tests {
         let policy = PeerOptions::new().http_upstream_request_policy;
         assert!(policy.strip_hop_by_hop);
         assert!(policy.strip_connection_nominated);
+        assert!(policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
     }
 
@@ -904,6 +914,7 @@ mod tests {
         let policy = HttpUpstreamRequestPolicy::preserve();
         assert!(!policy.strip_hop_by_hop);
         assert!(!policy.strip_connection_nominated);
+        assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
     }
 }

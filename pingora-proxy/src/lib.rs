@@ -43,11 +43,14 @@ use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
+use std::future::{poll_fn, Future};
 use std::str;
+use std::sync::LazyLock;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-    Arc, LazyLock,
+    atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    Arc,
 };
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
@@ -61,6 +64,8 @@ use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
+use pingora_core::protocols::http::custom::client::Session as _;
+use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
@@ -77,6 +82,9 @@ use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
 
+/// Caps per-proxy padding and one-time shutdown fan-out on very large hosts.
+const MAX_SHUTDOWN_NOTIFY_SHARDS: usize = 256;
+
 type DownstreamCustomMessageReader =
     Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
 
@@ -88,6 +96,8 @@ mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
 pub mod subrequest;
+#[cfg(test)]
+mod test_support;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
@@ -99,24 +109,91 @@ pub mod prelude {
     pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
 }
 
-pub type ProcessCustomSession<SV, C> = Arc<
-    dyn Fn(Arc<HttpProxy<SV, C>>, Stream, &ShutdownWatch) -> BoxFuture<'static, Option<Stream>>
+/// Type-erased custom-connection callback.
+///
+/// The callback remains boxed once per accepted custom connection; the
+/// downstream session operations themselves use concrete futures.
+pub type ProcessCustomSession<SV, C, DS = ()> = Arc<
+    dyn Fn(Arc<HttpProxy<SV, C, DS>>, Stream, &ShutdownWatch) -> BoxFuture<'static, Option<Stream>>
         + Send
         + Sync
         + Unpin
         + 'static,
 >;
 
+/// Shutdown [`Notify`] sharded by worker thread.
+///
+/// Every request that parks in `read_request()` registers a shutdown waiter and
+/// unregisters it when the read completes. Both operations lock the `Notify`'s
+/// internal mutex, so a single `Notify` shared across the whole proxy becomes a
+/// contention hot spot on many-core machines. Sharding keeps waiter
+/// registration on a (mostly) thread-local shard while shutdown notifies every
+/// shard.
+struct ShardedNotify {
+    shards: Box<[NotifyShard]>,
+}
+
+/// Align each shard so its [`Notify`] state and waiter-list mutex do not share a
+/// cache line with an adjacent shard. Without padding, writes made while adding
+/// or removing waiters can falsely share a cache line with an independent shard,
+/// forcing cache-coherence protocols such as MESI to transfer or invalidate that
+/// line between cores. These transfers are especially expensive when they cross
+/// the interconnect between sockets on a NUMA system.
+///
+/// The 128-byte alignment separates adjacent shards on systems with common
+/// 64- or 128-byte cache lines. This trades bounded padding for avoiding false
+/// sharing between shards; waiters assigned to the same shard can still contend.
+#[repr(align(128))]
+struct NotifyShard(Notify);
+
+impl ShardedNotify {
+    /// Create enough shards for the configured worker threads, rounded up
+    /// to preserve mask-based indexing and bounded by [`MAX_SHUTDOWN_NOTIFY_SHARDS`].
+    fn new(worker_threads: usize) -> Self {
+        let shards = worker_threads
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(MAX_SHUTDOWN_NOTIFY_SHARDS)
+            .min(MAX_SHUTDOWN_NOTIFY_SHARDS);
+        ShardedNotify {
+            shards: (0..shards).map(|_| NotifyShard(Notify::new())).collect(),
+        }
+    }
+
+    /// Return the shard assigned to the current thread.
+    ///
+    /// A task can migrate after registering, but its [`Notified`](tokio::sync::futures::Notified)
+    /// future remains bound to this shard and shutdown notifies every shard.
+    fn local(&self) -> &Notify {
+        static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static THREAD_ID: usize = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        }
+        let id = THREAD_ID.with(|id| *id);
+        // the shard count is a power of two
+        &self.shards[id & (self.shards.len() - 1)].0
+    }
+
+    /// Notify waiters on every shard, including tasks polled by a different
+    /// worker after registering.
+    fn notify_waiters(&self) {
+        for shard in self.shards.iter() {
+            shard.0.notify_waiters();
+        }
+    }
+}
+
 /// The concrete type that holds the user defined HTTP proxy.
 ///
 /// Users don't need to interact with this object directly.
-pub struct HttpProxy<SV, C = ()>
+pub struct HttpProxy<SV, C = (), DS = ()>
 where
     C: custom::Connector, // Upstream custom connector
+    DS: DownstreamSession,
 {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector<C>,
-    shutdown: Notify,
+    shutdown: ShardedNotify,
     shutdown_flag: Arc<AtomicBool>,
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
@@ -124,10 +201,10 @@ where
     #[cfg(feature = "upstream_modules")]
     pub upstream_modules: HttpModules,
     max_retries: usize,
-    process_custom_session: Option<ProcessCustomSession<SV, C>>,
+    process_custom_session: Option<ProcessCustomSession<SV, C, DS>>,
 }
 
-impl<SV> HttpProxy<SV, ()> {
+impl<SV> HttpProxy<SV, (), ()> {
     /// Create a new [`HttpProxy`] with the given [`ProxyHttp`] implementation and [`ServerConf`].
     ///
     /// After creating an `HttpProxy`, you should call [`HttpProxy::handle_init_modules()`] to
@@ -152,7 +229,7 @@ impl<SV> HttpProxy<SV, ()> {
         HttpProxy {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
             h2_options: None,
@@ -165,21 +242,22 @@ impl<SV> HttpProxy<SV, ()> {
     }
 }
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     fn new_custom(
         inner: SV,
         conf: Arc<ServerConf>,
         connector: C,
-        on_custom: Option<ProcessCustomSession<SV, C>>,
+        on_custom: Option<ProcessCustomSession<SV, C, DS>>,
         server_options: Option<HttpServerOptions>,
         client_options: Option<ConnectorOptions>,
     ) -> Self
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let client_options =
             client_options.unwrap_or_else(|| ConnectorOptions::from_server_conf(&conf));
@@ -188,7 +266,7 @@ where
         HttpProxy {
             inner,
             client_upstream,
-            shutdown: Notify::new(),
+            shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
@@ -221,7 +299,7 @@ where
     /// this method is called automatically.
     pub fn handle_init_modules(&mut self)
     where
-        SV: ProxyHttp,
+        SV: ProxyHttp<DS>,
     {
         self.inner
             .init_downstream_modules(&mut self.downstream_modules);
@@ -229,20 +307,77 @@ where
         self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
+    /// Resolve when `http_cleanup()` has been called.
+    ///
+    /// The waiter is registered on the current thread's shard before
+    /// `shutdown_flag` is checked, so a shutdown firing in between cannot be
+    /// missed: either the flag load sees the store, or the registered waiter
+    /// receives the notification.
+    async fn await_shutdown(&self) {
+        let notified = self.shutdown.local().notified();
+        tokio::pin!(notified);
+
+        poll_fn(|context| {
+            if notified.as_mut().poll(context).is_ready()
+                || self.shutdown_flag.load(Ordering::Acquire)
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    /// Ignore a downstream failure so that a cache fill can continue without its downstream.
+    ///
+    /// This always marks the downstream errored. When
+    /// [`Session::handles_downstream_abandonment`] is set, the fill can still produce a cache
+    /// entry (see `ServeFromCache::can_still_fill_cache`) and the client left before its response
+    /// was completely delivered (see `Session::downstream_left_before_response_complete`), it
+    /// also stops waiting for the cached response to reach the downstream and, the first time,
+    /// records the abandonment and calls [`ProxyHttp::downstream_abandoned_during_cache_fill`].
+    /// Otherwise the failure is ignored exactly as without that handling. A failed downstream
+    /// read comes here only if `proxy_common::downstream_read_error_means_client_left` holds;
+    /// any other read error only marks the downstream errored.
+    fn abandon_downstream_for_cache_fill(
+        &self,
+        serve_from_cache: &proxy_cache::ServeFromCache,
+        downstream_state: &mut proxy_common::DownstreamStateMachine,
+        response_state: &mut proxy_common::ResponseStateMachine,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) where
+        SV: ProxyHttp<DS>,
+    {
+        downstream_state.to_errored();
+        if !session.handles_downstream_abandonment()
+            || !serve_from_cache.can_still_fill_cache(&session.cache)
+            || !session.downstream_left_before_response_complete()
+        {
+            return;
+        }
+        response_state.maybe_set_cache_done(true);
+        if session.mark_downstream_abandoned_during_cache_fill() {
+            self.inner
+                .downstream_abandoned_during_cache_fill(session, ctx);
+        }
+    }
+
     async fn handle_new_request(
         &self,
-        mut downstream_session: Box<HttpSession>,
-    ) -> Option<Box<HttpSession>>
+        mut downstream_session: Box<HttpSession<DS>>,
+    ) -> Option<Box<HttpSession<DS>>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // phase 1 read request header
 
         let res = tokio::select! {
             biased; // biased select is cheaper, and we don't want to drop already buffered requests
             res = downstream_session.read_request() => { res }
-            _ = self.shutdown.notified() => {
+            _ = self.await_shutdown() => {
                 // service shutting down, dropping the connection to stop more req from coming in
                 return None;
             }
@@ -257,18 +392,24 @@ where
             }
             Err(mut e) => {
                 e.as_down();
-                error!(
-                    "Fail to proxy: {e}, downstream session type: {}",
-                    downstream_session.session_type()
-                );
                 if matches!(e.etype, InvalidHTTPHeader) {
+                    debug!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
                     downstream_session
                         .respond_error(400)
                         .await
                         .unwrap_or_else(|e| {
                             error!("failed to send error response to downstream: {e}");
                         });
-                } // otherwise the connection must be broken, no need to send anything
+                } else {
+                    // otherwise the connection must be broken, no need to send anything
+                    error!(
+                        "Fail to proxy: {e}, downstream session type: {}",
+                        downstream_session.session_type()
+                    );
+                }
                 downstream_session.shutdown().await;
                 return None;
             }
@@ -304,12 +445,12 @@ where
     // return bool: server_session can be reused, and error if any
     async fn proxy_to_upstream(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let peer = match self.inner.upstream_peer(session, ctx).await {
             Ok(p) => p,
@@ -362,9 +503,31 @@ where
                         (server_reused, error)
                     }
                     ClientSession::Custom(mut c) => {
+                        let mut request_write_attempted = false;
                         let (server_reused, error) = self
-                            .proxy_to_custom_upstream(session, &mut c, client_reused, &peer, ctx)
+                            .proxy_to_custom_upstream(
+                                session,
+                                &mut c,
+                                client_reused,
+                                &peer,
+                                ctx,
+                                &mut request_write_attempted,
+                            )
                             .await;
+                        if request_write_attempted
+                            && error.as_ref().is_some_and(|e| {
+                                session.downstream_abandoned_during_cache_fill()
+                                    || session.is_cache_fill_cancellation(e)
+                            })
+                        {
+                            // Once the downstream is abandoned, the attempt can stop reading
+                            // mid-response, where a connected request would have read on, and
+                            // leave the session with no signal of where it left off, so it must
+                            // not be reused. Abandon before releasing rather than skipping
+                            // release outright, so the connector's own bookkeeping still runs.
+                            // Any other failed attempt is released as without the opt-in.
+                            c.abandon("proxy attempt failed").await;
+                        }
                         let session = ClientSession::Custom(c);
                         self.client_upstream
                             .release_http_session(session, &*peer, peer.idle_timeout())
@@ -390,13 +553,13 @@ where
 
     async fn upstream_filter(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         task: &mut HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Result<Option<Duration>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let duration = match task {
             HttpTask::Header(header, _eos) => {
@@ -405,12 +568,15 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
+                    .upstream_response_trailer_filter(session, trailers, ctx)
+                    .await?;
                 None
             }
             _ => {
@@ -424,14 +590,14 @@ where
 
     async fn finish(
         &self,
-        mut session: Session,
-        ctx: &mut SV::CTX,
+        mut session: Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         reuse: bool,
         error: Option<Box<Error>>,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         self.inner
             .logging(&mut session, error.as_deref(), ctx)
@@ -459,7 +625,7 @@ where
         }
     }
 
-    fn cleanup_sub_req(&self, session: &mut Session) {
+    fn cleanup_sub_req(&self, session: &mut Session<DS>) {
         if let Some(ctx) = session.subrequest_ctx.as_mut() {
             ctx.release_write_lock();
         }
@@ -473,9 +639,12 @@ use pingora_core::protocols::http::compression::ResponseCompressionCtx;
 ///
 /// This object is what users interact with in order to access the request itself or change the proxy
 /// behavior.
-pub struct Session {
+pub struct Session<DS = ()>
+where
+    DS: DownstreamSession,
+{
     /// the HTTP session to downstream (the client)
-    pub downstream_session: Box<HttpSession>,
+    pub downstream_session: Box<HttpSession<DS>>,
     /// The interface to control HTTP caching
     pub cache: HttpCache,
     /// (de)compress responses coming into the proxy (from upstream)
@@ -489,7 +658,7 @@ pub struct Session {
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
-    pub subrequest_spawner: Option<SubrequestSpawner>,
+    pub subrequest_spawner: Option<SubrequestSpawner<DS>>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
     /// Upstream filter modules. These run before `upstream_compression` and see the raw
@@ -499,17 +668,28 @@ pub struct Session {
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
+    /// Request body bytes written to the upstream (payload only). Set by proxy layer.
+    ///
+    /// `None` when the proxy layer does not track it (HTTP/2 and custom upstreams), which is
+    /// deliberately distinct from `Some(0)` so that "not measured" cannot be mistaken for
+    /// "a request body was dropped".
+    upstream_body_bytes_sent: Option<usize>,
     /// Whether proxy task filtering has seen a downstream 101 upgrade header.
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Set from [`ProxyHttp::should_handle_downstream_abandonment`] after `early_request_filter`.
+    handles_downstream_abandonment: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
 
-impl Session {
+impl<DS> Session<DS>
+where
+    DS: DownstreamSession,
+{
     fn new(
-        downstream_session: impl Into<Box<HttpSession>>,
+        downstream_session: impl Into<Box<HttpSession<DS>>>,
         downstream_modules: &HttpModules,
         #[cfg(feature = "upstream_modules")] upstream_modules: &HttpModules,
         shutdown_flag: Arc<AtomicBool>,
@@ -528,39 +708,12 @@ impl Session {
             #[cfg(feature = "upstream_modules")]
             upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
+            upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
+            handles_downstream_abandonment: false,
             shutdown_flag,
         }
-    }
-
-    /// Create a new [Session] from the given [Stream]
-    ///
-    /// This function is mostly used for testing and mocking, given the downstream modules and
-    /// shutdown flags will never be set.
-    pub fn new_h1(stream: Stream) -> Self {
-        let modules = HttpModules::new();
-        Self::new(
-            Box::new(HttpSession::new_http1(stream)),
-            &modules,
-            #[cfg(feature = "upstream_modules")]
-            &HttpModules::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-
-    /// Create a new [Session] from the given [Stream] with modules
-    ///
-    /// This function is mostly used for testing and mocking, given the shutdown flag will never be
-    /// set.
-    pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
-        Self::new(
-            Box::new(HttpSession::new_http1(stream)),
-            downstream_modules,
-            #[cfg(feature = "upstream_modules")]
-            &HttpModules::new(),
-            Arc::new(AtomicBool::new(false)),
-        )
     }
 
     /// Run upstream module filters on the given [`HttpTask`].
@@ -598,12 +751,150 @@ impl Session {
         Ok(())
     }
 
-    pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
+    pub fn as_downstream_mut(&mut self) -> &mut HttpSession<DS> {
         &mut self.downstream_session
     }
 
-    pub fn as_downstream(&self) -> &HttpSession {
+    pub fn as_downstream(&self) -> &HttpSession<DS> {
         &self.downstream_session
+    }
+
+    /// Whether [`ProxyHttp::should_handle_downstream_abandonment`] opted this request in.
+    ///
+    /// The proxy asks once, right after [`ProxyHttp::early_request_filter`] succeeds, so this is
+    /// `false` until then and already set when [`ProxyHttp::request_filter`] runs.
+    pub fn handles_downstream_abandonment(&self) -> bool {
+        self.handles_downstream_abandonment
+    }
+
+    /// Set whether this request opted in to downstream abandonment handling.
+    ///
+    /// The proxy applies [`ProxyHttp::should_handle_downstream_abandonment`]'s answer through this
+    /// method once per request. It is not public, since changing the answer later in the request
+    /// would change how an abandonment already recorded is handled.
+    ///
+    /// For a subrequest session it also sets the subrequest's idle wait: with `handles` set, the
+    /// wait ends once the response is no longer received instead of once request input closes.
+    /// A parent that closes request input may still want the response:
+    /// [`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest) drops its request sender
+    /// whenever it returns, including on an error, while the state it returns keeps the response
+    /// receiver ([`pipe_rx`](crate::subrequest::pipe::PipeSubrequestState::pipe_rx)) for the
+    /// caller to drain. Only dropping that receiver abandons the subrequest. This changes only
+    /// the idle wait, which a subrequest enters once its request body is complete.
+    pub(crate) fn set_handles_downstream_abandonment(&mut self, handles: bool) {
+        self.handles_downstream_abandonment = handles;
+        // pingora-core implements a subrequest's idle wait and cannot read this flag.
+        if let Some(subrequest) = self.downstream_session.as_subrequest_mut() {
+            subrequest.set_idle_watches_response_receiver(handles);
+        }
+    }
+
+    /// Whether Pingora kept processing a potential cache fill of this request after its
+    /// downstream became unusable, that is, whether
+    /// [`ProxyHttp::downstream_abandoned_during_cache_fill`] was called for it.
+    ///
+    /// This records a past event, not an active cache writer: it can be set before cache
+    /// admission, and it stays `true` after the fill is declined or the request is retried.
+    /// Always `false` unless [`Self::handles_downstream_abandonment`] is set.
+    pub fn downstream_abandoned_during_cache_fill(&self) -> bool {
+        self.handles_downstream_abandonment && self.cache.downstream_abandoned_during_cache_fill()
+    }
+
+    /// Whether `error` is a cancelled cache fill of a request that
+    /// [`ProxyHttp::should_handle_downstream_abandonment`] opted in: its root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED),
+    /// wrapped or not. Always `false` for a request that did not opt in.
+    pub(crate) fn is_cache_fill_cancellation(&self, error: &Error) -> bool {
+        self.handles_downstream_abandonment
+            && pingora_cache::fill_cancellation::is_cache_fill_cancelled(error)
+    }
+
+    /// The no-cache reason for a cache failure that `error` caused.
+    ///
+    /// For a request that [`ProxyHttp::should_handle_downstream_abandonment`] opted in, an error whose
+    /// root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED)
+    /// gives
+    /// [`REASON_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED),
+    /// whether or not the downstream was abandoned. Any other error, and any error of a request
+    /// that did not opt in, gives `fallback`.
+    pub(crate) fn cache_failure_reason(
+        &self,
+        error: &Error,
+        fallback: NoCacheReason,
+    ) -> NoCacheReason {
+        if self.is_cache_fill_cancellation(error) {
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        } else {
+            fallback
+        }
+    }
+
+    /// Whether this attempt's response work is done.
+    ///
+    /// A connected request follows downstream delivery. An abandoned request waits for the
+    /// upstream task producer and any active cache admission.
+    fn response_work_done(&self, response_state: &proxy_common::ResponseStateMachine) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            response_state.upstream_producer_done() && !self.cache.is_cache_admission_active()
+        } else {
+            response_state.is_done()
+        }
+    }
+
+    /// Whether the transport loop should still receive upstream tasks.
+    ///
+    /// Direct delivery may end before the upstream producer does; once the downstream is
+    /// abandoned only the producer's terminal task matters.
+    fn should_poll_upstream_tasks(
+        &self,
+        response_state: &proxy_common::ResponseStateMachine,
+    ) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            !response_state.upstream_producer_done()
+        } else {
+            !response_state.upstream_delivery_done()
+        }
+    }
+
+    /// Whether a downstream failure means the client left before its response was completely
+    /// delivered.
+    ///
+    /// A client whose response is complete (see
+    /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete))
+    /// has everything this request owes it. A failed read reaches this check only if it closed or
+    /// broke the client's connection or stream (see `HttpProxy::abandon_downstream_for_cache_fill`).
+    fn downstream_left_before_response_complete(&self) -> bool {
+        !self.downstream_session.is_response_complete()
+    }
+
+    /// Whether a retry is still possible after abandonment.
+    ///
+    /// A retried attempt of an abandoned request can only fill the cache, so caching must still
+    /// be enabled. A bypassed response is admitted only if `cache_miss` enables caching again,
+    /// which it just declined or has not been asked yet, and nobody waits on that. The attempt
+    /// also never reads the abandoned downstream again, so it can only resend a request body
+    /// whose framing completed successfully. It also must not start while this attempt's cache
+    /// writer is still active, since a new admission cannot start on top of it.
+    ///
+    /// A requested fill cancellation is not an input here, and cannot be; see
+    /// [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) for why, and for what an
+    /// application that must stop sooner does instead.
+    fn cache_fill_retry_allowed(&mut self) -> bool {
+        !self.downstream_abandoned_during_cache_fill()
+            || (self.downstream_session.is_body_complete()
+                && self.cache.enabled()
+                && !self.cache.is_cache_admission_active())
+    }
+
+    /// Record that the downstream became unusable during a potential cache fill, returning
+    /// `true` only the first time (see [`Self::downstream_abandoned_during_cache_fill`]).
+    ///
+    /// Records nothing if [`Self::handles_downstream_abandonment`] is unset or caching was
+    /// never enabled for this request.
+    pub(crate) fn mark_downstream_abandoned_during_cache_fill(&mut self) -> bool {
+        self.handles_downstream_abandonment
+            && self.cache.mark_downstream_abandoned_during_cache_fill()
     }
 
     /// Write HTTP response with the given error code to the downstream.
@@ -837,6 +1128,20 @@ impl Session {
         self.upstream_body_bytes_received = n;
     }
 
+    /// Get the request body bytes written to the upstream (payload only) recorded by the proxy
+    /// layer.
+    ///
+    /// Returns `None` when the proxy layer does not track it (HTTP/2 and custom upstreams).
+    pub fn upstream_body_bytes_sent(&self) -> Option<usize> {
+        self.upstream_body_bytes_sent
+    }
+
+    /// Set the request body bytes written to the upstream (payload only). Intended for internal
+    /// use by proxy layer.
+    pub(crate) fn set_upstream_body_bytes_sent(&mut self, n: usize) {
+        self.upstream_body_bytes_sent = Some(n);
+    }
+
     /// Get the upstream write pending time recorded by the proxy layer. Returns [`Duration::ZERO`] for HTTP/2.
     pub fn upstream_write_pending_time(&self) -> Duration {
         self.upstream_write_pending_time
@@ -892,6 +1197,37 @@ impl Session {
     }
 }
 
+impl Session<()> {
+    /// Create a new [Session] from the given [Stream]
+    ///
+    /// This function is mostly used for testing and mocking, given the downstream modules and
+    /// shutdown flags will never be set.
+    pub fn new_h1(stream: Stream) -> Self {
+        let modules = HttpModules::new();
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            &modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Create a new [Session] from the given [Stream] with modules
+    ///
+    /// This function is mostly used for testing and mocking, given the shutdown flag will never be
+    /// set.
+    pub fn new_h1_with_modules(stream: Stream, downstream_modules: &HttpModules) -> Self {
+        Self::new(
+            Box::new(HttpSession::new_http1(stream)),
+            downstream_modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct H1UpgradeRequestStatus {
     upstream: Option<bool>,
@@ -917,11 +1253,14 @@ impl H1UpgradeRequestSnapshot {
 /// 101 can establish a tunnel. Otherwise one side changes protocol while the
 /// other stays in HTTP handling, allowing tunneled traffic to bypass request
 /// processing or corrupt the connection state.
-fn reject_mismatched_h1_upgrade_101(
-    session: &Session,
+fn reject_mismatched_h1_upgrade_101<DS>(
+    session: &Session<DS>,
     header: &ResponseHeader,
     stage: &'static str,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     if header.status != http::StatusCode::SWITCHING_PROTOCOLS {
         return Ok(());
     }
@@ -945,11 +1284,14 @@ fn reject_mismatched_h1_upgrade_101(
     Ok(())
 }
 
-fn reject_unexpected_task_after_h1_upgrade(
-    session: &Session,
+fn reject_unexpected_task_after_h1_upgrade<DS>(
+    session: &Session<DS>,
     task: &'static str,
     task_filter_seen_upgraded: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     let status = session.h1_upgrade_request_snapshot();
     Error::e_explain(
         InvalidHTTPHeader,
@@ -965,10 +1307,13 @@ fn reject_unexpected_task_after_h1_upgrade(
     .map_err(|e| e.into_in())
 }
 
-fn reject_unexpected_upgraded_body_before_h1_upgrade(
-    session: &Session,
+fn reject_unexpected_upgraded_body_before_h1_upgrade<DS>(
+    session: &Session<DS>,
     task_filter_seen_upgraded: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    DS: DownstreamSession,
+{
     let status = session.h1_upgrade_request_snapshot();
     Error::e_explain(
         InvalidHTTPHeader,
@@ -984,29 +1329,41 @@ fn reject_unexpected_upgraded_body_before_h1_upgrade(
     .map_err(|e| e.into_in())
 }
 
-impl AsRef<HttpSession> for Session {
-    fn as_ref(&self) -> &HttpSession {
+impl<DS> AsRef<HttpSession<DS>> for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    fn as_ref(&self) -> &HttpSession<DS> {
         &self.downstream_session
     }
 }
 
-impl AsMut<HttpSession> for Session {
-    fn as_mut(&mut self) -> &mut HttpSession {
+impl<DS> AsMut<HttpSession<DS>> for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    fn as_mut(&mut self) -> &mut HttpSession<DS> {
         &mut self.downstream_session
     }
 }
 
 use std::ops::{Deref, DerefMut};
 
-impl Deref for Session {
-    type Target = HttpSession;
+impl<DS> Deref for Session<DS>
+where
+    DS: DownstreamSession,
+{
+    type Target = HttpSession<DS>;
 
     fn deref(&self) -> &Self::Target {
         &self.downstream_session
     }
 }
 
-impl DerefMut for Session {
+impl<DS> DerefMut for Session<DS>
+where
+    DS: DownstreamSession,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.downstream_session
     }
@@ -1024,18 +1381,19 @@ static BAD_GATEWAY: LazyLock<ResponseHeader> = LazyLock::new(|| {
     resp
 });
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_request(
         self: &Arc<Self>,
-        mut session: Session,
-        mut ctx: <SV as ProxyHttp>::CTX,
+        mut session: Session<DS>,
+        mut ctx: <SV as ProxyHttp<DS>>::CTX,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if let Err(e) = self
             .inner
@@ -1050,6 +1408,10 @@ where
         if self.inner.allow_spawning_subrequest(&session, &ctx) {
             session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
+        let handles_downstream_abandonment = self
+            .inner
+            .should_handle_downstream_abandonment(&session, &ctx);
+        session.set_handles_downstream_abandonment(handles_downstream_abandonment);
 
         let req = session.downstream_session.req_header_mut();
 
@@ -1167,7 +1529,10 @@ where
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
+                Some(mut error) => {
+                    if !session.cache_fill_retry_allowed() {
+                        error.set_retry(false);
+                    }
                     let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
@@ -1225,6 +1590,7 @@ where
                 } else {
                     NoCacheReason::InternalError
                 };
+                let reason = session.cache_failure_reason(e, reason);
                 session.cache.disable(reason);
             }
             let res = self.inner.fail_to_proxy(&mut session, e, &mut ctx).await;
@@ -1249,14 +1615,14 @@ where
 
     async fn handle_error(
         &self,
-        mut session: Session,
-        ctx: &mut <SV as ProxyHttp>::CTX,
+        mut session: Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         e: Box<Error>,
         context: &str,
     ) -> Option<ReusedHttpStream>
     where
-        SV: ProxyHttp + Send + Sync + 'static,
-        <SV as ProxyHttp>::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
         if !self.inner.suppress_error_log(&session, ctx, &e) {
@@ -1300,24 +1666,28 @@ error[E0391]: cycle detected when computing type of `proxy_cache::<impl at pingo
 
 */
 #[async_trait]
-pub trait Subrequest {
+pub trait Subrequest<DS = ()>
+where
+    DS: DownstreamSession,
+{
     async fn process_subrequest(
         self: Arc<Self>,
-        session: Box<HttpSession>,
+        session: Box<HttpSession<DS>>,
         sub_req_ctx: Box<SubrequestCtx>,
     );
 }
 
 #[async_trait]
-impl<SV, C> Subrequest for HttpProxy<SV, C>
+impl<SV, C, DS> Subrequest<DS> for HttpProxy<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    <SV as ProxyHttp>::CTX: Send + Sync,
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_subrequest(
         self: Arc<Self>,
-        session: Box<HttpSession>,
+        session: Box<HttpSession<DS>>,
         sub_req_ctx: Box<SubrequestCtx>,
     ) {
         debug!("starting subrequest");
@@ -1346,36 +1716,48 @@ where
 }
 
 /// A handle to the underlying HTTP proxy app that allows spawning subrequests.
-pub struct SubrequestSpawner {
-    app: Arc<dyn Subrequest + Send + Sync>,
+pub struct SubrequestSpawner<DS = ()>
+where
+    DS: DownstreamSession,
+{
+    app: Arc<dyn Subrequest<DS> + Send + Sync>,
 }
 
 /// A [`PreparedSubrequest`] that is ready to run.
-pub struct PreparedSubrequest {
-    app: Arc<dyn Subrequest + Send + Sync>,
-    session: Box<HttpSession>,
+pub struct PreparedSubrequest<DS = ()>
+where
+    DS: DownstreamSession,
+{
+    app: Arc<dyn Subrequest<DS> + Send + Sync>,
+    session: Box<HttpSession<DS>>,
     sub_req_ctx: Box<SubrequestCtx>,
 }
 
-impl PreparedSubrequest {
+impl<DS> PreparedSubrequest<DS>
+where
+    DS: DownstreamSession,
+{
     pub async fn run(self) {
         self.app
             .process_subrequest(self.session, self.sub_req_ctx)
             .await
     }
 
-    pub fn session(&self) -> &HttpSession {
+    pub fn session(&self) -> &HttpSession<DS> {
         self.session.as_ref()
     }
 
-    pub fn session_mut(&mut self) -> &mut HttpSession {
+    pub fn session_mut(&mut self) -> &mut HttpSession<DS> {
         self.session.deref_mut()
     }
 }
 
-impl SubrequestSpawner {
+impl<DS> SubrequestSpawner<DS>
+where
+    DS: DownstreamSession,
+{
     /// Create a new [`SubrequestSpawner`].
-    pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
+    pub fn new(app: Arc<dyn Subrequest<DS> + Send + Sync>) -> SubrequestSpawner<DS> {
         SubrequestSpawner { app }
     }
 
@@ -1383,7 +1765,7 @@ impl SubrequestSpawner {
     // TODO: allow configuring the subrequest session before use
     pub fn spawn_background_subrequest(
         &self,
-        session: &HttpSession,
+        session: &HttpSession<DS>,
         ctx: SubrequestCtx,
     ) -> tokio::task::JoinHandle<()> {
         let new_app = self.app.clone(); // Clone the Arc
@@ -1410,9 +1792,9 @@ impl SubrequestSpawner {
     // TODO: allow configuring the subrequest session before use
     pub fn create_subrequest(
         &self,
-        session: &HttpSession,
+        session: &HttpSession<DS>,
         ctx: SubrequestCtx,
-    ) -> (PreparedSubrequest, SubrequestHandle) {
+    ) -> (PreparedSubrequest<DS>, SubrequestHandle) {
         let new_app = self.app.clone(); // Clone the Arc
         let (mut session, handle) = subrequest::create_session(session);
         if ctx.body_mode() == BodyMode::NoBody {
@@ -1434,15 +1816,16 @@ impl SubrequestSpawner {
 }
 
 #[async_trait]
-impl<SV, C> HttpServerApp for HttpProxy<SV, C>
+impl<SV, C, DS> HttpServerApp<DS> for HttpProxy<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    <SV as ProxyHttp>::CTX: Send + Sync,
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     async fn process_new_http(
         self: &Arc<Self>,
-        mut session: HttpSession,
+        mut session: HttpSession<DS>,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
         // Extract user context from the previous request before the session is moved into the Box
@@ -1576,26 +1959,47 @@ where
     Service::new(name.to_string(), proxy)
 }
 
-/// Create a [Service] from the user implemented [ProxyHttp].
+/// Create a [`Service`] with a custom upstream connector and standard HTTP downstream sessions.
 ///
-/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service_with_name_custom<SV, C>(
+/// The returned [`Service`] can be hosted by a [`pingora_core::server::Server`] directly.
+pub fn http_proxy_service_with_name_custom_connector<SV, C>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
     connector: C,
-    on_custom: ProcessCustomSession<SV, C>,
 ) -> Service<HttpProxy<SV, C>>
 where
     SV: ProxyHttp + Send + Sync + 'static,
     SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
 {
+    let mut proxy = HttpProxy::new_custom(inner, conf.clone(), connector, None, None, None);
+    proxy.handle_init_modules();
+
+    Service::new(name.to_string(), proxy)
+}
+
+/// Create a [Service] from the user implemented [ProxyHttp].
+///
+/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service_with_name_custom<SV, C, DS>(
+    conf: &Arc<ServerConf>,
+    inner: SV,
+    name: &str,
+    connector: C,
+    on_custom: ProcessCustomSession<SV, C, DS>,
+) -> Service<HttpProxy<SV, C, DS>, DS>
+where
+    SV: ProxyHttp<DS> + Send + Sync + 'static,
+    <SV as ProxyHttp<DS>>::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+    DS: DownstreamSession,
+{
     let mut proxy =
         HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
-    Service::new(name.to_string(), proxy)
+    Service::<_, DS>::new_with_custom_session(name.to_string(), proxy)
 }
 
 /// A builder for a [Service] that can be used to create a [HttpProxy] instance
@@ -1603,27 +2007,23 @@ where
 /// The [ProxyServiceBuilder] can be used to construct a [HttpProxy] service with a custom name,
 /// connector, and custom session handler.
 ///
-pub struct ProxyServiceBuilder<SV, C>
+pub struct ProxyServiceBuilder<SV, C, DS = ()>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     conf: Arc<ServerConf>,
     inner: SV,
     name: String,
     connector: C,
-    custom: Option<ProcessCustomSession<SV, C>>,
+    custom: Option<ProcessCustomSession<SV, C, DS>>,
     server_options: Option<HttpServerOptions>,
     client_options: Option<ConnectorOptions>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
+    runtime_group: Option<String>,
 }
 
-impl<SV> ProxyServiceBuilder<SV, ()>
-where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
-{
+impl<SV> ProxyServiceBuilder<SV, (), ()> {
     /// Create a new [ProxyServiceBuilder] with the given [ServerConf] and [ProxyHttp]
     /// implementation.
     ///
@@ -1643,15 +2043,15 @@ where
             server_options: None,
             client_options: None,
             runtime_opts_override: None,
+            runtime_group: None,
         }
     }
 }
 
-impl<SV, C> ProxyServiceBuilder<SV, C>
+impl<SV, C, DS> ProxyServiceBuilder<SV, C, DS>
 where
-    SV: ProxyHttp + Send + Sync + 'static,
-    SV::CTX: Send + Sync + 'static,
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     /// Sets the name of the [HttpProxy] service.
     pub fn name(mut self, name: impl AsRef<str>) -> Self {
@@ -1667,11 +2067,15 @@ where
     /// between the proxy and the upstream server.
     ///
     /// Returns a new [ProxyServiceBuilder] with the custom connector and session handler.
-    pub fn custom<C2: custom::Connector>(
+    pub fn custom<C2, DS2>(
         self,
         connector: C2,
-        on_custom: ProcessCustomSession<SV, C2>,
-    ) -> ProxyServiceBuilder<SV, C2> {
+        on_custom: ProcessCustomSession<SV, C2, DS2>,
+    ) -> ProxyServiceBuilder<SV, C2, DS2>
+    where
+        C2: custom::Connector,
+        DS2: DownstreamSession,
+    {
         let Self {
             conf,
             inner,
@@ -1679,6 +2083,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1690,6 +2095,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         }
     }
 
@@ -1720,13 +2126,25 @@ where
         self
     }
 
+    /// Run the [Service] built by this builder in the named runtime group.
+    ///
+    /// See [`Service::set_runtime_group`].
+    pub fn runtime_group(mut self, group: impl Into<String>) -> Self {
+        self.runtime_group = Some(group.into());
+        self
+    }
+
     /// Builds a new [Service] from the [ProxyServiceBuilder].
     ///
     /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
     /// a fully initialized [HttpProxy].
     ///
     /// The returned [Service] is ready to be used by a [pingora_core::server::Server].
-    pub fn build(self) -> Service<HttpProxy<SV, C>> {
+    pub fn build(self) -> Service<HttpProxy<SV, C, DS>, DS>
+    where
+        SV: ProxyHttp<DS> + Send + Sync + 'static,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync + 'static,
+    {
         let Self {
             conf,
             inner,
@@ -1736,6 +2154,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         } = self;
 
         let mut proxy = HttpProxy::new_custom(
@@ -1748,9 +2167,12 @@ where
         );
 
         proxy.handle_init_modules();
-        let mut service = Service::new(name, proxy);
+        let mut service = Service::<_, DS>::new_with_custom_session(name, proxy);
         if let Some(runtime_opts_override) = runtime_opts_override {
             service.set_runtime_opts_override(runtime_opts_override);
+        }
+        if let Some(runtime_group) = runtime_group {
+            service.set_runtime_group(runtime_group);
         }
         service
     }
@@ -1762,6 +2184,7 @@ mod tests {
     use pingora_core::modules::http::{HttpModule, HttpModuleBuilder};
     use pingora_core::protocols::l4::stream::Stream as L4Stream;
     use pingora_core::protocols::l4::virt::{VirtualSockOpt, VirtualSocket, VirtualSocketStream};
+    use pingora_error::RetryType;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1770,15 +2193,15 @@ mod tests {
 
     #[derive(Debug)]
     struct StaticVirtualSocket {
-        read_buf: &'static [u8],
+        read_buf: Vec<u8>,
         read_pos: usize,
         write_buf: Arc<Mutex<Vec<u8>>>,
     }
 
     impl StaticVirtualSocket {
-        fn new(read_buf: &'static [u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
+        fn new(read_buf: &[u8], write_buf: Arc<Mutex<Vec<u8>>>) -> Self {
             Self {
-                read_buf,
+                read_buf: read_buf.to_vec(),
                 read_pos: 0,
                 write_buf,
             }
@@ -1826,15 +2249,146 @@ mod tests {
         }
     }
 
-    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
-        let socket = StaticVirtualSocket::new(
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-            written,
-        );
+    async fn new_request_session(request: &[u8], written: Arc<Mutex<Vec<u8>>>) -> Session {
+        let socket = StaticVirtualSocket::new(request, written);
         let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
         let mut session = Session::new_h1(Box::new(stream));
         session.read_request().await.unwrap();
         session
+    }
+
+    async fn new_upgrade_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
+        new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            written,
+        )
+        .await
+    }
+
+    struct DefaultRetryProxy;
+
+    #[async_trait]
+    impl ProxyHttp for DefaultRetryProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!()
+        }
+    }
+
+    fn default_policy_would_retry_for_session(
+        session: &mut Session,
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut error = Error::new_up(ReadError);
+        error.retry = retry;
+
+        DefaultRetryProxy
+            .error_while_proxy(
+                &HttpPeer::new("127.0.0.1:80", false, "".to_string()),
+                session,
+                error,
+                &mut (),
+                client_reused,
+            )
+            .retry()
+    }
+
+    async fn default_policy_would_retry(
+        request: &[u8],
+        retry: RetryType,
+        client_reused: bool,
+    ) -> bool {
+        let mut session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        default_policy_would_retry_for_session(&mut session, retry, client_reused)
+    }
+
+    async fn buffered_put_session(body_len: usize) -> Session {
+        let mut request =
+            format!("PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: {body_len}\r\n\r\n")
+                .into_bytes();
+        request.resize(request.len() + body_len, b'a');
+
+        let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
+        session.enable_retry_buffering();
+        while session.read_request_body().await.unwrap().is_some() {}
+        session
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_idempotent_method() {
+        let decided_retry = RetryType::Decided(true);
+        assert!(
+            default_policy_would_retry(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            default_policy_would_retry(
+                b"PUT / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+        assert!(
+            !default_policy_would_retry(
+                b"PATCH / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                decided_retry,
+                false,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_resolves_reused_only() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assert!(default_policy_would_retry(request, RetryType::ReusedOnly, true).await);
+        assert!(!default_policy_would_retry(request, RetryType::ReusedOnly, false).await);
+    }
+
+    #[tokio::test]
+    async fn default_retry_policy_requires_an_untruncated_body_buffer() {
+        let mut complete = buffered_put_session(64 * 1024).await;
+        assert!(!complete.retry_buffer_truncated());
+        assert!(default_policy_would_retry_for_session(
+            &mut complete,
+            RetryType::Decided(true),
+            false,
+        ));
+
+        let mut truncated = buffered_put_session(64 * 1024 + 1).await;
+        assert!(truncated.retry_buffer_truncated());
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::Decided(true),
+            false,
+        ));
+        assert!(!default_policy_would_retry_for_session(
+            &mut truncated,
+            RetryType::ReusedOnly,
+            true,
+        ));
     }
 
     fn upgrade_response_header() -> ResponseHeader {
@@ -2278,5 +2832,449 @@ mod tests {
         assert!(called.load(Ordering::Acquire));
         let written = written.lock().unwrap().clone();
         assert_raw_upgrade_payload(&written);
+    }
+
+    /// A socket whose reads never complete, like an idle keep-alive connection
+    /// waiting for its next request.
+    #[derive(Debug)]
+    struct PendingVirtualSocket;
+
+    impl AsyncRead for PendingVirtualSocket {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingVirtualSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl VirtualSocket for PendingVirtualSocket {
+        fn set_socket_option(&self, _opt: VirtualSockOpt) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopProxy;
+
+    #[async_trait]
+    impl ProxyHttp for NoopProxy {
+        type CTX = ();
+        fn new_ctx(&self) -> Self::CTX {}
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            Err(Error::new(InternalError))
+        }
+    }
+
+    fn pending_session() -> Box<HttpSession> {
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(PendingVirtualSocket)));
+        Box::new(HttpSession::new_http1(Box::new(stream)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_wakes_parked_read_requests() {
+        let conf = ServerConf {
+            threads: 4,
+            ..ServerConf::default()
+        };
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(conf)));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let proxy = proxy.clone();
+                tokio::spawn(async move { proxy.handle_new_request(pending_session()).await })
+            })
+            .collect();
+        // let the tasks park in read_request()
+        time::sleep(Duration::from_millis(50)).await;
+        proxy.http_cleanup().await;
+        for handle in handles {
+            let session = time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("shutdown did not wake the parked read")
+                .unwrap();
+            assert!(session.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_read_request_parks_returns_immediately() {
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(ServerConf::default())));
+        proxy.http_cleanup().await;
+        // a request that parks after notify_waiters() already fired must not
+        // wait for a notification that will never come
+        let session = time::timeout(
+            Duration::from_secs(5),
+            proxy.handle_new_request(pending_session()),
+        )
+        .await
+        .expect("read_request parked after shutdown");
+        assert!(session.is_none());
+    }
+
+    /// Opts a request in from `early_request_filter` and records what `request_filter` sees.
+    struct AbandonmentOptInProxy {
+        seen_in_request_filter: Arc<std::sync::OnceLock<bool>>,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for AbandonmentOptInProxy {
+        type CTX = bool;
+
+        fn new_ctx(&self) -> Self::CTX {
+            false
+        }
+
+        async fn early_request_filter(
+            &self,
+            session: &mut Session,
+            opt_in: &mut bool,
+        ) -> Result<()> {
+            *opt_in = session.get_header_bytes("x-opt-in") == b"true";
+            Ok(())
+        }
+
+        fn should_handle_downstream_abandonment(&self, _session: &Session, opt_in: &bool) -> bool {
+            *opt_in
+        }
+
+        async fn request_filter(&self, session: &mut Session, _opt_in: &mut bool) -> Result<bool> {
+            self.seen_in_request_filter
+                .set(session.handles_downstream_abandonment())
+                .unwrap();
+            session.respond_error(204).await?;
+            Ok(true)
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _opt_in: &mut bool,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("request_filter responds to every request")
+        }
+    }
+
+    async fn opt_in_seen_by_request_filter(request: &[u8]) -> Option<bool> {
+        let seen_in_request_filter = Arc::new(std::sync::OnceLock::new());
+        let proxy = Arc::new(HttpProxy::new(
+            AbandonmentOptInProxy {
+                seen_in_request_filter: seen_in_request_filter.clone(),
+            },
+            Arc::new(ServerConf::default()),
+        ));
+        let session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        proxy.process_request(session, false).await;
+        seen_in_request_filter.get().copied()
+    }
+
+    #[tokio::test]
+    async fn request_filter_sees_the_downstream_abandonment_opt_in() {
+        let opted_in = b"GET / HTTP/1.1\r\nHost: example.com\r\nx-opt-in: true\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(opted_in).await, Some(true));
+        let default = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(default).await, Some(false));
+    }
+
+    mod suppress_error_log_default {
+        use super::*;
+        use crate::proxy_common::cache_fill_cancelled;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+
+        /// A session whose opted-in request's downstream was abandoned during a cache fill.
+        async fn abandoned_session(path: &str) -> Session {
+            cache_miss_session(path, &AbandonmentTiming::BeforeAttempt, true)
+                .await
+                .0
+        }
+
+        fn unrelated_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        /// Always answers `suppress_error_log` the same way, to prove an override wins over
+        /// the default regardless of the error's etype.
+        struct OverrideProxy(bool);
+
+        #[async_trait]
+        impl ProxyHttp for OverrideProxy {
+            type CTX = ();
+            fn new_ctx(&self) -> Self::CTX {}
+
+            async fn upstream_peer(
+                &self,
+                _session: &mut Session,
+                _ctx: &mut Self::CTX,
+            ) -> Result<Box<HttpPeer>> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn suppress_error_log(
+                &self,
+                _session: &Session,
+                _ctx: &Self::CTX,
+                _error: &Error,
+            ) -> bool {
+                self.0
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_cancellation_error_is_suppressed_by_default() {
+            let session = abandoned_session("/suppress-only-cancellation").await;
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an application-requested cancellation must not flood the error log"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &unrelated_error()),
+                "an unrelated error must still log at error level"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_override_replaces_the_default_in_both_directions() {
+            let session = abandoned_session("/suppress-override").await;
+            assert!(
+                OverrideProxy(true).suppress_error_log(&session, &(), &unrelated_error()),
+                "an override that suppresses everything must still suppress an unrelated error"
+            );
+            assert!(
+                !OverrideProxy(false).suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an override that suppresses nothing must still log the cancellation error"
+            );
+        }
+
+        #[tokio::test]
+        async fn nothing_is_suppressed_by_default_without_the_opt_in() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-without-opt-in",
+                &AbandonmentTiming::AfterAdmission,
+                false,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a request that did not opt in must keep logging every final error"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy, so a cancellation that
+        // reaches a connected request comes from elsewhere and is a failure worth logging.
+        #[tokio::test]
+        async fn a_connected_request_logs_its_cancellation() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-connected",
+                &AbandonmentTiming::AfterAdmission,
+                true,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a cancellation that failed a connected request was hidden from the error log"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wrapped_cancellation_is_still_suppressed_by_default() {
+            let session = abandoned_session("/suppress-wrapped").await;
+            let wrap = |cause: Box<Error>| {
+                Error::because(ErrorType::InternalError, "storage wrapped", cause)
+            };
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &wrap(cache_fill_cancelled())),
+                "wrapping the cancellation made it log at error level"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &wrap(unrelated_error())),
+                "a wrapped unrelated error must still log at error level"
+            );
+        }
+    }
+
+    mod fail_to_proxy_default {
+        use super::*;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+        use tokio::io::{AsyncReadExt, DuplexStream};
+
+        /// Run the default `fail_to_proxy` and return its code with whatever reached the client.
+        async fn fail_to_proxy_outcome(
+            path: &str,
+            abandonment: AbandonmentTiming,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(path, &abandonment, true).await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy.fail_to_proxy(&mut session, &error, &mut true).await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        async fn read_to_end(mut client: DuplexStream) -> Vec<u8> {
+            let mut written = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut written))
+                .await
+                .expect("dropping the session did not close the client half")
+                .unwrap();
+            written
+        }
+
+        fn upstream_read_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        // Nothing reaches a downstream that a cache fill abandoned, so by default no status
+        // describes the failure. `error_response_still_reaches_a_live_downstream` is the
+        // connected twin.
+        #[tokio::test]
+        async fn abandoned_downstream_reports_no_status_by_default() {
+            for (path, error) in [
+                ("/fail-to-proxy-abandoned-upstream", upstream_read_error()),
+                (
+                    "/fail-to-proxy-abandoned-http-status",
+                    Error::new(ErrorType::HTTPStatus(503)),
+                ),
+            ] {
+                let (code, written) =
+                    fail_to_proxy_outcome(path, AbandonmentTiming::BeforeAttempt, error).await;
+                assert_eq!(code, 0, "{path}: reported a status nobody received");
+                assert!(
+                    written.is_empty(),
+                    "{path}: an error response was written to an abandoned downstream: {written:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn error_response_still_reaches_a_live_downstream() {
+            let (code, written) = fail_to_proxy_outcome(
+                "/fail-to-proxy-live-upstream",
+                AbandonmentTiming::AfterAdmission,
+                upstream_read_error(),
+            )
+            .await;
+            assert_eq!(code, 502);
+            assert!(
+                written.starts_with(b"HTTP/1.1 502 "),
+                "the live downstream did not get the error response: {written:?}"
+            );
+        }
+
+        /// Run the default `fail_to_proxy` on a connected request's `error`.
+        async fn connected_fail_to_proxy_outcome(
+            path: &str,
+            mut handles_abandonment: bool,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(
+                path,
+                &AbandonmentTiming::AfterAdmission,
+                handles_abandonment,
+            )
+            .await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy
+                .fail_to_proxy(&mut session, &error, &mut handles_abandonment)
+                .await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        #[tokio::test]
+        async fn cancelled_error_keeps_the_old_mapping_without_the_opt_in() {
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-cancelled-without-opt-in",
+                false,
+                crate::proxy_common::cache_fill_cancelled(),
+            )
+            .await;
+            assert_eq!(
+                code, 400,
+                "a downstream error of a request that did not opt in keeps its old status"
+            );
+            assert!(
+                written.starts_with(b"HTTP/1.1 400 "),
+                "the error response must still be written: {written:?}"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy. A cancellation that fails a
+        // connected request, for example one a storage raised itself, still owes the client an
+        // error response.
+        #[tokio::test]
+        async fn a_connected_request_still_gets_an_error_response_for_a_cancellation() {
+            let storage_cancellation = Error::explain(
+                pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED,
+                "storage cancelled the fill",
+            );
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-connected-cancellation",
+                true,
+                storage_cancellation,
+            )
+            .await;
+            assert_eq!(code, 500);
+            assert!(
+                written.starts_with(b"HTTP/1.1 500 "),
+                "the connected client did not get an error response: {written:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_fill_classification_follows_the_opt_in() {
+        let cancelled = Error::because(
+            InternalError,
+            "storage wrapped",
+            proxy_common::cache_fill_cancelled(),
+        );
+        let mut session = new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "a request that did not opt in keeps the old no-cache reason"
+        );
+
+        session.set_handles_downstream_abandonment(true);
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        );
+        assert_eq!(
+            session.cache_failure_reason(&Error::new(InternalError), NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "only a cancelled fill changes the reason"
+        );
     }
 }

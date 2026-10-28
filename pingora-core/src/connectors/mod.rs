@@ -22,6 +22,7 @@ mod tls;
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
 
+use crate::protocols::http::v1::ResponseParserConfig;
 use crate::protocols::l4::ext::attach_connect_local_addr;
 use crate::protocols::{GetSocketDigest, Stream};
 use crate::server::configuration::ServerConf;
@@ -94,6 +95,12 @@ pub struct ConnectorOptions {
     /// its per-worker meaning even though the pool itself now uses a single
     /// global LRU.
     pub keepalive_pool_size: usize,
+    /// Configuration for parsing HTTP/1 response heads.
+    ///
+    /// By default, at most 256 fields are accepted and obsolete response syntax is rejected.
+    /// The field-count limit does not replace Pingora's byte-size limit for the complete
+    /// response head.
+    pub h1_response_parser_config: ResponseParserConfig,
     /// Optionally offload the connection establishment to dedicated thread pools
     ///
     /// TCP and TLS connection establishment can be CPU intensive. Sometimes such tasks can slow
@@ -143,6 +150,7 @@ impl ConnectorOptions {
             keepalive_pool_size: server_conf
                 .upstream_keepalive_pool_size
                 .saturating_mul(server_conf.threads.max(1)),
+            h1_response_parser_config: ResponseParserConfig::default(),
             offload_threadpool: server_conf.upstream_connect_offload_threadpool(),
             bind_to_v4,
             bind_to_v6,
@@ -159,11 +167,25 @@ impl ConnectorOptions {
             cert_key_file: None,
             debug_ssl_keylog: false,
             keepalive_pool_size,
+            h1_response_parser_config: ResponseParserConfig::default(),
             offload_threadpool: None,
             bind_to_v4: vec![],
             bind_to_v6: vec![],
             keepalive_pool_callback: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod response_parser_config_tests {
+    use super::*;
+
+    #[test]
+    fn connector_options_use_strict_response_parser_defaults() {
+        assert_eq!(
+            ConnectorOptions::new(1).h1_response_parser_config,
+            ResponseParserConfig::default()
+        );
     }
 }
 
@@ -656,7 +678,7 @@ mod tests {
         // make a new connection to mock uds
         let mut stream = connector.new_stream(&peer).await.unwrap();
         let mut buf = [0; 9];
-        let _ = stream.read(&mut buf).await.unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"it works!");
 
         // Test connection reuse by releasing and getting the stream back
