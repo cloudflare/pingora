@@ -504,9 +504,7 @@ impl CustomSession for HeaderReadFailureUpstream {
         false
     }
 
-    async fn shutdown(&mut self, _code: u32, _ctx: &str) {
-        unreachable!("client session: shutdown")
-    }
+    async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         self.upgraded_response

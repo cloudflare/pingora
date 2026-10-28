@@ -527,7 +527,9 @@ where
                             // leave the session with no signal of where it left off, so it must
                             // not be reused. Abandon before releasing rather than skipping
                             // release outright, so the connector's own bookkeeping still runs.
-                            // Any other failed attempt is released as without the opt-in.
+                            // Once its request header is written, any other failed attempt is
+                            // already abandoned by `proxy_to_custom_upstream`, so widening this
+                            // condition would abandon that session twice.
                             c.abandon("proxy attempt failed").await;
                         }
                         let session = ClientSession::Custom(c);
