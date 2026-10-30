@@ -120,6 +120,20 @@ struct H2BodySendError {
     /// Whether the downstream H2 stream closed while the body write to the upstream was pending.
     /// A request body filter error is not a close, even with a downstream source.
     downstream_closed: bool,
+    /// Whether writing the body to the upstream failed, e.g. because the upstream reset the
+    /// request stream or the write timed out. A request body filter error is not a write
+    /// failure, even with an upstream source.
+    upstream_write_failed: bool,
+}
+
+impl H2BodySendError {
+    fn upstream_write(error: Box<Error>) -> Self {
+        Self {
+            error: error.into_up(),
+            downstream_closed: false,
+            upstream_write_failed: true,
+        }
+    }
 }
 
 impl From<Box<Error>> for H2BodySendError {
@@ -127,6 +141,7 @@ impl From<Box<Error>> for H2BodySendError {
         Self {
             error,
             downstream_closed: false,
+            upstream_write_failed: false,
         }
     }
 }
@@ -574,32 +589,38 @@ where
         );
 
         #[cfg(not(feature = "early_body_buffer"))]
-        if let Some(buffer) = buffer {
-            self.send_body_to2(
-                session,
-                Some(buffer),
-                request_body_finished,
-                client_body,
-                ctx,
-                write_timeout,
-            )
-            .await
-            .map_err(|e| e.error)?;
-        }
-
+        let send_buffered = buffer.is_some();
         // The caller already ended an empty buffered body on HEADERS or empty DATA.
         #[cfg(feature = "early_body_buffer")]
-        if !upstream_body_finished && (buffer.is_some() || session.is_body_buffered()) {
-            self.send_body_to2(
-                session,
-                buffer,
-                request_body_finished,
-                client_body,
-                ctx,
-                write_timeout,
-            )
-            .await
-            .map_err(|e| e.error)?;
+        let send_buffered =
+            !upstream_body_finished && (buffer.is_some() || session.is_body_buffered());
+        if send_buffered {
+            match self
+                .send_body_to2(
+                    session,
+                    buffer,
+                    request_body_finished,
+                    client_body,
+                    ctx,
+                    write_timeout,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(H2BodySendError {
+                    error: e,
+                    upstream_write_failed: true,
+                    ..
+                }) if upstream_ended_stream(client_body) => {
+                    // As in the loop below: the upstream may still answer, e.g. with an early
+                    // response, so stop sending the body but keep handling the response.
+                    self.log_upstream_body_write_error(session, ctx, client_body, &e);
+                    downstream_state.to_stopped();
+                }
+                // E.g. the write timed out: the stream is still open and the upstream may be
+                // waiting for the rest of the body, so fail the attempt as before.
+                Err(H2BodySendError { error: e, .. }) => return Err(e),
+            }
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -692,7 +713,7 @@ where
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
-                        Err(H2BodySendError { error: e, downstream_closed }) if e.esource == ErrorSource::Downstream => {
+                        Err(H2BodySendError { error: e, downstream_closed, .. }) if e.esource == ErrorSource::Downstream => {
                             // Downstream reset/errored while the upstream write was blocked
                             // (e.g. on upstream flow control). Same policy as the read error
                             // handling above: ignore the downstream error if the upstream
@@ -732,11 +753,33 @@ where
                             // downstream session anyway.
                             session.downstream_session.on_proxy_failure(e);
                         },
+                        Err(H2BodySendError { error: e, upstream_write_failed: true, .. }) => {
+                            self.log_upstream_body_write_error(session, ctx, client_body, &e);
+                            // Writing the body to the upstream failed, e.g. the upstream
+                            // answered early and reset the request stream, or the write timed
+                            // out. Stop polling the downstream body, but leave the downstream
+                            // reusable: the response decides whether this attempt fails, and
+                            // finishing a reusable session drains the unread body instead of
+                            // closing on it, which would reset the client before it reads the
+                            // response. This matches the HTTP/1 upstream path.
+                            //
+                            // The upload error is only logged here. If the response then fails,
+                            // that error is what the attempt returns; the HTTP/1 path reports the
+                            // upload error and keeps the response error as context instead.
+                            //
+                            // The client's custom-message stream is still read until it closes,
+                            // as after a completed upload; the custom upstream path cancels it
+                            // on an upload failure instead.
+                            downstream_state.to_stopped();
+                        }
                         Err(H2BodySendError { error: e, .. }) => {
-                            // mark request done, attempt to drain receive
-                            warn!("Upstream h2 body send error: {e}");
-                            // upstream is what actually errored but we don't want to continue
-                            // polling the downstream body
+                            // A request body filter failed without blaming the client, whatever
+                            // source it set. The upstream did not stop the upload, so don't drain
+                            // or reuse the downstream; stop polling its body.
+                            warn!(
+                                "h2 request body filter error: {e}, {}",
+                                self.inner.request_summary(session, ctx)
+                            );
                             downstream_state.to_errored();
                         }
                     };
@@ -1160,6 +1203,31 @@ where
         res
     }
 
+    /// Logs a failed write of the request body to the upstream. An upstream that stopped the
+    /// upload with `RST_STREAM(NO_ERROR)` answered early, which HTTP/2 allows (RFC 9113 section
+    /// 8.1), so that is only logged at debug level.
+    fn log_upstream_body_write_error(
+        &self,
+        session: &Session<DS>,
+        ctx: &<SV as ProxyHttp<DS>>::CTX,
+        client_body: &mut h2::SendStream<Bytes>,
+        e: &Error,
+    ) where
+        SV: ProxyHttp<DS> + Send + Sync,
+    {
+        if upstream_stopped_upload_early(client_body) {
+            debug!(
+                "Upstream h2 stopped the request body early: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+        } else {
+            warn!(
+                "Upstream h2 body send error: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+        }
+    }
+
     async fn send_body_to2(
         &self,
         session: &mut Session<DS>,
@@ -1219,7 +1287,7 @@ where
             tokio::select! {
                 biased;
                 res = write_body(client_body, data, end, write_timeout) => {
-                    res.map_err(|e| e.into_up())?;
+                    res.map_err(H2BodySendError::upstream_write)?;
                 }
                 close_result = stream_close => {
                     return match close_result {
@@ -1229,17 +1297,38 @@ where
                         ),
                         Err(e) => Err(e),
                     }
-                    .map_err(|e| H2BodySendError { error: e.into_down(), downstream_closed: true });
+                    .map_err(|e| H2BodySendError {
+                        error: e.into_down(),
+                        downstream_closed: true,
+                        upstream_write_failed: false,
+                    });
                 }
             }
         } else {
             write_body(client_body, data, end, write_timeout)
                 .await
-                .map_err(|e| e.into_up())?;
+                .map_err(H2BodySendError::upstream_write)?;
         }
 
         Ok(end_of_body)
     }
+}
+
+/// Whether the upstream ended the request stream, e.g. it reset the stream after answering
+/// early, or the connection refused or lost it. A write that timed out leaves the stream open.
+fn upstream_ended_stream(client_body: &mut h2::SendStream<Bytes>) -> bool {
+    std::future::poll_fn(|cx| client_body.poll_reset(cx))
+        .now_or_never()
+        .is_some()
+}
+
+/// Whether the upstream reset the request stream with `NO_ERROR`, i.e. stopped the upload after
+/// answering early.
+fn upstream_stopped_upload_early(client_body: &mut h2::SendStream<Bytes>) -> bool {
+    matches!(
+        std::future::poll_fn(|cx| client_body.poll_reset(cx)).now_or_never(),
+        Some(Ok(h2::Reason::NO_ERROR))
+    )
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
@@ -2173,5 +2262,471 @@ mod tests {
             "a committed response must end the loop normally"
         );
         assert!(CANCELLATION_WATCHED_STORAGE.is_committed(path).await);
+    }
+
+    /// How the upload stops in [`run_upload_stop`].
+    #[derive(Clone, Copy)]
+    enum UploadStop {
+        /// The upstream reads the start of the upload, then stops it with `RST_STREAM(NO_ERROR)`
+        /// without granting more flow-control capacity, and answers once the client connection
+        /// has seen the reset.
+        UpstreamReset,
+        /// The request body filter fails without blaming the client; the upstream answers
+        /// without reading anything.
+        BodyFilterError,
+    }
+
+    /// Where the upload in [`run_upload_stop`] comes from.
+    #[derive(Clone, Copy, PartialEq)]
+    enum UploadSource {
+        /// Read from the client by the transport loop; the client is still sending when the
+        /// upstream stops the upload.
+        Streamed,
+        /// Already read into the retry buffer, as for a retried attempt, and sent before the loop.
+        RetryBuffer,
+        /// Buffered early by the application and sent before the loop.
+        #[cfg(feature = "early_body_buffer")]
+        EarlyBuffered,
+    }
+
+    impl UploadSource {
+        /// The bytes sent upstream. Each exceeds the stream window of the test upstream in
+        /// [`run_upload_stop`], so the upload is still blocked on flow control when the upstream
+        /// resets it.
+        fn len(self) -> usize {
+            match self {
+                UploadSource::Streamed => UPLOAD_LEN,
+                // Exactly the retry buffer limit.
+                UploadSource::RetryBuffer => 64 * 1024,
+                #[cfg(feature = "early_body_buffer")]
+                UploadSource::EarlyBuffered => 1 << 20,
+            }
+        }
+
+        /// The `content-length` the client declares.
+        fn declared_len(self) -> usize {
+            match self {
+                #[cfg(feature = "early_body_buffer")]
+                UploadSource::EarlyBuffered => 0,
+                _ => self.len(),
+            }
+        }
+    }
+
+    /// Fails `request_body_filter` with an error that has no source set, as `Error::explain`
+    /// produces, or with `upstream_source` one that an application tagged as an upstream error.
+    struct RejectingBodyFilter {
+        upstream_source: bool,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for RejectingBodyFilter {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test calls the transport loop directly")
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            let e = Error::explain(InternalError, "rejected request body");
+            Err(if self.upstream_source { e.into_up() } else { e })
+        }
+    }
+
+    /// What [`run_upload_stop`] saw.
+    struct UploadStopOutcome {
+        result: Result<bool>,
+        /// Whether `finish()` drained the unread upload and returned a reusable connection.
+        /// `None` when the loop did not leave the downstream reusable, so it was dropped.
+        drained_and_reusable: Option<bool>,
+        /// The bytes the client received.
+        response: String,
+        /// Whether the upstream stopped the upload with `RST_STREAM(NO_ERROR)`, as seen by the
+        /// check that picks the log level.
+        upstream_stopped_early: bool,
+    }
+
+    const UPLOAD_LEN: usize = 256 * 1024;
+    const EARLY_RESPONSE_BODY: &[u8] = &[b'r'; 200];
+
+    /// Proxies an HTTP/1 upload from `source` to an HTTP/2 upstream that answers it early with
+    /// a `413` carrying [`EARLY_RESPONSE_BODY`], stopping the upload as `stop` says. With
+    /// `cache_miss` the request is a streaming cache miss.
+    async fn run_upload_stop<SV>(
+        app: SV,
+        path: &str,
+        source: UploadSource,
+        stop: UploadStop,
+        cache_miss: bool,
+    ) -> UploadStopOutcome
+    where
+        SV: ProxyHttp<CTX = ()> + Send + Sync,
+    {
+        let declared_len = source.declared_len();
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: example.com\r\nContent-Length: {declared_len}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        // As an application that drains unread request bodies after an early response does.
+        session
+            .downstream_session
+            .set_close_on_response_before_downstream_finish(false);
+        if cache_miss {
+            session
+                .cache
+                .enable(&*WRITER_DEMAND_CACHE, None, None, None, None);
+            session.cache.set_cache_key(CacheKey::new(path, ""));
+            session.cache.cache_miss();
+            assert_eq!(session.cache.support_streaming_partial_write(), Some(true));
+        }
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let client_upload = tokio::spawn(async move {
+            let _ = client_write.write_all(&vec![b'u'; declared_len]).await;
+            client_write
+        });
+        match source {
+            UploadSource::Streamed => {}
+            UploadSource::RetryBuffer => {
+                session.as_mut().enable_retry_buffering();
+                let mut read = 0;
+                while read < source.len() {
+                    read += session.read_request_body().await.unwrap().unwrap().len();
+                }
+                assert!(session.as_mut().is_body_done());
+                assert_eq!(
+                    session.as_ref().get_retry_buffer().map(|b| b.len()),
+                    Some(source.len())
+                );
+            }
+            #[cfg(feature = "early_body_buffer")]
+            UploadSource::EarlyBuffered => session
+                .set_buffered_body(Some(Bytes::from(vec![b'u'; source.len()])))
+                .unwrap(),
+        }
+
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(1 << 20);
+        let upstream_server = tokio::spawn(async move {
+            // Smaller than every upload, so each one is still blocked on flow control when the
+            // upstream resets it, whatever h2's default window is.
+            let mut connection = h2::server::Builder::new()
+                .initial_window_size(16 * 1024)
+                .handshake::<_, Bytes>(upstream_server_io)
+                .await
+                .unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let connection_task =
+                tokio::spawn(async move { while connection.accept().await.is_some() {} });
+            if matches!(stop, UploadStop::UpstreamReset) {
+                let _ = request.into_body().data().await;
+                respond.send_reset(h2::Reason::NO_ERROR);
+            }
+            let _ = connection_task.await;
+        });
+        let (h2_client, connection) = h2::client::handshake(upstream_client_io).await.unwrap();
+        let upstream_connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://example.com{path}"))
+            .body(())
+            .unwrap();
+        let (upstream_response, mut request_body) = h2_client.send_request(request, false).unwrap();
+
+        let proxy = HttpProxy::new(app, Arc::new(ServerConf::default()));
+        let (response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let mut ctx = ();
+        let proxy_loop = proxy.bidirection_down_to_up(
+            &mut session,
+            &mut request_body,
+            response_rx,
+            &mut ctx,
+            None,
+            false,
+            &mut custom_writer,
+            &mut custom_reader,
+            Arc::new(AtomicU8::new(PipeState::Active as u8)),
+        );
+        let upstream = async move {
+            if matches!(stop, UploadStop::UpstreamReset) {
+                // The client connection has processed the reset, so the next upload write fails.
+                assert!(upstream_response.await.is_err());
+            }
+            let mut header = ResponseHeader::build(413, None).unwrap();
+            header
+                .insert_header("content-length", EARLY_RESPONSE_BODY.len().to_string())
+                .unwrap();
+            // A loop that has already ended dropped its receiver; its result says why.
+            for task in [
+                HttpTask::Header(Box::new(header), false),
+                HttpTask::Body(Some(Bytes::from_static(EARLY_RESPONSE_BODY)), true),
+                HttpTask::Done,
+            ] {
+                if response_tx.send(task).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(proxy_loop, upstream)
+        })
+        .await
+        .expect("H2 transport loop did not finish");
+
+        let upstream_stopped_early = upstream_stopped_upload_early(&mut request_body);
+        let drained_and_reusable = if matches!(result, Ok(true)) {
+            assert_eq!(
+                session.downstream_session.is_body_done(),
+                source != UploadSource::Streamed,
+                "only a streamed upload is left unread"
+            );
+            let reused =
+                tokio::time::timeout(Duration::from_secs(5), session.downstream_session.finish())
+                    .await
+                    .expect("draining the upload did not finish");
+            Some(matches!(reused, Ok(Some(_))))
+        } else {
+            drop(session);
+            None
+        };
+        let _client_write = client_upload.await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        upstream_server.abort();
+        upstream_connection.abort();
+        UploadStopOutcome {
+            result,
+            drained_and_reusable,
+            response: String::from_utf8(response).unwrap(),
+            upstream_stopped_early,
+        }
+    }
+
+    /// Asserts that the client received the complete early `413`, after an upstream that stopped
+    /// the upload with `RST_STREAM(NO_ERROR)`.
+    fn assert_early_response_after_upstream_reset(upstream_stopped_early: bool, response: &str) {
+        assert!(upstream_stopped_early);
+        assert_client_received_early_response(response);
+    }
+
+    /// Asserts that the client received the complete early `413`.
+    fn assert_client_received_early_response(response: &str) {
+        assert!(response.starts_with("HTTP/1.1 413 "), "{response:?}");
+        assert!(
+            response.ends_with(std::str::from_utf8(EARLY_RESPONSE_BODY).unwrap()),
+            "{response:?}"
+        );
+    }
+
+    /// An HTTP/2 upstream answers an upload early and resets the request stream while the
+    /// HTTP/1 client is still sending. The upload failure must not condemn the downstream
+    /// connection: `finish()` drains the rest of the upload, the connection is reusable, and
+    /// the client receives the whole response.
+    #[tokio::test]
+    async fn upstream_upload_reset_after_early_response_lets_downstream_drain() {
+        let outcome = run_upload_stop(
+            AbandonmentSignalProxy::default(),
+            "/h2-upload-reset",
+            UploadSource::Streamed,
+            UploadStop::UpstreamReset,
+            false,
+        )
+        .await;
+        assert!(
+            outcome
+                .result
+                .expect("a complete early response failed the request"),
+            "an upstream upload failure must leave the downstream reusable so it is drained"
+        );
+        assert_eq!(outcome.drained_and_reusable, Some(true));
+        assert_early_response_after_upstream_reset(
+            outcome.upstream_stopped_early,
+            &outcome.response,
+        );
+    }
+
+    /// As above for a streaming cache miss. Marking the downstream errored also switched off
+    /// the branches that stream the cache fill to the client, so it got nothing at all.
+    #[tokio::test]
+    async fn upstream_upload_reset_during_cache_miss_still_streams_response() {
+        let outcome = run_upload_stop(
+            AbandonmentSignalProxy::default(),
+            "/h2-upload-reset-cache-miss",
+            UploadSource::Streamed,
+            UploadStop::UpstreamReset,
+            true,
+        )
+        .await;
+        assert_early_response_after_upstream_reset(
+            outcome.upstream_stopped_early,
+            &outcome.response,
+        );
+        assert!(
+            outcome
+                .result
+                .expect("a complete early response failed the request"),
+            "an upstream upload failure must leave the downstream reusable so it is drained"
+        );
+        assert_eq!(outcome.drained_and_reusable, Some(true));
+    }
+
+    /// A request body filter error is not the upstream stopping the upload, whatever source it
+    /// sets: the downstream is still marked errored, so it is neither drained nor reused.
+    #[tokio::test]
+    async fn body_filter_error_is_not_treated_as_upstream_stopping_upload() {
+        for (path, upstream_source) in [
+            ("/h2-upload-filter-error-unsourced", false),
+            ("/h2-upload-filter-error-upstream-source", true),
+        ] {
+            let outcome = run_upload_stop(
+                RejectingBodyFilter { upstream_source },
+                path,
+                UploadSource::Streamed,
+                UploadStop::BodyFilterError,
+                false,
+            )
+            .await;
+            assert!(
+                !outcome
+                    .result
+                    .expect("the filter error is not returned on this path"),
+                "a body filter error must not leave the downstream reusable ({path})"
+            );
+            assert_eq!(outcome.drained_and_reusable, None, "{path}");
+        }
+    }
+
+    /// As [`upstream_upload_reset_after_early_response_lets_downstream_drain`] for a body sent
+    /// before the loop: a retried attempt replaying the retry buffer, or a body the application
+    /// buffered early. The failed write must not end the attempt before the response is read.
+    #[tokio::test]
+    async fn upstream_reset_of_body_sent_before_loop_still_delivers_response() {
+        for (path, source) in [
+            ("/h2-upload-reset-retry-buffer", UploadSource::RetryBuffer),
+            #[cfg(feature = "early_body_buffer")]
+            (
+                "/h2-upload-reset-early-buffered",
+                UploadSource::EarlyBuffered,
+            ),
+        ] {
+            let outcome = run_upload_stop(
+                AbandonmentSignalProxy::default(),
+                path,
+                source,
+                UploadStop::UpstreamReset,
+                false,
+            )
+            .await;
+            assert!(
+                outcome
+                    .result
+                    .unwrap_or_else(|e| panic!("a complete early response failed ({path}): {e}")),
+                "an upstream upload failure must leave the downstream reusable ({path})"
+            );
+            assert_eq!(outcome.drained_and_reusable, Some(true), "{path}");
+            assert_early_response_after_upstream_reset(
+                outcome.upstream_stopped_early,
+                &outcome.response,
+            );
+        }
+    }
+
+    /// A body sent before the loop whose upstream write times out, against an upstream that
+    /// neither reads it nor answers. Unlike a reset, a timeout doesn't mean the upstream stopped
+    /// the upload: it is still waiting for the rest of the body and may never answer. So the
+    /// attempt must fail with the timeout instead of waiting for a response.
+    #[tokio::test]
+    async fn upload_write_timeout_before_loop_fails_the_attempt() {
+        const LEN: usize = 64 * 1024;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client
+            .write_all(
+                format!("POST /t HTTP/1.1\r\nHost: example.com\r\nContent-Length: {LEN}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        client.write_all(&vec![b'u'; LEN]).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session.read_request().await.unwrap();
+        session.as_mut().enable_retry_buffering();
+        let mut read = 0;
+        while read < LEN {
+            read += session.read_request_body().await.unwrap().unwrap().len();
+        }
+
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(1 << 20);
+        let _upstream_server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(upstream_server_io).await.unwrap();
+            // Accept the stream but never read its body, so no capacity is released, and never
+            // answer.
+            let held = connection.accept().await.unwrap().unwrap();
+            while connection.accept().await.is_some() {}
+            drop(held);
+        });
+        let (h2_client, connection) = h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://example.com/t")
+            .body(())
+            .unwrap();
+        let (_upstream_response, mut request_body) =
+            h2_client.send_request(request, false).unwrap();
+
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        // Held open, as by a response reader with no read timeout that is still waiting.
+        let (_response_tx, response_rx) = mpsc::channel(TASK_BUFFER_SIZE);
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let mut ctx = ();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            proxy.bidirection_down_to_up(
+                &mut session,
+                &mut request_body,
+                response_rx,
+                &mut ctx,
+                Some(Duration::from_millis(200)),
+                false,
+                &mut custom_writer,
+                &mut custom_reader,
+                Arc::new(AtomicU8::new(PipeState::Active as u8)),
+            ),
+        )
+        .await
+        .expect("the attempt is still waiting for a response 3 s after a 200 ms write timeout");
+        let e = result.expect_err("a timed-out upload must fail the attempt");
+        assert_eq!(e.etype(), &WriteTimedout, "{e}");
     }
 }

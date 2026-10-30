@@ -331,6 +331,12 @@ impl ProxyHttp for ExampleProxyHttp {
             .get("x-close-on-response-before-downstream-finish")
             .is_some();
 
+        let total_drain_timeout = req
+            .headers
+            .get("x-total-drain-timeout-ms")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
+            .map(Duration::from_millis);
+
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if !downstream_compression {
             // enable upstream compression for all requests by default
@@ -348,6 +354,11 @@ impl ProxyHttp for ExampleProxyHttp {
         session.set_close_on_response_before_downstream_finish(
             close_on_response_before_downstream_finish,
         );
+        if total_drain_timeout.is_some() {
+            session
+                .downstream_session
+                .set_total_drain_timeout(total_drain_timeout);
+        }
 
         Ok(false)
     }
