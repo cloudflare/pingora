@@ -595,6 +595,15 @@ pub(crate) enum DownstreamStateMachine {
     Reading,
     /// no more data to read
     ReadingFinished,
+    /// Writing the request body to the upstream failed (e.g. the upstream reset the request
+    /// stream, or the write timed out), so the rest is no longer read while proxying. The
+    /// downstream itself is healthy: finishing the session may still drain the unread body and
+    /// reuse the connection.
+    ///
+    /// What happens to the unread body depends on the downstream protocol and implementation.
+    /// HTTP/1 drains it, so the connection can be reused. HTTP/2 does not drain: after an early
+    /// response it resets the request stream with `RST_STREAM(NO_ERROR)` (RFC 9113 section 8.1).
+    ReadingStopped,
     /// downstream is already errored or closed
     Errored,
 }
@@ -618,9 +627,13 @@ impl DownstreamStateMachine {
         }
     }
 
-    // Can call read() to read more data or wait on closing
+    /// Whether the downstream can be read: for more body, or to wait for it to close.
+    ///
+    /// Not after [`ReadingStopped`](Self::ReadingStopped): it is done but its body is unread,
+    /// so a read would take the unread body for data past the end and fail. The body is
+    /// drained when the session finishes instead.
     pub fn can_poll(&self) -> bool {
-        !matches!(self, Self::Errored)
+        !matches!(self, Self::ReadingStopped | Self::Errored)
     }
 
     pub fn is_reading(&self) -> bool {
@@ -639,19 +652,29 @@ impl DownstreamStateMachine {
     ///
     /// No-op when the current state is [`Errored`](Self::Errored) — once errored the
     /// downstream connection must not be reused, and late upstream chunks arriving
-    /// via `rx.recv()` must not overwrite that decision.
+    /// via `rx.recv()` must not overwrite that decision. Also a no-op when
+    /// [`ReadingStopped`](Self::ReadingStopped): the unread body must not be polled again.
     pub fn maybe_finished(&mut self, set: bool) {
-        if set && !self.is_errored() {
+        if set && self.is_reading() {
             *self = Self::ReadingFinished
         }
     }
 
     /// Reset to [`Reading`](Self::Reading) for upgraded connections when body mode changes.
     ///
-    /// No-op when the current state is [`Errored`](Self::Errored).
+    /// No-op when the current state is [`Errored`](Self::Errored) or
+    /// [`ReadingStopped`](Self::ReadingStopped).
     pub fn reset(&mut self) {
-        if !self.is_errored() {
+        if !matches!(self, Self::ReadingStopped | Self::Errored) {
             *self = Self::Reading;
+        }
+    }
+
+    /// Transition to [`ReadingStopped`](Self::ReadingStopped) because writing the request body
+    /// to the upstream failed. No-op when [`Errored`](Self::Errored).
+    pub fn to_stopped(&mut self) {
+        if !self.is_errored() {
+            *self = Self::ReadingStopped
         }
     }
 
@@ -1150,6 +1173,35 @@ mod tests {
         ds.reset(); // must not overwrite Errored
         assert!(ds.is_errored());
         assert!(!ds.can_poll());
+    }
+
+    /// `ReadingStopped` is done and no longer polled, but not errored, and neither a late
+    /// finish nor a reset makes the unread body pollable again.
+    #[test]
+    fn stopped_is_done_unpolled_and_not_errored() {
+        for finished in [false, true] {
+            let mut ds = DownstreamStateMachine::new(finished);
+            ds.to_stopped();
+            assert_eq!(ds, DownstreamStateMachine::ReadingStopped);
+            assert!(ds.is_done());
+            assert!(!ds.can_poll());
+            assert!(!ds.is_reading());
+            assert!(!ds.is_errored());
+            ds.maybe_finished(true);
+            ds.reset();
+            assert_eq!(ds, DownstreamStateMachine::ReadingStopped);
+            ds.to_errored();
+            assert!(ds.is_errored());
+        }
+    }
+
+    /// `to_stopped()` on `Errored` is a no-op — `Errored` is terminal.
+    #[test]
+    fn stopped_noop_on_errored() {
+        let mut ds = DownstreamStateMachine::new(false);
+        ds.to_errored();
+        ds.to_stopped();
+        assert!(ds.is_errored());
     }
 
     mod fill_cancellation {
