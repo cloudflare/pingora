@@ -114,6 +114,7 @@ where
         if self.inner.is_purge(session, ctx) {
             return self.proxy_purge(session, ctx).await;
         }
+        session.bypass_cache_for_response_hold();
 
         // bypass cache lookup if we predict to be uncacheable
         if session.cache.enabled() && !session.cache.cacheable_prediction() {
