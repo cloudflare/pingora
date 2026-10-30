@@ -1259,7 +1259,7 @@ pub mod range_filter {
         for _ in ranges_str.split(',') {
             range_count += 1;
             if let Some(max_ranges) = max_multipart_ranges {
-                if range_count >= max_ranges {
+                if range_count > max_ranges {
                     // If we get more than max configured ranges, return None for now to save parsing time
                     return RangeType::None;
                 }
@@ -1487,6 +1487,132 @@ pub mod range_filter {
             parse_range_header(&ranges, 1000, Some(200)),
             RangeType::None
         )
+    }
+
+    #[test]
+    fn test_parse_range_max_multipart_ranges_boundary() {
+        // Regression coverage for https://github.com/cloudflare/pingora/issues/1063
+        // Requests with exactly `max_multipart_ranges` range-specs must be served,
+        // only requests with more than the max are ignored.
+
+        // Same shape as the helper in test_parse_range_header_multi:
+        // `count` adjacent, non-overlapping, satisfiable byte ranges.
+        fn generate_range_header(count: usize) -> Vec<u8> {
+            let mut s = String::from("bytes=");
+            for i in 0..count {
+                let start = i * 4;
+                let end = start + 1;
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&start.to_string());
+                s.push('-');
+                s.push_str(&end.to_string());
+            }
+            s.into_bytes()
+        }
+
+        // Large enough that every generated range is satisfiable.
+        const CONTENT_LENGTH: usize = 100_000;
+
+        // No configured limit: requests well above the default 200 are served.
+        let range_type = parse_range_header(&generate_range_header(250), CONTENT_LENGTH, None);
+        assert_eq!(
+            range_type
+                .get_multirange_info()
+                .expect("250 ranges should produce multipart info")
+                .ranges
+                .len(),
+            250
+        );
+
+        // Below the limit: served.
+        let range_type = parse_range_header(&generate_range_header(199), CONTENT_LENGTH, Some(200));
+        assert_eq!(
+            range_type
+                .get_multirange_info()
+                .expect("199 ranges should produce multipart info")
+                .ranges
+                .len(),
+            199
+        );
+
+        // Exactly the limit: served (this is the boundary that was dropped).
+        let range_type = parse_range_header(&generate_range_header(200), CONTENT_LENGTH, Some(200));
+        let multi = range_type
+            .get_multirange_info()
+            .expect("exactly max_multipart_ranges ranges should be served");
+        assert_eq!(multi.ranges.len(), 200);
+        assert_eq!(multi.ranges[0], Range { start: 0, end: 2 });
+        assert_eq!(
+            multi.ranges[199],
+            Range {
+                start: 199 * 4,
+                end: 199 * 4 + 2
+            }
+        );
+
+        // Above the limit: still ignored, and the early exit still bounds
+        // the work spent on abusive headers.
+        assert_eq!(
+            parse_range_header(&generate_range_header(201), CONTENT_LENGTH, Some(200)),
+            RangeType::None
+        );
+        assert_eq!(
+            parse_range_header(&generate_range_header(1000), CONTENT_LENGTH, Some(200)),
+            RangeType::None
+        );
+
+        // Smallest configured limits.
+        assert_eq!(
+            parse_range_header(b"bytes=0-1", CONTENT_LENGTH, Some(1)),
+            RangeType::new_single(0, 2)
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,4-5", CONTENT_LENGTH, Some(1)),
+            RangeType::None
+        );
+        // A zero limit ignores every range request.
+        assert_eq!(
+            parse_range_header(b"bytes=0-1", CONTENT_LENGTH, Some(0)),
+            RangeType::None
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,4-5", CONTENT_LENGTH, Some(2))
+                .get_multirange_info()
+                .expect("2 ranges within a limit of 2 should be served")
+                .ranges,
+            vec![Range { start: 0, end: 2 }, Range { start: 4, end: 6 }]
+        );
+
+        // The limit counts raw range-specs, not satisfiable ones: an
+        // unsatisfiable specifier still consumes budget but is skipped in
+        // the output.
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,50-60", 10, Some(2)),
+            RangeType::new_single(0, 2)
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,50-60,70-80", 10, Some(2)),
+            RangeType::None
+        );
+
+        // Malformed range-specs within the limit keep the existing behavior:
+        // the whole header is declined.
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,garbage", CONTENT_LENGTH, Some(2)),
+            RangeType::None
+        );
+        assert_eq!(
+            parse_range_header(b"bytes=0-1,", CONTENT_LENGTH, Some(2)),
+            RangeType::None
+        );
+
+        // Overlapping ranges within the limit are still declined.
+        assert_eq!(
+            parse_range_header(b"bytes=0-3,2-5", CONTENT_LENGTH, Some(2)),
+            RangeType::None
+        );
     }
 
     // For Multipart Requests, we need to know the boundary, content length and type across
