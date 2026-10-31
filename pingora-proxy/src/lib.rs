@@ -41,11 +41,11 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
-use once_cell::sync::Lazy;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::future::{poll_fn, Future};
 use std::str;
+use std::sync::LazyLock;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc,
@@ -1464,7 +1464,7 @@ where
 }
 
 // generic HTTP 502 response sent when proxy_upstream_filter refuses to connect to upstream
-static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
+static BAD_GATEWAY: LazyLock<ResponseHeader> = LazyLock::new(|| {
     let mut resp = ResponseHeader::build(http::StatusCode::BAD_GATEWAY, Some(3)).unwrap();
     resp.insert_header(header::SERVER, &SERVER_NAME[..])
         .unwrap();

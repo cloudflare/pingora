@@ -22,7 +22,6 @@ workspace = true
 [dependencies]
 rand = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
-once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 thread_local = "1"
 log = { workspace = true }

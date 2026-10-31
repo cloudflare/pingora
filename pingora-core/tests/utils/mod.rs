@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::{thread, time};
 
 use clap::Parser;
@@ -124,7 +124,7 @@ impl MyServer {
     }
 }
 
-pub static TEST_SERVER: Lazy<MyServer> = Lazy::new(MyServer::start);
+pub static TEST_SERVER: LazyLock<MyServer> = LazyLock::new(MyServer::start);
 
 pub fn init() {
     let _ = *TEST_SERVER;

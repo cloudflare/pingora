@@ -19,7 +19,6 @@ use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE, VARY};
 use http::HeaderValue;
 use log::error;
-use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::fill_cancellation::is_cache_fill_cancelled;
@@ -58,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, LazyLock,
 };
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -514,7 +513,7 @@ impl ProxyHttp for ExampleProxyHttp {
     }
 }
 
-static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+static CACHE_BACKEND: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 static CACHE_FINISH_FAIL_BACKEND: FinishFailCache = FinishFailCache;
 static CACHE_STREAMING_FINISH_FAIL_BACKEND: FailingStreamingCache =
     FailingStreamingCache(MissFailure::Finish);
@@ -524,18 +523,18 @@ static CACHE_FILL_CANCELLATION_BACKEND: FillCancellationCache = FillCancellation
 static CACHE_CANCEL_FIRST_MISS_HANDLER_BACKEND: CancelFirstMissHandlerCache =
     CancelFirstMissHandlerCache;
 /// Readers of a fill whose writer is dropped unfinished fail instead of seeing the body end.
-static CACHE_FAIL_READERS_OF_DROPPED_WRITES_BACKEND: Lazy<MemCache> =
-    Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+static CACHE_FAIL_READERS_OF_DROPPED_WRITES_BACKEND: LazyLock<MemCache> =
+    LazyLock::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
 const CACHE_DEFAULT: CacheMetaDefaults =
     CacheMetaDefaults::new(|_| Some(Duration::from_secs(1)), 1, 1);
-static CACHE_PREDICTOR: Lazy<Predictor<32>> = Lazy::new(|| Predictor::new(5, None));
-static EVICTION_MANAGER: Lazy<Manager> = Lazy::new(|| Manager::new(8192)); // 8192 bytes
-static CACHE_LOCK: Lazy<Box<CacheKeyLockImpl>> =
-    Lazy::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
+static CACHE_PREDICTOR: LazyLock<Predictor<32>> = LazyLock::new(|| Predictor::new(5, None));
+static EVICTION_MANAGER: LazyLock<Manager> = LazyLock::new(|| Manager::new(8192)); // 8192 bytes
+static CACHE_LOCK: LazyLock<Box<CacheKeyLockImpl>> =
+    LazyLock::new(|| CacheLock::new_boxed(std::time::Duration::from_secs(2)));
 static DEFER_ADMISSION_POLICY: DeferAdmissionPolicy = DeferAdmissionPolicy;
 // Example of how one might restrict which fields can be varied on.
-static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
-    Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
+static CACHE_VARY_ALLOWED_HEADERS: LazyLock<Option<HashSet<&str>>> =
+    LazyLock::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
 
 struct DeferAdmissionPolicy;
 
@@ -764,11 +763,11 @@ impl DemandFillObservations {
 struct FillDemand(Mutex<DemandFillObservations>);
 
 /// Fills in progress, by the cache key hash the underlying storage uses.
-static ACTIVE_DEMAND_FILLS: Lazy<Mutex<HashMap<String, Arc<FillDemand>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static ACTIVE_DEMAND_FILLS: LazyLock<Mutex<HashMap<String, Arc<FillDemand>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// The latest fill of each primary cache key, kept for observation after it ends.
-static DEMAND_FILLS_BY_PRIMARY_KEY: Lazy<Mutex<HashMap<String, Arc<FillDemand>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static DEMAND_FILLS_BY_PRIMARY_KEY: LazyLock<Mutex<HashMap<String, Arc<FillDemand>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// What the demand-counting storage observed for the latest fill of `primary_key` (the test
 /// proxy's cache key is the request's host followed by its path).
@@ -1250,15 +1249,15 @@ struct CacheFillCancellationObservations {
 
 /// Per-cache-entry fill observations (handlers created, bytes written, finishes, drops), keyed
 /// by the full primary cache key: two hosts filling the same path are different cache entries.
-static CACHE_FILL_CANCELLATION_OBSERVATIONS: Lazy<
+static CACHE_FILL_CANCELLATION_OBSERVATIONS: LazyLock<
     Mutex<HashMap<String, CacheFillCancellationObservations>>,
-> = Lazy::new(|| Mutex::new(HashMap::new()));
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cancellations by full primary cache key, not by path alone — two hosts filling the same path
 /// are different cache entries and must never share one. Created on first use so a cancellation
 /// can be requested before the fill has a writer.
-static CACHE_FILL_CANCELLATIONS: Lazy<Mutex<HashMap<String, Arc<CacheFillCancellation>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static CACHE_FILL_CANCELLATIONS: LazyLock<Mutex<HashMap<String, Arc<CacheFillCancellation>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 impl FillCancellationCache {
     /// The cancellation for `cache_key`, created on first use so a cancellation can be requested
@@ -1371,8 +1370,8 @@ pub fn cache_fill_cancellation_handlers_dropped_unfinished(path: &str) -> usize 
 struct CancelFirstMissHandlerCache;
 
 /// Full primary cache keys whose first miss handler [`CancelFirstMissHandlerCache`] refused.
-static CANCELLED_FIRST_MISS_HANDLER_KEYS: Lazy<Mutex<HashSet<String>>> =
-    Lazy::new(|| Mutex::new(HashSet::new()));
+static CANCELLED_FIRST_MISS_HANDLER_KEYS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[async_trait]
 impl Storage for CancelFirstMissHandlerCache {
@@ -1449,33 +1448,33 @@ pub struct CacheCTX {
 pub struct ExampleProxyCache {}
 
 static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
-static DOWNSTREAM_CACHE_WARN_LOG_CALLS_BY_PATH: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS_BY_PATH: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[derive(Default)]
 struct CacheFillAbandonmentObservations {
     calls: usize,
     calls_with_pending_tasks: usize,
 }
 
-static DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS: Lazy<
+static DOWNSTREAM_ABANDONED_CACHE_FILL_CALLS: LazyLock<
     Mutex<HashMap<String, CacheFillAbandonmentObservations>>,
-> = Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_UPSTREAM_ATTEMPTS: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_UPSTREAM_REQUEST_FILTERS: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_REQUEST_COMPLETIONS: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_REQUEST_ERRORS: Lazy<Mutex<HashMap<String, Option<ErrorType>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_CACHE_REASONS: Lazy<Mutex<HashMap<String, Option<NoCacheReason>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_UPSTREAM_ATTEMPTS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_UPSTREAM_REQUEST_FILTERS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_REQUEST_COMPLETIONS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_REQUEST_ERRORS: LazyLock<Mutex<HashMap<String, Option<ErrorType>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_CACHE_REASONS: LazyLock<Mutex<HashMap<String, Option<NoCacheReason>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// `FailToProxy::error_code` reported by the cache proxy for instrumented requests.
-static RECORDED_FAIL_TO_PROXY_CODES: Lazy<Mutex<HashMap<String, u16>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_FAIL_TO_PROXY_CODES: LazyLock<Mutex<HashMap<String, u16>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// `suppress_error_log` calls for instrumented requests.
-static RECORDED_ERROR_LOG_OFFERS: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static RECORDED_ERROR_LOG_OFFERS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Upstream response hook calls recorded by the test proxy.
 pub struct UpstreamResponseHookCalls {
@@ -1487,18 +1486,19 @@ pub struct UpstreamResponseHookCalls {
     pub trailers: usize,
 }
 
-static UPSTREAM_RESPONSE_HOOK_CALLS: Lazy<Mutex<HashMap<String, UpstreamResponseHookCalls>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static UPSTREAM_RESPONSE_HOOK_CALLS: LazyLock<Mutex<HashMap<String, UpstreamResponseHookCalls>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[derive(Default)]
 struct ForcedRetryHookObservations {
     calls: usize,
     calls_with_retry_disabled: usize,
 }
 
-static FORCED_RETRY_ERROR_HOOK_CALLS: Lazy<Mutex<HashMap<String, ForcedRetryHookObservations>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static RECORDED_CACHE_LOOKUPS: Lazy<Mutex<HashMap<String, usize>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static FORCED_RETRY_ERROR_HOOK_CALLS: LazyLock<
+    Mutex<HashMap<String, ForcedRetryHookObservations>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static RECORDED_CACHE_LOOKUPS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// What the cache proxy's subrequest pipe observed for a request that asked for one with
 /// `x-pipe-subrequest`.
@@ -1508,8 +1508,8 @@ pub struct PipedSubrequest {
     pub outcome: Option<std::result::Result<(), ErrorType>>,
 }
 
-static PIPED_SUBREQUESTS: Lazy<Mutex<HashMap<String, PipedSubrequest>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PIPED_SUBREQUESTS: LazyLock<Mutex<HashMap<String, PipedSubrequest>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How many ignored downstream cache errors the proxy reported for this path.
 pub fn downstream_cache_warn_log_calls_for(path: &str) -> usize {
@@ -2741,9 +2741,9 @@ impl PskTlsServer {
 }
 
 // FIXME: this still allows multiple servers to spawn across integration tests
-pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
+pub static TEST_SERVER: LazyLock<Server> = LazyLock::new(Server::start);
 #[cfg(feature = "s2n")]
-pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
+pub static TEST_PSK_TLS_SERVER: LazyLock<PskTlsServer> = LazyLock::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
 
 pub async fn init_proxy() {

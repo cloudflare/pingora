@@ -48,7 +48,6 @@ http = { workspace = true }
 log = { workspace = true }
 pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
 prometheus = "0.14"
-once_cell = { workspace = true }
 bytes = { workspace = true }
 regex = "1"
 

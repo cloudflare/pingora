@@ -258,8 +258,8 @@ mod test {
         ScriptedMissHandler,
     };
     use crate::trace::Span;
-    use once_cell::sync::Lazy;
     use pingora_error::ErrorType;
+    use std::sync::LazyLock;
     use tokio::sync::oneshot;
 
     struct TestCachePut();
@@ -272,7 +272,7 @@ mod test {
     }
 
     type TestCachePutCtx = CachePutCtx<TestCachePut>;
-    static CACHE_BACKEND: Lazy<MemCache> = Lazy::new(MemCache::new);
+    static CACHE_BACKEND: LazyLock<MemCache> = LazyLock::new(MemCache::new);
 
     fn put_with_miss_handler(
         handler: MissHandler,

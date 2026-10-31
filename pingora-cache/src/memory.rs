@@ -497,7 +497,7 @@ impl Storage for MemCache {
 mod test {
     use super::*;
     use crate::trace::Span;
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
 
     fn gen_meta() -> CacheMeta {
         let mut header = ResponseHeader::build(200, None).unwrap();
@@ -515,7 +515,7 @@ mod test {
 
     #[tokio::test]
     async fn test_write_then_read() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("a", "1");
@@ -552,7 +552,7 @@ mod test {
 
     #[tokio::test]
     async fn test_read_range() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("a", "1");
@@ -597,7 +597,7 @@ mod test {
     async fn test_write_while_read() {
         use futures::FutureExt;
 
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
 
         let key1 = CacheKey::new("a", "1");
@@ -664,8 +664,8 @@ mod test {
 
     #[tokio::test]
     async fn dropping_an_unfinished_write_fails_an_attached_reader_when_enabled() {
-        static MEM_CACHE: Lazy<MemCache> =
-            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        static MEM_CACHE: LazyLock<MemCache> =
+            LazyLock::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
         let span = &Span::inactive().handle();
         let key = CacheKey::new("dropped-write", "1");
 
@@ -698,8 +698,8 @@ mod test {
 
     #[tokio::test]
     async fn dropping_a_write_after_eof_but_before_finish_fails_an_attached_reader_when_enabled() {
-        static MEM_CACHE: Lazy<MemCache> =
-            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        static MEM_CACHE: LazyLock<MemCache> =
+            LazyLock::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
         let span = &Span::inactive().handle();
         let key = CacheKey::new("eof-then-dropped", "1");
 
@@ -732,8 +732,8 @@ mod test {
 
     #[tokio::test]
     async fn finishing_a_write_without_eof_ends_an_attached_reader_when_enabled() {
-        static MEM_CACHE: Lazy<MemCache> =
-            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        static MEM_CACHE: LazyLock<MemCache> =
+            LazyLock::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
         let span = &Span::inactive().handle();
         let key = CacheKey::new("finished-without-eof", "1");
 
@@ -762,7 +762,7 @@ mod test {
 
     #[tokio::test]
     async fn dropping_an_unfinished_write_ends_an_attached_reader_by_default() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let span = &Span::inactive().handle();
         let key = CacheKey::new("dropped-write-default", "1");
 
@@ -794,7 +794,7 @@ mod test {
 
     #[tokio::test]
     async fn test_purge_partial() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
 
         let key = CacheKey::new("a", "1").to_compact();
@@ -825,7 +825,7 @@ mod test {
 
     #[tokio::test]
     async fn test_purge_complete() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
 
         let key = CacheKey::new("a", "1").to_compact();
@@ -857,7 +857,7 @@ mod test {
 
     #[tokio::test]
     async fn expiring_keeps_the_entry_but_makes_it_stale() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
 
         let key = CacheKey::new("expire-me", "1");
@@ -907,7 +907,7 @@ mod test {
 
     #[tokio::test]
     async fn expiring_an_absent_entry_finds_nothing() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let key = CacheKey::new("never-stored", "1").to_compact();
 
         let outcome = MEM_CACHE
@@ -923,7 +923,7 @@ mod test {
 
     #[tokio::test]
     async fn test_exact_identified_purge_does_not_remove_key_only_entry() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
         let key = CacheKey::new("identified", "1").to_compact();
         let hash = key.combined();
@@ -949,7 +949,7 @@ mod test {
 
     #[tokio::test]
     async fn test_exact_key_only_purge_succeeds_and_removes_entry() {
-        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        static MEM_CACHE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
         let cache = &MEM_CACHE;
         let key = CacheKey::new("key-only", "1").to_compact();
         let hash = key.combined();

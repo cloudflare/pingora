@@ -237,12 +237,12 @@ where
     digest
         .peer_addr
         .set(Some(peer_addr.clone()))
-        .expect("newly created OnceCell must be empty");
+        .expect("newly created OnceLock must be empty");
     if let Some(local_addr) = local_addr {
         digest
             .local_addr
             .set(Some(SocketAddr::Inet(local_addr)))
-            .expect("newly created OnceCell must be empty");
+            .expect("newly created OnceLock must be empty");
     }
     stream.set_socket_digest(digest);
 
