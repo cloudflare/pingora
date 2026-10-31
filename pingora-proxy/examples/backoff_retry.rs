@@ -25,51 +25,59 @@ use pingora_core::{prelude::Opt, Error};
 use pingora_proxy::{ProxyHttp, Session};
 
 /// This example shows how to setup retry-able errors with a backoff policy
-
-#[derive(Default)]
-struct RetryCtx {
-    pub retries: u32,
-}
-
 struct BackoffRetryProxy;
 
 #[async_trait]
 impl ProxyHttp for BackoffRetryProxy {
-    type CTX = RetryCtx;
-    fn new_ctx(&self) -> Self::CTX {
-        Self::CTX::default()
+    type CTX = ();
+    fn new_ctx(&self) -> Self::CTX {}
+
+    fn max_retries(&self, _session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+        // Allow up to 5 total attempts (initial attempt + up to 4 retries)
+        Some(5)
     }
 
     fn fail_to_connect(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _peer: &HttpPeer,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
         e: Box<Error>,
     ) -> Box<Error> {
         if let Some(local_addr) = e.connect_local_addr() {
-            info!("connection attempt used local address: {local_addr}");
+            info!(
+                "connection attempt #{} used local address: {local_addr}",
+                session.tries()
+            );
         }
-        ctx.retries += 1;
         let mut retry_e = e;
         retry_e.set_retry(true);
         retry_e
     }
 
+    async fn retry_backoff(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _error: &Error,
+    ) -> bool {
+        const MAX_SLEEP: Duration = Duration::from_secs(10);
+        let retries = session.retry_attempts() as u32;
+
+        // simple example of exponential backoff with a max of 10s
+        let sleep_ms = std::cmp::min(Duration::from_millis(u64::pow(10, retries)), MAX_SLEEP);
+        info!("sleeping for ms: {sleep_ms:?} before retry attempt #{retries}");
+        tokio::time::sleep(sleep_ms).await;
+
+        // Returning true proceeds with the retry attempt (return false to cancel retrying)
+        true
+    }
+
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        const MAX_SLEEP: Duration = Duration::from_secs(10);
-
-        if ctx.retries > 0 {
-            // simple example of exponential backoff with a max of 10s
-            let sleep_ms =
-                std::cmp::min(Duration::from_millis(u64::pow(10, ctx.retries)), MAX_SLEEP);
-            info!("sleeping for ms: {sleep_ms:?}");
-            tokio::time::sleep(sleep_ms).await;
-        }
         let mut peer = HttpPeer::new(("10.0.0.1", 80), false, "".into());
         peer.options.connection_timeout = Some(Duration::from_millis(100));
         Ok(Box::new(peer))
