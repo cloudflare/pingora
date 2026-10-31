@@ -88,6 +88,32 @@ impl ProxyHttp for MyGateway {
         Ok(false)
     }
 ```
+
+## Return a redirect
+
+`request_filter()` can write a response without contacting an upstream. Return `Ok(true)` after the response is
+written so that Pingora skips the remaining proxy phases.
+
+The response still needs valid HTTP message framing. For a redirect with no body, `Content-Length: 0` tells HTTP/1
+clients that the response is complete while allowing the connection to remain open. The `true` argument tells
+response filters that no body chunks will follow; it does not add a framing header.
+
+```Rust
+async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+    if session.req_header().uri.path() == "/old-path" {
+        let mut response = ResponseHeader::build(302, Some(2))?;
+        response.insert_header("Location", "/new-path")?;
+        response.insert_header("Content-Length", "0")?;
+        session
+            .write_response_header(Box::new(response), true)
+            .await?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+```
+
 ## Logging
 
 Logging logic can be added to the `logging` phase of Pingora. The logging phase runs on every request right before Pingora proxy finish processing it. This phase runs for both successful and failed requests.
