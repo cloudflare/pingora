@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod client;
+mod coalesce;
 pub mod server;
 mod stream;
 

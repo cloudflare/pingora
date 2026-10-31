@@ -90,6 +90,11 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&header::EXPECT);
+        }
+
         // Reconcile and revalidate after request filters, which can mutate Host, URI, or target.
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
@@ -110,7 +115,16 @@ where
             }
         }
 
-        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
+        // A filter may supply a body for a request that arrived without one.
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
+        let body_empty = session.is_body_empty();
+        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !body_empty) {
             return (false, true, Some(e));
         }
 
@@ -493,16 +507,21 @@ where
                 .await?;
         }
 
-        let request_body_finished = session.as_mut().is_body_done();
+        let (request_body_finished, buffer) = session.upstream_body_source();
         let mut downstream_state = DownstreamStateMachine::for_proxy_attempt(
             request_body_finished,
             session.downstream_abandoned_during_cache_fill(),
         );
 
-        let buffer = session.as_ref().get_retry_buffer();
+        // Keep is_body_empty() last: it initializes the H1 reader and must stay lazy when buffered.
+        #[cfg(feature = "early_body_buffer")]
+        let should_send_initial_body =
+            buffer.is_some() || session.is_body_buffered() || session.as_mut().is_body_empty();
+        #[cfg(not(feature = "early_body_buffer"))]
+        let should_send_initial_body = buffer.is_some() || session.as_mut().is_body_empty();
 
-        // retry, send buffer if it exists or body empty
-        if buffer.is_some() || session.as_mut().is_body_empty() {
+        // Send the final task for buffered empty bodies so H1 chunked framing is terminated.
+        if should_send_initial_body {
             let send_permit = tx
                 .reserve()
                 .await

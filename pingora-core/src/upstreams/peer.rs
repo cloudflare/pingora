@@ -17,10 +17,10 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
-#[cfg(feature = "openssl_derived")]
-use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::{HandshakeCompleteHook, VerifyCallback};
 #[cfg(unix)]
 use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
@@ -304,6 +304,16 @@ pub trait Peer: Display + Clone {
             .upstream_tls_handshake_complete_hook
             .as_ref()
     }
+
+    /// Returns a callback that should be run while the upstream's certificate chain is verified.
+    ///
+    /// See [`PeerOptions::upstream_tls_verify_callback`].
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_verify_callback(&self) -> Option<&VerifyCallback> {
+        self.get_peer_options()?
+            .upstream_tls_verify_callback
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -367,6 +377,8 @@ impl Peer for BasicPeer {
     fn reuse_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         self._address.hash(&mut hasher);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -551,6 +563,12 @@ pub struct PeerOptions {
     pub second_keyshare: bool,
     /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
+    /// Whether to coalesce the vectored writes of TLS connections to this peer, which is
+    /// default off. See `SslStream::enable_write_coalescing`. Only BoringSSL and OpenSSL
+    /// connections support it; other TLS backends ignore it.
+    ///
+    /// **Note:** This field is unstable and may be removed or changed in future versions.
+    pub tls_write_coalescing: bool,
     /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
@@ -567,6 +585,34 @@ pub struct PeerOptions {
     #[cfg(feature = "openssl_derived")]
     #[derivative(Debug = "ignore")]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
+    /// Callback run while the upstream's certificate chain is verified, with the semantics of an
+    /// `SSL_set_verify` callback.
+    ///
+    /// It is called with the result so far (`preverify_ok`) for each certificate in the built
+    /// chain and for each error found, and its return value replaces that result: returning
+    /// `false` fails verification and stops it, returning `true` for an error accepts the chain
+    /// despite that error, and returning `preverify_ok` only observes.
+    /// [`X509StoreContextRef::chain`] holds the chain built so far.
+    ///
+    /// It runs inside the TLS library's verify callback, so a panic aborts the process.
+    ///
+    /// It also runs when certificate verification is off (`verify_cert` is false or the SNI is
+    /// empty), where its return value cannot fail the handshake, though returning `false` still
+    /// stops verification.
+    ///
+    /// It runs during each full handshake when the server's certificate arrives, before the
+    /// server has proven it holds the certificate's key, so being called does not mean the
+    /// handshake will succeed. It does not run for resumed sessions, on renegotiation, or for
+    /// connections reused from the pool. It is not part of the connection reuse key either, so a
+    /// pooled connection established without it, or with another callback, can be reused for
+    /// this peer. For [`HttpPeer`], use a distinct `group_key` to keep them apart.
+    ///
+    /// Currently only enabled for openssl variants.
+    ///
+    /// [`X509StoreContextRef::chain`]: crate::tls::x509::X509StoreContextRef::chain
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_verify_callback: Option<VerifyCallback>,
 }
 
 impl PeerOptions {
@@ -605,12 +651,15 @@ impl PeerOptions {
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
             tcp_fast_open: false,
+            tls_write_coalescing: false,
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
             proxy_digest_user_data_hook: None,
             #[cfg(feature = "openssl_derived")]
             upstream_tls_handshake_complete_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_verify_callback: None,
         }
     }
 
@@ -797,6 +846,8 @@ impl Hash for HttpPeer {
         // adjusted over the lifetime of a connection.
         self.options.curves.hash(state);
         self.options.second_keyshare.hash(state);
+        // fixed on the TLS stream when the connection is made
+        self.options.tls_write_coalescing.hash(state);
     }
 }
 
@@ -916,5 +967,24 @@ mod tests {
         assert!(!policy.strip_connection_nominated);
         assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    /// A connection keeps the write coalescing it was made with, so a peer that changes the
+    /// setting must not reuse it.
+    #[test]
+    fn peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into());
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
+    }
+
+    #[test]
+    fn basic_peers_differing_in_tls_write_coalescing_do_not_share_connections() {
+        let mut peer = BasicPeer::new("127.0.0.1:443");
+        peer.sni = "pingora.org".into();
+        let mut coalescing = peer.clone();
+        coalescing.options.tls_write_coalescing = true;
+        assert_ne!(peer.reuse_hash(), coalescing.reuse_hash());
     }
 }

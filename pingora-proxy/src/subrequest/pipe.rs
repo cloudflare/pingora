@@ -39,6 +39,9 @@ pub enum InputBodyType {
     /// Preset body
     Preset(InputBody),
     /// Body should be saved (up to limit)
+    ///
+    /// If early body buffering already consumed the downstream body, the buffered body is
+    /// forwarded and saved in its place.
     SaveBody(usize),
 }
 
@@ -210,9 +213,21 @@ where
     DS: DownstreamSession,
     F: FnMut(HttpTask) -> Result<Option<HttpTask>>,
 {
-    let (maybe_preset_body, saved_body) = match input_body {
-        InputBodyType::Preset(body) => (Some(body), None),
-        InputBodyType::SaveBody(limit) => (None, Some(SavedBody::new(limit))),
+    // A non-empty body that early buffering already consumed, until it is sent. An empty one
+    // leaves the downstream body done, as for a request without a body.
+    let (maybe_preset_body, saved_body, mut retained_body): (_, _, Option<Bytes>) = match input_body
+    {
+        InputBodyType::Preset(body) => (Some(body), None, None),
+        #[cfg(feature = "early_body_buffer")]
+        InputBodyType::SaveBody(limit) if session.is_body_buffered() => (
+            None,
+            Some(SavedBody::new(limit)),
+            session
+                .get_buffered_body()
+                .filter(|b| !b.is_empty())
+                .cloned(),
+        ),
+        InputBodyType::SaveBody(limit) => (None, Some(SavedBody::new(limit)), None),
     };
     let use_preset_body = maybe_preset_body.is_some();
 
@@ -220,6 +235,8 @@ where
     let (no_body_input, mut maybe_preset_reader) = if use_preset_body {
         let preset_body = maybe_preset_body.expect("checked above");
         (preset_body.is_body_empty(), Some(preset_body.into_reader()))
+    } else if retained_body.is_some() {
+        (false, None)
     } else {
         (session.as_mut().is_body_done(), None)
     };
@@ -320,7 +337,9 @@ where
                     response_state.maybe_set_upstream_delivery_done(response_done);
                     // unsuccessful upgrade response may force the request done
                     // (can only happen with a real session, TODO to allow with preset body)
-                    downstream_state.maybe_finished(!use_preset_body && session.is_body_done());
+                    downstream_state.maybe_finished(
+                        !use_preset_body && retained_body.is_none() && session.is_body_done(),
+                    );
                 } else {
                     debug!("upstream channel closed early");
                     response_state.maybe_set_upstream_delivery_done(true);
@@ -358,8 +377,23 @@ where
                  */
             },
 
+            // A retained body goes through the same module filters and capture as a read one.
+            body = async { retained_body.take() },
+                if forward_body && retained_body.is_some() && downstream_state.is_reading() => {
+                debug!("downstream event: retained body for subrequest");
+                let request_done = map_pipe_err(send_body_to_pipe(
+                    session,
+                    body,
+                    true,
+                    state.saved_body.as_mut(),
+                    send_permit.expect("checked is_ok()"),
+                )
+                .await, false, &mut state)?;
+                downstream_state.maybe_finished(request_done);
+            },
+
             body = session.downstream_session.read_body_or_idle(watch_downstream || downstream_state.is_done()),
-                if downstream_state.can_poll() && (forward_body || watch_downstream) => {
+                if downstream_state.can_poll() && ((forward_body && retained_body.is_none()) || watch_downstream) => {
                 debug!(
                     "downstream event: {} for subrequest",
                     if watch_downstream { "client watch" } else { "main body" }
@@ -649,3 +683,6 @@ mod tests {
 
 #[cfg(test)]
 mod disconnect_tests;
+
+#[cfg(all(test, feature = "early_body_buffer"))]
+mod early_body_buffer_tests;

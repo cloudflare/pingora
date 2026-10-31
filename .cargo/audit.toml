@@ -23,4 +23,11 @@ ignore = [
     # (patched in webpki-roots >= 1.0.10 and rustls-webpki >= 0.103.16).
     "RUSTSEC-2026-0381", # webpki-roots: bundled root certificates allow trust in distrusted emSign intermediates
     "RUSTSEC-2026-0382", # rustls-webpki: certificate verification may accept distrusted intermediates
+    # crypto-bigint 0.5.5 is pulled in only by aws-sigv4's optional sigv4a
+    # feature, reached through the optional dial9-worker-s3 feature
+    # (aws-sdk-s3, aws-config, aws-sdk-s3-transfer-manager). Every
+    # aws-sigv4 release requires crypto-bigint ^0.5.4 and there is no 0.5.x
+    # backport (patched >= 0.7.6). It is used only for SigV4a key derivation
+    # and signing, which standard regional S3 uploads do not use.
+    "RUSTSEC-2026-0387", # crypto-bigint: multiple timing variability issues in constant-time operations
 ]
