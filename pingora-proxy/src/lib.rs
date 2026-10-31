@@ -684,6 +684,8 @@ where
     handles_downstream_abandonment: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    /// Number of upstream connection attempts made so far for this request.
+    tries: usize,
     /// Request body buffered early (before upstream connection) for auth/routing decisions.
     /// When set, body forwarding will use this instead of re-reading from downstream. It must
     /// outlive the first attempt so a retry can replay it.
@@ -725,6 +727,7 @@ where
             upstream_write_pending_time: Duration::ZERO,
             handles_downstream_abandonment: false,
             shutdown_flag,
+            tries: 0,
             #[cfg(feature = "early_body_buffer")]
             buffered_request_body: None,
             #[cfg(feature = "early_body_buffer")]
@@ -1171,6 +1174,21 @@ where
     /// Is the proxy process in the process of shutting down (e.g. due to graceful upgrade)?
     pub fn is_process_shutting_down(&self) -> bool {
         self.shutdown_flag.load(Ordering::Acquire)
+    }
+
+    /// Return the number of upstream attempts made so far for this request.
+    ///
+    /// This returns 0 before the first upstream attempt has begun, 1 during the initial
+    /// upstream attempt, and increments on each subsequent retry.
+    pub fn tries(&self) -> usize {
+        self.tries
+    }
+
+    /// Return the number of retries performed so far for this request.
+    ///
+    /// On the initial upstream attempt, this returns 0.
+    pub fn retry_attempts(&self) -> usize {
+        self.tries.saturating_sub(1)
     }
 
     /// Returns a reference to the fully buffered request body, if non-empty.
@@ -1627,8 +1645,14 @@ where
         let mut server_reuse = false;
         let mut proxy_error: Option<Box<Error>> = None;
 
-        while retries < self.max_retries {
+        let max_retries = self
+            .inner
+            .max_retries(&session, &ctx)
+            .unwrap_or(self.max_retries);
+
+        while retries < max_retries {
             retries += 1;
+            session.tries = retries;
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
             server_reuse = reuse;
@@ -1656,10 +1680,23 @@ where
                             self.inner.request_summary(&session, &ctx)
                         );
                     }
-                    proxy_error = Some(error);
                     if !retry {
+                        proxy_error = Some(error);
                         break;
                     }
+
+                    if retries < max_retries {
+                        let should_retry = self
+                            .inner
+                            .retry_backoff(&mut session, &mut ctx, &error)
+                            .await;
+                        if !should_retry {
+                            proxy_error = Some(error);
+                            break;
+                        }
+                    }
+
+                    proxy_error = Some(error);
                 }
                 None => {
                     proxy_error = None;
@@ -3716,5 +3753,207 @@ mod tests {
             NoCacheReason::StorageError,
             "only a cancelled fill changes the reason"
         );
+    }
+
+    mod retry_configuration_and_backoff {
+        use super::*;
+
+        #[tokio::test]
+        async fn session_tries_and_retry_attempts_initial() {
+            let session = new_request_session(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+            assert_eq!(session.tries(), 0);
+            assert_eq!(session.retry_attempts(), 0);
+        }
+
+        struct DynamicRetryProxy {
+            max_retries_override: Option<usize>,
+            backoff_calls: Arc<Mutex<Vec<(usize, usize)>>>,
+            should_continue_retry: bool,
+            attempts_seen: Arc<Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl ProxyHttp for DynamicRetryProxy {
+            type CTX = ();
+            fn new_ctx(&self) -> Self::CTX {}
+
+            fn max_retries(&self, _session: &Session, _ctx: &Self::CTX) -> Option<usize> {
+                self.max_retries_override
+            }
+
+            async fn retry_backoff(
+                &self,
+                session: &mut Session,
+                _ctx: &mut Self::CTX,
+                _error: &Error,
+            ) -> bool {
+                self.backoff_calls
+                    .lock()
+                    .unwrap()
+                    .push((session.tries(), session.retry_attempts()));
+                self.should_continue_retry
+            }
+
+            async fn upstream_peer(
+                &self,
+                session: &mut Session,
+                _ctx: &mut Self::CTX,
+            ) -> Result<Box<HttpPeer>> {
+                self.attempts_seen.lock().unwrap().push(session.tries());
+                // Unbound local port that will refuse connection immediately
+                let mut peer = HttpPeer::new("127.0.0.1:1", false, "".to_string());
+                peer.options.connection_timeout = Some(Duration::from_millis(50));
+                Ok(Box::new(peer))
+            }
+
+            fn fail_to_connect(
+                &self,
+                _session: &mut Session,
+                _peer: &HttpPeer,
+                _ctx: &mut Self::CTX,
+                mut e: Box<Error>,
+            ) -> Box<Error> {
+                e.set_retry(true);
+                e
+            }
+        }
+
+        #[tokio::test]
+        async fn max_retries_override_and_retry_backoff_called() {
+            let backoff_calls = Arc::new(Mutex::new(Vec::new()));
+            let attempts_seen = Arc::new(Mutex::new(Vec::new()));
+
+            let conf = ServerConf {
+                max_retries: 16, // default is 16
+                ..Default::default()
+            };
+
+            let proxy = Arc::new(HttpProxy::new(
+                DynamicRetryProxy {
+                    max_retries_override: Some(3),
+                    backoff_calls: backoff_calls.clone(),
+                    should_continue_retry: true,
+                    attempts_seen: attempts_seen.clone(),
+                },
+                Arc::new(conf),
+            ));
+
+            let session = new_request_session(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            proxy.process_request(session, ()).await;
+
+            // Exactly 3 attempts made
+            assert_eq!(*attempts_seen.lock().unwrap(), vec![1, 2, 3]);
+            // retry_backoff called before attempts 2 and 3 with corresponding (tries, retry_attempts)
+            assert_eq!(*backoff_calls.lock().unwrap(), vec![(1, 0), (2, 1)]);
+        }
+
+        #[tokio::test]
+        async fn max_retries_override_allows_single_attempt() {
+            let backoff_calls = Arc::new(Mutex::new(Vec::new()));
+            let attempts_seen = Arc::new(Mutex::new(Vec::new()));
+
+            let conf = ServerConf {
+                max_retries: 16,
+                ..Default::default()
+            };
+
+            let proxy = Arc::new(HttpProxy::new(
+                DynamicRetryProxy {
+                    max_retries_override: Some(1),
+                    backoff_calls: backoff_calls.clone(),
+                    should_continue_retry: true,
+                    attempts_seen: attempts_seen.clone(),
+                },
+                Arc::new(conf),
+            ));
+
+            let session = new_request_session(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            proxy.process_request(session, ()).await;
+
+            // Only 1 attempt made
+            assert_eq!(*attempts_seen.lock().unwrap(), vec![1]);
+            // retry_backoff never called because no retries were permitted
+            assert!(backoff_calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn retry_backoff_can_abort_retry_early() {
+            let backoff_calls = Arc::new(Mutex::new(Vec::new()));
+            let attempts_seen = Arc::new(Mutex::new(Vec::new()));
+
+            let conf = ServerConf {
+                max_retries: 5,
+                ..Default::default()
+            };
+
+            let proxy = Arc::new(HttpProxy::new(
+                DynamicRetryProxy {
+                    max_retries_override: Some(5),
+                    backoff_calls: backoff_calls.clone(),
+                    should_continue_retry: false, // abort after 1st attempt
+                    attempts_seen: attempts_seen.clone(),
+                },
+                Arc::new(conf),
+            ));
+
+            let session = new_request_session(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            proxy.process_request(session, ()).await;
+
+            // Only 1 attempt made because backoff hook returned false
+            assert_eq!(*attempts_seen.lock().unwrap(), vec![1]);
+            assert_eq!(*backoff_calls.lock().unwrap(), vec![(1, 0)]);
+        }
+
+        #[tokio::test]
+        async fn max_retries_falls_back_to_server_conf() {
+            let backoff_calls = Arc::new(Mutex::new(Vec::new()));
+            let attempts_seen = Arc::new(Mutex::new(Vec::new()));
+
+            let conf = ServerConf {
+                max_retries: 2, // server config specifies 2
+                ..Default::default()
+            };
+
+            let proxy = Arc::new(HttpProxy::new(
+                DynamicRetryProxy {
+                    max_retries_override: None, // falls back to server conf
+                    backoff_calls: backoff_calls.clone(),
+                    should_continue_retry: true,
+                    attempts_seen: attempts_seen.clone(),
+                },
+                Arc::new(conf),
+            ));
+
+            let session = new_request_session(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            proxy.process_request(session, ()).await;
+
+            // Exactly 2 attempts made based on conf.max_retries
+            assert_eq!(*attempts_seen.lock().unwrap(), vec![1, 2]);
+            assert_eq!(*backoff_calls.lock().unwrap(), vec![(1, 0)]);
+        }
     }
 }

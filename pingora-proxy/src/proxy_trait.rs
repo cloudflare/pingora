@@ -894,6 +894,40 @@ where
         e
     }
 
+    /// Return the maximum number of attempts (including the initial attempt) to make to
+    /// upstream for this request, or `None` to use the server configuration's `max_retries`.
+    ///
+    /// For example, returning `Some(1)` allows only the initial attempt and prevents retries.
+    /// Returning `Some(3)` allows the initial attempt plus up to 2 retries.
+    ///
+    /// The default implementation returns `None`.
+    fn max_retries(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> Option<usize> {
+        None
+    }
+
+    /// This filter is called asynchronously before retrying a request to the upstream.
+    ///
+    /// When an upstream attempt fails and the error is marked retryable (`e.retry() == true`),
+    /// this callback is invoked before the next upstream attempt begins.
+    ///
+    /// Implementations can use this hook to perform asynchronous delay or backoff
+    /// (e.g. `tokio::time::sleep`) without blocking runtime worker threads, or to dynamically
+    /// cancel the retry by returning `false` (for example, if a maximum elapsed duration is exceeded).
+    ///
+    /// Returning `true` continues with the retry attempt. Returning `false` aborts retrying.
+    /// The default implementation returns `true`.
+    async fn retry_backoff(
+        &self,
+        _session: &mut Session<DS>,
+        _ctx: &mut Self::CTX,
+        _error: &Error,
+    ) -> bool
+    where
+        Self::CTX: Send + Sync,
+    {
+        true
+    }
+
     /// This filter is called when the request encounters a fatal error.
     ///
     /// Users may write an error response to the downstream if the downstream is still writable.
