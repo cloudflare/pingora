@@ -746,6 +746,18 @@ where
         }
     }
 
+    /// Enable retry buffering with a custom buffer size, see the per-session
+    /// `enable_retry_buffering_with_size`. Custom sessions that do not override it keep
+    /// their fixed default.
+    pub fn enable_retry_buffering_with_size(&mut self, size: usize) {
+        match self {
+            Self::H1(s) => s.enable_retry_buffering_with_size(size),
+            Self::H2(s) => s.enable_retry_buffering_with_size(size),
+            Self::Subrequest(s) => s.enable_retry_buffering_with_size(size),
+            Self::Custom(s) => s.enable_retry_buffering_with_size(size),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),

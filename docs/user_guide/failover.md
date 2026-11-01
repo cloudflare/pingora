@@ -16,6 +16,9 @@ In order to implement retry or failover, `fail_to_connect()` / `error_while_prox
 ### Safety
 In general, idempotent HTTP requests, e.g., `GET`, are safe to retry. Other requests, e.g., `POST`, are not safe to retry if the requests have already been sent. When `fail_to_connect()` is called, pingora-proxy guarantees that nothing was sent upstream. Users are not recommended to retry a non-idempotent request after `error_while_proxy()` unless they know the upstream server enough to know whether it is safe.
 
+### Request body replay and the retry buffer
+Retrying a request with a body requires the body to be buffered so it can be replayed on the next attempt. Pingora buffers it per request up to a limit: bodies larger than the limit are truncated and the request is not retried. The default limit is 64 KiB (`DEFAULT_RETRY_BUFFER_LIMIT`). Applications proxying larger bodies can raise it by overriding `retry_buffer_size()` on `ProxyHttp`; custom downstream sessions use their own fixed size unless they override `enable_retry_buffering_with_size`. Note the trade-off: the worst-case buffered memory is the limit times the number of concurrent in-flight requests. The limit is read each time a request is proxied (per H2 stream) and is fixed for that request's retry attempts, so changing it at runtime affects subsequent requests, including requests on already-open connections.
+
 ### Example
 In the following example we set a `tries` variable on the `CTX` to track how many connection attempts we've made. When setting our peer in `upstream_peer` we check if `tries` is less than one and connect to 192.0.2.1. On connect failure we increment `tries` in `fail_to_connect` and set `e.set_retry(true)` which tells Pingora this is a retryable error. On retry, we enter `upstream_peer` again and this time connect to 1.1.1.1. If we're unable to connect to 1.1.1.1 we return a 502 since we only set `e.set_retry(true)` in `fail_to_connect` when `tries` is zero.
 

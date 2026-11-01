@@ -16,6 +16,10 @@ use bytes::{Bytes, BytesMut};
 
 /// A buffer with size limit. When the total amount of data written to the buffer is below the limit
 /// all the data will be held in the buffer. Otherwise, the buffer will report to be truncated.
+/// The default per-request retry buffer limit (64 KiB) — the historical fixed cap;
+/// applications override it via `ProxyHttp::retry_buffer_size`.
+pub const DEFAULT_RETRY_BUFFER_LIMIT: usize = 1024 * 64;
+
 pub struct FixedBuffer {
     buffer: BytesMut,
     capacity: usize,
