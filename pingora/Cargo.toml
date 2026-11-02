@@ -1,6 +1,6 @@
 [package]
 name = "pingora"
-version = "0.9.0"
+version = "0.9.1"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -23,12 +23,12 @@ rustc-args = ["--cfg", "tokio_unstable"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
-pingora-http = { version = "0.9.0", path = "../pingora-http" }
-pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
-pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", optional = true, default-features = false }
-pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", optional = true, default-features = false }
-pingora-cache = { version = "0.9.0", path = "../pingora-cache", optional = true, default-features = false }
+pingora-core = { version = "0.9.1", path = "../pingora-core", default-features = false }
+pingora-http = { version = "0.9.1", path = "../pingora-http" }
+pingora-timeout = { version = "0.9.1", path = "../pingora-timeout" }
+pingora-load-balancing = { version = "0.9.1", path = "../pingora-load-balancing", optional = true, default-features = false }
+pingora-proxy = { version = "0.9.1", path = "../pingora-proxy", optional = true, default-features = false }
+pingora-cache = { version = "0.9.1", path = "../pingora-cache", optional = true, default-features = false }
 
 
 # Only used for documenting features, but doesn't work in any other dependency 
@@ -46,7 +46,7 @@ http-body-util = "0.1"
 async-trait = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-pingora-prometheus = { version = "0.9.0", path = "../pingora-prometheus" }
+pingora-prometheus = { version = "0.9.1", path = "../pingora-prometheus" }
 prometheus = "0.14"
 once_cell = { workspace = true }
 bytes = { workspace = true }

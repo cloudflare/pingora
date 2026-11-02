@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1](https://github.com/cloudflare/pingora/compare/0.9.0...0.9.1) - 2026-11-02
+
+
+**🔒 Security**
+
+* Require zstd 0.14.3, and through it zstd-safe 8.2.0 and zstd-sys 2.1.2, so dependency resolution cannot select zstd crates affected by RUSTSEC-2026-0391, RUSTSEC-2026-0395 through RUSTSEC-2026-0406, or RUSTSEC-2026-0410.
+
+**🐛 Bug Fixes**
+
+* Fix a panic on every accepted and outgoing connection with tokio 1.54 and later, which rejects zero-capacity buffered readers (#1059).
+* Fix the docs.rs build of the `pingora` crate, which failed for 0.9.0 (#1018).
+* Fix a panic in `pingora-limits` `Estimator::incr` when a counter overflows in builds with overflow checks enabled (#1041).
+
+**⚙️ Miscellaneous Tasks**
+
+* Ignore RustSec advisories for rustls 0.21, webpki-roots 0.26, rustls-webpki 0.101 and crypto-bigint 0.5.5, which reach the lockfile only through optional transitive dependencies and have no compatible fixed release.
+* Update HTTP/2 rejection tests for h2 releases that reject conflicting Content-Length headers in the codec.
+
 ## [0.9.0](https://github.com/cloudflare/pingora/compare/0.8.0...0.9.0) - 2026-09-04
 
 ### ✨ Highlights
