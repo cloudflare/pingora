@@ -447,6 +447,8 @@ impl Connector {
             }
             let h2_stream = conn.spawn_stream().await?;
             if conn.more_streams_allowed() {
+                let _locked = conn.0.release_lock.lock_arc();
+                self.in_use_pool.release(reuse_hash, conn.id());
                 self.in_use_pool.insert(reuse_hash, conn);
             }
             Ok(h2_stream)
@@ -684,6 +686,94 @@ mod tests {
     use http::{Response, StatusCode};
     use pingora_http::RequestHeader;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Runs a hook in matches_fd(), which reused_http_session() calls between get() and insert().
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct HookPeer {
+        inner: HttpPeer,
+        hook: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    #[cfg(unix)]
+    impl std::fmt::Display for HookPeer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.inner.fmt(f)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Peer for HookPeer {
+        fn address(&self) -> &crate::protocols::l4::socket::SocketAddr {
+            self.inner.address()
+        }
+        fn tls(&self) -> bool {
+            self.inner.tls()
+        }
+        fn sni(&self) -> &str {
+            self.inner.sni()
+        }
+        fn reuse_hash(&self) -> u64 {
+            self.inner.reuse_hash()
+        }
+        fn matches_fd<V: std::os::unix::io::AsRawFd>(&self, _fd: V) -> bool {
+            if let Some(hook) = self.hook.lock().take() {
+                hook();
+            }
+            true
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reused_http_session_no_duplicate_in_use_entry() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            let mut srv = h2::server::handshake(server_io).await.unwrap();
+            while let Some(Ok((_req, mut respond))) = srv.accept().await {
+                let _ = respond.send_response(Response::new(()), true);
+            }
+        });
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(connection);
+        let (_closed_tx, closed_rx) = watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let conn = ConnectionRef::new(send_req, closed_rx, ping_timeout, 0, 10, Digest::default());
+
+        let connector = Arc::new(Connector::new(None));
+        let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let hash = peer.reuse_hash();
+        let idle = Some(Duration::from_millis(100));
+
+        let b = conn.spawn_stream().await.unwrap().unwrap();
+        let d = conn.spawn_stream().await.unwrap().unwrap();
+        connector.in_use_pool.insert(hash, conn.clone());
+
+        // Stream B ends while reused_http_session() holds C.
+        let hook_connector = connector.clone();
+        let hook_peer_inner = peer.clone();
+        let hook_peer = HookPeer {
+            inner: peer.clone(),
+            hook: Arc::new(Mutex::new(Some(Box::new(move || {
+                hook_connector.release_http_session(b, &hook_peer_inner, idle);
+            })))),
+        };
+        let a = connector
+            .reused_http_session(&hook_peer)
+            .await
+            .unwrap()
+            .unwrap();
+
+        connector.release_http_session(a, &peer, idle);
+        connector.release_http_session(d, &peer, idle);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut left = 0;
+        while connector.in_use_pool.get(hash).is_some() {
+            left += 1;
+        }
+        assert_eq!(left, 0, "InUsePool still holds C after idle_timeout");
+    }
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
