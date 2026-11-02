@@ -105,7 +105,7 @@ as long as there are new events to be handled.
 
 Interestingly, the `pingora` `Server` itself has no particular notion of a Proxy.
 
-Instead, it only thinks in terms of `Service`s, which are expected to contain a particular implementor of the `ServiceApp` trait.
+Instead, it only thinks in terms of `Service`s, which are expected to contain a particular implementor of the `ServerApp` trait.
 
 For example, this is how an `HttpProxy` struct, from the `pingora-proxy` crate, "becomes" a `Service` spawned by the `Server`:
 
@@ -127,7 +127,7 @@ For example, this is how an `HttpProxy` struct, from the `pingora-proxy` crate, 
                                        │
                                    contained    ┌─────────────────────┐
                                      within     │                     │
-                                       └───────>│ Service<ServiceApp> │
+                                       └───────>│ Service<ServerApp> │
                                                 │                     │
                                                 └─────────────────────┘
 ```
