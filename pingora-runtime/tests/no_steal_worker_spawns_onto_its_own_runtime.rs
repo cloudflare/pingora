@@ -14,24 +14,27 @@
 
 //! A fresh no-steal worker must not inherit a shut-down runtime.
 //!
-//! `CURRENT_HANDLE` is a `thread_local::ThreadLocal`. Each
-//! `NoStealRuntime` worker registers its own runtime's pools there in
-//! `init_pools()`, and `current_handle()` reads them back. The map is
-//! keyed by an id the `thread_local` crate allocates from a free list
-//! and recycles the moment a thread exits, so a registration outlives
-//! the thread that made it and reappears under whichever thread is
-//! handed the same id next.
+//! Each `NoStealRuntime` worker registers its own runtime's pools in
+//! `init_pools()`, and `current_handle()` reads them back. A
+//! registration must not outlive the worker thread that made it.
+//!
+//! This test, and the two single-test files beside it, guard against
+//! keeping the registration in a `thread_local::ThreadLocal`. That map is
+//! keyed by an id the `thread_local` crate allocates from a free list and
+//! recycles the moment a thread exits, so a registration outlives the
+//! thread that made it and reappears under whichever thread is handed
+//! the same id next.
 //!
 //! When that next thread is a worker of a newer `NoStealRuntime`, it
-//! finds the old entry under its id. Without the owning `ThreadId`
-//! stored beside the pools, the new worker holds a handle to the runtime
+//! finds the old entry under its id and holds a handle to the runtime
 //! that already shut down, and every task it spawns through
 //! `current_handle()` is canceled on arrival, on a runtime that is
 //! healthy and has nothing wrong with it.
 //!
 //! # Why it is deterministic
 //!
-//! Not timing, and no sleeps. It rests on being the only thing in its
+//! Not timing, and no sleeps. Against a `ThreadLocal` registration, the
+//! case it exists to catch, it rests on being the only thing in its
 //! process that allocates a `thread_local` id, which is why this is a
 //! test file of its own with exactly one `#[test]` in it:
 //!
@@ -69,17 +72,18 @@ const SECOND_THREADS: usize = 1;
 fn no_steal_worker_spawns_onto_its_own_runtime() {
     // A no-steal runtime, used and then shut down. Reading the handle is
     // what builds the pools and spawns the worker threads, and each
-    // worker registers this runtime's pools against its own thread id
-    // before it starts driving its runtime.
+    // worker registers this runtime's pools before it starts driving its
+    // runtime.
     let first = Runtime::new_no_steal(FIRST_THREADS, "first");
     let _ = first.get_handle();
-    // Joins the worker threads. That is what puts their thread ids back
-    // on the free list. The registrations they left behind stay.
+    // Joins the worker threads. With a `ThreadLocal` registration, that is
+    // what puts their ids back on the free list, and the registrations
+    // they left behind stay.
     first.shutdown_timeout(Duration::from_secs(10));
 
-    // A second no-steal runtime, built after the first one is gone. Its
-    // worker is handed a recycled id, and with it the first runtime's
-    // registration.
+    // A second no-steal runtime, built after the first one is gone. With a
+    // `ThreadLocal` registration, its worker is handed a recycled id, and
+    // with it the first runtime's registration.
     let second = Runtime::new_no_steal(SECOND_THREADS, "second");
 
     // Ask the worker of the second runtime, from a task running on it,
