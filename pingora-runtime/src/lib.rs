@@ -23,16 +23,15 @@
 //! This flavor is as efficient as the single-threaded runtime while allows the async
 //! program to use multiple cores.
 
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::OnceCell;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 #[cfg(feature = "dial9")]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle, ThreadId};
+use std::thread::JoinHandle;
 use std::time::Duration;
-use thread_local::ThreadLocal;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
 
@@ -635,49 +634,37 @@ impl Runtime {
     }
 }
 
-/// The no-steal pools a thread should spawn onto, per thread. Only a
-/// `NoStealRuntime` worker registers one, in `init_pools()`.
-///
-/// Keyed by an id the `thread_local` crate hands out and recycles when a
-/// thread exits, so a slot can outlive the thread that filled it and
-/// reappear under an unrelated one. The owning [`ThreadId`] is stored
-/// with the pools and checked on read for exactly that reason: without
-/// it, a thread can be handed a handle to a runtime that has already
-/// shut down, and every task it spawns is canceled on arrival. The slot
-/// is a `RefCell` so a thread that inherits a recycled one can claim it.
-static CURRENT_HANDLE: Lazy<ThreadLocal<Registration>> = Lazy::new(ThreadLocal::new);
+thread_local! {
+    /// The pools of the `NoStealRuntime` this thread is a worker of. Only
+    /// `init_pools()` sets it, on the worker thread it spawns.
+    ///
+    /// Keep this a std `thread_local!`, which drops the value when its
+    /// thread exits. A `thread_local::ThreadLocal` keeps it and hands the
+    /// slot to a later thread, which then spawns onto a runtime that has
+    /// already shut down.
+    static CURRENT_HANDLE: RefCell<Option<Pools>> = const { RefCell::new(None) };
+}
 
 /// Return the [Handle] of current runtime.
 /// If the current thread is under a `Steal` runtime, the current [Handle] is returned.
 /// If the current thread is under a `NoSteal` runtime, the [Handle] of a random thread
 /// under this runtime is returned. This function will panic if called outside any runtime.
 pub fn current_handle() -> Handle {
-    if let Some(slot) = CURRENT_HANDLE.get() {
-        let registered = slot.borrow();
-        if let Some((owner, pools)) = registered.as_ref() {
-            if *owner == thread::current().id() {
-                // `pools` is the OnceCell that `get_pools()` fills after
-                // `init_pools()` returns, and `init_pools()` is what
-                // spawned this thread, so a worker that reaches here
-                // early can legitimately find it empty. Falling through
-                // to `Handle::current()` gives that thread its own
-                // runtime, which is the right answer, rather than
-                // panicking on an ordering this code does not control.
-                if let Some(pools) = pools.get() {
-                    let mut rng = rand::thread_rng();
-                    let index = rng.gen_range(0..pools.len());
-                    return pools[index].clone();
-                }
-            }
-        }
-    }
-    // Not a NoStealRuntime thread, or a slot left behind by one that has
-    // exited. Either way the current tokio runtime is the answer.
-    Handle::current()
+    CURRENT_HANDLE
+        .try_with(|slot| {
+            let slot = slot.borrow();
+            // `get_pools()` fills the cell before any task can reach a
+            // worker, so an empty one is not expected here. Falling back
+            // instead of unwrapping is only defensive.
+            let pools = slot.as_ref()?.get()?;
+            let index = rand::thread_rng().gen_range(0..pools.len());
+            Some(pools[index].clone())
+        })
+        .ok()
+        .flatten()
+        // Not a NoStealRuntime worker, so use the current tokio runtime.
+        .unwrap_or_else(Handle::current)
 }
-
-/// A thread's no-steal pool registration, with the thread that made it.
-type Registration = RefCell<Option<(ThreadId, Pools)>>;
 
 type Control = (Sender<Duration>, JoinHandle<()>);
 type Pools = Arc<OnceCell<Box<[Handle]>>>;
@@ -730,11 +717,7 @@ impl NoStealRuntime {
             let join = std::thread::Builder::new()
                 .name(self.name.clone())
                 .spawn(move || {
-                    // Claim the slot rather than `get_or`, which would
-                    // leave a recycled one holding a dead runtime's
-                    // pools and hand them to this thread.
-                    *CURRENT_HANDLE.get_or_default().borrow_mut() =
-                        Some((thread::current().id(), pools_ref));
+                    CURRENT_HANDLE.with(|slot| *slot.borrow_mut() = Some(pools_ref));
                     if let Ok(timeout) = rt.block_on(rx) {
                         rt.shutdown_timeout(timeout);
                     } // else Err(_): tx is dropped, just exit
