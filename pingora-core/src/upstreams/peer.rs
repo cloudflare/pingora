@@ -764,6 +764,17 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with the given socket address and TLS settings.
+    ///
+    /// `address` is anything that implements [`ToSocketAddrs`](std::net::ToSocketAddrs).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SocketError`] if `address` cannot be converted to a socket address, for
+    /// example because it is malformed or its hostname does not resolve.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `address` converts successfully but yields no socket addresses.
     pub fn new<A: ToInetSocketAddrs>(address: A, tls: bool, sni: String) -> Result<Self> {
         let mut addrs_iter = address
             .to_socket_addrs()
@@ -808,6 +819,14 @@ impl HttpPeer {
     }
 
     /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`HttpPeer::new`].
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`HttpPeer::new`].
     pub fn new_mtls<A: ToInetSocketAddrs>(
         address: A,
         sni: String,
