@@ -19,13 +19,13 @@ mod stream;
 pub use stream::*;
 
 use crate::utils::tls::WrappedX509;
-use pingora_rustls::CertificateDer;
+use pingora_rustls::{CertificateDer, NamedGroup};
 
 pub type CaType = [WrappedX509];
 
 /// TLS connection state exposed to post-handshake callbacks.
 ///
-/// Provides access to peer certificates and negotiated cipher suite
+/// Provides access to peer certificates and negotiated TLS parameters
 /// after a TLS handshake completes. This is the rustls equivalent of
 /// the OpenSSL `SslRef` that is used as `TlsRef` in the boringssl/openssl path.
 #[derive(Debug)]
@@ -34,6 +34,7 @@ pub struct TlsRef {
     pub(super) cipher: Option<&'static str>,
     pub(super) version: Option<&'static str>,
     pub(super) server_name: Option<String>,
+    pub(super) key_exchange_group: Option<NamedGroup>,
 }
 
 impl TlsRef {
@@ -54,6 +55,44 @@ impl TlsRef {
     /// Returns the negotiated cipher suite name, if available.
     pub fn current_cipher_name(&self) -> Option<&'static str> {
         self.cipher
+    }
+
+    /// Returns the negotiated key exchange group, if available.
+    ///
+    /// Returns `None` when no key exchange occurred, including resumed TLS 1.2
+    /// handshakes. This reports the group for this handshake, not an earlier
+    /// handshake that established a resumed session.
+    ///
+    /// A downstream [`TlsAccept`](crate::listeners::TlsAccept) callback can
+    /// retain this value in an application-defined digest extension:
+    ///
+    /// ```
+    /// use async_trait::async_trait;
+    /// use pingora_core::listeners::TlsAccept;
+    /// use pingora_core::protocols::tls::{SslDigest, TlsRef};
+    /// use pingora_rustls::NamedGroup;
+    /// use std::{any::Any, sync::Arc};
+    ///
+    /// struct Group(Option<NamedGroup>);
+    /// struct CaptureGroup;
+    ///
+    /// #[async_trait]
+    /// impl TlsAccept for CaptureGroup {
+    ///     async fn handshake_complete_callback(
+    ///         &self,
+    ///         tls: &TlsRef,
+    ///     ) -> Option<Arc<dyn Any + Send + Sync>> {
+    ///         Some(Arc::new(Group(tls.negotiated_key_exchange_group())))
+    ///     }
+    /// }
+    ///
+    /// fn group_id(digest: &SslDigest) -> Option<u16> {
+    ///     // Numeric identifiers also preserve groups without a known name.
+    ///     digest.extension.get::<Group>()?.0.map(u16::from)
+    /// }
+    /// ```
+    pub fn negotiated_key_exchange_group(&self) -> Option<NamedGroup> {
+        self.key_exchange_group
     }
 
     /// Returns the negotiated TLS protocol version (e.g. "TLSv1.3"), if available.
