@@ -90,6 +90,15 @@ jobs:
           cargo test --verbose --lib --bins --tests --no-fail-fast --
           --skip connectors::http::v2::tests::test_h2_late_frames_on_cancelled_streams_keep_connection
 
+      - name: Test keep listening on terminate
+        if: matrix.toolchain == '1.97.1'
+        run: |
+          cargo clippy --package pingora-core --all-targets --features keep_listening_on_terminate -- --allow=unknown-lints --deny=warnings
+          cargo test --package pingora-core --features keep_listening_on_terminate \
+            --lib --test test_keep_listening_on_terminate --no-fail-fast -- \
+            --skip connectors::http::v2::tests::test_h2_late_frames_on_cancelled_streams_keep_connection
+          cargo build --package pingora-proxy --example keep_listening_on_terminate --features keep_listening_on_terminate
+
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
