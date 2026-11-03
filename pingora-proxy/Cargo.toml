@@ -84,6 +84,7 @@ sentry = ["pingora-core/sentry"]
 patched_http1 = ["pingora-core/patched_http1"]
 upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
+keep_listening_on_terminate = ["pingora-core/keep_listening_on_terminate"]
 trace = ["pingora-cache/trace"]
 early_body_buffer = ["dep:pingora-timeout"]
 
@@ -94,6 +95,10 @@ required-features = ["connection_filter"]
 [[example]]
 name = "body_routing"
 required-features = ["early_body_buffer"]
+
+[[example]]
+name = "keep_listening_on_terminate"
+required-features = ["keep_listening_on_terminate"]
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
