@@ -333,6 +333,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
             .negotiated_cipher_suite()
             .and_then(|suite| suite.suite().as_str());
         let version = session.protocol_version().and_then(|v| v.as_str());
+        let key_exchange_group = session
+            .negotiated_key_exchange_group()
+            .map(|group| group.name());
         let server_name = match stream {
             RusTlsStream::Server(s) => s.get_ref().1.server_name().map(|n| n.to_string()),
             RusTlsStream::Client(_) => None,
@@ -342,6 +345,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> InnerStream<T> {
             cipher,
             version,
             server_name,
+            key_exchange_group,
         })
     }
 }
