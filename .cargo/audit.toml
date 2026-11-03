@@ -30,4 +30,16 @@ ignore = [
     # backport (patched >= 0.7.6). It is used only for SigV4a key derivation
     # and signing, which standard regional S3 uploads do not use.
     "RUSTSEC-2026-0387", # crypto-bigint: multiple timing variability issues in constant-time operations
+    # paste 1.0.15 is an informational "unmaintained" advisory on a proc-macro
+    # crate that is never linked into the proxy, and the advisory has no patched
+    # release. It reaches us as foundations -> tikv-jemalloc-ctl -> paste, a
+    # Linux-only edge behind Foundations' memory-profiling feature, but the
+    # dependency is still locked by `cargo generate-lockfile`, so cargo-audit
+    # reports it. Every published tikv-jemalloc-ctl (0.4.2 through 0.7.0)
+    # requires paste ^1 non-optionally, so no version bump removes it; the
+    # removal is merged upstream in tikv/jemallocator#189 and tracked in #184,
+    # not yet released.
+    # Remove once a paste-free tikv-jemalloc-ctl ships and Foundations widens
+    # its requirement to select it.
+    "RUSTSEC-2024-0436", # paste: no longer maintained
 ]
