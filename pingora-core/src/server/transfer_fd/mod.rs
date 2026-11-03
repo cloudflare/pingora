@@ -35,17 +35,36 @@ use std::{thread, time};
 /// Container for open file descriptors and their associated bind addresses.
 pub struct Fds {
     map: HashMap<String, RawFd>,
+    local: HashSet<String>,
 }
 
 impl Fds {
     pub fn new() -> Self {
         Fds {
             map: HashMap::new(),
+            local: HashSet::new(),
         }
     }
 
     pub fn add(&mut self, bind: String, fd: RawFd) {
+        self.local.insert(bind.clone());
         self.map.insert(bind, fd);
+    }
+
+    pub(crate) fn try_add(&mut self, bind: String, fd: RawFd) -> Result<(), Error> {
+        if self.map.contains_key(&bind) {
+            return Err(Errno::EEXIST);
+        }
+        self.add(bind, fd);
+        Ok(())
+    }
+
+    pub(crate) fn is_local(&self, bind: &str) -> bool {
+        self.local.contains(bind)
+    }
+
+    pub(crate) fn mark_local(&mut self, bind: &str) {
+        self.local.insert(bind.to_string());
     }
 
     pub fn get(&self, bind: &str) -> Option<&RawFd> {
@@ -63,6 +82,7 @@ impl Fds {
     pub fn deserialize(&mut self, binds: Vec<String>, fds: Vec<RawFd>) {
         assert_eq!(binds.len(), fds.len());
         for (bind, fd) in binds.into_iter().zip(fds) {
+            self.local.remove(&bind);
             self.map.insert(bind, fd);
         }
     }
@@ -108,6 +128,7 @@ impl Fds {
             closed.push(bind.clone());
             false
         });
+        self.local.retain(|bind| keep.contains(bind));
         closed
     }
 }
