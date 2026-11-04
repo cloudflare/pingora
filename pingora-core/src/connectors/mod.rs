@@ -518,6 +518,206 @@ fn test_reusable_stream(stream: &mut Stream, unexpected_data_conn_count: &Atomic
     }
 }
 
+
+/// Test utilities for creating TCP mock acceptors.
+#[cfg(test)]
+pub(crate) mod test_mock_tcp_server {
+    use tokio::net::TcpListener;
+    use tokio::io::AsyncWriteExt;
+    use tokio::task::JoinSet;
+    use pingora_rustls::{load_certs_and_key_files, TlsAcceptor};
+    use std::sync::Arc;
+    use std::net::SocketAddr;
+
+    pub async fn spawn_mock_tls_tcp_server(
+        response: &'static [u8],
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<(
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncReadExt;
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+
+        let cert_path = "pingora-proxy/tests/keys/server.crt";
+        let key_path = "pingora-proxy/tests/keys/key.pem";
+
+        let (certs, key) = load_certs_and_key_files(cert_path, key_path)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Certs or key missing"))?;
+
+        let provider = rustls::crypto::ring::default_provider();
+
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("Safe default protocol failed")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("Single cert failed");
+
+        server_config.alpn_protocols = alpn_protocols;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let server_handle = tokio::spawn(async move {
+        let mut handlers = JoinSet::new();
+        let _ = ready_tx.send(());
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+
+                result = listener.accept() => {
+                    let Ok((mut stream, _)) = result else {
+                        break;
+                    };
+
+                    handlers.spawn(async move {
+                        if read_request_headers(&mut stream).await.is_err() {
+                            return;
+                        }
+
+                        if stream.write_all(response).await.is_err() {
+                            return;
+                        }
+
+                        let mut buf = [0u8; 1024];
+                        while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+                    });
+                }
+
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+            }
+        }
+
+        handlers.shutdown().await;
+    });
+
+        Ok((local_addr, ready_rx, shutdown_tx, server_handle))
+    }
+
+    pub async fn spawn_mock_tcp_server(
+    response: &'static [u8],
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = listener.local_addr()?;
+
+    let server_handle = tokio::spawn(async move {
+        let mut handlers = JoinSet::new();
+        let _ = ready_tx.send(());
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+
+                result = listener.accept() => {
+                    let Ok((mut stream, _)) = result else {
+                        break;
+                    };
+
+                    handlers.spawn(async move {
+                        if read_request_headers(&mut stream).await.is_err() {
+                            return;
+                        }
+
+                        if stream.write_all(response).await.is_err() {
+                            return;
+                        }
+
+                        let mut buf = [0u8; 1024];
+                        while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+                    });
+                }
+
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+            }
+        }
+
+        handlers.shutdown().await;
+    });
+
+    Ok((local_addr, ready_rx, shutdown_tx, server_handle))
+}
+
+    pub async fn read_request_headers(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut matched = 0;
+        let mut buf = [0u8; 1024];
+
+        loop {
+            let n = stream.read(&mut buf).await?;
+
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+
+            for &byte in &buf[..n] {
+                matched = match (matched, byte) {
+                    (0, b'\r') => 1,
+                    (1, b'\n') => 2,
+                    (2, b'\r') => 3,
+                    (3, b'\n') => return Ok(()),
+                    (_, b'\r') => 1,
+                    _ => 0,
+                };
+            }
+        }
+
+    }
+
+    // pub async fn spawn_mock_tcp_server_close_immediate() -> Result<(
+    //     SocketAddr,
+    //     tokio::sync::oneshot::Receiver<()>,
+    //     tokio::sync::oneshot::Sender<()>,
+    //     tokio::task::JoinHandle<()>
+    // ), Box<dyn std::error::Error>> {
+    //             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    //     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    //
+    //     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    //     let local_addr = listener.local_addr()?;
+    //
+    //     let server_handle = tokio::spawn(async move{
+    //         let _ = ready_tx.send(());
+    //
+    //         if let Ok((mut stream, _addr)) = listener.accept().await {
+    //             if let Err(e) = stream.write_all(response).await {
+    //                 eprintln!("Failed to write response: {}", e);
+    //             }
+    //             let _ = shutdown_rx.await;
+    //         }
+    //     });
+    //     Ok((local_addr, ready_rx, shutdown_tx, server_handle))
+    //
+    // }
+
+}
+
+
 /// Test utilities for creating mock acceptors.
 #[cfg(all(test, unix))]
 pub(crate) mod test_utils {
