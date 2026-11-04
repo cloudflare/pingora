@@ -144,7 +144,7 @@ impl Rate {
         // should be short enough not to overflow
         let now = Instant::now().duration_since(self.start).as_millis() as u64;
         let last_reset = self.last_reset_time.load(Ordering::SeqCst);
-        let past_ms = now - last_reset;
+        let past_ms = now.saturating_sub(last_reset);
 
         if past_ms < self.reset_interval_ms {
             // no need to reset
@@ -164,14 +164,14 @@ impl Rate {
                 self.red_or_blue.store(!red_or_blue, Ordering::SeqCst);
                 // if current time is beyond 2 intervals, the data stored in the previous slot
                 // is also stale, we should clear that too
-                if now - last_reset >= self.reset_interval_ms * 2 {
+                if now.saturating_sub(last_reset) >= self.reset_interval_ms * 2 {
                     // Note that this is the previous one now because we just flipped self.red_or_blue
                     self.current(red_or_blue).reset();
                 }
             }
             Err(new) => {
                 // another thread beats us to it
-                assert!(new >= now - 1000); // double check that the new timestamp looks right
+                assert!(new >= now.saturating_sub(1000)); // double check that the new timestamp looks right
             }
         }
 
@@ -343,5 +343,25 @@ mod tests {
         // second: 3
         sleep(Duration::from_secs(1));
         assert_eq!(r.rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN), 0f64);
+    }
+
+    #[test]
+    fn test_concurrent_reset_does_not_panic() {
+        let r = std::sync::Arc::new(Rate::new(Duration::from_millis(1)));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let r = r.clone();
+                std::thread::spawn(move || {
+                    let end = Instant::now() + Duration::from_millis(500);
+                    while Instant::now() < end {
+                        r.observe(&1, 1);
+                        r.rate(&1);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }
