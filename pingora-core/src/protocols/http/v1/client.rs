@@ -235,6 +235,14 @@ impl HttpSession {
             }
         }
 
+        if resp_header.headers.contains_key(header::TRANSFER_ENCODING) {
+            // If chunked is not the final Transfer-Encoding, reject response
+            // See https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.4.3
+            if !self.is_chunked_encoding() {
+                return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
+            }
+        }
+
         Ok(())
     }
 
@@ -2492,7 +2500,8 @@ hello\r\n\
     #[tokio::test]
     async fn test_response_multiple_te_headers_chunked_not_last() {
         init_log();
-        // Chunked in first header but not last - should NOT be chunked
+        // Chunked in first header but not last - should fail validation
+        // Per RFC 9112 Section 6.3-2.4.3, non-chunked final Transfer-Encoding is an unrecoverable error.
         let input = b"HTTP/1.1 200 OK\r\n\
 Transfer-Encoding: chunked\r\n\
 Transfer-Encoding: identity\r\n\
@@ -2502,10 +2511,29 @@ hello";
 
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_response().await.unwrap();
+        let res = http_stream.read_response().await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(err.to_string().contains("non-chunked final Transfer-Encoding"));
+    }
 
-        // Should NOT be chunked - identity is final encoding
-        assert!(!http_stream.is_chunked_encoding());
+    #[tokio::test]
+    async fn test_response_single_te_header_not_chunked() {
+        init_log();
+        let input = b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: gzip\r\n\
+Content-Length: 5\r\n\
+\r\n\
+hello";
+
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_response().await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(err.to_string().contains("non-chunked final Transfer-Encoding"));
     }
 
     #[test]
