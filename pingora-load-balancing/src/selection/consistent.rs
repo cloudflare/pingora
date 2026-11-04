@@ -157,4 +157,18 @@ mod test {
         let mut iter = hash.iter(b"test9");
         assert_eq!(iter.next(), Some(&b2));
     }
+
+    #[test]
+    fn test_ketama_honors_backend_weight() {
+        let b1 = Backend::new("1.1.1.1:80").unwrap();
+        let b2 = Backend::new_with_weight("1.0.0.1:80", 3).unwrap();
+        let backends = BTreeSet::from_iter([b1, b2.clone()]);
+        let hash = Arc::new(KetamaHashing::build(&backends));
+
+        // weight 3 of 4 in total, so about 3000 of these 4000 keys
+        let on_b2 = (0..4000)
+            .filter(|i| hash.iter(format!("key{i}").as_bytes()).next() == Some(&b2))
+            .count();
+        assert!(on_b2 > 2500, "weight 3 backend got {on_b2} of 4000 keys");
+    }
 }
