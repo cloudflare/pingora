@@ -202,14 +202,14 @@ impl HttpHealthCheck<()> {
     /// * consecutive_failure: 1
     /// * reuse_connection: false
     /// * validator: `None`, any 200 response is considered successful
-    pub fn new(host: &str, tls: bool) -> Self {
-        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
-        req.append_header("Host", host).unwrap();
+    pub fn new(host: &str, tls: bool) -> Result<Self> {
+        let mut req = RequestHeader::build("GET", b"/", None)?;
+        req.append_header("Host", host)?;
         let sni = if tls { host.into() } else { String::new() };
-        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni);
+        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni)?;
         peer_template.options.connection_timeout = Some(Duration::from_secs(1));
         peer_template.options.read_timeout = Some(Duration::from_secs(1));
-        HttpHealthCheck {
+        Ok(HttpHealthCheck {
             consecutive_success: 1,
             consecutive_failure: 1,
             peer_template,
@@ -220,7 +220,7 @@ impl HttpHealthCheck<()> {
             port_override: None,
             health_changed_callback: None,
             backend_summary_callback: None,
-        }
+        })
     }
 }
 
@@ -236,14 +236,14 @@ where
     /// * consecutive_failure: 1
     /// * reuse_connection: false
     /// * validator: `None`, any 200 response is considered successful
-    pub fn new_custom(host: &str, tls: bool, custom: HttpConnector<C>) -> Self {
-        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
-        req.append_header("Host", host).unwrap();
+    pub fn new_custom(host: &str, tls: bool, custom: HttpConnector<C>) -> Result<Self> {
+        let mut req = RequestHeader::build("GET", b"/", None)?;
+        req.append_header("Host", host)?;
         let sni = if tls { host.into() } else { String::new() };
-        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni);
+        let mut peer_template = HttpPeer::new("0.0.0.0:1", tls, sni)?;
         peer_template.options.connection_timeout = Some(Duration::from_secs(1));
         peer_template.options.read_timeout = Some(Duration::from_secs(1));
-        HttpHealthCheck {
+        Ok(HttpHealthCheck {
             consecutive_success: 1,
             consecutive_failure: 1,
             peer_template,
@@ -254,7 +254,7 @@ where
             port_override: None,
             health_changed_callback: None,
             backend_summary_callback: None,
-        }
+        })
     }
 
     /// Replace the internal http connector with the given [HttpConnector]
@@ -465,7 +465,7 @@ mod test {
 
     #[tokio::test]
     async fn test_http_custom_check() {
-        let mut http_check = HttpHealthCheck::new("one.one.one.one", false);
+        let mut http_check = HttpHealthCheck::new("one.one.one.one", false).unwrap();
         http_check.validator = Some(Box::new(|resp: &ResponseHeader| {
             if resp.status == 301 {
                 Ok(())
@@ -545,7 +545,7 @@ mod test {
             };
             let bob = Box::new(ob);
 
-            let mut https_check = HttpHealthCheck::new("one.one.one.one", true);
+            let mut https_check = HttpHealthCheck::new("one.one.one.one", true).unwrap();
             https_check.health_changed_callback = Some(bob);
 
             let discovery = discovery::Static::default();

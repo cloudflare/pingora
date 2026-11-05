@@ -451,7 +451,7 @@ impl ProxyHttp for ExampleProxyHttp {
             format!("127.0.0.1:{port}"),
             false,
             "".to_string(),
-        ));
+        )?);
 
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
@@ -1804,7 +1804,7 @@ impl ProxyHttp for ExampleProxyCache {
             format!("127.0.0.1:{}", port),
             false,
             "".to_string(),
-        ));
+        )?);
 
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
