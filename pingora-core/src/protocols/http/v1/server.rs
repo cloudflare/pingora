@@ -1479,6 +1479,10 @@ impl HttpSession {
     pub async fn reuse(mut self) -> Result<Option<ReusableHttpStream>> {
         if !self.will_keepalive() {
             debug!("HTTP shutdown connection");
+            // TODO: linger after the shutdown when request body bytes are unread: keep reading and
+            // discarding them until the client closes or a short timeout passes. Closing with
+            // unread bytes makes the kernel send a reset, which can destroy the response before
+            // the client reads it (RFC 9112 section 9.6).
             self.shutdown().await;
             Ok(None)
         } else {
