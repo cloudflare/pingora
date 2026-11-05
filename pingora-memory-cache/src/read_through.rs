@@ -49,6 +49,31 @@ impl CacheLock {
     }
 }
 
+/// Releases a [CacheLock] it owns when dropped, including when the owning future is cancelled
+/// while the lookup is still pending.
+struct CacheLockGuard<'a> {
+    lockers: &'a RwLock<HashMap<u64, Arc<CacheLock>>>,
+    hashed_key: u64,
+    lock: Arc<CacheLock>,
+}
+
+impl Drop for CacheLockGuard<'_> {
+    fn drop(&mut self) {
+        /* add permit so that reader can start. Any number of permits will do,
+         * since readers will return permits right away. */
+        self.lock.lock.add_permits(10);
+
+        /* Only remove our own lock: a newer writer may already have replaced it. */
+        let mut lockers = self.lockers.write();
+        let ours = lockers
+            .get(&self.hashed_key)
+            .is_some_and(|l| Arc::ptr_eq(l, &self.lock));
+        if ours {
+            lockers.remove(&self.hashed_key);
+        }
+    }
+}
+
 #[async_trait]
 /// [Lookup] defines the caching behavior that the implementor needs. The `extra` field can be used
 /// to define any additional metadata that the implementor uses to determine cache eligibility.
@@ -252,6 +277,14 @@ where
         } else {
             /* this one will do the look up, either because it gets the write lock or the read
              * lock age is reached */
+            /* Held across the lookup await so the lock is released even if this future is
+             * dropped (cancelled) while the lookup is still pending. */
+            let _guard = my_write.as_ref().map(|lock| CacheLockGuard {
+                lockers: &self.lockers,
+                hashed_key,
+                lock: lock.clone(),
+            });
+
             let value = CB::lookup(key, extra).await;
             let ret = match value {
                 Ok((v, new_ttl)) => {
@@ -267,18 +300,6 @@ where
                     (Err(err), cache_state)
                 }
             };
-            if let Some(my_write) = my_write {
-                /* add permit so that reader can start. Any number of permits will do,
-                 * since readers will return permits right away. */
-                my_write.lock.add_permits(10);
-
-                {
-                    // remove the lock from locker
-                    let mut lockers = self.lockers.write();
-                    lockers.remove(&hashed_key);
-                } // write lock dropped here
-            }
-
             ret
         }
     }
@@ -801,5 +822,103 @@ mod tests {
         let (res, hit) = CACHE.get(&1, ttl, opt.as_ref()).await;
         assert_eq!(res.unwrap(), 2);
         assert_eq!(hit, CacheStatus::Hit);
+    }
+
+    // Issue #931: a cancelled writer leaves its CacheLock behind in `lockers` with zero
+    // permits, so every later request for the same key blocks forever.
+    static LOOKUP_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LOOKUP_ENTERED: once_cell::sync::Lazy<tokio::sync::Notify> =
+        once_cell::sync::Lazy::new(tokio::sync::Notify::new);
+
+    struct HangingLookup;
+
+    #[async_trait]
+    impl Lookup<i32, i32, ()> for HangingLookup {
+        async fn lookup(
+            _key: &i32,
+            _extra: Option<&()>,
+        ) -> Result<(i32, Option<Duration>), Box<dyn ErrorTrait + Send + Sync>> {
+            if std::sync::atomic::AtomicUsize::fetch_add(
+                &LOOKUP_CALLS,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+            ) == 0
+            {
+                /* the writer's lookup never completes on its own */
+                LOOKUP_ENTERED.notify_one();
+                std::future::pending::<()>().await;
+            }
+            Ok((1, None))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_writer_does_not_block_later_readers() {
+        let cache: RTCache<i32, i32, HangingLookup, ()> = RTCache::new(10, None, None);
+        let cache = Arc::new(cache);
+
+        let cache_c = cache.clone();
+        let writer = tokio::spawn(async move { cache_c.get(&1, None, None).await });
+
+        /* wait until the writer is inside lookup(), so its lock is registered */
+        LOOKUP_ENTERED.notified().await;
+
+        /* cancel the writer while its lookup is still awaiting */
+        writer.abort();
+        let _ = writer.await;
+
+        /* a later request for the same key must still make progress */
+        let later = tokio::time::timeout(Duration::from_secs(5), cache.get(&1, None, None)).await;
+        assert!(
+            later.is_ok(),
+            "RTCache::get() is stuck: stale CacheLock left in lockers after writer cancellation"
+        );
+        assert_eq!(later.unwrap().1, CacheStatus::Miss);
+    }
+
+    // A cancelled writer must not remove a newer writer's lock for the same key.
+    #[test]
+    fn test_guard_does_not_remove_newer_lock() {
+        let lockers: RwLock<HashMap<u64, Arc<CacheLock>>> = RwLock::new(HashMap::new());
+        let key = 42;
+
+        let old_lock = CacheLock::new_arc();
+        lockers.write().insert(key, old_lock.clone());
+
+        /* a newer writer has since taken over the key */
+        let new_lock = CacheLock::new_arc();
+        lockers.write().insert(key, new_lock.clone());
+
+        /* the old writer finishes (or is cancelled) afterwards */
+        drop(CacheLockGuard {
+            lockers: &lockers,
+            hashed_key: key,
+            lock: old_lock.clone(),
+        });
+
+        let entry = lockers.read().get(&key).cloned();
+        assert!(
+            entry.as_ref().is_some_and(|l| Arc::ptr_eq(l, &new_lock)),
+            "stale cleanup removed the newer writer's lock"
+        );
+        assert!(new_lock.lock.available_permits() == 0);
+    }
+
+    // A writer that finishes normally must still release its own lock.
+    #[test]
+    fn test_guard_releases_own_lock() {
+        let lockers: RwLock<HashMap<u64, Arc<CacheLock>>> = RwLock::new(HashMap::new());
+        let key = 7;
+        let lock = CacheLock::new_arc();
+        lockers.write().insert(key, lock.clone());
+
+        drop(CacheLockGuard {
+            lockers: &lockers,
+            hashed_key: key,
+            lock: lock.clone(),
+        });
+
+        assert!(lockers.read().get(&key).is_none());
+        assert!(lock.lock.available_permits() > 0);
     }
 }
