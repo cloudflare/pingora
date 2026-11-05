@@ -1625,6 +1625,9 @@ mod tests {
     };
     use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
     use pingora_cache::{CacheKey, NoCacheReason};
+    use pingora_core::protocols::http::v2::server::{
+        self as h2_server, H2Accept, HttpSession as SessionV2,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2291,8 +2294,8 @@ mod tests {
 
     impl UploadSource {
         /// The bytes sent upstream. Each exceeds the stream window of the test upstream in
-        /// [`run_upload_stop`], so the upload is still blocked on flow control when the upstream
-        /// resets it.
+        /// [`proxy_upload_to_early_response`], so the upload is still blocked on flow control when
+        /// the upstream resets it.
         fn len(self) -> usize {
             match self {
                 UploadSource::Streamed => UPLOAD_LEN,
@@ -2361,8 +2364,7 @@ mod tests {
     const UPLOAD_LEN: usize = 256 * 1024;
     const EARLY_RESPONSE_BODY: &[u8] = &[b'r'; 200];
 
-    /// Proxies an HTTP/1 upload from `source` to an HTTP/2 upstream that answers it early with
-    /// a `413` carrying [`EARLY_RESPONSE_BODY`], stopping the upload as `stop` says. With
+    /// Proxies an HTTP/1 upload from `source` through [`proxy_upload_to_early_response`]. With
     /// `cache_miss` the request is a streaming cache miss.
     async fn run_upload_stop<SV>(
         app: SV,
@@ -2392,18 +2394,56 @@ mod tests {
             .downstream_session
             .set_close_on_response_before_downstream_finish(false);
         if cache_miss {
-            session
-                .cache
-                .enable(&*WRITER_DEMAND_CACHE, None, None, None, None);
-            session.cache.set_cache_key(CacheKey::new(path, ""));
-            session.cache.cache_miss();
-            assert_eq!(session.cache.support_streaming_partial_write(), Some(true));
+            start_streaming_cache_miss(&mut session, path);
         }
         let (mut client_read, mut client_write) = tokio::io::split(client);
         let client_upload = tokio::spawn(async move {
             let _ = client_write.write_all(&vec![b'u'; declared_len]).await;
             client_write
         });
+        read_upload_source(&mut session, source).await;
+
+        let (result, upstream_stopped_early) =
+            proxy_upload_to_early_response(app, &mut session, path, stop).await;
+        let drained_and_reusable = if matches!(result, Ok(true)) {
+            assert_eq!(
+                session.downstream_session.is_body_done(),
+                source != UploadSource::Streamed,
+                "only a streamed upload is left unread"
+            );
+            let reused =
+                tokio::time::timeout(Duration::from_secs(5), session.downstream_session.finish())
+                    .await
+                    .expect("draining the upload did not finish");
+            Some(matches!(reused, Ok(Some(_))))
+        } else {
+            drop(session);
+            None
+        };
+        let _client_write = client_upload.await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        UploadStopOutcome {
+            result,
+            drained_and_reusable,
+            response: String::from_utf8(response).unwrap(),
+            upstream_stopped_early,
+        }
+    }
+
+    /// Makes `session` a streaming cache miss for `path`.
+    fn start_streaming_cache_miss(session: &mut Session, path: &str) {
+        session
+            .cache
+            .enable(&*WRITER_DEMAND_CACHE, None, None, None, None);
+        session.cache.set_cache_key(CacheKey::new(path, ""));
+        session.cache.cache_miss();
+        assert_eq!(session.cache.support_streaming_partial_write(), Some(true));
+    }
+
+    /// Reads or buffers the upload as `source` says, before the transport loop starts.
+    async fn read_upload_source(session: &mut Session, source: UploadSource) {
         match source {
             UploadSource::Streamed => {}
             UploadSource::RetryBuffer => {
@@ -2423,7 +2463,20 @@ mod tests {
                 .set_buffered_body(Some(Bytes::from(vec![b'u'; source.len()])))
                 .unwrap(),
         }
+    }
 
+    /// Runs the transport loop for `session` against an HTTP/2 upstream that answers early with
+    /// a `413` carrying [`EARLY_RESPONSE_BODY`], stopping the upload as `stop` says. Returns the
+    /// loop's result and [`UploadStopOutcome::upstream_stopped_early`].
+    async fn proxy_upload_to_early_response<SV>(
+        app: SV,
+        session: &mut Session,
+        path: &str,
+        stop: UploadStop,
+    ) -> (Result<bool>, bool)
+    where
+        SV: ProxyHttp<CTX = ()> + Send + Sync,
+    {
         let (upstream_client_io, upstream_server_io) = tokio::io::duplex(1 << 20);
         let upstream_server = tokio::spawn(async move {
             // Smaller than every upload, so each one is still blocked on flow control when the
@@ -2460,7 +2513,7 @@ mod tests {
         let mut custom_reader = None;
         let mut ctx = ();
         let proxy_loop = proxy.bidirection_down_to_up(
-            &mut session,
+            session,
             &mut request_body,
             response_rx,
             &mut ctx,
@@ -2497,33 +2550,9 @@ mod tests {
         .expect("H2 transport loop did not finish");
 
         let upstream_stopped_early = upstream_stopped_upload_early(&mut request_body);
-        let drained_and_reusable = if matches!(result, Ok(true)) {
-            assert_eq!(
-                session.downstream_session.is_body_done(),
-                source != UploadSource::Streamed,
-                "only a streamed upload is left unread"
-            );
-            let reused =
-                tokio::time::timeout(Duration::from_secs(5), session.downstream_session.finish())
-                    .await
-                    .expect("draining the upload did not finish");
-            Some(matches!(reused, Ok(Some(_))))
-        } else {
-            drop(session);
-            None
-        };
-        let _client_write = client_upload.await.unwrap();
-
-        let mut response = Vec::new();
-        client_read.read_to_end(&mut response).await.unwrap();
         upstream_server.abort();
         upstream_connection.abort();
-        UploadStopOutcome {
-            result,
-            drained_and_reusable,
-            response: String::from_utf8(response).unwrap(),
-            upstream_stopped_early,
-        }
+        (result, upstream_stopped_early)
     }
 
     /// Asserts that the client received the complete early `413`, after an upstream that stopped
@@ -2728,5 +2757,192 @@ mod tests {
         .expect("the attempt is still waiting for a response 3 s after a 200 ms write timeout");
         let e = result.expect_err("a timed-out upload must fail the attempt");
         assert_eq!(e.etype(), &WriteTimedout, "{e}");
+    }
+
+    /// What [`run_h2_client_upload_stop`] saw.
+    struct H2ClientOutcome {
+        result: Result<bool>,
+        /// As in [`UploadStopOutcome`].
+        upstream_stopped_early: bool,
+        status: http::StatusCode,
+        body: Vec<u8>,
+        /// How the proxy ended the client's request stream once the session was finished and
+        /// dropped. Only polled for a streamed upload, the only one the client leaves open.
+        upload_reset: Option<h2::Reason>,
+    }
+
+    /// As [`run_upload_stop`] with [`UploadStop::UpstreamReset`], for an HTTP/2 client.
+    async fn run_h2_client_upload_stop(
+        path: &str,
+        source: UploadSource,
+        cache_miss: bool,
+    ) -> H2ClientOutcome {
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let (mut requests, connection) = h2::client::handshake(client_io).await.unwrap();
+        let client_connection = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut server_connection = h2_server::handshake(Box::new(server_io), None)
+            .await
+            .unwrap();
+        let declared_len = source.declared_len();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://example.com{path}"))
+            .header("content-length", declared_len.to_string())
+            .body(())
+            .unwrap();
+        let (response, mut upload) = requests.send_request(request, declared_len == 0).unwrap();
+        if declared_len > 0 {
+            // Leave a streamed upload open, as a client still sending it does: the proxy drops a
+            // closed request stream without a reset.
+            let streamed = source == UploadSource::Streamed;
+            let sent = if streamed {
+                declared_len / 2
+            } else {
+                declared_len
+            };
+            upload
+                .send_data(Bytes::from(vec![b'u'; sent]), !streamed)
+                .unwrap();
+        }
+        let digest = Arc::new(Digest::default());
+        let Some(H2Accept::Session(http)) =
+            SessionV2::from_h2_conn(&mut server_connection, digest.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("expected the upload request")
+        };
+        let server_connection = tokio::spawn(async move {
+            while let Ok(Some(_)) =
+                SessionV2::from_h2_conn(&mut server_connection, digest.clone()).await
+            {}
+        });
+        let modules = HttpModules::new();
+        let mut session = Session::new(
+            Box::new(HttpSession::new_http2(http)),
+            &modules,
+            #[cfg(feature = "upstream_modules")]
+            &modules,
+            Arc::new(AtomicBool::new(false)),
+        );
+        if cache_miss {
+            start_streaming_cache_miss(&mut session, path);
+        }
+        read_upload_source(&mut session, source).await;
+
+        let (result, upstream_stopped_early) = proxy_upload_to_early_response(
+            AbandonmentSignalProxy::default(),
+            &mut session,
+            path,
+            UploadStop::UpstreamReset,
+        )
+        .await;
+        if matches!(result, Ok(true)) {
+            // As the proxy finishes a reusable session: an HTTP/2 one is ended, never drained.
+            let finished =
+                tokio::time::timeout(Duration::from_secs(5), session.downstream_session.finish())
+                    .await
+                    .expect("finishing the HTTP/2 session did not return");
+            assert!(finished
+                .expect("finishing the HTTP/2 session failed")
+                .is_none());
+        } else {
+            drop(session);
+        }
+
+        let response = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("the client got no response")
+            .expect("the client's stream failed instead of returning a response");
+        let status = response.status();
+        let body = read_h2_body(response.into_body()).await;
+        let upload_reset = if source == UploadSource::Streamed {
+            let reset = tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| upload.poll_reset(cx)),
+            )
+            .await
+            .expect("the proxy never reset the client's unread upload");
+            Some(reset.expect("polling the upload for a reset failed"))
+        } else {
+            None
+        };
+        server_connection.abort();
+        client_connection.abort();
+        H2ClientOutcome {
+            result,
+            upstream_stopped_early,
+            status,
+            body,
+            upload_reset,
+        }
+    }
+
+    /// Reads a whole HTTP/2 response body, releasing flow-control capacity as it goes.
+    async fn read_h2_body(mut body: h2::RecvStream) -> Vec<u8> {
+        let mut read = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("the response body failed");
+            let _ = body.flow_control().release_capacity(chunk.len());
+            read.extend_from_slice(&chunk);
+        }
+        read
+    }
+
+    /// Asserts that the HTTP/2 client got the complete early `413` after the upstream stopped
+    /// the upload with `RST_STREAM(NO_ERROR)`, and that the loop left the downstream healthy.
+    fn assert_h2_client_got_early_response(outcome: H2ClientOutcome, path: &str) {
+        assert!(outcome.upstream_stopped_early, "{path}");
+        assert_eq!(outcome.status, 413, "{path}");
+        assert_eq!(outcome.body, EARLY_RESPONSE_BODY, "{path}");
+        assert!(
+            outcome
+                .result
+                .unwrap_or_else(|e| panic!("a complete early response failed ({path}): {e}")),
+            "an upstream upload failure must not mark the downstream errored ({path})"
+        );
+    }
+
+    /// As [`upstream_upload_reset_after_early_response_lets_downstream_drain`] for an HTTP/2
+    /// client: the upload it is still sending is stopped with `RST_STREAM(NO_ERROR)` instead
+    /// of being drained (RFC 9113 section 8.1).
+    #[tokio::test]
+    async fn h2_client_upload_reset_after_early_response_is_stopped_not_drained() {
+        let path = "/h2-client-upload-reset";
+        let outcome = run_h2_client_upload_stop(path, UploadSource::Streamed, false).await;
+        assert_eq!(outcome.upload_reset, Some(h2::Reason::NO_ERROR));
+        assert_h2_client_got_early_response(outcome, path);
+    }
+
+    /// As [`upstream_upload_reset_during_cache_miss_still_streams_response`] for an HTTP/2
+    /// client.
+    #[tokio::test]
+    async fn h2_client_upload_reset_during_cache_miss_still_streams_response() {
+        let path = "/h2-client-upload-reset-cache-miss";
+        let outcome = run_h2_client_upload_stop(path, UploadSource::Streamed, true).await;
+        assert_eq!(outcome.upload_reset, Some(h2::Reason::NO_ERROR));
+        assert_h2_client_got_early_response(outcome, path);
+    }
+
+    /// As [`upstream_reset_of_body_sent_before_loop_still_delivers_response`] for an HTTP/2
+    /// client.
+    #[tokio::test]
+    async fn h2_client_upstream_reset_of_body_sent_before_loop_still_delivers_response() {
+        for (path, source) in [
+            (
+                "/h2-client-upload-reset-retry-buffer",
+                UploadSource::RetryBuffer,
+            ),
+            #[cfg(feature = "early_body_buffer")]
+            (
+                "/h2-client-upload-reset-early-buffered",
+                UploadSource::EarlyBuffered,
+            ),
+        ] {
+            let outcome = run_h2_client_upload_stop(path, source, false).await;
+            assert_h2_client_got_early_response(outcome, path);
+        }
     }
 }
