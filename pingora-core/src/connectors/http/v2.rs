@@ -679,7 +679,8 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstreams::peer::HttpPeer;
+    use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
+use crate::upstreams::peer::HttpPeer;
     use bytes::Bytes;
     use http::{Response, StatusCode};
     use pingora_http::RequestHeader;
@@ -722,8 +723,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
+
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into());
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), false, "".into());
         peer.options.set_http_version(2, 1);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -734,6 +738,8 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]

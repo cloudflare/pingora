@@ -345,7 +345,8 @@ async fn proxy_connect<P: Peer>(peer: &P) -> Result<Stream> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
+    use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
+use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -471,9 +472,12 @@ mod tests {
     async fn test_tweak_hook() {
         const INIT_FLAG: bool = false;
 
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
+
         let flag = Arc::new(AtomicBool::new(INIT_FLAG));
 
-        let mut peer = BasicPeer::new("1.1.1.1:80");
+        let mut peer = BasicPeer::new(addr.to_string().as_str());
 
         let move_flag = Arc::clone(&flag);
 
@@ -485,29 +489,40 @@ mod tests {
         connect(&peer, None).await.unwrap();
 
         assert_eq!(!INIT_FLAG, flag.load(Ordering::SeqCst));
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_custom_connect() {
         #[derive(Debug)]
-        struct MyL4;
+        struct MyL4{
+            addr: std::net::SocketAddr,
+        }
+
         #[async_trait]
         impl Connect for MyL4 {
             async fn connect(&self, _addr: &SocketAddr) -> Result<Stream> {
-                tokio::net::TcpStream::connect("1.1.1.1:80")
+                tokio::net::TcpStream::connect(self.addr)
                     .await
                     .map(|s| s.into())
                     .or_fail()
             }
         }
         // :79 shouldn't be able to be connected to
-        let mut peer = BasicPeer::new("1.1.1.1:79");
-        peer.options.custom_l4 = Some(std::sync::Arc::new(MyL4 {}));
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
+
+        let mut peer = BasicPeer::new("127.0.0.1:1");
+        peer.options.custom_l4 = Some(std::sync::Arc::new(MyL4 {addr: mock_addr}));
 
         let new_session = connect(&peer, None).await;
 
         // but MyL4 connects to :80 instead
         assert!(new_session.is_ok());
+
+        let _ = shutdown_tx.send(());
+        server_handle.await.unwrap();
     }
 
     #[cfg(unix)]
