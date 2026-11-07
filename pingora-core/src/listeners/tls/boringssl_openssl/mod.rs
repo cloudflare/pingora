@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use log::debug;
-use pingora_error::{ErrorType, ErrorType::InternalError, OrErr, Result};
+use pingora_error::{Error, ErrorType, ErrorType::InternalError, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
 use crate::listeners::tls::boringssl_openssl::alpn::valid_alpn;
@@ -194,18 +194,36 @@ impl TlsSettings {
 }
 
 impl Acceptor {
+    #[cfg(test)]
     pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<SslStream<S>> {
+        self.tls_handshake_checked(stream, |_| Ok(())).await
+    }
+
+    /// Run [`Self::tls_handshake`]. If a TLS offload thread runs the handshake, `check` runs
+    /// first on that thread, and an error from it is returned instead of starting the handshake.
+    /// Otherwise `check` is not called.
+    pub(crate) async fn tls_handshake_checked<S, E>(
+        &self,
+        stream: S,
+        check: impl FnOnce(&S) -> Result<(), E> + Send + 'static,
+    ) -> Result<SslStream<S>, E>
+    where
+        S: IO + 'static,
+        E: From<Box<Error>> + Send + 'static,
+    {
         debug!("new ssl session");
         let mut stream = if let Some(offload) = self.offload.as_ref() {
             let ssl_acceptor = self.ssl_acceptor.clone();
             let callbacks = self.callbacks.clone();
             offload
                 .spawn_abort_on_drop(stream.id() as u64, async move {
-                    if let Some(cb) = callbacks.as_ref() {
-                        handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
+                    check(&stream)?;
+                    let stream = if let Some(cb) = callbacks.as_ref() {
+                        handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await?
                     } else {
-                        handshake(&ssl_acceptor, stream).await
-                    }
+                        handshake(&ssl_acceptor, stream).await?
+                    };
+                    Ok::<_, E>(stream)
                 })
                 .await
                 .or_err(InternalError, "TLS offload runtime failure")??
