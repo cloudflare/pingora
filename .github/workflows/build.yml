@@ -82,15 +82,21 @@ jobs:
             cargo check --workspace
           fi
 
-      - name: Run cargo test
+      - name: Install cargo-nextest
+        if: matrix.toolchain != '1.85.0'
+        run: cargo install --locked cargo-nextest --version 0.9.151
+
+      # .config/nextest.toml serializes the integration binaries that bind
+      # fixed ports.
+      - name: Run cargo nextest
         if: matrix.toolchain != '1.85.0'
         # The skipped test needs an h2 client that discards late frames on
         # forgotten streams, which no h2 release does yet (hyperium/h2#983).
         run: >-
-          cargo test --verbose --lib --bins --tests --no-fail-fast --
-          --skip connectors::http::v2::tests::test_h2_late_frames_on_cancelled_streams_keep_connection
+          cargo nextest run --workspace --no-fail-fast
+          -E 'not test(test_h2_late_frames_on_cancelled_streams_keep_connection)'
 
-      # Need to run doc tests separately.
+      # nextest does not run doc tests, so run them separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
         if: matrix.toolchain != '1.85.0'
