@@ -96,6 +96,16 @@ jobs:
         if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --doc
 
+      # The fixed-seed fuzz cases run with the tests above. The soak runs many
+      # more cases from a seed that changes with every workflow run. A failure
+      # prints its case seed, and PINGORA_BODY_FUZZ_CASE=<seed> replays it.
+      - name: Run body reader fuzz soak
+        if: matrix.toolchain == '1.97.1'
+        env:
+          PINGORA_BODY_FUZZ_CASES: "1000000"
+          PINGORA_BODY_FUZZ_SEED: ${{ github.run_id }}
+        run: cargo test --release -p pingora-core --lib body_reader_fuzz_soak -- --ignored --nocapture
+
       - name: Run cargo clippy
         run: |
           [[ ${{ matrix.toolchain }} != 1.97.1 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
