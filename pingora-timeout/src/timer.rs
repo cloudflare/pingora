@@ -71,11 +71,26 @@ pub struct TimerStub(Arc<Notify>, Arc<AtomicBool>);
 
 impl TimerStub {
     /// Wait for the timer to expire.
-    pub async fn poll(self) {
+    pub fn poll(self) -> impl std::future::Future<Output = ()> {
+        self.poll_impl(|| {})
+    }
+
+    // The hook makes the window before the waiter is created deterministic in tests.
+    async fn poll_impl<F>(self, before_waiter: F)
+    where
+        F: FnOnce(),
+    {
+        // Create the waiter before checking the flag. `notify_waiters` does not retain a
+        // permit for waiters created after the notification, but it does reach one that
+        // already exists, even before its first poll.
+        before_waiter();
+        let notified = self.0.notified();
+
         if self.1.load(Ordering::SeqCst) {
             return;
         }
-        self.0.notified().await;
+
+        notified.await;
     }
 }
 
@@ -323,5 +338,17 @@ mod tests {
         tm.unpause();
         t1.poll().await;
         assert_eq!(now.elapsed().as_secs(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_timer_stub_poll_does_not_miss_fire() {
+        let timer = Timer::new();
+        let stub = timer.subscribe();
+
+        // Fire before the waiter is created. The check after creating it must observe
+        // the fire instead of sleeping forever.
+        tokio::time::timeout(Duration::from_secs(1), stub.poll_impl(|| timer.fire()))
+            .await
+            .expect("TimerStub::poll missed a fire");
     }
 }
