@@ -402,7 +402,7 @@ impl HttpSession {
     ///
     /// This convenience wrapper uses a fresh malformed-stream counter on every
     /// call. It preserves the public API, but does not enforce the
-    /// [`MAX_MALFORMED_STREAMS_PER_CONN`] budget across repeated calls by an
+    /// `MAX_MALFORMED_STREAMS_PER_CONN` budget across repeated calls by an
     /// external accept loop. Pingora's built-in downstream accept loop uses the
     /// internal budgeted helper to share one counter for the connection lifetime.
     pub async fn from_h2_conn(
