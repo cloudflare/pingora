@@ -15,7 +15,7 @@
 //! Distributed tracing helpers
 //!
 //! When the `trace` feature is enabled, this module re-exports the real
-//! [`cf_rustracing`]/[`cf_rustracing_jaeger`] span types.
+//! `cf_rustracing`/`cf_rustracing_jaeger` span types.
 //!
 //! When the `trace` feature is **disabled**, lightweight no-op shim types are
 //! provided instead so that the rest of the crate compiles without pulling in
@@ -46,7 +46,7 @@ pub use real::*;
 // ---------------------------------------------------------------------------
 #[cfg(not(feature = "trace"))]
 mod noop {
-    /// A no-op replacement for [`cf_rustracing::tag::Tag`].
+    /// A no-op replacement for `cf_rustracing::tag::Tag`.
     #[derive(Debug)]
     pub struct Tag {
         _priv: (),
