@@ -103,7 +103,7 @@ impl ProxyHttp for Json2Yaml {
         if end_of_stream {
             // This is the last chunk, we can process the data now
             let json_body: Resp = serde_json::de::from_slice(&ctx.buffer).unwrap();
-            let yaml_body = serde_yaml::to_string(&json_body).unwrap();
+            let yaml_body = serde_saphyr::to_string(&json_body).unwrap();
             *body = Some(Bytes::copy_from_slice(yaml_body.as_bytes()));
         }
 

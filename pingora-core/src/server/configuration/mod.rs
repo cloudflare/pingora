@@ -349,7 +349,7 @@ impl ServerConf {
 
     pub fn from_yaml(conf_str: &str) -> Result<Self> {
         trace!("Read conf file: {conf_str}");
-        let conf: ServerConf = serde_yaml::from_str(conf_str).or_err_with(ReadError, || {
+        let conf: ServerConf = serde_saphyr::from_str(conf_str).or_err_with(ReadError, || {
             format!("Unable to parse yaml conf {conf_str}")
         })?;
 
@@ -358,7 +358,7 @@ impl ServerConf {
     }
 
     pub fn to_yaml(&self) -> String {
-        serde_yaml::to_string(self).unwrap()
+        serde_saphyr::to_string(self).unwrap()
     }
 
     pub fn validate(self) -> Result<Self> {
@@ -641,11 +641,15 @@ working_directory: /var/lib/pingora
             Some(std::path::Path::new("/var/lib/pingora"))
         );
 
-        let yaml = serde_yaml::to_value(&conf).unwrap();
-        assert_eq!(
-            yaml.get("working_directory"),
-            Some(&serde_yaml::Value::String("/var/lib/pingora".to_string()))
+        // The path is written as a plain string, and what was written reads back as the same configuration.
+        let yaml = conf.to_yaml();
+        assert!(
+            yaml.lines()
+                .any(|line| line.trim() == "working_directory: /var/lib/pingora"),
+            "unexpected yaml: {yaml}"
         );
+        let reread = ServerConf::from_yaml(&yaml).unwrap();
+        assert_eq!(reread.working_directory, conf.working_directory);
     }
 
     #[test]
