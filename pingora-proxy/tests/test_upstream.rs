@@ -831,6 +831,170 @@ async fn test_h2_upstream_early_response_keeps_downstream_alive() {
     );
 }
 
+// The early response can still be on its way to the client when the client sends more of the
+// request body. Those bytes belong to the request body and must not abort the response.
+#[tokio::test]
+async fn test_h2_upstream_early_response_reads_body_sent_during_delivery() {
+    init_proxy().await;
+
+    // Larger than the loopback socket buffers, so the proxy is still writing the response when
+    // the client sends body, and smaller than the 8 MiB h2 receive window, so the upstream
+    // completes the response and resets the stream before the client reads it.
+    const RESPONSE_LEN: usize = 7 << 20;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        while let Some(Ok((request, mut respond))) = connection.accept().await {
+            let len = if request.method() == http::Method::POST {
+                RESPONSE_LEN
+            } else {
+                0
+            };
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-length", len.to_string())
+                .body(())
+                .unwrap();
+            let mut body = respond.send_response(response, len == 0).unwrap();
+            // Small DATA frames make the proxy deliver the response over many loop iterations.
+            let chunk = Bytes::from(vec![b'x'; 1024]);
+            let chunks = len / chunk.len();
+            for i in 0..chunks {
+                body.send_data(chunk.clone(), i + 1 == chunks).unwrap();
+            }
+            // h2 sends the queued body, then RST_STREAM(NO_ERROR) for the unread request body.
+            drop(request);
+        }
+    });
+
+    async fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> usize {
+        timeout(Duration::from_secs(5), stream.read(buf))
+            .await
+            .expect("timed out waiting for the h1 response")
+            .unwrap_or(0)
+    }
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    // A fixed receive buffer turns off autotuning, so reading the response makes the proxy write
+    // again instead of draining its send buffer into a growing receive buffer.
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    let mut stream = socket
+        .connect("127.0.0.1:6147".parse().unwrap())
+        .await
+        .unwrap();
+    let header = format!(
+        "POST /test HTTP/1.1\r\nHost: client.example\r\nx-port: {port}\r\nx-h2: true\r\nContent-Length: 3\r\n\r\n"
+    );
+    stream.write_all(header.as_bytes()).await.unwrap();
+
+    let mut buf = vec![0; 64 * 1024];
+    let mut head = Vec::new();
+    let body_start = loop {
+        let read = read_some(&mut stream, &mut buf).await;
+        assert!(read > 0, "connection closed before the response head");
+        head.extend_from_slice(&buf[..read]);
+        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+    assert!(
+        head.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&head)
+    );
+    let mut received = head.len() - body_start;
+
+    // The upstream finishes and resets the stream while the proxy waits to write to the client.
+    // The body then arrives one byte at a time while the response is being read.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stream.write_all(b"a").await.unwrap();
+    while received < 2 << 20 {
+        let read = read_some(&mut stream, &mut buf).await;
+        assert!(
+            read > 0,
+            "response aborted after {received} of {RESPONSE_LEN} bytes"
+        );
+        received += read;
+    }
+    stream.write_all(b"b").await.unwrap();
+    while received < RESPONSE_LEN {
+        let read = read_some(&mut stream, &mut buf).await;
+        assert!(
+            read > 0,
+            "response aborted after {received} of {RESPONSE_LEN} bytes"
+        );
+        received += read;
+    }
+    assert_eq!(received, RESPONSE_LEN);
+    stream.write_all(b"c").await.unwrap();
+
+    let second = format!(
+        "GET /test HTTP/1.1\r\nHost: client.example\r\nx-port: {port}\r\nx-h2: true\r\n\r\n"
+    );
+    stream.write_all(second.as_bytes()).await.unwrap();
+    let read = read_some(&mut stream, &mut buf).await;
+    let second = String::from_utf8_lossy(&buf[..read]);
+    assert!(
+        second.starts_with("HTTP/1.1 200"),
+        "downstream connection closed after the early response: {second:?}"
+    );
+}
+
+// The request ends with the early response, so an h2 client that is still sending its body
+// gets RST_STREAM(NO_ERROR) instead of a proxy waiting for the rest of the body.
+#[tokio::test]
+async fn test_h2_upstream_early_response_resets_h2_downstream_body() {
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        while let Some(Ok((request, mut respond))) = connection.accept().await {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            respond.send_response(response, true).unwrap();
+            drop(request);
+        }
+    });
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://127.0.0.1:6146/test")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut body) = client.send_request(request, false).unwrap();
+    let response = timeout(Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the h2 response")
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // This chunk meets the upstream reset; the rest of the body never comes.
+    body.send_data(Bytes::from_static(b"a"), false).unwrap();
+    let reason = timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| body.poll_reset(cx)),
+    )
+    .await
+    .expect("the proxy kept waiting for the rest of the request body")
+    .unwrap();
+    assert_eq!(reason, h2::Reason::NO_ERROR);
+}
+
 #[tokio::test]
 async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
     init_proxy().await;
