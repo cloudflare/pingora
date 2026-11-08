@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use ahash::AHasher;
 use log::debug;
+use lru::LruCache;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Once};
 
 use crate::connectors::tls::replace_leftmost_underscore;
@@ -21,16 +27,42 @@ use crate::connectors::ConnectorOptions;
 use crate::protocols::tls::client::handshake;
 use crate::protocols::tls::SslStream;
 use crate::protocols::IO;
+use crate::tls::ex_data::Index;
 use crate::tls::ext::{
     add_host, clear_error_stack, ssl_add_chain_cert, ssl_set_groups_list,
     ssl_set_renegotiate_mode_freely, ssl_set_verify_cert_store, ssl_use_certificate,
     ssl_use_private_key, ssl_use_second_key_share,
 };
-use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
+use crate::tls::ssl::{
+    Ssl, SslConnector, SslContext, SslFiletype, SslMethod, SslSession, SslSessionCacheMode,
+    SslVerifyMode, SslVersion,
+};
 use crate::tls::x509::store::X509StoreBuilder;
 use crate::upstreams::peer::{Peer, ALPN};
 
 pub type TlsConnector = SslConnector;
+
+/// How many session keys (see `session_key`) a connector keeps the latest TLS session for.
+const TLS_SESSION_CACHE_SIZE: usize = 1024;
+
+type SessionCache = Mutex<LruCache<u64, Vec<u8>>>;
+
+// The sessions of peers with `tls_session_reuse` live in the connector context's ex data, where
+// both `connect()` and the context's new-session callback reach them; the key of the connection
+// being made lives in the ex data of its `Ssl`. They are kept serialized rather than as session
+// objects: OpenSSL marks a session object not resumable when a connection holding it is freed
+// without a TLS shutdown, which happens to a pooled upstream connection all the time.
+static SESSION_CACHE: Lazy<Index<SslContext, SessionCache>> =
+    Lazy::new(|| SslContext::new_ex_index().unwrap());
+static SESSION_KEY: Lazy<Index<Ssl, u64>> = Lazy::new(|| Ssl::new_ex_index().unwrap());
+
+/// Peers that can share connections and offer the same ALPN share TLS sessions.
+fn session_key<P: Peer>(peer: &P, alpn: Option<&ALPN>) -> u64 {
+    let mut hasher = AHasher::default();
+    peer.reuse_hash().hash(&mut hasher);
+    alpn.hash(&mut hasher);
+    hasher.finish()
+}
 
 const CIPHER_LIST: &str = "AES-128-GCM-SHA256\
     :AES-256-GCM-SHA384\
@@ -139,6 +171,29 @@ impl Connector {
             builder.set_default_verify_paths().unwrap();
         }
 
+        // Keep the sessions of the peers that opt in (`PeerOptions::tls_session_reuse`) for
+        // resumption. The callback is the only way to see TLS 1.3 tickets, which arrive after
+        // the handshake; the library's own cache is for servers and stays off.
+        builder.set_session_cache_mode(
+            SslSessionCacheMode::CLIENT | SslSessionCacheMode::NO_INTERNAL_STORE,
+        );
+        builder.set_ex_data(
+            *SESSION_CACHE,
+            Mutex::new(LruCache::new(
+                NonZeroUsize::new(TLS_SESSION_CACHE_SIZE).unwrap(),
+            )),
+        );
+        builder.set_new_session_callback(|ssl, session| {
+            // only the connections of peers that opted in carry a key
+            if let Some(key) = ssl.ex_data(*SESSION_KEY) {
+                if let (Some(cache), Ok(der)) =
+                    (ssl.ssl_context().ex_data(*SESSION_CACHE), session.to_der())
+                {
+                    cache.lock().put(*key, der);
+                }
+            }
+        });
+
         Connector {
             ctx: Arc::new(builder.build()),
         }
@@ -158,6 +213,29 @@ where
     let mut ssl_conf = tls_ctx.configure().unwrap();
 
     ssl_set_renegotiate_mode_freely(&mut ssl_conf);
+
+    let alpn = alpn_override.as_ref().or(peer.get_alpn());
+
+    if peer.get_peer_options().is_some_and(|o| o.tls_session_reuse) {
+        let key = session_key(peer, alpn);
+        ssl_conf.set_ex_data(*SESSION_KEY, key);
+        let session = ssl_conf
+            .ssl_context()
+            .ex_data(*SESSION_CACHE)
+            .and_then(|cache| {
+                cache
+                    .lock()
+                    .get(&key)
+                    .and_then(|der| SslSession::from_der(der).ok())
+            });
+        if let Some(session) = session {
+            // SAFETY: the session was issued to this connector, whose own new-session callback
+            // is the only writer of the cache, and is re-created from its DER form with the
+            // library's default X509 method, the one the connector's context uses.
+            unsafe { ssl_conf.set_session(&session) }
+                .or_err(InternalError, "failed to set TLS session")?;
+        }
+    }
 
     // Set up CA/verify cert store
     // TODO: store X509Store in the peer directly
@@ -242,7 +320,7 @@ where
     */
     ssl_conf.set_verify_hostname(false);
 
-    if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
+    if let Some(alpn) = alpn {
         ssl_conf.set_alpn_protos(alpn.to_wire_preference()).unwrap();
     }
 
@@ -420,6 +498,101 @@ mod tests {
             .unwrap();
         server.await.unwrap();
         stream
+    }
+
+    /// A local TLS server and a connector kept across handshakes, so sessions can be resumed.
+    struct Upstream {
+        acceptor: SslAcceptor,
+        connector: Connector,
+    }
+
+    impl Upstream {
+        fn new(max_version: SslVersion) -> Self {
+            let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+            let dir = env!("CARGO_MANIFEST_DIR");
+            acceptor
+                .set_certificate_chain_file(format!("{dir}/tests/keys/server.crt"))
+                .unwrap();
+            acceptor
+                .set_private_key_file(format!("{dir}/tests/keys/key.pem"), SslFiletype::PEM)
+                .unwrap();
+            acceptor.set_max_proto_version(Some(max_version)).unwrap();
+            Upstream {
+                acceptor: acceptor.build(),
+                connector: Connector::new(None),
+            }
+        }
+
+        /// Handshakes with `peer`, reads the byte the server sends afterwards (which also
+        /// delivers the TLS 1.3 ticket to the client) and tells whether the session was resumed.
+        async fn session_reused(&self, peer: &HttpPeer) -> bool {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let acceptor = self.acceptor.clone();
+            let server = tokio::spawn(async move {
+                let mut stream = accept(&acceptor, server_io).await.unwrap();
+                stream.write_all(b"x").await.unwrap();
+            });
+            let mut stream = connect(client_io, peer, None, &self.connector.ctx)
+                .await
+                .unwrap();
+            stream.read_exact(&mut [0u8; 1]).await.unwrap();
+            server.await.unwrap();
+            stream.ssl().session_reused()
+        }
+    }
+
+    fn local_peer() -> HttpPeer {
+        let mut peer = HttpPeer::new("127.0.0.1:443", true, "pingora.org".into());
+        peer.options.verify_cert = false;
+        peer
+    }
+
+    #[tokio::test]
+    async fn tls_sessions_are_not_reused_by_default() {
+        let upstream = Upstream::new(SslVersion::TLS1_3);
+        let peer = local_peer();
+        assert!(!upstream.session_reused(&peer).await);
+        assert!(!upstream.session_reused(&peer).await);
+    }
+
+    #[tokio::test]
+    async fn tls13_sessions_are_resumed_when_the_peer_enables_it() {
+        let upstream = Upstream::new(SslVersion::TLS1_3);
+        let mut peer = local_peer();
+        peer.options.tls_session_reuse = true;
+        // the ticket of the first handshake resumes the second, whose ticket resumes the third
+        assert!(!upstream.session_reused(&peer).await);
+        assert!(upstream.session_reused(&peer).await);
+        assert!(upstream.session_reused(&peer).await);
+    }
+
+    #[tokio::test]
+    async fn tls12_sessions_are_resumed_when_the_peer_enables_it() {
+        let upstream = Upstream::new(SslVersion::TLS1_2);
+        let mut peer = local_peer();
+        peer.options.tls_session_reuse = true;
+        assert!(!upstream.session_reused(&peer).await);
+        assert!(upstream.session_reused(&peer).await);
+    }
+
+    #[tokio::test]
+    async fn tls_sessions_are_kept_per_peer_and_alpn() {
+        let upstream = Upstream::new(SslVersion::TLS1_3);
+        let mut peer = local_peer();
+        peer.options.tls_session_reuse = true;
+        assert!(!upstream.session_reused(&peer).await);
+
+        // another SNI is another peer; the first peer's session is still there
+        let mut other = peer.clone();
+        other.sni = "other.pingora.org".into();
+        assert!(!upstream.session_reused(&other).await);
+        assert!(upstream.session_reused(&peer).await);
+
+        // same for another ALPN, which the reuse hash leaves out
+        peer.options.alpn = ALPN::H2;
+        assert!(!upstream.session_reused(&peer).await);
+        assert!(upstream.session_reused(&peer).await);
     }
 
     #[tokio::test]

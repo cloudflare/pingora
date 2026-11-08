@@ -34,6 +34,7 @@ A `PeerOptions` defines how to connect to the upstream.
 |s2n_security_policy: `Option<S2NPolicy>` | S2N [Security Policy](https://aws.github.io/s2n-tls/usage-guide/ch06-security-policies.html) to use. Defaults to `default_tls13` if undefined. (s2n-tls only) |
 |max_blinding_delay: `Option<u32>` | S2N-TLS will delay a response up to the [max blinding delay](https://aws.github.io/s2n-tls/usage-guide/ch03-error-handling.html#blinding) (default 30) seconds whenever an error triggered by a peer occurs to mitigate against timing side channels. (s2n-tls only) |
 |tcp_keepalive: `Option<TcpKeepalive>`| TCP keepalive settings to upstream |
+|tls_session_reuse: `bool`| Whether to resume the TLS session the upstream issued last instead of doing a full handshake on every new connection (BoringSSL and OpenSSL only) |
 |http_upstream_request_policy: `HttpUpstreamRequestPolicy`| Controls automatic forwarding of hop-by-hop request headers and HTTP/1 upgrades |
 
 ### HTTP upstream request header policy
