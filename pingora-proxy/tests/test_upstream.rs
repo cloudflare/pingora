@@ -769,6 +769,68 @@ async fn test_h1_absolute_form_to_h2_upstream_sends_path_and_query() {
     assert_eq!(uri.path_and_query().unwrap(), "/test?q=1");
 }
 
+// A server may send a complete response before it has read the request body and then
+// reset the stream with NO_ERROR to stop the rest of the body (RFC 9113 section 8.1).
+// The response is valid and the downstream connection stays reusable.
+#[tokio::test]
+async fn test_h2_upstream_early_response_keeps_downstream_alive() {
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(tcp).await.unwrap();
+        while let Some(Ok((request, mut respond))) = connection.accept().await {
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            respond.send_response(response, true).unwrap();
+            // Dropping the unread request body after the complete response makes h2 send
+            // RST_STREAM(NO_ERROR) behind the response, the way nginx does.
+            drop(request);
+        }
+    });
+
+    async fn read_response(stream: &mut TcpStream) -> String {
+        let mut response = Vec::new();
+        let mut buf = [0; 1024];
+        while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("timed out waiting for the h1 response")
+                .unwrap();
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let header = format!(
+        "POST /test HTTP/1.1\r\nHost: client.example\r\nx-port: {port}\r\nx-h2: true\r\nContent-Length: 4\r\n\r\n"
+    );
+    stream.write_all(header.as_bytes()).await.unwrap();
+    // The body follows the response, so the reset reaches the proxy before the body is sent.
+    let first = read_response(&mut stream).await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    stream.write_all(b"body").await.unwrap();
+
+    let second = format!(
+        "GET /test HTTP/1.1\r\nHost: client.example\r\nx-port: {port}\r\nx-h2: true\r\n\r\n"
+    );
+    stream.write_all(second.as_bytes()).await.unwrap();
+    let second = read_response(&mut stream).await;
+    assert!(
+        second.starts_with("HTTP/1.1 200"),
+        "downstream connection closed after the early response: {second:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_h1_absolute_form_host_override_rewrites_target_authority() {
     init_proxy().await;

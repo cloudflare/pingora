@@ -733,11 +733,20 @@ where
                             session.downstream_session.on_proxy_failure(e);
                         },
                         Err(H2BodySendError { error: e, .. }) => {
-                            // mark request done, attempt to drain receive
-                            warn!("Upstream h2 body send error: {e}");
-                            // upstream is what actually errored but we don't want to continue
-                            // polling the downstream body
-                            downstream_state.to_errored();
+                            if early_response_reset(client_body) {
+                                // RFC 9113 section 8.1: the upstream sent a complete response and asked
+                                // for the rest of the request body to be dropped with RST_STREAM(NO_ERROR).
+                                // The response stays valid, so the request body is finished rather than
+                                // errored and the downstream connection stays reusable.
+                                debug!("Upstream finished the response before the request body: {e}");
+                                downstream_state.maybe_finished(true);
+                            } else {
+                                // mark request done, attempt to drain receive
+                                warn!("Upstream h2 body send error: {e}");
+                                // upstream is what actually errored but we don't want to continue
+                                // polling the downstream body
+                                downstream_state.to_errored();
+                            }
                         }
                     };
                 },
@@ -1240,6 +1249,15 @@ where
 
         Ok(end_of_body)
     }
+}
+
+/// Whether the upstream reset the stream with `NO_ERROR` after a complete response, which asks
+/// the client to stop sending the request body (RFC 9113 section 8.1).
+fn early_response_reset(client_body: &mut h2::SendStream<Bytes>) -> bool {
+    matches!(
+        std::future::poll_fn(|cx| client_body.poll_reset(cx)).now_or_never(),
+        Some(Ok(h2::Reason::NO_ERROR))
+    )
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
