@@ -200,7 +200,7 @@ fn resp_header_to_buf(resp: &ResponseHeader, buf: &mut Vec<u8>) -> usize {
     let status = resp.status;
     buf.put_slice(status.as_str().as_bytes());
     buf.put_u8(b' ');
-    let reason = status.canonical_reason();
+    let reason = resp.get_reason_phrase();
     if let Some(reason_buf) = reason {
         buf.put_slice(reason_buf.as_bytes());
     }
@@ -247,8 +247,12 @@ fn buf_to_http_header_with_parser_config(
 #[inline]
 fn parsed_to_header(parsed: &ParsedResponse<'_, '_>) -> Result<ResponseHeader> {
     // code should always be there
-    // TODO: allow reading the parsed http version?
     let mut resp = ResponseHeader::build(parsed.code().unwrap(), Some(parsed.header_count()))?;
+    resp.set_version(match parsed.version() {
+        Some(0) => Version::HTTP_10,
+        _ => Version::HTTP_11,
+    });
+    resp.set_reason_phrase(parsed.reason())?;
 
     for header in parsed.headers() {
         let header_value = pingora_http::header_value_from_slice(header.value);
@@ -290,6 +294,59 @@ mod tests {
         let header2 = serde.deserialize(&compressed).unwrap();
         assert_eq!(header.status, header2.status);
         assert_eq!(header.headers, header2.headers);
+    }
+
+    #[test]
+    fn test_ser_de_preserves_http1_version_and_reason() {
+        let serde = HeaderSerde::new(None);
+        for version in [Version::HTTP_10, Version::HTTP_11] {
+            for reason in [None, Some("Custom"), Some("")] {
+                let mut header = ResponseHeader::build(200, None).unwrap();
+                header.set_version(version);
+                header.set_reason_phrase(reason).unwrap();
+                let compressed = serde.serialize(&header).unwrap();
+                let restored = serde.deserialize(&compressed).unwrap();
+                assert_eq!(restored.version, version);
+                assert_eq!(restored.get_reason_phrase(), header.get_reason_phrase());
+            }
+        }
+    }
+
+    #[test]
+    fn test_ser_de_keeps_http2_and_http3_normalization() {
+        let serde = HeaderSerde::new(None);
+        for version in [Version::HTTP_2, Version::HTTP_3] {
+            let mut header = ResponseHeader::build(200, None).unwrap();
+            header.set_version(version);
+            let compressed = serde.serialize(&header).unwrap();
+            let restored = serde.deserialize(&compressed).unwrap();
+            assert_eq!(restored.version, Version::HTTP_11);
+            assert_eq!(restored.get_reason_phrase(), Some("OK"));
+        }
+    }
+
+    #[test]
+    fn test_deserialize_existing_status_lines() {
+        let serde = HeaderSerde::new(None);
+        // Existing entries are still compressed HTTP/1 wire headers, with no new format marker.
+        for (wire, version, reason) in [
+            (
+                &b"HTTP/1.0 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n"[..],
+                Version::HTTP_10,
+                "OK",
+            ),
+            (
+                &b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n"[..],
+                Version::HTTP_11,
+                "OK",
+            ),
+        ] {
+            let compressed = zstd::bulk::compress(wire, COMPRESS_LEVEL).unwrap();
+            let restored = serde.deserialize(&compressed).unwrap();
+            assert_eq!(restored.version, version);
+            assert_eq!(restored.get_reason_phrase(), Some(reason));
+            assert_eq!(restored.headers.get_all("set-cookie").iter().count(), 2);
+        }
     }
 
     #[test]

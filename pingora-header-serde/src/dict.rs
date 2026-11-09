@@ -94,11 +94,15 @@ mod test {
     fn test_ser_de_with_dict() {
         let dict = gen_test_dict();
         let serde = crate::HeaderSerde::new(Some(dict));
-        let header = gen_test_header();
+        let mut header = gen_test_header();
+        header.set_version(http::Version::HTTP_10);
+        header.set_reason_phrase(Some("Cached Custom")).unwrap();
 
         let compressed = serde.serialize(&header).unwrap();
         let header2 = serde.deserialize(&compressed).unwrap();
 
+        assert_eq!(header.version, header2.version);
+        assert_eq!(header.get_reason_phrase(), header2.get_reason_phrase());
         assert_eq!(header.status, header2.status);
         assert_eq!(header.headers, header2.headers);
     }
