@@ -97,6 +97,7 @@ mod tests {
     use crate::upstreams::peer::HttpPeer;
     use crate::upstreams::peer::Peer;
     use pingora_http::RequestHeader;
+    use rstest::rstest;
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -167,6 +168,71 @@ ZZ\r\n",
 
         connector.release_http_session(http, &peer, None).await;
         assert!(connector.reused_http_session(&peer).await.is_none());
+        server.abort();
+    }
+
+    #[rstest]
+    #[case("Content-Length: 128")]
+    #[case("Transfer-Encoding: chunked")]
+    #[tokio::test]
+    async fn no_content_response_with_body_framing_is_not_returned_to_pool(#[case] framing: &str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!("HTTP/1.1 204 No Content\r\n{framing}\r\n\r\n");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            // Only the header section is sent. The body it frames, which a 204 must
+            // not have, could still follow once the connection has been released.
+            stream.write_all(response.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+        let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        http.write_request_header(Box::new(request)).await.unwrap();
+        http.read_response().await.unwrap();
+        assert_eq!(http.get_status().unwrap(), 204);
+        assert!(http.read_body_bytes().await.unwrap().is_none());
+
+        connector.release_http_session(http, &peer, None).await;
+        assert!(connector.reused_http_session(&peer).await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn no_content_response_with_zero_content_length_is_returned_to_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0];
+            stream.read_exact(&mut request_byte).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+        let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+
+        let request = RequestHeader::build("GET", b"/", None).unwrap();
+        http.write_request_header(Box::new(request)).await.unwrap();
+        http.read_response().await.unwrap();
+        assert_eq!(http.get_status().unwrap(), 204);
+        assert!(http.read_body_bytes().await.unwrap().is_none());
+
+        connector.release_http_session(http, &peer, None).await;
+        assert!(connector.reused_http_session(&peer).await.is_some());
         server.abort();
     }
 
