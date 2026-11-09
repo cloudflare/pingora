@@ -56,11 +56,19 @@ static SESSION_CACHE: Lazy<Index<SslContext, SessionCache>> =
     Lazy::new(|| SslContext::new_ex_index().unwrap());
 static SESSION_KEY: Lazy<Index<Ssl, u64>> = Lazy::new(|| Ssl::new_ex_index().unwrap());
 
-/// Peers that can share connections and offer the same ALPN share TLS sessions.
+/// Peers that can share connections, offer the same ALPN and trust the same CAs share TLS
+/// sessions.
 fn session_key<P: Peer>(peer: &P, alpn: Option<&ALPN>) -> u64 {
     let mut hasher = AHasher::default();
     peer.reuse_hash().hash(&mut hasher);
     alpn.hash(&mut hasher);
+    // the CA bundle is not part of the reuse hash, and a resumed handshake does not verify the
+    // server's certificate again
+    if let Some(ca_list) = peer.get_ca() {
+        for ca in &***ca_list {
+            ca.to_der().unwrap_or_default().hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -577,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tls_sessions_are_kept_per_peer_and_alpn() {
+    async fn tls_sessions_are_kept_per_peer_alpn_and_ca() {
         let upstream = Upstream::new(SslVersion::TLS1_3);
         let mut peer = local_peer();
         peer.options.tls_session_reuse = true;
@@ -589,8 +597,12 @@ mod tests {
         assert!(!upstream.session_reused(&other).await);
         assert!(upstream.session_reused(&peer).await);
 
-        // same for another ALPN, which the reuse hash leaves out
+        // same for another ALPN and another CA bundle, which the reuse hash leaves out
         peer.options.alpn = ALPN::H2;
+        assert!(!upstream.session_reused(&peer).await);
+        assert!(upstream.session_reused(&peer).await);
+        let ca = X509::from_pem(&fixture("verify-ca.crt")).unwrap();
+        peer.options.ca = Some(Arc::new(vec![ca].into_boxed_slice()));
         assert!(!upstream.session_reused(&peer).await);
         assert!(upstream.session_reused(&peer).await);
     }
