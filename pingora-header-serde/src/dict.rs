@@ -14,18 +14,23 @@
 
 //! Training to generate the zstd dictionary.
 
-use std::fs;
+use std::{fs, io::Error, io::ErrorKind};
 use zstd::dict;
 
 /// Train the zstd dictionary from all the files under the given `dir_path`
 ///
 /// The output will be the trained dictionary
-pub fn train<P: AsRef<std::path::Path>>(dir_path: P) -> Vec<u8> {
-    // TODO: check f is file, it can be dir
-    let files = fs::read_dir(dir_path)
-        .unwrap()
-        .filter_map(|entry| entry.ok().map(|f| f.path()));
-    dict::from_files(files, 64 * 1024 * 1024).unwrap()
+pub fn train<P: AsRef<std::path::Path>>(dir_path: P) -> Result<Vec<u8>, Error> {
+    if dir_path.as_ref().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "expected a directory, got a file",
+        ));
+    }
+
+    let files = fs::read_dir(dir_path)?.filter_map(|entry| entry.ok().map(|f| f.path()));
+
+    Ok(dict::from_files(files, 64 * 1024 * 1024).unwrap())
 }
 
 #[cfg(test)]
@@ -37,7 +42,7 @@ mod test {
     fn gen_test_dict() -> Vec<u8> {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("samples/test");
-        train(path)
+        train(path).expect("expected a trained dictionary")
     }
 
     fn gen_test_header() -> ResponseHeader {
