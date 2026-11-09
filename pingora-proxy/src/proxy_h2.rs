@@ -611,11 +611,15 @@ where
 
         let mut next_upstream_task: Option<HttpTask> = None;
         let mut fill_cancellation = CacheFillCancellationState::new();
+        // Set once the upstream ends the request body with RST_STREAM(NO_ERROR) after a complete
+        // response (RFC 9113 section 8.1). The rest of the downstream body is read and dropped
+        // while the response is delivered, and `reuse()` drains whatever is left after that.
+        let mut upstream_body_reset = false;
 
         /* duplex mode
          * see the Same function for h1 for more comments
          */
-        while !downstream_state.is_done()
+        while !(downstream_state.is_done() || upstream_body_reset)
             || !session.response_work_done(&response_state)
             || downstream_custom_read && !downstream_state.is_errored()
             || downstream_custom_write && !session.downstream_abandoned_during_cache_fill()
@@ -688,6 +692,12 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
+                    if upstream_body_reset {
+                        // Reading on keeps a client that writes its whole body before reading the
+                        // response from stalling, and keeps body bytes out of the idle read.
+                        downstream_state.maybe_finished(is_body_done);
+                        continue;
+                    }
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
@@ -733,11 +743,20 @@ where
                             session.downstream_session.on_proxy_failure(e);
                         },
                         Err(H2BodySendError { error: e, .. }) => {
-                            // mark request done, attempt to drain receive
-                            warn!("Upstream h2 body send error: {e}");
-                            // upstream is what actually errored but we don't want to continue
-                            // polling the downstream body
-                            downstream_state.to_errored();
+                            if early_response_reset(client_body) {
+                                // RFC 9113 section 8.1: the upstream sent a complete response and asked
+                                // for the rest of the request body to be dropped with RST_STREAM(NO_ERROR).
+                                // The response stays valid and the downstream connection stays reusable.
+                                debug!("Upstream finished the response before the request body: {e}");
+                                upstream_body_reset = true;
+                                downstream_state.maybe_finished(is_body_done);
+                            } else {
+                                // mark request done, attempt to drain receive
+                                warn!("Upstream h2 body send error: {e}");
+                                // upstream is what actually errored but we don't want to continue
+                                // polling the downstream body
+                                downstream_state.to_errored();
+                            }
                         }
                     };
                 },
@@ -1240,6 +1259,15 @@ where
 
         Ok(end_of_body)
     }
+}
+
+/// Whether the upstream reset the stream with `NO_ERROR` after a complete response, which asks
+/// the client to stop sending the request body (RFC 9113 section 8.1).
+fn early_response_reset(client_body: &mut h2::SendStream<Bytes>) -> bool {
+    matches!(
+        std::future::poll_fn(|cx| client_body.poll_reset(cx)).now_or_never(),
+        Some(Ok(h2::Reason::NO_ERROR))
+    )
 }
 
 /* Read response header, body and trailer from h2 upstream and send them to tx */
