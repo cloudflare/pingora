@@ -41,6 +41,13 @@ use std::fs::Permissions;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+#[cfg(feature = "keep_listening_on_terminate")]
+mod keep_listening;
+#[cfg(all(test, feature = "keep_listening_on_terminate"))]
+mod keep_listening_tests;
+#[cfg(feature = "keep_listening_on_terminate")]
+use keep_listening::TerminatePhases;
+
 /// Override the runtime options used to run a listening service.
 pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
 
@@ -57,6 +64,9 @@ where
     pub threads: Option<usize>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
     runtime_group: Option<String>,
+    /// Set by [`Self::keep_listening_on_terminate`].
+    #[cfg(feature = "keep_listening_on_terminate")]
+    terminate_phases: Option<Arc<TerminatePhases>>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -75,6 +85,8 @@ where
             threads: None,
             runtime_opts_override: None,
             runtime_group: None,
+            #[cfg(feature = "keep_listening_on_terminate")]
+            terminate_phases: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -94,6 +106,8 @@ where
             threads: None,
             runtime_opts_override: None,
             runtime_group: None,
+            #[cfg(feature = "keep_listening_on_terminate")]
+            terminate_phases: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
         }
@@ -244,6 +258,7 @@ where
         app_logic: Arc<A>,
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
+        #[cfg(feature = "keep_listening_on_terminate")] phases: Option<Arc<TerminatePhases>>,
     ) {
         // the accept loop, until the system is shutting down
         loop {
@@ -254,6 +269,17 @@ where
                         Ok(()) => {
                             if !*shutdown.borrow() {
                                 // happen in the initial read
+                                continue;
+                            }
+                            #[cfg(feature = "keep_listening_on_terminate")]
+                            if phases
+                                .as_ref()
+                                .is_some_and(|phases| !phases.is_graceful_upgrade())
+                            {
+                                info!(
+                                    "Graceful terminate: {} keeps listening until runtime shutdown",
+                                    stack.as_str()
+                                );
                                 continue;
                             }
                             info!("Shutting down {}", stack.as_str());
@@ -347,6 +373,8 @@ where
             .take()
             .expect("can only start_service() once");
         let app_logic = Arc::new(app_logic);
+        #[cfg(feature = "keep_listening_on_terminate")]
+        let terminate_phases = self.terminate_phases.take();
 
         let mut handlers = Vec::new();
 
@@ -355,9 +383,18 @@ where
                 let shutdown = shutdown.clone();
                 let my_app_logic = app_logic.clone();
                 let endpoint = endpoint.clone();
+                #[cfg(feature = "keep_listening_on_terminate")]
+                let phases = terminate_phases.clone();
 
                 let jh = runtime.spawn(async move {
-                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                    Self::run_endpoint(
+                        my_app_logic,
+                        endpoint,
+                        shutdown,
+                        #[cfg(feature = "keep_listening_on_terminate")]
+                        phases,
+                    )
+                    .await;
                 });
 
                 handlers.push(jh);
@@ -472,6 +509,8 @@ mod tests {
             Arc::new(HoldUntilByte),
             stack,
             shutdown,
+            #[cfg(feature = "keep_listening_on_terminate")]
+            None,
         ));
 
         let mut first = TcpStream::connect(addr).await.unwrap();
@@ -508,6 +547,8 @@ mod tests {
             Arc::new(HandOff(streams_tx)),
             stack,
             shutdown,
+            #[cfg(feature = "keep_listening_on_terminate")]
+            None,
         ));
 
         let _first = TcpStream::connect(addr).await.unwrap();
