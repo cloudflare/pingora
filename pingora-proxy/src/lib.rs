@@ -34,6 +34,9 @@
 //! run it.
 //!
 //! See `examples/load_balancer.rs` for a detailed example.
+//!
+//! For an introduction to this crate's interfaces and the stages of a request, see the
+//! [user guide](https://github.com/cloudflare/pingora/blob/main/docs/user_guide/index.md).
 
 use async_trait::async_trait;
 use bytes::Bytes;
