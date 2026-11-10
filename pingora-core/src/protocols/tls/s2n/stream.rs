@@ -312,12 +312,15 @@ impl SslDigest {
             }
         }
 
+        let sni = conn.server_name().map(ToOwned::to_owned);
+
         SslDigest::new(
             cipher,
             version,
             organization,
             serial_number,
             cert_digest.unwrap_or_default(),
+            sni,
         )
     }
 }
