@@ -82,28 +82,44 @@ jobs:
             cargo check --workspace
           fi
 
-      - name: Run cargo test
+      - name: Install cargo-nextest
+        if: matrix.toolchain != '1.85.0'
+        run: cargo install --locked cargo-nextest --version 0.9.151
+
+      # .config/nextest.toml serializes the integration binaries that bind
+      # fixed ports.
+      - name: Run cargo nextest
         if: matrix.toolchain != '1.85.0'
         # The skipped test needs an h2 client that discards late frames on
         # forgotten streams, which no h2 release does yet (hyperium/h2#983).
         run: >-
-          cargo test --verbose --lib --bins --tests --no-fail-fast --
-          --skip connectors::http::v2::tests::test_h2_late_frames_on_cancelled_streams_keep_connection
+          cargo nextest run --workspace --no-fail-fast
+          -E 'not test(test_h2_late_frames_on_cancelled_streams_keep_connection)'
 
       - name: Test keep listening on terminate
         if: matrix.toolchain == '1.97.1'
         run: |
           cargo clippy --package pingora-core --all-targets --features keep_listening_on_terminate -- --allow=unknown-lints --deny=warnings
-          cargo test --package pingora-core --features keep_listening_on_terminate \
-            --lib --test test_keep_listening_on_terminate --no-fail-fast -- \
-            --skip connectors::http::v2::tests::test_h2_late_frames_on_cancelled_streams_keep_connection
+          cargo nextest run --package pingora-core --features keep_listening_on_terminate \
+            --lib --test test_keep_listening_on_terminate --no-fail-fast \
+            -E 'not test(test_h2_late_frames_on_cancelled_streams_keep_connection)'
           cargo build --package pingora-proxy --example keep_listening_on_terminate --features keep_listening_on_terminate
 
-      # Need to run doc tests separately.
+      # nextest does not run doc tests, so run them separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
         if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --doc
+
+      # The fixed-seed fuzz cases run with the tests above. The soak runs many
+      # more cases from a seed that changes with every workflow run. A failure
+      # prints its case seed, and PINGORA_BODY_FUZZ_CASE=<seed> replays it.
+      - name: Run body reader fuzz soak
+        if: matrix.toolchain == '1.97.1'
+        env:
+          PINGORA_BODY_FUZZ_CASES: "1000000"
+          PINGORA_BODY_FUZZ_SEED: ${{ github.run_id }}
+        run: cargo test --release -p pingora-core --lib body_reader_fuzz_soak -- --ignored --nocapture
 
       - name: Run cargo clippy
         run: |

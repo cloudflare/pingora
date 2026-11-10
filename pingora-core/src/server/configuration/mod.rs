@@ -135,9 +135,11 @@ pub struct ServerConf {
     /// This setting is a fail-safe and defaults to 16.
     pub max_retries: usize,
     /// Maximum number of retries for upgrade socket connect and accept operations.
-    /// This controls how many times send_fds_to will retry connecting and how many times
-    /// get_fds_from will retry accepting during graceful upgrades.
+    /// This controls how many times the old process will retry connecting to the upgrade
+    /// socket and how many times the new process will retry accepting on it during graceful
+    /// upgrades.
     /// The retry interval is 1 second between attempts.
+    /// The accept side waits one additional interval beyond this count.
     /// If not set, defaults to 5 retries.
     pub upgrade_sock_connect_accept_max_retries: Option<usize>,
     /// The maximum number of threads in each runtime's blocking thread pool.

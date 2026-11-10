@@ -101,7 +101,7 @@ impl ProxyHttp for MyProxy {
             ("1.1.1.1", 443),
             true,
             "one.one.one.one".to_string(),
-        ));
+        )?);
         Ok(peer)
     }
 }

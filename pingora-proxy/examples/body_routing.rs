@@ -167,7 +167,7 @@ impl ProxyHttp for MyProxy {
             ("httpbin.org", 443),
             true,
             "httpbin.org".to_string(),
-        ));
+        )?);
         Ok(peer)
     }
 }

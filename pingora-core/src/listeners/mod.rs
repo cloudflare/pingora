@@ -43,6 +43,7 @@
 //! # }
 //! ```
 
+mod accept_limits;
 mod l4;
 
 #[cfg(feature = "connection_filter")]
@@ -75,14 +76,18 @@ pub mod tls;
 pub use crate::tls::listeners as tls;
 
 use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
+use crate::upstreams::peer::Tracer;
 
 #[cfg(unix)]
 use crate::server::ListenFds;
 
 use async_trait::async_trait;
-use pingora_error::Result;
+use pingora_error::{Error, Result};
+use pingora_timeout::timeout;
 use std::{any::Any, fs::Permissions, sync::Arc};
 
+pub(crate) use accept_limits::ConnectionPermit;
+use accept_limits::{EndpointLimits, PendingHandshake, SkipReason};
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
@@ -91,6 +96,7 @@ pub use crate::protocols::l4::stream::{
 };
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::GetSocketDigest;
+pub use accept_limits::{AcceptLimits, AcceptStats, DEFAULT_HANDSHAKE_TIMEOUT};
 pub use l4::{ServerAddress, TcpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
@@ -165,9 +171,11 @@ struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
     l4_buffer: L4BufferSettings,
+    accept_limits: AcceptLimits,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
 }
 
 impl TransportStackBuilder {
@@ -195,6 +203,11 @@ impl TransportStackBuilder {
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
+            limits: Arc::new(EndpointLimits::new(
+                self.accept_limits.clone(),
+                self.l4.as_ref().to_string(),
+            )),
         })
     }
 }
@@ -202,12 +215,13 @@ impl TransportStackBuilder {
 /// Configuration for one listening endpoint.
 ///
 /// This configures the endpoint address and endpoint-specific transport
-/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4 buffer sizes
-/// ([`L4BufferSettings`]).
+/// settings such as [`TcpSocketOptions`], [`TlsSettings`], L4 buffer sizes
+/// ([`L4BufferSettings`]), and limits on accepted connections ([`AcceptLimits`]).
 pub struct ListenerConfig {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
     l4_buffer: L4BufferSettings,
+    accept_limits: AcceptLimits,
 }
 
 impl ListenerConfig {
@@ -217,6 +231,7 @@ impl ListenerConfig {
             l4: ServerAddress::Tcp(addr.into(), None),
             tls: None,
             l4_buffer: L4BufferSettings::default(),
+            accept_limits: AcceptLimits::default(),
         }
     }
 
@@ -227,6 +242,7 @@ impl ListenerConfig {
             l4: ServerAddress::Uds(addr.into(), None),
             tls: None,
             l4_buffer: L4BufferSettings::default(),
+            accept_limits: AcceptLimits::default(),
         }
     }
 
@@ -275,6 +291,12 @@ impl ListenerConfig {
         self.l4_buffer = settings;
         self
     }
+
+    /// Set limits on the connections this endpoint accepts. See [`AcceptLimits`].
+    pub fn accept_limits(mut self, limits: AcceptLimits) -> Self {
+        self.accept_limits = limits;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -283,6 +305,8 @@ pub(crate) struct TransportStack {
     tls: Option<Arc<Acceptor>>,
     l4_buffer: L4BufferSettings,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
+    limits: Arc<EndpointLimits>,
 }
 
 impl TransportStack {
@@ -291,17 +315,46 @@ impl TransportStack {
     }
 
     pub async fn accept(&self) -> Result<UninitializedStream> {
-        let stream = self.l4.accept().await?;
+        let mut stream = self.l4.accept().await?;
+        // Attach the listener's tracer, if any, the same way the upstream connector does:
+        // report the connection now and let `Stream`'s `Drop` report the disconnect. The
+        // tracer rides on the L4 stream, which `handshake()` keeps alive in both the plain
+        // and the TLS case, so the whole life of the connection is covered -- including
+        // connections that never finish the handshake.
+        if let Some(tracer) = self.tracer.as_ref() {
+            let tracer = tracer.clone();
+            tracer.0.on_connected();
+            stream.tracer = Some(tracer);
+        }
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
+            limits: self.limits.clone(),
+            pending: PendingHandshake::uncounted(),
         })
+    }
+
+    /// Admit an accepted connection under the endpoint's [`AcceptLimits`]. Returns `None`, and
+    /// closes the connection, if the endpoint already has
+    /// [`max_connections`](AcceptLimits::max_connections) open or
+    /// [`max_pending_handshakes`](AcceptLimits::max_pending_handshakes) pending.
+    pub fn admit(&self, mut stream: UninitializedStream) -> Option<UninitializedStream> {
+        let (permit, pending) = self.limits.admit()?;
+        // The stream holds the permit, so the connection counts until the socket closes.
+        stream.l4.set_connection_permit(permit);
+        stream.pending = pending;
+        Some(stream)
     }
 
     pub fn cleanup(&mut self) {
         // placeholder
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.l4.local_addr()
     }
 }
 
@@ -310,10 +363,75 @@ pub(crate) struct UninitializedStream {
     tls: Option<Arc<Acceptor>>,
     l4_buffer: L4BufferSettings,
     pre_tls_callback: Option<PreTlsCallback>,
+    limits: Arc<EndpointLimits>,
+    pending: PendingHandshake,
+}
+
+/// How a handshake under an endpoint's [`AcceptLimits`] failed.
+#[derive(Debug)]
+pub(crate) enum HandshakeFailure {
+    /// The connection was closed before its handshake started.
+    Skipped(SkipReason),
+    /// The handshake did not finish within the handshake timeout.
+    TimedOut,
+    /// The handshake failed.
+    Error(Box<Error>),
+}
+
+impl From<Box<Error>> for HandshakeFailure {
+    fn from(e: Box<Error>) -> Self {
+        HandshakeFailure::Error(e)
+    }
 }
 
 impl UninitializedStream {
-    pub async fn handshake(mut self) -> Result<Stream> {
+    /// Run the handshake under the endpoint's [`AcceptLimits`]: close the connection first if
+    /// the limits say so, and give up after the handshake timeout.
+    pub(crate) async fn handshake_with_limits(mut self) -> Result<Stream, HandshakeFailure> {
+        // Dropped when the handshake finishes, one way or another.
+        let _pending = std::mem::replace(&mut self.pending, PendingHandshake::uncounted());
+        let limits = self.limits.clone();
+        if let Some(reason) = limits.check_before_handshake(&self.l4) {
+            return Err(HandshakeFailure::Skipped(reason));
+        }
+        // A client can give up while its handshake waits for a TLS offload thread.
+        let recheck = limits.skips_closed_peers().then(|| limits.clone());
+        let handshake = self.handshake_checked(move |l4| {
+            match recheck.and_then(|limits| limits.check_before_handshake(l4)) {
+                Some(reason) => Err(HandshakeFailure::Skipped(reason)),
+                None => Ok(()),
+            }
+        });
+        match timeout(limits.handshake_timeout(), handshake).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(HandshakeFailure::Error(e))) => {
+                limits.count_handshake_error();
+                Err(HandshakeFailure::Error(e))
+            }
+            // Skipped when the offload thread started the handshake.
+            Ok(Err(failure)) => Err(failure),
+            Err(_) => {
+                limits.count_handshake_timeout();
+                Err(HandshakeFailure::TimedOut)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn handshake(self) -> Result<Stream> {
+        self.handshake_checked(|_| Ok(())).await
+    }
+
+    /// Run [`Self::handshake`]. If a TLS offload thread runs the TLS handshake, `check` runs
+    /// first on that thread, and an error from it is returned instead of starting the handshake.
+    /// Otherwise `check` is not called.
+    async fn handshake_checked<E>(
+        mut self,
+        check: impl FnOnce(&L4Stream) -> Result<(), E> + Send + 'static,
+    ) -> Result<Stream, E>
+    where
+        E: From<Box<Error>> + Send + 'static,
+    {
         self.l4.set_buffer(self.l4_buffer);
         if let Some(tls) = self.tls {
             // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
@@ -321,7 +439,7 @@ impl UninitializedStream {
                 callback.process(&mut self.l4).await?;
             }
 
-            let tls_stream = tls.tls_handshake(self.l4).await?;
+            let tls_stream = tls.tls_handshake_checked(self.l4, check).await?;
             Ok(Box::new(tls_stream))
         } else {
             Ok(Box::new(self.l4))
@@ -342,6 +460,7 @@ pub struct Listeners {
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
     pre_tls_callback: Option<PreTlsCallback>,
+    tracer: Option<Tracer>,
 }
 
 impl Listeners {
@@ -352,6 +471,7 @@ impl Listeners {
             #[cfg(feature = "connection_filter")]
             connection_filter: None,
             pre_tls_callback: None,
+            tracer: None,
         }
     }
     /// Create a new [`Listeners`] with a TCP server endpoint from the given string.
@@ -450,14 +570,21 @@ impl Listeners {
 
     /// Add the given listener endpoint to `self`.
     pub fn add_listener(&mut self, endpoint: ListenerConfig) {
-        let ListenerConfig { l4, tls, l4_buffer } = endpoint;
+        let ListenerConfig {
+            l4,
+            tls,
+            l4_buffer,
+            accept_limits,
+        } = endpoint;
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
             l4_buffer,
+            accept_limits,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
         });
     }
 
@@ -490,15 +617,52 @@ impl Listeners {
         }
     }
 
+    /// Set a [`Tracer`] to report the lifetime of accepted (downstream) connections.
+    ///
+    /// The tracer is cloned per connection. [`Tracing::on_connected`] is called right after
+    /// `accept()` returns, before the TLS handshake, and [`Tracing::on_disconnected`] is called
+    /// by [`Stream`]'s `Drop`. The two therefore pair by construction, and connections that
+    /// never finish the handshake are covered as well.
+    ///
+    /// This is the same mechanism [`crate::upstreams::peer::Peer::get_tracer`] provides for
+    /// connections Pingora opens *to* an upstream; this method is the downstream counterpart.
+    ///
+    /// [`Tracing::on_connected`]: crate::upstreams::peer::Tracing::on_connected
+    /// [`Tracing::on_disconnected`]: crate::upstreams::peer::Tracing::on_disconnected
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use pingora_core::listeners::Listeners;
+    /// use pingora_core::upstreams::peer::Tracer;
+    ///
+    /// let mut listeners = Listeners::new();
+    /// listeners.set_tracer(Tracer(Box::new(MyConnectionCount::default())));
+    /// listeners.add_tcp("0.0.0.0:8080");
+    /// ```
+    pub fn set_tracer(&mut self, tracer: Tracer) {
+        log::debug!("Setting tracer on Listeners");
+
+        // Store the tracer for future endpoints
+        self.tracer = Some(tracer.clone());
+
+        // Apply to existing stacks
+        for stack in &mut self.stacks {
+            stack.tracer = Some(tracer.clone());
+        }
+    }
+
     /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided.
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
             l4_buffer: L4BufferSettings::default(),
+            accept_limits: AcceptLimits::default(),
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
             pre_tls_callback: self.pre_tls_callback.clone(),
+            tracer: self.tracer.clone(),
         })
     }
 
@@ -530,9 +694,11 @@ impl Listeners {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "any_tls")]
+    use pingora_error::ErrorType::InternalError;
     #[cfg(feature = "connection_filter")]
     use std::sync::atomic::{AtomicUsize, Ordering};
-    #[cfg(feature = "any_tls")]
+    #[cfg(any(feature = "any_tls", target_os = "linux"))]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -604,6 +770,87 @@ mod test {
         let mut response = [0; 4];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
+    }
+
+    #[tokio::test]
+    async fn test_listener_tracer_reports_connect_and_disconnect() {
+        use crate::upstreams::peer::Tracing;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Counters {
+            connected: AtomicUsize,
+            disconnected: AtomicUsize,
+        }
+
+        // A tracer clone must share the counters with the original: the listener clones the
+        // tracer once per connection.
+        #[derive(Debug, Clone)]
+        struct Count(Arc<Counters>);
+
+        impl Tracing for Count {
+            fn on_connected(&self) {
+                self.0.connected.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_disconnected(&self) {
+                self.0.disconnected.fetch_add(1, Ordering::Relaxed);
+            }
+            fn boxed_clone(&self) -> Box<dyn Tracing> {
+                Box::new(self.clone())
+            }
+        }
+
+        let counters = Arc::new(Counters::default());
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.set_tracer(Tracer(Box::new(Count(counters.clone()))));
+
+        let mut built = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(built.len(), 1);
+        let stack = built.pop().unwrap();
+        let addr = stack.l4.local_addr().unwrap();
+
+        let accepted = tokio::spawn(async move { stack.accept().await.unwrap() });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let stream = accepted.await.unwrap();
+
+        // Reported at accept time, before any handshake.
+        assert_eq!(counters.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.disconnected.load(Ordering::Relaxed), 0);
+
+        // Dropping the connection without ever handshaking still reports the disconnect,
+        // which is the window an application-side counter cannot see.
+        drop(stream);
+        assert_eq!(counters.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.disconnected.load(Ordering::Relaxed), 1);
+
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_listener_without_tracer_is_unchanged() {
+        // The default is no tracer; this is the "nothing changes for anyone who does not opt
+        // in" half, and it fails if `accept()` ever starts assuming a tracer is present.
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        let mut built = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap();
+        let stack = built.pop().unwrap();
+        let addr = stack.l4.local_addr().unwrap();
+
+        let accepted = tokio::spawn(async move { stack.accept().await.unwrap() });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = accepted.await.unwrap();
+        drop(stream);
     }
 
     #[test]
@@ -783,6 +1030,342 @@ mod test {
             assert_eq!(request.await.unwrap(), reqwest::StatusCode::OK);
         }
         server.await.unwrap();
+    }
+
+    async fn build_one(config: ListenerConfig) -> TransportStack {
+        let mut listeners = Listeners::new();
+        listeners.add_listener(config);
+        listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    /// Whether the peer of `client` closes the connection within a second.
+    async fn closed_by_peer(client: &mut TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => true,
+            Ok(Ok(_)) | Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn test_add_listener_config_accept_limits() {
+        let mut listeners = Listeners::new();
+        listeners.add_listener(
+            ListenerConfig::tcp("127.0.0.1:7108").accept_limits(AcceptLimits {
+                max_connections: Some(7),
+                ..Default::default()
+            }),
+        );
+        listeners.add_tcp("127.0.0.1:7109");
+
+        assert_eq!(listeners.stacks[0].accept_limits.max_connections, Some(7));
+        assert_eq!(listeners.stacks[1].accept_limits.max_connections, None);
+        assert_eq!(
+            listeners.stacks[1].accept_limits.handshake_timeout,
+            DEFAULT_HANDSHAKE_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_connections_closes_connections_over_the_limit() {
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_one(
+            ListenerConfig::tcp("127.0.0.1:0").accept_limits(AcceptLimits {
+                max_connections: Some(1),
+                stats: Some(stats.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        let mut first_client = TcpStream::connect(addr).await.unwrap();
+        let first = listener.admit(listener.accept().await.unwrap()).unwrap();
+        assert_eq!(stats.open_connections(), 1);
+        assert_eq!(stats.pending_handshakes(), 1);
+
+        let mut second_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_none());
+        assert!(closed_by_peer(&mut second_client).await);
+        assert!(!closed_by_peer(&mut first_client).await);
+        assert_eq!(stats.closed_at_connection_limit(), 1);
+        assert_eq!(stats.open_connections(), 1);
+
+        // Closing the first connection frees its slot.
+        drop(first);
+        assert_eq!(stats.open_connections(), 0);
+        assert_eq!(stats.pending_handshakes(), 0);
+        let _third_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_connection_counts_until_its_stream_drops() {
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_one(
+            ListenerConfig::tcp("127.0.0.1:0").accept_limits(AcceptLimits {
+                max_connections: Some(1),
+                stats: Some(stats.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let stream = stream.handshake_with_limits().await.unwrap();
+        assert_eq!(stats.pending_handshakes(), 0);
+        assert_eq!(stats.open_connections(), 1);
+
+        // The slot stays taken after the handshake, until the stream is dropped.
+        let _second_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_none());
+        drop(stream);
+        assert_eq!(stats.open_connections(), 0);
+        let _third_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_handshake_timeout() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_one(
+            ListenerConfig::tcp("127.0.0.1:0")
+                .tls(TlsSettings::intermediate(&cert_path, &key_path).unwrap())
+                .accept_limits(AcceptLimits {
+                    handshake_timeout: std::time::Duration::from_millis(100),
+                    max_pending_handshakes: Some(1),
+                    stats: Some(stats.clone()),
+                    ..Default::default()
+                }),
+        )
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        // A client that never sends its ClientHello.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let handshake = stream.handshake_with_limits().await;
+        assert!(matches!(handshake, Err(HandshakeFailure::TimedOut)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(stats.handshake_timeouts(), 1);
+        assert_eq!(stats.pending_handshakes(), 0);
+        // The timed-out handshake gave back its handshake slot.
+        let _second_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_some());
+        assert_eq!(stats.open_connections(), 0);
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn test_skip_closed_peers() {
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_one(
+            ListenerConfig::tcp("127.0.0.1:0").accept_limits(AcceptLimits {
+                skip_closed_peers: true,
+                stats: Some(stats.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        // A client that sends its first bytes and gives up before the server gets to them.
+        let mut gone = TcpStream::connect(addr).await.unwrap();
+        gone.write_all(b"hello").await.unwrap();
+        drop(gone);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let handshake = stream.handshake_with_limits().await;
+        assert!(matches!(
+            handshake,
+            Err(HandshakeFailure::Skipped(SkipReason::PeerClosed))
+        ));
+        assert_eq!(stats.closed_peer_gone(), 1);
+        assert_eq!(stats.pending_handshakes(), 0);
+        assert_eq!(stats.open_connections(), 0);
+
+        let mut waiting = TcpStream::connect(addr).await.unwrap();
+        waiting.write_all(b"hello").await.unwrap();
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let handshake = stream.handshake_with_limits().await;
+        assert!(handshake.is_ok());
+        assert_eq!(stats.closed_peer_gone(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_pending_handshakes_closes_connections_over_the_limit() {
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_one(
+            ListenerConfig::tcp("127.0.0.1:0").accept_limits(AcceptLimits {
+                max_pending_handshakes: Some(1),
+                stats: Some(stats.clone()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        let _first_client = TcpStream::connect(addr).await.unwrap();
+        let first = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let mut second_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_none());
+        assert!(closed_by_peer(&mut second_client).await);
+        assert_eq!(stats.closed_at_handshake_limit(), 1);
+
+        // Once its handshake ends, the first connection stays open but frees its slot.
+        let _stream = first.handshake_with_limits().await.unwrap();
+        assert_eq!(stats.pending_handshakes(), 0);
+        assert_eq!(stats.open_connections(), 1);
+        let _third_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_some());
+    }
+
+    /// A TLS endpoint whose handshakes run on a single offload thread.
+    #[cfg(feature = "any_tls")]
+    async fn build_offloaded_tls(limits: AcceptLimits) -> TransportStack {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut tls = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        tls.set_offload_threadpool(1, 1);
+        build_one(
+            ListenerConfig::tcp("127.0.0.1:0")
+                .tls(tls)
+                .accept_limits(limits),
+        )
+        .await
+    }
+
+    /// Hold the only offload thread of `listener` until the returned sender sends or is dropped.
+    #[cfg(feature = "any_tls")]
+    async fn hold_offload_thread(listener: &TransportStack) -> std::sync::mpsc::Sender<()> {
+        let acceptor = listener.tls.clone().unwrap();
+        let held = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (_, server) = tokio::io::duplex(1024);
+        let notify = held.clone();
+        tokio::spawn(async move {
+            acceptor
+                .tls_handshake_checked(server, move |_| {
+                    notify.notify_one();
+                    let _ = release_rx.recv();
+                    Err(Error::explain(InternalError, "held"))
+                })
+                .await
+        });
+        held.notified().await;
+        release_tx
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_offloaded_tls_handshake_runs_its_check_first_on_the_offload_thread() {
+        let listener = build_offloaded_tls(AcceptLimits::default()).await;
+        let acceptor = listener.tls.clone().unwrap();
+        // The client never sends a ClientHello, so a handshake that started would not finish.
+        let (_client, server) = tokio::io::duplex(1024);
+        let handshake = acceptor.tls_handshake_checked(server, |_| {
+            let thread = std::thread::current().name().unwrap_or_default().to_owned();
+            Err(Error::explain(InternalError, thread))
+        });
+        let handshake = tokio::time::timeout(std::time::Duration::from_secs(5), handshake)
+            .await
+            .expect("the handshake started");
+        let Err(e) = handshake else {
+            panic!("the check did not stop the handshake");
+        };
+        assert!(e.to_string().contains("downstream TLS offload"), "{e}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "any_tls")]
+    async fn test_connection_counts_until_its_offloaded_handshake_is_dropped() {
+        use std::time::Duration;
+
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_offloaded_tls(AcceptLimits {
+            handshake_timeout: Duration::from_millis(100),
+            max_connections: Some(1),
+            stats: Some(stats.clone()),
+            ..Default::default()
+        })
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+        let release = hold_offload_thread(&listener).await;
+
+        // The handshake times out while it waits for the offload thread, which owns the socket.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let handshake = stream.handshake_with_limits().await;
+        assert!(matches!(handshake, Err(HandshakeFailure::TimedOut)));
+        assert_eq!(stats.open_connections(), 1);
+        let mut second_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_none());
+        assert!(closed_by_peer(&mut second_client).await);
+
+        // The offload thread drops the handshake when it gets to it, closing the socket.
+        release.send(()).unwrap();
+        assert!(closed_by_peer(&mut client).await);
+        for _ in 0..100 {
+            if stats.open_connections() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(stats.open_connections(), 0);
+        let _third_client = TcpStream::connect(addr).await.unwrap();
+        assert!(listener.admit(listener.accept().await.unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(all(target_os = "linux", feature = "any_tls"))]
+    async fn test_skip_closed_peers_checks_again_when_the_offload_thread_starts() {
+        use std::time::Duration;
+
+        let stats = Arc::new(AcceptStats::default());
+        let listener = build_offloaded_tls(AcceptLimits {
+            skip_closed_peers: true,
+            stats: Some(stats.clone()),
+            ..Default::default()
+        })
+        .await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        // Keep the only offload thread busy until the client below has given up.
+        let release = hold_offload_thread(&listener).await;
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let stream = listener.admit(listener.accept().await.unwrap()).unwrap();
+        let handshake = tokio::spawn(stream.handshake_with_limits());
+        // The handshake passes the first check, then waits for the offload thread.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(stats.closed_peer_gone(), 0);
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+
+        let handshake = handshake.await.unwrap();
+        assert!(matches!(
+            handshake,
+            Err(HandshakeFailure::Skipped(SkipReason::PeerClosed))
+        ));
+        assert_eq!(stats.closed_peer_gone(), 1);
+        assert_eq!(stats.handshake_errors(), 0);
+        assert_eq!(stats.pending_handshakes(), 0);
     }
 
     #[cfg(feature = "connection_filter")]
