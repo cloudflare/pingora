@@ -50,7 +50,7 @@ impl ProxyHttp for Proxy {
             ("1.1.1.1", 80),
             false,
             String::new(),
-        )))
+        )?))
     }
 }
 
