@@ -101,6 +101,14 @@ pub mod listeners {
         pub async fn tls_handshake<S: AsyncRead + AsyncWrite>(&self, _: S) -> Result<SslStream<S>> {
             unimplemented!("No tls feature was specified")
         }
+
+        pub(crate) async fn tls_handshake_checked<S: AsyncRead + AsyncWrite, E>(
+            &self,
+            _: S,
+            _: impl FnOnce(&S) -> Result<(), E>,
+        ) -> Result<SslStream<S>, E> {
+            unimplemented!("No tls feature was specified")
+        }
     }
 }
 

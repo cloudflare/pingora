@@ -242,6 +242,21 @@ impl Acceptor {
     }
 
     pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<TlsStream<S>> {
+        self.tls_handshake_checked(stream, |_| Ok(())).await
+    }
+
+    /// Run [`Self::tls_handshake`]. If a TLS offload thread runs the handshake, `check` runs
+    /// first on that thread, and an error from it is returned instead of starting the handshake.
+    /// Otherwise `check` is not called.
+    pub(crate) async fn tls_handshake_checked<S, E>(
+        &self,
+        stream: S,
+        check: impl FnOnce(&S) -> Result<(), E> + Send + 'static,
+    ) -> Result<TlsStream<S>, E>
+    where
+        S: IO + 'static,
+        E: From<Box<Error>> + Send + 'static,
+    {
         debug!("new tls session");
         if let Some(offload) = self.offload.as_ref() {
             // Clone without offload to prevent recursive offloading on the worker runtime.
@@ -253,18 +268,20 @@ impl Acceptor {
             let callbacks = self.callbacks.clone();
             offload
                 .spawn_abort_on_drop(stream.id() as u64, async move {
-                    if let Some(cb) = callbacks.as_ref() {
-                        handshake_with_callback(&acceptor, stream, cb.as_ref()).await
+                    check(&stream)?;
+                    let stream = if let Some(cb) = callbacks.as_ref() {
+                        handshake_with_callback(&acceptor, stream, cb.as_ref()).await?
                     } else {
-                        handshake(&acceptor, stream).await
-                    }
+                        handshake(&acceptor, stream).await?
+                    };
+                    Ok::<_, E>(stream)
                 })
                 .await
                 .or_err(InternalError, "TLS offload runtime failure")?
         } else if let Some(cb) = self.callbacks.as_ref() {
-            handshake_with_callback(self, stream, cb.as_ref()).await
+            Ok(handshake_with_callback(self, stream, cb.as_ref()).await?)
         } else {
-            handshake(self, stream).await
+            Ok(handshake(self, stream).await?)
         }
     }
 }

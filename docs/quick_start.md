@@ -85,7 +85,7 @@ impl ProxyHttp for LB {
         //   Use `false` for a plain-HTTP upstream (e.g. a local server).
         // - the SNI `one.one.one.one` must match the upstream's TLS certificate.
         //   When TLS is disabled the SNI is unused, so pass an empty string instead.
-        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string()));
+        let peer = Box::new(HttpPeer::new(upstream, true, "one.one.one.one".to_string())?);
         Ok(peer)
     }
 }
@@ -189,7 +189,7 @@ certificate, so leaving TLS enabled (as in the demo) causes the connection to
 fail with a `502`. Pass `false` for the `tls` argument and an empty SNI:
 
 ```rust
-        let peer = Box::new(HttpPeer::new(upstream, false, String::new()));
+        let peer = Box::new(HttpPeer::new(upstream, false, String::new())?);
 ```
 
 Finally, the `Host` header set in `upstream_request_filter()` is specific to the

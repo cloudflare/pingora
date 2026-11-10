@@ -59,7 +59,7 @@ impl ProxyHttp for MyProxy {
             ("1.1.1.1", 443)
         };
 
-        let mut peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string()));
+        let mut peer = Box::new(HttpPeer::new(addr, true, "one.one.one.one".to_string())?);
         peer.options.connection_timeout = Some(Duration::from_millis(100));
         Ok(peer)
     }

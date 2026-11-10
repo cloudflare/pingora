@@ -390,7 +390,7 @@ impl ProxyHttp for EarlyBufferProxy {
             format!("127.0.0.1:{}", self.origin_port),
             false,
             String::new(),
-        ));
+        )?);
         if self.use_h2_upstream {
             peer.options.alpn = ALPN::H2;
         }
@@ -434,7 +434,7 @@ impl ProxyHttp for DefaultRetryEarlyBufferProxy {
             format!("127.0.0.1:{}", self.origin_port),
             false,
             String::new(),
-        ));
+        )?);
         peer.options.idle_timeout = Some(Duration::from_secs(60));
         Ok(peer)
     }
@@ -1422,7 +1422,7 @@ impl ProxyHttp for AbandonmentOrderProxy {
             format!("127.0.0.1:{}", self.origin_port),
             false,
             String::new(),
-        )))
+        )?))
     }
 }
 
