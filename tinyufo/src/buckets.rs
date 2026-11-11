@@ -139,6 +139,7 @@ mod tests {
         assert!(fast.get_map(&1, |_| ()).is_none());
 
         let bucket = Bucket {
+            id: 0,
             queue: crate::Location::new_small(),
             weight: 1,
             uses: Default::default(),
@@ -159,6 +160,7 @@ mod tests {
         assert!(compact.get_map(&1, |_| ()).is_none());
 
         let bucket = Bucket {
+            id: 0,
             queue: crate::Location::new_small(),
             weight: 1,
             uses: Default::default(),
