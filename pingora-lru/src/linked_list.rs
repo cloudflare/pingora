@@ -469,7 +469,7 @@ impl<'a, K: Default + Clone> Iterator for LinkedListIter<'a, K> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let next_index = self.list.next_compact(self.head);
-        if next_index == TAIL || next_index == NULL {
+        if next_index == self.tail || next_index == NULL {
             None
         } else {
             self.head = next_index;
@@ -486,7 +486,7 @@ impl<'a, K: Default + Clone> Iterator for LinkedListIter<'a, K> {
 impl<K: Default + Clone> DoubleEndedIterator for LinkedListIter<'_, K> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let prev_index = self.list.prev_compact(self.tail);
-        if prev_index == HEAD || prev_index == NULL {
+        if prev_index == self.head || prev_index == NULL {
             None
         } else {
             self.tail = prev_index;
@@ -509,6 +509,38 @@ mod test {
     fn assert_list_reverse(list: &LinkedList<u64>, values: &[u64]) {
         let list_values: Vec<_> = list.iter().rev().copied().collect();
         assert_eq!(values, &list_values)
+    }
+
+    #[test]
+    fn test_iter_front_after_back() {
+        let mut list = LinkedList::with_capacity(3);
+        for value in 0..3u64 {
+            list.push_tail(value);
+        }
+        let mut iter = list.iter();
+        assert_eq!(iter.next_back(), Some(&2));
+        assert_eq!(iter.next(), Some(&0));
+        assert_eq!(iter.next_back(), Some(&1));
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
+    fn test_iter_back_after_front() {
+        let mut list = LinkedList::with_capacity(3);
+        for value in 0..3u64 {
+            list.push_tail(value);
+        }
+        let mut iter = list.iter();
+        assert_eq!(iter.next(), Some(&0));
+        assert_eq!(iter.next_back(), Some(&2));
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next_back(), None);
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
     }
 
     #[test]
