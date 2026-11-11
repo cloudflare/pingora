@@ -1259,7 +1259,7 @@ pub mod range_filter {
         for _ in ranges_str.split(',') {
             range_count += 1;
             if let Some(max_ranges) = max_multipart_ranges {
-                if range_count >= max_ranges {
+                if range_count > max_ranges {
                     // If we get more than max configured ranges, return None for now to save parsing time
                     return RangeType::None;
                 }
