@@ -14,6 +14,7 @@
 
 //! HTTP/2 implementation
 
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::{Error, ErrorType::*, OrErr, Result};
@@ -25,8 +26,38 @@ use h2::SendStream;
 pub mod client;
 pub mod server;
 
-async fn reserve_and_send(
-    writer: &mut SendStream<Bytes>,
+/// The DATA-frame writing surface shared by a raw [`SendStream`] and
+/// [`client::RequestBodyWriter`], which additionally accounts the payload bytes it accepts.
+trait H2BodyWriter {
+    fn reserve_capacity(&mut self, capacity: usize);
+
+    fn poll_capacity(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<usize, h2::Error>>>;
+
+    fn send_data(&mut self, data: Bytes, end: bool) -> std::result::Result<(), h2::Error>;
+}
+
+impl H2BodyWriter for SendStream<Bytes> {
+    fn reserve_capacity(&mut self, capacity: usize) {
+        SendStream::reserve_capacity(self, capacity)
+    }
+
+    fn poll_capacity(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<usize, h2::Error>>> {
+        SendStream::poll_capacity(self, cx)
+    }
+
+    fn send_data(&mut self, data: Bytes, end: bool) -> std::result::Result<(), h2::Error> {
+        SendStream::send_data(self, data, end).map(|_| ())
+    }
+}
+
+async fn reserve_and_send<W: H2BodyWriter>(
+    writer: &mut W,
     remaining: &mut Bytes,
     end: bool,
 ) -> Result<()> {
@@ -51,6 +82,17 @@ async fn reserve_and_send(
 /// A helper function to write the body of h2 streams.
 pub async fn write_body(
     writer: &mut SendStream<Bytes>,
+    data: Bytes,
+    end: bool,
+    write_timeout: Option<Duration>,
+) -> Result<()> {
+    write_body_to(writer, data, end, write_timeout).await
+}
+
+/// Write a body to any [`H2BodyWriter`], spreading it over as many DATA frames as
+/// flow control requires.
+async fn write_body_to<W: H2BodyWriter>(
+    writer: &mut W,
     data: Bytes,
     end: bool,
     write_timeout: Option<Duration>,

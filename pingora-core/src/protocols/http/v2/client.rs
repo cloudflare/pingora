@@ -25,7 +25,7 @@ use pingora_error::{Error, ErrorType, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
@@ -50,9 +50,77 @@ fn validate_response_header(header: &ResponseHeader) -> Result<()> {
     validate_content_length_without_transfer_encoding(&header.headers)
 }
 
+/// The request body writer of an HTTP/2 upstream stream
+///
+/// The h2 crate only exposes payload accounting on the receiving side, so this writer counts the
+/// payload bytes the stream accepts and shares that counter with its [`Http2Session`]. That way
+/// [`Http2Session::body_bytes_sent`] keeps accounting after the writer has been moved to another
+/// task, which is how the proxy streams a request body upstream.
+pub struct RequestBodyWriter {
+    send_body: SendStream<Bytes>,
+    body_sent: Arc<AtomicUsize>,
+}
+
+impl RequestBodyWriter {
+    /// Wrap an h2 request stream, counting the payload bytes it accepts
+    pub fn new(send_body: SendStream<Bytes>) -> Self {
+        Self::with_counter(send_body, Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// Wrap an h2 request stream, adding its payload bytes to a shared counter
+    pub(crate) fn with_counter(send_body: SendStream<Bytes>, body_sent: Arc<AtomicUsize>) -> Self {
+        RequestBodyWriter {
+            send_body,
+            body_sent,
+        }
+    }
+
+    /// Write a request body chunk. See [`super::write_body`].
+    pub async fn write_body(
+        &mut self,
+        data: Bytes,
+        end: bool,
+        write_timeout: Option<Duration>,
+    ) -> Result<()> {
+        super::write_body_to(self, data, end, write_timeout).await
+    }
+
+    /// Send a request body chunk, counting the payload bytes the stream accepts.
+    pub fn send_data(&mut self, data: Bytes, end: bool) -> std::result::Result<(), h2::Error> {
+        <Self as super::H2BodyWriter>::send_data(self, data, end)
+    }
+
+    /// Reset the upstream request stream.
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.send_body.send_reset(reason)
+    }
+}
+
+impl super::H2BodyWriter for RequestBodyWriter {
+    fn reserve_capacity(&mut self, capacity: usize) {
+        self.send_body.reserve_capacity(capacity)
+    }
+
+    fn poll_capacity(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<usize, h2::Error>>> {
+        self.send_body.poll_capacity(cx)
+    }
+
+    fn send_data(&mut self, data: Bytes, end: bool) -> std::result::Result<(), h2::Error> {
+        let len = data.len();
+        self.send_body.send_data(data, end)?;
+        if len > 0 {
+            self.body_sent.fetch_add(len, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
 pub struct Http2Session {
     send_req: SendRequest<Bytes>,
-    send_body: Option<SendStream<Bytes>>,
+    send_body: Option<RequestBodyWriter>,
     resp_fut: Option<ResponseFuture>,
     req_sent: Option<Box<RequestHeader>>,
     response_header: Option<ResponseHeader>,
@@ -70,6 +138,9 @@ pub struct Http2Session {
     ended: bool,
     // Total DATA payload bytes received from upstream response
     body_recv: usize,
+    // Total DATA payload bytes accepted by the upstream request stream. Shared with the
+    // `RequestBodyWriter`, which can outlive its stay in this session.
+    body_sent: Arc<AtomicUsize>,
 }
 
 impl Drop for Http2Session {
@@ -92,6 +163,7 @@ impl Http2Session {
             conn,
             ended: false,
             body_recv: 0,
+            body_sent: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -144,7 +216,10 @@ impl Http2Session {
             .or_err(H2Error, "while sending request")
             .map_err(|e| self.handle_err(e))?;
         self.req_sent = Some(req);
-        self.send_body = Some(send_body);
+        self.send_body = Some(RequestBodyWriter::with_counter(
+            send_body,
+            self.body_sent.clone(),
+        ));
         self.resp_fut = Some(resp_fut);
         self.ended = self.ended || end;
 
@@ -163,7 +238,8 @@ impl Http2Session {
             .as_mut()
             .expect("Try to write request body before sending request header");
 
-        super::write_body(body_writer, data, end, self.write_timeout)
+        body_writer
+            .write_body(data, end, self.write_timeout)
             .await
             .map_err(|e| self.handle_err(e))?;
         self.ended = self.ended || end;
@@ -488,8 +564,18 @@ impl Http2Session {
         self.body_recv
     }
 
+    /// Request body bytes written to the upstream (HTTP/2 DATA payload; excludes headers and
+    /// framing).
+    ///
+    /// Counts what the upstream stream accepted, not what the caller offered, so it can be
+    /// compared against the request `Content-Length` to detect a truncated request body. Bytes
+    /// written through a writer taken by [`Self::take_request_body_writer`] are counted too.
+    pub fn body_bytes_sent(&self) -> usize {
+        self.body_sent.load(Ordering::Relaxed)
+    }
+
     /// take the body sender to another task to perform duplex read and write
-    pub fn take_request_body_writer(&mut self) -> Option<SendStream<Bytes>> {
+    pub fn take_request_body_writer(&mut self) -> Option<RequestBodyWriter> {
         self.send_body.take()
     }
 
@@ -871,6 +957,79 @@ mod tests_h2 {
         }
         assert_eq!(total, 3);
         assert_eq!(h2s.body_bytes_received(), 3);
+    }
+
+    #[tokio::test]
+    async fn h2_body_bytes_sent_includes_taken_writer() {
+        let (client_io, server_io) = duplex(65536);
+
+        // Server: drain the request body, then respond. The connection has to keep being polled
+        // for the DATA frames to be read, so the body is drained in its own task.
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            while let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                tokio::spawn(async move {
+                    let mut body = req.into_body();
+                    let mut received = 0;
+                    while let Some(chunk) = body.data().await {
+                        received += chunk.unwrap().len();
+                    }
+                    assert_eq!(received, 5);
+                    let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    send_resp.send_response(resp, true).unwrap();
+                });
+            }
+        });
+
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            1,
+            Digest::default(),
+        );
+        let mut h2s = Http2Session::new(send_req, conn_ref);
+
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        req.insert_header(http::header::CONTENT_LENGTH, "5")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), false).unwrap();
+
+        // the request header must not be counted
+        assert_eq!(h2s.body_bytes_sent(), 0);
+        h2s.write_request_body(Bytes::from("a"), false)
+            .await
+            .unwrap();
+        assert_eq!(h2s.body_bytes_sent(), 1);
+
+        // The proxy streams the request body through a writer taken out of the session, which
+        // must keep the session accounting up to date.
+        let mut writer = h2s.take_request_body_writer().unwrap();
+        writer
+            .write_body(Bytes::from("bc"), false, None)
+            .await
+            .unwrap();
+        writer.send_data(Bytes::from("de"), true).unwrap();
+        assert_eq!(h2s.body_bytes_sent(), 5);
+
+        // The response only arrives once the upstream read all 5 bytes
+        tokio::time::timeout(Duration::from_secs(5), h2s.read_response_header())
+            .await
+            .expect("upstream should respond after reading the request body")
+            .unwrap();
+        assert_eq!(h2s.response_header().unwrap().status, StatusCode::OK);
     }
 
     #[test]
