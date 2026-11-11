@@ -576,6 +576,18 @@ mod tests {
     }
 
     #[test]
+    fn node_idx_wraps_past_last_point() {
+        let c = Continuum::new(&[
+            Bucket::new(get_sockaddr("127.0.0.1:6443"), 1),
+            Bucket::new(get_sockaddr("127.0.0.2:6443"), 1),
+        ]);
+
+        // A hash above the last point on the ring belongs to the first point
+        assert!(c.ring.len() > 1);
+        assert_eq!(c.ring.node_idx(u32::MAX), 0);
+    }
+
+    #[test]
     fn test_empty() {
         let c = Continuum::new(&[]);
         assert!(c.node(b"doghash").is_none());

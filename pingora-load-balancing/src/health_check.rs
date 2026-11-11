@@ -415,6 +415,21 @@ mod test {
     use async_trait::async_trait;
     use http::Extensions;
 
+    #[test]
+    fn test_health_counter_restarts_after_flip() {
+        let health = Health::default();
+
+        assert!(!health.observe_health(false, 2));
+        assert!(health.observe_health(false, 2));
+        assert!(!health.ready());
+
+        // Coming back takes the full threshold again
+        assert!(!health.observe_health(true, 2));
+        assert!(!health.ready());
+        assert!(health.observe_health(true, 2));
+        assert!(health.ready());
+    }
+
     #[tokio::test]
     async fn test_tcp_check() {
         let tcp_check = TcpHealthCheck::default();
