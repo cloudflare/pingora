@@ -2289,6 +2289,28 @@ mod test {
         .expect("selector builds did not start");
     }
 
+    async fn wait_for_live_selectors(tracker: &BuildTracker, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tracker.live_selectors.load(Relaxed) != expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retired selectors were not destroyed");
+    }
+
+    /// Unblocks selector destructors when dropped. A test that panics while
+    /// destructors are blocked would otherwise leave a blocking thread parked
+    /// in [`BuildTracker::wait_drop`], and runtime shutdown waits for blocking
+    /// threads without a timeout, so the test would hang instead of failing.
+    struct UnblockDropOnExit<'a>(&'a BuildTracker);
+
+    impl Drop for UnblockDropOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.unblock_drop();
+        }
+    }
+
     #[tokio::test]
     async fn test_static_backends() {
         let backends: LoadBalancer<selection::RoundRobin> =
@@ -3727,6 +3749,7 @@ mod test {
         second.update().await.unwrap();
 
         tracker.block_drop();
+        let _unblock_drop = UnblockDropOnExit(&tracker);
         tracker.unblock();
         tokio::time::timeout(Duration::from_secs(5), async {
             while tracker.drop_waiters.load(Relaxed) == 0 {
@@ -4294,6 +4317,11 @@ mod test {
 
         group.update().await.unwrap();
         wait_for_group_generation(&group, 1).await;
+        // Publishing generation 1 retires the generation-0 selector built by the
+        // constructor and destroys it on a blocking thread that may not have run
+        // yet. The gate makes generation 2 wait for that release, so it must
+        // finish before `block_drop` below or its destructor blocks forever.
+        wait_for_live_selectors(&tracker, 1).await;
         tracker.reset();
 
         // Hold a live iterator over the generation-1 selector. It keeps both the
@@ -4306,6 +4334,7 @@ mod test {
 
         // Make the eventual destructor of the generation-1 selector block.
         tracker.block_drop();
+        let _unblock_drop = UnblockDropOnExit(&tracker);
 
         // Generation 2 builds a replacement and retires generation 1.
         discovery.add(b2);
