@@ -95,12 +95,11 @@ mod tests {
     use super::*;
     use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
     use crate::protocols::l4::socket::SocketAddr;
-use crate::upstreams::peer::HttpPeer;
+    use crate::upstreams::peer::HttpPeer;
     use crate::upstreams::peer::Peer;
     use pingora_http::RequestHeader;
     use std::fmt::{Display, Formatter, Result as FmtResult};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 
     async fn get_http(http: &mut HttpSession, expected_status: u16) {
         let mut req = Box::new(RequestHeader::build("GET", b"/", None).unwrap());
@@ -121,7 +120,8 @@ use crate::upstreams::peer::HttpPeer;
             Connection: keep-alive\r\n\
             \r\n";
 
-        let (mock_addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(response).await.unwrap();
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(response).await.unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
@@ -268,7 +268,8 @@ ZZ\r\n",
             Content-Length: 0\r\n\
             Connection: keep-alive\r\n\
             \r\n";
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(response).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(response).await.unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
@@ -301,15 +302,16 @@ ZZ\r\n",
             Connection: keep-alive\r\n\
             \r\n";
 
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"http/1.1".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"http/1.1".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../pingora-core/src/connectors/test-certs/ca.crt"
         );
-        let (mock_addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
         let mock_addr = SocketAddr::Inet(mock_addr);
 
@@ -333,7 +335,7 @@ ZZ\r\n",
         connector.release_http_session(http, &peer, None).await;
         let (_, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(reused);
-        
+
         shutdown_tx.send(()).unwrap();
         server_handle.await.unwrap();
     }

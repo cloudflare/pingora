@@ -167,7 +167,7 @@ where
 mod tests {
     use super::*;
     use crate::connectors::TransportConnector;
-use crate::listeners::tls::TlsSettings;
+    use crate::listeners::tls::TlsSettings;
     use crate::listeners::{Listeners, TransportStack, ALPN};
     use crate::protocols::http::v1::client::HttpSession as Http1Session;
     use crate::protocols::tls::CustomALPN;
@@ -197,12 +197,12 @@ use crate::listeners::tls::TlsSettings;
     #[tokio::test]
     async fn test_connect_h2() {
         use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-            b"http/1.1".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        let (mock_addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let ca_path = concat!(
@@ -214,7 +214,11 @@ use crate::listeners::tls::TlsSettings;
         options.ca_file = Some(ca_path.to_string().to_owned());
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new((mock_addr.ip(), mock_addr.port()), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(
+            (mock_addr.ip(), mock_addr.port()),
+            true,
+            "one.one.one.one".into(),
+        );
         peer.options.set_http_version(2, 2);
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -246,11 +250,11 @@ use crate::listeners::tls::TlsSettings;
             Content-Length: 0\r\n\
             Connection: keep-alive\r\n\
             \r\n";
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-            b"http/1.1".to_vec(),
-        ];
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let ca_path = concat!(
@@ -297,11 +301,11 @@ use crate::listeners::tls::TlsSettings;
             Content-Length: 0\r\n\
             Connection: keep-alive\r\n\
             \r\n";
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-            b"http/1.1".to_vec(),
-        ];
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let ca_path = concat!(
@@ -353,11 +357,11 @@ use crate::listeners::tls::TlsSettings;
             Connection: keep-alive\r\n\
             \r\n";
 
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-            b"http/1.1".to_vec(),
-        ];
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let ca_path = concat!(
@@ -471,7 +475,7 @@ use crate::listeners::tls::TlsSettings;
         }
     }
     fn create_test_connector_for_mock_server() -> Connector<MockConnector> {
-    #[cfg(feature = "rustls")]
+        #[cfg(feature = "rustls")]
         let custom_transport = {
             let ca_path = concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -492,7 +496,6 @@ use crate::listeners::tls::TlsSettings;
                 reusable: Arc::new(Mutex::new(false)),
             },
         }
-
     }
 
     // Creates a test peer that uses a custom ALPN protocol and disables cert/hostname verification for tests.
@@ -654,7 +657,10 @@ use crate::listeners::tls::TlsSettings;
             // b"h2".to_vec(),
             // b"http/1.1".to_vec(),
         ];
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         // Upstream supports H1 and H2

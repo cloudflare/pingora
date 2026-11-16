@@ -680,7 +680,7 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
 mod tests {
     use super::*;
     use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
-use crate::upstreams::peer::HttpPeer;
+    use crate::upstreams::peer::HttpPeer;
     use bytes::Bytes;
     use http::{Response, StatusCode};
     use pingora_http::RequestHeader;
@@ -690,9 +690,7 @@ use crate::upstreams::peer::HttpPeer;
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
         use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -702,9 +700,12 @@ use crate::upstreams::peer::HttpPeer;
         let mut options = ConnectorOptions::new(1);
         options.ca_file = Some(ca_path.to_string().to_owned());
 
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
-        
+
         let connector = Connector::new(Some(options));
         let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
@@ -725,9 +726,7 @@ use crate::upstreams::peer::HttpPeer;
     #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
         use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"http/1.1".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"http/1.1".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -737,10 +736,12 @@ use crate::upstreams::peer::HttpPeer;
         let mut options = ConnectorOptions::new(1);
         options.ca_file = Some(ca_path.to_string().to_owned());
 
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
-        
         let connector = Connector::new(Some(options));
         let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
         // a hack to force h1, new_http_session() in the future might validate this setting
@@ -760,7 +761,8 @@ use crate::upstreams::peer::HttpPeer;
 
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tcp_server(b"").await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(b"").await.unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
@@ -825,9 +827,7 @@ use crate::upstreams::peer::HttpPeer;
     #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
         use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -837,7 +837,10 @@ use crate::upstreams::peer::HttpPeer;
         let mut options = ConnectorOptions::new(1);
         options.ca_file = Some(ca_path.to_string().to_owned());
 
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
@@ -880,9 +883,7 @@ use crate::upstreams::peer::HttpPeer;
     #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
         use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -892,7 +893,10 @@ use crate::upstreams::peer::HttpPeer;
         let mut options = ConnectorOptions::new(1);
         options.ca_file = Some(ca_path.to_string().to_owned());
 
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
@@ -1028,11 +1032,11 @@ use crate::upstreams::peer::HttpPeer;
     #[cfg(all(feature = "any_tls", unix))]
     #[tokio::test]
     async fn test_h2_reuse_rejects_fd_mismatch() {
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
         use crate::protocols::l4::socket::SocketAddr;
         use crate::upstreams::peer::Peer;
         use std::fmt::{Display, Formatter, Result as FmtResult};
         use std::os::unix::prelude::AsRawFd;
-        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
 
         #[derive(Clone)]
         struct MismatchPeer {
@@ -1067,9 +1071,7 @@ use crate::upstreams::peer::HttpPeer;
                 false
             }
         }
-        let alpn_protocols: Vec<Vec<u8>> = vec![
-            b"h2".to_vec(),
-        ];
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
 
         let ca_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1079,7 +1081,10 @@ use crate::upstreams::peer::HttpPeer;
         let mut options = ConnectorOptions::new(1);
         options.ca_file = Some(ca_path.to_string().to_owned());
 
-        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
