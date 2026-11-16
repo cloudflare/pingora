@@ -164,9 +164,9 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for ContractProxy {
             .upstream_attempts
             .fetch_add(1, Ordering::Relaxed);
         let peer = match self.upstream {
-            Upstream::Http(port) => HttpPeer::new(("127.0.0.1", port), false, String::new()),
+            Upstream::Http(port) => HttpPeer::new(("127.0.0.1", port), false, String::new())?,
             Upstream::Custom => {
-                let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+                let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new())?;
                 peer.options.alpn = ALPN::Custom(CustomALPN::new(b"test/1".to_vec()));
                 peer
             }

@@ -23,7 +23,8 @@ use crate::listeners::tls::TlsSettings;
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 use crate::listeners::{
-    ConnectionFilter, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions, TransportStack,
+    ConnectionFilter, HandshakeFailure, ListenerConfig, Listeners, ServerAddress, TcpSocketOptions,
+    TransportStack,
 };
 use crate::protocols::http::custom::server::Session as CustomServerSession;
 use crate::protocols::Stream;
@@ -36,11 +37,9 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use pingora_error::Result;
 use pingora_runtime::current_handle;
-use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Override the runtime options used to run a listening service.
 pub type RuntimeOptsOverride = Arc<dyn Fn(&RuntimeOpts) -> Option<RuntimeOpts> + Send + Sync>;
@@ -269,25 +268,30 @@ where
             };
             match new_io {
                 Ok(io) => {
+                    // At one of the endpoint's limits: the connection is already closed.
+                    let Some(io) = stack.admit(io) else {
+                        continue;
+                    };
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
-                        match timeout(Duration::from_secs(60), io.handshake()).await {
-                            Ok(handshake) => {
-                                match handshake {
-                                    Ok(io) => Self::handle_event(io, app, shutdown).await,
-                                    Err(e) => {
-                                        // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
-                                        if let Some(addr) = peer_addr {
-                                            error!("Downstream handshake error from {}: {e}", addr);
-                                        } else {
-                                            error!("Downstream handshake error: {e}");
-                                        }
-                                    }
+                        match io.handshake_with_limits().await {
+                            Ok(io) => Self::handle_event(io, app, shutdown).await,
+                            Err(HandshakeFailure::Skipped(reason)) => {
+                                debug!(
+                                    "Closed a downstream connection before its handshake: {reason}"
+                                );
+                            }
+                            Err(HandshakeFailure::Error(e)) => {
+                                // TODO: Maybe IOApp trait needs a fn to handle/filter out this error
+                                if let Some(addr) = peer_addr {
+                                    error!("Downstream handshake error from {}: {e}", addr);
+                                } else {
+                                    error!("Downstream handshake error: {e}");
                                 }
                             }
-                            Err(_) => {
+                            Err(HandshakeFailure::TimedOut) => {
                                 error!("Downstream handshake timeout");
                             }
                         }
@@ -385,5 +389,146 @@ where
 
     fn listen_addresses(&self) -> Option<Vec<String>> {
         Some(self.listeners.addresses())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::listeners::{AcceptLimits, AcceptStats};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Keeps each connection until its client sends a byte, then closes it.
+    struct HoldUntilByte;
+
+    #[async_trait]
+    impl ServerApp for HoldUntilByte {
+        async fn process_new(
+            self: &Arc<Self>,
+            mut session: Stream,
+            _shutdown: &ShutdownWatch,
+        ) -> Option<Stream> {
+            let mut buf = [0; 1];
+            let _ = session.read(&mut buf).await;
+            None
+        }
+    }
+
+    /// Sends each connection to the test and returns at once, like an application that serves
+    /// connections on tasks of its own.
+    struct HandOff(tokio::sync::mpsc::UnboundedSender<Stream>);
+
+    #[async_trait]
+    impl ServerApp for HandOff {
+        async fn process_new(
+            self: &Arc<Self>,
+            session: Stream,
+            _shutdown: &ShutdownWatch,
+        ) -> Option<Stream> {
+            let _ = self.0.send(session);
+            None
+        }
+    }
+
+    /// An endpoint that keeps at most one connection open.
+    async fn build_one_connection_endpoint(stats: &Arc<AcceptStats>) -> TransportStack {
+        let mut listeners = Listeners::new();
+        listeners.add_listener(
+            ListenerConfig::tcp("127.0.0.1:0").accept_limits(AcceptLimits {
+                max_connections: Some(1),
+                stats: Some(stats.clone()),
+                ..Default::default()
+            }),
+        );
+        listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn test_connection_limit_holds_until_the_session_ends() {
+        let stats = Arc::new(AcceptStats::default());
+        let stack = build_one_connection_endpoint(&stats).await;
+        let addr = stack.local_addr().unwrap();
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let endpoint = tokio::spawn(Service::<HoldUntilByte>::run_endpoint(
+            Arc::new(HoldUntilByte),
+            stack,
+            shutdown,
+        ));
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        wait_for("the first session", || {
+            stats.pending_handshakes() == 0 && stats.open_connections() == 1
+        })
+        .await;
+
+        // The session is still running, so the second connection is over the limit.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0; 1];
+        assert!(matches!(second.read(&mut buf).await, Ok(0) | Err(_)));
+        assert_eq!(stats.closed_at_connection_limit(), 1);
+
+        // Ending the session frees the slot.
+        first.write_all(b"x").await.unwrap();
+        wait_for("the first session to end", || stats.open_connections() == 0).await;
+        let _third = TcpStream::connect(addr).await.unwrap();
+        wait_for("the third session", || stats.open_connections() == 1).await;
+        assert_eq!(stats.closed_at_connection_limit(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        endpoint.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connection_limit_holds_while_the_app_keeps_the_stream() {
+        let stats = Arc::new(AcceptStats::default());
+        let stack = build_one_connection_endpoint(&stats).await;
+        let addr = stack.local_addr().unwrap();
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let (streams_tx, mut streams) = tokio::sync::mpsc::unbounded_channel();
+        let endpoint = tokio::spawn(Service::<HandOff>::run_endpoint(
+            Arc::new(HandOff(streams_tx)),
+            stack,
+            shutdown,
+        ));
+
+        let _first = TcpStream::connect(addr).await.unwrap();
+        let held = streams.recv().await.unwrap();
+        // `process_new` has returned, but the stream is still open, so it still counts.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(stats.open_connections(), 1);
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0; 1];
+        assert!(matches!(second.read(&mut buf).await, Ok(0) | Err(_)));
+        assert_eq!(stats.closed_at_connection_limit(), 1);
+
+        // Dropping the stream frees the slot.
+        drop(held);
+        assert_eq!(stats.open_connections(), 0);
+        let _third = TcpStream::connect(addr).await.unwrap();
+        let _held = streams.recv().await.unwrap();
+        assert_eq!(stats.open_connections(), 1);
+        assert_eq!(stats.closed_at_connection_limit(), 1);
+
+        shutdown_tx.send(true).unwrap();
+        endpoint.await.unwrap();
     }
 }

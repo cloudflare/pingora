@@ -5,12 +5,13 @@ The pingora-proxy HTTP proxy framework supports highly programmable proxy behavi
 
 ## Life of a proxied HTTP request
 1. The life of a proxied HTTP request starts when the proxy reads the request header from the **downstream** (i.e., the client).
-2. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
-3. The proxy then sends the request header to the upstream.
-4. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
+2. If the request opts in to early body buffering (the `early_body_buffer` cargo feature, with `early_request_body_buffer_limit()` returning a limit), the proxy reads the whole request body from the downstream before choosing an upstream. Otherwise the body is read later, while it is proxied.
+3. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
+4. The proxy then sends the request header to the upstream.
+5. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
     a. upstream response (both header and body) to the downstream, and
-    b. downstream request body to upstream (if any).
-5. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
+    b. downstream request body to upstream (if any; an early-buffered body is sent from memory).
+6. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
 
 ## Pingora-proxy phases and filters
 Pingora-proxy allows users to insert arbitrary logic into the life of a request.
@@ -18,6 +19,8 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
  graph TD;
     start("new request")-->early_request_filter;
     early_request_filter-->request_filter;
+    early_request_filter-.feature: early_body_buffer.->early_request_body_filter;
+    early_request_body_filter-->request_filter;
     request_filter-->upstream_peer;
 
     upstream_peer-->Connect{{IO: connect to upstream}};
@@ -62,11 +65,24 @@ This function is similar to `request_filter()` but executes before any other log
 
 Right after this phase, before downstream modules and `request_filter()` run, the proxy calls `should_handle_downstream_abandonment()` once to decide whether this request opts in to Pingora's handling of a client that leaves while its response is still being produced. The decision can use the context set up in this phase. It returns `false` by default, which keeps the proxy behaving as it did before that handling existed.
 
+### `early_request_body_filter()`
+This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. `early_request_body_buffer_timeout()` can optionally bound the complete buffering phase, including body-filter callbacks. No upstream timeout backstops this phase: HTTP/2 body reads have no per-read timeout and the HTTP/1 read timeout resets on every read, so applications enabling buffering should set a finite deadline. Requires the `early_body_buffer` cargo feature.
+
+Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
+
+Modify or discard each chunk through the callback's `body` argument. Set `*body = None` on every invocation to discard the entire body. After the buffering loop finishes, Pingora assembles the filtered chunks and stores the result, so do not call `session.set_buffered_body()` from `early_request_body_filter()`. To replace the fully assembled body, call it later from `request_filter()`.
+
+Whenever filtering or replacement changes the body length, update `Content-Length` and `Transfer-Encoding` before forwarding. In particular, leaving the original `Content-Length` after discarding bytes can leave an HTTP/1.1 upstream waiting for data that will never arrive. HTTP/2 stream termination is derived from the buffered body.
+
+Pingora answers an HTTP/1.1 or HTTP/2 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
+
 ### `request_filter()`
-This phase is usually for validating request inputs, rate limiting, and initializing context.
+This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.
+
+Use `session.set_buffered_body()` here to replace the assembled body.
 
 ### `request_body_filter()`
-This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received.
+This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received. This runs during the upstream forwarding phase, after `upstream_peer()` and connection establishment.
 
 ### `proxy_upstream_filter()`
 This phase determines if we should continue to the upstream to serve a response. If we short-circuit, a 502 is returned by default, but a different response can be implemented.

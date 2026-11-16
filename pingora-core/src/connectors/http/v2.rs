@@ -800,7 +800,7 @@ use crate::upstreams::peer::HttpPeer;
             .with_spaces_after_header_name_in_responses(true)
             .with_obsolete_multiline_headers_in_responses(true);
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(address, false, "".into());
+        let mut peer = HttpPeer::new(address, false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
 
         let session = connector

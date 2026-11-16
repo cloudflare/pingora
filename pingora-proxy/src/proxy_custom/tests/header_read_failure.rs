@@ -77,7 +77,7 @@ async fn framed_response_finishes_without_upstream_eos_after_upload_failure() {
             None,
             None,
         );
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let (reuse, error) = tokio::time::timeout(
             Duration::from_secs(1),
             proxy.proxy_to_custom_upstream(
@@ -122,7 +122,7 @@ async fn partial_framed_response_still_reports_upload_failure() {
         None,
         None,
     );
-    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
     let (reuse, error) = tokio::time::timeout(
         Duration::from_secs(1),
         proxy.proxy_to_custom_upstream(
@@ -227,7 +227,7 @@ async fn upload_with_header_read_failure_on_retry(
         None,
         None,
     );
-    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
     let mut request_write_attempted = false;
     let (reuse, error) = proxy
         .proxy_to_custom_upstream(
@@ -396,7 +396,7 @@ async fn full_custom_relay_succeeds_after_upgraded_downstream_half_close() {
             None,
             None,
         );
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let mut request_write_attempted = false;
         let mut ctx = ();
         let ((_, error), ()) = tokio::join!(
@@ -504,9 +504,7 @@ impl CustomSession for HeaderReadFailureUpstream {
         false
     }
 
-    async fn shutdown(&mut self, _code: u32, _ctx: &str) {
-        unreachable!("client session: shutdown")
-    }
+    async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
 
     fn response_header(&self) -> Option<&ResponseHeader> {
         self.upgraded_response

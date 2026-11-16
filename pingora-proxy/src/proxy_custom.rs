@@ -242,9 +242,21 @@ where
             }
         }
 
+        #[cfg(feature = "early_body_buffer")]
+        if session.is_body_buffered() {
+            req.remove_header(&http::header::EXPECT);
+        }
+
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
 
         session.upstream_compression.request_filter(&req);
+        #[cfg(feature = "early_body_buffer")]
+        let body_empty = if session.is_body_buffered() {
+            session.get_buffered_body().is_none_or(Bytes::is_empty)
+        } else {
+            session.as_mut().is_body_empty()
+        };
+        #[cfg(not(feature = "early_body_buffer"))]
         let body_empty = session.as_mut().is_body_empty();
 
         debug!("Request to custom: {req:?}");
@@ -268,13 +280,8 @@ where
 
         let Some(upstream_custom_message_reader) = client_session.take_custom_message_reader()
         else {
-            return (
-                false,
-                Some(Error::explain(
-                    ReadError,
-                    "can't extract custom reader from upstream",
-                )),
-            );
+            let error = Error::explain(ReadError, "can't extract custom reader from upstream");
+            return fail_custom_setup(session, client_session, error).await;
         };
         // Without downstream abandonment handling the reader stays here until this function
         // returns, as before that handling existed.
@@ -282,13 +289,11 @@ where
 
         let Some(mut upstream_custom_message_writer) = client_session.take_custom_message_writer()
         else {
-            return (
-                false,
-                Some(Error::explain(
-                    WriteError,
-                    "custom upstream must have a custom message writer",
-                )),
+            let error = Error::explain(
+                WriteError,
+                "custom upstream must have a custom message writer",
             );
+            return fail_custom_setup(session, client_session, error).await;
         };
 
         // A channel to inject custom messages to upstream from server logic.
@@ -299,7 +304,7 @@ where
         let mut downstream_custom_message_reader = match session.downstream_custom_message() {
             Ok(Some(rx)) => rx,
             Ok(None) => Box::new(futures::stream::empty::<Result<Bytes>>()),
-            Err(err) => return (false, Some(err)),
+            Err(err) => return fail_custom_setup(session, client_session, err).await,
         };
 
         // Downstream writer
@@ -354,16 +359,16 @@ where
                 if let Err(restore_error) =
                     custom_session.restore_custom_message_writer(downstream_custom_message_writer)
                 {
-                    return (false, Some(restore_error));
+                    return fail_custom_setup(session, client_session, restore_error).await;
                 }
 
                 if let Err(restore_error) =
                     custom_session.restore_custom_message_reader(downstream_custom_message_reader)
                 {
-                    return (false, Some(restore_error));
+                    return fail_custom_setup(session, client_session, restore_error).await;
                 }
             }
-            return (false, Some(e));
+            return fail_custom_setup(session, client_session, e).await;
         }
 
         let upstream_custom_message_forwarder = CustomMessageForwarder {
@@ -415,6 +420,12 @@ where
             upstream_custom_message_forwarder.proxy(),
             downstream_custom_message_forwarder.proxy(),
         );
+
+        if let Err(e) = &ret {
+            if !caller_abandons_failed_attempt(session, e) {
+                abandon_custom_exchange(client_session).await;
+            }
+        }
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             custom_session
@@ -549,7 +560,7 @@ where
             cancel_upstream_reader_tx,
         );
 
-        let request_body_finished = session.as_mut().is_body_done();
+        let (request_body_finished, buffer) = session.upstream_body_source();
         let mut downstream_state = DownstreamStateMachine::for_proxy_attempt(
             request_body_finished,
             session.downstream_abandoned_during_cache_fill(),
@@ -564,8 +575,12 @@ where
         let mut reads_since_upload_failure = 0;
         let mut upgraded_downstream_half_closed = false;
 
+        // An empty buffered body already ended the request on its header.
+        #[cfg(feature = "early_body_buffer")]
+        let buffer = buffer.filter(|b| !b.is_empty() || !session.is_body_buffered());
+
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = buffer {
             if let CustomBodyWriteResult::UpstreamFailed(error) = self
                 .send_body_to_custom(
                     session,
@@ -1293,6 +1308,48 @@ where
     }
 }
 
+/// Abandon a custom upstream exchange that ends before its response is complete.
+///
+/// Callers use this after setup or one of the concurrent proxy tasks fails once
+/// the request header has been sent. Completed responses are safe to reuse, so
+/// `response_finished()` gates the abandon operation.
+async fn abandon_unfinished_custom_response<S: CustomSession>(client: &mut S) {
+    if !client.response_finished() {
+        abandon_custom_exchange(client).await;
+    }
+}
+
+async fn abandon_custom_exchange<S: CustomSession>(client: &mut S) {
+    client
+        .abandon("custom upstream proxy ended before response completion")
+        .await;
+}
+
+/// Whether the caller of `proxy_to_custom_upstream` abandons the session of this failed attempt
+/// itself, which it does after a cache fill abandonment or cancellation.
+///
+/// The abandonment outlives the attempt it happened in, so a retried attempt is covered too, and
+/// abandoning its session here as well would abandon it twice.
+fn caller_abandons_failed_attempt<DS: DownstreamSession>(
+    session: &Session<DS>,
+    error: &Error,
+) -> bool {
+    session.downstream_abandoned_during_cache_fill() || session.is_cache_fill_cancellation(error)
+}
+
+/// Fail an attempt whose custom upstream session cannot be set up after its request header was
+/// sent, abandoning the session unless the caller does.
+async fn fail_custom_setup<DS: DownstreamSession, S: CustomSession>(
+    session: &Session<DS>,
+    client: &mut S,
+    error: Box<Error>,
+) -> (bool, Option<Box<Error>>) {
+    if !caller_abandons_failed_attempt(session, &error) {
+        abandon_unfinished_custom_response(client).await;
+    }
+    (false, Some(error))
+}
+
 /* Read response header, body and trailer from custom upstream and send them to tx */
 async fn custom_pipe_up_to_down_response<S: CustomSession>(
     client: &mut S,
@@ -1586,11 +1643,17 @@ mod tests {
         cache_miss_session_on, AbandonmentSignalProxy, AbandonmentTiming,
         CANCELLATION_WATCHED_STORAGE,
     };
+    use futures::Stream;
+    use http::HeaderMap;
     use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
     use pingora_cache::{
         predictor::{CacheablePredictor, Predictor},
         CacheKey, MemCache,
     };
+    use pingora_core::connectors::http::custom::{Connection, Connector};
+    use pingora_core::protocols::{l4::socket::SocketAddr, Digest, UniqueIDType};
+    use pingora_core::upstreams::peer::Peer;
+    use pingora_http::{RequestHeader, ResponseHeader};
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -1776,7 +1839,7 @@ mod tests {
             script.build()
         };
         let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
         let (downstream_reusable, upstream_reusable, error) = proxy
             .proxy_1to1(&mut session, &mut upstream, &peer, &mut ())
@@ -1930,7 +1993,7 @@ mod tests {
                 .wait(Duration::from_secs(30))
                 .build();
             let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
             let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
             let mut ctx = ();
             let mut run = tokio_test::task::spawn(proxy.proxy_1to1(
@@ -2206,7 +2269,7 @@ mod tests {
             script.build()
         };
         let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
         let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
         let mut ctx = ();
         let ((_, _, error), ()) = tokio::join!(
@@ -2319,7 +2382,7 @@ mod tests {
                 .read_error(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
                 .build();
             let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+            let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
             let proxy = HttpProxy::new(TestProxy, Arc::new(ServerConf::default()));
             let mut ctx = ();
             let ((_, _, h1_error), ()) = tokio::join!(
@@ -2525,6 +2588,166 @@ mod tests {
         fn upgrade_body_writer(&mut self) {}
     }
 
+    struct AbandonRecordingCustom {
+        response_finished: bool,
+        custom_message_reader_available: bool,
+        custom_message_writer_available: bool,
+        abandon_calls: usize,
+        abandon_context: Option<String>,
+    }
+
+    impl AbandonRecordingCustom {
+        fn new() -> Self {
+            Self {
+                response_finished: false,
+                custom_message_reader_available: true,
+                custom_message_writer_available: true,
+                abandon_calls: 0,
+                abandon_context: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CustomSession for AbandonRecordingCustom {
+        async fn write_request_header(
+            &mut self,
+            _req: Box<RequestHeader>,
+            _end: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write_request_body(&mut self, _data: Bytes, _end: bool) -> Result<()> {
+            unreachable!("not used by the abandon test")
+        }
+
+        async fn finish_request_body(&mut self) -> Result<()> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) {}
+
+        fn set_write_timeout(&mut self, _timeout: Option<Duration>) {}
+
+        async fn read_response_header(&mut self) -> Result<()> {
+            Err(Error::explain(
+                ReadError,
+                "custom test response header failure",
+            ))
+        }
+
+        async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn response_finished(&self) -> bool {
+            self.response_finished
+        }
+
+        async fn shutdown(&mut self, _code: u32, _ctx: &str) {
+            unreachable!("not used by the abandon test")
+        }
+
+        async fn abandon(&mut self, ctx: &str) {
+            self.abandon_calls += 1;
+            self.abandon_context = Some(ctx.to_owned());
+        }
+
+        fn response_header(&self) -> Option<&ResponseHeader> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn was_upgraded(&self) -> bool {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn digest(&self) -> Option<&Digest> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn digest_mut(&mut self) -> Option<&mut Digest> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn server_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn client_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by the abandon test")
+        }
+
+        async fn read_trailers(&mut self) -> Result<Option<HeaderMap>> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn fd(&self) -> UniqueIDType {
+            unreachable!("not used by the abandon test")
+        }
+
+        async fn check_response_end_or_error(&mut self, _headers: bool) -> Result<bool> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>> {
+            Some(Box::new(TestBodyWriter {
+                cleanup_called: Arc::new(AtomicBool::new(false)),
+                finish_notify: None,
+            }))
+        }
+
+        async fn finish_custom(&mut self) -> Result<()> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn take_custom_message_reader(
+            &mut self,
+        ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+            self.custom_message_reader_available
+                .then(|| Box::new(futures::stream::empty()) as _)
+        }
+
+        async fn drain_custom_messages(&mut self) -> Result<()> {
+            unreachable!("not used by the abandon test")
+        }
+
+        fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
+            self.custom_message_writer_available
+                .then(|| Box::new(()) as _)
+        }
+    }
+
+    struct TestCustomConnector;
+
+    #[async_trait]
+    impl Connector for TestCustomConnector {
+        type Session = AbandonRecordingCustom;
+
+        async fn get_http_session<P: Peer + Send + Sync + 'static>(
+            &self,
+            _peer: &P,
+        ) -> Result<(Connection<Self::Session>, bool)> {
+            unreachable!("connector is not used by the abandon test")
+        }
+
+        async fn reused_http_session<P: Peer + Send + Sync + 'static>(
+            &self,
+            _peer: &P,
+        ) -> Option<Self::Session> {
+            unreachable!("connector is not used by the abandon test")
+        }
+
+        async fn release_http_session<P: Peer + Send + Sync + 'static>(
+            &self,
+            _session: Self::Session,
+            _peer: &P,
+            _idle_timeout: Option<Duration>,
+        ) {
+            unreachable!("connector is not used by the abandon test")
+        }
+    }
+
     #[async_trait]
     impl ProxyHttp for TestProxy {
         type CTX = ();
@@ -2556,6 +2779,231 @@ mod tests {
         ) -> Result<Box<HttpPeer>> {
             unreachable!("test does not select an upstream peer")
         }
+    }
+
+    struct FailingCustomForwardingProxy;
+
+    #[async_trait]
+    impl ProxyHttp for FailingCustomForwardingProxy {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("test does not select an upstream peer")
+        }
+
+        async fn custom_forwarding(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+            _custom_message_to_upstream: Option<mpsc::Sender<Bytes>>,
+            _custom_message_to_downstream: mpsc::Sender<Bytes>,
+        ) -> Result<()> {
+            Err(Error::explain(
+                InternalError,
+                "custom forwarding test failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_custom_response_is_abandoned() {
+        let mut session = AbandonRecordingCustom::new();
+
+        abandon_unfinished_custom_response(&mut session).await;
+
+        assert_eq!(session.abandon_calls, 1);
+        assert_eq!(
+            session.abandon_context.as_deref(),
+            Some("custom upstream proxy ended before response completion")
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_custom_response_is_not_abandoned() {
+        let mut session = AbandonRecordingCustom::new();
+        session.response_finished = true;
+
+        abandon_unfinished_custom_response(&mut session).await;
+
+        assert_eq!(session.abandon_calls, 0);
+        assert_eq!(session.abandon_context, None);
+    }
+
+    #[tokio::test]
+    async fn failed_custom_exchange_is_abandoned_after_response_finished() {
+        let mut session = AbandonRecordingCustom::new();
+        session.response_finished = true;
+
+        abandon_custom_exchange(&mut session).await;
+
+        assert_eq!(session.abandon_calls, 1);
+        assert_eq!(
+            session.abandon_context.as_deref(),
+            Some("custom upstream proxy ended before response completion")
+        );
+    }
+
+    async fn run_setup_failure_test<SV>(
+        proxy: HttpProxy<SV, TestCustomConnector>,
+        upstream: &mut AbandonRecordingCustom,
+        mut ctx: SV::CTX,
+    ) -> (bool, Box<Error>)
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        SV::CTX: Send + Sync,
+    {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned()).unwrap();
+        let mut request_write_attempted = false;
+        let (reuse, error) = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.custom_proxy_down_to_up(
+                &mut session,
+                upstream,
+                &peer,
+                &mut ctx,
+                &mut request_write_attempted,
+            ),
+        )
+        .await
+        .expect("custom proxy should return from setup failure");
+
+        (
+            reuse,
+            error.expect("custom proxy should return a setup error"),
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_custom_reader_abandons_unfinished_response() {
+        let proxy = HttpProxy::<_, TestCustomConnector, ()>::new_custom(
+            TestProxy,
+            Arc::new(ServerConf::default()),
+            TestCustomConnector,
+            None,
+            None,
+            None,
+        );
+        let mut upstream = AbandonRecordingCustom::new();
+        upstream.custom_message_reader_available = false;
+
+        let (reuse, error) = run_setup_failure_test(proxy, &mut upstream, ()).await;
+
+        assert!(!reuse);
+        assert!(error.to_string().contains("can't extract custom reader"));
+        assert_eq!(upstream.abandon_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_custom_writer_abandons_unfinished_response() {
+        let proxy = HttpProxy::<_, TestCustomConnector, ()>::new_custom(
+            TestProxy,
+            Arc::new(ServerConf::default()),
+            TestCustomConnector,
+            None,
+            None,
+            None,
+        );
+        let mut upstream = AbandonRecordingCustom::new();
+        upstream.custom_message_writer_available = false;
+
+        let (reuse, error) = run_setup_failure_test(proxy, &mut upstream, ()).await;
+
+        assert!(!reuse);
+        assert!(error
+            .to_string()
+            .contains("custom upstream must have a custom message writer"));
+        assert_eq!(upstream.abandon_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn custom_forwarding_failure_abandons_unfinished_response() {
+        let proxy = HttpProxy::<_, TestCustomConnector, ()>::new_custom(
+            FailingCustomForwardingProxy,
+            Arc::new(ServerConf::default()),
+            TestCustomConnector,
+            None,
+            None,
+            None,
+        );
+        let mut upstream = AbandonRecordingCustom::new();
+
+        let (reuse, error) = run_setup_failure_test(proxy, &mut upstream, ()).await;
+
+        assert!(!reuse);
+        assert!(error.to_string().contains("custom forwarding test failure"));
+        assert_eq!(upstream.abandon_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn custom_proxy_abandons_unfinished_response_on_join_error() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+
+        let proxy = HttpProxy::<_, TestCustomConnector, ()>::new_custom(
+            TestProxy,
+            Arc::new(ServerConf::default()),
+            TestCustomConnector,
+            None,
+            None,
+            None,
+        );
+        let mut upstream = AbandonRecordingCustom::new();
+        let peer = HttpPeer::new("127.0.0.1:80", false, "example.com".to_owned()).unwrap();
+        let mut ctx = ();
+        let mut request_write_attempted = false;
+
+        let (reuse, error) = tokio::time::timeout(
+            Duration::from_secs(1),
+            proxy.custom_proxy_down_to_up(
+                &mut session,
+                &mut upstream,
+                &peer,
+                &mut ctx,
+                &mut request_write_attempted,
+            ),
+        )
+        .await
+        .expect("custom proxy should return after the response header error");
+
+        assert!(!reuse);
+        let error = error.expect("custom proxy should return the joined error");
+        assert!(
+            error
+                .to_string()
+                .contains("custom test response header failure"),
+            "unexpected proxy error: {error}"
+        );
+        assert_eq!(upstream.abandon_calls, 1);
+        assert_eq!(
+            upstream.abandon_context.as_deref(),
+            Some("custom upstream proxy ended before response completion")
+        );
     }
 
     async fn predicted_too_large_session(key: CacheKey, max_file_size: usize) -> Session {

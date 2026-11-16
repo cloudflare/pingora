@@ -569,7 +569,7 @@ async fn custom_batched_complete_response_commits_despite_pending_cancellation()
 
 /// Without the opt-in the proxy never watches for a cancellation: the abandonment hook that would
 /// cancel does not run, a cancellation requested anyway is ignored, the fill commits, and the
-/// failed attempt releases its session without an abandon signal, as before cancellation existed.
+/// failed attempt abandons its session once, as it does for any other failure.
 #[tokio::test]
 async fn custom_fill_cancel_ignored_without_abandonment_handling() {
     let path = "/custom-cache-fill-cancel-without-abandonment-handling";
@@ -651,9 +651,10 @@ async fn custom_fill_cancel_ignored_without_abandonment_handling() {
         observed.body_bytes.load(Ordering::Relaxed),
         FIRST_BODY.len() + LAST_BODY.len()
     );
-    assert!(
-        abandon_calls.lock().unwrap().is_empty(),
-        "a failed attempt that did not opt in must not abandon its session"
+    assert_eq!(
+        *abandon_calls.lock().unwrap(),
+        vec!["abandon(custom upstream proxy ended before response completion)".to_owned()],
+        "a failed attempt that did not opt in must abandon its session exactly once"
     );
     let cached_body = read_cached_body(&CANCELLATION_WATCHED_CACHE.inner, path)
         .await

@@ -58,6 +58,9 @@ mod final_error_log;
 #[path = "custom_cache_fill/fill_cancellation.rs"]
 mod fill_cancellation;
 
+#[path = "custom_cache_fill/retry_after_abandonment.rs"]
+mod retry_after_abandonment;
+
 /// Bound for each wait in these tests, which only a hang can exceed. It costs nothing while the
 /// suite passes, so it is generous.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,6 +83,9 @@ struct Observations {
     cancel_in_hook: Option<Arc<CacheFillCancellation>>,
     /// Hook that fails before the proxy writes the request to the custom upstream, if any.
     pre_write_failure: Option<PreWriteFailure>,
+    /// Fails `custom_forwarding` from this call on (0-based), if set.
+    fail_custom_forwarding_from: Option<usize>,
+    custom_forwarding_calls: AtomicUsize,
     first_custom_message: Notify,
     abandoned: Notify,
     downstream_error_ignored: Notify,
@@ -140,7 +146,7 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
         _session: &mut Session<DS>,
         _ctx: &mut (),
     ) -> Result<Box<HttpPeer>> {
-        let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+        let mut peer = HttpPeer::new(("127.0.0.1", 1), false, String::new())?;
         peer.options.alpn = ALPN::Custom(CustomALPN::new(b"test/1".to_vec()));
         Ok(Box::new(peer))
     }
@@ -208,6 +214,27 @@ impl<DS: DownstreamSession> ProxyHttp<DS> for CacheFillProxy {
         Ok(Some(message))
     }
 
+    async fn custom_forwarding(
+        &self,
+        _session: &mut Session<DS>,
+        _ctx: &mut (),
+        _custom_message_to_upstream: Option<tokio::sync::mpsc::Sender<Bytes>>,
+        _custom_message_to_downstream: tokio::sync::mpsc::Sender<Bytes>,
+    ) -> Result<()> {
+        let call = self
+            .observed
+            .custom_forwarding_calls
+            .fetch_add(1, Ordering::Relaxed);
+        if self
+            .observed
+            .fail_custom_forwarding_from
+            .is_some_and(|from| call >= from)
+        {
+            return Error::e_explain(ErrorType::InternalError, "injected custom forwarding error");
+        }
+        Ok(())
+    }
+
     fn downstream_abandoned_during_cache_fill(&self, session: &Session<DS>, _ctx: &mut ()) {
         self.observed
             .admitted_at_abandonment
@@ -258,10 +285,11 @@ struct RunningProxy {
 }
 
 impl RunningProxy {
-    fn start<A>(app: A, connector: StreamingConnector) -> Self
+    fn start<A, C>(app: A, connector: C) -> Self
     where
         A: ProxyHttp + Send + Sync + 'static,
         A::CTX: Send + Sync + 'static,
+        C: pingora_core::connectors::http::custom::Connector,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

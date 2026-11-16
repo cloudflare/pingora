@@ -171,7 +171,7 @@ ZZ\r\n",
         });
 
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(address, false, "".into());
+        let peer = HttpPeer::new(address, false, "".into()).unwrap();
         let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
 
@@ -209,7 +209,7 @@ ZZ\r\n",
             .with_spaces_after_header_name_in_responses(true)
             .with_obsolete_multiline_headers_in_responses(true);
         let connector = Connector::new(Some(options));
-        let peer = HttpPeer::new(address, false, "".into());
+        let peer = HttpPeer::new(address, false, "".into()).unwrap();
         let (mut session, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
 

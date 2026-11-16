@@ -517,7 +517,7 @@ async fn h1_retry_upload_failure_after_client_left(path: &str) -> Option<Box<Err
         .read(b"HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: 4\r\n\r\nbody")
         .build();
     let mut upstream = HttpSessionV1::new(Box::new(upstream_io));
-    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new());
+    let peer = HttpPeer::new(("127.0.0.1", 1), false, String::new()).unwrap();
     let (_, _, error) = proxy
         .proxy_1to1(&mut session, &mut upstream, &peer, &mut ())
         .await;

@@ -497,7 +497,7 @@ use crate::listeners::tls::TlsSettings;
 
     // Creates a test peer that uses a custom ALPN protocol and disables cert/hostname verification for tests.
     fn create_peer_with_custom_proto(port: u16, proto: &[u8]) -> HttpPeer {
-        let mut peer = HttpPeer::new(("127.0.0.1", port), true, "localhost".into());
+        let mut peer = HttpPeer::new(("127.0.0.1", port), true, "localhost".into()).unwrap();
         let mut options = PeerOptions::new();
         options.alpn = ALPN::Custom(CustomALPN::new(proto.to_vec()));
         // Disable cert verification for this test (self-signed or invalid certs are OK)

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A failed custom upstream attempt of a request that opted in to downstream abandonment
-//! handling is abandoned only once its downstream was abandoned or its fill was cancelled. Any
-//! other failed attempt, before or after it wrote its request, is released exactly as without
-//! the opt-in.
+//! A failed custom upstream attempt is abandoned exactly once after it wrote its request,
+//! whether or not the request opted in to downstream abandonment handling. The abandon context
+//! differs only when the downstream was abandoned or the fill was cancelled. An attempt that
+//! failed before writing its request is released without being abandoned.
 
 use super::*;
 use std::sync::LazyLock;
@@ -194,7 +194,7 @@ async fn assert_post_write_failure(path: &'static str, client_event: Client, opt
         if abandoned {
             vec!["abandon(proxy attempt failed)".to_owned()]
         } else {
-            Vec::new()
+            vec!["abandon(custom upstream proxy ended before response completion)".to_owned()]
         }
     );
     assert_eq!(releases.load(Ordering::Relaxed), 1);

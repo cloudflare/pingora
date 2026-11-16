@@ -612,6 +612,24 @@ impl HttpSession {
     // the write_* don't have timeouts because the actual writing happens on the connection
     // not here.
 
+    /// Write a `100 Continue` interim response to the client.
+    ///
+    /// Unlike [Self::write_response_header], this sends the informational header instead of
+    /// ignoring it. It is a no-op once the final response header has been written.
+    pub fn write_continue_response(&mut self) -> Result<()> {
+        if self.ended || self.response_written.is_some() {
+            return Ok(());
+        }
+        let resp = Response::builder()
+            .status(StatusCode::CONTINUE)
+            .body(())
+            .or_err(ErrorType::InternalError, "while building h2 100 continue")?;
+        self.send_response.send_informational(resp).or_err(
+            ErrorType::WriteError,
+            "while writing h2 100 continue to downstream",
+        )
+    }
+
     /// Write the response header to the client.
     /// # the `end` flag
     /// `end` marks the end of this session.

@@ -24,7 +24,6 @@ rand = "0.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 once_cell = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-thread_local = "1"
 log = { workspace = true }
 dial9-tokio-telemetry = { version = "0.3", optional = true }
 dial9-perf-self-profile = { version = "0.4", optional = true }
@@ -45,6 +44,7 @@ aws-sdk-s3 = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "net"] }
+thread_local = "1"
 
 [[bench]]
 name = "hello"
