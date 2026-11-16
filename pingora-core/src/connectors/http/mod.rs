@@ -218,7 +218,7 @@ mod tests {
             (mock_addr.ip(), mock_addr.port()),
             true,
             "one.one.one.one".into(),
-        );
+        ).unwrap();
         peer.options.set_http_version(2, 2);
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -266,7 +266,7 @@ mod tests {
         options.ca_file = Some(ca_path.to_string().to_owned());
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(1, 1);
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -317,7 +317,7 @@ mod tests {
         options.ca_file = Some(ca_path.to_string().to_owned());
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into()).unwrap();
         // As it is hard to find a server that support only h1, we use the following hack to trick
         // the connector to think the server supports only h1. We force ALPN to use h1 and then
         // return the connection to the Connector. And then we use a Peer that allows h2
@@ -333,7 +333,7 @@ mod tests {
         }
         connector.release_http_session(h1, &peer, None).await;
 
-        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
 
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
@@ -373,7 +373,7 @@ mod tests {
         options.ca_file = Some(ca_path.to_string().to_owned());
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
         connector.prefer_h1(&peer);
 
@@ -664,7 +664,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         // Upstream supports H1 and H2
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         // Client sets upstream ALPN as custom protocol
         peer.options.alpn = ALPN::Custom(CustomALPN::new(custom_proto));
 

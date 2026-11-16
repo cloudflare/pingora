@@ -707,7 +707,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -743,7 +743,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         // a hack to force h1, new_http_session() in the future might validate this setting
         peer.options.set_http_version(1, 1);
         let h2 = connector
@@ -766,7 +766,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(addr, false, "".into());
+        let mut peer = HttpPeer::new(addr, false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -844,7 +844,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
         let h2 = connector
@@ -900,7 +900,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 3;
         let h2 = connector
@@ -1088,7 +1088,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(Some(options));
-        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
 

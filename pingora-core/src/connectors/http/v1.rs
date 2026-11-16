@@ -125,7 +125,7 @@ mod tests {
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
-        let peer = HttpPeer::new((mock_addr.ip(), mock_addr.port()), false, "".into());
+        let peer = HttpPeer::new((mock_addr.ip(), mock_addr.port()), false, "".into()).unwrap();
         // make a new connection to the mock addr
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
@@ -273,7 +273,7 @@ ZZ\r\n",
         ready_rx.await.unwrap();
 
         let connector = Connector::new(None);
-        let peer = HttpPeer::new((addr.ip(), addr.port()), false, "".into());
+        let peer = HttpPeer::new(addr, false, "".into()).unwrap();
         let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         get_http(&mut http, 301).await;
@@ -319,7 +319,7 @@ ZZ\r\n",
         options.ca_file = Some(ca_path.to_string().to_owned());
 
         let connector = Connector::new(Some(options));
-        let peer = HttpPeer::new(&mock_addr, true, "one.one.one.one".into());
+        let peer = HttpPeer::new(&mock_addr, true, "one.one.one.one".into()).unwrap();
         // connect to the local host mock TLS server
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
