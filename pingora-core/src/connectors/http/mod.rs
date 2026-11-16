@@ -167,7 +167,7 @@ where
 mod tests {
     use super::*;
     use crate::connectors::TransportConnector;
-    use crate::listeners::tls::TlsSettings;
+use crate::listeners::tls::TlsSettings;
     use crate::listeners::{Listeners, TransportStack, ALPN};
     use crate::protocols::http::v1::client::HttpSession as Http1Session;
     use crate::protocols::tls::CustomALPN;
@@ -193,10 +193,28 @@ mod tests {
         while http.read_body_bytes().await.unwrap().is_some() {}
     }
 
+    #[cfg(feature = "rustls")]
     #[tokio::test]
     async fn test_connect_h2() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let alpn_protocols: Vec<Vec<u8>> = vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ];
+
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
+        ready_rx.await.unwrap();
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new((mock_addr.ip(), mock_addr.port()), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 2);
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -216,12 +234,35 @@ mod tests {
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
             HttpSession::Custom(_) => panic!("expect h2"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_connect_h1() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+        let alpn_protocols: Vec<Vec<u8>> = vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ];
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        ready_rx.await.unwrap();
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
         peer.options.set_http_version(1, 1);
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -242,15 +283,37 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_connect_h2_fallback_h1_reuse() {
         // this test verify that if the server doesn't support h2, the Connector will reuse the
         // h1 session instead.
+        use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+        let alpn_protocols: Vec<Vec<u8>> = vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ];
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        ready_rx.await.unwrap();
 
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
         // As it is hard to find a server that support only h1, we use the following hack to trick
         // the connector to think the server supports only h1. We force ALPN to use h1 and then
         // return the connection to the Connector. And then we use a Peer that allows h2
@@ -266,7 +329,7 @@ mod tests {
         }
         connector.release_http_session(h1, &peer, None).await;
 
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 1);
 
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
@@ -277,12 +340,36 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_connect_prefer_h1() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+
+        let alpn_protocols: Vec<Vec<u8>> = vec![
+            b"h2".to_vec(),
+            b"http/1.1".to_vec(),
+        ];
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        ready_rx.await.unwrap();
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new((addr.ip(), addr.port()), true, "one.one.one.one".into());
         peer.options.set_http_version(2, 1);
         connector.prefer_h1(&peer);
 
@@ -306,6 +393,8 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
     // Track the flow of calls when using a custom protocol. For this we need to create a Mock Connector
     struct MockConnector {
@@ -380,6 +469,30 @@ mod tests {
                 reusable: Arc::new(Mutex::new(false)),
             },
         }
+    }
+    fn create_test_connector_for_mock_server() -> Connector<MockConnector> {
+    #[cfg(feature = "rustls")]
+        let custom_transport = {
+            let ca_path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../pingora-core/src/connectors/test-certs/ca.crt"
+            );
+            let mut options = ConnectorOptions::new(1);
+            options.ca_file = Some(ca_path.to_string().to_owned());
+
+            TransportConnector::new(Some(options))
+        };
+        #[cfg(not(feature = "rustls"))]
+        let custom_transport = TransportConnector::new(None);
+        Connector {
+            h1: v1::Connector::new(None),
+            h2: v2::Connector::new(None),
+            custom: MockConnector {
+                transport: custom_transport,
+                reusable: Arc::new(Mutex::new(false)),
+            },
+        }
+
     }
 
     // Creates a test peer that uses a custom ALPN protocol and disables cert/hostname verification for tests.
@@ -526,10 +639,26 @@ mod tests {
     // Client thinks server is custom but server is not Custom. Should fallback to H1
     #[tokio::test]
     async fn test_custom_client_non_custom_upstream() {
+        use super::super::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+
         let custom_proto = b"custom".to_vec();
-        let connector = create_test_connector();
+        let connector = create_test_connector_for_mock_server();
+
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+
+        let alpn_protocols: Vec<Vec<u8>> = vec![
+            // b"h2".to_vec(),
+            // b"http/1.1".to_vec(),
+        ];
+        let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(response, alpn_protocols).await.unwrap();
+        ready_rx.await.unwrap();
+
         // Upstream supports H1 and H2
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into());
         // Client sets upstream ALPN as custom protocol
         peer.options.alpn = ALPN::Custom(CustomALPN::new(custom_proto));
 
@@ -561,6 +690,8 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 }
 

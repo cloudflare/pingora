@@ -380,9 +380,13 @@ use crate::upstreams::peer::{BasicPeer, HttpPeer, Proxy};
 
     #[tokio::test]
     async fn test_conn_error_refused() {
-        let peer = BasicPeer::new("127.0.0.1:79"); // hopefully port 79 is not used
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr_str = addr.to_string();
+        drop(listener);
+        let peer = BasicPeer::new(&addr_str);
         let new_session = connect(&peer, None).await;
-        assert_eq!(new_session.unwrap_err().etype(), &ConnectRefused)
+        assert_eq!(new_session.unwrap_err().etype(), &ConnectRefused);
     }
 
     #[tokio::test]
