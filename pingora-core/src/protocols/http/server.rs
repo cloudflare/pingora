@@ -357,6 +357,28 @@ where
         }
     }
 
+    /// Stop accepting new requests on the downstream connection of this session once the
+    /// requests in flight are done.
+    ///
+    /// - HTTP/1.x: same as `set_keepalive(None)`, the connection is closed after the current
+    ///   response.
+    /// - HTTP/2: the connection sends GOAWAY and is closed once its in-flight streams finish, see
+    ///   [`SessionV2::graceful_shutdown_connection`].
+    ///
+    /// Returns `false` if nothing was done: for subrequest and custom sessions, and for an
+    /// HTTP/2 session that was not accepted by Pingora's downstream accept loop.
+    pub fn graceful_shutdown_connection(&mut self) -> bool {
+        match self {
+            Self::H1(s) => {
+                s.set_server_keepalive(None);
+                true
+            }
+            Self::H2(s) => s.graceful_shutdown_connection(),
+            Self::Subrequest(_) => false,
+            Self::Custom(_) => false,
+        }
+    }
+
     /// Get the keepalive timeout. None if keepalive is disabled. Not applicable for h2 or
     /// subrequest
     pub fn get_keepalive(&self) -> Option<u64> {
@@ -1236,6 +1258,30 @@ mod tests {
         .await;
         assert!(!while_pending);
         assert!(after_write);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_connection_disables_h1_keepalive() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+            .await
+            .unwrap();
+        let mut session = Session::new_http1(Box::new(server));
+        assert!(session.read_request().await.unwrap());
+        session.set_keepalive(Some(60));
+        assert_eq!(session.get_keepalive(), Some(60));
+
+        assert!(session.graceful_shutdown_connection());
+        assert_eq!(session.get_keepalive(), None);
+    }
+
+    #[test]
+    fn graceful_shutdown_connection_is_noop_for_custom_session() {
+        let mut session = Session::new_custom(());
+        assert!(!session.graceful_shutdown_connection());
     }
 
     struct ProxyTaskCustom {

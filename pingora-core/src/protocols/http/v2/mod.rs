@@ -767,4 +767,228 @@ mod test {
         }
         client_handle.await.unwrap();
     }
+
+    fn get_request_headers(stream_id: u32) -> Headers {
+        let mut headers = Headers::new(
+            stream_id.into(),
+            Pseudo::request(
+                Method::GET,
+                Uri::from_static("https://one.one.one.one/"),
+                None,
+            ),
+            HeaderMap::new(),
+        );
+        headers.set_end_headers();
+        headers.set_end_stream();
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_connection_drains_connection() {
+        // The session of stream 1 asks for a graceful shutdown of its connection
+        // while stream 1 is still in flight, with no server shutdown signal. The
+        // client must see GOAWAY, stream 1 must still be answered, a stream
+        // opened above the final last_stream_id must not be surfaced, and the
+        // connection must close once stream 1 is done.
+        let (mut client, server) = duplex(65536);
+        // Keep the sender alive so `shutdown.changed()` stays pending.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (respond_tx, respond_rx) = oneshot::channel::<()>();
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+            codec.send(get_request_headers(1).into()).await.unwrap();
+
+            let mut respond_tx = Some(respond_tx);
+            let mut goaway_last_stream_ids = vec![];
+            let mut saw_response = false;
+            let closed = pingora_timeout::timeout(Duration::from_secs(5), async {
+                while let Some(frame) = codec.next().await {
+                    match frame {
+                        Ok(Frame::GoAway(goaway)) => {
+                            assert_eq!(goaway.reason(), h2::Reason::NO_ERROR);
+                            goaway_last_stream_ids.push(goaway.last_stream_id());
+                            if goaway.last_stream_id() == 1u32 {
+                                // The final GOAWAY: let the server answer stream 1
+                                // only now, and open a stream it must refuse.
+                                respond_tx.take().unwrap().send(()).unwrap();
+                                let _ = codec.send(get_request_headers(3).into()).await;
+                            }
+                        }
+                        // Acknowledge the PING that h2 sends with the first GOAWAY.
+                        Ok(Frame::Ping(ping)) if !ping.is_ack() => {
+                            let pong = Ping::pong(*ping.payload());
+                            codec.send(pong.into()).await.unwrap();
+                        }
+                        Ok(Frame::Headers(headers)) => {
+                            assert_eq!(headers.stream_id(), 1u32);
+                            assert!(headers.is_end_stream());
+                            saw_response = true;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+
+            assert!(closed.is_ok(), "connection was not closed");
+            assert!(saw_response, "expected response for stream 1");
+            // GOAWAY(MAX) first, then the final GOAWAY(1).
+            assert_eq!(
+                goaway_last_stream_ids.first().copied(),
+                Some(h2::frame::StreamId::MAX)
+            );
+            assert_eq!(goaway_last_stream_ids.last().copied(), Some(1u32.into()));
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut respond_rx = Some(respond_rx);
+        let mut session_handles = vec![];
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(5),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                None,
+                |mut session, guard| {
+                    let respond_rx = respond_rx.take().expect("only stream 1 may be surfaced");
+                    session_handles.push(tokio::spawn(async move {
+                        let _guard = guard;
+                        assert!(session.graceful_shutdown_connection());
+                        respond_rx.await.unwrap();
+                        let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                        session.write_response_header(resp, true).unwrap();
+                    }));
+                },
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "accept loop did not finish after graceful_shutdown_connection"
+        );
+        assert_eq!(session_handles.len(), 1);
+        for h in session_handles {
+            h.await.unwrap();
+        }
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connection_stays_open_without_graceful_shutdown_connection() {
+        // Without a call to graceful_shutdown_connection the connection keeps
+        // accepting streams and sends no GOAWAY.
+        let (mut client, server) = duplex(65536);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            let mut saw_goaway = false;
+            for stream_id in [1u32, 3] {
+                codec
+                    .send(get_request_headers(stream_id).into())
+                    .await
+                    .unwrap();
+                let answered = pingora_timeout::timeout(Duration::from_secs(5), async {
+                    while let Some(frame) = codec.next().await {
+                        match frame.unwrap() {
+                            Frame::GoAway(_) => saw_goaway = true,
+                            Frame::Headers(headers) if headers.stream_id() == stream_id => {
+                                return true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    false
+                })
+                .await;
+                assert!(
+                    matches!(answered, Ok(true)),
+                    "expected response for stream {stream_id}"
+                );
+            }
+            assert!(!saw_goaway, "unexpected GOAWAY");
+            // Dropping the codec closes the connection.
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut session_handles = vec![];
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(5),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                None,
+                |mut session, guard| {
+                    session_handles.push(tokio::spawn(async move {
+                        let _guard = guard;
+                        let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                        session.write_response_header(resp, true).unwrap();
+                    }));
+                },
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "accept loop did not finish");
+        assert_eq!(session_handles.len(), 2);
+        for h in session_handles {
+            h.await.unwrap();
+        }
+        client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown_connection_without_accept_loop() {
+        // A session that was not accepted by `accept_downstream_sessions` has no
+        // connection to shut down.
+        let (mut client, server) = duplex(65536);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+            codec.send(get_request_headers(1).into()).await.unwrap();
+            // Keep the connection open until the server is done with it.
+            while let Some(Ok(_)) = codec.next().await {}
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let accepted = HttpSession::from_h2_conn(&mut connection, digest)
+            .await
+            .unwrap()
+            .unwrap();
+        let H2Accept::Session(session) = accepted else {
+            panic!("expected a session for stream 1");
+        };
+        assert!(!session.graceful_shutdown_connection());
+
+        drop(session);
+        drop(connection);
+        client_handle.await.unwrap();
+    }
 }
