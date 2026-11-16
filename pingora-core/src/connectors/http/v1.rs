@@ -93,6 +93,7 @@ impl Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
     use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::HttpPeer;
     use crate::upstreams::peer::Peer;
@@ -113,12 +114,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect() {
+        let response = b"HTTP/1.1 301 Moved Permanently\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(response).await.unwrap();
+        ready_rx.await.unwrap();
+
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
-        // make a new connection to 1.1.1.1
+        let peer = HttpPeer::new((mock_addr.ip(), mock_addr.port()), false, "".into()).unwrap();
+        // make a new connection to the mock addr
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
-        assert_eq!(*server_addr, "1.1.1.1:80".parse::<SocketAddr>().unwrap());
+
+        match server_addr {
+            SocketAddr::Inet(addr) => assert_eq!(*addr, mock_addr),
+            SocketAddr::Unix(_) => panic!("Expected TCP socket, got Unix socket"),
+        }
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse
@@ -130,6 +145,9 @@ mod tests {
         connector.release_http_session(http, &peer, None).await;
         let (_, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(reused);
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -245,8 +263,17 @@ ZZ\r\n",
             }
         }
 
+        let response = b"HTTP/1.1 301 Moved Permanently\r\n\
+            Location: https://example.com/\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(response).await.unwrap();
+        ready_rx.await.unwrap();
+
         let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
+        let peer = HttpPeer::new(addr, false, "".into()).unwrap();
         let (mut http, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
         get_http(&mut http, 301).await;
@@ -261,17 +288,42 @@ ZZ\r\n",
             .reused_http_session(&mismatch_peer)
             .await
             .is_none());
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
-    #[cfg(feature = "any_tls")]
+    #[cfg(all(feature = "any_tls", feature = "rustls"))]
     async fn test_connect_tls() {
-        let connector = Connector::new(None);
-        let peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
-        // make a new connection to https://1.1.1.1
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let response = b"HTTP/1.1 200 OK\r\n\
+            Content-Length: 0\r\n\
+            Connection: keep-alive\r\n\
+            \r\n";
+
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"http/1.1".to_vec()];
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+        let (mock_addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(response, alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+        let mock_addr = SocketAddr::Inet(mock_addr);
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let connector = Connector::new(Some(options));
+        let peer = HttpPeer::new(&mock_addr, true, "one.one.one.one".into()).unwrap();
+        // connect to the local host mock TLS server
         let (http, reused) = connector.get_http_session(&peer).await.unwrap();
         let server_addr = http.server_addr().unwrap();
-        assert_eq!(*server_addr, "1.1.1.1:443".parse::<SocketAddr>().unwrap());
+        assert_eq!(*server_addr, mock_addr);
         assert!(!reused);
 
         // this http is not even used, so not be able to reuse
@@ -283,5 +335,8 @@ ZZ\r\n",
         connector.release_http_session(http, &peer, None).await;
         let (_, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(reused);
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 }
