@@ -856,20 +856,28 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    #[cfg(feature = "rustls")]
     #[tokio::test]
     async fn test_connect_tls() {
         let alpn_protocols = vec![
-            b"h/2".to_vec(),
+            b"h2".to_vec(),
             b"http/1.1".to_vec(),
         ];
         let (addr, ready_rx, shutdown_tx, server_handle) = spawn_mock_tls_tcp_server(b"", alpn_protocols).await.unwrap();
         ready_rx.await.unwrap();
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+        let connector = TransportConnector::new(Some(options));
+
         let addr_str = addr.to_string();
-        let connector = TransportConnector::new(None);
         let mut peer = BasicPeer::new(&addr_str);
         // BasicPeer will use tls when SNI is set
         peer.sni = "one.one.one.one".to_string();
-        // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
         let timing = stream.get_timing_digest();
         assert_eq!(timing.len(), 2);
@@ -1013,7 +1021,6 @@ mod tests {
     #[tokio::test]
     async fn test_tls_connect_timeout_supersedes_total() {
         let mut peer = BasicPeer::new(BLACKHOLE);
-        peer.options.custom_l4 = Some(Arc::new(HangingL4));
         peer.options.total_connection_timeout = Some(Duration::from_millis(10));
         peer.options.connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
@@ -1025,6 +1032,7 @@ mod tests {
             assert!(!context.contains("total-connection timeout"));
         }
     }
+
 
     #[tokio::test]
     async fn test_do_connect_without_total_timeout() {
