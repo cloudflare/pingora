@@ -119,6 +119,9 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 ///      - the codec is driven to completion so the final GOAWAY can be
 ///        flushed and the connection closed cleanly.
 ///
+/// The same drain is started for this connection alone when any of its sessions
+/// calls [`HttpSession::graceful_shutdown_connection`].
+///
 /// `on_session` is invoked once per accepted stream, together with a
 /// [`StreamGuard`]. Typical callers spawn a task to process the session so the
 /// accept loop is not blocked, and move the guard into that task so its lifetime
@@ -140,6 +143,9 @@ pub(crate) async fn accept_downstream_sessions<F>(
     F: FnMut(HttpSession, StreamGuard),
 {
     let mut shutdown_initiated = false;
+    // Lets the sessions of this connection request a graceful shutdown of the
+    // connection, see `HttpSession::graceful_shutdown_connection`.
+    let conn_shutdown = Arc::new(Notify::new());
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
     // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
@@ -159,6 +165,13 @@ pub(crate) async fn accept_downstream_sessions<F>(
                 // and is polled again on the next iteration.
                 biased;
                 _ = shutdown.changed() => {
+                    conn.graceful_shutdown();
+                    shutdown_initiated = true;
+                    continue;
+                }
+                // Same drain as above, requested by a session for this
+                // connection only.
+                _ = conn_shutdown.notified() => {
                     conn.graceful_shutdown();
                     shutdown_initiated = true;
                     continue;
@@ -191,7 +204,8 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // The offending stream was already answered or reset; keep the
             // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
-            Ok(Some(H2Accept::Session(session))) => {
+            Ok(Some(H2Accept::Session(mut session))) => {
+                session.conn_shutdown = Some(conn_shutdown.clone());
                 on_session(session, active.start_session());
             }
         }
@@ -291,6 +305,8 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
+    // Set by `accept_downstream_sessions`, see `graceful_shutdown_connection()`
+    conn_shutdown: Option<Arc<Notify>>,
 }
 
 /// The outcome of accepting the next event on an HTTP/2 downstream connection.
@@ -499,6 +515,7 @@ impl HttpSession {
             digest,
             write_timeout: None,
             total_drain_timeout: None,
+            conn_shutdown: None,
         })))
     }
 
@@ -866,6 +883,29 @@ impl HttpSession {
     pub fn shutdown_with_reason(&mut self, reason: h2::Reason) {
         if !self.ended {
             self.send_response.send_reset(reason);
+        }
+    }
+
+    /// Gracefully shut down the HTTP/2 connection that carries this stream.
+    ///
+    /// The connection sends GOAWAY and stops accepting new streams. Streams that are already
+    /// in flight, including this one, are processed as usual; the connection is closed once
+    /// they are done. This is the same drain that a server shutdown performs (see
+    /// [`h2::server::Connection::graceful_shutdown`]), limited to this connection. Other
+    /// connections are not affected.
+    ///
+    /// Returns `true` if the shutdown was requested, or had already been requested by another
+    /// stream of the same connection. Returns `false`, and does nothing, if this session was
+    /// not accepted by Pingora's downstream accept loop (for example, a session created
+    /// directly with [`Self::from_h2_conn`]).
+    pub fn graceful_shutdown_connection(&self) -> bool {
+        match self.conn_shutdown.as_ref() {
+            Some(conn_shutdown) => {
+                // Stores a permit if the accept loop is not waiting right now.
+                conn_shutdown.notify_one();
+                true
+            }
+            None => false,
         }
     }
 
