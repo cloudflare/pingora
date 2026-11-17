@@ -120,6 +120,15 @@ impl SocketDigest {
         super::l4::ext::get_socket_cookie(self.raw_fd)
     }
 
+    /// Return the raw file descriptor of the socket.
+    ///
+    /// The descriptor stays owned by the connection. Callers may use it to read or set socket
+    /// options, but must not close it or perform I/O on it.
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.raw_fd
+    }
+
     #[cfg(unix)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
         self.peer_addr
@@ -282,5 +291,18 @@ mod tests {
 
         assert_ne!(client_digest.socket_cookie().unwrap(), 0);
         assert_ne!(server_digest.socket_cookie().unwrap(), 0);
+    }
+
+    #[test]
+    fn raw_fd_returns_the_socket_fd() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let client_digest = SocketDigest::from_raw_fd(client.as_raw_fd());
+        let server_digest = SocketDigest::from_raw_fd(server.as_raw_fd());
+
+        assert_eq!(client_digest.raw_fd(), client.as_raw_fd());
+        assert_eq!(server_digest.raw_fd(), server.as_raw_fd());
     }
 }
