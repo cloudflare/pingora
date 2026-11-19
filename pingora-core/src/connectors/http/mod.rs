@@ -18,7 +18,6 @@ use crate::connectors::http::custom::Connection;
 use crate::connectors::ConnectorOptions;
 use crate::listeners::ALPN;
 use crate::protocols::http::client::HttpSession;
-use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::upstreams::peer::Peer;
 use pingora_error::Result;
 use std::sync::atomic::AtomicU64;
@@ -91,10 +90,7 @@ where
                 }
                 // Negotiated ALPN is not custom, create a new H1 session
                 Connection::Stream(s) => {
-                    return Ok((
-                        HttpSession::H1(Http1Session::new_with_options(s, peer)),
-                        false,
-                    ));
+                    return Ok((HttpSession::H1(self.h1.new_http_session(s, peer)), false));
                 }
             }
         }
@@ -200,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h2() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let (h2, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -225,7 +221,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(1, 1);
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
         assert!(!reused);
@@ -254,7 +250,7 @@ mod tests {
         // h1 session instead.
 
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // As it is hard to find a server that support only h1, we use the following hack to trick
         // the connector to think the server supports only h1. We force ALPN to use h1 and then
         // return the connection to the Connector. And then we use a Peer that allows h2
@@ -270,7 +266,7 @@ mod tests {
         }
         connector.release_http_session(h1, &peer, None).await;
 
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
 
         let (mut h1, reused) = connector.get_http_session(&peer).await.unwrap();
@@ -286,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn test_connect_prefer_h1() {
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 1);
         connector.prefer_h1(&peer);
 
@@ -388,7 +384,7 @@ mod tests {
 
     // Creates a test peer that uses a custom ALPN protocol and disables cert/hostname verification for tests.
     fn create_peer_with_custom_proto(port: u16, proto: &[u8]) -> HttpPeer {
-        let mut peer = HttpPeer::new(("127.0.0.1", port), true, "localhost".into());
+        let mut peer = HttpPeer::new(("127.0.0.1", port), true, "localhost".into()).unwrap();
         let mut options = PeerOptions::new();
         options.alpn = ALPN::Custom(CustomALPN::new(proto.to_vec()));
         // Disable cert verification for this test (self-signed or invalid certs are OK)
@@ -533,7 +529,7 @@ mod tests {
         let custom_proto = b"custom".to_vec();
         let connector = create_test_connector();
         // Upstream supports H1 and H2
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into());
+        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
         // Client sets upstream ALPN as custom protocol
         peer.options.alpn = ALPN::Custom(CustomALPN::new(custom_proto));
 

@@ -73,6 +73,7 @@ pub struct MemCache {
     pub(crate) cached: Arc<RwLock<HashMap<String, CacheObject>>>,
     pub(crate) temp: Arc<RwLock<HashMap<String, HashMap<u64, TempObject>>>>,
     pub(crate) last_temp_id: AtomicU64,
+    fail_readers_of_dropped_writes: bool,
 }
 
 impl MemCache {
@@ -82,7 +83,19 @@ impl MemCache {
             cached: Arc::new(RwLock::new(HashMap::new())),
             temp: Arc::new(RwLock::new(HashMap::new())),
             last_temp_id: AtomicU64::new(0),
+            fail_readers_of_dropped_writes: false,
         }
+    }
+
+    /// Make readers of a write dropped before [`HandleMiss::finish`] fail instead of ending the
+    /// body cleanly.
+    ///
+    /// Off by default: such a reader then sees the body end with `Ok(None)` once the writer is
+    /// gone, even though the write was incomplete. Turn it on to exercise the reader contract
+    /// that [`HandleMiss::finish`] recommends for storages whose fills can be cancelled.
+    pub fn fail_readers_of_dropped_writes(mut self, fail: bool) -> Self {
+        self.fail_readers_of_dropped_writes = fail;
+        self
     }
 }
 
@@ -95,6 +108,10 @@ pub enum MemHitHandler {
 enum PartialState {
     Partial(usize),
     Complete(usize),
+    /// The writer was dropped before `finish()`, so the body will never complete. Only
+    /// published by a [`MemCache`] built with
+    /// [`fail_readers_of_dropped_writes`](MemCache::fail_readers_of_dropped_writes).
+    Aborted,
 }
 
 pub struct CompleteHit {
@@ -141,7 +158,7 @@ pub struct PartialHit {
 }
 
 impl PartialHit {
-    async fn read(&mut self) -> Option<Bytes> {
+    async fn read(&mut self) -> Result<Option<Bytes>> {
         loop {
             let bytes_written = *self.bytes_written.borrow_and_update();
             let bytes_end = match bytes_written {
@@ -149,9 +166,15 @@ impl PartialHit {
                 PartialState::Complete(c) => {
                     // no more data will arrive
                     if c == self.bytes_read {
-                        return None;
+                        return Ok(None);
                     }
                     c
+                }
+                PartialState::Aborted => {
+                    return Error::e_explain(
+                        ErrorType::InternalError,
+                        "cache write ended before the body was complete",
+                    );
                 }
             };
             assert!(bytes_end >= self.bytes_read);
@@ -161,14 +184,14 @@ impl PartialHit {
                 let new_bytes =
                     Bytes::copy_from_slice(&self.body.read()[self.bytes_read..bytes_end]);
                 self.bytes_read = bytes_end;
-                return Some(new_bytes);
+                return Ok(Some(new_bytes));
             }
 
             // wait for more data
             if self.bytes_written.changed().await.is_err() {
                 // err: sender dropped, body is finished
                 // FIXME: sender could drop because of an error
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -179,7 +202,7 @@ impl HandleHit for MemHitHandler {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
         match self {
             Self::Complete(c) => Ok(c.get()),
-            Self::Partial(p) => Ok(p.read().await),
+            Self::Partial(p) => p.read().await,
         }
     }
     async fn finish(
@@ -244,6 +267,9 @@ pub struct MemMissHandler {
     cache: Arc<RwLock<HashMap<String, CacheObject>>>,
     // key -> (temp writer id -> temp object) to support concurrent writers
     temp: Arc<RwLock<HashMap<String, HashMap<u64, TempObject>>>>,
+    // whether dropping this writer before `finish()` fails its readers
+    fail_readers_if_dropped: bool,
+    finished: bool,
 }
 
 #[async_trait]
@@ -252,6 +278,7 @@ impl HandleMiss for MemMissHandler {
         let current_bytes = match *self.bytes_written.borrow() {
             PartialState::Partial(p) => p,
             PartialState::Complete(_) => panic!("already EOF"),
+            PartialState::Aborted => unreachable!("only dropping the writer aborts it"),
         };
         self.body.write().extend_from_slice(&data);
         let written = current_bytes + data.len();
@@ -264,7 +291,7 @@ impl HandleMiss for MemMissHandler {
         Ok(())
     }
 
-    async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+    async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
         // safe, the temp object is inserted when the miss handler is created
         let cache_object = self
             .temp
@@ -280,6 +307,9 @@ impl HandleMiss for MemMissHandler {
             .write()
             .get_mut(&self.key)
             .and_then(|map| map.remove(&self.temp_id.into()));
+        // Dropping this handler drops the last sender, which ends attached readers cleanly.
+        // Skip the abort that dropping an unfinished write publishes.
+        self.finished = true;
         Ok(MissFinishType::Created(size))
     }
 
@@ -294,6 +324,9 @@ impl Drop for MemMissHandler {
             .write()
             .get_mut(&self.key)
             .and_then(|map| map.remove(&self.temp_id.into()));
+        if self.fail_readers_if_dropped && !self.finished {
+            self.bytes_written.send_replace(PartialState::Aborted);
+        }
     }
 }
 
@@ -378,6 +411,8 @@ impl Storage for MemCache {
             cache: self.cached.clone(),
             temp: self.temp.clone(),
             temp_id: temp_id.into(),
+            fail_readers_if_dropped: self.fail_readers_of_dropped_writes,
+            finished: false,
         };
         self.temp
             .write()
@@ -625,6 +660,136 @@ mod test {
         assert!(data.is_none());
         let data = hit_handler2.read_body().await.unwrap();
         assert!(data.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_write_fails_an_attached_reader_when_enabled() {
+        static MEM_CACHE: Lazy<MemCache> =
+            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        let span = &Span::inactive().handle();
+        let key = CacheKey::new("dropped-write", "1");
+
+        let mut miss_handler = MEM_CACHE
+            .get_miss_handler(&key, &gen_meta(), span)
+            .await
+            .unwrap();
+        let (_, mut hit_handler) = MEM_CACHE
+            .lookup(&key, span)
+            .await
+            .unwrap()
+            .expect("lookups find the write in progress");
+        miss_handler
+            .write_body(b"abc"[..].into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_handler.read_body().await.unwrap().as_deref(),
+            Some(b"abc".as_slice())
+        );
+
+        drop(miss_handler);
+
+        let after_drop = hit_handler.read_body().await;
+        assert!(
+            after_drop.is_err(),
+            "a write dropped before finish() must not end its reader's body cleanly: {after_drop:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_write_after_eof_but_before_finish_fails_an_attached_reader_when_enabled() {
+        static MEM_CACHE: Lazy<MemCache> =
+            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        let span = &Span::inactive().handle();
+        let key = CacheKey::new("eof-then-dropped", "1");
+
+        let mut miss_handler = MEM_CACHE
+            .get_miss_handler(&key, &gen_meta(), span)
+            .await
+            .unwrap();
+        let (_, mut hit_handler) = MEM_CACHE
+            .lookup(&key, span)
+            .await
+            .unwrap()
+            .expect("lookups find the write in progress");
+        miss_handler
+            .write_body(b"abc"[..].into(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_handler.read_body().await.unwrap().as_deref(),
+            Some(b"abc".as_slice())
+        );
+
+        drop(miss_handler);
+
+        let after_drop = hit_handler.read_body().await;
+        assert!(
+            after_drop.is_err(),
+            "a write dropped before finish() must fail its reader even after an eof write: {after_drop:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_a_write_without_eof_ends_an_attached_reader_when_enabled() {
+        static MEM_CACHE: Lazy<MemCache> =
+            Lazy::new(|| MemCache::new().fail_readers_of_dropped_writes(true));
+        let span = &Span::inactive().handle();
+        let key = CacheKey::new("finished-without-eof", "1");
+
+        let mut miss_handler = MEM_CACHE
+            .get_miss_handler(&key, &gen_meta(), span)
+            .await
+            .unwrap();
+        let (_, mut hit_handler) = MEM_CACHE
+            .lookup(&key, span)
+            .await
+            .unwrap()
+            .expect("lookups find the write in progress");
+        miss_handler
+            .write_body(b"abc"[..].into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_handler.read_body().await.unwrap().as_deref(),
+            Some(b"abc".as_slice())
+        );
+
+        miss_handler.finish().await.unwrap();
+
+        assert_eq!(hit_handler.read_body().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unfinished_write_ends_an_attached_reader_by_default() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let span = &Span::inactive().handle();
+        let key = CacheKey::new("dropped-write-default", "1");
+
+        let mut miss_handler = MEM_CACHE
+            .get_miss_handler(&key, &gen_meta(), span)
+            .await
+            .unwrap();
+        let (_, mut hit_handler) = MEM_CACHE
+            .lookup(&key, span)
+            .await
+            .unwrap()
+            .expect("lookups find the write in progress");
+        miss_handler
+            .write_body(b"abc"[..].into(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            hit_handler.read_body().await.unwrap().as_deref(),
+            Some(b"abc".as_slice())
+        );
+
+        drop(miss_handler);
+
+        assert!(
+            hit_handler.read_body().await.unwrap().is_none(),
+            "by default a reader of a dropped write sees the body end cleanly"
+        );
     }
 
     #[tokio::test]

@@ -144,6 +144,90 @@ where
         false
     }
 
+    /// Opt this request in to Pingora's handling of a client that leaves while this request's
+    /// response is still being produced.
+    ///
+    /// The proxy calls this once per request, subrequests included, right after
+    /// [`Self::early_request_filter`] succeeds and before downstream modules and
+    /// [`Self::request_filter`] run, and keeps the answer for the rest of the request; see
+    /// [`Session::handles_downstream_abandonment`]. The decision can use what
+    /// `early_request_filter` put in the context. A subrequest does not inherit its parent's
+    /// answer.
+    ///
+    /// Returning `true` changes nothing on a proxied response while the client stays connected,
+    /// except that a cache failure caused by a fill cancellation is recorded as one (see below).
+    /// A client that fails after its response was completely written (see
+    /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete)),
+    /// an HTTP/1 client that sends its next request before this response is complete, or a
+    /// client whose request body read times out or is malformed, is handled exactly as without
+    /// this opt-in. A watched cache hit or subrequest pipe, below, is the exception.
+    ///
+    /// A cache hit also watches its client while it waits for its cached body, until its
+    /// response is complete: an HTTP/2 client from the start, since waiting on its stream reads
+    /// nothing, and any other client only if its request body is complete when the hit starts,
+    /// since the hit never reads that body. A client that closes or resets its connection, or
+    /// resets its HTTP/2 stream, ends the hit even while its cache read stalls, so dropping the
+    /// request releases that reader; with `abort_on_close` disabled, a half-closed HTTP/1 client
+    /// keeps its response. A hit that ends this way is offered to [`Self::suppress_error_log`];
+    /// any other failed hit is logged as without this opt-in. An HTTP/1 next request sent early
+    /// follows the regular pipelining policy: with pipelining disabled it ends the hit with
+    /// `ConnectError`, which is not offered, and with it enabled it is kept for the next request,
+    /// as on a proxied response. Once the hit has kept that request's first byte, it no longer
+    /// reads its client, so a client that then closes or resets its connection goes unnoticed
+    /// until the hit ends or a response write fails, as in the proxy loops. A stale-if-error hit
+    /// keeps that path's logging: its caller offers every final error to
+    /// [`Self::suppress_error_log`], as without this opt-in.
+    ///
+    /// A subrequest pipe ([`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest)) also
+    /// watches its client while it waits for the subrequest's response, and fails as soon as the
+    /// client leaves: an HTTP/2 client from the start, any other client once its request body is
+    /// complete, so unlike a hit, a pipe can start watching partway through. `abort_on_close`
+    /// and the pipelining policy apply as for a hit, including that a client that closes after
+    /// the pipe kept its next request's first byte goes unnoticed. Without this opt-in, the pipe
+    /// reads the client only to forward a body the subrequest asked for, so an early next
+    /// request can be left unread. That function documents the details. Returning `true` for a
+    /// subrequest makes it treat the request that created it as gone only once that request
+    /// stops receiving the subrequest's response, not as soon as it stops sending request input.
+    ///
+    /// The rest applies only once a client leaves before its response is completely delivered,
+    /// while a cache fill can still produce an entry (a miss with an active cache writer, or
+    /// streaming storage before the response's cache decision is made). The proxy then records
+    /// the abandonment and reports it once through
+    /// [`Self::downstream_abandoned_during_cache_fill`]. After that:
+    /// - the proxy stops writing to and waiting on that downstream and finishes the upstream
+    ///   response for the cache. The default [`Self::fail_to_proxy`] writes no error response to
+    ///   it and reports 0. Stale-if-error is the exception: if the upstream fails before any
+    ///   response was written and the stale entry can be served on error, that stale response is
+    ///   still written to the downstream, as without this opt-in;
+    /// - a response that will not be admitted to the cache fails the request, as does a failed
+    ///   write of its header or body to the cache, since the cache is its only output. A failed
+    ///   finish of the cache entry stays best-effort, as without this opt-in: the entry is not
+    ///   admitted, and that failure does not itself fail the request;
+    /// - a retry happens only if the request body was read to its end, caching is still
+    ///   enabled, and no cache writer is still active;
+    /// - the proxy watches the fill's active miss writer for a
+    ///   [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) and ends the fill with
+    ///   [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED)
+    ///   once it is cancelled; see [`Self::downstream_abandoned_during_cache_fill`];
+    /// - the default [`Self::suppress_error_log`] does not log that error.
+    ///
+    /// Whether or not the client left, a cache failure of an opted-in request that
+    /// `ERR_CACHE_FILL_CANCELLED` caused, wrapped or not, disables the cache with
+    /// [`REASON_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+    /// rather than [`NoCacheReason::StorageError`](pingora_cache::NoCacheReason::StorageError).
+    ///
+    /// Any other downstream failure is handled as it would be without this opt-in. When it
+    /// returns `false`, the default, the proxy behaves as it did before this handling existed,
+    /// except that a [`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest) that fails on
+    /// a client read turns keep-alive off with or without this opt-in.
+    fn should_handle_downstream_abandonment(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> bool {
+        false
+    }
+
     /// Handle the incoming request body.
     ///
     /// This function will be called every time a piece of request body is received. The `body` is
@@ -245,6 +329,120 @@ where
         Self::CTX: Send + Sync,
     {
         Ok(true)
+    }
+
+    /// Determine whether to buffer the entire request body before connecting to upstream.
+    ///
+    /// This is called after [`Self::early_request_filter()`],
+    /// [`Self::allow_spawning_subrequest()`], and [`Self::should_handle_downstream_abandonment()`],
+    /// but before [`Self::request_filter()`] and [`Self::upstream_peer()`]. Nothing has been
+    /// buffered yet when it runs: the assembled body is available through
+    /// [`Session::get_buffered_body()`] from the downstream modules' header filters and
+    /// [`Self::request_filter()`] onward.
+    ///
+    /// When this returns `Some`, Pingora reads the downstream body itself, so neither this nor
+    /// [`Self::early_request_body_filter()`] may read it, including through a spawned subrequest.
+    ///
+    /// # Returns
+    /// - `None`: Don't buffer, stream body to upstream (default)
+    /// - `Some(max_size)`: Buffer body with size limit, return 413 error if exceeded
+    ///
+    /// # Use Cases
+    /// - Auth signature verification (need full body before auth decision)
+    /// - Content-based routing decisions
+    /// - Body transformation before upstream selection
+    ///
+    /// # Size Limit Enforcement
+    /// When returning `Some(max_size)`:
+    /// - Content-Length header is checked first (fail fast before reading)
+    /// - Input bytes are checked before filtering
+    /// - Retained bytes are checked after filtering
+    /// - If exceeded, returns HTTP 413 (Payload Too Large)
+    ///
+    /// # Memory
+    /// The limit applies to each request, not to a total. Each HTTP/2 stream buffers separately, so
+    /// one connection can retain up to its concurrent stream count times `max_size`: 100 streams
+    /// with `Some(10 << 20)` is about 1 GiB. The body is held until the request finishes,
+    /// including while a long response streams.
+    ///
+    /// # Retries
+    /// The complete retained body is separate from Pingora's ordinary 64 KiB retry buffer and can
+    /// be replayed on every retry allowed by [`Self::error_while_proxy()`].
+    /// `retry_buffer_truncated()` does not reflect this buffer's size. Choose a limit that accounts
+    /// for retaining and potentially replaying the full body on each attempt.
+    ///
+    /// The default retry policy still restricts retries to idempotent methods. Applications must
+    /// override [`Self::error_while_proxy()`] to opt non-idempotent requests into replay.
+    ///
+    /// Use [`Self::early_request_body_buffer_timeout()`] to apply a total deadline to this phase.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    fn early_request_body_buffer_limit(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> Option<usize> {
+        None // Default: stream body to upstream
+    }
+
+    /// Set a deadline for buffering the entire request body.
+    ///
+    /// The deadline includes local `100 Continue` handling, downstream reads, and
+    /// [`Self::early_request_body_filter()`] calls. When it expires, buffering fails with HTTP 408.
+    ///
+    /// Returning `None` leaves total buffering time unbounded. No upstream exists yet, so no
+    /// upstream timeout backstops this phase: H2 body reads have no per-read timeout, and the H1
+    /// downstream read timeout resets on every read. Applications enabling buffering should
+    /// return a finite deadline.
+    ///
+    /// This is only consulted when [`Self::early_request_body_buffer_limit()`] returns `Some`.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    fn early_request_body_buffer_timeout(
+        &self,
+        _session: &Session<DS>,
+        _ctx: &Self::CTX,
+    ) -> Option<Duration> {
+        None
+    }
+
+    /// Handle each chunk of request body during early buffering.
+    ///
+    /// This is called while the body is buffered early (enabled by
+    /// [`Self::early_request_body_buffer_limit()`]) for each body chunk, **before**
+    /// [`Self::request_filter()`] and [`Self::upstream_peer()`]. Use this for processing that must
+    /// happen before header filters run (e.g., streaming decompression).
+    ///
+    /// Unlike [`Self::request_body_filter()`], this callback explicitly runs before any
+    /// header-phase filters, so it should not depend on state set by [`Self::request_filter()`].
+    ///
+    /// Modify the current chunk through `body`. Set `*body = None` to discard it; do this on every
+    /// invocation to discard the entire body. After the buffering loop finishes, Pingora
+    /// assembles the chunks your filter leaves in place and stores the result. Do not call
+    /// [`Session::set_buffered_body()`] from this callback because that assembled result may
+    /// overwrite it. To replace the fully assembled body, call [`Session::set_buffered_body()`]
+    /// later from [`Self::request_filter()`].
+    ///
+    /// When filtering changes the body length, update `Content-Length` and `Transfer-Encoding`
+    /// before forwarding. HTTP/2 stream termination is derived from the buffered body.
+    ///
+    /// The normal [`Self::request_body_filter()`] still runs during upstream body forwarding.
+    ///
+    /// Requires the `early_body_buffer` feature.
+    #[cfg(feature = "early_body_buffer")]
+    async fn early_request_body_filter(
+        &self,
+        _session: &mut Session<DS>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(())
     }
 
     /// Decide if the response is cacheable
@@ -565,11 +763,65 @@ where
     ) {
     }
 
-    /// A value of true means that the log message will be suppressed. The default value is false.
+    /// A value of true means that the final proxy error log message will be suppressed.
+    ///
+    /// By default, once [`Session::downstream_abandoned_during_cache_fill`] is true, suppresses
+    /// exactly the cancelled cache fills
+    /// [`is_cache_fill_cancelled`](pingora_cache::fill_cancellation::is_cache_fill_cancelled)
+    /// recognizes, wrapped or not: the application asked to end an abandoned cache fill early via
+    /// [`Self::downstream_abandoned_during_cache_fill`], so it is expected control flow rather
+    /// than a failure. The error still reaches [`Self::logging`] unchanged, so access logs and
+    /// any custom accounting there are unaffected. For any other request or error the default is
+    /// false. An override replaces this default entirely and takes full control of what logs, in
+    /// both directions.
     ///
     /// See also: [`Self::suppress_proxy_warn_log`].
-    fn suppress_error_log(&self, _session: &Session<DS>, _ctx: &Self::CTX, _error: &Error) -> bool {
-        false
+    fn suppress_error_log(&self, session: &Session<DS>, _ctx: &Self::CTX, error: &Error) -> bool {
+        session.downstream_abandoned_during_cache_fill()
+            && pingora_cache::fill_cancellation::is_cache_fill_cancelled(error)
+    }
+
+    /// Called at most once when Pingora keeps processing a potential streaming cache fill after
+    /// the downstream becomes unusable, for a request that
+    /// [`Self::should_handle_downstream_abandonment`] opted in.
+    ///
+    /// It runs only while the fill can still produce an entry: during a miss with an active cache
+    /// writer, or with streaming storage before the response's cache decision is made, which can
+    /// be before response cacheability or miss-handler creation is known. Storage backends
+    /// without streaming partial writes propagate the downstream error and do not call this hook.
+    /// The hook runs inline on proxy I/O paths, so implementations should be cheap.
+    ///
+    /// It runs at most once per request, retries included, and [`Session::downstream_abandoned_during_cache_fill`]
+    /// stays `true` for the rest of the request. Applications can release their downstream demand
+    /// here, then call [`HttpCache::release_miss_writer_demand`] if a miss writer already exists.
+    /// Calling it before a writer exists does not affect writers created later, by the fill's
+    /// cache admission or by a retry, and this hook is not called again for them. An application
+    /// whose storage tracks writer demand therefore carries the abandonment to that storage
+    /// itself: for example, it keeps the abandonment in the request context, copies it into the
+    /// [`CacheMeta`](pingora_cache::CacheMeta) returned by [`Self::response_cache_filter`], and
+    /// has [`Storage::get_miss_handler`](pingora_cache::storage::Storage::get_miss_handler)
+    /// release the new writer's demand before returning it.
+    ///
+    /// The fill keeps running until the upstream completes unless a miss writer offers a
+    /// [`CacheFillCancellationWatcher`](pingora_cache::CacheFillCancellationWatcher) and its
+    /// [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) is cancelled. Cancelling
+    /// here, before any miss writer exists, is allowed and sticky; that type's documentation
+    /// explains when the proxy first acts on such a cancellation and why retries before then
+    /// ignore it.
+    /// From the point it applies the proxy ends the fill instead of waiting for more upstream data
+    /// and fails the request with
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED).
+    /// The cancellation is observed the next time the proxy asks for upstream data: data the
+    /// upstream already handed over is processed first, so a response whose final bytes have
+    /// already arrived is committed normally, and only a bounded amount of further data follows,
+    /// so an upstream that always has more ready cannot keep a cancelled fill running.
+    ///
+    /// A cancellation therefore cannot end an upstream that stalls before its response header:
+    /// it keeps readers waiting on the cache lock until their lock timeout, and keeps the
+    /// upstream connection until the peer's read timeout, which is unset by default. Set
+    /// [`PeerOptions::read_timeout`](pingora_core::upstreams::peer::PeerOptions::read_timeout)
+    /// and a cache lock timeout to bound both.
+    fn downstream_abandoned_during_cache_fill(&self, _session: &Session<DS>, _ctx: &mut Self::CTX) {
     }
 
     /// A value of true means that the proxy warning log message will be suppressed.
@@ -647,6 +899,9 @@ where
     /// Users may write an error response to the downstream if the downstream is still writable.
     ///
     /// The response status code of the error response may be returned for logging purposes.
+    /// By default no error response is written and 0 is returned once
+    /// [`Session::downstream_abandoned_during_cache_fill`] is true, since the proxy no longer
+    /// writes to that downstream. Overrides that write responses should check it too.
     /// Additionally, the user can return whether this session may be reused in spite of the error.
     /// Today this reuse status is only respected for errors that occur prior to upstream peer
     /// selection, and the keepalive configured on the `Session` itself still takes precedent.
@@ -660,6 +915,8 @@ where
         Self::CTX: Send + Sync,
     {
         let code = match e.etype() {
+            // Nothing written to a downstream that a cache fill abandoned can reach it.
+            _ if session.downstream_abandoned_during_cache_fill() => 0,
             HTTPStatus(code) => *code,
             _ => {
                 match e.esource() {
@@ -774,6 +1031,9 @@ where
 
 /// Context struct returned by `fail_to_proxy`.
 pub struct FailToProxy {
+    /// The response status that describes the failure, or 0 when none applies, such as for a
+    /// downstream connection that is already dead or one abandoned during a cache fill. The final
+    /// "Fail to proxy" error log reports it.
     pub error_code: u16,
     pub can_reuse_downstream: bool,
 }

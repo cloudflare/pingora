@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use ouroboros::self_referencing;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::InvalidCert, OrErr, Result};
 use pingora_rustls::CertificateDer;
 use std::hash::{Hash, Hasher};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -178,6 +178,24 @@ impl CertKey {
 }
 
 impl WrappedX509 {
+    /// Parse a DER-encoded X.509 certificate.
+    ///
+    /// Returns an [`InvalidCert`](pingora_error::ErrorType::InvalidCert) error if `raw_cert` is
+    /// not a valid DER-encoded certificate, or if any bytes follow the certificate.
+    pub fn parse(raw_cert: Vec<u8>) -> Result<Self> {
+        Self::try_new(raw_cert, |raw_cert| {
+            let (rest, cert) = X509Certificate::from_der(raw_cert)
+                .or_err(InvalidCert, "failed to parse DER certificate")?;
+            if !rest.is_empty() {
+                return Error::e_explain(
+                    InvalidCert,
+                    format!("{} trailing bytes after DER certificate", rest.len()),
+                );
+            }
+            Ok(cert)
+        })
+    }
+
     pub fn not_after(&self) -> String {
         self.borrow_cert().validity.not_after.to_string()
     }
@@ -220,5 +238,45 @@ impl Hash for CertKey {
 impl<'a> From<&'a WrappedX509> for CertificateDer<'static> {
     fn from(value: &'a WrappedX509) -> Self {
         CertificateDer::from(value.borrow_raw_cert().as_slice().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x509_parser::pem::Pem;
+
+    fn server_cert_der() -> Vec<u8> {
+        let pem = include_bytes!("../../../tests/keys/server.crt");
+        Pem::iter_from_buffer(pem).next().unwrap().unwrap().contents
+    }
+
+    #[test]
+    fn test_parse_valid_der() {
+        let der = server_cert_der();
+        let cert = WrappedX509::parse(der.clone()).unwrap();
+        assert_eq!(cert.borrow_raw_cert(), &der);
+        assert_eq!(get_common_name(&cert).as_deref(), Some("openrusty.org"));
+    }
+
+    #[test]
+    fn test_parse_invalid_der() {
+        let err = WrappedX509::parse(vec![0xff, 0x00, 0xde, 0xad]).unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert);
+    }
+
+    #[test]
+    fn test_parse_empty_der() {
+        let err = WrappedX509::parse(Vec::new()).unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert);
+    }
+
+    #[test]
+    fn test_parse_der_with_trailing_bytes() {
+        let mut der = server_cert_der();
+        der.extend_from_slice(&[0xde, 0xad]);
+        let err = WrappedX509::parse(der).unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert);
+        assert!(err.to_string().contains("trailing bytes"), "{err}");
     }
 }

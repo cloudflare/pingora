@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::protocols::http::custom::server::Session as CustomServerSession;
+use crate::protocols::http::v1::HeaderLimit;
 use crate::protocols::http::v2::server;
 use crate::protocols::http::{ReusableHttpStream, ServerSession};
 use crate::protocols::Digest;
@@ -87,6 +88,12 @@ pub struct HttpServerOptions {
     ///
     /// Unlike nginx, the default behavior here is _no limit_.
     pub keepalive_request_limit: Option<u32>,
+
+    /// Maximum number of fields accepted in an HTTP/1 request head.
+    ///
+    /// The default is [`HeaderLimit::Limited`] with a value of 256. This does not replace
+    /// Pingora's byte-size limit for the complete request head.
+    pub h1_header_count_limit: HeaderLimit,
 
     /// If set, close a downstream HTTP/2 connection that has been idle
     /// for this duration.
@@ -361,6 +368,9 @@ where
             return self.clone().process_custom_session(stream, shutdown).await;
         } else {
             // No ALPN or ALPN::H1 and h2c was not configured, fallback to HTTP/1.1
+            let h1_header_count_limit = self
+                .server_options()
+                .map_or_else(HeaderLimit::default, |opts| opts.h1_header_count_limit);
             let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
             if *shutdown.borrow() {
                 // stop downstream from reusing if this service is shutting down soon
@@ -373,10 +383,13 @@ where
                 self.server_options()
                     .and_then(|opts| opts.keepalive_request_limit),
             );
+            session.set_h1_header_count_limit(h1_header_count_limit);
 
             let mut result = self.process_new_http(session, shutdown).await;
             while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
                 let mut session = ServerSession::<DS>::new_http1_with_custom_session(stream);
+                // Keepalive reuse creates a fresh session, so reapply listener parser settings.
+                session.set_h1_header_count_limit(h1_header_count_limit);
                 if let Some(persistent_settings) = persistent_settings {
                     persistent_settings.apply_to_session(&mut session);
                 }
@@ -396,6 +409,14 @@ where
 mod tests {
     use super::*;
     use tokio_test::io::Builder;
+
+    #[test]
+    fn http_server_options_preserve_default_header_limit() {
+        assert_eq!(
+            HttpServerOptions::default().h1_header_count_limit,
+            HeaderLimit::default()
+        );
+    }
 
     #[test]
     fn test_persistent_settings_user_context_roundtrip() {

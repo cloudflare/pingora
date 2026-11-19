@@ -5,12 +5,13 @@ The pingora-proxy HTTP proxy framework supports highly programmable proxy behavi
 
 ## Life of a proxied HTTP request
 1. The life of a proxied HTTP request starts when the proxy reads the request header from the **downstream** (i.e., the client).
-2. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
-3. The proxy then sends the request header to the upstream.
-4. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
+2. If the request opts in to early body buffering (the `early_body_buffer` cargo feature, with `early_request_body_buffer_limit()` returning a limit), the proxy reads the whole request body from the downstream before choosing an upstream. Otherwise the body is read later, while it is proxied.
+3. Then, the proxy connects to the **upstream** (i.e., the remote server). This step is skipped if there is a previously established [connection to reuse](pooling.md).
+4. The proxy then sends the request header to the upstream.
+5. Once the request header is sent, the proxy enters a duplex mode, which simultaneously proxies:
     a. upstream response (both header and body) to the downstream, and
-    b. downstream request body to upstream (if any).
-5. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
+    b. downstream request body to upstream (if any; an early-buffered body is sent from memory).
+6. Once the entire request/response finishes, the life of the request is ended. All resources are released. The downstream connections and the upstream connections are recycled to be reused if applicable.
 
 ## Pingora-proxy phases and filters
 Pingora-proxy allows users to insert arbitrary logic into the life of a request.
@@ -18,6 +19,8 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
  graph TD;
     start("new request")-->early_request_filter;
     early_request_filter-->request_filter;
+    early_request_filter-.feature: early_body_buffer.->early_request_body_filter;
+    early_request_body_filter-->request_filter;
     request_filter-->upstream_peer;
 
     upstream_peer-->Connect{{IO: connect to upstream}};
@@ -60,11 +63,26 @@ This is the first phase of every request.
 
 This function is similar to `request_filter()` but executes before any other logic, including downstream module logic. The main purpose of this function is to provide finer-grained control of the behavior of the modules.
 
+Right after this phase, before downstream modules and `request_filter()` run, the proxy calls `should_handle_downstream_abandonment()` once to decide whether this request opts in to Pingora's handling of a client that leaves while its response is still being produced. The decision can use the context set up in this phase. It returns `false` by default, which keeps the proxy behaving as it did before that handling existed.
+
+### `early_request_body_filter()`
+This phase runs during early body buffering, **before** `request_filter()` and `upstream_peer()`. It is only called when `early_request_body_buffer_limit()` returns `Some(max_size)`, which opts in to reading and buffering the full request body before upstream peer selection. `early_request_body_buffer_timeout()` can optionally bound the complete buffering phase, including body-filter callbacks. No upstream timeout backstops this phase: HTTP/2 body reads have no per-read timeout and the HTTP/1 read timeout resets on every read, so applications enabling buffering should set a finite deadline. Requires the `early_body_buffer` cargo feature.
+
+Use this for processing that must happen before header filters run, such as streaming decompression. The buffered body is then available via `session.get_buffered_body()` in `request_filter()` for routing decisions, auth signature verification, or body mutation.
+
+Modify or discard each chunk through the callback's `body` argument. Set `*body = None` on every invocation to discard the entire body. After the buffering loop finishes, Pingora assembles the filtered chunks and stores the result, so do not call `session.set_buffered_body()` from `early_request_body_filter()`. To replace the fully assembled body, call it later from `request_filter()`.
+
+Whenever filtering or replacement changes the body length, update `Content-Length` and `Transfer-Encoding` before forwarding. In particular, leaving the original `Content-Length` after discarding bytes can leave an HTTP/1.1 upstream waiting for data that will never arrive. HTTP/2 stream termination is derived from the buffered body.
+
+Pingora answers an HTTP/1.1 or HTTP/2 `Expect: 100-continue` request locally before reading an automatically buffered body. The original header remains visible to application filters but is removed from the upstream request after `upstream_request_filter()`.
+
 ### `request_filter()`
-This phase is usually for validating request inputs, rate limiting, and initializing context.
+This phase is usually for validating request inputs, rate limiting, and initializing context. When early body buffering is enabled, the full body is already available via `session.get_buffered_body()`.
+
+Use `session.set_buffered_body()` here to replace the assembled body.
 
 ### `request_body_filter()`
-This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received.
+This phase is triggered after a request body is ready to send to upstream. It will be called every time a piece of request body is received. This runs during the upstream forwarding phase, after `upstream_peer()` and connection establishment.
 
 ### `proxy_upstream_filter()`
 This phase determines if we should continue to the upstream to serve a response. If we short-circuit, a 502 is returned by default, but a different response can be implemented.
@@ -126,7 +144,7 @@ This phase is usually for logging and post request cleanup.
 ### `request_summary()`
 This is not a phase, but a commonly used callback.
 
-Every error that reaches `fail_to_proxy()` will be automatically logged in the error log. `request_summary()` will be called to dump the info regarding the request when logging the error.
+Errors that reach `fail_to_proxy()` are logged in the error log unless `suppress_error_log()` suppresses them. `request_summary()` will be called to dump the info regarding the request when logging the error.
 
 This callback returns a string which allows users to customize what info to dump in the error log to help track and debug the failures.
 
@@ -134,6 +152,25 @@ This callback returns a string which allows users to customize what info to dump
 This is also not a phase, but another callback.
 
 `fail_to_proxy()` errors are automatically logged in the error log, but users may not be interested in every error. For example, downstream errors are logged if the client disconnects early, but these errors can become noisy if users are mainly interested in observing upstream issues. This callback can inspect the error and returns true or false. If true, the error will not be written to the log.
+
+By default, once a request that `should_handle_downstream_abandonment()` opted in has had its downstream abandoned during a cache fill, this suppresses exactly the errors `pingora_cache::fill_cancellation::is_cache_fill_cancelled()` recognizes: `ERR_CACHE_FILL_CANCELLED`, including when another error wraps it. A cache fill the application itself asked to end early is expected control flow rather than a failure. The error still reaches `logging()`, so access logs are unaffected. For any other request or error the default suppresses nothing. Overriding this callback replaces the default entirely, including that suppression.
+
+Besides errors that reach `fail_to_proxy()`, it is offered the failure of a cache hit of an opted-in request whose client watch ended the hit because the client closed or reset its connection or stream. Every other failed cache hit is logged as it is without the opt-in.
+
+### `downstream_abandoned_during_cache_fill()`
+This is also not a phase, but another callback.
+
+It applies only to a request that `should_handle_downstream_abandonment()` opted in. Pingora calls it when that request's downstream becomes unusable and Pingora keeps filling the cache without it. Pingora calls it at most once per request, retries included.
+
+Pingora calls it only if the fill can still produce a cache entry:
+* during a miss with an active cache writer, or
+* with streaming storage, before the response's cache decision is made. The response's cacheability and its cache writer may not be known yet at that point.
+
+With storage that does not support streaming partial writes, Pingora does not keep filling. It returns the downstream error and does not call this callback.
+
+The callback runs inline on proxy I/O paths, so keep it cheap.
+
+By default the fill then runs until the upstream response completes. A storage backend can let the application cancel it earlier: its miss handler returns a `CacheFillCancellationWatcher` from `HandleMiss::cancellation_watcher()`, and the application calls `cancel()` on the matching `CacheFillCancellation` once nobody is waiting for the fill, either inside this callback or later, for example when the last other reader of the same asset leaves. The proxy only honors the cancellation after the downstream was abandoned, because until then the fill is also the downstream's response, and it observes it the next time it asks for upstream data: data the upstream already handed over is processed first, so a response whose final upstream bytes have already arrived is committed normally, and only a bounded amount of further data follows, so an upstream that always has more ready cannot keep a cancelled fill running. An honored cancellation cancels the upstream read without waiting for more upstream data, drops the miss handler without `finish()`, and fails the request with `ERR_CACHE_FILL_CANCELLED`, which is never retried. One `CacheFillCancellation` covers one logical fill, including miss handlers created for later upstream attempts after abandonment; it must not be reused for an unrelated later request that happens to share the cache key.
 
 ### `suppress_proxy_warn_log()`
 This is also not a phase, but another callback.

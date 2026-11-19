@@ -122,6 +122,24 @@ impl<S: Session> HttpSession<S> {
         }
     }
 
+    /// Set the maximum number of fields accepted in an HTTP/1 response head.
+    ///
+    /// This is a no-op for non-HTTP/1 sessions.
+    pub fn set_h1_header_count_limit(&mut self, limit: super::v1::HeaderLimit) {
+        if let Self::H1(session) = self {
+            session.set_header_count_limit(limit);
+        }
+    }
+
+    /// Set the HTTP/1 response parser configuration.
+    ///
+    /// This is a no-op for non-HTTP/1 sessions.
+    pub fn set_h1_response_parser_config(&mut self, config: super::v1::ResponseParserConfig) {
+        if let Self::H1(session) = self {
+            session.set_response_parser_config(config);
+        }
+    }
+
     /// Read the response header from the server
     /// For http1, this function can be called multiple times, if the headers received are just
     /// informational headers.

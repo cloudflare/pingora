@@ -16,6 +16,7 @@ members = [
     "pingora-proxy",
     "pingora-cache",
     "pingora-http",
+    "pingora-http-parser",
     "pingora-lru",
     "pingora-openssl",
     "pingora-boringssl",
@@ -38,6 +39,7 @@ tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.12", features = ["rt"] }
 async-trait = "0.1.42"
 httparse = "1"
+pingora-http-parser = { version = "0.9.0", path = "pingora-http-parser" }
 bytes = "1.0"
 derivative = "2.2.0"
 http = "1"

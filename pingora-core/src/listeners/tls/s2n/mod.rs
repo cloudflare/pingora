@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use log::debug;
-use pingora_error::{ErrorType::InternalError, OrErr, Result};
+use pingora_error::{Error, ErrorType::InternalError, OrErr, Result};
 use pingora_s2n::{
     load_certs_and_key_files, ClientAuthType, Config, IgnoreVerifyHostnameCallback, S2NPolicy,
     TlsAcceptor, DEFAULT_TLS13,
@@ -225,6 +225,21 @@ impl TlsSettings {
 
 impl Acceptor {
     pub async fn tls_handshake<S: IO + 'static>(&self, stream: S) -> Result<TlsStream<S>> {
+        self.tls_handshake_checked(stream, |_| Ok(())).await
+    }
+
+    /// Run [`Self::tls_handshake`]. If a TLS offload thread runs the handshake, `check` runs
+    /// first on that thread, and an error from it is returned instead of starting the handshake.
+    /// Otherwise `check` is not called.
+    pub(crate) async fn tls_handshake_checked<S, E>(
+        &self,
+        stream: S,
+        check: impl FnOnce(&S) -> Result<(), E> + Send + 'static,
+    ) -> Result<TlsStream<S>, E>
+    where
+        S: IO + 'static,
+        E: From<Box<Error>> + Send + 'static,
+    {
         debug!("new tls session");
         if let Some(offload) = self.offload.as_ref() {
             // Clone without offload to prevent recursive offloading on the worker runtime.
@@ -234,12 +249,13 @@ impl Acceptor {
             };
             offload
                 .spawn_abort_on_drop(stream.id() as u64, async move {
-                    handshake(&acceptor, stream).await
+                    check(&stream)?;
+                    Ok::<_, E>(handshake(&acceptor, stream).await?)
                 })
                 .await
                 .or_err(InternalError, "TLS offload runtime failure")?
         } else {
-            handshake(self, stream).await
+            Ok(handshake(self, stream).await?)
         }
     }
 }

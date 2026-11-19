@@ -106,6 +106,15 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn response_written(&self) -> Option<&ResponseHeader>;
 
+    /// Whether the whole response is written, so nothing is left to deliver to the client.
+    ///
+    /// The proxy uses this to tell a client that failed after receiving its whole response from
+    /// one that left before it was complete. With the default `false`, every failure the proxy
+    /// counts as the client leaving is taken as leaving before the response was complete.
+    fn is_response_complete(&self) -> bool {
+        false
+    }
+
     fn shutdown(&mut self, code: u32, ctx: &str) -> impl Future<Output = ()> + Send;
 
     /// Abandon the response mid-message, in a way the peer can tell apart from a
@@ -132,6 +141,17 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn is_body_empty(&mut self) -> bool;
 
+    /// Read a request-body chunk, or watch for transport termination while idle.
+    ///
+    /// When `no_body_expected` is `false`, return body bytes or `Ok(None)` for EOF.
+    /// When it is `true`, no further request-body events are expected: remain pending
+    /// until a reset, disconnect, or other transport error can be returned as `Err`.
+    /// Do not return `Ok(None)` again or return additional body bytes in idle mode.
+    /// Implementations should reject either result as an internal error.
+    ///
+    /// This operation must be cancellation-safe: proxy loops may drop and recreate
+    /// its future when another request or response event becomes ready. Dropping
+    /// the future must not lose body bytes or a termination notification.
     fn read_body_or_idle(
         &mut self,
         no_body_expected: bool,

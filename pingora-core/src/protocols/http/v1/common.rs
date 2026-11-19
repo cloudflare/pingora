@@ -18,13 +18,12 @@ use http::{header, HeaderValue};
 use log::{debug, warn};
 use pingora_error::{Error, ErrorType::*, Result};
 use pingora_http::{HMap, RequestHeader, ResponseHeader};
+use pingora_http_parser::Header;
 use std::str;
 use std::time::Duration;
 
 use super::body::BodyWriter;
 use crate::utils::KVRef;
-
-pub(super) const MAX_HEADERS: usize = 256;
 
 pub(super) const INIT_HEADER_BUF_SIZE: usize = 4096;
 pub(super) const MAX_HEADER_SIZE: usize = 1048575;
@@ -35,12 +34,6 @@ pub const CRLF: &[u8; 2] = b"\r\n";
 /// The empty line that terminates a message's header section.
 pub(super) const HEADER_SECTION_END: &[u8; 4] = b"\r\n\r\n";
 pub const HEADER_KV_DELIMITER: &[u8; 2] = b": ";
-
-pub(super) enum HeaderParseState {
-    Complete(usize),
-    Partial,
-    Invalid(httparse::Error),
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum KeepaliveStatus {
@@ -268,13 +261,13 @@ pub(super) fn is_buf_keepalive(header_value: Option<&HeaderValue>) -> Option<boo
 }
 
 #[inline]
-pub(super) fn populate_headers(
+pub(super) fn populate_headers<'buf>(
     base: usize,
     header_ref: &mut Vec<KVRef>,
-    headers: &[httparse::Header],
+    headers: impl IntoIterator<Item = Header<'buf>>,
 ) -> usize {
     let mut used_header_index = 0;
-    for header in headers.iter() {
+    for header in headers {
         if !header.name.is_empty() {
             header_ref.push(KVRef::new(
                 header.name.as_ptr() as usize - base,

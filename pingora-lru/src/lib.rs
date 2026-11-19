@@ -33,6 +33,28 @@ use parking_lot::RwLock;
 use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Where [`Lru::mutate_pair`] inserts a key that did not previously exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Most recently used position.
+    Head,
+    /// Least recently used position.
+    #[default]
+    Tail,
+}
+
+/// Outcome of [`Lru::upsert_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Upsert {
+    /// An accepted existing entry was updated; carries its previous weight.
+    Updated(usize),
+    /// A missing entry was admitted.
+    Admitted,
+    /// An existing entry was rejected and left unchanged.
+    Rejected,
+}
+
 /// The LRU with `N` shards
 pub struct Lru<T, const N: usize> {
     units: [RwLock<LruUnit<T>>; N],
@@ -115,6 +137,27 @@ impl<T, const N: usize> Lru<T, N> {
         self.shard_lens[shard].fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Move the global weight from `old_weight` to `new_weight` with one atomic
+    /// read-modify-write.
+    ///
+    /// The change may go in either direction. Applying the net delta as a single
+    /// `fetch_add` or `fetch_sub` means a concurrent reader of [`Self::weight`] sees
+    /// this update either not at all or in full; two separate updates would expose
+    /// an intermediate total that no entry state ever had.
+    ///
+    /// `Relaxed` is enough: [`Self::weight`] is a best-effort shadow that publishes
+    /// no other data, so the update needs atomicity, not ordering.
+    #[inline]
+    fn apply_weight_change(&self, old_weight: usize, new_weight: usize) {
+        if new_weight >= old_weight {
+            self.weight
+                .fetch_add(new_weight - old_weight, Ordering::Relaxed);
+        } else {
+            self.weight
+                .fetch_sub(old_weight - new_weight, Ordering::Relaxed);
+        }
+    }
+
     /// Admit the key value to the [Lru]
     ///
     /// Return the shard index which the asset is added to
@@ -128,11 +171,11 @@ impl<T, const N: usize> Lru<T, N> {
 
         let old_weight = unit.admit(key, data, weight);
         if old_weight != weight {
-            self.weight.fetch_add(weight, Ordering::Relaxed);
             if old_weight > 0 {
-                self.weight.fetch_sub(old_weight, Ordering::Relaxed);
+                self.apply_weight_change(old_weight, weight);
             } else {
                 // Assume old_weight == 0 means a new item is admitted
+                self.weight.fetch_add(weight, Ordering::Relaxed);
                 self.incr_count(shard);
             }
         }
@@ -197,6 +240,74 @@ impl<T, const N: usize> Lru<T, N> {
         match old_weight {
             Some(old_weight) => {
                 if old_weight != new_weight {
+                    self.apply_weight_change(old_weight, new_weight);
+                }
+            }
+            None => {
+                self.weight.fetch_add(new_weight, Ordering::Relaxed);
+                self.incr_count(shard);
+            }
+        }
+        old_weight
+    }
+
+    /// Update an existing entry only if `predicate` accepts its data.
+    ///
+    /// The predicate, update, optional promotion, and weight accounting run under
+    /// the shard write lock. Callbacks must not re-enter this shard. The weight
+    /// returned by `update` is floored to `1`. Returns the old weight, or `None`
+    /// if the key is absent or rejected, leaving data, weight, and order unchanged.
+    pub fn update_if(
+        &self,
+        key: u64,
+        predicate: impl FnOnce(&T) -> bool,
+        update: impl FnOnce(&mut T, usize) -> usize,
+        promote: bool,
+    ) -> Option<usize> {
+        let shard = get_shard(key, N);
+        let unit = &mut *self.units[shard].write();
+        let node = unit.lookup_table.get_mut(&key)?;
+        if !predicate(&node.data) {
+            return None;
+        }
+        let new_weight = update(&mut node.data, node.weight).max(1);
+        let old_weight = LruUnit::adjust_weight(node, &mut unit.used_weight, new_weight);
+        if promote {
+            unit.order.promote(node.list_index);
+        }
+        if old_weight != new_weight {
+            self.weight.fetch_add(new_weight, Ordering::Relaxed);
+            self.weight.fetch_sub(old_weight, Ordering::Relaxed);
+        }
+        Some(old_weight)
+    }
+
+    /// Update an accepted existing entry, or admit a missing entry.
+    ///
+    /// Like [`Self::update_or_admit`], accepted updates promote the entry and all
+    /// weights are floored to `1`. Returns [`Upsert::Updated`] for an update,
+    /// [`Upsert::Admitted`] for admission, or [`Upsert::Rejected`] when an
+    /// existing entry fails `predicate` without changing data, weight, order, or counters.
+    /// `predicate` is not called for missing keys. All callbacks and accounting
+    /// run under the shard write lock; callbacks must not re-enter this shard.
+    pub fn upsert_if(
+        &self,
+        key: u64,
+        predicate: impl FnOnce(&T) -> bool,
+        update: impl FnOnce(&mut T, usize) -> usize,
+        admit_data: impl FnOnce() -> (T, usize),
+    ) -> Upsert {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+        if let Some(data) = unit.peek(key) {
+            if !predicate(data) {
+                return Upsert::Rejected;
+            }
+        }
+        let (old_weight, new_weight) = unit.update_or_admit(key, update, admit_data);
+        match old_weight {
+            Some(old_weight) => {
+                if old_weight != new_weight {
                     self.weight.fetch_add(new_weight, Ordering::Relaxed);
                     self.weight.fetch_sub(old_weight, Ordering::Relaxed);
                 }
@@ -206,7 +317,98 @@ impl<T, const N: usize> Lru<T, N> {
                 self.incr_count(shard);
             }
         }
-        old_weight
+        match old_weight {
+            Some(weight) => Upsert::Updated(weight),
+            None => Upsert::Admitted,
+        }
+    }
+
+    /// Mutate two distinct keys atomically under their existing shard locks.
+    ///
+    /// Locks are acquired in ascending shard order; keys in the same shard take
+    /// a single lock. The callback receives cloned data and weights; assigning
+    /// `None` removes a key, and assigning `Some` inserts or updates it. Existing
+    /// entries retain their order; new entries use the placement selected by the
+    /// callback (the tail by default), and
+    /// weights are floored to one. Callbacks must not re-enter this LRU.
+    /// Returns `None` without calling the callback when the keys are identical.
+    /// Weight increases are published before decreases, so a transfer cannot
+    /// transiently understate the global weight. Global counters remain
+    /// best-effort observations, not a cross-shard snapshot.
+    pub fn mutate_pair<R>(
+        &self,
+        first: u64,
+        second: u64,
+        mutate: impl FnOnce(&mut Option<(T, usize)>, &mut Option<(T, usize)>, &mut Placement) -> R,
+    ) -> Option<R>
+    where
+        T: Clone,
+    {
+        if first == second {
+            return None;
+        }
+        let a = get_shard(first, N);
+        let b = get_shard(second, N);
+        let low = a.min(b);
+        let high = a.max(b);
+        let mut low_unit = self.units[low].write();
+        let mut high_unit = (low != high).then(|| self.units[high].write());
+        let read = |key, shard| {
+            let unit = match high_unit.as_deref() {
+                Some(unit) if shard != low => unit,
+                _ => &*low_unit,
+            };
+            unit.lookup_table
+                .get(&key)
+                .map(|node| (node.data.clone(), node.weight))
+        };
+        let mut left = read(first, a);
+        let mut right = read(second, b);
+        let old_left = left.as_ref().map_or(0, |(_, weight)| *weight);
+        let old_right = right.as_ref().map_or(0, |(_, weight)| *weight);
+        let existed_left = left.is_some();
+        let existed_right = right.is_some();
+        let mut placement = Placement::default();
+        let result = mutate(&mut left, &mut right, &mut placement);
+        for value in [&mut left, &mut right].into_iter().flatten() {
+            value.1 = value.1.max(1);
+        }
+        let new_left = left.as_ref().map_or(0, |(_, weight)| *weight);
+        let new_right = right.as_ref().map_or(0, |(_, weight)| *weight);
+        self.weight
+            .fetch_add(new_left.saturating_sub(old_left), Ordering::Relaxed);
+        self.weight
+            .fetch_add(new_right.saturating_sub(old_right), Ordering::Relaxed);
+        for (key, shard, value, existed) in [
+            (first, a, left, existed_left),
+            (second, b, right, existed_right),
+        ] {
+            let unit = match high_unit.as_deref_mut() {
+                Some(unit) if shard != low => unit,
+                _ => &mut *low_unit,
+            };
+            match value {
+                Some((data, weight)) => {
+                    if let Some(node) = unit.lookup_table.get_mut(&key) {
+                        LruUnit::adjust_weight(node, &mut unit.used_weight, weight);
+                        node.data = data;
+                    } else {
+                        unit.insert_at(key, data, weight, placement);
+                        self.incr_count(shard);
+                    }
+                }
+                None if existed => {
+                    unit.remove(key);
+                    self.decr_count(shard);
+                }
+                None => {}
+            }
+        }
+        self.weight
+            .fetch_sub(old_left.saturating_sub(new_left), Ordering::Relaxed);
+        self.weight
+            .fetch_sub(old_right.saturating_sub(new_right), Ordering::Relaxed);
+        Some(result)
     }
 
     /// Set the weight associated with an existing key without changing LRU order.
@@ -222,10 +424,33 @@ impl<T, const N: usize> Lru<T, N> {
         let weight = weight.max(1);
         let old_weight = unit.set_weight(key, weight)?;
         if old_weight != weight {
-            self.weight.fetch_add(weight, Ordering::Relaxed);
-            self.weight.fetch_sub(old_weight, Ordering::Relaxed);
+            self.apply_weight_change(old_weight, weight);
         }
         Some(old_weight)
+    }
+
+    /// Set an existing key's weight if its current weight equals `expected_weight`.
+    ///
+    /// The comparison and update share the shard write lock. Missing keys or weight
+    /// mismatches return `false` without changes. A match returns `true`, floors the
+    /// new weight to `1`, and preserves the entry's data and LRU order.
+    ///
+    /// This never admits a missing key and never evicts, so growing an entry can
+    /// leave [`Self::weight`] above [`Self::weight_limit`] until the caller runs
+    /// [`Self::evict_to_limit`].
+    #[must_use = "the weight is unchanged when this returns `false`"]
+    pub fn set_weight_if_unchanged(&self, key: u64, expected_weight: usize, weight: usize) -> bool {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+
+        let weight = weight.max(1);
+        if !unit.set_weight_if_unchanged(key, expected_weight, weight) {
+            return false;
+        }
+        if expected_weight != weight {
+            self.apply_weight_change(expected_weight, weight);
+        }
+        true
     }
 
     /// Promote the key to the head of the LRU
@@ -377,6 +602,98 @@ impl<T, const N: usize> Lru<T, N> {
         removed
     }
 
+    /// Remove an existing entry only if `predicate` accepts its data.
+    ///
+    /// The predicate, removal, and accounting run under the shard write lock;
+    /// the callback must not re-enter this shard. Returns the removed data and
+    /// weight, or `None` for an absent or rejected key without changing anything.
+    /// Explicit removal does not increment eviction counters; see
+    /// [`Self::evict_if`] for a counted removal.
+    pub fn remove_if(&self, key: u64, predicate: impl FnOnce(&T) -> bool) -> Option<(T, usize)> {
+        self.remove_if_weight(key, |data, _| predicate(data))
+    }
+
+    /// Remove an entry only if its data and weight are accepted atomically.
+    ///
+    /// Like [`Self::remove_if`], the callback and removal run under the shard
+    /// write lock. This also permits compare-and-remove against a previously
+    /// observed weight without a check-then-remove race.
+    pub fn remove_if_weight(
+        &self,
+        key: u64,
+        predicate: impl FnOnce(&T, usize) -> bool,
+    ) -> Option<(T, usize)> {
+        self.remove_matching(key, predicate, false)
+    }
+
+    /// Evict an existing entry only if `predicate` accepts its data.
+    ///
+    /// Like [`Self::remove_if`], but a removal is counted in
+    /// [`Self::evicted_weight`] and [`Self::evicted_len`], as with
+    /// [`Self::evict_shard`]. Use this to complete an eviction whose victim was
+    /// chosen earlier, for example by [`Self::select_lru_if`]; selection alone
+    /// does not count as an eviction because it can be undone. The callback must
+    /// not re-enter this shard.
+    pub fn evict_if(&self, key: u64, predicate: impl FnOnce(&T) -> bool) -> Option<(T, usize)> {
+        self.remove_matching(key, |data, _| predicate(data), true)
+    }
+
+    /// Remove an entry accepted by `predicate` under its shard write lock,
+    /// optionally counting the removal as an eviction.
+    fn remove_matching(
+        &self,
+        key: u64,
+        predicate: impl FnOnce(&T, usize) -> bool,
+        count_as_eviction: bool,
+    ) -> Option<(T, usize)> {
+        let shard = get_shard(key, N);
+        let unit = &mut self.units[shard].write();
+        let node = unit.lookup_table.get(&key)?;
+        if !predicate(&node.data, node.weight) {
+            return None;
+        }
+        let removed = unit.remove(key)?;
+        self.weight.fetch_sub(removed.1, Ordering::Relaxed);
+        self.decr_count(shard);
+        if count_as_eviction {
+            self.evicted_weight.fetch_add(removed.1, Ordering::Relaxed);
+            self.evicted_len.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(removed)
+    }
+
+    /// Select and promote the least-recently-used eligible entry in a shard.
+    ///
+    /// The hash-like `shard` seed is mapped into `0..N` via `% N`. The scan
+    /// visits at most `max_scan` entries. Ineligible entries visited by the scan
+    /// are moved to the head of the shard. On a match, `select` receives the
+    /// entry's data and weight, then the entry is promoted. Callbacks must not
+    /// re-enter this shard. Returns cloned modified data and unchanged weight
+    /// without changing accounting, or `None` if no entry was selected.
+    pub fn select_lru_if(
+        &self,
+        shard: u64,
+        max_scan: usize,
+        predicate: impl Fn(&T) -> bool,
+        select: impl FnOnce(&mut T, usize),
+    ) -> Option<(T, usize)>
+    where
+        T: Clone,
+    {
+        let unit = &mut *self.units[get_shard(shard, N)].write();
+        for _ in 0..max_scan.min(unit.lookup_table.len()) {
+            let key = *unit.order.peek(unit.order.tail()?)?;
+            let node = unit.lookup_table.get_mut(&key)?;
+            if predicate(&node.data) {
+                select(&mut node.data, node.weight);
+                unit.order.promote(node.list_index);
+                return Some((node.data.clone(), node.weight));
+            }
+            unit.order.promote(node.list_index);
+        }
+        None
+    }
+
     /// Insert the item to the tail of this LRU.
     ///
     /// Useful to recreate an LRU in most-to-least order
@@ -394,6 +711,18 @@ impl<T, const N: usize> Lru<T, N> {
     /// Check existence of a key without changing the order in LRU.
     pub fn peek(&self, key: u64) -> bool {
         self.units[get_shard(key, N)].read().peek(key).is_some()
+    }
+
+    /// Inspect the data associated with a key without changing its position in
+    /// the LRU.
+    ///
+    /// The callback runs while holding the shard's read lock. Keep it brief and
+    /// do not call methods that would acquire the same shard's write lock.
+    pub fn peek_with<F>(&self, key: u64, inspect: F) -> bool
+    where
+        F: FnOnce(Option<&T>) -> bool,
+    {
+        inspect(self.units[get_shard(key, N)].read().peek(key))
     }
 
     /// Check the weight of a key without changing the order in LRU.
@@ -637,6 +966,23 @@ impl<T> LruUnit<T> {
         Some(Self::adjust_weight(node, &mut self.used_weight, weight))
     }
 
+    /// Set the weight when it matches, preserving data and LRU order.
+    pub fn set_weight_if_unchanged(
+        &mut self,
+        key: u64,
+        expected_weight: usize,
+        weight: usize,
+    ) -> bool {
+        let Some(node) = self.lookup_table.get_mut(&key) else {
+            return false;
+        };
+        if node.weight != expected_weight {
+            return false;
+        }
+        Self::adjust_weight(node, &mut self.used_weight, weight);
+        true
+    }
+
     // Check if a key is already in the top n most recently used nodes.
     // this is a heuristic to reduce write, which requires exclusive locks, for promotion,
     // especially on very populate nodes
@@ -686,10 +1032,17 @@ impl<T> LruUnit<T> {
     }
 
     pub fn insert_tail(&mut self, key: u64, data: T, weight: usize) -> bool {
+        self.insert_at(key, data, weight, Placement::Tail)
+    }
+
+    fn insert_at(&mut self, key: u64, data: T, weight: usize, placement: Placement) -> bool {
         if self.lookup_table.contains_key(&key) {
             return false;
         }
-        let list_index = self.order.push_tail(key);
+        let list_index = match placement {
+            Placement::Head => self.order.push_head(key),
+            Placement::Tail => self.order.push_tail(key),
+        };
         let node = Box::new(LruNode {
             data,
             list_index,
@@ -766,6 +1119,106 @@ impl<T> DoubleEndedIterator for LruUnitIter<'_, T> {
 #[cfg(test)]
 mod test_lru {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::{sync::Barrier, thread};
+
+    #[test]
+    fn pair_transfer_preserves_weight_counts_and_order() {
+        for destination in [2, 3] {
+            let lru = Lru::<u64, 2>::with_capacity(100, 0);
+            lru.insert_tail(0, 0, 12);
+            lru.insert_tail(4, 4, 1);
+            lru.mutate_pair(0, destination, |source, target, _| {
+                source.as_mut().unwrap().1 -= 5;
+                *target = Some((destination, 5));
+            });
+            assert_eq!(lru.weight(), 13);
+            assert_eq!(lru.len(), 3);
+            assert_eq!(lru.peek_weight(0), Some(7));
+            assert_eq!(lru.peek_weight(destination), Some(5));
+            assert_lru(
+                &lru,
+                if destination == 2 {
+                    &[0, 4, 2]
+                } else {
+                    &[0, 4]
+                },
+                0,
+            );
+            lru.mutate_pair(0, destination, |source, target, _| {
+                *source = None;
+                target.as_mut().unwrap().1 += 7;
+            });
+            assert_eq!(lru.weight(), 13);
+            assert_eq!(lru.len(), 2);
+            assert_eq!(lru.shard_len(0) + lru.shard_len(1), 2);
+            assert_eq!(lru.peek_weight(destination), Some(12));
+            assert!(lru
+                .mutate_pair(4, 4, |_, _, _| panic!("same key callback"))
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn pair_reverse_lock_order_and_update_are_atomic() {
+        let lru = Lru::<u64, 2>::with_capacity(1000, 0);
+        lru.insert_tail(0, 0, 100);
+        lru.insert_tail(1, 1, 100);
+        std::thread::scope(|scope| {
+            for (a, b) in [(0, 1), (1, 0)] {
+                let lru = &lru;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        lru.mutate_pair(a, b, |left, right, _| {
+                            let total = left.as_ref().unwrap().1 + right.as_ref().unwrap().1;
+                            assert_eq!(total, 200);
+                            std::mem::swap(
+                                &mut left.as_mut().unwrap().1,
+                                &mut right.as_mut().unwrap().1,
+                            );
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(lru.weight(), 200);
+        assert_eq!(lru.len(), 2);
+    }
+
+    #[test]
+    fn pair_insert_placement_and_zero_weight_removal() {
+        let lru = Lru::<u64, 1>::with_capacity(100, 0);
+        lru.insert_tail(1, 1, 0);
+        lru.insert_tail(2, 2, 2);
+        lru.mutate_pair(1, 3, |source, target, placement| {
+            *source = None;
+            *target = Some((3, 3));
+            *placement = Placement::Head;
+        });
+        assert_lru(&lru, &[3, 2], 0);
+        assert_eq!(lru.peek_weight(1), None);
+        assert_accounting(&lru, 5, 2);
+        lru.mutate_pair(2, 4, |_, target, _| *target = Some((4, 4)));
+        assert_lru(&lru, &[3, 2, 4], 0);
+        assert_accounting(&lru, 9, 3);
+    }
+
+    #[test]
+    fn conditional_weight_removal_rejects_changed_charge() {
+        let lru = Lru::<u64, 2>::with_capacity(100, 0);
+        lru.insert_tail(0, 7, 10);
+        lru.set_weight(0, 12);
+        assert!(lru
+            .remove_if_weight(0, |data, weight| *data == 7 && weight == 10)
+            .is_none());
+        assert_eq!(lru.weight(), 12);
+        assert_eq!(
+            lru.remove_if_weight(0, |data, weight| *data == 7 && weight == 12),
+            Some((7, 12))
+        );
+        assert_eq!(lru.weight(), 0);
+        assert_eq!(lru.shard_len(0), 0);
+    }
 
     fn assert_lru<T: Copy + PartialEq + std::fmt::Debug, const N: usize>(
         lru: &Lru<T, N>,
@@ -1025,6 +1478,527 @@ mod test_lru {
         assert_lru(&lru, &[3, 2, 1], 0);
     }
 
+    fn assert_accounting<T, const N: usize>(lru: &Lru<T, N>, weight: usize, len: usize) {
+        assert_eq!(lru.weight(), weight);
+        assert_eq!(lru.len(), len);
+        assert_eq!((lru.evicted_weight(), lru.evicted_len()), (0, 0));
+        let mut shard_weight = 0;
+        let mut shard_len = 0;
+        for shard in 0..N {
+            let unit = lru.units[shard].read();
+            assert_eq!(lru.shard_len(shard), unit.len());
+            shard_weight += unit.used_weight;
+            shard_len += unit.len();
+        }
+        assert_eq!((shard_weight, shard_len), (weight, len));
+    }
+
+    #[test]
+    fn test_update_if() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        lru.admit(1, 10, 2);
+        lru.admit(2, 20, 4);
+        assert_eq!(
+            lru.update_if(
+                3,
+                |_| unreachable!("absent key"),
+                |_, _| unreachable!("absent key"),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            lru.update_if(
+                1,
+                |data| *data == 99,
+                |_, _| unreachable!("rejected key"),
+                true,
+            ),
+            None
+        );
+        assert_lru(&lru, &[20, 10], 0);
+        assert_eq!(lru.peek_weight(1), Some(2));
+        assert_accounting(&lru, 6, 2);
+
+        assert_eq!(
+            lru.update_if(
+                1,
+                |data| *data == 10,
+                |data, weight| {
+                    *data += 1;
+                    weight + 3
+                },
+                false,
+            ),
+            Some(2)
+        );
+        assert_lru(&lru, &[20, 11], 0);
+        assert_eq!(lru.peek_weight(1), Some(5));
+        assert_accounting(&lru, 9, 2);
+
+        assert_eq!(lru.update_if(1, |_| true, |_, _| 0, true), Some(5));
+        assert_lru(&lru, &[11, 20], 0);
+        assert_eq!(lru.peek_weight(1), Some(1));
+        assert_accounting(&lru, 5, 2);
+        assert_eq!(lru.update_if(2, |_| true, |_, w| w, true), Some(4));
+        assert_lru(&lru, &[20, 11], 0);
+        assert_accounting(&lru, 5, 2);
+    }
+
+    #[test]
+    fn test_upsert_if() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        assert_eq!(
+            lru.upsert_if(
+                1,
+                |_| unreachable!("absent key"),
+                |_, _| unreachable!("absent key"),
+                || (10, 0),
+            ),
+            Upsert::Admitted
+        );
+        lru.admit(2, 20, 4);
+        assert_accounting(&lru, 5, 2);
+        assert_eq!(
+            lru.upsert_if(
+                1,
+                |data| *data == 99,
+                |_, _| unreachable!("colliding identity"),
+                || unreachable!("existing key"),
+            ),
+            Upsert::Rejected
+        );
+        assert_lru(&lru, &[20, 10], 0);
+        assert_eq!(lru.peek_weight(1), Some(1));
+        assert_accounting(&lru, 5, 2);
+
+        assert_eq!(
+            lru.upsert_if(
+                1,
+                |data| *data == 10,
+                |data, weight| {
+                    *data += 1;
+                    weight + 5
+                },
+                || unreachable!("existing key"),
+            ),
+            Upsert::Updated(1)
+        );
+        assert_lru(&lru, &[11, 20], 0);
+        assert_accounting(&lru, 10, 2);
+        assert_eq!(
+            lru.upsert_if(2, |_| true, |_, _| 0, || unreachable!("existing key")),
+            Upsert::Updated(4)
+        );
+        assert_lru(&lru, &[20, 11], 0);
+        assert_eq!(lru.peek_weight(2), Some(1));
+        assert_accounting(&lru, 7, 2);
+        assert_eq!(
+            lru.upsert_if(1, |_| true, |_, w| w, || unreachable!("existing key")),
+            Upsert::Updated(6)
+        );
+        assert_lru(&lru, &[11, 20], 0);
+        assert_accounting(&lru, 7, 2);
+    }
+
+    #[test]
+    fn test_remove_if() {
+        let lru = Lru::<_, 2>::with_capacity(30, 10);
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        lru.admit(1, 10, 3);
+        assert_eq!(lru.remove_if(6, |_| unreachable!("absent key")), None);
+        assert_eq!(lru.remove_if(2, |data| *data == 99), None);
+        assert_lru(&lru, &[40, 20], 0);
+        assert_lru(&lru, &[10], 1);
+        assert_eq!(lru.peek_weight(2), Some(2));
+        assert_accounting(&lru, 9, 3);
+        assert_eq!(lru.remove_if(2, |data| *data == 20), Some((20, 2)));
+        assert_lru(&lru, &[40], 0);
+        assert_accounting(&lru, 7, 2);
+        assert_eq!(lru.remove_if(2, |_| unreachable!("removed key")), None);
+        assert_accounting(&lru, 7, 2);
+    }
+
+    #[test]
+    fn test_evict_if() {
+        let lru = Lru::<_, 2>::with_capacity(30, 10);
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        lru.admit(1, 10, 3);
+        assert_eq!(lru.evict_if(6, |_| unreachable!("absent key")), None);
+        assert_eq!(lru.evict_if(2, |data| *data == 99), None);
+        assert_accounting(&lru, 9, 3);
+
+        // Selection alone must not count as an eviction.
+        let selected = lru.select_lru_if(0, 2, |_| true, |_, _| {});
+        assert_eq!(selected, Some((20, 2)));
+        assert_accounting(&lru, 9, 3);
+
+        assert_eq!(lru.evict_if(2, |data| *data == 20), Some((20, 2)));
+        assert_eq!((lru.weight(), lru.len()), (7, 2));
+        assert_eq!((lru.evicted_weight(), lru.evicted_len()), (2, 1));
+        assert_lru(&lru, &[40], 0);
+        assert_lru(&lru, &[10], 1);
+        assert_eq!(lru.evict_if(2, |_| unreachable!("evicted key")), None);
+
+        // Explicit removal still leaves the eviction counters alone.
+        assert_eq!(lru.remove_if(4, |_| true), Some((40, 4)));
+        assert_eq!(lru.evict_if(1, |data| *data == 10), Some((10, 3)));
+        assert_eq!((lru.weight(), lru.len()), (0, 0));
+        assert_eq!((lru.evicted_weight(), lru.evicted_len()), (5, 2));
+    }
+
+    #[test]
+    fn test_select_lru_if() {
+        let lru = Lru::<_, 2>::with_capacity(30, 10);
+        assert_eq!(
+            lru.select_lru_if(0, 3, |_| true, |_, _| unreachable!("empty")),
+            None
+        );
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        lru.admit(6, 60, 6);
+        lru.admit(1, 10, 1);
+        assert_eq!(
+            lru.select_lru_if(2, 3, |_| false, |_, _| unreachable!("no eligible entry")),
+            None
+        );
+        assert_lru(&lru, &[60, 40, 20], 0);
+        assert_accounting(&lru, 13, 4);
+        assert_eq!(
+            lru.select_lru_if(
+                2,
+                3,
+                |data| *data >= 40,
+                |data, weight| {
+                    assert_eq!(weight, 4);
+                    *data += 1;
+                }
+            ),
+            Some((41, 4))
+        );
+        assert_lru(&lru, &[41, 20, 60], 0);
+        assert_lru(&lru, &[10], 1);
+        assert_eq!(lru.peek_weight(4), Some(4));
+        assert_accounting(&lru, 13, 4);
+        assert_eq!(
+            lru.select_lru_if(
+                0,
+                3,
+                |data| *data == 20,
+                |data, weight| {
+                    assert_eq!(weight, 2);
+                    *data += 1;
+                }
+            ),
+            Some((21, 2))
+        );
+        assert_lru(&lru, &[21, 60, 41], 0);
+        assert_accounting(&lru, 13, 4);
+    }
+
+    #[test]
+    fn bounded_selection_rotates_skipped_entries() {
+        let lru = Lru::<u64, 1>::with_capacity(100, 0);
+        lru.insert_tail(1, 1, 7);
+        for key in 2..=6 {
+            lru.insert_tail(key, key, 1);
+        }
+        assert_eq!(
+            lru.select_lru_if(0, 0, |_| true, |_, _| unreachable!()),
+            None
+        );
+        assert_eq!(
+            lru.select_lru_if(0, 2, |data| *data == 1, |_, _| unreachable!()),
+            None
+        );
+        assert_accounting(&lru, 12, 6);
+        assert_eq!(
+            lru.select_lru_if(0, 2, |data| *data == 1, |_, _| unreachable!()),
+            None
+        );
+        assert_accounting(&lru, 12, 6);
+        assert_eq!(
+            lru.select_lru_if(0, 2, |data| *data == 1, |_, w| assert_eq!(w, 7)),
+            Some((1, 7))
+        );
+        assert_accounting(&lru, 12, 6);
+        assert_eq!(
+            lru.select_lru_if(0, 6, |_| false, |_, _| unreachable!()),
+            None
+        );
+        assert_accounting(&lru, 12, 6);
+    }
+
+    #[test]
+    fn test_update_remove_if_race() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        lru.admit(1, 10, 2);
+        let held = Barrier::new(2);
+        let release = Barrier::new(2);
+        let contender = Barrier::new(2);
+        thread::scope(|scope| {
+            let update = scope.spawn(|| {
+                lru.update_if(
+                    1,
+                    |data| {
+                        held.wait();
+                        release.wait();
+                        *data == 10
+                    },
+                    |data, weight| {
+                        *data = 20;
+                        weight + 3
+                    },
+                    true,
+                )
+            });
+            held.wait();
+            let locked = lru.units[0].try_write().is_none();
+            let remove = scope.spawn(|| {
+                contender.wait();
+                lru.remove_if(1, |data| *data == 20)
+            });
+            contender.wait();
+            release.wait();
+            assert_eq!(update.join().unwrap(), Some(2));
+            assert_eq!(remove.join().unwrap(), Some((20, 5)));
+            assert!(locked);
+        });
+        assert_accounting(&lru, 0, 0);
+
+        lru.admit(1, 10, 2);
+        thread::scope(|scope| {
+            let remove = scope.spawn(|| {
+                lru.remove_if(1, |data| {
+                    held.wait();
+                    release.wait();
+                    *data == 10
+                })
+            });
+            held.wait();
+            let locked = lru.units[0].try_write().is_none();
+            let update = scope.spawn(|| {
+                contender.wait();
+                lru.update_if(
+                    1,
+                    |_| unreachable!("removed key"),
+                    |_, _| unreachable!("removed key"),
+                    true,
+                )
+            });
+            contender.wait();
+            release.wait();
+            assert_eq!(remove.join().unwrap(), Some((10, 2)));
+            assert_eq!(update.join().unwrap(), None);
+            assert!(locked);
+        });
+        assert_lru(&lru, &[], 0);
+        assert_accounting(&lru, 0, 0);
+    }
+
+    #[test]
+    fn test_set_weight_if_unchanged_preserves_entries() {
+        let lru = Lru::<_, 2>::with_capacity(30, 10);
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        lru.admit(6, 60, 6);
+        lru.admit(1, 10, 10);
+
+        for (expected_weight, weight, stored_weight) in [(4, 9, 9), (9, 3, 3), (3, 0, 1), (1, 1, 1)]
+        {
+            assert!(lru.set_weight_if_unchanged(4, expected_weight, weight));
+            assert_eq!(lru.peek_weight(4), Some(stored_weight));
+            assert_eq!(lru.shard_weight(0), 2 + stored_weight + 6);
+            assert_eq!(lru.shard_weight(1), 10);
+            assert_eq!(lru.weight(), 2 + stored_weight + 6 + 10);
+            assert_eq!(lru.len(), 4);
+            assert_eq!(lru.shard_len(0), 3);
+            assert_eq!(lru.shard_len(1), 1);
+            assert_eq!(lru.evicted_len(), 0);
+            assert_eq!(lru.evicted_weight(), 0);
+            assert_lru(&lru, &[60, 40, 20], 0);
+            assert_lru(&lru, &[10], 1);
+        }
+
+        assert!(!lru.set_weight_if_unchanged(4, 0, 5));
+        assert_eq!(lru.peek_weight(4), Some(1));
+        assert_eq!(lru.weight(), 19);
+    }
+
+    #[test]
+    fn test_set_weight_if_unchanged_rejects_stale_weight() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        lru.admit(2, 20, 2);
+        lru.admit(4, 40, 4);
+        let observed_weight = lru.peek_weight(4).unwrap();
+        assert_eq!(lru.increment_weight(4, || 99, 5, None), 9);
+        lru.admit(6, 60, 6);
+
+        assert!(!lru.set_weight_if_unchanged(4, observed_weight, 1));
+        assert_eq!(lru.peek_weight(4), Some(9));
+        assert_eq!(lru.shard_weight(0), 17);
+        assert_eq!(lru.weight(), 17);
+        assert_eq!(lru.len(), 3);
+        assert_eq!(lru.shard_len(0), 3);
+        assert_lru(&lru, &[60, 40, 20], 0);
+    }
+
+    #[test]
+    fn test_set_weight_if_unchanged_missing_key() {
+        let lru = Lru::<_, 1>::with_capacity(30, 10);
+        lru.admit(1, 10, 3);
+
+        assert!(!lru.set_weight_if_unchanged(2, 0, 9));
+        assert_eq!(lru.peek_weight(2), None);
+        assert_eq!(lru.shard_weight(0), 3);
+        assert_eq!(lru.weight(), 3);
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.shard_len(0), 1);
+        assert_lru(&lru, &[10], 0);
+    }
+
+    #[test]
+    fn test_set_weight_if_unchanged_concurrent_increment() {
+        let lru = Lru::<_, 2>::with_capacity(30, 10);
+        lru.admit(1, 10, 5);
+        lru.admit(2, 20, 8);
+
+        for _ in 0..32 {
+            lru.set_weight(2, 8);
+            let start = Barrier::new(2);
+            let updated = thread::scope(|scope| {
+                let setter = scope.spawn(|| {
+                    start.wait();
+                    lru.set_weight_if_unchanged(2, 8, 2)
+                });
+                let incrementer = scope.spawn(|| {
+                    start.wait();
+                    lru.increment_weight(2, || 99, 4, None);
+                });
+                let updated = setter.join().unwrap();
+                incrementer.join().unwrap();
+                updated
+            });
+
+            let expected_weight = if updated { 6 } else { 12 };
+            assert_eq!(lru.peek_weight(2), Some(expected_weight));
+            assert_eq!(lru.shard_weight(0), expected_weight);
+            assert_eq!(lru.weight(), expected_weight + 5);
+            assert_eq!(lru.len(), 2);
+            assert_eq!(lru.shard_len(0), 1);
+            assert_eq!(lru.shard_len(1), 1);
+            assert_lru(&lru, &[20], 0);
+            assert_lru(&lru, &[10], 1);
+        }
+    }
+
+    /// Every path that changes an existing entry's weight (`admit` replacing an
+    /// entry, `update_or_admit`, `set_weight` and `set_weight_if_unchanged`) must
+    /// apply the change to the global weight as one net-delta atomic update, so
+    /// that `weight()` never reports a total that no entry state ever had.
+    ///
+    /// The LRU holds a single entry whose weight toggles between `LO` and `HI`, so
+    /// any other sampled value is such a transient, and correct code cannot fail
+    /// the check. A split update is caught only when a reader samples inside the
+    /// few instructions between its two halves, which cannot be widened without
+    /// instrumenting the code under test, so detection is probabilistic: each of
+    /// the `ITERS` updates opens a new window, and `READERS` threads sample
+    /// `weight()` continuously while the writer runs.
+    #[test]
+    fn weight_shadow_never_transiently_exceeds_the_true_value() {
+        #[derive(Debug, Clone, Copy)]
+        enum Site {
+            SetWeight,
+            SetWeightIfUnchanged,
+            UpdateOrAdmit,
+            AdmitReplace,
+        }
+
+        struct StopOnDrop<'a>(&'a AtomicBool);
+
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        const LO: usize = 3;
+        const HI: usize = 1_000_003;
+        const ITERS: usize = 50_000;
+        const READERS: usize = 2;
+
+        for site in [
+            Site::SetWeight,
+            Site::SetWeightIfUnchanged,
+            Site::UpdateOrAdmit,
+            Site::AdmitReplace,
+        ] {
+            let lru = Lru::<i32, 1>::with_capacity(usize::MAX / 2, 4);
+            lru.admit(1, 0, LO);
+
+            let violation = AtomicBool::new(false);
+            let stop = AtomicBool::new(false);
+            // Releases the readers and the writer together, so every reader
+            // thread has started before the writer mutates. Without it, a loaded
+            // or single-core scheduler could let the writer finish every
+            // iteration before a reader thread ever runs, silently turning this
+            // into a no-op check. The barrier makes overlap likely, not certain.
+            let start = Barrier::new(READERS + 1);
+
+            thread::scope(|scope| {
+                for _ in 0..READERS {
+                    let lru = &lru;
+                    let violation = &violation;
+                    let stop = &stop;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        while !stop.load(Ordering::Relaxed) {
+                            let w = lru.weight();
+                            if w != LO && w != HI {
+                                violation.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+                start.wait();
+                // Readers spin until `stop` is set, and `thread::scope` joins them
+                // before re-raising a panic, so a failed check below must set it too.
+                let _stop = StopOnDrop(&stop);
+
+                let mut current = LO;
+                for _ in 0..ITERS {
+                    let next = if current == LO { HI } else { LO };
+                    match site {
+                        Site::SetWeight => {
+                            lru.set_weight(1, next);
+                        }
+                        Site::SetWeightIfUnchanged => {
+                            assert!(lru.set_weight_if_unchanged(1, current, next));
+                        }
+                        Site::UpdateOrAdmit => {
+                            lru.update_or_admit(1, |_, _| next, || unreachable!());
+                        }
+                        Site::AdmitReplace => {
+                            lru.admit(1, 0, next);
+                        }
+                    }
+                    current = next;
+                }
+            });
+
+            assert!(
+                !violation.load(Ordering::Relaxed),
+                "{site:?}: weight() observed a value other than {LO} or {HI}"
+            );
+        }
+    }
+
     #[test]
     fn test_remove() {
         let lru = Lru::<_, 2>::with_capacity(30, 10);
@@ -1069,6 +2043,15 @@ mod test_lru {
 
         assert_lru(&lru, &[4, 2], 0);
         assert_lru(&lru, &[3], 1);
+    }
+
+    #[test]
+    fn test_peek_with() {
+        let lru = Lru::<String, 1>::with_capacity(10, 10);
+        lru.admit(2, "value".to_owned(), 1);
+
+        assert!(lru.peek_with(2, |data| data.is_some_and(|value| value == "value")));
+        assert!(!lru.peek_with(3, |data| data.is_some()));
     }
 
     #[test]

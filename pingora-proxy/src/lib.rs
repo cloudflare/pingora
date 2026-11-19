@@ -64,10 +64,13 @@ use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
+use pingora_core::protocols::http::custom::client::Session as _;
 use pingora_core::protocols::http::custom::server::Session as DownstreamSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
 use pingora_core::protocols::http::v1::client::HttpSession as HttpSessionV1;
+#[cfg(feature = "early_body_buffer")]
+use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::protocols::http::v2::server::H2Options;
 use pingora_core::protocols::http::HttpTask;
 use pingora_core::protocols::http::ServerSession as HttpSession;
@@ -95,6 +98,8 @@ mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
 pub mod subrequest;
+#[cfg(test)]
+mod test_support;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
@@ -326,6 +331,41 @@ where
         .await;
     }
 
+    /// Ignore a downstream failure so that a cache fill can continue without its downstream.
+    ///
+    /// This always marks the downstream errored. When
+    /// [`Session::handles_downstream_abandonment`] is set, the fill can still produce a cache
+    /// entry (see `ServeFromCache::can_still_fill_cache`) and the client left before its response
+    /// was completely delivered (see `Session::downstream_left_before_response_complete`), it
+    /// also stops waiting for the cached response to reach the downstream and, the first time,
+    /// records the abandonment and calls [`ProxyHttp::downstream_abandoned_during_cache_fill`].
+    /// Otherwise the failure is ignored exactly as without that handling. A failed downstream
+    /// read comes here only if `proxy_common::downstream_read_error_means_client_left` holds;
+    /// any other read error only marks the downstream errored.
+    fn abandon_downstream_for_cache_fill(
+        &self,
+        serve_from_cache: &proxy_cache::ServeFromCache,
+        downstream_state: &mut proxy_common::DownstreamStateMachine,
+        response_state: &mut proxy_common::ResponseStateMachine,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) where
+        SV: ProxyHttp<DS>,
+    {
+        downstream_state.to_errored();
+        if !session.handles_downstream_abandonment()
+            || !serve_from_cache.can_still_fill_cache(&session.cache)
+            || !session.downstream_left_before_response_complete()
+        {
+            return;
+        }
+        response_state.maybe_set_cache_done(true);
+        if session.mark_downstream_abandoned_during_cache_fill() {
+            self.inner
+                .downstream_abandoned_during_cache_fill(session, ctx);
+        }
+    }
+
     async fn handle_new_request(
         &self,
         mut downstream_session: Box<HttpSession<DS>>,
@@ -465,9 +505,33 @@ where
                         (server_reused, error)
                     }
                     ClientSession::Custom(mut c) => {
+                        let mut request_write_attempted = false;
                         let (server_reused, error) = self
-                            .proxy_to_custom_upstream(session, &mut c, client_reused, &peer, ctx)
+                            .proxy_to_custom_upstream(
+                                session,
+                                &mut c,
+                                client_reused,
+                                &peer,
+                                ctx,
+                                &mut request_write_attempted,
+                            )
                             .await;
+                        if request_write_attempted
+                            && error.as_ref().is_some_and(|e| {
+                                session.downstream_abandoned_during_cache_fill()
+                                    || session.is_cache_fill_cancellation(e)
+                            })
+                        {
+                            // Once the downstream is abandoned, the attempt can stop reading
+                            // mid-response, where a connected request would have read on, and
+                            // leave the session with no signal of where it left off, so it must
+                            // not be reused. Abandon before releasing rather than skipping
+                            // release outright, so the connector's own bookkeeping still runs.
+                            // Once its request header is written, any other failed attempt is
+                            // already abandoned by `proxy_to_custom_upstream`, so widening this
+                            // condition would abandon that session twice.
+                            c.abandon("proxy attempt failed").await;
+                        }
                         let session = ClientSession::Custom(c);
                         self.client_upstream
                             .release_http_session(session, &*peer, peer.idle_timeout())
@@ -618,8 +682,20 @@ where
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Set from [`ProxyHttp::should_handle_downstream_abandonment`] after `early_request_filter`.
+    handles_downstream_abandonment: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    /// Request body buffered early (before upstream connection) for auth/routing decisions.
+    /// When set, body forwarding will use this instead of re-reading from downstream. It must
+    /// outlive the first attempt so a retry can replay it.
+    /// Use accessor methods: `get_buffered_body()`, `set_buffered_body()`.
+    #[cfg(feature = "early_body_buffer")]
+    buffered_request_body: Option<Bytes>,
+    /// Whether body has been fully consumed for buffering.
+    /// Use accessor: `is_body_buffered()`.
+    #[cfg(feature = "early_body_buffer")]
+    body_buffered: bool,
 }
 
 impl<DS> Session<DS>
@@ -649,7 +725,12 @@ where
             upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
+            handles_downstream_abandonment: false,
             shutdown_flag,
+            #[cfg(feature = "early_body_buffer")]
+            buffered_request_body: None,
+            #[cfg(feature = "early_body_buffer")]
+            body_buffered: false,
         }
     }
 
@@ -694,6 +775,144 @@ where
 
     pub fn as_downstream(&self) -> &HttpSession<DS> {
         &self.downstream_session
+    }
+
+    /// Whether [`ProxyHttp::should_handle_downstream_abandonment`] opted this request in.
+    ///
+    /// The proxy asks once, right after [`ProxyHttp::early_request_filter`] succeeds, so this is
+    /// `false` until then and already set when [`ProxyHttp::request_filter`] runs.
+    pub fn handles_downstream_abandonment(&self) -> bool {
+        self.handles_downstream_abandonment
+    }
+
+    /// Set whether this request opted in to downstream abandonment handling.
+    ///
+    /// The proxy applies [`ProxyHttp::should_handle_downstream_abandonment`]'s answer through this
+    /// method once per request. It is not public, since changing the answer later in the request
+    /// would change how an abandonment already recorded is handled.
+    ///
+    /// For a subrequest session it also sets the subrequest's idle wait: with `handles` set, the
+    /// wait ends once the response is no longer received instead of once request input closes.
+    /// A parent that closes request input may still want the response:
+    /// [`pipe_subrequest`](crate::subrequest::pipe::pipe_subrequest) drops its request sender
+    /// whenever it returns, including on an error, while the state it returns keeps the response
+    /// receiver ([`pipe_rx`](crate::subrequest::pipe::PipeSubrequestState::pipe_rx)) for the
+    /// caller to drain. Only dropping that receiver abandons the subrequest. This changes only
+    /// the idle wait, which a subrequest enters once its request body is complete.
+    pub(crate) fn set_handles_downstream_abandonment(&mut self, handles: bool) {
+        self.handles_downstream_abandonment = handles;
+        // pingora-core implements a subrequest's idle wait and cannot read this flag.
+        if let Some(subrequest) = self.downstream_session.as_subrequest_mut() {
+            subrequest.set_idle_watches_response_receiver(handles);
+        }
+    }
+
+    /// Whether Pingora kept processing a potential cache fill of this request after its
+    /// downstream became unusable, that is, whether
+    /// [`ProxyHttp::downstream_abandoned_during_cache_fill`] was called for it.
+    ///
+    /// This records a past event, not an active cache writer: it can be set before cache
+    /// admission, and it stays `true` after the fill is declined or the request is retried.
+    /// Always `false` unless [`Self::handles_downstream_abandonment`] is set.
+    pub fn downstream_abandoned_during_cache_fill(&self) -> bool {
+        self.handles_downstream_abandonment && self.cache.downstream_abandoned_during_cache_fill()
+    }
+
+    /// Whether `error` is a cancelled cache fill of a request that
+    /// [`ProxyHttp::should_handle_downstream_abandonment`] opted in: its root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED),
+    /// wrapped or not. Always `false` for a request that did not opt in.
+    pub(crate) fn is_cache_fill_cancellation(&self, error: &Error) -> bool {
+        self.handles_downstream_abandonment
+            && pingora_cache::fill_cancellation::is_cache_fill_cancelled(error)
+    }
+
+    /// The no-cache reason for a cache failure that `error` caused.
+    ///
+    /// For a request that [`ProxyHttp::should_handle_downstream_abandonment`] opted in, an error whose
+    /// root type is
+    /// [`ERR_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED)
+    /// gives
+    /// [`REASON_CACHE_FILL_CANCELLED`](pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED),
+    /// whether or not the downstream was abandoned. Any other error, and any error of a request
+    /// that did not opt in, gives `fallback`.
+    pub(crate) fn cache_failure_reason(
+        &self,
+        error: &Error,
+        fallback: NoCacheReason,
+    ) -> NoCacheReason {
+        if self.is_cache_fill_cancellation(error) {
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        } else {
+            fallback
+        }
+    }
+
+    /// Whether this attempt's response work is done.
+    ///
+    /// A connected request follows downstream delivery. An abandoned request waits for the
+    /// upstream task producer and any active cache admission.
+    fn response_work_done(&self, response_state: &proxy_common::ResponseStateMachine) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            response_state.upstream_producer_done() && !self.cache.is_cache_admission_active()
+        } else {
+            response_state.is_done()
+        }
+    }
+
+    /// Whether the transport loop should still receive upstream tasks.
+    ///
+    /// Direct delivery may end before the upstream producer does; once the downstream is
+    /// abandoned only the producer's terminal task matters.
+    fn should_poll_upstream_tasks(
+        &self,
+        response_state: &proxy_common::ResponseStateMachine,
+    ) -> bool {
+        if self.downstream_abandoned_during_cache_fill() {
+            !response_state.upstream_producer_done()
+        } else {
+            !response_state.upstream_delivery_done()
+        }
+    }
+
+    /// Whether a downstream failure means the client left before its response was completely
+    /// delivered.
+    ///
+    /// A client whose response is complete (see
+    /// [`ServerSession::is_response_complete`](pingora_core::protocols::http::ServerSession::is_response_complete))
+    /// has everything this request owes it. A failed read reaches this check only if it closed or
+    /// broke the client's connection or stream (see `HttpProxy::abandon_downstream_for_cache_fill`).
+    fn downstream_left_before_response_complete(&self) -> bool {
+        !self.downstream_session.is_response_complete()
+    }
+
+    /// Whether a retry is still possible after abandonment.
+    ///
+    /// A retried attempt of an abandoned request can only fill the cache, so caching must still
+    /// be enabled. A bypassed response is admitted only if `cache_miss` enables caching again,
+    /// which it just declined or has not been asked yet, and nobody waits on that. The attempt
+    /// also never reads the abandoned downstream again, so it can only resend a request body
+    /// whose framing completed successfully. It also must not start while this attempt's cache
+    /// writer is still active, since a new admission cannot start on top of it.
+    ///
+    /// A requested fill cancellation is not an input here, and cannot be; see
+    /// [`CacheFillCancellation`](pingora_cache::CacheFillCancellation) for why, and for what an
+    /// application that must stop sooner does instead.
+    fn cache_fill_retry_allowed(&mut self) -> bool {
+        !self.downstream_abandoned_during_cache_fill()
+            || (self.downstream_session.is_body_complete()
+                && self.cache.enabled()
+                && !self.cache.is_cache_admission_active())
+    }
+
+    /// Record that the downstream became unusable during a potential cache fill, returning
+    /// `true` only the first time (see [`Self::downstream_abandoned_during_cache_fill`]).
+    ///
+    /// Records nothing if [`Self::handles_downstream_abandonment`] is unset or caching was
+    /// never enabled for this request.
+    pub(crate) fn mark_downstream_abandoned_during_cache_fill(&mut self) -> bool {
+        self.handles_downstream_abandonment
+            && self.cache.mark_downstream_abandoned_during_cache_fill()
     }
 
     /// Write HTTP response with the given error code to the downstream.
@@ -956,6 +1175,84 @@ where
         self.shutdown_flag.load(Ordering::Acquire)
     }
 
+    /// Returns a reference to the fully buffered request body, if non-empty.
+    ///
+    /// The body may be buffered automatically when
+    /// [`ProxyHttp::early_request_body_buffer_limit()`] returns `Some(max_size)`, or supplied by
+    /// application code through [`Self::set_buffered_body()`].
+    #[cfg(feature = "early_body_buffer")]
+    pub fn get_buffered_body(&self) -> Option<&Bytes> {
+        self.buffered_request_body.as_ref()
+    }
+
+    /// Sets a fully consumed request body for upstream forwarding.
+    ///
+    /// The body is retained and replayed across upstream retries. `None` marks the request body as
+    /// fully consumed and empty.
+    ///
+    /// When automatic early buffering is enabled, call this from
+    /// [`ProxyHttp::request_filter()`], after Pingora has assembled the filtered chunks. Do not
+    /// call it from [`ProxyHttp::early_request_body_filter()`]; that callback must modify its
+    /// `body` argument, and the buffering loop may overwrite the body you set when it stores the
+    /// assembled result.
+    ///
+    /// Application code calling this directly must first fully consume the downstream body and
+    /// handle `Expect: 100-continue` before reading. It must also update `Content-Length` and
+    /// `Transfer-Encoding` to describe the supplied body.
+    ///
+    /// Returns an error if the downstream body has not been fully consumed, including when its
+    /// read failed before the declared framing ended.
+    #[cfg(feature = "early_body_buffer")]
+    pub fn set_buffered_body(&mut self, body: Option<Bytes>) -> Result<()> {
+        // Also pins the H1 body reader to the original framing before callers rewrite it.
+        if !self.downstream_session.is_body_complete() {
+            return Error::e_explain(
+                InternalError,
+                "set_buffered_body called before the downstream body was fully consumed",
+            );
+        }
+        self.store_buffered_body(body);
+        Ok(())
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    fn store_buffered_body(&mut self, body: Option<Bytes>) {
+        self.body_buffered = true;
+        self.buffered_request_body = body.filter(|b| !b.is_empty());
+    }
+
+    /// Returns whether a body has been buffered (or confirmed empty).
+    ///
+    /// When `true`, the body has been fully read and is available via `get_buffered_body()`,
+    /// or the request has no body. Body forwarding will skip re-reading from downstream.
+    #[cfg(feature = "early_body_buffer")]
+    pub fn is_body_buffered(&self) -> bool {
+        self.body_buffered
+    }
+
+    /// Marks the body as buffered without setting a body.
+    ///
+    /// Used when buffering confirms that the request body is empty.
+    #[cfg(feature = "early_body_buffer")]
+    pub(crate) fn mark_body_buffered(&mut self) {
+        self.body_buffered = true;
+    }
+
+    /// Returns whether the request body is finished and any body to send before reading downstream.
+    ///
+    /// Without early buffering this preserves the ordinary retry-buffer behavior.
+    pub(crate) fn upstream_body_source(&mut self) -> (bool, Option<Bytes>) {
+        #[cfg(feature = "early_body_buffer")]
+        if self.body_buffered {
+            // Clone, never take: this bypasses the retry buffer, so it is the only replayable copy.
+            return (true, self.buffered_request_body.clone());
+        }
+        (
+            self.downstream_session.is_body_done(),
+            self.downstream_session.get_retry_buffer(),
+        )
+    }
+
     pub fn downstream_custom_message(&mut self) -> Result<Option<DownstreamCustomMessageReader>> {
         if let Some(custom_session) = self.downstream_session.as_custom_mut() {
             custom_session
@@ -1207,6 +1504,21 @@ where
         if self.inner.allow_spawning_subrequest(&session, &ctx) {
             session.subrequest_spawner = Some(SubrequestSpawner::new(self.clone()));
         }
+        let handles_downstream_abandonment = self
+            .inner
+            .should_handle_downstream_abandonment(&session, &ctx);
+        session.set_handles_downstream_abandonment(handles_downstream_abandonment);
+
+        // early body buffering: read full request body before request_filter
+        // see https://github.com/cloudflare/pingora/issues/780
+        #[cfg(feature = "early_body_buffer")]
+        if !session.is_body_buffered() {
+            if let Err(e) = self.buffer_request_body_early(&mut session, &mut ctx).await {
+                return self
+                    .handle_error(session, &mut ctx, e, "Failed to buffer request body:")
+                    .await;
+            }
+        }
 
         let req = session.downstream_session.req_header_mut();
 
@@ -1324,7 +1636,10 @@ where
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
+                Some(mut error) => {
+                    if !session.cache_fill_retry_allowed() {
+                        error.set_retry(false);
+                    }
                     let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
@@ -1382,6 +1697,7 @@ where
                 } else {
                     NoCacheReason::InternalError
                 };
+                let reason = session.cache_failure_reason(e, reason);
                 session.cache.disable(reason);
             }
             let res = self.inner.fail_to_proxy(&mut session, e, &mut ctx).await;
@@ -1445,6 +1761,208 @@ where
             None
         }
     }
+
+    /// Buffer the entire request body before connecting to upstream.
+    ///
+    /// This enables early_request_body_filter to run BEFORE upstream_peer selection,
+    /// allowing auth signature verification and content-based routing.
+    ///
+    /// Buffering is controlled by the trait method `early_request_body_buffer_limit()`:
+    /// - Returns `None`: Skip buffering, stream body to upstream (default)
+    /// - Returns `Some(max_size)`: Buffer body with size limit enforcement
+    ///
+    /// Size limit enforcement:
+    /// - Content-Length checked first (fail fast before reading)
+    /// - Accumulated size checked during reading (streaming protection)
+    /// - Returns HTTP 413 (Payload Too Large) if exceeded
+    #[cfg(feature = "early_body_buffer")]
+    async fn buffer_request_body_early(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        // check trait method for opt-in and size limit
+        let Some(max_size) = self.inner.early_request_body_buffer_limit(session, ctx) else {
+            return Ok(());
+        };
+
+        // skip if already buffered
+        if session.is_body_buffered() {
+            return Ok(());
+        }
+
+        let total_timeout = self.inner.early_request_body_buffer_timeout(session, ctx);
+        if let Some(total_timeout) = total_timeout {
+            match pingora_timeout::timeout(
+                total_timeout,
+                self.buffer_request_body_early_inner(session, ctx, max_size),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Error::e_explain(
+                    HTTPStatus(408),
+                    format!("buffering request body, timeout: {total_timeout:?}"),
+                )
+                .map_err(|e| e.into_down()),
+            }
+        } else {
+            self.buffer_request_body_early_inner(session, ctx, max_size)
+                .await
+        }
+    }
+
+    #[cfg(feature = "early_body_buffer")]
+    async fn buffer_request_body_early_inner(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        max_size: usize,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        let content_length = header_value_content_length(
+            session
+                .downstream_session
+                .req_header()
+                .headers
+                .get(header::CONTENT_LENGTH),
+        );
+
+        // fail fast: reject before reading if Content-Length exceeds limit
+        if let Some(cl) = content_length {
+            if cl > max_size {
+                return Error::e_explain(
+                    HTTPStatus(413),
+                    format!(
+                        "Request body too large: Content-Length {} exceeds limit {} bytes",
+                        cl, max_size
+                    ),
+                );
+            }
+        }
+
+        // Content-Length: 0 means no body; for all other cases (no Content-Length,
+        // Transfer-Encoding, HTTP/2) attempt to read. read_request_body returns
+        // None immediately if there's nothing.
+        if content_length == Some(0) {
+            // Initialize the downstream reader from the original framing before request_filter
+            // can replace the body and mutate Content-Length.
+            session.downstream_session.is_body_done();
+            session.mark_body_buffered();
+            return Ok(());
+        }
+
+        if expects_continue(session.downstream_session.req_header()) {
+            session
+                .downstream_session
+                .write_continue_response()
+                .await
+                .map_err(|e| e.into_down())?;
+        }
+
+        let mut first_part: Option<Bytes> = None;
+        let mut combined: Option<bytes::BytesMut> = None;
+        let mut input_size: usize = 0;
+        let mut retained_size: usize = 0;
+
+        // read body chunks until end of stream
+        loop {
+            let body_chunk: Option<Bytes> =
+                match session.downstream_session.read_request_body().await {
+                    Ok(chunk) => chunk,
+                    Err(e) => return Err(e.into_down()),
+                };
+
+            // end of stream: None means no more data, or downstream reports done
+            let end_of_body = body_chunk.is_none() || session.downstream_session.is_body_done();
+
+            if let Some(chunk) = body_chunk.as_ref() {
+                input_size = input_size.saturating_add(chunk.len());
+                if input_size > max_size {
+                    return Error::e_explain(
+                        HTTPStatus(413),
+                        format!(
+                            "Request body exceeded limit: {} > {} bytes",
+                            input_size, max_size
+                        ),
+                    );
+                }
+            }
+
+            // run early body filter (not module filters, they haven't run header filter yet)
+            let mut filter_data = body_chunk;
+            self.inner
+                .early_request_body_filter(session, &mut filter_data, end_of_body, ctx)
+                .await?;
+
+            // accumulate the (possibly filtered) data
+            if let Some(filtered) = filter_data {
+                retained_size = retained_size.saturating_add(filtered.len());
+
+                // check size limit during accumulation
+                if retained_size > max_size {
+                    return Error::e_explain(
+                        HTTPStatus(413),
+                        format!(
+                            "Request body exceeded limit: {} > {} bytes",
+                            retained_size, max_size
+                        ),
+                    );
+                }
+
+                if let Some(combined) = combined.as_mut() {
+                    combined.extend_from_slice(&filtered);
+                } else if let Some(first) = first_part.take() {
+                    // Content-Length is client-controlled, so it only seeds a bounded allocation.
+                    let capacity = content_length
+                        .unwrap_or(retained_size)
+                        .min(EARLY_BODY_PRESIZE_LIMIT)
+                        .max(retained_size);
+                    let mut body = bytes::BytesMut::with_capacity(capacity);
+                    body.extend_from_slice(&first);
+                    body.extend_from_slice(&filtered);
+                    combined = Some(body);
+                } else {
+                    first_part = Some(filtered);
+                }
+            }
+
+            if end_of_body {
+                break;
+            }
+        }
+
+        if retained_size == 0 {
+            session.mark_body_buffered();
+        } else if let Some(combined) = combined {
+            session.store_buffered_body(Some(combined.freeze()));
+        } else {
+            // common case: a single chunk can be moved without a second copy
+            session.store_buffered_body(first_part);
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "early_body_buffer")]
+const EARLY_BODY_PRESIZE_LIMIT: usize = 1 << 20;
+
+/// Like the H1 check, but also covers H2, which permits `Expect: 100-continue` too.
+#[cfg(feature = "early_body_buffer")]
+fn expects_continue(req: &RequestHeader) -> bool {
+    matches!(req.version, Version::HTTP_11 | Version::HTTP_2)
+        && req
+            .headers
+            .get(header::EXPECT)
+            .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"))
 }
 
 /* Make process_subrequest() a trait to workaround https://github.com/rust-lang/rust/issues/78649
@@ -1811,6 +2329,7 @@ where
     server_options: Option<HttpServerOptions>,
     client_options: Option<ConnectorOptions>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
+    runtime_group: Option<String>,
 }
 
 impl<SV> ProxyServiceBuilder<SV, (), ()> {
@@ -1833,6 +2352,7 @@ impl<SV> ProxyServiceBuilder<SV, (), ()> {
             server_options: None,
             client_options: None,
             runtime_opts_override: None,
+            runtime_group: None,
         }
     }
 }
@@ -1872,6 +2392,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
             ..
         } = self;
         ProxyServiceBuilder {
@@ -1883,6 +2404,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         }
     }
 
@@ -1913,6 +2435,14 @@ where
         self
     }
 
+    /// Run the [Service] built by this builder in the named runtime group.
+    ///
+    /// See [`Service::set_runtime_group`].
+    pub fn runtime_group(mut self, group: impl Into<String>) -> Self {
+        self.runtime_group = Some(group.into());
+        self
+    }
+
     /// Builds a new [Service] from the [ProxyServiceBuilder].
     ///
     /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
@@ -1933,6 +2463,7 @@ where
             server_options,
             client_options,
             runtime_opts_override,
+            runtime_group,
         } = self;
 
         let mut proxy = HttpProxy::new_custom(
@@ -1948,6 +2479,9 @@ where
         let mut service = Service::<_, DS>::new_with_custom_session(name, proxy);
         if let Some(runtime_opts_override) = runtime_opts_override {
             service.set_runtime_opts_override(runtime_opts_override);
+        }
+        if let Some(runtime_group) = runtime_group {
+            service.set_runtime_group(runtime_group);
         }
         service
     }
@@ -2067,7 +2601,7 @@ mod tests {
 
         DefaultRetryProxy
             .error_while_proxy(
-                &HttpPeer::new("127.0.0.1:80", false, "".to_string()),
+                &HttpPeer::new("127.0.0.1:80", false, "".to_string()).unwrap(),
                 session,
                 error,
                 &mut (),
@@ -2609,6 +3143,139 @@ mod tests {
         assert_raw_upgrade_payload(&written);
     }
 
+    #[cfg(feature = "early_body_buffer")]
+    mod body_buffer {
+        use super::*;
+
+        const EMPTY_POST: &[u8] =
+            b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
+
+        async fn empty_post_session() -> Session {
+            new_request_session(EMPTY_POST, Arc::new(Mutex::new(Vec::new()))).await
+        }
+
+        #[tokio::test]
+        async fn test_initial_state() {
+            let session = empty_post_session().await;
+            assert!(!session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_set_and_get_buffered_body() {
+            let mut session = empty_post_session().await;
+            let body = Bytes::from("test body");
+
+            session.set_buffered_body(Some(body.clone())).unwrap();
+
+            assert!(session.is_body_buffered());
+            assert_eq!(session.get_buffered_body(), Some(&body));
+        }
+
+        #[tokio::test]
+        async fn test_set_buffered_body_requires_consumed_downstream_body() {
+            let mut session = new_request_session(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            assert!(session.set_buffered_body(Some(Bytes::from("x"))).is_err());
+            assert!(!session.is_body_buffered());
+
+            while session.read_request_body().await.unwrap().is_some() {}
+            session.set_buffered_body(Some(Bytes::from("x"))).unwrap();
+            assert!(session.is_body_buffered());
+        }
+
+        #[tokio::test]
+        async fn test_set_buffered_body_rejects_truncated_downstream_body() {
+            let mut session = new_request_session(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhe",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            while let Ok(Some(_)) = session.read_request_body().await {}
+            assert!(session.downstream_session.is_body_done());
+            assert!(session.set_buffered_body(Some(Bytes::from("he"))).is_err());
+            assert!(!session.is_body_buffered());
+        }
+
+        #[tokio::test]
+        async fn test_mark_body_buffered() {
+            let mut session = empty_post_session().await;
+
+            session.mark_body_buffered();
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_set_none_marks_empty_body_buffered() {
+            let mut session = empty_post_session().await;
+
+            session.set_buffered_body(None).unwrap();
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_set_empty_body_reads_back_as_none() {
+            let mut session = empty_post_session().await;
+
+            session.set_buffered_body(Some(Bytes::new())).unwrap();
+            assert!(session.is_body_buffered());
+            assert!(session.get_buffered_body().is_none());
+        }
+
+        #[tokio::test]
+        async fn test_upstream_body_source_replays_buffered_body() {
+            let mut session = empty_post_session().await;
+            let body = Bytes::from("payload");
+            session.set_buffered_body(Some(body.clone())).unwrap();
+
+            for _ in 0..3 {
+                let (finished, buffer) = session.upstream_body_source();
+                assert!(finished);
+                assert!(
+                    proxy_common::DownstreamStateMachine::for_proxy_attempt(finished, false)
+                        .can_poll(),
+                    "finished bodies must still poll for close"
+                );
+                assert_eq!(buffer, Some(body.clone()));
+            }
+        }
+
+        #[tokio::test]
+        async fn test_upstream_body_source_empty_buffered_body() {
+            let mut session = empty_post_session().await;
+            session.set_buffered_body(None).unwrap();
+
+            let (finished, buffer) = session.upstream_body_source();
+            assert!(finished);
+            assert!(
+                proxy_common::DownstreamStateMachine::for_proxy_attempt(finished, false).can_poll()
+            );
+            assert_eq!(buffer, None);
+        }
+
+        #[test]
+        fn test_expects_continue_covers_h1_and_h2() {
+            for version in [Version::HTTP_11, Version::HTTP_2] {
+                let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+                req.set_version(version);
+                req.insert_header(header::EXPECT, "100-Continue").unwrap();
+                assert!(expects_continue(&req), "{version:?}");
+            }
+
+            let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+            req.set_version(Version::HTTP_10);
+            req.insert_header(header::EXPECT, "100-continue").unwrap();
+            assert!(!expects_continue(&req));
+        }
+    }
+
     /// A socket whose reads never complete, like an idle keep-alive connection
     /// waiting for its next request.
     #[derive(Debug)]
@@ -2706,5 +3373,350 @@ mod tests {
         .await
         .expect("read_request parked after shutdown");
         assert!(session.is_none());
+    }
+
+    /// Opts a request in from `early_request_filter` and records what `request_filter` sees.
+    struct AbandonmentOptInProxy {
+        seen_in_request_filter: Arc<std::sync::OnceLock<bool>>,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for AbandonmentOptInProxy {
+        type CTX = bool;
+
+        fn new_ctx(&self) -> Self::CTX {
+            false
+        }
+
+        async fn early_request_filter(
+            &self,
+            session: &mut Session,
+            opt_in: &mut bool,
+        ) -> Result<()> {
+            *opt_in = session.get_header_bytes("x-opt-in") == b"true";
+            Ok(())
+        }
+
+        fn should_handle_downstream_abandonment(&self, _session: &Session, opt_in: &bool) -> bool {
+            *opt_in
+        }
+
+        async fn request_filter(&self, session: &mut Session, _opt_in: &mut bool) -> Result<bool> {
+            self.seen_in_request_filter
+                .set(session.handles_downstream_abandonment())
+                .unwrap();
+            session.respond_error(204).await?;
+            Ok(true)
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _opt_in: &mut bool,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("request_filter responds to every request")
+        }
+    }
+
+    async fn opt_in_seen_by_request_filter(request: &[u8]) -> Option<bool> {
+        let seen_in_request_filter = Arc::new(std::sync::OnceLock::new());
+        let proxy = Arc::new(HttpProxy::new(
+            AbandonmentOptInProxy {
+                seen_in_request_filter: seen_in_request_filter.clone(),
+            },
+            Arc::new(ServerConf::default()),
+        ));
+        let session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        proxy.process_request(session, false).await;
+        seen_in_request_filter.get().copied()
+    }
+
+    #[tokio::test]
+    async fn request_filter_sees_the_downstream_abandonment_opt_in() {
+        let opted_in = b"GET / HTTP/1.1\r\nHost: example.com\r\nx-opt-in: true\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(opted_in).await, Some(true));
+        let default = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(opt_in_seen_by_request_filter(default).await, Some(false));
+    }
+
+    mod suppress_error_log_default {
+        use super::*;
+        use crate::proxy_common::cache_fill_cancelled;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+
+        /// A session whose opted-in request's downstream was abandoned during a cache fill.
+        async fn abandoned_session(path: &str) -> Session {
+            cache_miss_session(path, &AbandonmentTiming::BeforeAttempt, true)
+                .await
+                .0
+        }
+
+        fn unrelated_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        /// Always answers `suppress_error_log` the same way, to prove an override wins over
+        /// the default regardless of the error's etype.
+        struct OverrideProxy(bool);
+
+        #[async_trait]
+        impl ProxyHttp for OverrideProxy {
+            type CTX = ();
+            fn new_ctx(&self) -> Self::CTX {}
+
+            async fn upstream_peer(
+                &self,
+                _session: &mut Session,
+                _ctx: &mut Self::CTX,
+            ) -> Result<Box<HttpPeer>> {
+                unreachable!("not exercised by this test")
+            }
+
+            fn suppress_error_log(
+                &self,
+                _session: &Session,
+                _ctx: &Self::CTX,
+                _error: &Error,
+            ) -> bool {
+                self.0
+            }
+        }
+
+        #[tokio::test]
+        async fn only_the_cancellation_error_is_suppressed_by_default() {
+            let session = abandoned_session("/suppress-only-cancellation").await;
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an application-requested cancellation must not flood the error log"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &unrelated_error()),
+                "an unrelated error must still log at error level"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_override_replaces_the_default_in_both_directions() {
+            let session = abandoned_session("/suppress-override").await;
+            assert!(
+                OverrideProxy(true).suppress_error_log(&session, &(), &unrelated_error()),
+                "an override that suppresses everything must still suppress an unrelated error"
+            );
+            assert!(
+                !OverrideProxy(false).suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "an override that suppresses nothing must still log the cancellation error"
+            );
+        }
+
+        #[tokio::test]
+        async fn nothing_is_suppressed_by_default_without_the_opt_in() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-without-opt-in",
+                &AbandonmentTiming::AfterAdmission,
+                false,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a request that did not opt in must keep logging every final error"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy, so a cancellation that
+        // reaches a connected request comes from elsewhere and is a failure worth logging.
+        #[tokio::test]
+        async fn a_connected_request_logs_its_cancellation() {
+            let (session, _client) = cache_miss_session(
+                "/suppress-connected",
+                &AbandonmentTiming::AfterAdmission,
+                true,
+            )
+            .await;
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &cache_fill_cancelled()),
+                "a cancellation that failed a connected request was hidden from the error log"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wrapped_cancellation_is_still_suppressed_by_default() {
+            let session = abandoned_session("/suppress-wrapped").await;
+            let wrap = |cause: Box<Error>| {
+                Error::because(ErrorType::InternalError, "storage wrapped", cause)
+            };
+            assert!(
+                NoopProxy.suppress_error_log(&session, &(), &wrap(cache_fill_cancelled())),
+                "wrapping the cancellation made it log at error level"
+            );
+            assert!(
+                !NoopProxy.suppress_error_log(&session, &(), &wrap(unrelated_error())),
+                "a wrapped unrelated error must still log at error level"
+            );
+        }
+    }
+
+    mod fail_to_proxy_default {
+        use super::*;
+        use crate::test_support::{cache_miss_session, AbandonmentTiming};
+        use pingora_error::ErrorType;
+        use tokio::io::{AsyncReadExt, DuplexStream};
+
+        /// Run the default `fail_to_proxy` and return its code with whatever reached the client.
+        async fn fail_to_proxy_outcome(
+            path: &str,
+            abandonment: AbandonmentTiming,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(path, &abandonment, true).await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy.fail_to_proxy(&mut session, &error, &mut true).await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        async fn read_to_end(mut client: DuplexStream) -> Vec<u8> {
+            let mut written = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut written))
+                .await
+                .expect("dropping the session did not close the client half")
+                .unwrap();
+            written
+        }
+
+        fn upstream_read_error() -> Box<Error> {
+            Error::explain(ErrorType::ReadError, "upstream truncated").into_up()
+        }
+
+        // Nothing reaches a downstream that a cache fill abandoned, so by default no status
+        // describes the failure. `error_response_still_reaches_a_live_downstream` is the
+        // connected twin.
+        #[tokio::test]
+        async fn abandoned_downstream_reports_no_status_by_default() {
+            for (path, error) in [
+                ("/fail-to-proxy-abandoned-upstream", upstream_read_error()),
+                (
+                    "/fail-to-proxy-abandoned-http-status",
+                    Error::new(ErrorType::HTTPStatus(503)),
+                ),
+            ] {
+                let (code, written) =
+                    fail_to_proxy_outcome(path, AbandonmentTiming::BeforeAttempt, error).await;
+                assert_eq!(code, 0, "{path}: reported a status nobody received");
+                assert!(
+                    written.is_empty(),
+                    "{path}: an error response was written to an abandoned downstream: {written:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn error_response_still_reaches_a_live_downstream() {
+            let (code, written) = fail_to_proxy_outcome(
+                "/fail-to-proxy-live-upstream",
+                AbandonmentTiming::AfterAdmission,
+                upstream_read_error(),
+            )
+            .await;
+            assert_eq!(code, 502);
+            assert!(
+                written.starts_with(b"HTTP/1.1 502 "),
+                "the live downstream did not get the error response: {written:?}"
+            );
+        }
+
+        /// Run the default `fail_to_proxy` on a connected request's `error`.
+        async fn connected_fail_to_proxy_outcome(
+            path: &str,
+            mut handles_abandonment: bool,
+            error: Box<Error>,
+        ) -> (u16, Vec<u8>) {
+            let (mut session, client) = cache_miss_session(
+                path,
+                &AbandonmentTiming::AfterAdmission,
+                handles_abandonment,
+            )
+            .await;
+            let proxy = AbandonmentOptInProxy {
+                seen_in_request_filter: Default::default(),
+            };
+            let outcome = proxy
+                .fail_to_proxy(&mut session, &error, &mut handles_abandonment)
+                .await;
+            drop(session);
+            (outcome.error_code, read_to_end(client).await)
+        }
+
+        #[tokio::test]
+        async fn cancelled_error_keeps_the_old_mapping_without_the_opt_in() {
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-cancelled-without-opt-in",
+                false,
+                crate::proxy_common::cache_fill_cancelled(),
+            )
+            .await;
+            assert_eq!(
+                code, 400,
+                "a downstream error of a request that did not opt in keeps its old status"
+            );
+            assert!(
+                written.starts_with(b"HTTP/1.1 400 "),
+                "the error response must still be written: {written:?}"
+            );
+        }
+
+        // Only an abandoned fill can be cancelled through the proxy. A cancellation that fails a
+        // connected request, for example one a storage raised itself, still owes the client an
+        // error response.
+        #[tokio::test]
+        async fn a_connected_request_still_gets_an_error_response_for_a_cancellation() {
+            let storage_cancellation = Error::explain(
+                pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED,
+                "storage cancelled the fill",
+            );
+            let (code, written) = connected_fail_to_proxy_outcome(
+                "/fail-to-proxy-connected-cancellation",
+                true,
+                storage_cancellation,
+            )
+            .await;
+            assert_eq!(code, 500);
+            assert!(
+                written.starts_with(b"HTTP/1.1 500 "),
+                "the connected client did not get an error response: {written:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_fill_classification_follows_the_opt_in() {
+        let cancelled = Error::because(
+            InternalError,
+            "storage wrapped",
+            proxy_common::cache_fill_cancelled(),
+        );
+        let mut session = new_request_session(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "a request that did not opt in keeps the old no-cache reason"
+        );
+
+        session.set_handles_downstream_abandonment(true);
+        assert_eq!(
+            session.cache_failure_reason(&cancelled, NoCacheReason::StorageError),
+            NoCacheReason::Custom(pingora_cache::fill_cancellation::REASON_CACHE_FILL_CANCELLED)
+        );
+        assert_eq!(
+            session.cache_failure_reason(&Error::new(InternalError), NoCacheReason::StorageError),
+            NoCacheReason::StorageError,
+            "only a cancelled fill changes the reason"
+        );
     }
 }

@@ -187,7 +187,7 @@ impl CacheHashKey for CompactCacheKey {
  * use because hashing performance is not critical.
  * Note: we should avoid hashes like ahash which does not have consistent output
  * across machines because it is designed purely for in memory hashtable
-*/
+ */
 
 // hash output: we use 128 bits (16 bytes) hash which will map to 32 bytes hex string
 pub(crate) type Blake2b128 = Blake2b<blake2::digest::consts::U16>;

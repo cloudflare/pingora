@@ -123,4 +123,18 @@ mod test {
 
         assert_eq!(key_a, key_b);
     }
+
+    #[test]
+    fn test_value_differentiates_key() {
+        // the value is part of the key: gzip and br must not share a cached variant
+        let mut key_gzip = VarianceBuilder::new();
+        key_gzip.add_value("accept-encoding", "gzip");
+        let key_gzip = key_gzip.finalize().unwrap();
+
+        let mut key_br = VarianceBuilder::new();
+        key_br.add_value("accept-encoding", "br");
+        let key_br = key_br.finalize().unwrap();
+
+        assert_ne!(key_gzip, key_br);
+    }
 }

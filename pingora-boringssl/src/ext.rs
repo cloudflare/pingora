@@ -15,6 +15,7 @@
 //! the extended functionalities that are yet exposed via the [`boring`] APIs
 
 use boring::error::ErrorStack;
+use boring::ex_data::Index;
 use boring::pkey::{HasPrivate, PKeyRef};
 use boring::ssl::{Ssl, SslAcceptor, SslRef};
 use boring::x509::store::X509StoreRef;
@@ -23,6 +24,7 @@ use boring::x509::X509Ref;
 use foreign_types_shared::ForeignTypeRef;
 use libc::*;
 use std::ffi::CString;
+use std::sync::OnceLock;
 
 fn cvt(r: c_int) -> Result<c_int, ErrorStack> {
     if r != 1 {
@@ -201,4 +203,71 @@ pub fn is_suspended_for_cert(error: &boring::ssl::Error) -> bool {
 /// the caller needs to make sure that they hold a &mut SslRef
 pub unsafe fn ssl_mut(ssl: &SslRef) -> &mut SslRef {
     unsafe { SslRef::from_ptr_mut(ssl.as_ptr()) }
+}
+
+/// The downstream connection identifier stored by [`set_downstream_fd`]: the
+/// raw socket fd type on unix.
+///
+/// This is the same type as `pingora_core::protocols::UniqueIDType`, so a
+/// stream's `UniqueID::id()` can be stored without a cast.
+#[cfg(unix)]
+pub type DownstreamFd = i32;
+/// The downstream connection identifier stored by [`set_downstream_fd`]: a
+/// `RawSocket` held as `usize` on Windows.
+///
+/// This is the same type as `pingora_core::protocols::UniqueIDType`, so a
+/// stream's `UniqueID::id()` can be stored without a cast.
+#[cfg(windows)]
+pub type DownstreamFd = usize;
+
+/// Returns the `ex_data` slot shared by [`set_downstream_fd`] and
+/// [`get_downstream_fd`].
+fn downstream_fd_index() -> Index<Ssl, DownstreamFd> {
+    // Allocate the slot once per process: each `new_ex_index()` call returns a
+    // different slot, so a setter and getter holding separate slots never match.
+    static IDX: OnceLock<Index<Ssl, DownstreamFd>> = OnceLock::new();
+    *IDX.get_or_init(|| Ssl::new_ex_index().expect("alloc ssl ex_index for downstream fd"))
+}
+
+/// Stores the downstream connection identifier on `ssl`, replacing any previous
+/// value.
+///
+/// `pingora_core::protocols::tls::server::handshake_with_callback` calls this
+/// with the stream's `UniqueID::id()` just before it invokes
+/// `TlsAccept::certificate_callback`, which can read it back with
+/// [`get_downstream_fd`]. For pingora's L4 `Stream` the identifier is the raw
+/// socket fd, usable with calls such as `getsockopt`; other IO types may return
+/// an identifier that is not a socket. The stream still owns the fd, so the
+/// callback must not close it.
+pub fn set_downstream_fd(ssl: &mut SslRef, fd: DownstreamFd) {
+    ssl.set_ex_data(downstream_fd_index(), fd);
+}
+
+/// Returns the identifier stored by [`set_downstream_fd`], or `None` if nothing
+/// has been stored on `ssl`.
+pub fn get_downstream_fd(ssl: &SslRef) -> Option<DownstreamFd> {
+    ssl.ex_data(downstream_fd_index()).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boring::ssl::{SslContextBuilder, SslMethod};
+
+    #[test]
+    fn test_downstream_fd_round_trips() {
+        let ctx_builder = SslContextBuilder::new(SslMethod::tls()).unwrap();
+        let mut ssl = Ssl::new(&ctx_builder.build()).unwrap();
+
+        // Nothing stashed yet.
+        assert_eq!(get_downstream_fd(&ssl), None);
+
+        // A stashed fd reads back through the shared ex_data slot.
+        set_downstream_fd(&mut ssl, 42);
+        assert_eq!(get_downstream_fd(&ssl), Some(42));
+
+        // Overwriting replaces the previous value.
+        set_downstream_fd(&mut ssl, 7);
+        assert_eq!(get_downstream_fd(&ssl), Some(7));
+    }
 }

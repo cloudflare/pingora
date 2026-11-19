@@ -99,3 +99,18 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "time")))]
     pub use pingora_timeout::*;
 }
+
+#[cfg(all(test, feature = "dial9-cpu-profiling"))]
+mod dial9_cpu_profiling_api_tests {
+    use crate::server::{CpuProfilingConfig, Dial9RuntimeOpts, EventSource, SchedEventConfig};
+
+    #[test]
+    fn profiling_configuration_is_available_through_pingora_server() {
+        let opts = Dial9RuntimeOpts::new("trace")
+            .with_cpu_profiling(CpuProfilingConfig::default().event_source(EventSource::SwCpuClock))
+            .with_sched_events(SchedEventConfig::default());
+
+        assert!(opts.cpu_profiling.is_some());
+        assert!(opts.sched_events.is_some());
+    }
+}

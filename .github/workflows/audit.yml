@@ -3,7 +3,7 @@ name: Security Audit
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       - "**/Cargo.toml"
   schedule:
@@ -28,6 +28,6 @@ jobs:
 
       - name: Audit Check
         # https://github.com/rustsec/audit-check/issues/2
-        uses: rustsec/audit-check@master
+        uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

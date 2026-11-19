@@ -44,7 +44,7 @@ tokio = { workspace = true }
 lru = { workspace = true }
 ahash = { workspace = true }
 hex = "0.4"
-httparse = { workspace = true }
+pingora-http-parser = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
 rand = "0.8"
 arrayvec = "0.7"

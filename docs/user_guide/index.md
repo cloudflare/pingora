@@ -6,6 +6,7 @@ In this guide, we will cover the most used features, operations and settings of 
 * [Start and stop](start_stop.md)
 * [Graceful restart and graceful shutdown](graceful.md)
 * [Configuration](conf.md)
+* [Sharing runtimes between services](runtime_groups.md)
 * [Daemonization](daemon.md)
 * [Systemd integration](systemd.md)
 * [Handling panics](panic.md)

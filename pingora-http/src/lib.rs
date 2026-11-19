@@ -50,6 +50,29 @@ pub mod prelude {
     pub use crate::ResponseHeader;
 }
 
+/// HTTP/1 parsing configuration and backend capabilities.
+///
+/// Byte parsing and backend-specific storage remain implementation details of
+/// the parser compatibility layer.
+pub mod h1 {
+    pub use pingora_http_parser::{
+        capabilities as parser_capabilities, Capabilities as ParserCapabilities, HeaderLimit,
+        ResponseParserConfig,
+    };
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parser_configuration_is_reexported() {
+            let _: ParserCapabilities = parser_capabilities();
+            let _ = HeaderLimit::default();
+            let _ = ResponseParserConfig::default();
+        }
+    }
+}
+
 /* an ordered header map to store the original case of each header name
 HMap({
     "foo": ["Foo", "foO", "FoO"]
@@ -1197,6 +1220,28 @@ mod tests {
                 _ => panic!("too many headers"),
             }
         });
+    }
+
+    #[test]
+    fn test_remove_header_drops_case_name() {
+        // removing a header also drops its case-preserved name, keeping names paired with values
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.append_header("X-Removed", "gone").unwrap();
+        req.append_header("FoO", "Bar").unwrap();
+        req.remove_header("x-removed");
+        req.append_header("BAZ", "baR").unwrap();
+        let mut buf: Vec<u8> = vec![];
+        req.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"FoO: Bar\r\nBAZ: baR\r\n");
+
+        let mut resp = ResponseHeader::new(None);
+        resp.append_header("X-Removed", "gone").unwrap();
+        resp.append_header("FoO", "Bar").unwrap();
+        resp.remove_header("x-removed");
+        resp.append_header("BAZ", "baR").unwrap();
+        let mut buf: Vec<u8> = vec![];
+        resp.header_to_h1_wire(&mut buf);
+        assert_eq!(buf, b"FoO: Bar\r\nBAZ: baR\r\n");
     }
 
     // These two no longer need patched_http1: the target carries no representable

@@ -21,9 +21,12 @@ use http_body_util::BodyExt;
 use hyper_util::client::legacy::Client;
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
-use pingora_test_utils::http_origin::HttpOrigin;
+use pingora_test_utils::{
+    http_origin::HttpOrigin,
+    raw_http_origin::{read_http1_head, RawHttpOrigin},
+};
 use reqwest::{header, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use utils::server_utils::{
@@ -31,19 +34,81 @@ use utils::server_utils::{
     suppress_proxy_warn_log_calls,
 };
 
+#[test]
+fn certificate_install_keeps_open_readers_on_complete_file() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.pem");
+    let destination = dir.path().join("installed.pem");
+    std::fs::write(&source, b"new certificate").unwrap();
+    std::fs::write(&destination, b"old certificate").unwrap();
+
+    let mut reader = std::fs::File::open(&destination).unwrap();
+    utils::mock_origin::install_certificate(&source, &destination).unwrap();
+
+    let mut observed = Vec::new();
+    reader.read_to_end(&mut observed).unwrap();
+    assert_eq!(observed, b"old certificate");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new certificate");
+}
+
 fn is_specified_port(port: u16) -> bool {
     (1..65535).contains(&port)
 }
 
-#[tokio::test]
-async fn test_origin_alive() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:8000/").await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let headers = res.headers();
-    assert_eq!(headers[header::CONTENT_LENGTH], "13");
-    let body = res.text().await.unwrap();
-    assert_eq!(body, "Hello World!\n");
+async fn read_h1_headers(stream: &mut BufReader<TcpStream>) -> Vec<u8> {
+    let mut headers = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = stream.read_until(b'\n', &mut line).await.unwrap();
+        assert_ne!(
+            bytes_read, 0,
+            "upstream closed before sending request headers"
+        );
+        let done = line == b"\r\n";
+        headers.extend_from_slice(&line);
+        if done {
+            return headers;
+        }
+    }
+}
+
+async fn read_h1_chunked_body(stream: &mut BufReader<TcpStream>) -> (Vec<u8>, Vec<u8>) {
+    let mut wire_body = Vec::new();
+    let mut decoded_body = Vec::new();
+    loop {
+        let mut size_line = Vec::new();
+        let bytes_read = stream.read_until(b'\n', &mut size_line).await.unwrap();
+        assert_ne!(bytes_read, 0, "upstream closed before chunked body ended");
+        wire_body.extend_from_slice(&size_line);
+
+        let size_text = std::str::from_utf8(&size_line[..size_line.len() - 2]).unwrap();
+        let size_text = size_text.split(';').next().unwrap();
+        let chunk_size = usize::from_str_radix(size_text, 16).unwrap();
+        if chunk_size == 0 {
+            loop {
+                let mut trailer = Vec::new();
+                let bytes_read = stream.read_until(b'\n', &mut trailer).await.unwrap();
+                assert_ne!(bytes_read, 0, "upstream closed before chunk trailers ended");
+                let done = trailer == b"\r\n";
+                wire_body.extend_from_slice(&trailer);
+                if done {
+                    return (wire_body, decoded_body);
+                }
+            }
+        }
+
+        let mut chunk = vec![0; chunk_size];
+        stream.read_exact(&mut chunk).await.unwrap();
+        wire_body.extend_from_slice(&chunk);
+        decoded_body.extend_from_slice(&chunk);
+
+        let mut chunk_end = [0; 2];
+        stream.read_exact(&mut chunk_end).await.unwrap();
+        assert_eq!(&chunk_end, b"\r\n");
+        wire_body.extend_from_slice(&chunk_end);
+    }
 }
 
 #[tokio::test]
@@ -201,6 +266,102 @@ async fn test_h2c_to_h2c() {
 
     let body = res.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+#[tokio::test]
+async fn test_h2_to_h1_empty_end_stream_writes_one_terminator_and_reuses_origin() {
+    init_proxy().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let origin = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+
+        let first_headers = read_h1_headers(&mut stream).await;
+        assert!(String::from_utf8_lossy(&first_headers)
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"));
+        let (wire_body, decoded_body) = read_h1_chunked_body(&mut stream).await;
+        assert_eq!(decoded_body, b"body-data");
+        assert_eq!(
+            wire_body
+                .windows(b"0\r\n\r\n".len())
+                .filter(|window| *window == b"0\r\n\r\n")
+                .count(),
+            1,
+            "the chunked body must contain exactly one terminal chunk"
+        );
+
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        // This listener accepts only one socket. A second request here proves the
+        // proxy reused the same keep-alive origin connection.
+        let second_headers = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_h1_headers(&mut stream),
+        )
+        .await
+        .expect("no second request arrived on the pooled origin connection");
+        assert!(
+            String::from_utf8_lossy(&second_headers).starts_with("GET /second HTTP/1.1\r\n"),
+            "unexpected bytes before the follow-up request: {second_headers:?}"
+        );
+        stream
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut client, connection) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://example.test/first")
+        .header("x-port", origin_port.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut body) = client.send_request(request, false).unwrap();
+    body.send_data(Bytes::from_static(b"body-data"), false)
+        .unwrap();
+    body.send_data(Bytes::new(), true).unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the first response")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://example.test/second")
+        .header("x-port", origin_port.to_string())
+        .body(())
+        .unwrap();
+    let (response, _) = client
+        .ready()
+        .await
+        .unwrap()
+        .send_request(request, true)
+        .unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+        .await
+        .expect("timed out waiting for the follow-up response")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), origin)
+        .await
+        .expect("origin test task did not finish")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -682,13 +843,27 @@ async fn test_tls_underscore_non_sub_alt_verify_host() {
 
 #[tokio::test]
 async fn test_upstream_compression() {
-    init();
+    init_proxy().await;
+    let origin = HttpOrigin::bind(|request| async move {
+        assert!(request
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .is_some_and(|value| value.as_bytes() == b"gzip"));
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Bytes::from_static(b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let origin_port = origin.addr().port().to_string();
 
     // disable reqwest gzip support to check compression headers and body
     // otherwise reqwest will decompress and strip the headers
     let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
     let res = client
         .get("http://127.0.0.1:6147/no_compression")
+        .header("x-port", &origin_port)
         .header("accept-encoding", "gzip")
         .send()
         .await
@@ -702,6 +877,7 @@ async fn test_upstream_compression() {
     let client = reqwest::ClientBuilder::new().gzip(true).build().unwrap();
     let res = client
         .get("http://127.0.0.1:6147/no_compression")
+        .header("x-port", &origin_port)
         .header("accept-encoding", "gzip")
         .send()
         .await
@@ -709,6 +885,7 @@ async fn test_upstream_compression() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.bytes().await.unwrap();
     assert_eq!(body.as_ref(), &[b'B'; 32]);
+    origin.shutdown().await;
 }
 
 #[tokio::test]
@@ -911,28 +1088,15 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     assert!(resp.ends_with("ok"));
 }
 
-/// Read a complete HTTP/1 header block. A single `read()` can return a partial
-/// request line, so responding or asserting on one risks a flaky failure.
-async fn read_h1_head(stream: &mut TcpStream) -> String {
-    let mut head = Vec::new();
-    let mut buf = [0u8; 1024];
-    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-        let read = stream.read(&mut buf).await.unwrap();
-        assert_ne!(0, read, "connection closed before end of headers");
-        head.extend_from_slice(&buf[..read]);
-    }
-    String::from_utf8_lossy(&head).into_owned()
-}
-
 #[tokio::test]
 async fn test_absolute_form_request_target_h1() {
-    init();
+    init_proxy().await;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        let request = read_h1_head(&mut socket).await;
+        let request = read_http1_head(&mut socket).await;
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
             .await
@@ -948,7 +1112,7 @@ async fn test_absolute_form_request_target_h1() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let resp = read_h1_head(&mut stream).await;
+    let resp = read_http1_head(&mut stream).await;
     assert!(resp.lines().next().unwrap().contains(" 200 "));
 
     // RFC 9112 §3.2.2: absolute-form is accepted inbound and forwarded verbatim.
@@ -1190,7 +1354,13 @@ async fn test_tls_psk_invalid() {
 
 #[tokio::test]
 async fn test_error_before_headers_sent() {
-    init();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        let _ = read_http1_head(&mut stream).await;
+        stream.set_zero_linger().unwrap();
+    })
+    .await
+    .unwrap();
     let url = "http://127.0.0.1:6146/sleep/test_error_before_headers_sent.txt";
 
     let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
@@ -1202,6 +1372,7 @@ async fn test_error_before_headers_sent() {
 
     let request = Request::builder()
         .uri(url)
+        .header("x-port", origin.addr().port().to_string())
         .header("x-set-sleep", "0")
         .header("x-abort", "true")
         .body(())
@@ -1215,11 +1386,22 @@ async fn test_error_before_headers_sent() {
     while let Some(chunk) = body.data().await {
         assert_eq!(chunk.unwrap(), Bytes::new());
     }
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_error_after_headers_sent_rst_received() {
-    init();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        let _ = read_http1_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nAAAAA")
+            .await
+            .unwrap();
+        stream.set_zero_linger().unwrap();
+    })
+    .await
+    .unwrap();
     let url = "http://127.0.0.1:6146/connection_die/test_error_after_headers_sent_rst_received.txt";
 
     let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
@@ -1229,7 +1411,11 @@ async fn test_error_after_headers_sent_rst_received() {
         h2.await.unwrap();
     });
 
-    let request = Request::builder().uri(url).body(()).unwrap();
+    let request = Request::builder()
+        .uri(url)
+        .header("x-port", origin.addr().port().to_string())
+        .body(())
+        .unwrap();
 
     let (response, mut _stream) = client.send_request(request, true).unwrap();
 
@@ -1251,24 +1437,62 @@ async fn test_error_after_headers_sent_rst_received() {
             assert_eq!(err.reason().expect("reset reason"), h2::Reason::CANCEL);
         }
     }
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_103() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:6147/103").await.unwrap();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        let _ = read_http1_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n123456")
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/103")
+        .header("x-port", origin.addr().port().to_string())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let headers = res.headers();
     assert_eq!(headers[header::CONTENT_LENGTH], "6");
     let body = res.text().await.unwrap();
     assert_eq!(body, "123456");
+    origin.shutdown().await;
 }
 
 #[tokio::test]
 async fn test_103_die() {
-    init();
-    let res = reqwest::get("http://127.0.0.1:6147/103-die").await.unwrap();
+    init_proxy().await;
+    let origin = RawHttpOrigin::bind(|mut stream, _peer| async move {
+        let _ = read_http1_head(&mut stream).await;
+        stream
+            .write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        stream.set_zero_linger().unwrap();
+    })
+    .await
+    .unwrap();
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/103-die")
+        .header("x-port", origin.addr().port().to_string())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    origin.shutdown().await;
 }
 
 // Push request body until the proxy stops granting send capacity, which means it has
@@ -1324,7 +1548,7 @@ async fn test_h2_downstream_rst_while_upstream_write_blocked() {
     use std::future::poll_fn;
     use std::time::Duration;
 
-    init();
+    init_proxy().await;
 
     // An h2c upstream that accepts one request but never reads its body and never
     // sends window updates, so the proxy's upstream write blocks on flow control.
@@ -1400,7 +1624,7 @@ async fn test_h2_downstream_rst_during_cache_fill() {
     use std::future::poll_fn;
     use std::time::{Duration, Instant};
 
-    init();
+    init_proxy().await;
 
     let uri = "http://127.0.0.1:6154/test_h2_downstream_rst_during_cache_fill";
 
@@ -1662,3 +1886,9 @@ async fn test_h2_reset_before_headers_flush_keeps_headers_first() {
     drop(send_stream);
     let _ = conn_task.await;
 }
+
+#[path = "test_basic/cache_fill_abandonment.rs"]
+mod cache_fill_abandonment;
+
+#[path = "test_basic/gate_off_contract.rs"]
+mod gate_off_contract;

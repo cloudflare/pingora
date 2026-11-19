@@ -16,3 +16,5 @@
 //! Test utilities for Pingora services and libraries.
 
 pub mod http_origin;
+pub mod raw_http_origin;
+mod tcp_server;

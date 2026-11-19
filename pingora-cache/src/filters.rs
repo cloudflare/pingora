@@ -680,4 +680,25 @@ mod tests {
         assert!(!meta.headers().contains_key(SET_COOKIE));
         assert!(!meta.headers().contains_key("meta1"));
     }
+
+    #[test]
+    fn test_upstream_request_filter_revalidates_with_if_modified_since() {
+        // revalidation sends Last-Modified as If-Modified-Since, so the origin can answer 304
+        let last_modified = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let meta = resp_cacheable_wrapper(
+            build_response(200, &[(header::LAST_MODIFIED, last_modified)]),
+            &DEFAULTS,
+            false,
+        )
+        .unwrap();
+
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        upstream::request_filter(&mut req, Some(&meta));
+
+        assert_eq!(
+            req.headers.get(header::IF_MODIFIED_SINCE).unwrap(),
+            last_modified
+        );
+        assert!(!req.headers.contains_key(header::IF_UNMODIFIED_SINCE));
+    }
 }

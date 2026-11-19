@@ -20,7 +20,8 @@ path = "src/lib.rs"
 http = { workspace = true }
 bytes = { workspace = true }
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
+pingora-http-parser = { workspace = true }
 
 [features]
 default = []
-patched_http1 = []
+patched_http1 = ["pingora-http-parser/patched_http1"]

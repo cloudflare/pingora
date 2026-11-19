@@ -56,6 +56,24 @@ impl CustomMessageWrite for () {
     }
 }
 
+/// Writes a request body to a custom upstream.
+///
+/// The proxy takes the writer from the client session once the request header is written, and
+/// sends the request body through it:
+///
+/// - [`write_all_buf`](Self::write_all_buf) is called with each piece of the body as it arrives,
+///   except empty pieces before the end, and should write all of it.
+/// - [`finish`](Self::finish) is called when the body ends.
+/// - [`upgrade_body_writer`](Self::upgrade_body_writer) is called each time the proxy handles a
+///   piece of the body once the downstream session is upgraded, so it can be called more than
+///   once.
+/// - [`cleanup`](Self::cleanup) is called when the proxy finishes relaying the response without
+///   an error. It does not mean that the upload completed: the body may not have ended, for
+///   example when the client left while its response was being cached.
+///
+/// Once `write_all_buf` or `finish` fails, the proxy sends no more of the body and drops the
+/// writer without calling `cleanup`, even when the upstream still sends a complete response and
+/// the attempt succeeds.
 #[async_trait]
 pub trait BodyWrite: Send + Sync + Unpin + 'static {
     async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()>;
