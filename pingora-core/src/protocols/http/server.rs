@@ -797,6 +797,15 @@ where
         }
     }
 
+    /// The HTTP/2 stream id this session serves, if it is HTTP/2.
+    ///
+    /// Returns `None` for HTTP/1.x, subrequest and custom sessions. The value
+    /// is connection-scoped and monotonic for client-initiated streams, so it
+    /// is a stable key for per-stream accounting.
+    pub fn h2_stream_id(&self) -> Option<u32> {
+        self.as_http2().map(SessionV2::stream_id)
+    }
+
     pub fn as_subrequest(&self) -> Option<&SessionSubrequest> {
         match self {
             Self::H1(_) => None,
