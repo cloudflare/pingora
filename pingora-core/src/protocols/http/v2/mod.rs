@@ -253,6 +253,7 @@ mod test {
             let H2Accept::Session(mut h2_stream) = accepted else {
                 continue;
             };
+            assert_eq!(h2_stream.stream_id(), 1);
             handles.push(tokio::spawn(async move {
                 h2_stream.set_write_timeout(Some(Duration::from_millis(100)));
                 let req = h2_stream.req_header();
