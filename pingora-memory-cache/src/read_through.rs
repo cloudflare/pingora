@@ -393,12 +393,11 @@ where
         };
         /* fill in final_result */
         let mut n_miss = 0;
-        for item in hits {
-            match item.0 {
-                Some(v) => final_results.push((v, item.1)),
+        for (value, status) in hits {
+            match value {
+                Some(v) => final_results.push((v, status)),
                 None => {
-                    final_results // miss_results.len() === #None in result (asserted above)
-                    .push((miss_results[n_miss].0.clone(), CacheStatus::Miss));
+                    final_results.push((miss_results[n_miss].0.clone(), status));
                     n_miss += 1;
                 }
             }
@@ -721,6 +720,28 @@ mod tests {
         assert_eq!(resp[1].1, CacheStatus::Hit);
         assert_eq!(resp[2].0, 3);
         assert_eq!(resp[2].1, CacheStatus::Hit);
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_preserves_expired_status() {
+        let cache: RTCache<i32, i32, TestCB, ExtraOpt> = RTCache::new(10, None, None);
+        cache.inner.put(&1, 10, None);
+        cache.inner.store.force_put(
+            cache.inner.hasher.hash_one(2_i32),
+            crate::Node::new(20, Some(Duration::ZERO)),
+            1,
+        );
+
+        let results = cache.multi_get([1, 2, 3].iter(), None, None).await.unwrap();
+        assert_eq!(
+            results,
+            [
+                (10, CacheStatus::Hit),
+                (2, CacheStatus::Expired),
+                (3, CacheStatus::Miss),
+            ]
+        );
+        assert_eq!(cache.inner.get(&2), (Some(2), CacheStatus::Hit));
     }
 
     #[tokio::test]
