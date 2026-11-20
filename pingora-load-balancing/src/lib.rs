@@ -2369,6 +2369,19 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_round_robin_does_not_skip_backend_after_exhausting_budget() {
+        let disabled = Backend::new("127.0.0.1:8000").unwrap();
+        let enabled = Backend::new("127.0.0.1:8001").unwrap();
+        let discovery = discovery::Static::new(BTreeSet::from([disabled.clone(), enabled.clone()]));
+        let lb = LoadBalancer::<selection::RoundRobin>::from_backends(Backends::new(discovery));
+        lb.update().await.unwrap();
+        lb.backends().set_enable(&disabled, false);
+
+        assert_eq!(lb.select(b"", 1), None);
+        assert_eq!(lb.select(b"", 1), Some(enabled));
+    }
+
+    #[tokio::test]
     async fn test_discovery_readiness() {
         use discovery::Static;
 

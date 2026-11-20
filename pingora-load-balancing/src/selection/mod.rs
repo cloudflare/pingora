@@ -111,10 +111,8 @@ where
     }
 
     pub fn get_next(&mut self) -> Option<Backend> {
-        while let Some(item) = self.iter.next() {
-            if self.steps >= self.max_iterations {
-                return None;
-            }
+        while self.steps < self.max_iterations {
+            let item = self.iter.next()?;
             self.steps += 1;
 
             let hash_key = item.hash_key();
