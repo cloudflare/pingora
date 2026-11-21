@@ -16,8 +16,8 @@ use crate::protocols::digest::TimingDigest;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl, UniqueID,
-    UniqueIDType, ALPN,
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, GetTransportState, Peek, Shutdown,
+    SocketDigest, Ssl, TransportState, UniqueID, UniqueIDType, ALPN,
 };
 use crate::tls::TlsStream as S2NTlsStream;
 use crate::utils::tls::get_organization_serial_bytes;
@@ -323,6 +323,15 @@ impl SslDigest {
 }
 
 impl<S: AsyncRead + AsyncWrite + std::marker::Unpin> Peek for TlsStream<S> {}
+
+impl<S> GetTransportState for TlsStream<S>
+where
+    S: GetTransportState + AsyncRead + AsyncWrite + std::marker::Unpin,
+{
+    fn get_transport_state(&self) -> Option<TransportState> {
+        self.stream.get_ref().get_transport_state()
+    }
+}
 
 #[async_trait]
 impl<S: Shutdown + AsyncRead + AsyncWrite + std::marker::Unpin + Send> Shutdown for TlsStream<S> {

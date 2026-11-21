@@ -346,7 +346,8 @@ impl BodyReader {
     ///
     /// Overread bytes are bytes that were read from the stream but are beyond the
     /// end of the current request's body — i.e. they belong to a pipelined next
-    /// request on the same connection. Callers that support HTTP/1.1 pipelining
+    /// request on the same connection, or are early data that the idle read kept
+    /// with pipelining disabled. Callers that support HTTP/1.1 pipelining
     /// extract these bytes here and feed them to the next session's request
     /// parser via [`HttpSession::set_pipelined_prefix`](super::server::HttpSession::set_pipelined_prefix).
     pub fn take_body_overread(&mut self) -> Option<BytesMut> {
@@ -365,10 +366,11 @@ impl BodyReader {
     /// The "second request arrives in a separate read after the first
     /// request's body is already done" shape is different: the body
     /// reader never sees those bytes — they land on the idle-branch read
-    /// in [`super::server::HttpSession::read_body_or_idle`]. When
-    /// pipelining is enabled, that caller stashes the idle read here so
-    /// a single downstream overread surface covers both shapes and
-    /// [`Self::take_body_overread`] returns them uniformly.
+    /// in [`super::server::HttpSession::read_body_or_idle`]. That caller
+    /// stashes the idle read here so a single downstream overread surface
+    /// covers both shapes and [`Self::take_body_overread`] returns them
+    /// uniformly. With pipelining disabled, it stashes the read too, so
+    /// that the byte is not lost and the session refuses reuse.
     pub fn push_body_overread(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;

@@ -17,6 +17,7 @@
 use bstr::ByteSlice;
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
+use futures::FutureExt;
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
 use http::{header, header::AsHeaderName, Method, Version};
@@ -39,10 +40,10 @@ use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
 use crate::protocols::http::{
-    authority::validate_request_authority, body_buffer::FixedBuffer, date, HttpTask,
-    ReusableHttpStream,
+    authority::validate_request_authority, body_buffer::FixedBuffer, date, DownstreamGone,
+    HttpTask, ReusableHttpStream,
 };
-use crate::protocols::{Digest, SocketAddr, Stream};
+use crate::protocols::{Digest, SocketAddr, Stream, TransportState};
 use crate::utils::{BufRef, KVRef};
 
 /// Tracks which writer is currently processing a task.
@@ -154,15 +155,17 @@ pub struct HttpSession {
     /// call to [`Self::read_request`]. Set via [`Self::set_pipelined_prefix`] after
     /// the previous session's [`BodyReader::take_body_overread`] yielded bytes.
     pipelined_prefix: Option<BytesMut>,
-    /// Set once the idle-branch of [`Self::read_body_or_idle`] has read the
-    /// first bytes of a pipelined next request and pushed them onto the body
-    /// reader's overread surface. Further idle polls on the same request
-    /// return pending instead of re-reading the stream, so the body-pump
-    /// `tokio::select!` loop can exit via its other branches while the
-    /// stashed bytes travel through `reuse()` +
-    /// [`super::super::HttpPersistentSettings`] into the next session.
+    /// Set once the idle-branch of [`Self::read_body_or_idle`] has read early
+    /// data after the request body and pushed it onto the body reader's
+    /// overread surface. Further idle polls on the same request do not
+    /// re-read the stream. With pipelining enabled they return pending, so
+    /// the body-pump `tokio::select!` loop can exit via its other branches
+    /// while the stashed bytes travel through `reuse()` +
+    /// [`super::super::HttpPersistentSettings`] into the next session. With
+    /// pipelining disabled they return the same `ConnectError`, and `reuse()`
+    /// refuses the connection because of the stashed bytes.
     /// Scoped narrowly so it cannot affect FIN / `abort_on_close` semantics.
-    pipelined_idle_bytes_stashed: bool,
+    idle_bytes_stashed: bool,
 }
 
 impl HttpSession {
@@ -211,7 +214,7 @@ impl HttpSession {
             pipelining_enabled: false,
             header_limit: HeaderLimit::default(),
             pipelined_prefix: None,
-            pipelined_idle_bytes_stashed: false,
+            idle_bytes_stashed: false,
         }
     }
 
@@ -422,7 +425,7 @@ impl HttpSession {
                         self.request_header = Some(request_header);
 
                         self.body_reader.reinit();
-                        self.pipelined_idle_bytes_stashed = false;
+                        self.idle_bytes_stashed = false;
                         self.response_written = None;
                         self.respect_keepalive();
 
@@ -1258,17 +1261,21 @@ impl HttpSession {
                 }
                 return std::future::pending().await;
             }
-            // When pipelining is enabled and an earlier idle read already
-            // stashed the next request's bytes as overread, any further
-            // poll of this function on the same request must not read
-            // the stream again (the proxy's body-pump `select!` loop
-            // will call back into here repeatedly until its other
-            // branches resolve the request). Go straight to pending.
-            // `abort_on_close` and the FIN handling above stay untouched
-            // — this branch is exclusive to the pipelining case where
-            // bytes (not FIN) arrived on the idle poll.
-            if self.pipelining_enabled && self.pipelined_idle_bytes_stashed {
-                return std::future::pending().await;
+            // When an earlier idle read already stashed early data as
+            // overread, any further poll of this function on the same
+            // request must not read the stream again (the proxy's
+            // body-pump `select!` loop will call back into here
+            // repeatedly until its other branches resolve the request).
+            // With pipelining enabled, go straight to pending; without
+            // it, return the same error again. `abort_on_close` and the
+            // FIN handling above stay untouched — this branch is
+            // exclusive to the case where bytes (not FIN) arrived on the
+            // idle poll.
+            if self.idle_bytes_stashed {
+                if self.pipelining_enabled {
+                    return std::future::pending().await;
+                }
+                return Error::e_explain(ConnectError, "Sent data after end of body");
             }
             // XXX: account for upgraded body reader change, if the read half split from the write half
             let (probe, read) = self
@@ -1292,7 +1299,14 @@ impl HttpSession {
                     // will fail.
                     std::future::pending().await
                 }
-            } else if self.pipelining_enabled {
+            } else if !self.pipelining_enabled {
+                // Keep the byte as overread, as with pipelining, so that it is
+                // not lost and `reuse()` refuses the connection.
+                self.body_reader.push_body_overread(&probe[..read]);
+                self.idle_bytes_stashed = true;
+                self.set_keepalive(None);
+                Error::e_explain(ConnectError, "Sent data after end of body")
+            } else {
                 // The read bytes are the start of a pipelined next
                 // request on this keep-alive connection (RFC 9112
                 // §9.3.2). Stash them on the body reader's overread
@@ -1316,11 +1330,9 @@ impl HttpSession {
                 // flag prevents later idle polls for this request from
                 // reading the stream again.
                 self.body_reader.push_body_overread(&probe[..read]);
-                self.pipelined_idle_bytes_stashed = true;
+                self.idle_bytes_stashed = true;
                 debug!("pipelined request bytes stashed as overread ({read} bytes)");
                 std::future::pending().await
-            } else {
-                Error::e_explain(ConnectError, "Sent data after end of body")
             }
         } else {
             self.read_body_bytes().await
@@ -1330,6 +1342,36 @@ impl HttpSession {
     /// Whether the client has half-closed the TCP connection.
     pub fn is_half_closed(&self) -> bool {
         self.half_closed
+    }
+
+    /// Checks once, without waiting, whether the client has left.
+    ///
+    /// On TCP and Unix sockets, with or without TLS, this asks the socket without reading data
+    /// from the socket:
+    ///
+    /// - A reset means the client is gone.
+    /// - A close means the client is gone only after pingora has read the whole request body,
+    ///   and only if [`Self::set_abort_on_close`] is on (the default). Before then, pingora
+    ///   cannot tell whether the client sent the whole body.
+    /// - A TLS `close_notify` is not seen unless the TCP connection also closes.
+    /// - A close or reset that just happened can be missed.
+    ///
+    /// On other streams, this tries one read, and only after the request body is read. If the
+    /// client sent more data, pingora keeps the byte it read as overread. With pipelining off,
+    /// the connection is then not reused, and this returns [`DownstreamGone::UnexpectedData`].
+    pub fn downstream_gone(&mut self) -> Option<DownstreamGone> {
+        match self.underlying_stream.get_transport_state() {
+            Some(TransportState::Reset) => Some(DownstreamGone::Reset),
+            Some(TransportState::Closed) => {
+                (self.abort_on_close && self.is_body_done()).then_some(DownstreamGone::Closed)
+            }
+            Some(TransportState::Open) => None,
+            None if self.is_body_done() => {
+                let error = self.read_body_or_idle(true).now_or_never()?.err()?;
+                Some(DownstreamGone::from_idle_error(&error))
+            }
+            None => None,
+        }
     }
 
     /// Return the raw bytes of the request header.
@@ -1479,6 +1521,10 @@ impl HttpSession {
     pub async fn reuse(mut self) -> Result<Option<ReusableHttpStream>> {
         if !self.will_keepalive() {
             debug!("HTTP shutdown connection");
+            // TODO: linger after the shutdown when request body bytes are unread: keep reading and
+            // discarding them until the client closes or a short timeout passes. Closing with
+            // unread bytes makes the kernel send a reset, which can destroy the response before
+            // the client reads it (RFC 9112 section 9.6).
             self.shutdown().await;
             Ok(None)
         } else {
@@ -4363,6 +4409,7 @@ mod test_pipelining {
 
         let mut s = HttpSession::new(Box::new(mock_io));
         // Leave pipelining at the default (off).
+        s.set_server_keepalive(Some(60));
         s.read_request().await.unwrap();
         let _ = s.read_body_bytes().await.unwrap();
         assert!(s.is_body_done());
@@ -4376,6 +4423,15 @@ mod test_pipelining {
             pingora_error::ErrorType::ConnectError,
             "non-adopter callers must still see ConnectError on surplus idle bytes"
         );
+        // The byte is kept, and the connection is not reused.
+        assert_eq!(s.body_reader.get_body_overread().unwrap(), b"G");
+        assert!(!s.will_keepalive());
+        // A later call does not read again: the drained mock would return EOF, which is
+        // `ConnectionClosed`.
+        let err = s.read_body_or_idle(true).await.unwrap_err();
+        assert_eq!(*err.etype(), pingora_error::ErrorType::ConnectError);
+        s.set_server_keepalive(Some(60));
+        assert!(s.reuse().await.unwrap().is_none());
     }
 
     /// End-to-end: session A finishes with overread, bytes are extracted,
@@ -4624,5 +4680,157 @@ mod test_pipelining {
         }
 
         assert!(prefix.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod test_downstream_gone {
+    use super::*;
+    use crate::protocols::l4::stream::Stream as L4Stream;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use tokio_test::io::Builder;
+
+    const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+    const POST: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 4\r\n\r\n";
+    const UPGRADE_GET: &[u8] =
+        b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+
+    /// The check reads the socket's readiness, so these use real sockets.
+    async fn tcp_session(request: &[u8]) -> (HttpSession, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(request).await.unwrap();
+        let stream: L4Stream = server.into();
+        let mut s = HttpSession::new(Box::new(stream));
+        s.read_request().await.unwrap();
+        (s, client)
+    }
+
+    /// Wait until the I/O driver has seen `state` on the session's socket.
+    async fn wait_for_transport(s: &HttpSession, state: TransportState) {
+        timeout(Duration::from_secs(5), async {
+            while s.underlying_stream.get_transport_state() != Some(state) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the transport state did not arrive");
+    }
+
+    #[tokio::test]
+    async fn counts_a_close_only_after_the_body() {
+        let (mut s, mut client) = tcp_session(POST).await;
+        assert_eq!(s.downstream_gone(), None);
+        client.write_all(b"body").await.unwrap();
+        client.shutdown().await.unwrap();
+        wait_for_transport(&s, TransportState::Closed).await;
+        assert_eq!(s.downstream_gone(), None);
+        // Nothing was read.
+        assert_eq!(s.read_body_bytes().await.unwrap().unwrap(), &b"body"[..]);
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::Closed));
+        assert!(!s.is_half_closed());
+        s.set_abort_on_close(false);
+        assert_eq!(s.downstream_gone(), None);
+    }
+
+    #[tokio::test]
+    async fn counts_a_reset_behind_unread_body() {
+        let (mut s, mut client) = tcp_session(POST).await;
+        client.write_all(b"bo").await.unwrap();
+        #[allow(deprecated)]
+        client.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+        wait_for_transport(&s, TransportState::Reset).await;
+        assert!(!s.is_body_done());
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::Reset));
+    }
+
+    #[tokio::test]
+    async fn reads_no_data() {
+        let (mut s, mut client) = tcp_session(GET).await;
+        client.write_all(b"GET /next").await.unwrap();
+        // Let the I/O driver see the data.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(s.downstream_gone(), None);
+        assert!(!s.body_reader.has_bytes_overread());
+        let mut next = [0u8; 9];
+        s.underlying_stream.read_exact(&mut next).await.unwrap();
+        assert_eq!(&next, b"GET /next");
+    }
+
+    // The mock stream cannot report its state, so these use the idle read.
+
+    async fn mock_session(mock: &mut Builder) -> HttpSession {
+        let mut s = HttpSession::new(Box::new(mock.build()));
+        s.read_request().await.unwrap();
+        assert_eq!(s.underlying_stream.get_transport_state(), None);
+        s
+    }
+
+    #[tokio::test]
+    async fn idle_read_counts_a_close() {
+        let mut s = mock_session(Builder::new().read(GET)).await;
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::Closed));
+        let mut s = mock_session(Builder::new().read(GET)).await;
+        s.set_abort_on_close(false);
+        assert_eq!(s.downstream_gone(), None);
+        assert!(s.is_half_closed());
+    }
+
+    #[tokio::test]
+    async fn idle_read_counts_a_read_error() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let mut s = mock_session(Builder::new().read(GET).read_error(reset)).await;
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::Reset));
+    }
+
+    #[tokio::test]
+    async fn idle_read_waits_for_the_body() {
+        let mut s = mock_session(Builder::new().read(POST).read(b"bo")).await;
+        assert_eq!(s.downstream_gone(), None);
+        assert_eq!(s.read_body_bytes().await.unwrap().unwrap(), &b"bo"[..]);
+    }
+
+    #[tokio::test]
+    async fn idle_read_keeps_early_data_without_pipelining() {
+        let mut s = mock_session(Builder::new().read(GET).read(b"xyz")).await;
+        s.set_server_keepalive(Some(60));
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::UnexpectedData));
+        assert_eq!(s.body_reader.get_body_overread().unwrap(), b"x");
+        assert!(!s.will_keepalive());
+        // A later call does not read again.
+        assert_eq!(s.downstream_gone(), Some(DownstreamGone::UnexpectedData));
+        let mut rest = Vec::new();
+        s.underlying_stream.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"yz");
+    }
+
+    /// With pipelining enabled, early data on an upgrade request is kept, and the upgraded body
+    /// starts with it.
+    #[tokio::test]
+    async fn idle_read_keeps_early_upgrade_data_for_the_tunnel() {
+        let mut s = mock_session(
+            Builder::new()
+                .read(UPGRADE_GET)
+                .read(b"AB")
+                .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+                .read(b"CD"),
+        )
+        .await;
+        s.set_pipelining_enabled(true);
+        assert_eq!(s.downstream_gone(), None);
+        assert!(s.body_reader.has_bytes_overread());
+        let mut resp = ResponseHeader::build(101, None).unwrap();
+        resp.set_version(http::Version::HTTP_11);
+        s.write_response_header(Box::new(resp)).await.unwrap();
+        let mut body = Vec::new();
+        while body.len() < 4 {
+            body.extend_from_slice(&s.read_body_bytes().await.unwrap().unwrap());
+        }
+        assert_eq!(body, b"ABCD");
     }
 }

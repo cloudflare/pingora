@@ -68,7 +68,7 @@ impl PipeSubrequestState {
     /// Creates a snapshot for error reporting, excluding the join handle.
     /// Moves `pipe_rx` into the snapshot so the receiver stays alive through
     /// the error path and is not dropped when `self` is cleaned up.
-    /// Used by [`map_pipe_err`] to capture state at the point of failure.
+    /// Used by `map_pipe_err` to capture state at the point of failure.
     pub fn snapshot_for_error(&mut self) -> Self {
         PipeSubrequestState {
             saved_body: self.saved_body.clone(),

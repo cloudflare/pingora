@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         # nightly, msrv, and latest stable
-        toolchain: [nightly, 1.85.0, 1.97.1]
+        toolchain: [nightly, 1.85.0, 1.99.1]
     runs-on: ubuntu-24.04
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
@@ -106,7 +106,7 @@ jobs:
       # more cases from a seed that changes with every workflow run. A failure
       # prints its case seed, and PINGORA_BODY_FUZZ_CASE=<seed> replays it.
       - name: Run body reader fuzz soak
-        if: matrix.toolchain == '1.97.1'
+        if: matrix.toolchain == '1.99.1'
         env:
           PINGORA_BODY_FUZZ_CASES: "1000000"
           PINGORA_BODY_FUZZ_SEED: ${{ github.run_id }}
@@ -114,15 +114,15 @@ jobs:
 
       - name: Run cargo clippy
         run: |
-          [[ ${{ matrix.toolchain }} != 1.97.1 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
+          [[ ${{ matrix.toolchain }} != 1.99.1 ]] || cargo clippy --all-targets --all -- --allow=unknown-lints --deny=warnings
 
       - name: Run cargo audit
         run: |
-          [[ ${{ matrix.toolchain }} != 1.97.1 ]] || (cargo install --locked cargo-audit && cargo generate-lockfile --ignore-rust-version && cargo audit)
+          [[ ${{ matrix.toolchain }} != 1.99.1 ]] || (cargo install --locked cargo-audit && cargo generate-lockfile --ignore-rust-version && cargo audit)
 
       - name: Run cargo machete
         run: |
-          [[ ${{ matrix.toolchain }} != 1.97.1 ]] || (
+          [[ ${{ matrix.toolchain }} != 1.99.1 ]] || (
             # pingora-runtime's dial9 feature lists the metrique crates only to pin their versions,
             # so no code references them. cargo-machete reads ignore lists only from Cargo.toml.
             printf '\n[package.metadata.cargo-machete]\nignored = ["metrique", "metrique-core", "metrique-macro", "metrique-service-metrics", "metrique-timesource", "metrique-writer", "metrique-writer-core", "metrique-writer-macro"]\n' >> pingora-runtime/Cargo.toml

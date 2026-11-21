@@ -14,8 +14,8 @@
 
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, SocketDigest, Ssl, TimingDigest,
-    UniqueID, UniqueIDType,
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, GetTransportState, Peek, SocketDigest, Ssl,
+    TimingDigest, TransportState, UniqueID, UniqueIDType,
 };
 use async_trait::async_trait;
 use core::pin::Pin;
@@ -89,6 +89,12 @@ impl GetProxyDigest for DummyIO {
 
 impl GetSocketDigest for DummyIO {
     fn get_socket_digest(&self) -> Option<Arc<SocketDigest>> {
+        None
+    }
+}
+
+impl GetTransportState for DummyIO {
+    fn get_transport_state(&self) -> Option<TransportState> {
         None
     }
 }

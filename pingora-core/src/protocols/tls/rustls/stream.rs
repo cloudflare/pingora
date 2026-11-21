@@ -24,7 +24,8 @@ use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::TlsRef;
 use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, GetTransportState, SocketDigest, Ssl,
+    TransportState, UniqueID, ALPN,
 };
 use crate::utils::tls::get_organization_serial_bytes;
 use pingora_error::ErrorType::{AcceptError, ConnectError, InternalError, TLSHandshakeFailure};
@@ -429,3 +430,9 @@ impl SslDigest {
 }
 
 impl<S> Peek for TlsStream<S> {}
+
+impl<S: GetTransportState> GetTransportState for TlsStream<S> {
+    fn get_transport_state(&self) -> Option<TransportState> {
+        self.tls.stream.as_ref()?.get_ref().0.get_transport_state()
+    }
+}

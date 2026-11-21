@@ -274,7 +274,7 @@ where
         let mut request_done = false;
         let mut response_done = false;
         let mut upstream_can_reuse = true;
-        let mut send_error = None;
+        let mut send_error: Option<Box<Error>> = None;
         let mut upgraded = false;
 
         /* duplex mode, wait for either to complete */
@@ -330,7 +330,16 @@ where
                         Err(e) => {
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
-                            let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
+                            // An earlier upload failure keeps its type and retry decision, but
+                            // the read error is kept as context: it is why the response was cut
+                            // short.
+                            let e = e.into_up();
+                            let e = match send_error {
+                                Some(send_error) => send_error
+                                    .more_context(format!("then reading the response failed: {e}")),
+                                None => e,
+                            };
+                            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
                             // A response read error means the HTTP/1 message boundary was not
                             // established successfully, so the connection cannot be reused.
                             return Ok(false)
@@ -1814,5 +1823,63 @@ mod tests {
             CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
             "a fill that did not opt in was discarded for a cancellation"
         );
+    }
+
+    /// When the response read fails after the upload already failed, the reported error keeps
+    /// the upload error's type, source and retry decision, and says why the response failed.
+    #[tokio::test]
+    async fn response_read_error_after_upload_failure_keeps_both_errors() {
+        const REQUEST: &[u8] = b"POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\n";
+        // Reads wait until the scripted writes are used up, so the upload fails first.
+        let upstream = tokio_test::io::Builder::new()
+            .write(REQUEST)
+            .write_error(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .read_error(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .build();
+        let mut client_session = HttpSessionV1::new(Box::new(upstream));
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header("content-length", "5").unwrap();
+        client_session
+            .write_request_header(Box::new(request))
+            .await
+            .unwrap();
+
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        let (tx_upstream, mut rx_upstream) = mpsc::channel(TASK_BUFFER_SIZE);
+        let (tx_downstream, rx_downstream) = mpsc::channel(TASK_BUFFER_SIZE);
+        tx_downstream
+            .send(HttpTask::Body(Some(Bytes::from_static(b"hello")), true))
+            .await
+            .unwrap();
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+
+        let reuse = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.proxy_handle_upstream(
+                &mut client_session,
+                tx_upstream,
+                rx_downstream,
+                pipe_state,
+            ),
+        )
+        .await
+        .expect("the upstream half did not finish")
+        .expect("the failure is reported through the task pipe");
+        assert!(!reuse);
+
+        let Some(HttpTask::Failed(e)) = rx_upstream.recv().await else {
+            panic!("expected a failed task");
+        };
+        assert_eq!(e.esource, ErrorSource::Upstream);
+        assert_eq!(e.etype(), &WriteError, "{e}");
+        let message = e.to_string();
+        assert!(
+            message.contains("then reading the response failed: Upstream "),
+            "{message}"
+        );
+        assert!(!message.contains("failed:  "), "{message}");
     }
 }

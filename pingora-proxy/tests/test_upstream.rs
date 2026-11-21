@@ -2103,6 +2103,270 @@ async fn test_h2_upstream_no_end_stream_read_timeout() {
     }
 }
 
+const EARLY_413_BODY: &[u8] = &[b'r'; 64];
+const EARLY_UPLOAD_LEN: usize = 4 << 20;
+/// Sent before the response is read: more than the HTTP/2 window, so the upload is still blocked
+/// on flow control when the origin stops it.
+const EARLY_UPLOAD_FIRST_PART: usize = 256 * 1024;
+
+/// An HTTP/2 origin that answers an upload early: it reads the start of the body without
+/// granting more flow-control capacity, sends a complete `413`, then drops the stream, so the
+/// `h2` server stops the upload with `RST_STREAM(NO_ERROR)` once the response is flushed
+/// (RFC 9113 section 8.1). An explicit reset would discard the queued response instead. A request
+/// for `/followup` gets `200 ok`.
+async fn early_response_h2_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((io, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut connection) = h2::server::handshake(io).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = connection.accept().await {
+                    tokio::spawn(async move {
+                        let response = |status, len: usize| {
+                            http::Response::builder()
+                                .status(status)
+                                .header("content-length", len.to_string())
+                                .body(())
+                                .unwrap()
+                        };
+                        if request.uri().path() == "/followup" {
+                            let mut body = respond.send_response(response(200, 2), false).unwrap();
+                            body.send_data(Bytes::from_static(b"ok"), true).unwrap();
+                            return;
+                        }
+                        let mut upload = request.into_body();
+                        let _ = upload.data().await;
+                        let mut body = respond
+                            .send_response(response(413, EARLY_413_BODY.len()), false)
+                            .unwrap();
+                        body.send_data(Bytes::from_static(EARLY_413_BODY), true)
+                            .unwrap();
+                        drop((upload, body, respond));
+                    });
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Reads one HTTP/1 response with a `content-length` body; returns its head and body.
+async fn read_h1_response(reader: &mut (impl AsyncReadExt + Unpin)) -> (String, Vec<u8>) {
+    let mut response = Vec::new();
+    let mut buf = [0; 4096];
+    let header_end = loop {
+        if let Some(i) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(n > 0, "connection closed before the response head");
+        response.extend_from_slice(&buf[..n]);
+    };
+    let head = String::from_utf8(response[..header_end].to_vec()).unwrap();
+    let len: usize = head
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .expect("response without content-length");
+    let mut body = response[header_end..].to_vec();
+    while body.len() < len {
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(n > 0, "connection closed before the response body ended");
+        body.extend_from_slice(&buf[..n]);
+    }
+    (head, body)
+}
+
+/// Starts an HTTP/1 upload of [`EARLY_UPLOAD_LEN`] bytes through the proxy to
+/// [`early_response_h2_origin`], sending only [`EARLY_UPLOAD_FIRST_PART`], and reads the early
+/// `413`. Returns the connection halves and the task that sends the rest once told to.
+async fn early_413_with_upload_pending(
+    extra_headers: &str,
+) -> (
+    u16,
+    tokio::net::tcp::OwnedReadHalf,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<tokio::net::tcp::OwnedWriteHalf>,
+) {
+    init_proxy().await;
+    let port = early_response_h2_origin().await;
+    let (mut reader, mut writer) = TcpStream::connect("127.0.0.1:6147")
+        .await
+        .unwrap()
+        .into_split();
+    let (send_rest_tx, send_rest_rx) = oneshot::channel::<()>();
+    let head = format!(
+        "POST /early-413 HTTP/1.1\r\nHost: localhost\r\nx-port: {port}\r\nx-h2: true\r\n\
+         {extra_headers}Content-Length: {EARLY_UPLOAD_LEN}\r\n\r\n"
+    );
+    let upload = tokio::spawn(async move {
+        writer.write_all(head.as_bytes()).await.unwrap();
+        writer
+            .write_all(&[b'u'; EARLY_UPLOAD_FIRST_PART])
+            .await
+            .unwrap();
+        if send_rest_rx.await.is_ok() {
+            writer
+                .write_all(&vec![b'u'; EARLY_UPLOAD_LEN - EARLY_UPLOAD_FIRST_PART])
+                .await
+                .unwrap();
+        } else {
+            // Stall: keep the connection open without sending the rest.
+            std::future::pending::<()>().await;
+        }
+        writer
+    });
+
+    let (head, body) = timeout(Duration::from_secs(5), read_h1_response(&mut reader))
+        .await
+        .expect("the early response did not arrive while the upload was pending");
+    assert!(head.starts_with("HTTP/1.1 413 "), "{head}");
+    assert!(
+        !head.to_ascii_lowercase().contains("connection: close"),
+        "the connection must stay open to drain the upload: {head}"
+    );
+    assert_eq!(body, EARLY_413_BODY);
+    (port, reader, send_rest_tx, upload)
+}
+
+/// An HTTP/2 origin answers an HTTP/1 upload early and resets the request stream with
+/// `RST_STREAM(NO_ERROR)` while the client is still uploading. The client gets the whole
+/// response, the proxy drains the rest of the upload, and the connection is reused.
+#[tokio::test]
+async fn test_h2_upstream_early_response_and_reset_drains_upload_and_reuses_downstream() {
+    let (port, mut reader, send_rest, upload) = early_413_with_upload_pending("").await;
+    send_rest.send(()).unwrap();
+    let mut writer = timeout(Duration::from_secs(10), upload)
+        .await
+        .expect("the proxy did not drain the rest of the upload")
+        .unwrap();
+
+    writer
+        .write_all(
+            format!(
+                "GET /followup HTTP/1.1\r\nHost: localhost\r\nx-port: {port}\r\nx-h2: true\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (head, body) = timeout(Duration::from_secs(5), read_h1_response(&mut reader))
+        .await
+        .expect("the reused connection did not answer the next request");
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_eq!(body, b"ok");
+}
+
+/// As above, but the client stalls after the early response. The proxy drains until
+/// `total_drain_timeout` and then closes the connection, rather than closing it right away.
+#[tokio::test]
+async fn test_h2_upstream_early_response_and_reset_stalled_upload_hits_drain_timeout() {
+    const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+    let (_port, mut reader, _send_rest, upload) = early_413_with_upload_pending(&format!(
+        "x-total-drain-timeout-ms: {}\r\n",
+        DRAIN_TIMEOUT.as_millis()
+    ))
+    .await;
+    let start = Instant::now();
+    let mut buf = [0; 1024];
+    let read = timeout(Duration::from_secs(5), reader.read(&mut buf))
+        .await
+        .expect("the proxy kept draining a stalled upload past its drain timeout");
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "expected the connection to close, got {read:?}"
+    );
+    // The response was read before `start`, so allow for the time it took.
+    assert!(
+        elapsed >= DRAIN_TIMEOUT / 2,
+        "the connection closed after {elapsed:?}, before the drain timeout"
+    );
+    upload.abort();
+}
+
+/// Reads a whole HTTP/2 response body, releasing flow-control capacity as it goes.
+async fn read_h2_body(mut body: h2::RecvStream) -> Vec<u8> {
+    let mut read = Vec::new();
+    while let Some(chunk) = timeout(Duration::from_secs(5), body.data())
+        .await
+        .expect("timed out reading the response body")
+    {
+        let chunk = chunk.expect("the response body failed");
+        let _ = body.flow_control().release_capacity(chunk.len());
+        read.extend_from_slice(&chunk);
+    }
+    read
+}
+
+/// As [`test_h2_upstream_early_response_and_reset_drains_upload_and_reuses_downstream`] for an
+/// h2c client. Instead of draining the rest of the upload, the proxy stops it with
+/// `RST_STREAM(NO_ERROR)` after the complete `413`, and the connection serves another request.
+#[tokio::test]
+async fn test_h2c_client_h2_upstream_early_response_resets_upload_and_keeps_connection() {
+    init_proxy().await;
+    let port = early_response_h2_origin().await;
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://127.0.0.1/early-413")
+        .header("x-port", port.to_string())
+        .header("x-h2", "true")
+        .header("content-length", EARLY_UPLOAD_LEN.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut upload) = h2.send_request(request, false).unwrap();
+    upload
+        .send_data(Bytes::from(vec![b'u'; EARLY_UPLOAD_FIRST_PART]), false)
+        .unwrap();
+    let response = timeout(Duration::from_secs(5), response)
+        .await
+        .expect("the early response did not arrive while the upload was pending")
+        .expect("the h2 stream failed instead of returning a response");
+    assert_eq!(response.status(), 413);
+    assert_eq!(read_h2_body(response.into_body()).await, EARLY_413_BODY);
+
+    let reset = timeout(
+        Duration::from_secs(5),
+        std::future::poll_fn(|cx| upload.poll_reset(cx)),
+    )
+    .await
+    .expect("the proxy never stopped the pending upload")
+    .unwrap();
+    assert_eq!(reset, h2::Reason::NO_ERROR);
+
+    let followup = http::Request::builder()
+        .method("GET")
+        .uri("http://127.0.0.1/followup")
+        .header("x-port", port.to_string())
+        .header("x-h2", "true")
+        .body(())
+        .unwrap();
+    let mut h2 = timeout(Duration::from_secs(5), h2.ready())
+        .await
+        .expect("the connection did not accept another stream")
+        .expect("the connection failed after the early response");
+    let (response, _) = h2.send_request(followup, true).unwrap();
+    let response = timeout(Duration::from_secs(5), response)
+        .await
+        .expect("the follow-up request got no response")
+        .expect("the follow-up stream failed");
+    assert_eq!(response.status(), 200);
+    assert_eq!(read_h2_body(response.into_body()).await, b"ok");
+}
+
 /// Mock origin that sends 100 Continue then a final response for any request.
 /// Returns the port the server is listening on.
 async fn mock_100_continue_server() -> u16 {

@@ -139,7 +139,7 @@ impl<T> PoolNode<T> {
     /// an exclusive (write) lock before actually removing the node from the parent
     /// pool HashMap. A false-negative simply defers cleanup to the next opportunity;
     /// a false-positive is largely mitigated by the re-check (see
-    /// [`ConnectionPool::try_remove_empty_node`] for residual race-window analysis).
+    /// `ConnectionPool::try_remove_empty_node` for residual race-window analysis).
     pub fn is_empty(&self) -> bool {
         // Check the lock-free queue first (cheap atomic load) to avoid acquiring
         // the mutex in the common case where connections are present.

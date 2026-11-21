@@ -28,14 +28,14 @@
 //!   pipeline (with rate limiting, redaction, JSON/text formatting, etc.).
 //!
 //! - **`sentry`**: Enables foundations' sentry integration. Use
-//!   [`foundations::sentry::install_hook`] on your `ClientOptions` before
-//!   passing them to [`Server::set_sentry_config`](pingora_core::server::Server::set_sentry_config)
+//!   `foundations::sentry::install_hook` on your `ClientOptions` before
+//!   passing them to `Server::set_sentry_config`
 //!   to add a `sentry_events_total` counter.
 //!
 //! - **`tracing`**: Enables foundations' distributed tracing via
 //!   `cf-rustracing-jaeger`. Trace spans are reported to a Jaeger agent
 //!   (UDP) or an OpenTelemetry collector (gRPC), configured through
-//!   [`TracingSettings`](foundations::telemetry::settings::TracingSettings).
+//!   `foundations::telemetry::settings::TracingSettings`.
 //!
 //! - **`metrics`**: Enables foundations' metrics collection.
 //!
