@@ -26,7 +26,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, FromRawSocket};
+use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 use std::time::Duration;
 use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
@@ -237,7 +237,8 @@ fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
             #[cfg(unix)]
             let std_listener_socket = unsafe { std::net::TcpStream::from_raw_fd(fd) };
             #[cfg(windows)]
-            let std_listener_socket = unsafe { std::net::TcpStream::from_raw_socket(fd as u64) };
+            let std_listener_socket =
+                unsafe { std::net::TcpStream::from_raw_socket(fd as RawSocket) };
             let listener_socket = TcpSocket::from_std_stream(std_listener_socket);
             // Note that we call listen on an already listening socket
             // POSIX undefined but on Linux it will update the backlog size
