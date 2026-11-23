@@ -527,6 +527,202 @@ fn test_reusable_stream(stream: &mut Stream, unexpected_data_conn_count: &Atomic
     }
 }
 
+/// Test utilities for creating TCP mock acceptors.
+#[cfg(test)]
+pub(crate) mod test_mock_tcp_server {
+    #[cfg(feature = "rustls")]
+    use pingora_rustls::{load_certs_and_key_files, TlsAcceptor};
+    use tokio::task::JoinSet;
+
+    #[cfg(feature = "rustls")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "rustls")]
+    pub async fn spawn_mock_tls_tcp_server(
+        response: &'static [u8],
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+
+        let cert_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/server.crt"
+        );
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/server.key"
+        );
+
+        let (certs, key) = load_certs_and_key_files(cert_path, key_path)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "Certs or key missing")
+        })?;
+
+        let provider = rustls::crypto::ring::default_provider();
+
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("Safe default protocol failed")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("Single cert failed");
+
+        server_config.alpn_protocols = alpn_protocols;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let server_handle = tokio::spawn(async move {
+            let mut handlers = JoinSet::<()>::new();
+            let _ = ready_tx.send(());
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+
+                    result = listener.accept() => {
+                        let Ok((stream, _)) = result else {
+                            break;
+                        };
+
+                        let acceptor = acceptor.clone();
+
+                        handlers.spawn(async move {
+                            let mut stream = match acceptor.accept(stream).await {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    eprintln!("TLS Handshake failed: {}", e);
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) = read_request_headers(&mut stream).await {
+                                eprintln!("Request reading failed: {}", e);
+                                return;
+                            }
+
+                            if let Err(e) = stream.write_all(response).await {
+                                eprintln!("Writing response error: {}", e);
+                                return;
+                            }
+
+                            let mut buf = [0u8; 1024];
+                            while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+                        });
+                    }
+
+                    Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+                }
+            }
+
+            handlers.shutdown().await;
+        });
+
+        Ok((local_addr, ready_rx, shutdown_tx, server_handle))
+    }
+
+    pub async fn spawn_mock_tcp_server(
+        response: &'static [u8],
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::oneshot,
+        };
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+
+        let server_handle = tokio::spawn(async move {
+            let mut handlers = JoinSet::new();
+            let _ = ready_tx.send(());
+
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+
+                    result = listener.accept() => {
+                        let Ok((mut stream, _)) = result else {
+                            break;
+                        };
+
+                        handlers.spawn(async move {
+                            if read_request_headers(&mut stream).await.is_err() {
+                                return;
+                            }
+
+                            if stream.write_all(response).await.is_err() {
+                                return;
+                            }
+
+                            let mut buf = [0u8; 1024];
+                            while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+                        });
+                    }
+
+                    Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+                }
+            }
+
+            handlers.shutdown().await;
+        });
+
+        Ok((local_addr, ready_rx, shutdown_tx, server_handle))
+    }
+
+    pub async fn read_request_headers<S>(stream: &mut S) -> std::io::Result<()>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut matched = 0;
+        let mut buf = [0u8; 1024];
+
+        loop {
+            let n = stream.read(&mut buf).await?;
+
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+
+            for &byte in &buf[..n] {
+                matched = match (matched, byte) {
+                    (0, b'\r') => 1,
+                    (1, b'\n') => 2,
+                    (2, b'\r') => 3,
+                    (3, b'\n') => return Ok(()),
+                    (_, b'\r') => 1,
+                    _ => 0,
+                };
+            }
+        }
+    }
+}
+
 /// Test utilities for creating mock acceptors.
 #[cfg(all(test, unix))]
 pub(crate) mod test_utils {
@@ -610,19 +806,28 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 #[cfg(feature = "any_tls")]
 mod tests {
+    use std::future;
     use std::time::Duration;
 
     use pingora_error::ErrorType;
     use tls::Connector;
 
     use super::*;
+    use crate::connectors::test_mock_tcp_server::{
+        spawn_mock_tcp_server, spawn_mock_tls_tcp_server,
+    };
+    use crate::protocols::l4::socket;
     use crate::upstreams::peer::BasicPeer;
 
     #[tokio::test]
     async fn test_connect() {
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
         let connector = TransportConnector::new(None);
-        let peer = BasicPeer::new("1.1.1.1:80");
-        // make a new connection to 1.1.1.1
+        let peer = BasicPeer::new(&addr.to_string());
+        // make a new connection to the local mock server
         let stream = connector.new_stream(&peer).await.unwrap();
         let timing = stream.get_timing_digest();
         assert_eq!(timing.len(), 1);
@@ -633,29 +838,55 @@ mod tests {
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_connect_with_offload_timing() {
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
+
         let mut conf = ConnectorOptions::new(1);
         conf.offload_threadpool = Some((1, 1));
         let connector = TransportConnector::new(Some(conf));
-        let peer = BasicPeer::new("1.1.1.1:80");
+        let addr_str = addr.to_string();
+        let peer = BasicPeer::new(&addr_str);
 
         let stream = connector.new_stream(&peer).await.unwrap();
         let timing = stream.get_timing_digest();
         let l4_timing = timing[0].as_ref().unwrap();
         assert!(l4_timing.establishment_duration.is_some());
         assert!(l4_timing.offload_wait_duration.is_some());
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
+    #[cfg(feature = "rustls")]
     #[tokio::test]
     async fn test_connect_tls() {
-        let connector = TransportConnector::new(None);
-        let mut peer = BasicPeer::new("1.1.1.1:443");
+        let alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+        let connector = TransportConnector::new(Some(options));
+
+        let addr_str = addr.to_string();
+        let mut peer = BasicPeer::new(&addr_str);
         // BasicPeer will use tls when SNI is set
         peer.sni = "one.one.one.one".to_string();
-        // make a new connection to https://1.1.1.1
         let stream = connector.new_stream(&peer).await.unwrap();
         let timing = stream.get_timing_digest();
         assert_eq!(timing.len(), 2);
@@ -669,6 +900,8 @@ mod tests {
 
         let (_, reused) = connector.get_stream(&peer).await.unwrap();
         assert!(reused);
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -844,18 +1077,26 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct HangingL4;
+
+    #[async_trait::async_trait]
+    impl L4Connect for HangingL4 {
+        async fn connect(
+            &self,
+            _addr: &socket::SocketAddr,
+        ) -> Result<crate::protocols::l4::stream::Stream> {
+            future::pending().await
+        }
+    }
     #[tokio::test]
     async fn test_do_connect_with_total_timeout() {
         let mut peer = BasicPeer::new(BLACKHOLE);
+        peer.options.custom_l4 = Some(Arc::new(HangingL4));
         peer.options.total_connection_timeout = Some(Duration::from_millis(1));
         let (etype, context) = get_do_connect_failure_with_peer(&peer).await;
-        assert!(
-            etype == ConnectTimedout || etype == ConnectNoRoute,
-            "unexpected error type: {etype:?}"
-        );
-        if etype == ConnectTimedout {
-            assert!(context.contains("total-connection timeout"));
-        }
+        assert!(etype == ConnectTimedout, "unexpected error type: {etype:?}");
+        assert!(context.contains("total-connection timeout"));
     }
 
     #[tokio::test]

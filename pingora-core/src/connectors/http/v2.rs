@@ -679,6 +679,7 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::test_mock_tcp_server::spawn_mock_tcp_server;
     use crate::upstreams::peer::HttpPeer;
     use bytes::Bytes;
     use http::{Response, StatusCode};
@@ -688,8 +689,25 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_h2() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -700,13 +718,32 @@ mod tests {
             HttpSession::H2(h2_stream) => assert!(!h2_stream.ping_timedout()),
             HttpSession::Custom(_) => panic!("expect h2"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_connect_h1() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"http/1.1".to_vec()];
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         // a hack to force h1, new_http_session() in the future might validate this setting
         peer.options.set_http_version(1, 1);
         let h2 = connector
@@ -718,12 +755,18 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_connect_h1_plaintext() {
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tcp_server(b"").await.unwrap();
+        ready_rx.await.unwrap();
+
         let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 80), false, "".into()).unwrap();
+        let mut peer = HttpPeer::new(addr, false, "".into()).unwrap();
         peer.options.set_http_version(2, 1);
         let h2 = connector
             .new_http_session::<HttpPeer, ()>(&peer)
@@ -734,6 +777,8 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -781,8 +826,25 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_h2_single_stream() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
         let h2 = connector
@@ -812,13 +874,33 @@ mod tests {
 
         let h2_3 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_3.conn.id());
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
     #[cfg(feature = "any_tls")]
     async fn test_h2_multiple_stream() {
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 3;
         let h2 = connector
@@ -857,6 +939,9 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     /// `spawn_stream` must return `Ok(None)` and mark the connection as shutting
@@ -947,6 +1032,7 @@ mod tests {
     #[cfg(all(feature = "any_tls", unix))]
     #[tokio::test]
     async fn test_h2_reuse_rejects_fd_mismatch() {
+        use crate::connectors::test_mock_tcp_server::spawn_mock_tls_tcp_server;
         use crate::protocols::l4::socket::SocketAddr;
         use crate::upstreams::peer::Peer;
         use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -985,9 +1071,24 @@ mod tests {
                 false
             }
         }
+        let alpn_protocols: Vec<Vec<u8>> = vec![b"h2".to_vec()];
 
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(("1.1.1.1", 443), true, "one.one.one.one".into()).unwrap();
+        let ca_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pingora-core/src/connectors/test-certs/ca.crt"
+        );
+
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some(ca_path.to_string().to_owned());
+
+        let (addr, ready_rx, shutdown_tx, server_handle) =
+            spawn_mock_tls_tcp_server(b"", alpn_protocols)
+                .await
+                .unwrap();
+        ready_rx.await.unwrap();
+
+        let connector = Connector::new(Some(options));
+        let mut peer = HttpPeer::new(addr, true, "one.one.one.one".into()).unwrap();
         peer.options.set_http_version(2, 2);
         peer.options.max_h2_streams = 1;
 
@@ -1013,6 +1114,8 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        shutdown_tx.send(()).unwrap();
+        server_handle.await.unwrap();
     }
 
     #[tokio::test]
