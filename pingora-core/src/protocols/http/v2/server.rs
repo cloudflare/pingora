@@ -383,6 +383,15 @@ fn account_malformed_stream(malformed_streams: &mut usize) -> Result<()> {
 }
 
 impl HttpSession {
+    /// The HTTP/2 stream id this session serves.
+    ///
+    /// Stream ids are connection-scoped and monotonic for client-initiated
+    /// streams, so a per-frame observer can key its accounting by this value
+    /// without reaching into the h2 codec.
+    pub fn stream_id(&self) -> u32 {
+        self.request_body_reader.stream_id().into()
+    }
+
     /// Create a new [`HttpSession`] from the HTTP/2 connection.
     /// This function returns a new HTTP/2 session when the provided HTTP/2 connection, `conn`,
     /// establishes a new HTTP/2 stream to this server.
