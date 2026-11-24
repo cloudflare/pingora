@@ -200,8 +200,9 @@ fn resp_header_to_buf(resp: &ResponseHeader, buf: &mut Vec<u8>) -> usize {
     let status = resp.status;
     buf.put_slice(status.as_str().as_bytes());
     buf.put_u8(b' ');
-    let reason = status.canonical_reason();
-    if let Some(reason_buf) = reason {
+    // Write the header's actual reason phrase: the custom one when set,
+    // otherwise the canonical one (get_reason_phrase falls back to it).
+    if let Some(reason_buf) = resp.get_reason_phrase() {
         buf.put_slice(reason_buf.as_bytes());
     }
     buf.put_slice(CRLF);
@@ -247,8 +248,18 @@ fn buf_to_http_header_with_parser_config(
 #[inline]
 fn parsed_to_header(parsed: &ParsedResponse<'_, '_>) -> Result<ResponseHeader> {
     // code should always be there
-    // TODO: allow reading the parsed http version?
     let mut resp = ResponseHeader::build(parsed.code().unwrap(), Some(parsed.header_count()))?;
+
+    // Restore the version and reason phrase from the parsed status line;
+    // build() defaults to HTTP/1.1 and the canonical reason phrase.
+    match parsed.version() {
+        Some(0) => resp.set_version(Version::HTTP_10),
+        Some(1) => resp.set_version(Version::HTTP_11),
+        _ => {}
+    }
+    if let Some(reason) = parsed.reason() {
+        resp.set_reason_phrase(Some(reason))?;
+    }
 
     for header in parsed.headers() {
         let header_value = pingora_http::header_value_from_slice(header.value);
@@ -454,5 +465,88 @@ X-Custom: foo\r\n \
     fn test_response_compatibility_syntax_is_rejected_by_default() {
         assert!(buf_to_http_header(b"HTTP/1.1 200 OK\r\nName : value\r\n\r\n").is_err());
         assert!(buf_to_http_header(b"HTTP/1.1 200 OK\r\nName: value\r\n folded\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn test_round_trip_preserves_http_10() {
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.set_version(Version::HTTP_10);
+        header.append_header("Server", "Pingora").unwrap();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header2.version, Version::HTTP_10);
+        assert_eq!(header.status, header2.status);
+        assert_eq!(header.headers, header2.headers);
+    }
+
+    #[test]
+    fn test_round_trip_preserves_http_11() {
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.set_version(Version::HTTP_11);
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header2.version, Version::HTTP_11);
+    }
+
+    #[test]
+    fn test_round_trip_preserves_custom_reason_phrase() {
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.set_reason_phrase(Some("All Good Here")).unwrap();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header2.get_reason_phrase(), Some("All Good Here"));
+    }
+
+    #[test]
+    fn test_round_trip_preserves_empty_reason_phrase() {
+        let serde = HeaderSerde::new(None);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.set_reason_phrase(Some("")).unwrap();
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header2.get_reason_phrase(), Some(""));
+    }
+
+    #[test]
+    fn test_parse_http10_status_line_keeps_version_and_reason() {
+        // An HTTP/1.0 status line (the shape reported in the issue, with a
+        // 1xx status and a non-canonical phrase) must keep its version and
+        // reason phrase through a full round trip.
+        let header =
+            buf_to_http_header(b"HTTP/1.0 100 Continue Later\r\nX-Test: yes\r\n\r\n").unwrap();
+        assert_eq!(header.version, Version::HTTP_10);
+        assert_eq!(header.status.as_u16(), 100);
+        assert_eq!(header.get_reason_phrase(), Some("Continue Later"));
+
+        let mut buf = vec![];
+        resp_header_to_buf(&header, &mut buf);
+        assert!(buf.starts_with(b"HTTP/1.0 100 Continue Later\r\n"));
+    }
+
+    #[test]
+    fn test_canonical_reason_payload_shape_unchanged() {
+        // A header with no custom phrase still serializes with the canonical
+        // reason, exactly as payloads written before this fix did, and those
+        // bytes still deserialize to the same header.
+        let serde = HeaderSerde::new(None);
+        let header =
+            buf_to_http_header(b"HTTP/1.1 404 Not Found\r\nServer: Pingora\r\n\r\n").unwrap();
+
+        let mut buf = vec![];
+        resp_header_to_buf(&header, &mut buf);
+        assert!(buf.starts_with(b"HTTP/1.1 404 Not Found\r\n"));
+
+        let compressed = serde.serialize(&header).unwrap();
+        let header2 = serde.deserialize(&compressed).unwrap();
+        assert_eq!(header2.version, Version::HTTP_11);
+        assert_eq!(header2.get_reason_phrase(), Some("Not Found"));
+        assert_eq!(header.headers, header2.headers);
     }
 }
