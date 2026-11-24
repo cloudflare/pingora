@@ -1336,9 +1336,9 @@ impl BodyWriter {
 
     // NOTE on buffering/flush stream when writing the body
     // Buffering writes can reduce the syscalls hence improves efficiency of the system
-    // But it hurts real time communication
-    // So we only allow buffering when the body size is known ahead, which is less likely
-    // to be real time interaction
+    // But it hurts real time communication: the peer may be waiting on each chunk
+    // even when the body size is known ahead (slow downloads, streamed files), so
+    // every body mode flushes after each write.
 
     pub async fn write_body<S>(&mut self, stream: &mut S, buf: &[u8]) -> Result<Option<usize>>
     where
@@ -1386,9 +1386,7 @@ impl BodyWriter {
                 match res {
                     Ok(()) => {
                         self.body_mode = BM::ContentLength(total, written + to_write);
-                        if self.finished() {
-                            stream.flush().await.or_err(WriteError, "flushing body")?;
-                        }
+                        stream.flush().await.or_err(WriteError, "flushing body")?;
                         Ok(Some(to_write))
                     }
                     Err(e) => Error::e_because(WriteError, "while writing body", e),
@@ -1796,7 +1794,7 @@ impl BodyWriter {
     // ========================================================================
 
     /// Internal helper to poll a body task that writes in content-length mode
-    /// and flushes at end.
+    /// and flushes after each write.
     fn poll_write_content_length_body_task<S>(
         &mut self,
         cx: &mut Context<'_>,
@@ -1849,13 +1847,9 @@ impl BodyWriter {
                     let (total, written) = self.body_mode.expect_content_length();
                     self.body_mode = BM::ContentLength(total, written + bytes_written);
 
-                    if written + bytes_written >= total {
-                        // All content-length bytes written, flush needed
-                        self.send_body_state.write_state = WriteState::Flushing(bytes_written);
-                    } else {
-                        // More bytes to come, no flush needed
-                        self.send_body_state.write_state = WriteState::Done(bytes_written);
-                    }
+                    // Flush after every write, not just the last one: the peer
+                    // may be waiting on this chunk even if more bytes are coming.
+                    self.send_body_state.write_state = WriteState::Flushing(bytes_written);
                 }
                 Err(e) => {
                     return Poll::Ready(Error::e_because(WriteError, "while writing body", e))
@@ -4458,10 +4452,97 @@ mod test_body_task_api {
         );
     }
 
+    // Regression test for #1143: a content-length body written in multiple
+    // chunks must flush after every chunk, not only when the last byte is
+    // written. Otherwise a slow upstream's early chunks sit in the write
+    // buffer and the downstream client stalls.
+    // Async write_body() path.
+    #[tokio::test]
+    async fn content_length_write_body_flushes_each_chunk() {
+        init_log();
+
+        let chunk1 = b"Hello";
+        let chunk2 = b"World";
+        let total_len = chunk1.len() + chunk2.len();
+
+        let mock_io = Builder::new().write(chunk1).write(chunk2).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(total_len);
+
+        let result = body_writer
+            .write_body(&mut flush_mock, chunk1)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk1.len()));
+        assert!(!body_writer.finished());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "First content-length chunk should flush even though more bytes are coming"
+        );
+
+        let result = body_writer
+            .write_body(&mut flush_mock, chunk2)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk2.len()));
+        assert!(body_writer.finished());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            2,
+            "Final content-length chunk should flush as well"
+        );
+    }
+
+    // Regression test for #1143, cancel-safe task path
+    // (send_body_task + write_current_body_task).
+    #[tokio::test]
+    async fn content_length_body_task_flushes_each_chunk() {
+        init_log();
+
+        let chunk1 = b"Hello";
+        let chunk2 = b"World";
+        let total_len = chunk1.len() + chunk2.len();
+
+        let mock_io = Builder::new().write(chunk1).write(chunk2).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(total_len);
+
+        body_writer.send_body_task(Bytes::from_static(chunk1), None);
+        let result = body_writer
+            .write_current_body_task(&mut flush_mock)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk1.len()));
+        assert!(!body_writer.finished());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "First content-length chunk should flush even though more bytes are coming"
+        );
+
+        body_writer.send_body_task(Bytes::from_static(chunk2), None);
+        let result = body_writer
+            .write_current_body_task(&mut flush_mock)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk2.len()));
+        assert!(body_writer.finished());
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            2,
+            "Final content-length chunk should flush as well"
+        );
+    }
+
     // Verifies that body_mode byte tracking is correct when writing
-    // content-length body in multiple chunks. Each intermediate chunk
-    // does not trigger a flush; the body_mode must still accumulate
-    // bytes correctly so that finish_task succeeds.
+    // content-length body in multiple chunks. Each chunk flushes; the
+    // body_mode must still accumulate bytes correctly so that
+    // finish_task succeeds.
     #[tokio::test]
     async fn content_length_body_mode_tracks_across_chunks() {
         init_log();
@@ -4470,13 +4551,13 @@ mod test_body_task_api {
         let chunk2 = b", World!";
         let total_len = chunk1.len() + chunk2.len(); // 13
 
-        // Mock expects both writes; the final write triggers a flush internally
+        // Mock expects both writes; each write triggers a flush internally
         let mut mock_io = Builder::new().write(chunk1).write(chunk2).build();
 
         let mut body_writer = BodyWriter::new();
         body_writer.init_content_length(total_len);
 
-        // Write first chunk (intermediate, no flush expected)
+        // Write first chunk (intermediate)
         body_writer.send_body_task(Bytes::from_static(chunk1), None);
         let result = body_writer
             .write_current_body_task(&mut mock_io)
