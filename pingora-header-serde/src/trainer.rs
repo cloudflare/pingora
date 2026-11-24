@@ -18,6 +18,6 @@ use std::io::{self, Write};
 
 pub fn main() {
     let args: Vec<String> = env::args().collect();
-    let dict = train(&args[1]);
+    let dict = train(&args[1]).expect("expected a trained directory");
     io::stdout().write_all(&dict).unwrap();
 }
