@@ -3688,6 +3688,39 @@ mod tests {
                 "the connected client did not get an error response: {written:?}"
             );
         }
+
+        // A deadline that expired against the upstream is a 504 (RFC 9110 section 15.6.6). Other
+        // upstream failures, and the same timeouts on the downstream side, keep their mapping.
+        #[tokio::test]
+        async fn upstream_timeouts_default_to_504() {
+            for etype in [
+                ErrorType::ConnectTimedout,
+                ErrorType::TLSHandshakeTimedout,
+                ErrorType::ReadTimedout,
+                ErrorType::WriteTimedout,
+            ] {
+                let error = Error::explain(etype.clone(), "upstream deadline").into_up();
+                let (code, written) =
+                    connected_fail_to_proxy_outcome("/fail-to-proxy-upstream-timeout", true, error)
+                        .await;
+                assert_eq!(code, 504, "{etype:?}");
+                assert!(
+                    written.starts_with(b"HTTP/1.1 504 "),
+                    "{etype:?}: {written:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn other_upstream_failures_stay_502() {
+            for etype in [ErrorType::ConnectRefused, ErrorType::ConnectError] {
+                let error = Error::explain(etype.clone(), "upstream broken").into_up();
+                let (code, _) =
+                    connected_fail_to_proxy_outcome("/fail-to-proxy-upstream-broken", true, error)
+                        .await;
+                assert_eq!(code, 502, "{etype:?}");
+            }
+        }
     }
 
     #[tokio::test]

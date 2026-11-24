@@ -920,7 +920,13 @@ where
             HTTPStatus(code) => *code,
             _ => {
                 match e.esource() {
-                    ErrorSource::Upstream => 502,
+                    ErrorSource::Upstream => match e.etype() {
+                        // The upstream did not answer in time (RFC 9110 section 15.6.6)
+                        ConnectTimedout | TLSHandshakeTimedout | ReadTimedout | WriteTimedout => {
+                            504
+                        }
+                        _ => 502,
+                    },
                     ErrorSource::Downstream => {
                         match e.etype() {
                             WriteError | ReadError | ConnectionClosed => {
