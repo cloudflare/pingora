@@ -534,6 +534,21 @@ mod test {
     }
 
     #[test]
+    fn test_peek_does_not_promote() {
+        let lru = Manager::<1>::with_capacity(4, 10);
+        let until = SystemTime::now(); // unused value as a placeholder
+
+        let key1 = CacheKey::new("a", "1").to_compact();
+        lru.admit(key1.clone(), 1, until);
+        let key2 = CacheKey::new("b", "1").to_compact();
+        lru.admit(key2, 1, until);
+
+        // key1 is the least recently used and a peek must leave it there
+        assert!(lru.peek(&key1));
+        assert_eq!(lru.peek_lru(0).unwrap(), CacheEntryKey::key_only(key1));
+    }
+
+    #[test]
     fn test_serde() {
         let lru = Manager::<1>::with_capacity(4, 10);
         let key1 = CacheKey::new("a", "1").to_compact();

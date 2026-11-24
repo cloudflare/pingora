@@ -1010,6 +1010,20 @@ mod tests {
         assert!(node.is_empty(), "node should be empty after draining all");
     }
 
+    #[test]
+    fn test_pool_node_remove_keeps_other_hot_queue_items() {
+        let node: PoolNode<String> = PoolNode::new();
+        node.insert(1, "v1".to_string());
+        node.insert(2, "v2".to_string());
+        node.insert(3, "v3".to_string());
+
+        // 1 and 2 sit ahead of 3 in the hot queue
+        assert_eq!(node.remove(3).as_deref(), Some("v3"));
+        assert_eq!(node.remove(1).as_deref(), Some("v1"));
+        assert_eq!(node.remove(2).as_deref(), Some("v2"));
+        assert!(node.is_empty());
+    }
+
     #[tokio::test]
     async fn test_empty_node_removed_after_pop_closed() {
         // Reproducer from GitHub issue #748: a single connection is added and
