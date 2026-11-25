@@ -203,4 +203,140 @@ mod tests {
         let cipher = digest.extension.get::<CipherName>().unwrap();
         assert!(!cipher.0.is_empty());
     }
+
+    #[derive(Debug)]
+    struct NegotiatedTls {
+        group: Option<rustls::NamedGroup>,
+        cipher: String,
+    }
+
+    struct GroupCallback;
+
+    #[async_trait]
+    impl TlsAccept for GroupCallback {
+        async fn handshake_complete_callback(
+            &self,
+            tls: &TlsRef,
+        ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            Some(Arc::new(NegotiatedTls {
+                group: tls.negotiated_key_exchange_group(),
+                cipher: tls.current_cipher_name()?.to_owned(),
+            }))
+        }
+    }
+
+    fn group_acceptor() -> crate::listeners::tls::Acceptor {
+        let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut settings = TlsSettings::with_callbacks(Box::new(GroupCallback)).unwrap();
+        settings.set_certificate_chain_file(&cert).unwrap();
+        settings.set_private_key_file(&key).unwrap();
+        settings.build()
+    }
+
+    fn group_connector(
+        group: &'static dyn rustls::crypto::SupportedKxGroup,
+        version: &'static rustls::SupportedProtocolVersion,
+    ) -> pingora_rustls::TlsConnector {
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![group];
+        let config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        pingora_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    async fn group_handshake(
+        acceptor: &crate::listeners::tls::Acceptor,
+        connector: &pingora_rustls::TlsConnector,
+    ) -> (
+        super::TlsStream<DuplexStream>,
+        super::TlsStream<DuplexStream>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, server) = tokio::join!(
+                crate::protocols::tls::rustls::client::handshake(
+                    connector,
+                    "openrusty.org",
+                    client
+                ),
+                acceptor.tls_handshake(server),
+            );
+            (client.unwrap(), server.unwrap())
+        })
+        .await
+        .expect("TLS handshake timed out")
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_group_digest_extension() {
+        use crate::protocols::Ssl;
+        use rustls::crypto::ring::kx_group::{SECP256R1, X25519};
+
+        let acceptor = group_acceptor();
+        let mut digests = Vec::new();
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            for group in [X25519, SECP256R1] {
+                let connector = group_connector(group, version);
+                let (client, server) = group_handshake(&acceptor, &connector).await;
+                assert_eq!(
+                    client.get_ssl().unwrap().negotiated_key_exchange_group(),
+                    Some(group.name())
+                );
+                let digest = server.ssl_digest().unwrap();
+                let metadata = digest.extension.get::<NegotiatedTls>().unwrap();
+                assert_eq!(metadata.group, Some(group.name()));
+                assert_eq!(metadata.cipher, digest.cipher);
+                assert_eq!(client.ssl_digest().unwrap().version, digest.version);
+                digests.push((digest, group.name()));
+            }
+        }
+        // Retained digests must keep their own connection's metadata.
+        for (digest, group) in digests {
+            assert_eq!(
+                digest.extension.get::<NegotiatedTls>().unwrap().group,
+                Some(group)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_group_tls12_resumption() {
+        use crate::protocols::Ssl;
+
+        let acceptor = group_acceptor();
+        let connector = group_connector(
+            rustls::crypto::ring::kx_group::X25519,
+            &rustls::version::TLS12,
+        );
+        let (client, server) = group_handshake(&acceptor, &connector).await;
+        let original = server.ssl_digest().unwrap();
+        assert_eq!(
+            original.extension.get::<NegotiatedTls>().unwrap().group,
+            Some(rustls::NamedGroup::X25519)
+        );
+        drop((client, server));
+
+        let (client, server) = group_handshake(&acceptor, &connector).await;
+        assert_eq!(
+            client.stream.as_ref().unwrap().get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed)
+        );
+        assert_eq!(
+            client.get_ssl().unwrap().negotiated_key_exchange_group(),
+            None
+        );
+        let digest = server.ssl_digest().unwrap();
+        let metadata = digest.extension.get::<NegotiatedTls>().unwrap();
+        assert_eq!(metadata.group, None);
+        assert_eq!(metadata.cipher, digest.cipher);
+        assert_eq!(
+            original.extension.get::<NegotiatedTls>().unwrap().group,
+            Some(rustls::NamedGroup::X25519)
+        );
+    }
 }

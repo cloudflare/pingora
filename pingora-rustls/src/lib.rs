@@ -32,8 +32,8 @@ pub use rustls::server::{
 pub use rustls::sign;
 pub use rustls::{
     client::WebPkiServerVerifier, crypto::CryptoProvider, version, CertificateError, ClientConfig,
-    DigitallySignedStruct, Error as RusTlsError, KeyLogFile, RootCertStore, ServerConfig,
-    SignatureScheme, Stream,
+    DigitallySignedStruct, Error as RusTlsError, KeyLogFile, NamedGroup, RootCertStore,
+    ServerConfig, SignatureScheme, Stream,
 };
 
 /// Install the default `ring` CryptoProvider for rustls.
