@@ -35,7 +35,7 @@ A `PeerOptions` defines how to connect to the upstream.
 |max_blinding_delay: `Option<u32>` | S2N-TLS will delay a response up to the [max blinding delay](https://aws.github.io/s2n-tls/usage-guide/ch03-error-handling.html#blinding) (default 30) seconds whenever an error triggered by a peer occurs to mitigate against timing side channels. (s2n-tls only) |
 |tcp_keepalive: `Option<TcpKeepalive>`| TCP keepalive settings to upstream |
 |http_upstream_request_policy: `HttpUpstreamRequestPolicy`| Controls automatic forwarding of hop-by-hop request headers and HTTP/1 upgrades |
-|ext: `Extensions`| Additional data attached to the peer. Not part of the connection reuse key, so anything identity relevant should go in `group_key` |
+|ext: `Extensions`| Additional data attached to the peer. |
 
 ### HTTP upstream request header policy
 

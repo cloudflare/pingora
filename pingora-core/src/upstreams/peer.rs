@@ -617,10 +617,6 @@ pub struct PeerOptions {
     ///
     /// **Note:** This field isn't used by Pingora and is intended to be used for
     /// custom implementations.
-    ///
-    /// This field is not part of the connection reuse key, so peers that only differ in extensions
-    /// may share pooled connections. Any data that affects peer identity or connection
-    /// reuse, should be included in `group_key`.
     pub ext: http::Extensions,
 }
 
