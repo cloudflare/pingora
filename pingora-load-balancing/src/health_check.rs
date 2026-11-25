@@ -22,7 +22,11 @@ use pingora_core::connectors::{http::Connector as HttpConnector, TransportConnec
 use pingora_core::custom_session;
 use pingora_core::protocols::http::custom::client::Session;
 use pingora_core::upstreams::peer::{BasicPeer, HttpPeer, Peer};
-use pingora_error::{Error, ErrorType::CustomCode, Result};
+use pingora_error::{
+    Error,
+    ErrorType::{Custom, CustomCode},
+    Result,
+};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::sync::Arc;
 use std::time::Duration;
@@ -170,6 +174,14 @@ where
     ///
     /// Set the `scheme` field to use HTTPs.
     pub peer_template: HttpPeer,
+    /// Total time allowed for one probe, including connection setup, the request,
+    /// response body, custom messages, and returning the connection to the pool.
+    ///
+    /// Defaults to three seconds. Set `None` to disable this limit. The timeouts
+    /// in `peer_template` apply independently and do not extend this total budget.
+    /// Like other async timeouts, this cannot interrupt code that does not yield,
+    /// such as a synchronous response validator.
+    pub total_timeout: Option<Duration>,
     /// Whether the underlying TCP/TLS connection can be reused across checks.
     ///
     /// * `false` will make sure that every health check goes through TCP (and TLS) handshakes.
@@ -197,6 +209,7 @@ impl HttpHealthCheck<()> {
     /// Create a new [HttpHealthCheck] with the following default settings
     /// * connect timeout: 1 second
     /// * read timeout: 1 second
+    /// * total timeout: 3 seconds
     /// * req: a GET to the `/` of the given host name
     /// * consecutive_success: 1
     /// * consecutive_failure: 1
@@ -213,6 +226,7 @@ impl HttpHealthCheck<()> {
             consecutive_success: 1,
             consecutive_failure: 1,
             peer_template,
+            total_timeout: Some(Duration::from_secs(3)),
             connector: HttpConnector::new(None),
             reuse_connection: false,
             req,
@@ -231,6 +245,7 @@ where
     /// Create a new [HttpHealthCheck] with the following default settings
     /// * connect timeout: 1 second
     /// * read timeout: 1 second
+    /// * total timeout: 3 seconds
     /// * req: a GET to the `/` of the given host name
     /// * consecutive_success: 1
     /// * consecutive_failure: 1
@@ -247,6 +262,7 @@ where
             consecutive_success: 1,
             consecutive_failure: 1,
             peer_template,
+            total_timeout: Some(Duration::from_secs(3)),
             connector: custom,
             reuse_connection: false,
             req,
@@ -284,53 +300,67 @@ where
     }
 
     async fn check(&self, target: &Backend) -> Result<()> {
-        let mut peer = self.peer_template.clone();
-        peer._address = target.addr.clone();
-        if let Some(port) = self.port_override {
-            peer._address.set_port(port);
-        }
-        let session = self.connector.get_http_session(&peer).await?;
+        let probe = async {
+            let mut peer = self.peer_template.clone();
+            peer._address = target.addr.clone();
+            if let Some(port) = self.port_override {
+                peer._address.set_port(port);
+            }
+            let session = self.connector.get_http_session(&peer).await?;
 
-        let mut session = session.0;
+            let mut session = session.0;
 
-        session.set_write_timeout(peer.options.write_timeout);
+            session.set_write_timeout(peer.options.write_timeout);
 
-        let req = Box::new(self.req.clone());
-        session.write_request_header(req).await?;
-        session.finish_request_body().await?;
+            let req = Box::new(self.req.clone());
+            session.write_request_header(req).await?;
+            session.finish_request_body().await?;
 
-        custom_session!(session.finish_custom().await?);
+            custom_session!(session.finish_custom().await?);
 
-        session.set_read_timeout(peer.options.read_timeout);
+            session.set_read_timeout(peer.options.read_timeout);
 
-        session.read_response_header().await?;
+            session.read_response_header().await?;
 
-        let resp = session.response_header().expect("just read");
+            let resp = session.response_header().expect("just read");
 
-        if let Some(validator) = self.validator.as_ref() {
-            validator(resp)?;
-        } else if resp.status != 200 {
-            return Error::e_explain(
-                CustomCode("non 200 code", resp.status.as_u16()),
-                "during http healthcheck",
-            );
+            if let Some(validator) = self.validator.as_ref() {
+                validator(resp)?;
+            } else if resp.status != 200 {
+                return Error::e_explain(
+                    CustomCode("non 200 code", resp.status.as_u16()),
+                    "during http healthcheck",
+                );
+            };
+
+            while session.read_response_body().await?.is_some() {
+                // drain the body if any
+            }
+
+            // TODO(slava): do it concurrently wtih body drain?
+            custom_session!(session.drain_custom_messages().await?);
+
+            if self.reuse_connection {
+                let idle_timeout = peer.idle_timeout();
+                self.connector
+                    .release_http_session(session, &peer, idle_timeout)
+                    .await;
+            }
+
+            Ok(())
         };
 
-        while session.read_response_body().await?.is_some() {
-            // drain the body if any
+        match self.total_timeout {
+            Some(limit) => tokio::time::timeout(limit, probe)
+                .await
+                .unwrap_or_else(|_| {
+                    Error::e_explain(
+                        Custom("health check timed out"),
+                        format!("HTTP health check exceeded {limit:?}"),
+                    )
+                }),
+            None => probe.await,
         }
-
-        // TODO(slava): do it concurrently wtih body drain?
-        custom_session!(session.drain_custom_messages().await?);
-
-        if self.reuse_connection {
-            let idle_timeout = peer.idle_timeout();
-            self.connector
-                .release_http_session(session, &peer, idle_timeout)
-                .await;
-        }
-
-        Ok(())
     }
     async fn health_status_change(&self, target: &Backend, healthy: bool) {
         if let Some(callback) = &self.health_changed_callback {
