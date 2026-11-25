@@ -613,6 +613,15 @@ pub struct PeerOptions {
     #[cfg(feature = "openssl_derived")]
     #[derivative(Debug = "ignore")]
     pub upstream_tls_verify_callback: Option<VerifyCallback>,
+    /// Additional data attached to this peer.
+    ///
+    /// **Note:** This field isn't used by Pingora and is intended to be used for
+    /// custom implementations.
+    ///
+    /// This field is not part of the connection reuse key, so peers that only differ in extensions
+    /// may share pooled connections. Any data that affects peer identity or connection
+    /// reuse, should be included in `group_key`.
+    pub ext: http::Extensions,
 }
 
 impl PeerOptions {
@@ -660,6 +669,7 @@ impl PeerOptions {
             upstream_tls_handshake_complete_hook: None,
             #[cfg(feature = "openssl_derived")]
             upstream_tls_verify_callback: None,
+            ext: http::Extensions::new(),
         }
     }
 
