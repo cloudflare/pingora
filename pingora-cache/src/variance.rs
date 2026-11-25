@@ -48,14 +48,20 @@ impl<'a> VarianceBuilder<'a> {
 
     /// Hash this variance key. Returns [`None`] if [`Self::has_variance`] is false.
     pub fn finalize(self) -> Option<HashBinary> {
-        const SALT: &[u8; 1] = &[0u8; 1];
         if self.has_variance() {
             let mut hash = Blake2b128::new();
             for (name, value) in self.values.iter() {
-                hash.update(name.as_bytes());
-                hash.update(SALT);
+                // Length-prefix each field so the hashed bytes are an injective
+                // encoding of the (name, value) pairs. A single-byte separator is
+                // ambiguous for any field that can itself contain that byte, which
+                // lets distinct variance sets serialize to the same bytes and share
+                // a cache key. Explicit lengths make the field boundaries
+                // unambiguous regardless of field contents.
+                let name = name.as_bytes();
+                hash.update((name.len() as u64).to_le_bytes());
+                hash.update(name);
+                hash.update((value.len() as u64).to_le_bytes());
                 hash.update(value);
-                hash.update(SALT);
             }
             Some(hash.finalize().into())
         } else {
@@ -136,5 +142,23 @@ mod test {
         let key_br = key_br.finalize().unwrap();
 
         assert_ne!(key_gzip, key_br);
+    }
+
+    #[test]
+    fn test_field_boundaries_are_unambiguous() {
+        // Distinct dimension sets must never serialize to the same key, even when a
+        // value contains bytes that could be mistaken for a field boundary. Two
+        // dimensions {a: b, c: d} must not collide with a single dimension whose
+        // value reproduces the old separator bytes.
+        let mut two = VarianceBuilder::new();
+        two.add_owned_name_value("a".to_string(), b"b".to_vec());
+        two.add_owned_name_value("c".to_string(), b"d".to_vec());
+        let two = two.finalize().unwrap();
+
+        let mut one = VarianceBuilder::new();
+        one.add_owned_name_value("a".to_string(), b"b\x00c\x00d".to_vec());
+        let one = one.finalize().unwrap();
+
+        assert_ne!(two, one);
     }
 }
