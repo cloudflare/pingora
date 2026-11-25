@@ -163,6 +163,13 @@ connection_filter = [
 ## `early_request_body_filter` trait hooks.
 early_body_buffer = ["pingora-proxy?/early_body_buffer"]
 
+## Allow listening services to keep accepting through a graceful terminate, via
+## `Service::keep_listening_on_terminate`.
+keep_listening_on_terminate = [
+    "pingora-core/keep_listening_on_terminate",
+    "pingora-proxy?/keep_listening_on_terminate",
+]
+
 
 # These features are intentionally not documented
 openssl_derived = ["any_tls"]
@@ -179,6 +186,7 @@ document-features = [
     "dial9-worker-s3",
     "dial9-cpu-profiling",
     "connection_filter",
-    "early_body_buffer"
+    "early_body_buffer",
+    "keep_listening_on_terminate"
 ]
 trace = ["pingora-cache?/trace", "pingora-proxy?/trace"]
