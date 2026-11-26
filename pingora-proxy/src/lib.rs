@@ -850,25 +850,30 @@ where
 
     /// Whether this attempt's response work is done.
     ///
-    /// A connected request follows downstream delivery. An abandoned request waits for the
+    /// A connected request follows downstream delivery, except while a cache admission is
+    /// active: the downstream may complete by its own framing (e.g. an H1 downstream with
+    /// Content-Length) before an H2 upstream signals END_STREAM, and the fill still needs the
+    /// producer's terminal task to finish the miss. An abandoned request waits for the
     /// upstream task producer and any active cache admission.
     fn response_work_done(&self, response_state: &proxy_common::ResponseStateMachine) -> bool {
         if self.downstream_abandoned_during_cache_fill() {
             response_state.upstream_producer_done() && !self.cache.is_cache_admission_active()
         } else {
             response_state.is_done()
+                && !(self.cache.is_cache_admission_active()
+                    && !response_state.upstream_producer_done())
         }
     }
 
     /// Whether the transport loop should still receive upstream tasks.
     ///
-    /// Direct delivery may end before the upstream producer does; once the downstream is
-    /// abandoned only the producer's terminal task matters.
+    /// Direct delivery may end before the upstream producer does; an active cache admission
+    /// still needs the producer's terminal task, as does an abandoned downstream.
     fn should_poll_upstream_tasks(
         &self,
         response_state: &proxy_common::ResponseStateMachine,
     ) -> bool {
-        if self.downstream_abandoned_during_cache_fill() {
+        if self.downstream_abandoned_during_cache_fill() || self.cache.is_cache_admission_active() {
             !response_state.upstream_producer_done()
         } else {
             !response_state.upstream_delivery_done()
