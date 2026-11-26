@@ -183,6 +183,95 @@ impl Storage for WriterDemandCache {
     }
 }
 
+/// A [`MemCache`] that hides its streaming partial write, as storages that only admit a
+/// response once its fill is finished do. A fill on this storage keeps its write admission
+/// until the miss is finished.
+pub(crate) struct NoStreamingCache {
+    inner: MemCache,
+}
+
+pub(crate) static NO_STREAMING_CACHE: LazyLock<NoStreamingCache> =
+    LazyLock::new(|| NoStreamingCache {
+        inner: MemCache::new(),
+    });
+
+impl NoStreamingCache {
+    /// Whether a completed response is cached under this primary key.
+    pub(crate) async fn is_committed(&'static self, key: &str) -> bool {
+        let span = pingora_cache::trace::Span::inactive();
+        self.inner
+            .lookup(&CacheKey::new(key, ""), &span.handle())
+            .await
+            .unwrap()
+            .is_some()
+    }
+}
+
+#[async_trait]
+impl Storage for NoStreamingCache {
+    async fn lookup(
+        &'static self,
+        key: &CacheKey,
+        trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        self.inner.lookup(key, trace).await
+    }
+
+    async fn lookup_streaming_write(
+        &'static self,
+        key: &CacheKey,
+        streaming_write_tag: Option<&[u8]>,
+        trace: &SpanHandle,
+    ) -> Result<Option<(CacheMeta, HitHandler)>> {
+        self.inner
+            .lookup_streaming_write(key, streaming_write_tag, trace)
+            .await
+    }
+
+    async fn get_miss_handler(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<MissHandler> {
+        self.inner.get_miss_handler(key, meta, trace).await
+    }
+
+    async fn purge(
+        &'static self,
+        target: PurgeTarget<'_>,
+        purge_type: PurgeType,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.inner.purge(target, purge_type, trace).await
+    }
+
+    async fn expire(
+        &'static self,
+        target: PurgeTarget<'_>,
+        trace: &SpanHandle,
+    ) -> Result<PurgeOutcome> {
+        self.inner.expire(target, trace).await
+    }
+
+    async fn update_meta(
+        &'static self,
+        key: &CacheKey,
+        meta: &CacheMeta,
+        trace: &SpanHandle,
+    ) -> Result<bool> {
+        self.inner.update_meta(key, meta, trace).await
+    }
+
+    fn support_streaming_partial_write(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+        self
+    }
+}
+
 /// [`MemCache`] whose miss handlers offer the cancellation watcher registered for their cache key.
 ///
 /// [`Self::cancellation_for`] returns one [`CacheFillCancellation`] per key, created on first use.

@@ -841,6 +841,14 @@ where
                                 "upstream response task pipe closed before completion",
                             );
                         }
+                        // The task pipe closed without a terminal task. While a cache
+                        // admission is active this loop would poll a closed channel forever,
+                        // so treat the producer as finished; an unfinished fill then ends
+                        // through the dangling write permit like any request whose producer
+                        // died.
+                        if session.cache.is_cache_admission_active() {
+                            response_state.maybe_set_upstream_producer_done(true);
+                        }
                         response_state.maybe_set_upstream_delivery_done(true);
                     }
                 },
@@ -1621,7 +1629,7 @@ mod tests {
         cache_miss_session, cache_miss_session_on, drive_custom_sender_while_client_leaves,
         AbandonmentSignalProxy, AbandonmentTiming, CustomSenderOutcome, CustomWriteCalls,
         HeldCustomSenderProxy, RecordingCustomWriter, CANCELLATION_WATCHED_STORAGE,
-        WRITER_DEMAND_CACHE,
+        NO_STREAMING_CACHE, WRITER_DEMAND_CACHE,
     };
     use pingora_cache::fill_cancellation::ERR_CACHE_FILL_CANCELLED;
     use pingora_cache::{CacheKey, NoCacheReason};
@@ -2944,5 +2952,252 @@ mod tests {
             let outcome = run_h2_client_upload_stop(path, source, false).await;
             assert_h2_client_got_early_response(outcome, path);
         }
+    }
+
+    /// An HTTP/2 upstream that answers with `Content-Length`, sends the whole body in DATA
+    /// frames without END_STREAM, and only later sends END_STREAM in a separate empty DATA
+    /// frame. The HTTP/1.1 downstream completes by its own framing on the last body byte,
+    /// before END_STREAM arrives. While the cache admission is active, the transport loop must
+    /// keep receiving upstream tasks so the terminal tasks finish the miss: the object is
+    /// admitted to the cache and the request ends without leaving the fill unfinished.
+    #[tokio::test]
+    async fn cache_miss_finishes_when_downstream_completes_before_upstream_end_stream() {
+        const BODY_LEN: usize = 1000;
+        let path = "/h2-miss-eos-after-body";
+
+        // A storage without streaming partial write: the fill is streamed directly from the
+        // upstream tasks, so the response completes by its own framing before END_STREAM.
+        let (mut session, mut client) = cache_miss_session_on(
+            path,
+            &AbandonmentTiming::AfterAdmission,
+            false,
+            &*NO_STREAMING_CACHE,
+        )
+        .await;
+        // The client reads concurrently, so the loop never blocks on its backpressure.
+        let reader = tokio::spawn(async move {
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let terminal_sends = Arc::new(AtomicUsize::new(0));
+        let feeder = {
+            let terminal_sends = Arc::clone(&terminal_sends);
+            let (response_tx, response_rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+            tokio::spawn(async move {
+                let mut header = ResponseHeader::build(200, None).unwrap();
+                header
+                    .insert_header("content-length", BODY_LEN.to_string())
+                    .unwrap();
+                header.insert_header("cache-control", "max-age=60").unwrap();
+                response_tx
+                    .send(HttpTask::Header(Box::new(header), false))
+                    .await
+                    .unwrap();
+                response_tx
+                    .send(HttpTask::Body(
+                        Some(Bytes::from(vec![b'x'; BODY_LEN])),
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                // The origin is slow to signal the end: the downstream delivery completes
+                // long before this terminal pair is sent.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if response_tx
+                    .send(HttpTask::Body(Some(Bytes::new()), true))
+                    .await
+                    .is_ok()
+                {
+                    terminal_sends.fetch_add(1, Ordering::AcqRel);
+                }
+                if response_tx.send(HttpTask::Done).await.is_ok() {
+                    terminal_sends.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+            response_rx
+        };
+
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let mut ctx = ();
+        // A request body source over an h2 upstream: a GET whose upload already ended.
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(1 << 20);
+        let upstream_server = tokio::spawn(async move {
+            let _connection = h2::server::handshake(upstream_server_io).await;
+            // Never answer: the feeder above plays the response instead.
+        });
+        let (h2_client, connection) = h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://example.com{path}"))
+            .body(())
+            .unwrap();
+        let (_upstream_response, mut request_body) = h2_client.send_request(request, true).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.bidirection_down_to_up(
+                &mut session,
+                &mut request_body,
+                feeder,
+                &mut ctx,
+                None,
+                true,
+                &mut custom_writer,
+                &mut custom_reader,
+                Arc::new(AtomicU8::new(PipeState::Active as u8)),
+            ),
+        )
+        .await
+        .expect("the transport loop must end once the upstream stream ends");
+        let _ = result.expect("a complete response must not fail the attempt");
+
+        // Both terminal tasks reached the loop and finished the miss.
+        assert_eq!(
+            terminal_sends.load(Ordering::Acquire),
+            2,
+            "the delayed END_STREAM body and Done must be received while the admission is active"
+        );
+        assert!(
+            !session.cache.is_cache_admission_active(),
+            "the miss handler must be finished, not dropped unfinished"
+        );
+
+        // Dropping the session closes the connection, which ends the concurrent reader.
+        drop(session);
+        let response = String::from_utf8(reader.await.unwrap()).unwrap();
+        upstream_server.abort();
+
+        // The client received the complete response through its own framing.
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response:?}");
+        assert!(
+            response.ends_with(&"x".repeat(BODY_LEN)),
+            "the client must receive the whole body: {response:?}"
+        );
+        assert!(
+            NO_STREAMING_CACHE.is_committed(path).await,
+            "the completed response must be admitted to the cache"
+        );
+    }
+
+    /// The task pipe closes while a cache admission is still active, without a terminal task
+    /// (a producer that died abnormally). The transport loop must end instead of polling the
+    /// closed channel forever; the unfinished fill is left to the dangling write permit as for
+    /// any request whose producer died, and nothing is committed to the cache.
+    #[tokio::test]
+    async fn pipe_closed_during_active_admission_ends_the_loop() {
+        const BODY_LEN: usize = 1000;
+        let path = "/h2-miss-pipe-closed";
+
+        // A storage without streaming partial write: the fill is streamed directly from the
+        // upstream tasks, so the response completes by its own framing before END_STREAM.
+        let (mut session, mut client) = cache_miss_session_on(
+            path,
+            &AbandonmentTiming::AfterAdmission,
+            false,
+            &*NO_STREAMING_CACHE,
+        )
+        .await;
+        // The client reads concurrently, so delivering the body never blocks the loop on the
+        // client's backpressure; it ends when the session below is dropped.
+        let reader = tokio::spawn(async move {
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            response
+        });
+
+        let (response_tx, response_rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+        tokio::spawn(async move {
+            let mut header = ResponseHeader::build(200, None).unwrap();
+            header
+                .insert_header("content-length", BODY_LEN.to_string())
+                .unwrap();
+            header.insert_header("cache-control", "max-age=60").unwrap();
+            response_tx
+                .send(HttpTask::Header(Box::new(header), false))
+                .await
+                .unwrap();
+            response_tx
+                .send(HttpTask::Body(
+                    Some(Bytes::from(vec![b'x'; BODY_LEN])),
+                    false,
+                ))
+                .await
+                .unwrap();
+            // The producer dies without a terminal task.
+            drop(response_tx);
+        });
+
+        let proxy = HttpProxy::new(
+            AbandonmentSignalProxy::default(),
+            Arc::new(ServerConf::default()),
+        );
+        let mut custom_writer = None;
+        let mut custom_reader = None;
+        let mut ctx = ();
+        let (upstream_client_io, upstream_server_io) = tokio::io::duplex(1 << 20);
+        let upstream_server = tokio::spawn(async move {
+            let _connection = h2::server::handshake(upstream_server_io).await;
+        });
+        let (h2_client, connection) = h2::client::handshake(upstream_client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut h2_client = h2_client.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://example.com{path}"))
+            .body(())
+            .unwrap();
+        let (_upstream_response, mut request_body) = h2_client.send_request(request, true).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy.bidirection_down_to_up(
+                &mut session,
+                &mut request_body,
+                response_rx,
+                &mut ctx,
+                None,
+                true,
+                &mut custom_writer,
+                &mut custom_reader,
+                Arc::new(AtomicU8::new(PipeState::Active as u8)),
+            ),
+        )
+        .await
+        .expect("the loop must not poll a closed task pipe forever while a fill is active");
+        let _pipe = result.expect("an abnormal producer death is not a transport error");
+
+        assert!(
+            session.cache.is_cache_admission_active(),
+            "the fill was never finished: the admission is still the request's to clean up"
+        );
+
+        // Dropping the session closes the connection, which ends the concurrent reader.
+        drop(session);
+        let response = String::from_utf8(reader.await.unwrap()).unwrap();
+        upstream_server.abort();
+
+        // The client received what was produced before the pipe closed.
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response:?}");
+        assert!(
+            response.ends_with(&"x".repeat(BODY_LEN)),
+            "the client must receive the whole body: {response:?}"
+        );
+        assert!(
+            !NO_STREAMING_CACHE.is_committed(path).await,
+            "a response whose end was never seen must not be committed"
+        );
     }
 }

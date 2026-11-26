@@ -736,6 +736,14 @@ where
                                 "upstream response task pipe closed before completion",
                             );
                         }
+                        // The task pipe closed without a terminal task. While a cache
+                        // admission is active this loop would poll a closed channel forever,
+                        // so treat the producer as finished; an unfinished fill then ends
+                        // through the dangling write permit like any request whose producer
+                        // died.
+                        if session.cache.is_cache_admission_active() {
+                            response_state.maybe_set_upstream_producer_done(true);
+                        }
                         response_state.maybe_set_upstream_delivery_done(true);
                     }
                 },
