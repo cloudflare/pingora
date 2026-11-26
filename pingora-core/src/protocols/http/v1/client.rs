@@ -604,6 +604,18 @@ impl HttpSession {
             self.set_keepalive(None);
             return;
         }
+        // Per [RFC 9112 Section 6.3](https://datatracker.ietf.org/doc/html/rfc9112#section-6.3),
+        // a 204 response ends at the first empty line after the header fields regardless of
+        // the fields present, and a server MUST NOT send Transfer-Encoding or Content-Length
+        // with it ([RFC 9112 Section 6.1](https://datatracker.ietf.org/doc/html/rfc9112#section-6.1),
+        // [RFC 9110 Section 8.6](https://datatracker.ietf.org/doc/html/rfc9110#section-8.6)).
+        // A server that frames a body on a 204 anyway may send it after the header section.
+        // Bytes that arrive once the connection is back in the pool would be read as the
+        // response to the next request, so such a connection must not be reused.
+        if self.get_status() == Some(StatusCode::NO_CONTENT) && self.resp_declares_body() {
+            self.set_keepalive(None);
+            return;
+        }
         if let Some(keepalive) = self.is_connection_keepalive() {
             if keepalive {
                 let (timeout, _max_use) = self.get_keepalive_values();
@@ -788,6 +800,17 @@ impl HttpSession {
         self.resp_header()
             .map(|h| is_chunked_encoding_from_headers(&h.headers))
             .unwrap_or(false)
+    }
+
+    /// Whether the response header fields announce a body: Transfer-Encoding is present, or
+    /// Content-Length is present with a value other than zero.
+    fn resp_declares_body(&self) -> bool {
+        let Some(headers) = self.resp_header().map(|h| &h.headers) else {
+            return false;
+        };
+        headers.contains_key(header::TRANSFER_ENCODING)
+            || (headers.contains_key(header::CONTENT_LENGTH)
+                && content_length_parse_all(headers) != Some(0))
     }
 
     fn init_req_body_writer(&mut self, header: &RequestHeader) {
@@ -2453,6 +2476,45 @@ hello\r\n\
 
         // HTTP/1.1 should allow keepalive by default
         assert!(http_stream.will_keepalive());
+    }
+
+    #[rstest]
+    #[case("Content-Length: 128")]
+    #[case("Content-Length: 1")]
+    #[case("Transfer-Encoding: chunked")]
+    #[case("Transfer-Encoding: chunked\r\nContent-Length: 0")]
+    #[tokio::test]
+    async fn no_content_response_with_body_framing_disables_keepalive(#[case] framing: &str) {
+        init_log();
+        // A 204 has no body, but this server frames one anyway. Its bytes may only
+        // show up after the connection is released, so the connection is not reusable.
+        let input =
+            format!("HTTP/1.1 204 No Content\r\n{framing}\r\nConnection: keep-alive\r\n\r\n");
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        assert!(http_stream.is_body_done());
+
+        http_stream.respect_keepalive();
+        assert!(!http_stream.will_keepalive());
+        assert!(http_stream.reuse().await.is_none());
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case("Content-Length: 0\r\n")]
+    #[tokio::test]
+    async fn no_content_response_without_body_framing_allows_keepalive(#[case] framing: &str) {
+        init_log();
+        let input = format!("HTTP/1.1 204 No Content\r\n{framing}\r\n");
+        let mock_io = Builder::new().read(input.as_bytes()).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        assert!(http_stream.is_body_done());
+
+        http_stream.respect_keepalive();
+        assert!(http_stream.will_keepalive());
+        assert!(http_stream.reuse().await.is_some());
     }
 
     #[tokio::test]
