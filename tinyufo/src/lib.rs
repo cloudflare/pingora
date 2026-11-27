@@ -23,7 +23,7 @@ use crossbeam_queue::SegQueue;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{
-    AtomicBool, AtomicU8,
+    AtomicBool, AtomicU64, AtomicU8,
     Ordering::{Acquire, Relaxed, SeqCst},
 };
 mod buckets;
@@ -122,6 +122,7 @@ pub struct KV<T> {
 
 // the data and its metadata
 pub struct Bucket<T> {
+    id: u64,
     uses: Uses,
     queue: Location,
     weight: Weight,
@@ -132,11 +133,12 @@ const SMALL_QUEUE_PERCENTAGE: f32 = 0.1;
 
 struct FiFoQueues<T> {
     total_weight_limit: usize,
+    next_id: AtomicU64,
 
-    small: SegQueue<Key>,
+    small: SegQueue<(Key, u64)>,
     small_weight: AtomicUsize,
 
-    main: SegQueue<Key>,
+    main: SegQueue<(Key, u64)>,
     main_weight: AtomicUsize,
 
     // this replaces the ghost queue of S3-FIFO with similar goal: track the evicted assets
@@ -163,7 +165,7 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
 
         assert!(weight > 0);
         let new_bucket = {
-            let Some((uses, queue, weight)) = buckets.get_map(&key, |bucket| {
+            let Some((id, uses, queue, weight)) = buckets.get_map(&key, |bucket| {
                 // the item exists, in case weight changes
                 let old_weight = bucket.weight;
                 let uses = bucket.uses.inc_uses();
@@ -184,7 +186,7 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                 } else {
                     update_atomic(&self.small_weight, old_weight, weight);
                 }
-                (uses, queue, weight)
+                (bucket.id, uses, queue, weight)
             }) else {
                 let mut evicted = self.evict_to_limit(weight, buckets);
                 // TODO: figure out the right way to compare frequencies of different weights across
@@ -207,7 +209,9 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                     (key, data, weight)
                 };
 
+                let id = self.next_id.fetch_add(1, Relaxed);
                 let bucket = Bucket {
+                    id,
                     queue: Location::new_small(),
                     weight,
                     uses: Default::default(), // 0
@@ -218,13 +222,14 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                     // Always push key first before updating weight
                     // If doing the other order, another concurrent thread might not
                     // find things to evict
-                    self.small.push(key);
+                    self.small.push((key, id));
                     self.small_weight.fetch_add(weight as usize, SeqCst);
                 } // else: two threads are racing adding the item
                   // TODO: compare old.weight and update accordingly
                 return evicted;
             };
             Bucket {
+                id,
                 queue: Location(queue.into()),
                 weight,
                 uses: Uses(uses.into()),
@@ -284,20 +289,23 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
 
     fn evict_one_from_small(&self, buckets: &Buckets<T>) -> Option<KV<T>> {
         loop {
-            let Some(to_evict) = self.small.pop() else {
+            let Some((to_evict, queued_id)) = self.small.pop() else {
                 // empty queue, this is caught between another pop() and fetch_sub()
                 return None;
             };
 
             let v = buckets
                 .get_map(&to_evict, |bucket| {
+                    if bucket.id != queued_id || bucket.queue.is_main() {
+                        return None;
+                    }
                     let weight = bucket.weight;
                     self.small_weight.fetch_sub(weight as usize, SeqCst);
 
                     if bucket.uses.uses() > 1 {
                         // move to main
                         bucket.queue.move_to_main();
-                        self.main.push(to_evict);
+                        self.main.push((to_evict, queued_id));
                         self.main_weight.fetch_add(weight as usize, SeqCst);
                         // continue until find one to evict
                         None
@@ -322,13 +330,16 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
 
     fn evict_one_from_main(&self, buckets: &Buckets<T>) -> Option<KV<T>> {
         loop {
-            let to_evict = self.main.pop()?;
+            let (to_evict, queued_id) = self.main.pop()?;
 
             if let Some(v) = buckets
                 .get_map(&to_evict, |bucket| {
+                    if bucket.id != queued_id || !bucket.queue.is_main() {
+                        return None;
+                    }
                     if bucket.uses.decr_uses() > 0 {
                         // put it back
-                        self.main.push(to_evict);
+                        self.main.push((to_evict, queued_id));
                         // continue the loop
                         None
                     } else {
@@ -370,6 +381,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
             main: SegQueue::new(),
             main_weight: 0.into(),
             total_weight_limit,
+            next_id: 0.into(),
             estimator: TinyLfu::new(estimated_size),
             _t: PhantomData,
         };
@@ -392,6 +404,7 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
             main: SegQueue::new(),
             main_weight: 0.into(),
             total_weight_limit,
+            next_id: 0.into(),
             estimator: TinyLfu::new_compact(estimated_size),
             _t: PhantomData,
         };
@@ -786,5 +799,30 @@ mod tests {
         let total_weight =
             cache.queues.small_weight.load(SeqCst) + cache.queues.main_weight.load(SeqCst);
         assert!(total_weight <= 5); // Should not exceed limit
+    }
+
+    #[test]
+    fn test_remove_then_reput_does_not_underflow_or_corrupt_weights() {
+        // Removing a key leaves its entry queued in the SegQueue. Re-inserting
+        // and promoting that key before the stale queue entry is popped must
+        // not process the newly inserted bucket twice or underflow small_weight.
+        let mut cache = TinyUfo::new(7, 8);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(8);
+
+        cache.force_put(5u8, 0u8, 1);
+        cache.put(3, 0, 1);
+        cache.force_put(3, 0, 1);
+        assert_eq!(cache.remove(&5), Some(0));
+        cache.put(3, 0, 2);
+        cache.put(5, 0, 1);
+        cache.put(5, 0, 2);
+        assert_eq!(cache.get(&5), Some(0));
+        cache.put(0, 0, 2);
+        cache.put(1, 0, 2);
+
+        let small_w = cache.queues.small_weight.load(SeqCst);
+        let main_w = cache.queues.main_weight.load(SeqCst);
+        assert!(small_w + main_w <= 7);
     }
 }
