@@ -11,8 +11,11 @@ A `HttpPeer` defines which upstream to connect to.
 |sni: `String`| The SNI to use, Https only |
 |proxy: `Option<Proxy>`| The setting to proxy the request through a [CONNECT proxy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/CONNECT) |
 |client_cert_key: `Option<Arc<CertKey>>`| The client certificate to use in mTLS connections to upstream |
+|group_key: `u64`| A custom field to isolate connection reuse. Requests with different group keys cannot share connections with each other. |
 |options: `PeerOptions`| See below |
 
+**Note:** `options.ext` is not part of `HttpPeer`'s reuse hash, so peers that only differ in `ext`
+can share connections. Anything identity relevant should go in `group_key`.
 
 ## `PeerOptions`
 A `PeerOptions` defines how to connect to the upstream.
@@ -35,6 +38,7 @@ A `PeerOptions` defines how to connect to the upstream.
 |max_blinding_delay: `Option<u32>` | S2N-TLS will delay a response up to the [max blinding delay](https://aws.github.io/s2n-tls/usage-guide/ch03-error-handling.html#blinding) (default 30) seconds whenever an error triggered by a peer occurs to mitigate against timing side channels. (s2n-tls only) |
 |tcp_keepalive: `Option<TcpKeepalive>`| TCP keepalive settings to upstream |
 |http_upstream_request_policy: `HttpUpstreamRequestPolicy`| Controls automatic forwarding of hop-by-hop request headers and HTTP/1 upgrades |
+|ext: `Extensions`| Additional data attached to the peer. |
 
 ### HTTP upstream request header policy
 
