@@ -875,6 +875,8 @@ impl Hash for HttpPeer {
         self.options.second_keyshare.hash(state);
         // fixed on the TLS stream when the connection is made
         self.options.tls_write_coalescing.hash(state);
+        // options.ext is intentionally excluded from the reuse hash as it carries custom data,
+        // not connection identity. Use group_key to keep connections apart.
     }
 }
 

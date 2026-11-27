@@ -11,8 +11,11 @@ A `HttpPeer` defines which upstream to connect to.
 |sni: `String`| The SNI to use, Https only |
 |proxy: `Option<Proxy>`| The setting to proxy the request through a [CONNECT proxy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/CONNECT) |
 |client_cert_key: `Option<Arc<CertKey>>`| The client certificate to use in mTLS connections to upstream |
+|group_key: `u64`| A custom field to isolate connection reuse. Requests with different group keys cannot share connections with each other. |
 |options: `PeerOptions`| See below |
 
+**Note:** `options.ext` is not part of `HttpPeer`'s reuse hash, so peers that only differ in `ext`
+can share connections. Anything identity relevant should go in `group_key`.
 
 ## `PeerOptions`
 A `PeerOptions` defines how to connect to the upstream.
